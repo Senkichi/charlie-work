@@ -133,6 +133,10 @@ class GitHub:
     def pr_comment(self, number: int, body_file: Path) -> None:
         self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
 
+    def label_list(self) -> list[dict[str, Any]]:
+        result = self.run(["label", "list", "--limit", "200", "--json", "name"], json_output=True)
+        return result if isinstance(result, list) else []
+
     def label_create(self, label: str, color: str, description: str) -> None:
         self.run(
             ["label", "create", label, "--color", color, "--description", description],

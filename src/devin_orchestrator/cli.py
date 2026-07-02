@@ -8,6 +8,7 @@ from typing import Any
 
 from . import CLI_NAME
 from .config import find_config_path, load_config
+from .doctor import run_doctor
 from .github import GitHub, GitHubError
 from .paths import find_repo_root, runtime_paths
 from .workflow import CommandResult, OrchestratorApp
@@ -22,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status")
+    subparsers.add_parser("doctor")
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -82,6 +84,24 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     return OrchestratorApp(repo_root, paths, config, gh)
 
 
+def run_doctor_command(args: argparse.Namespace) -> CommandResult:
+    repo_root = find_repo_root(args.repo)
+    config_path = find_config_path(repo_root, args.config)
+    config = load_config(config_path)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    ok, checks = run_doctor(repo_root, paths, config, config_path, gh)
+    failed = [check for check in checks if not check.ok]
+    message = (
+        "doctor: all checks passed"
+        if ok and not failed
+        else f"doctor: {len(failed)} finding(s)"
+        if ok
+        else f"doctor: {len(failed)} finding(s), at least one blocking"
+    )
+    return CommandResult(ok, message, {"checks": [check.to_dict() for check in checks]})
+
+
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
     if args.command == "status":
         return app.status()
@@ -127,8 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args([arg for arg in raw_argv if arg != "--json"])
     args.json_output = json_output or args.json_output
     try:
-        app = build_app(args)
-        result = run_command(app, args)
+        if args.command == "doctor":
+            result = run_doctor_command(args)
+        else:
+            app = build_app(args)
+            result = run_command(app, args)
     except GitHubError as exc:
         print(f"GitHub error: {exc}", file=sys.stderr)
         return 2
