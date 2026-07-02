@@ -127,14 +127,21 @@ def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False
     """
     venv_path = worktree_path / ".venv"
     if venv_path.exists() or is_junction(venv_path):
-        if is_junction(venv_path):
-            os.rmdir(venv_path)
-        elif venv_path.is_dir():
-            if not force:
-                return False
-            shutil.rmtree(venv_path)
-        else:
-            venv_path.unlink()
+        # Any OS-level failure removing the reparse point / local venv is an
+        # "expected failure" per this function's contract (a locked/open file
+        # under force=True raises PermissionError/WinError 32) — return False,
+        # never raise, so one worktree's teardown can't crash the whole batch.
+        try:
+            if is_junction(venv_path):
+                os.rmdir(venv_path)
+            elif venv_path.is_dir():
+                if not force:
+                    return False
+                shutil.rmtree(venv_path)
+            else:
+                venv_path.unlink()
+        except OSError:
+            return False
 
     args = ["git", "worktree", "remove", str(worktree_path)]
     if force:

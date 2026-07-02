@@ -160,16 +160,32 @@ class OrchestratorApp:
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
-        candidates = [issue for issue in issues if self._is_dispatchable(issue)]
+        state = load_state(self.paths.state_file)
+        # Defence-in-depth against double-dispatch: an issue whose state records
+        # a live launched worker (status "dispatched") is not re-dispatchable
+        # even if its GitHub label write failed after the worker launched.
+        # _is_dispatchable is label-only; this closes the launched-but-unlabeled
+        # window that would otherwise spawn a second worker on the same issue.
+        live_dispatched = {
+            int(number)
+            for number, entry in state.get("issues", {}).items()
+            if isinstance(entry, dict) and entry.get("status") == "dispatched"
+        }
+        candidates = [
+            issue
+            for issue in issues
+            if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
+        ]
+        skipped_issue_numbers: list[int] = []
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
             selected = [by_number[number] for number in wanted if number in by_number]
+            skipped_issue_numbers = sorted(set(wanted) - set(by_number))
         else:
             selected = candidates[:dispatch_limit]
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
-        state = load_state(self.paths.state_file)
         for issue in selected:
             issue_number = int(issue["number"])
             full_issue = self.gh.issue_view(issue_number)
@@ -204,17 +220,11 @@ class OrchestratorApp:
         # in-progress. Only an adapter that actually launched something may
         # promote to in-progress.
         manual = self.config.devin.adapter == "manual"
+        label_errors: list[int] = []
         for request in session_requests:
             full_issue = full_issues[request.issue_number]
             ok = request.issue_number in successful_issue_numbers
-            if ok:
-                transition(
-                    self.gh,
-                    self.config.labels,
-                    request.issue_number,
-                    "queued" if manual else "dispatched",
-                )
-            state["issues"][str(request.issue_number)] = {
+            entry = {
                 **state["issues"].get(str(request.issue_number), {}),
                 "number": request.issue_number,
                 "title": full_issue.get("title"),
@@ -226,25 +236,54 @@ class OrchestratorApp:
                 else "dispatch_failed",
                 "dispatched_at": utc_now() if ok else None,
             }
+            entry.pop("label_error", None)
+            state["issues"][str(request.issue_number)] = entry
+            # Persist the launched worker BEFORE touching GitHub labels: a
+            # transient label-write failure (or crash) must never leave a live
+            # worker unrecorded and therefore re-dispatchable next wave. The
+            # transition is isolated per-issue so one failure never aborts the
+            # rest of the batch (orphaning already-launched workers).
+            save_state(self.paths.state_file, state)
+            if ok:
+                try:
+                    transition(
+                        self.gh,
+                        self.config.labels,
+                        request.issue_number,
+                        "queued" if manual else "dispatched",
+                    )
+                except GitHubError as exc:
+                    entry["label_error"] = str(exc)
+                    label_errors.append(request.issue_number)
+                    save_state(self.paths.state_file, state)
         append_event(
             state,
             "dispatch",
             {
                 "issue_numbers": sorted(successful_issue_numbers),
                 "failed_issue_numbers": sorted(failed_issue_numbers),
+                "label_errors": sorted(label_errors),
+                "skipped_issue_numbers": skipped_issue_numbers,
             },
         )
         save_state(self.paths.state_file, state)
         result_dicts = [result.to_dict() for result in dispatch_results]
+        message = "dispatch complete"
+        if failed_issue_numbers:
+            message = "dispatch completed with failures"
+        if skipped_issue_numbers:
+            message += f" (skipped non-dispatchable: {skipped_issue_numbers})"
+        if label_errors:
+            message += f" (launched but label write failed: {sorted(label_errors)})"
         return CommandResult(
             not failed_issue_numbers,
-            "dispatch complete"
-            if not failed_issue_numbers
-            else "dispatch completed with failures",
+            message,
             {
                 "selected_count": len(successful_issue_numbers),
                 "attempted_count": len(session_requests),
                 "failed_count": len(failed_issue_numbers),
+                "skipped_issue_numbers": skipped_issue_numbers,
+                "label_errors": sorted(label_errors),
                 "session_manifest": str(manifest_path),
                 "session_results": str(results_path),
                 "sessions": [asdict(request) for request in session_requests],
@@ -405,45 +444,71 @@ class OrchestratorApp:
             "reviewed_at": utc_now(),
         }
         state = load_state(self.paths.state_file)
+        pr_state = state["prs"].get(str(pr_number), {})
         rework_path: str | None = None
         escalated = False
+        # Durable per-PR rework counter — NOT derived from the global events
+        # log, which append_event truncates to the last 200 entries: on a busy
+        # repo that eviction silently reset the count and defeated the cap
+        # (a PR could rework forever instead of escalating to a human).
+        request_changes_count = int(pr_state.get("request_changes_count", 0))
         if decision == "request_changes":
             # Rework cap: past max_rework_cycles the evidence says iteration
             # thrashes (wrong brief or unimplementable criteria) — escalate to
-            # a human instead of dispatching another cycle. The count derives
-            # from the events already recorded; no new schema field.
-            prior_cycles = sum(
-                1
-                for event in state.get("events", [])
-                if event.get("kind") == "record_review"
-                and event.get("payload", {}).get("pr_number") == pr_number
-                and event.get("payload", {}).get("decision") == "request_changes"
-            )
-            escalated = prior_cycles >= self.config.review.max_rework_cycles
-            if escalated:
-                if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "escalated")
-            else:
+            # a human instead of dispatching another cycle.
+            escalated = request_changes_count >= self.config.review.max_rework_cycles
+            if not escalated:
+                request_changes_count += 1
                 rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
-                if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "rework_requested")
-            if comment and summary_text:
-                self._comment_pr(pr_number, summary_text)
-        elif decision == "blocked" and issue_number is not None:
-            transition(self.gh, self.config.labels, issue_number, "blocked")
         decision_payload["escalated"] = escalated
         decision_path = pr_dir / "review-decision.json"
         self._write_json(decision_path, decision_payload)
-        state["prs"].setdefault(str(pr_number), {})["decision"] = decision
-        state["prs"][str(pr_number)]["decision_path"] = str(decision_path)
-        append_event(state, "record_review", {"pr_number": pr_number, "decision": decision})
+        # Merge-update (never in-place assignment) and persist BEFORE any GitHub
+        # label mutation: a label-write failure or crash must not desync the
+        # durable decision/counter from what actually happened.
+        state["prs"][str(pr_number)] = {
+            **pr_state,
+            "number": pr_number,
+            "issue_number": issue_number,
+            "decision": decision,
+            "decision_path": str(decision_path),
+            "request_changes_count": request_changes_count,
+            "status": "escalated" if escalated else decision,
+        }
+        append_event(
+            state,
+            "record_review",
+            {"pr_number": pr_number, "decision": decision, "escalated": escalated},
+        )
         save_state(self.paths.state_file, state)
+        # GitHub label side effects are best-effort and isolated: the durable
+        # decision above is the authority; a label failure is reported, not fatal.
+        label_error: str | None = None
+        try:
+            if issue_number is not None:
+                if decision == "request_changes":
+                    transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        "escalated" if escalated else "rework_requested",
+                    )
+                elif decision == "blocked":
+                    transition(self.gh, self.config.labels, issue_number, "blocked")
+                elif decision == "approved":
+                    transition(self.gh, self.config.labels, issue_number, "review_approved")
+            if decision == "request_changes" and comment and summary_text:
+                self._comment_pr(pr_number, summary_text)
+        except GitHubError as exc:
+            label_error = str(exc)
         message = (
             f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
             "escalated to human"
             if escalated
             else "review recorded"
         )
+        if label_error:
+            message += f" (label update failed: {label_error})"
         return CommandResult(
             True,
             message,
@@ -453,6 +518,8 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "rework_path": rework_path,
                 "escalated": escalated,
+                "request_changes_count": request_changes_count,
+                "label_error": label_error,
             },
         )
 
@@ -471,18 +538,36 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
+        label_error: str | None = None
         if can_merge and should_merge:
             # Merge, then labels, then best-effort branch deletion — in that
-            # order. A branch-deletion failure (e.g. the head branch is checked
-            # out in a local worktree) must never leave a merged PR's issue
-            # labels un-updated, which is exactly what the old coupled
-            # `gh pr merge --delete-branch` behavior did.
+            # order. merge_pr is the irreversible step: persist status="merged"
+            # to state IMMEDIATELY after it succeeds and BEFORE the label
+            # transition, so a transition failure or Ctrl+C can't leave GitHub
+            # merged while state.json still shows "reviewing" — which made
+            # reconcile false-positive on every clean auto-merge and lost the
+            # merged fact entirely on a crash between merge and save.
             merge_output = self.gh.merge_pr(pr_number, self.config.auto_merge.strategy)
-            if issue_number is not None:
-                transition(self.gh, self.config.labels, issue_number, "merged")
-            if self.config.auto_merge.delete_branch:
-                head_ref = str(pr.get("headRefName") or "")
-                branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
+            state = load_state(self.paths.state_file)
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "merged",
+                "merged": True,
+            }
+            save_state(self.paths.state_file, state)
+            # Label + branch cleanup are best-effort; the merged fact is already
+            # durable. A branch-deletion failure (head branch checked out in a
+            # worktree) or label failure must never un-record the merge.
+            try:
+                if issue_number is not None:
+                    transition(self.gh, self.config.labels, issue_number, "merged")
+                if self.config.auto_merge.delete_branch:
+                    head_ref = str(pr.get("headRefName") or "")
+                    branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
+            except GitHubError as exc:
+                label_error = str(exc)
         data = {
             "pr": pr_number,
             "issue": issue_number,
@@ -493,16 +578,25 @@ class OrchestratorApp:
             "branch_deleted": branch_deleted,
             "review_decision": decision,
             "checks": asdict(summary),
+            "label_error": label_error,
         }
         state = load_state(self.paths.state_file)
-        state["prs"].setdefault(str(pr_number), {}).update(data)
+        merged_fields = {"status": "merged"} if merge_output else {}
+        state["prs"][str(pr_number)] = {
+            **state["prs"].get(str(pr_number), {}),
+            **data,
+            **merged_fields,
+        }
         append_event(
             state,
             "merge_ready",
             {"pr_number": pr_number, "can_merge": can_merge, "merged": bool(merge_output)},
         )
         save_state(self.paths.state_file, state)
-        return CommandResult(True, "merge readiness evaluated", data)
+        message = "merge readiness evaluated"
+        if label_error:
+            message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
+        return CommandResult(True, message, data)
 
     def spec_review(self, artifact_path: Path) -> CommandResult:
         """Run an explicit cross-family adversarial pass over a spec/plan file.

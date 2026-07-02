@@ -18,8 +18,13 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         "queued": ((labels.queued,), ()),
         # worker launch confirmed (subprocess ok / independent evidence)
         "dispatched": ((labels.in_progress,), (labels.queued,)),
-        "review_started": ((labels.pr_open, labels.reviewing), ()),
+        # Re-review is a fresh cycle: clear needs_rework so repeated loop()
+        # passes don't permanently stack reviewing on top of needs_rework.
+        "review_started": ((labels.pr_open, labels.reviewing), (labels.needs_rework,)),
         "rework_requested": ((labels.needs_rework,), (labels.reviewing,)),
+        # reviewer approved; waiting on merge. pr_open (kept) without reviewing
+        # is the "approved, not yet merged" state — distinct from under-review.
+        "review_approved": ((), (labels.reviewing, labels.needs_rework)),
         # rework cap exhausted or reviewer blocked — a human decision is needed
         "escalated": ((labels.human_needed,), (labels.reviewing,)),
         "blocked": ((labels.human_needed,), ()),

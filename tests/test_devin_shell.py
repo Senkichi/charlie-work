@@ -159,6 +159,35 @@ def test_read_session_records_skips_malformed_sidecar(tmp_path: Path) -> None:
     assert read_session_records(sessions_dir) == []
 
 
+def test_read_session_records_skips_claude_code_sidecars(tmp_path: Path) -> None:
+    # Both adapters share one sessions_dir. The devin glob `issue-*.json` also
+    # matches the claude-code adapter's `issue-N.claude.json` sidecars, so
+    # read_session_records must skip them (otherwise doctor double-counts every
+    # Claude worker and tries to parse a foreign schema).
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    devin_payload = {
+        "issue_number": 5,
+        "branch": "agent/issue-5",
+        "prompt_path": "p.md",
+        "command": ["devin", "--print"],
+        "pid": 1234,
+        "started_at": "2026-01-01T00:00:00Z",
+        "log_path": "issue-5.log",
+        "error": None,
+    }
+    (sessions_dir / "issue-5.json").write_text(json.dumps(devin_payload), encoding="utf-8")
+    # A claude-code sidecar with a deliberately foreign schema: if the exclusion
+    # regressed, from_dict would choke on the missing devin-shaped keys.
+    (sessions_dir / "issue-6.claude.json").write_text(
+        json.dumps({"issue_number": 6, "worktree": "wt", "pid": 5678}), encoding="utf-8"
+    )
+
+    records = read_session_records(sessions_dir)
+
+    assert [record.issue_number for record in records] == [5]
+
+
 def test_probe_devin_ok_for_zero_exit_fake(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

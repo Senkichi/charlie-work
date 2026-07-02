@@ -223,8 +223,9 @@ concurrency cap exists in code:
   actual quota/rate-limit budget for whichever worker CLI you're driving.
 - Before dispatching a new wave, check for still-alive sessions:
   `devin_shell.read_session_records(sessions_dir)` +
-  `devin_shell.is_session_alive(record)` (Windows-safe PID liveness via
-  `os.kill(pid, 0)`), or the `claude_code` equivalents
+  `devin_shell.is_session_alive(record)` (Windows PID liveness via ctypes
+  `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on
+  Windows; `os.kill(pid, 0)` on POSIX), or the `claude_code` equivalents
   (`read_worker_records`, checking `record.pid`).
 - `doctor`'s `probe_devin()` / `probe_claude()` helpers are cheap
   `--version` checks — use them to confirm the CLI is reachable at all

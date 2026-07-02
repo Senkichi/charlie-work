@@ -14,7 +14,7 @@ import json
 import shutil
 from pathlib import Path
 
-from devin_orchestrator.state import load_state, save_state
+from devin_orchestrator.state import append_event, empty_state, load_state, save_state
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "state_production_redacted.json"
 
@@ -170,6 +170,33 @@ def test_save_state_refreshes_generated_at_but_keeps_everything_else(tmp_path: P
     assert reloaded["issues"] == raw["issues"]
     assert reloaded["prs"] == raw["prs"]
     assert reloaded["events"] == raw["events"]
+
+
+def test_append_event_caps_at_200_keeping_newest() -> None:
+    """append_event bounds the audit trail to the most recent 200 entries.
+
+    This is the truncation the durable per-PR rework counter had to be moved
+    off of (see test_rework_cap_survives_event_log_truncation) — pin the exact
+    contract so the cap and the newest-retained invariant can't silently drift.
+    """
+    state = empty_state()
+    for index in range(205):
+        append_event(state, "dispatch", {"seq": index})
+
+    events = state["events"]
+    assert len(events) == 200
+    # Oldest five (seq 0-4) were evicted; the newest is retained and last.
+    assert events[0]["payload"]["seq"] == 5
+    assert events[-1]["payload"]["seq"] == 204
+    assert [event["payload"]["seq"] for event in events] == list(range(5, 205))
+
+
+def test_append_event_below_cap_keeps_all() -> None:
+    state = empty_state()
+    for index in range(3):
+        append_event(state, "intake", {"seq": index})
+
+    assert [event["payload"]["seq"] for event in state["events"]] == [0, 1, 2]
 
 
 def test_old_orchestrator_state_file_loads_cleanly_end_to_end(tmp_path: Path) -> None:

@@ -235,6 +235,21 @@ def run_doctor(
     else:
         add("dispatch adapter", True, config.devin.adapter)
 
+    # claude-code worktrees junction a shared venv in; surface a missing
+    # venv_source at preflight rather than deferring it to the first dispatch.
+    if config.devin.adapter == "claude-code" and config.claude_code.venv_source:
+        venv = Path(config.claude_code.venv_source)
+        if not venv.is_absolute():
+            venv = repo_root / venv
+        add(
+            "claude-code venv source",
+            venv.is_dir(),
+            str(venv)
+            if venv.is_dir()
+            else f"claude_code.venv_source does not exist: {venv} "
+            "(set it to null to disable venv sharing)",
+        )
+
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
         _surface_sessions(add, repo_root, config)

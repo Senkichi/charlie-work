@@ -160,6 +160,11 @@ def read_session_records(sessions_dir: Path) -> list[SessionRecord]:
         return []
     records: list[SessionRecord] = []
     for path in sorted(sessions_dir.glob("issue-*.json")):
+        # `issue-*.json` also matches the claude-code adapter's
+        # `issue-N.claude.json` sidecars (both adapters share one sessions_dir).
+        # Skip them so doctor doesn't read every Claude worker twice.
+        if path.name.endswith(".claude.json"):
+            continue
         try:
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)

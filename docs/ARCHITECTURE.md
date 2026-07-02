@@ -297,11 +297,22 @@ incidents actually happened — not scattered as defensive checks:
 ## Adapter boundary
 
 `devin.adapter` selects how a worker session actually gets launched:
-`manual` (write a session manifest, operator pastes the prompt into a Devin
-app session by hand — no subprocess, `ok=True` means "manifest written",
-not "worker launched") or `command` (subprocess-launch via
-`devin.dispatch_command`, blocking, through `run_captured`). The two
-in-flight non-blocking adapters (`devin_shell.py`, `claude_code.py`) are a
-third and fourth shape — headless, `Popen`-based, sidecar-JSON-tracked — not
-yet exposed as a `devin.adapter` value in `config.py`; see the module map
-above for their current standalone API.
+
+- `manual` — write a session manifest, operator pastes the prompt into a Devin
+  app session by hand. No subprocess; `ok=True` means "manifest written", not
+  "worker launched", so the issue is labelled `agent:queued` (not
+  `agent:in-progress`).
+- `command` — subprocess-launch via `devin.dispatch_command`, blocking,
+  through `run_captured`.
+- `devin-shell` — headless `devin --print` via `Popen` (non-blocking),
+  sidecar-JSON-tracked (`devin_shell.py`).
+- `claude-code` — headless `claude -p` in an isolated git worktree
+  (`claude_code.py`), sidecar-JSON-tracked, junction-safe shared venv.
+
+All four are routed by `adapters.dispatch_sessions` from a single
+`AdapterSettings` the workflow resolves. Only adapters that actually launch a
+worker (`command`/`devin-shell`/`claude-code`) promote the issue to
+`agent:in-progress`; a launched worker is recorded in `state.json` **before**
+the label write, so a failed label call can never orphan it into a
+re-dispatchable state. Probe the configured adapter's CLI and surface
+stale/failed sessions with `devin-orch doctor --adapter-probe`.

@@ -102,11 +102,21 @@ def _error_record(
     )
 
 
-def _render_command(command_template: tuple[str, ...], prompt_path: Path) -> tuple[str, ...]:
-    return tuple(
-        part.format(prompt_path=str(prompt_path)) if "{prompt_path}" in part else part
-        for part in command_template
-    )
+def _render_command(
+    command_template: tuple[str, ...],
+    prompt_path: Path,
+    *,
+    issue_number: int,
+    branch: str,
+) -> tuple[str, ...]:
+    # Same placeholder set as devin_shell so the two adapters' command
+    # templates are drop-in compatible: {prompt_path} {issue_number} {branch}.
+    values = {
+        "prompt_path": str(prompt_path),
+        "issue_number": str(issue_number),
+        "branch": branch,
+    }
+    return tuple(part.format(**values) for part in command_template)
 
 
 def launch_claude_worker(
@@ -165,7 +175,9 @@ def launch_claude_worker(
         )
         return _write_record(sessions_dir, record)
 
-    command = _render_command(command_template, prompt_path)
+    command = _render_command(
+        command_template, prompt_path, issue_number=issue_number, branch=branch
+    )
     feed_stdin = "{prompt_path}" not in "".join(command_template)
 
     try:

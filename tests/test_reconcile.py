@@ -131,6 +131,25 @@ def test_detect_drift_finds_closed_unmerged_pr_with_active_labels() -> None:
     }
 
 
+def test_apply_fixes_closed_unmerged_pr_removes_active_labels() -> None:
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(2, "CLOSED", head_ref="agent/issue-20-x")],
+        issues=[_issue(20, [config.labels.pr_open, config.labels.reviewing])],
+    )
+    state = empty_state()
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_active_labels"
+    ]
+
+    apply_fixes(gh, state, drift, config)
+
+    assert (20, config.labels.pr_open) in gh.labels_removed
+    assert (20, config.labels.reviewing) in gh.labels_removed
+
+
 def test_detect_drift_finds_state_pr_missing_on_github() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])

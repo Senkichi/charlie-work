@@ -265,6 +265,7 @@ class FakeGitHub:
         }
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
+        self.labels_created: list[tuple[str, str, str]] = []
         self.merged: list[tuple[int, str]] = []
         self.deleted_branches: list[str] = []
         self.delete_branch_ok = True
@@ -306,7 +307,7 @@ class FakeGitHub:
         return self.delete_branch_ok
 
     def label_create(self, label: str, color: str, description: str) -> None:
-        pass
+        self.labels_created.append((label, color, description))
 
     def pr_comment(self, number: int, body_file: Path) -> None:
         pass
@@ -1040,3 +1041,261 @@ def test_cli_routes_reconcile_fix_flag(monkeypatch, capsys) -> None:
 
     assert cli.main(["reconcile", "--fix"]) == 0
     assert seen["fix"] is True
+
+
+# --- adversarial-review fixes: regressions + coverage gaps ---------------------
+
+
+def _approved_automerge():
+    from devin_orchestrator.config import AutoMergeConfig
+
+    # No required checks -> the check gate is vacuously satisfied, isolating the
+    # approved-decision path for merge tests.
+    return AutoMergeConfig(required_checks=(), require_approved_review=True)
+
+
+def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
+    # A bare #N substring in an attacker-controlled title must NOT bind the PR
+    # to issue N (label/merge hijack). Only a closing keyword counts.
+    assert linked_issue_number({"title": "Refactor everything #1 nicely"}) is None
+    assert linked_issue_number({"title": "see #5 for context", "body": "no link"}) is None
+    # Closing-keyword forms still resolve.
+    assert linked_issue_number({"title": "Fix #321: thing"}) == 321
+    assert linked_issue_number({"body": "Resolves #7"}) == 7
+    # Orchestrator's own branch convention is the trusted head-ref signal.
+    assert linked_issue_number({"headRefName": "agent/issue-456-x", "title": "#999"}) == 456
+
+
+def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
+    # The P0: the counter used to derive from state["events"], which
+    # append_event truncates to the last 200 - evicting a PR's earlier
+    # request_changes and silently resetting the cap. The durable per-PR
+    # counter must escalate regardless of how many unrelated events churn.
+    from devin_orchestrator.state import append_event as _append
+
+    config = OrchestratorConfig()  # max_rework_cycles = 2
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "request_changes", summary="a")
+    app.record_review(456, "request_changes", summary="b")
+    # Flood the event log so any record_review events for 456 are evicted.
+    state = load_state(paths.state_file)
+    for i in range(300):
+        _append(state, "review_packet", {"pr_number": 90000 + i})
+    save_state(paths.state_file, state)
+    assert not any(  # prove the earlier request_changes events are gone
+        e.get("kind") == "record_review" for e in load_state(paths.state_file)["events"]
+    )
+
+    third = app.record_review(456, "request_changes", summary="c")
+
+    assert third.data["escalated"] is True
+    assert third.data["rework_path"] is None
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+
+def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # review_approved clears reviewing/needs-rework so the issue isn't stuck.
+    assert (123, "agent:reviewing") in fake_gh.labels_removed
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
+
+
+def test_review_started_clears_needs_rework() -> None:
+    # Re-review after a rework must not stack reviewing on top of needs-rework.
+    from devin_orchestrator.labels import transition
+
+    fake_gh = FakeGitHub()
+    transition(fake_gh, OrchestratorConfig().labels, 123, "review_started")
+
+    assert (123, "agent:pr-open") in fake_gh.labels_added
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+    assert (123, "agent:needs-rework") in fake_gh.labels_removed
+
+
+def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is True
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
+
+
+def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Path) -> None:
+    from devin_orchestrator.github import GitHubError as _GitHubError
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> None:
+            raise _GitHubError("rate limited")
+
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Write the approved decision directly so the merge gate opens without
+    # needing a (failing) label transition first.
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved"}), encoding="utf-8"
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is True
+    assert result.data["label_error"] == "rate limited"
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
+
+
+def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path: Path) -> None:
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Simulate a prior dispatch that launched a worker but whose label write
+    # failed: state says "dispatched" but the issue still lacks active labels.
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {"number": 123, "status": "dispatched"}
+    save_state(paths.state_file, seed)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=3)
+
+    assert result.data["attempted_count"] == 0  # not re-dispatched
+
+
+def test_dispatch_isolates_label_write_failure(tmp_path: Path) -> None:
+    from devin_orchestrator.github import GitHubError as _GitHubError
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> None:
+            raise _GitHubError("edit failed")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    # Worker launched and recorded even though labeling failed - no crash.
+    assert 123 in result.data["label_errors"]
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    assert "label_error" in state["issues"]["123"]
+
+
+def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.dispatch(only_issues="123,999")
+
+    assert result.data["skipped_issue_numbers"] == [999]
+    assert "999" in result.message
+
+
+def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.bootstrap_labels()
+
+    created = {name for name, _color, _desc in fake_gh.labels_created}
+    assert created == set(config.labels.all)
+    assert all(desc for _n, _c, desc in fake_gh.labels_created)
+
+
+def test_status_aggregates_counts(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.status()
+
+    assert result.ok is True
+    assert result.data["ready_issue_count"] == 1
+    assert result.data["available_issue_count"] == 1
+    assert result.data["open_linked_pr_count"] == 1
+
+
+def test_github_dry_run_skips_mutating_command(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path, dry_run=True)
+
+    out = gh.run(["pr", "merge", "1", "--squash"])
+
+    assert out.startswith("DRY-RUN:")
+    assert calls == []  # subprocess.run never invoked for a mutating command
+
+
+def test_github_dry_run_allows_readonly_command(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path, dry_run=True)
+
+    gh.run(["issue", "list", "--label", "x"], json_output=True)
+
+    assert len(calls) == 1  # read-only command still executes under dry-run
+
+
+def test_is_mutating_classifies_readonly_and_mutating() -> None:
+    from devin_orchestrator.github import _is_mutating
+
+    for readonly in (
+        ["issue", "list"],
+        ["pr", "view", "1"],
+        ["pr", "checks", "1"],
+        ["label", "list"],
+    ):
+        assert _is_mutating(readonly) is False
+    for mutating in (["pr", "merge", "1"], ["issue", "edit", "1"], ["label", "create", "x"]):
+        assert _is_mutating(mutating) is True
+
+
+def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
+    from devin_orchestrator.github import GitHubError as _GitHubError
+
+    def _boom(args):
+        raise _GitHubError("boom")
+
+    monkeypatch.setattr(cli, "build_app", _boom)
+
+    assert cli.main(["status"]) == 2
+    assert "GitHub error: boom" in capsys.readouterr().err

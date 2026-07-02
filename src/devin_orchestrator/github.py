@@ -138,8 +138,12 @@ class GitHub:
         return result if isinstance(result, list) else []
 
     def label_create(self, label: str, color: str, description: str) -> None:
+        # --force makes this update-or-create: bootstrap must be idempotent, and
+        # without it `gh label create` errors on a pre-existing label and the
+        # colour/description drift silently. `--force` is a mutation but stays
+        # read-only-safe under dry-run via `_is_mutating`.
         self.run(
-            ["label", "create", label, "--color", color, "--description", description],
+            ["label", "create", label, "--force", "--color", color, "--description", description],
             allow_failure=True,
         )
 
@@ -188,17 +192,34 @@ def label_names(item: dict[str, Any]) -> set[str]:
     return names
 
 
+# GitHub's own issue-closing keyword set, used here to decide whether a `#N`
+# reference in freeform text actually links the PR to issue N.
+_CLOSING_KEYWORD_REF = re.compile(
+    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", flags=re.IGNORECASE
+)
+# The orchestrator's own branch convention (agent/issue-N-slug). A head ref is
+# the trusted signal because the orchestrator created it at dispatch.
+_BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
+
+
 def linked_issue_number(pr: dict[str, Any]) -> int | None:
+    """Resolve the issue a PR is bound to, safe against hijack.
+
+    A bare ``#N`` substring in an attacker-controlled PR *title* must never
+    bind the PR to issue N — that let any external PR author drive another
+    issue's label/merge transitions. So: trust the head ref only in the
+    orchestrator's own ``issue-N`` branch form, and in freeform title/body
+    text require a GitHub closing keyword (the same set GitHub itself uses to
+    auto-close), never a lone ``#N``.
+    """
     head = str(pr.get("headRefName") or "")
-    title = str(pr.get("title") or "")
-    body = str(pr.get("body") or "")
-    for text in (head, title):
-        match = re.search(r"(?:issue[-_/]|#)(\d+)", text, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    match = re.search(r"(?:closes|fixes|resolves)\s+#(\d+)", body, flags=re.IGNORECASE)
+    match = _BRANCH_ISSUE_REF.search(head)
     if match:
         return int(match.group(1))
+    for text in (str(pr.get("title") or ""), str(pr.get("body") or "")):
+        match = _CLOSING_KEYWORD_REF.search(text)
+        if match:
+            return int(match.group(1))
     return None
 
 
