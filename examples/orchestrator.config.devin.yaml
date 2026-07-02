@@ -1,0 +1,67 @@
+# devin-orchestrator config — Devin-workers profile (the default runtime).
+# Copy to your repo root as `orchestrator.config.yaml` and adjust.
+
+labels:
+  ready: automated-ready
+
+dispatch:
+  default_limit: 3
+  branch_prefix: agent/issue
+  worker_model_tier: capable
+  orchestrator_model_tier: top-reasoning
+  # Devin worker sessions use the skills-based loop.
+  worker_template: worker.md
+
+review:
+  max_rework_cycles: 3
+  require_tests_or_rationale: true
+  require_issue_link: true
+
+auto_merge:
+  enabled: true
+  strategy: squash
+  # Post-merge REMOTE branch deletion is best-effort and never aborts the
+  # merge/label sequence. Safe to keep true even with local worktree checkouts.
+  delete_branch: true
+  require_approved_review: true
+  # MUST match the check-run names GitHub reports for your CI
+  # (see the job `name:` fields in .github/workflows/*.yml).
+  # `devin-orch doctor` verifies these against your workflows.
+  required_checks:
+    - Tests passed
+    - Lint & Format
+    - Pre-commit
+  allow_auto_merge_when_pending: false
+
+runtime:
+  state_dir: .var/devin-orchestrator
+  # Optional repo-local template dir; files here override the package
+  # templates by filename (e.g. drop in your own worker.md).
+  # prompts_dir: orchestrator-prompts
+
+devin:
+  adapter: manual
+  session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
+  session_results: .var/devin-orchestrator/dispatches/session-results.json
+  # When a working one-session-per-issue launcher is available, switch to
+  # adapter: command and configure the command shape, e.g.
+  # dispatch_command: [devin, --prompt-file, "{prompt_path}", -p]
+  # command_timeout_seconds: 300
+
+cross_family:
+  # Auto adversarial pass by a NON-Claude model (codex via the Devin CLI) on
+  # every non-draft PR `review` and on-demand `spec-review`. Findings are
+  # LEADS, not verdicts (the model over-escalates severity) and never gate a
+  # merge. Set `enabled: false` (or delete this block) to revert to
+  # Claude-only review.
+  enabled: true
+  model: codex
+  # {model} and {prompt_path} are substituted at run time. A list runs without a shell.
+  command:
+    - devin
+    - --model
+    - "{model}"
+    - -p
+    - --prompt-file
+    - "{prompt_path}"
+  timeout_seconds: 300

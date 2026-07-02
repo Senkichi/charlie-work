@@ -1,0 +1,47 @@
+# devin-orchestrator config — Claude-Code-workers profile.
+# Copy to your repo root as `orchestrator.config.yaml` and adjust.
+
+labels:
+  ready: automated-ready
+
+dispatch:
+  default_limit: 3
+  branch_prefix: agent/issue
+  worker_model_tier: capable
+  orchestrator_model_tier: top-reasoning
+  # Claude Code workers use the direct-shell loop (no Devin session skills).
+  worker_template: worker_claude_code.md
+
+review:
+  max_rework_cycles: 3
+  require_tests_or_rationale: true
+  require_issue_link: true
+
+auto_merge:
+  enabled: true
+  strategy: squash
+  # Deletion is remote-only and best-effort — safe with local worktrees
+  # (the failure mode that forced delete_branch:false in empericus is fixed).
+  delete_branch: true
+  require_approved_review: true
+  # MUST match the check-run names GitHub reports for your CI
+  # (see the job `name:` fields in .github/workflows/*.yml).
+  # `devin-orch doctor` verifies these against your workflows.
+  required_checks:
+    - Test
+    - "Lint, Types & Pre-commit"
+  allow_auto_merge_when_pending: false
+
+runtime:
+  state_dir: .var/devin-orchestrator
+  # Repo-local templates override package templates by filename. Point this at
+  # a tracked dir holding your specialized worker prompt (repo invariants,
+  # canonical commands) — see the empericus setup for the pattern.
+  # prompts_dir: orchestrator-prompts
+
+devin:
+  adapter: manual
+  session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
+  session_results: .var/devin-orchestrator/dispatches/session-results.json
+
+# cross_family omitted → disabled (Claude-only review).
