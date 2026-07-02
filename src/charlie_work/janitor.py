@@ -19,11 +19,11 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from devin_orchestrator.checks import summarize_checks
-from devin_orchestrator.github import linked_issue_number
+from charlie_work.checks import summarize_checks
+from charlie_work.github import linked_issue_number
 
 if TYPE_CHECKING:
-    from devin_orchestrator.config import OrchestratorConfig
+    from charlie_work.config import OrchestratorConfig
 
 # Case-insensitive markers scanned for in the PR body when
 # `config.review.require_tests_or_rationale` is set. Presence of any one of

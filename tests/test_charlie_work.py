@@ -5,10 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from devin_orchestrator import cli
-from devin_orchestrator import github as github_module
-from devin_orchestrator.checks import summarize_checks
-from devin_orchestrator.config import (
+from charlie_work import cli
+from charlie_work import github as github_module
+from charlie_work.checks import summarize_checks
+from charlie_work.config import (
     CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
@@ -17,16 +17,16 @@ from devin_orchestrator.config import (
     find_config_path,
     load_config,
 )
-from devin_orchestrator.cross_family import (
+from charlie_work.cross_family import (
     CrossFamilyResult,
     render_command,
     run_cross_family_review,
 )
-from devin_orchestrator.github import label_names, linked_issue_number
-from devin_orchestrator.paths import runtime_paths
-from devin_orchestrator.prompts import render_prompt
-from devin_orchestrator.state import load_state, save_state
-from devin_orchestrator.workflow import OrchestratorApp, slugify
+from charlie_work.github import label_names, linked_issue_number
+from charlie_work.paths import runtime_paths
+from charlie_work.prompts import render_prompt
+from charlie_work.state import load_state, save_state
+from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
@@ -42,9 +42,9 @@ def test_default_config_enables_auto_merge() -> None:
 
 
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
-    paths = runtime_paths(tmp_path, ".var/devin-orchestrator")
+    paths = runtime_paths(tmp_path, ".var/charlie-work")
 
-    assert paths.root == tmp_path / ".var" / "devin-orchestrator"
+    assert paths.root == tmp_path / ".var" / "charlie-work"
     assert paths.state_file == paths.root / "state.json"
 
 
@@ -172,7 +172,7 @@ def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
 
 
 def test_load_config_names_unknown_keys_and_section(tmp_path: Path) -> None:
-    from devin_orchestrator.config import ConfigError
+    from charlie_work.config import ConfigError
 
     config_path = tmp_path / "orchestrator.config.yaml"
     config_path.write_text(
@@ -210,7 +210,7 @@ def test_cli_accepts_json_after_subcommand(monkeypatch, capsys) -> None:
         lambda app, args: cli.CommandResult(True, "ok", {"json_output": args.json_output}),
     )
 
-    assert cli.main(["status", "--json"]) == 0
+    assert cli.main(["roll-call", "--json"]) == 0
 
     output = json.loads(capsys.readouterr().out)
     assert output["data"]["json_output"] is True
@@ -235,7 +235,7 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
 
 
 def _required_checks_config(**kwargs) -> OrchestratorConfig:
-    from devin_orchestrator.config import AutoMergeConfig
+    from charlie_work.config import AutoMergeConfig
 
     auto_merge = AutoMergeConfig(
         required_checks=("Tests passed", "Lint & Format", "Pre-commit"), **kwargs
@@ -323,12 +323,8 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
 
     assert result.ok is True
     assert result.data["selected_count"] == 1
-    prompt_path = (
-        tmp_path / ".var" / "devin-orchestrator" / "issues" / "issue-123" / "worker-prompt.md"
-    )
-    manifest_path = (
-        tmp_path / ".var" / "devin-orchestrator" / "dispatches" / "session-manifest.json"
-    )
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
     assert prompt_path.exists()
     assert manifest_path.exists()
     assert "Closes #123" in prompt_path.read_text(encoding="utf-8")
@@ -362,9 +358,7 @@ def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) ->
 
     app.dispatch(limit=1)
 
-    prompt_path = (
-        tmp_path / ".var" / "devin-orchestrator" / "issues" / "issue-123" / "worker-prompt.md"
-    )
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
     text = prompt_path.read_text(encoding="utf-8")
     assert "git switch -c agent/issue-123-fix-search" in text  # Claude Code loop
     assert "/create-branch" not in text  # not the Devin skills loop
@@ -380,9 +374,7 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
 
     app.dispatch(limit=1)
 
-    prompt_path = (
-        tmp_path / ".var" / "devin-orchestrator" / "issues" / "issue-123" / "worker-prompt.md"
-    )
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
     assert prompt_path.read_text(encoding="utf-8") == "REPO-LOCAL #123"
 
 
@@ -409,7 +401,7 @@ def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> Non
     assert result.data["failed_count"] == 0
     assert result.data["dispatch_results"][0]["stdout"].strip() == "123"
     assert (123, "agent:in-progress") in fake_gh.labels_added
-    results_path = tmp_path / ".var" / "devin-orchestrator" / "dispatches" / "session-results.json"
+    results_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-results.json"
     results = json.loads(results_path.read_text(encoding="utf-8"))
     assert results["results"][0]["ok"] is True
 
@@ -446,7 +438,7 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
     assert not_ready.data["can_merge"] is False
     assert fake_gh.merged == []
 
-    decision_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
         json.dumps({"decision": "approved"}), encoding="utf-8"
@@ -471,7 +463,7 @@ def test_merge_ready_branch_delete_failure_never_blocks_labels(tmp_path: Path) -
     fake_gh = FakeGitHub()
     fake_gh.delete_branch_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    decision_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
         json.dumps({"decision": "approved"}), encoding="utf-8"
@@ -489,7 +481,7 @@ def test_merge_ready_honors_delete_branch_false(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    decision_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
         json.dumps({"decision": "approved"}), encoding="utf-8"
@@ -671,13 +663,13 @@ def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkey
         Path(kwargs["report_path"]).write_text("codex findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
 
     result = app.review(456)
 
     assert calls["n"] == 1
     assert result.data["cross_family_ok"] is True
-    prs_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     prompt_text = (prs_dir / "review-prompt.md").read_text(encoding="utf-8")
     assert "Cross-family adversarial pass" in prompt_text
     assert "leads, not verdicts" in prompt_text
@@ -693,7 +685,7 @@ def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch)
         Path(kwargs["report_path"]).write_text("codex findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
 
     app.review(456)
     app.review(456)
@@ -707,13 +699,13 @@ def test_review_no_cross_family_override_skips(tmp_path: Path, monkeypatch) -> N
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run when disabled per call")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
 
     result = app.review(456, cross_family=False)
 
     assert result.data["cross_family_ok"] is None
     prompt_text = (
-        tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456" / "review-prompt.md"
+        tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
     ).read_text(encoding="utf-8")
     assert "Cross-family adversarial pass" not in prompt_text
 
@@ -725,7 +717,7 @@ def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> 
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run for a draft PR")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
 
     result = app.review(456)
 
@@ -748,7 +740,7 @@ def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None
         Path(kwargs["report_path"]).write_text("spec findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
 
     result = app.spec_review(spec)
 
@@ -770,7 +762,7 @@ def test_spec_review_missing_file_returns_error(tmp_path: Path) -> None:
 
 
 def test_load_state_quarantines_corrupt_file(tmp_path: Path) -> None:
-    from devin_orchestrator.state import load_state as _load
+    from charlie_work.state import load_state as _load
 
     state_path = tmp_path / "state.json"
     state_path.write_text("{truncated garbage", encoding="utf-8")
@@ -785,8 +777,8 @@ def test_load_state_quarantines_corrupt_file(tmp_path: Path) -> None:
 
 
 def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
-    from devin_orchestrator.state import load_state as _load
-    from devin_orchestrator.state import save_state as _save
+    from charlie_work.state import load_state as _load
+    from charlie_work.state import save_state as _save
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -839,7 +831,7 @@ def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
 
 def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
-    pr_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True)
     (pr_dir / "cross-family-review.md").write_text(
         "# Cross-family adversarial review — `codex` (UNAVAILABLE)\n\n> timed out\n",
@@ -852,7 +844,7 @@ def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) ->
         Path(kwargs["report_path"]).write_text("# real findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
 
     result = app.review(456)
 
@@ -861,7 +853,7 @@ def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) ->
 
 
 def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
-    from devin_orchestrator.github import GitHubError as _GitHubError
+    from charlie_work.github import GitHubError as _GitHubError
 
     class ExplodingGitHub(FakeGitHub):
         def pr_view(self, number: int):
@@ -878,7 +870,7 @@ def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
 
 
 def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
-    from devin_orchestrator.subprocess_runner import run_captured
+    from charlie_work.subprocess_runner import run_captured
 
     result = run_captured(
         [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'caf' + bytes([0xE9]))"],
@@ -909,16 +901,14 @@ def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path) ->
     assert result.ok is True
     assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
     assert (123, "agent:in-progress") in fake_gh.labels_added
-    sidecar = (
-        tmp_path / ".var" / "devin-orchestrator" / "dispatches" / "sessions" / "issue-123.json"
-    )
+    sidecar = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions" / "issue-123.json"
     assert sidecar.exists()
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "dispatched"
 
 
 def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> None:
-    from devin_orchestrator.claude_code import ClaudeWorkerRecord
+    from charlie_work.claude_code import ClaudeWorkerRecord
 
     captured: dict[str, object] = {}
 
@@ -936,7 +926,7 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
             log_path=str(tmp_path / "log"),
         )
 
-    monkeypatch.setattr("devin_orchestrator.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -951,7 +941,7 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
 
 
 def test_claude_code_dispatch_failure_stays_out_of_progress(tmp_path: Path, monkeypatch) -> None:
-    from devin_orchestrator.claude_code import ClaudeWorkerRecord
+    from charlie_work.claude_code import ClaudeWorkerRecord
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
@@ -966,7 +956,7 @@ def test_claude_code_dispatch_failure_stays_out_of_progress(tmp_path: Path, monk
             error="claude not found on PATH",
         )
 
-    monkeypatch.setattr("devin_orchestrator.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -990,7 +980,7 @@ def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
     result = app.review(456)
 
     assert result.ok is False
-    packet = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456" / "review-prompt.md"
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
     assert not packet.exists()  # zero packet spend on a blocked PR
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "janitor_blocked"
@@ -1006,7 +996,7 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     result = app.review(456)
 
     assert result.ok is True
-    packet = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456" / "review-prompt.md"
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
     assert "Janitor warnings" in packet.read_text(encoding="utf-8")
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["janitor_ok"] is True
@@ -1039,7 +1029,7 @@ def test_cli_routes_reconcile_fix_flag(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(cli, "build_app", lambda args: StubApp())
 
-    assert cli.main(["reconcile", "--fix"]) == 0
+    assert cli.main(["mop-up", "--fix"]) == 0
     assert seen["fix"] is True
 
 
@@ -1047,7 +1037,7 @@ def test_cli_routes_reconcile_fix_flag(monkeypatch, capsys) -> None:
 
 
 def _approved_automerge():
-    from devin_orchestrator.config import AutoMergeConfig
+    from charlie_work.config import AutoMergeConfig
 
     # No required checks -> the check gate is vacuously satisfied, isolating the
     # approved-decision path for merge tests.
@@ -1071,7 +1061,7 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # append_event truncates to the last 200 - evicting a PR's earlier
     # request_changes and silently resetting the cap. The durable per-PR
     # counter must escalate regardless of how many unrelated events churn.
-    from devin_orchestrator.state import append_event as _append
+    from charlie_work.state import append_event as _append
 
     config = OrchestratorConfig()  # max_rework_cycles = 2
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -1111,7 +1101,7 @@ def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
 
 def test_review_started_clears_needs_rework() -> None:
     # Re-review after a rework must not stack reviewing on top of needs-rework.
-    from devin_orchestrator.labels import transition
+    from charlie_work.labels import transition
 
     fake_gh = FakeGitHub()
     transition(fake_gh, OrchestratorConfig().labels, 123, "review_started")
@@ -1135,7 +1125,7 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
 
 
 def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Path) -> None:
-    from devin_orchestrator.github import GitHubError as _GitHubError
+    from charlie_work.github import GitHubError as _GitHubError
 
     class LabelFailGitHub(FakeGitHub):
         def add_issue_label(self, number: int, label: str) -> None:
@@ -1182,7 +1172,7 @@ def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path:
 
 
 def test_dispatch_isolates_label_write_failure(tmp_path: Path) -> None:
-    from devin_orchestrator.github import GitHubError as _GitHubError
+    from charlie_work.github import GitHubError as _GitHubError
 
     class LabelFailGitHub(FakeGitHub):
         def add_issue_label(self, number: int, label: str) -> None:
@@ -1276,7 +1266,7 @@ def test_github_dry_run_allows_readonly_command(monkeypatch, tmp_path: Path) -> 
 
 
 def test_is_mutating_classifies_readonly_and_mutating() -> None:
-    from devin_orchestrator.github import _is_mutating
+    from charlie_work.github import _is_mutating
 
     for readonly in (
         ["issue", "list"],
@@ -1290,12 +1280,12 @@ def test_is_mutating_classifies_readonly_and_mutating() -> None:
 
 
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
-    from devin_orchestrator.github import GitHubError as _GitHubError
+    from charlie_work.github import GitHubError as _GitHubError
 
     def _boom(args):
         raise _GitHubError("boom")
 
     monkeypatch.setattr(cli, "build_app", _boom)
 
-    assert cli.main(["status"]) == 2
+    assert cli.main(["roll-call"]) == 2
     assert "GitHub error: boom" in capsys.readouterr().err

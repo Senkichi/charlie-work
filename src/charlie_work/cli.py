@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", dest="json_output")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("status")
+    subparsers.add_parser("roll-call")
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument(
         "--adapter-probe",
@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
-    reconcile = subparsers.add_parser("reconcile")
+    reconcile = subparsers.add_parser("mop-up")
     reconcile.add_argument(
         "--fix",
         action="store_true",
@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    dispatch = subparsers.add_parser("dispatch")
+    dispatch = subparsers.add_parser("work")
     dispatch.add_argument("--limit", type=int, default=None)
     dispatch.add_argument(
         "--issues",
@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    review = subparsers.add_parser("review")
+    review = subparsers.add_parser("why-charlie-hate")
     review.add_argument("--pr", type=int, required=True)
     cross_family_group = review.add_mutually_exclusive_group()
     cross_family_group.add_argument(
@@ -71,10 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cross-family", action="store_const", const=False, dest="cross_family"
     )
 
-    spec_review = subparsers.add_parser("spec-review")
+    spec_review = subparsers.add_parser("why-charlie-hate-spec")
     spec_review.add_argument("--file", type=Path, required=True, dest="spec_file")
 
-    record = subparsers.add_parser("record-review")
+    record = subparsers.add_parser("verdict")
     record.add_argument("--pr", type=int, required=True)
     record.add_argument(
         "--decision", choices=["approved", "request_changes", "blocked"], required=True
@@ -83,14 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--summary-file", type=Path, default=None)
     record.add_argument("--comment", action="store_true")
 
-    merge_ready = subparsers.add_parser("merge-ready")
+    merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
     merge_group = merge_ready.add_mutually_exclusive_group()
     merge_group.add_argument("--merge", action="store_true", dest="merge")
     merge_group.add_argument("--no-merge", action="store_false", dest="merge")
     merge_ready.set_defaults(merge=None)
 
-    loop = subparsers.add_parser("loop")
+    loop = subparsers.add_parser("bash-rats")
     loop.add_argument("--limit", type=int, default=None)
 
     return parser
@@ -125,21 +125,21 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
 
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
-    if args.command == "status":
+    if args.command == "roll-call":
         return app.status()
     if args.command == "bootstrap-labels":
         return app.bootstrap_labels()
     if args.command == "intake":
         return app.intake()
-    if args.command == "reconcile":
+    if args.command == "mop-up":
         return app.reconcile(fix=args.fix)
-    if args.command == "dispatch":
+    if args.command == "work":
         return app.dispatch(args.limit, only_issues=args.issues)
-    if args.command == "review":
+    if args.command == "why-charlie-hate":
         return app.review(args.pr, cross_family=args.cross_family)
-    if args.command == "spec-review":
+    if args.command == "why-charlie-hate-spec":
         return app.spec_review(args.spec_file)
-    if args.command == "record-review":
+    if args.command == "verdict":
         return app.record_review(
             args.pr,
             args.decision,
@@ -147,9 +147,9 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             summary_file=args.summary_file,
             comment=args.comment,
         )
-    if args.command == "merge-ready":
+    if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
-    if args.command == "loop":
+    if args.command == "bash-rats":
         return app.loop(args.limit)
     return CommandResult(False, f"unknown command: {args.command}", {})
 

@@ -3,36 +3,36 @@
 This walks a new consumer repo through install, config, label bootstrap, a
 preflight check, and one full intake → dispatch → review → merge cycle.
 
-## 1. Install as an editable path dependency
+## 1. Set up charlie-work as an external tool
 
-`devin-orchestrator` is consumed as a library + CLI from your target repo,
-not installed standalone. In your consumer repo's `pyproject.toml`:
-
-```toml
-[tool.uv.sources]
-devin-orchestrator = { path = "../devin-orchestrator", editable = true }
-
-[project]
-dependencies = [
-    "devin-orchestrator",
-    # ...your other deps
-]
-```
-
-Adjust the relative path to wherever you've cloned this repo. Then, from the
-consumer repo:
+`charlie-work` is a standalone dev tool with its own environment — it operates
+*on* your target repo but is **not** a dependency of it. (An editable path dep
+would break the consumer's CI: a locked `uv sync --all-extras` tries to install
+`../charlie-work`, which CI runners never check out.) Clone it next to your
+consumer repo and set up its environment once:
 
 ```powershell
+# from the charlie-work repo
 uv sync
 ```
 
-This installs the `devin-orch` console script (`[project.scripts]` in this
-repo's `pyproject.toml`: `devin-orch = "devin_orchestrator.cli:main"`).
-Verify it resolved:
+Invoke it against a consumer repo by running charlie-work's own uv project with
+the consumer as the `--repo` target:
 
 ```powershell
-uv run devin-orch --help
+uv run --project ..\charlie-work --directory ..\job-cannon charlie --repo ..\job-cannon --help
 ```
+
+- `--project` selects charlie-work's environment
+- `--directory` sets the working directory to the consumer repo
+- `--repo` is charlie-work's explicit target — config, state, prompts, and every
+  `gh`/`git` call resolve against it
+
+Most consumers wrap this in a one-line script so daily use is just
+`charlie <command>`. The console script is `charlie` (with a `charlie-work`
+alias), defined by `[project.scripts]` in this repo's `pyproject.toml`
+(`charlie = "charlie_work.cli:main"`). The `uv run charlie …` examples below are
+shorthand for that wrapped invocation.
 
 ## 2. Add a config file
 
@@ -48,7 +48,7 @@ into your consumer repo's root as `orchestrator.config.yaml`, then edit the
 `required_checks` list to match your CI's actual job `name:` fields:
 
 ```powershell
-Copy-Item ..\devin-orchestrator\examples\orchestrator.config.devin.yaml orchestrator.config.yaml
+Copy-Item ..\charlie-work\examples\orchestrator.config.devin.yaml orchestrator.config.yaml
 ```
 
 Minimal example (everything not listed keeps its dataclass default):
@@ -67,7 +67,7 @@ devin:
   adapter: manual
 ```
 
-Key knobs, all overridable per-section (see `src/devin_orchestrator/config.py`
+Key knobs, all overridable per-section (see `src/charlie_work/config.py`
 for the full dataclass list and defaults):
 
 | Key | Meaning |
@@ -75,7 +75,7 @@ for the full dataclass list and defaults):
 | `labels.*` | The nine `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)). |
 | `dispatch.default_limit` / `branch_prefix` / `worker_template` | Wave size, branch-name prefix, which prompt template renders per-issue worker prompts (`worker.md` for Devin, `worker_claude_code.md` for Claude Code). |
 | `review.max_rework_cycles` | `request_changes` cycles allowed before escalating to `agent:human-needed` instead of dispatching another rework round. |
-| `auto_merge.required_checks` | CI check-run names that must be green before `merge-ready` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
+| `auto_merge.required_checks` | CI check-run names that must be green before `ship-it` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
 | `devin.adapter` | `manual` (write a session manifest for a human to paste into a Devin session) or `command` (subprocess-launch via `devin.dispatch_command`). |
 | `cross_family.*` | Enables the non-Claude adversarial pass (`enabled: false` by default; both example profiles show how to turn it on/off). |
@@ -83,7 +83,7 @@ for the full dataclass list and defaults):
 ## 3. Preflight with `doctor`
 
 ```powershell
-uv run devin-orch doctor
+uv run charlie doctor
 ```
 
 `run_doctor` (in `doctor.py`) checks, in order: `gh` on PATH and
@@ -103,7 +103,7 @@ One-time per repo (idempotent — re-running is safe, `gh label create` is
 called with `allow_failure=True`):
 
 ```powershell
-uv run devin-orch bootstrap-labels
+uv run charlie bootstrap-labels
 ```
 
 Creates all nine labels from `LabelConfig.all` (`automated-ready`,
@@ -119,31 +119,31 @@ steps, one pass):
 
 ```powershell
 # See what's ready, what's active, what's linked
-uv run devin-orch status --json
+uv run charlie roll-call --json
 
 # Write worker-prompt.md + issue.json for every automated-ready issue
-uv run devin-orch intake
+uv run charlie intake
 
 # Select a wave (newest-first, up to dispatch.default_limit) and write the
 # session manifest / launch workers per the configured adapter
-uv run devin-orch dispatch --limit 3
+uv run charlie work --limit 3
 
 # ...worker does its thing out-of-band (manual paste, or a launched process)
 # and opens a PR that references the issue (branch name, title, or
 # "Closes #<n>" in the body) ...
 
 # Generate an adversarial review packet for that PR
-uv run devin-orch review --pr 123
+uv run charlie why-charlie-hate --pr 123
 
-# Read .var/devin-orchestrator/prs/pr-123/review-prompt.md, do the review,
+# Read .var/charlie-work/prs/pr-123/review-prompt.md, do the review,
 # then record a decision
-uv run devin-orch record-review --pr 123 --decision approved --summary-file review.md
+uv run charlie verdict --pr 123 --decision approved --summary-file review.md
 
 # Merge once checks + decision are green
-uv run devin-orch merge-ready --pr 123
+uv run charlie ship-it --pr 123
 
 # Or run intake + dispatch + review + conditional-merge in one pass:
-uv run devin-orch loop --limit 3
+uv run charlie bash-rats --limit 3
 ```
 
 Every command accepts `--json` (either before or after the subcommand — the
@@ -175,7 +175,7 @@ integration status.
 
 ## 7. Prompt templates
 
-Package defaults live in `src/devin_orchestrator/prompts/`
+Package defaults live in `src/charlie_work/prompts/`
 (`orchestrator.md`, `worker.md`, `worker_claude_code.md`, `review.md`,
 `rework.md`, `cross_family_review.md`, `cross_family_spec_review.md`). A
 repo-local `runtime.prompts_dir` overrides these **by filename** — point it

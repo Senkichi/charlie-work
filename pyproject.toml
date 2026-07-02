@@ -1,5 +1,5 @@
 [project]
-name = "devin-orchestrator"
+name = "charlie-work"
 version = "0.1.0"
 description = "Deterministic GitHub-issue orchestrator for AI worker fleets — Devin workers by default, Claude Code workers first-class"
 readme = "README.md"
@@ -8,7 +8,9 @@ license = { text = "MIT" }
 dependencies = ["pyyaml>=6.0"]
 
 [project.scripts]
-devin-orch = "devin_orchestrator.cli:main"
+# `charlie` is the hero command; `charlie-work` is a formal alias to the same entry point.
+charlie = "charlie_work.cli:main"
+charlie-work = "charlie_work.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
@@ -18,7 +20,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/devin_orchestrator"]
+packages = ["src/charlie_work"]
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"

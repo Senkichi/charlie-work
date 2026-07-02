@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from devin_orchestrator.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
-from devin_orchestrator.janitor import JanitorVerdict, run_janitor
+from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
+from charlie_work.janitor import JanitorVerdict, run_janitor
 
 REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 

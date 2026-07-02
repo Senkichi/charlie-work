@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 from string import Template
 
-from devin_orchestrator.prompt_sections import section_variables
-from devin_orchestrator.prompts import render_prompt
+from charlie_work.prompt_sections import section_variables
+from charlie_work.prompts import render_prompt
 
 ISSUE_VALUES = {
     "issue_number": 123,
@@ -108,7 +108,7 @@ def test_rendered_worker_prompts_contain_shared_section_text_and_no_placeholders
 
 
 def test_worker_templates_reference_section_variables_in_source() -> None:
-    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "devin_orchestrator" / "prompts"
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
 
     for template_name in ("worker.md", "worker_claude_code.md"):
         text = (prompts_dir / template_name).read_text(encoding="utf-8")

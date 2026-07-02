@@ -84,7 +84,7 @@ class AutoMergeConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    state_dir: str = ".var/devin-orchestrator"
+    state_dir: str = ".var/charlie-work"
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -98,12 +98,12 @@ class DevinConfig:
     # "claude-code" launches Claude Code workers in isolated git worktrees
     # (claude_code.py, configured under the claude_code section).
     adapter: str = "manual"
-    session_manifest: str = ".var/devin-orchestrator/dispatches/session-manifest.json"
-    session_results: str = ".var/devin-orchestrator/dispatches/session-results.json"
+    session_manifest: str = ".var/charlie-work/dispatches/session-manifest.json"
+    session_results: str = ".var/charlie-work/dispatches/session-results.json"
     dispatch_command: str | tuple[str, ...] = ""
     command_timeout_seconds: int = 300
     # devin-shell adapter: sidecar JSON + per-session logs live here.
-    sessions_dir: str = ".var/devin-orchestrator/dispatches/sessions"
+    sessions_dir: str = ".var/charlie-work/dispatches/sessions"
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch}.
     shell_command: tuple[str, ...] = ()
@@ -116,7 +116,7 @@ class ClaudeCodeConfig:
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
     command: tuple[str, ...] = ()
-    # None -> worktree.py default (<repo_root>/.var/devin-orchestrator/worktrees).
+    # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
     worktrees_dir: str | None = None
     # Relative to the consumer repo root; junctioned into each worktree so
     # workers share one venv (operator decision 2026-07-01). None disables.

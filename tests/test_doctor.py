@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from devin_orchestrator.config import (
+from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
     CrossFamilyConfig,
@@ -11,9 +11,9 @@ from devin_orchestrator.config import (
     OrchestratorConfig,
     RuntimeConfig,
 )
-from devin_orchestrator.doctor import _check_name_matches, run_doctor, workflow_job_names
-from devin_orchestrator.paths import runtime_paths
-from devin_orchestrator.subprocess_runner import RunResult
+from charlie_work.doctor import _check_name_matches, run_doctor, workflow_job_names
+from charlie_work.paths import runtime_paths
+from charlie_work.subprocess_runner import RunResult
 
 
 class FakeDoctorGitHub:
@@ -126,7 +126,7 @@ def test_doctor_flags_missing_prompts_dir_and_template(tmp_path: Path) -> None:
 
 def test_doctor_cross_family_missing_binary_is_warning(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "devin_orchestrator.doctor.shutil.which",
+        "charlie_work.doctor.shutil.which",
         lambda name: None if name == "devin" else f"C:/fake/{name}",
     )
     config = _config(
@@ -184,7 +184,7 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
         },
     )
     monkeypatch.setattr(
-        "devin_orchestrator.devin_shell.probe_devin",
+        "charlie_work.devin_shell.probe_devin",
         lambda repo_root, **kwargs: RunResult(returncode=0, stdout="devin 1.2.3", stderr=""),
     )
 
@@ -210,7 +210,7 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
 
 def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "devin_orchestrator.devin_shell.probe_devin",
+        "charlie_work.devin_shell.probe_devin",
         lambda repo_root, **kwargs: RunResult(
             returncode=None, stdout="", stderr="", error="devin: not found"
         ),
@@ -234,7 +234,7 @@ def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkey
 
 def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "devin_orchestrator.claude_code.probe_claude",
+        "charlie_work.claude_code.probe_claude",
         lambda repo_root, **kwargs: RunResult(returncode=0, stdout="claude 2.0", stderr=""),
     )
     config = _config(

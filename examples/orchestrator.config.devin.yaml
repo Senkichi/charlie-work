@@ -1,4 +1,4 @@
-# devin-orchestrator config — Devin-workers profile (the default runtime).
+# charlie-work config — Devin-workers profile (the default runtime).
 # Copy to your repo root as `orchestrator.config.yaml` and adjust.
 
 labels:
@@ -29,7 +29,7 @@ auto_merge:
   require_approved_review: true
   # MUST match the check-run names GitHub reports for your CI
   # (see the job `name:` fields in .github/workflows/*.yml).
-  # `devin-orch doctor` verifies these against your workflows.
+  # `charlie doctor` verifies these against your workflows.
   required_checks:
     - Tests passed
     - Lint & Format
@@ -37,7 +37,7 @@ auto_merge:
   allow_auto_merge_when_pending: false
 
 runtime:
-  state_dir: .var/devin-orchestrator
+  state_dir: .var/charlie-work
   # Optional repo-local template dir; files here override the package
   # templates by filename (e.g. drop in your own worker.md).
   # prompts_dir: orchestrator-prompts
@@ -45,13 +45,13 @@ runtime:
 devin:
   # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,
   # with sidecar JSON + per-session logs under sessions_dir. Verify with
-  # `devin-orch doctor --adapter-probe` before the first wave.
+  # `charlie doctor --adapter-probe` before the first wave.
   # Fall back to `adapter: manual` (operator pastes prompts from the session
   # manifest) if the devin CLI is unavailable on this machine.
   adapter: devin-shell
-  session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
-  session_results: .var/devin-orchestrator/dispatches/session-results.json
-  sessions_dir: .var/devin-orchestrator/dispatches/sessions
+  session_manifest: .var/charlie-work/dispatches/session-manifest.json
+  session_results: .var/charlie-work/dispatches/session-results.json
+  sessions_dir: .var/charlie-work/dispatches/sessions
   # Launch command; empty uses the built-in default shown here. Placeholders:
   # {prompt_path} {issue_number} {branch}. A list runs without a shell.
   # shell_command: [devin, --prompt-file, "{prompt_path}", --print]
@@ -60,7 +60,7 @@ devin:
 
 cross_family:
   # Auto adversarial pass by a NON-Claude model (codex via the Devin CLI) on
-  # every non-draft PR `review` and on-demand `spec-review`. Findings are
+  # every non-draft PR `why-charlie-hate` and on-demand `why-charlie-hate-spec`. Findings are
   # LEADS, not verdicts (the model over-escalates severity) and never gate a
   # merge. Set `enabled: false` (or delete this block) to revert to
   # Claude-only review.

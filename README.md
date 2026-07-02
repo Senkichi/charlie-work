@@ -1,4 +1,4 @@
-# devin-orchestrator
+# charlie-work
 
 Deterministic GitHub-issue orchestration for AI worker fleets. One labeled
 issue → one worker session → one PR → adversarial review → gated auto-merge.
@@ -7,6 +7,10 @@ Devin workers by default; Claude Code workers first-class.
 Extracted from the battle-tested orchestrators that ran inside
 [job-cannon](../job-cannon) and [empericus](../empericus) — this repo is the
 union of both forks plus the fixes each learned separately.
+
+> The name is a nod to *It's Always Sunny in Philadelphia*: "charlie work" is
+> the thankless, unglamorous grunt labor nobody else wants to do. Which is
+> exactly what this tool takes off your hands.
 
 ## How it works
 
@@ -23,9 +27,9 @@ union of both forks plus the fixes each learned separately.
                                                                   (best-effort)
 ```
 
-- **Hub**: a deterministic Python CLI (`devin-orch`). No chat memory, no
+- **Hub**: a deterministic Python CLI (`charlie`). No chat memory, no
   LLM-driven control flow — state lives in GitHub labels plus a JSON state
-  file under `.var/devin-orchestrator/`.
+  file under `.var/charlie-work/`.
 - **Workers**: hermetic one-shot sessions, each bound to exactly one issue,
   driven by a generated `worker-prompt.md`.
 - **Review**: a deterministic **janitor gate** runs first (draft/conflict/red-CI/
@@ -36,36 +40,70 @@ union of both forks plus the fixes each learned separately.
 - **Merge**: gated on required CI checks + a recorded `approved` decision.
   Branch deletion is remote-only and best-effort — it can never abort the
   merge/label sequence.
-- **Reconcile**: `devin-orch reconcile` detects drift when humans act outside
+- **Reconcile**: `charlie mop-up` detects drift when humans act outside
   the orchestrator (a PR merged by hand leaving stale labels) — read-only by
   default, `--fix` to repair.
 
 ## Quickstart
 
+`charlie-work` is a standalone dev tool with its own environment — it is **not**
+a dependency of the repos it operates on. Clone it as a sibling of your consumer
+repo and run it against that repo with `--repo`:
+
 ```powershell
-# in this repo
+# one-time: set up this tool's own environment
 uv sync
 
-# in your consumer repo's pyproject.toml
-# [tool.uv.sources]
-# devin-orchestrator = { path = "../devin-orchestrator", editable = true }
+# operate on a consumer repo by running charlie-work's own uv project against it:
+#   --project selects charlie-work's env · --directory sets cwd · --repo is the target
+uv run --project ../charlie-work --directory ../job-cannon charlie --repo ../job-cannon roll-call
 
-# copy an example config to your repo root and adjust
-cp ../devin-orchestrator/examples/orchestrator.config.devin.yaml orchestrator.config.yaml
-
-devin-orch doctor              # preflight: env, labels, CI-check names, config
-devin-orch doctor --adapter-probe   # also probe the worker CLI + surface stale sessions
-devin-orch bootstrap-labels    # create the agent:* labels once
-devin-orch status --json       # what is ready / active / linked
-devin-orch dispatch --limit 3  # newest-first wave
-devin-orch dispatch --issues 565,570   # dependency-ordered wave
-devin-orch review --pr 123     # janitor gate → adversarial review packet
-devin-orch record-review --pr 123 --decision approved --summary-file review.md
-devin-orch merge-ready --pr 123
-devin-orch loop --limit 3      # intake + dispatch + review + merge in one pass
-devin-orch spec-review --file docs/SPEC.md   # cross-family pass on a design doc
-devin-orch reconcile           # detect label/state drift (--fix to repair)
+# copy an example config to the CONSUMER repo's root and adjust it there
+cp examples/orchestrator.config.devin.yaml ../job-cannon/orchestrator.config.yaml
 ```
+
+Most consumers wrap that invocation in a one-line script, so day-to-day use is
+just `charlie <command>`:
+
+```powershell
+charlie doctor              # preflight: env, labels, CI-check names, config
+charlie doctor --adapter-probe   # also probe the worker CLI + surface stale sessions
+charlie bootstrap-labels    # create the agent:* labels once
+charlie roll-call --json    # what is ready / active / linked
+charlie work --limit 3      # newest-first dispatch wave
+charlie work --issues 565,570   # dependency-ordered wave
+charlie why-charlie-hate --pr 123     # janitor gate → adversarial review packet
+charlie verdict --pr 123 --decision approved --summary-file review.md
+charlie ship-it --pr 123
+charlie bash-rats --limit 3      # intake → dispatch → review → merge in one pass
+charlie why-charlie-hate-spec --file docs/SPEC.md   # cross-family pass on a design doc
+charlie mop-up              # detect label/state drift (--fix to repair)
+```
+
+> **Why not an editable path dependency?** Because it breaks consumer CI: a
+> locked `uv sync --all-extras` would try to install `../charlie-work`, which CI
+> runners never check out. Running it as an external tool (above) leaves the
+> consumer's dependency graph and lockfile completely untouched.
+
+## Commands
+
+Every command runs deterministically and is safe to re-run — state lives in
+GitHub, not in the CLI. The verbs are themed; the mechanics are boringly
+predictable.
+
+| Command | What it does |
+|---|---|
+| `charlie roll-call` | show what's ready / active / linked (the `status` view) |
+| `charlie intake` | label eligible open issues `automated-ready` |
+| `charlie work` | dispatch a newest-first wave of one-issue worker sessions |
+| `charlie why-charlie-hate` | janitor gate + adversarial review packet for a PR |
+| `charlie why-charlie-hate-spec` | cross-family adversarial pass on a design doc |
+| `charlie verdict` | record a review decision (`approved` / `request_changes` / `blocked`) |
+| `charlie ship-it` | merge a PR once it's approved and required checks are green |
+| `charlie bash-rats` | run the whole cycle (intake → work → review → merge) until the queue's dry |
+| `charlie mop-up` | detect (and with `--fix`, repair) label/state drift |
+| `charlie doctor` | preflight diagnostics (env, labels, CI-check names, config, adapter) |
+| `charlie bootstrap-labels` | create the nine `agent:*` / `automated-ready` labels once |
 
 ## Configuration
 
@@ -91,11 +129,11 @@ the operator to paste; `command` runs a blocking per-issue launcher;
 `devin-shell` launches headless `devin --print` sessions non-blocking with
 sidecar tracking; `claude-code` launches `claude -p` workers in isolated git
 worktrees (shared venv junctioned in — teardown is junction-safe). Probe the
-configured adapter with `devin-orch doctor --adapter-probe`.
+configured adapter with `charlie doctor --adapter-probe`.
 
 ## Prompt templates
 
-Package defaults live in `src/devin_orchestrator/prompts/`. A repo-local
+Package defaults live in `src/charlie_work/prompts/`. A repo-local
 directory (`runtime.prompts_dir`) overrides them **by filename** — drop in
 your own `worker.md` carrying your repo's invariants and canonical commands,
 and everything else keeps the defaults. `worker.md` targets Devin sessions;
@@ -107,7 +145,7 @@ too, so a shared change lands in one place instead of drifting across forks.
 
 ## State
 
-`.var/devin-orchestrator/` in the consumer repo holds `state.json`
+`.var/charlie-work/` in the consumer repo holds `state.json`
 (issues/prs/events, schema v1 — compatible with pre-extraction state), the
 per-issue worker prompts, per-PR review packets and decisions, and the
 session dispatch manifest/results. All JSON writes are atomic
@@ -116,6 +154,6 @@ session dispatch manifest/results. All JSON writes are atomic
 ## Provenance
 
 Unioned from two production forks (June–July 2026): job-cannon contributed
-cross-family review and `spec-review`; empericus contributed `--issues` wave
+cross-family review and `why-charlie-hate-spec`; empericus contributed `--issues` wave
 dispatch, the `gh pr merge` stdout fix, and the worktree/branch-deletion
 failure report that drove the decoupled merge sequence.

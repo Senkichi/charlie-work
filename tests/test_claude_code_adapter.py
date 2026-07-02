@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from devin_orchestrator import claude_code
-from devin_orchestrator.claude_code import (
+from charlie_work import claude_code
+from charlie_work.claude_code import (
     ClaudeWorkerRecord,
     launch_claude_worker,
     probe_claude,
     read_worker_records,
 )
-from devin_orchestrator.worktree import WorktreeInfo
+from charlie_work.worktree import WorktreeInfo
 
 
 def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
@@ -343,7 +343,7 @@ def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     def fake_run_captured(command, *, cwd, timeout_seconds, shell=False):
         calls.append((command, cwd, timeout_seconds))
-        from devin_orchestrator.subprocess_runner import RunResult
+        from charlie_work.subprocess_runner import RunResult
 
         return RunResult(returncode=0, stdout="1.0.0", stderr="")
 

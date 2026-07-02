@@ -1,7 +1,7 @@
 """Load-bearing regression tests: production state.json shapes must survive.
 
 The fixture `tests/fixtures/state_production_redacted.json` is a redacted copy of a
-real job-cannon `.var/devin-orchestrator/state.json` (titles/bodies/URLs/paths
+real job-cannon `.var/charlie-work/state.json` (titles/bodies/URLs/paths
 scrubbed; numbers, statuses, event kinds, and timestamps kept verbatim — see
 docs/design/extraction-dossier.md section 3 "De facto state.json schema"). These
 tests prove the extracted `state.py` module can round-trip a file written by the
@@ -14,7 +14,7 @@ import json
 import shutil
 from pathlib import Path
 
-from devin_orchestrator.state import append_event, empty_state, load_state, save_state
+from charlie_work.state import append_event, empty_state, load_state, save_state
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "state_production_redacted.json"
 

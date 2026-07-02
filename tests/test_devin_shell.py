@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from devin_orchestrator.devin_shell import (
+from charlie_work.devin_shell import (
     SessionRecord,
     is_session_alive,
     launch_devin_session,
@@ -16,7 +16,7 @@ from devin_orchestrator.devin_shell import (
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
 # sys.executable to dodge PATH entirely (mirrors the sys.executable fake-binary
-# pattern in tests/test_devin_orchestrator.py).
+# pattern in tests/test_charlie_work.py).
 _FAKE_DEVIN_SLEEP = """
 import sys, time
 sys.stdout.write("fake-devin argv=" + " ".join(sys.argv[1:]) + "\\n")

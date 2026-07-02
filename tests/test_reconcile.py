@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from devin_orchestrator.config import OrchestratorConfig
-from devin_orchestrator.reconcile import DriftItem, apply_fixes, detect_drift
-from devin_orchestrator.state import empty_state
+from charlie_work.config import OrchestratorConfig
+from charlie_work.reconcile import DriftItem, apply_fixes, detect_drift
+from charlie_work.state import empty_state
 
 
 class FakeGitHub:

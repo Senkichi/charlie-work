@@ -2,10 +2,10 @@
 
 ## Hub-and-spoke model
 
-`devin-orch` is a **deterministic Python hub**. It has no chat memory and no
+`charlie` is a **deterministic Python hub**. It has no chat memory and no
 LLM-driven control flow of its own — every decision it makes (what to
 dispatch, what to merge, what to escalate) is a pure function of GitHub state
-(issues, PRs, labels, checks) and the local `.var/devin-orchestrator/` state
+(issues, PRs, labels, checks) and the local `.var/charlie-work/` state
 tree. The hub never "thinks"; it renders prompts, shells out to `gh`/worker
 CLIs, and records outcomes.
 
@@ -21,7 +21,7 @@ boring and auditable.
 **GitHub labels are the durable state machine.** An issue's `agent:*` labels
 *are* its state — not a cache of it. This means the true state survives an
 orchestrator crash, a machine reboot, or a switch to a different operator's
-laptop: `devin-orch status` reconstructs everything by re-querying GitHub.
+laptop: `charlie roll-call` reconstructs everything by re-querying GitHub.
 The local `state.json` is a derived event log and convenience cache (recent
 runs, artifact paths, cross-family reuse), never the source of truth for
 "what state is this issue in."
@@ -46,8 +46,8 @@ should not need to be read to reason about it.
 
 | Module | Responsibility |
 |---|---|
-| `__init__.py` | Package version and `CLI_NAME` (`devin-orch`) constant. |
-| `cli.py` | `argparse` surface: parses `devin-orch <command>` invocations, builds `OrchestratorApp`, and prints `CommandResult` as text or `--json`. No business logic. |
+| `__init__.py` | Package version and `CLI_NAME` (`charlie`) constant. |
+| `cli.py` | `argparse` surface: parses `charlie <command>` invocations, builds `OrchestratorApp`, and prints `CommandResult` as text or `--json`. No business logic. |
 | `config.py` | Frozen dataclasses (`LabelConfig`, `DispatchConfig`, `ReviewConfig`, `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `CrossFamilyConfig`) plus `load_config`/`find_config_path`. Absent `orchestrator.config.yaml` → pure dataclass defaults. |
 | `workflow.py` | `OrchestratorApp` — the orchestration engine: `status`, `bootstrap_labels`, `intake`, `dispatch`, `review`, `record_review`, `merge_ready`, `spec_review`, `loop`. Owns every multi-step business rule (merge-update-not-replace, rework cap, merge/label/branch-delete ordering). |
 | `github.py` | `GitHub` — every `gh` CLI invocation, JSON parsing, and the `dry_run` mutating-call guard. Also `label_names()` and `linked_issue_number()` helpers used across the codebase to read label/issue-link state from raw `gh` JSON. |
@@ -64,7 +64,7 @@ should not need to be read to reason about it.
 | `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()`, `is_session_alive()` (Windows liveness via ctypes `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on Windows; `os.kill` on POSIX), and `probe_devin()` (for `doctor --adapter-probe`) round out the module. Selected by `devin.adapter: devin-shell`. |
 | `claude_code.py` | Worktree-isolated Claude Code workers: `launch_claude_worker()` composes `worktree.create_worktree()` with a headless `claude -p` `Popen` launch, writing a `.claude.json` sidecar per issue (field names mirror `devin_shell`'s sidecar so downstream code can treat both worker kinds uniformly). Best-effort worktree cleanup on a failed launch. `read_worker_records()` and `probe_claude()` mirror the `devin_shell` helpers. Selected by `devin.adapter: claude-code`. |
 | `janitor.py` | Deterministic, non-LLM pre-review gate: `run_janitor(pr, checks, config)` returns a `JanitorVerdict` (pass/fail + warnings) by checking draft state, PR/mergeable state, required-checks status, linked-issue presence, non-empty body with a tests/rationale mention, conventional-commit-shaped title (warning only), and oversized-diff size (warning only). Pure function — no I/O, no `gh` calls; the caller feeds it data it already fetched. `review()` calls it **before** any packet or cross-family spend and short-circuits a failing PR to `janitor_blocked`. |
-| `reconcile.py` | Drift detection between GitHub's actual state and the orchestrator's recorded state — e.g. a PR merged outside `merge_ready()` whose issue is still labeled `agent:in-progress`. `detect_drift()` is read-only (two `gh` list calls, zero mutations); `apply_fixes()` returns a *new* state and repairs labels via `labels.transition`. Surfaced as `devin-orch reconcile [--fix]` (read-only without `--fix`). |
+| `reconcile.py` | Drift detection between GitHub's actual state and the orchestrator's recorded state — e.g. a PR merged outside `merge_ready()` whose issue is still labeled `agent:in-progress`. `detect_drift()` is read-only (two `gh` list calls, zero mutations); `apply_fixes()` returns a *new* state and repairs labels via `labels.transition`. Surfaced as `charlie mop-up [--fix]` (read-only without `--fix`). |
 | `prompt_sections.py` | Shared worker-prompt partials: `section_variables(search_dirs)` discovers every `*.md` file under a `worker_sections/` directory (package default `prompts/worker_sections/`, e.g. `scope_contract.md`, `issue_metadata.md`) and exposes each as a `section_<stem>` template value — repo-local `<search_dir>/worker_sections/` wins over the package default per filename, mirroring `prompts.resolve_template`. No section names are hardcoded; the available set is whatever `*.md` files exist on disk. `render_prompt()` folds these in and runs a two-pass substitution so section text carrying its own `$placeholders` resolves. |
 
 ## Label state machine
@@ -76,23 +76,23 @@ all overridable in `orchestrator.config.yaml`'s `labels:` block).
 stateDiagram-v2
     [*] --> ready: operator adds automated-ready
 
-    ready --> queued: dispatch (event "queued")\nmanual adapter: manifest written
-    ready --> in_progress: dispatch (event "dispatched")\nnon-manual adapter: session launched
+    ready --> queued: work (event "queued")\nmanual adapter: manifest written
+    ready --> in_progress: work (event "dispatched")\nnon-manual adapter: session launched
 
-    queued --> pr_open: review (event "review_started")
-    in_progress --> pr_open: review (event "review_started")
+    queued --> pr_open: why-charlie-hate (event "review_started")
+    in_progress --> pr_open: why-charlie-hate (event "review_started")
 
-    pr_open --> reviewing: review (event "review_started", same transition)
+    pr_open --> reviewing: why-charlie-hate (event "review_started", same transition)
 
-    reviewing --> needs_rework: record-review request_changes,\nunder rework cap (event "rework_requested")
-    reviewing --> human_needed: record-review request_changes,\nrework cap exhausted (event "escalated")
+    reviewing --> needs_rework: verdict request_changes,\nunder rework cap (event "rework_requested")
+    reviewing --> human_needed: verdict request_changes,\nrework cap exhausted (event "escalated")
 
     needs_rework --> reviewing: review() re-run after rework push
 
-    reviewing --> done: merge-ready merges\n(event "merged")
+    reviewing --> done: ship-it merges\n(event "merged")
 
-    ready --> human_needed: record-review blocked (event "blocked")
-    reviewing --> human_needed: record-review blocked (event "blocked")
+    ready --> human_needed: verdict blocked (event "blocked")
+    reviewing --> human_needed: verdict blocked (event "blocked")
 
     done --> [*]
     human_needed --> [*]
@@ -133,7 +133,7 @@ or already resolved is never re-dispatched.
 ## `state.json` schema
 
 Located at `<state_dir>/state.json` (`state_dir` defaults to
-`.var/devin-orchestrator`, configurable via `runtime.state_dir`). Written by
+`.var/charlie-work`, configurable via `runtime.state_dir`). Written by
 `state.save_state()`: atomic (temp file + `Path.replace`), pretty-printed,
 sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
 
@@ -147,7 +147,7 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
       "title": "...",
       "url": "https://github.com/...",
       "labels": ["agent:in-progress", "automated-ready"],
-      "prompt_path": ".var/devin-orchestrator/issues/issue-565/worker-prompt.md",
+      "prompt_path": ".var/charlie-work/issues/issue-565/worker-prompt.md",
       "branch_name": "agent/issue-565-short-title",
       "status": "manifest_written",       // or "dispatched" | "dispatch_failed"
       "dispatched_at": "2026-07-02T18:00:00Z",
@@ -159,10 +159,10 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
       "number": 123,
       "url": "https://github.com/.../pull/123",
       "issue_number": 565,
-      "prompt_path": ".var/devin-orchestrator/prs/pr-123/review-prompt.md",
-      "decision_path": ".var/devin-orchestrator/prs/pr-123/review-decision.json",
+      "prompt_path": ".var/charlie-work/prs/pr-123/review-prompt.md",
+      "decision_path": ".var/charlie-work/prs/pr-123/review-decision.json",
       "status": "reviewing",
-      "cross_family_report": ".var/devin-orchestrator/prs/pr-123/cross-family-review.md",
+      "cross_family_report": ".var/charlie-work/prs/pr-123/cross-family-review.md",
       "cross_family_ok": true,
       "decision": "approved",              // set by record_review()
       // merge_ready() also folds in: can_merge, auto_merge_enabled, merged,
@@ -190,7 +190,7 @@ quarantines an unparseable file to `state.json.corrupt-<UTC-timestamp>`
 The per-issue/PR artifact tree alongside `state.json`:
 
 ```
-.var/devin-orchestrator/
+.var/charlie-work/
 ├── state.json
 ├── issues/issue-<n>/
 │   ├── issue.json              # gh issue view snapshot (intake)
@@ -202,9 +202,9 @@ The per-issue/PR artifact tree alongside `state.json`:
 │   ├── review-prompt.md        # rendered from prompts/review.md
 │   ├── review-decision.json    # the merge-gate authority (see below)
 │   ├── rework-prompt.md        # rendered on request_changes, under cap
-│   ├── review-comment.md       # written when record-review --comment
+│   ├── review-comment.md       # written when verdict --comment
 │   └── cross-family-review.md  # if cross_family enabled and PR non-draft
-├── cross-family/                # spec-review artifacts (prompt + report per slug)
+├── cross-family/                # why-charlie-hate-spec artifacts (prompt + report per slug)
 ├── dispatches/
 │   ├── session-manifest.json   # dispatch_sessions() write, every wave
 │   └── session-results.json    # per-request ok/error outcome
@@ -228,13 +228,13 @@ review packet generation (review())
    - transition("review_started") → agent:pr-open + agent:reviewing
         │
         ▼
-record-review (human or orchestrating agent decides)
+verdict (human or orchestrating agent decides)
    - approved            → merge_ready() eligible
    - request_changes     → rework cap check → rework_requested | escalated
    - blocked             → escalated (agent:human-needed)
         │
         ▼
-merge-ready
+ship-it
    - checks.summarize_checks() against auto_merge.required_checks
    - decision.decision == "approved" (or require_approved_review: false)
    - → merge, then labels, then best-effort branch delete
@@ -315,4 +315,4 @@ worker (`command`/`devin-shell`/`claude-code`) promote the issue to
 `agent:in-progress`; a launched worker is recorded in `state.json` **before**
 the label write, so a failed label call can never orphan it into a
 re-dispatchable state. Probe the configured adapter's CLI and surface
-stale/failed sessions with `devin-orch doctor --adapter-probe`.
+stale/failed sessions with `charlie doctor --adapter-probe`.

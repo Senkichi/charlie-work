@@ -1,6 +1,6 @@
 # Runbook
 
-Operational procedures for running `devin-orch` day to day. For the
+Operational procedures for running `charlie` day to day. For the
 architecture behind these procedures, see [ARCHITECTURE.md](ARCHITECTURE.md).
 For exact command sequences per worker adapter, see
 [WORKFLOWS.md](WORKFLOWS.md).
@@ -8,7 +8,7 @@ For exact command sequences per worker adapter, see
 ## Reading status and `state.json`
 
 ```powershell
-uv run devin-orch status --json
+uv run charlie roll-call --json
 ```
 
 `OrchestratorApp.status()` returns: `ready_issue_count` (open issues labeled
@@ -21,13 +21,13 @@ actually dispatchable — no active or terminal label already present),
 **`state.json` is a derived cache, not the source of truth** — GitHub labels
 are (see [ARCHITECTURE.md](ARCHITECTURE.md#hub-and-spoke-model)). If you
 suspect `state.json` has drifted from reality, trust `gh issue list --label
-agent:in-progress` / `gh pr list` over what's on disk; `status` itself
+agent:in-progress` / `gh pr list` over what's on disk; `roll-call` itself
 already re-queries GitHub live, it does not read state for its counts.
 
 Raw inspection:
 
 ```powershell
-Get-Content .var\devin-orchestrator\state.json | ConvertFrom-Json | Select-Object -ExpandProperty events | Select-Object -Last 20
+Get-Content .var\charlie-work\state.json | ConvertFrom-Json | Select-Object -ExpandProperty events | Select-Object -Last 20
 ```
 
 The `events` array (capped at the most recent 200 entries by
@@ -40,14 +40,14 @@ The `events` array (capped at the most recent 200 entries by
 | Label | Meaning | Set by |
 |---|---|---|
 | `automated-ready` | Operator-applied. Issue is eligible for automation. | Human, on GitHub. |
-| `agent:queued` | Manual adapter dispatch wrote a session manifest; no worker independently confirmed yet. | `dispatch` → event `queued`. |
-| `agent:in-progress` | A non-manual adapter actually launched a worker. | `dispatch` → event `dispatched`. |
-| `agent:pr-open` | A PR exists and `review()` has run against it at least once. | `review` → event `review_started`. |
-| `agent:reviewing` | Set alongside `agent:pr-open` in the same transition; distinguished for readability, not a separate state. | `review` → event `review_started`. |
-| `agent:needs-rework` | `record-review --decision request_changes`, under the rework cap. | `record-review` → event `rework_requested`. |
-| `agent:blocked` | `record-review --decision blocked` — a product/security decision is needed. | `record-review` → event `blocked`. |
-| `agent:done` | PR merged via `merge-ready`. Every `active` label is removed in the same transition. | `merge-ready` → event `merged`. |
-| `agent:human-needed` | Either `blocked`, or the rework cap was exhausted. Terminal — no further automation happens until a human clears it. | `record-review` → event `escalated` or `blocked`. |
+| `agent:queued` | Manual adapter dispatch wrote a session manifest; no worker independently confirmed yet. | `work` → event `queued`. |
+| `agent:in-progress` | A non-manual adapter actually launched a worker. | `work` → event `dispatched`. |
+| `agent:pr-open` | A PR exists and `review()` has run against it at least once. | `why-charlie-hate` → event `review_started`. |
+| `agent:reviewing` | Set alongside `agent:pr-open` in the same transition; distinguished for readability, not a separate state. | `why-charlie-hate` → event `review_started`. |
+| `agent:needs-rework` | `verdict --decision request_changes`, under the rework cap. | `verdict` → event `rework_requested`. |
+| `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
+| `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
+| `agent:human-needed` | Either `blocked`, or the rework cap was exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated` or `blocked`. |
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
@@ -66,7 +66,7 @@ internalizing operationally:
 ## Handling `agent:human-needed` escalations
 
 An issue lands on `agent:human-needed` for one of two reasons — check
-`review-decision.json` under `.var/devin-orchestrator/prs/pr-<n>/` to tell
+`review-decision.json` under `.var/charlie-work/prs/pr-<n>/` to tell
 which:
 
 1. **Explicit block** (`"decision": "blocked"`) — a reviewer decided a
@@ -84,15 +84,15 @@ which:
 product ambiguity, or manually push a fix to the PR branch yourself), then
 either:
 
-- Re-run `devin-orch record-review --pr <n> --decision approved
+- Re-run `charlie verdict --pr <n> --decision approved
   --summary-file <path>` once you've verified it's actually fixed, which
-  routes straight to `merge-ready` eligibility, or
+  routes straight to `ship-it` eligibility, or
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
-  `agent:needs-rework`) on GitHub and re-run `devin-orch review --pr <n>` to
+  `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
   regenerate a fresh packet before deciding again.
 
 There is no automatic un-escalation — a human decision, once escalated,
-requires a human (or an explicit re-`record-review`) to move the issue
+requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
 
 ## Corrupt-state quarantine recovery
@@ -107,17 +107,17 @@ returned and used for that run.
 starts fresh (empty `issues`/`prs`/`events`) — but nothing on GitHub was
 touched, and none of the per-issue/PR artifact files (`worker-prompt.md`,
 `review-decision.json`, etc.) are affected, since they live in separate
-files. `status` will still correctly show live GitHub state because it
+files. `roll-call` will still correctly show live GitHub state because it
 re-queries `gh`, not the (now-empty) cache. To recover the lost projections:
 
-1. Find the quarantined file: `Get-ChildItem .var\devin-orchestrator\state.json.corrupt-*`.
+1. Find the quarantined file: `Get-ChildItem .var\charlie-work\state.json.corrupt-*`.
 2. Inspect it for forensics (what was in flight, what the last few `events`
    entries were) — it's valid enough to eyeball even if it failed strict
    JSON parsing (truncation usually cuts off the tail).
 3. Do **not** delete it silently — it's your only record of the interrupted
    write. Move it aside for later analysis once you've extracted anything
    useful.
-4. Re-run `devin-orch intake` and `devin-orch status` to rebuild the
+4. Re-run `charlie intake` and `charlie roll-call` to rebuild the
    `issues`/`prs` projections from live GitHub + existing artifact files;
    `review-decision.json` files under `prs/pr-<n>/` are untouched and remain
    the merge-gate authority regardless of what's in `state.json`.
@@ -129,15 +129,15 @@ never got past the temp-file stage or a manually edited file.
 
 ## Reconcile for drift
 
-`devin-orch reconcile` detects drift between GitHub's actual state and the
+`charlie mop-up` detects drift between GitHub's actual state and the
 orchestrator's recorded labels/state — the concrete, observed gap being a PR
 merged outside `merge_ready()` (e.g. a human clicking "Merge" on GitHub
 directly) whose issue is still labeled `agent:in-progress` because the
 `merged` label transition never ran.
 
 ```powershell
-devin-orch reconcile          # read-only: reports every drift item, mutates nothing
-devin-orch reconcile --fix    # repairs labels/state for the detected drift
+charlie mop-up          # read-only: reports every drift item, mutates nothing
+charlie mop-up --fix    # repairs labels/state for the detected drift
 ```
 
 Without `--fix` it is strictly read-only (two `gh` list queries, zero
@@ -178,8 +178,8 @@ because they all point at the same target directory.
 
 ```powershell
 # WRONG — if <worktree>/.venv is a junction, this deletes the SHARED venv
-Remove-Item -Recurse -Force .var\devin-orchestrator\worktrees\agent-issue-565
-git worktree remove --force .var\devin-orchestrator\worktrees\agent-issue-565
+Remove-Item -Recurse -Force .var\charlie-work\worktrees\agent-issue-565
+git worktree remove --force .var\charlie-work\worktrees\agent-issue-565
 ```
 
 **Correct teardown order** (what `worktree.remove_worktree()` does

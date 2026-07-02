@@ -38,7 +38,7 @@ def _slugify(value: str, *, max_length: int = 80) -> str:
 
 
 def _default_worktrees_dir(repo_root: Path) -> Path:
-    return repo_root / ".var" / "devin-orchestrator" / "worktrees"
+    return repo_root / ".var" / "charlie-work" / "worktrees"
 
 
 def is_junction(path: Path) -> bool:

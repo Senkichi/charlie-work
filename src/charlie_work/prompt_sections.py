@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from devin_orchestrator.prompts import TEMPLATE_DIR
+from charlie_work.prompts import TEMPLATE_DIR
 
 WORKER_SECTIONS_DIRNAME = "worker_sections"
 

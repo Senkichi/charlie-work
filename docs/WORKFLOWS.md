@@ -6,7 +6,7 @@ procedures, see [RUNBOOK.md](RUNBOOK.md).
 
 All commands below assume you're in the consumer repo root with
 `orchestrator.config.yaml` present (or accept the dataclass defaults) and
-`devin-orch` resolved via `uv run devin-orch ...` (or a bare `devin-orch` if
+`charlie` resolved via `uv run charlie ...` (or a bare `charlie` if
 the venv is activated). Add `--json` for machine-readable output and
 `--dry-run` to suppress mutating `gh` calls (see the scope caveat in
 [QUICKSTART.md](QUICKSTART.md#5-first-cycle-intake--dispatch--review--merge)).
@@ -19,49 +19,49 @@ prompt into a Devin session by hand.
 
 ```powershell
 # 1. Preflight once per session
-devin-orch doctor
+charlie doctor
 
 # 2. See what's ready
-devin-orch status --json
+charlie roll-call --json
 
 # 3. Write worker prompts + issue snapshots for every automated-ready issue
-devin-orch intake
+charlie intake
 
 # 4. Select and "dispatch" a wave — writes session-manifest.json and
 #    worker-prompt.md per issue, labels agent:queued (manual adapter
 #    never promotes straight to agent:in-progress — see
 #    ARCHITECTURE.md#invariants)
-devin-orch dispatch --limit 3
+charlie work --limit 3
 
-# 5. Open .var/devin-orchestrator/dispatches/session-manifest.json.
+# 5. Open .var/charlie-work/dispatches/session-manifest.json.
 #    For each session listed, open a Devin session and paste in the
 #    contents of that issue's worker-prompt.md
-#    (.var/devin-orchestrator/issues/issue-<n>/worker-prompt.md).
+#    (.var/charlie-work/issues/issue-<n>/worker-prompt.md).
 
 # 6. ...worker works, opens a PR referencing the issue...
 
 # 7. Generate the adversarial review packet
-devin-orch review --pr 123
+charlie why-charlie-hate --pr 123
 
-# 8. Read .var/devin-orchestrator/prs/pr-123/review-prompt.md (and the
+# 8. Read .var/charlie-work/prs/pr-123/review-prompt.md (and the
 #    cross-family report if cross_family.enabled), do the adversarial
 #    review yourself (or via an orchestrating Claude session using
 #    prompts/orchestrator.md as its operating brief), write a summary,
 #    then record the decision
-devin-orch record-review --pr 123 --decision approved --summary-file review.md
+charlie verdict --pr 123 --decision approved --summary-file review.md
 #    or:
-devin-orch record-review --pr 123 --decision request_changes --summary-file review.md --comment
-devin-orch record-review --pr 123 --decision blocked --summary-file review.md
+charlie verdict --pr 123 --decision request_changes --summary-file review.md --comment
+charlie verdict --pr 123 --decision blocked --summary-file review.md
 
 # 9. Merge once approved and required checks are green
-devin-orch merge-ready --pr 123
+charlie ship-it --pr 123
 ```
 
 For explicit dependency-ordered dispatch (foundations before leaves) instead
 of the newest-first heuristic:
 
 ```powershell
-devin-orch dispatch --issues 565,570,572
+charlie work --issues 565,570,572
 ```
 
 Numbers that aren't currently dispatchable (already active, terminal, or
@@ -73,7 +73,7 @@ To run intake + dispatch + review + conditional-merge in one pass (steps
 3, 4, 7-9 collapsed, looping over every open linked PR):
 
 ```powershell
-devin-orch loop --limit 3
+charlie bash-rats --limit 3
 ```
 
 ## (b) Devin shell adapter loop
@@ -88,26 +88,26 @@ blocking on the worker.
 ```powershell
 # 1. Preflight, confirm the devin CLI itself is reachable. --adapter-probe
 #    runs devin_shell.probe_devin() and surfaces stale/failed sessions.
-devin-orch doctor --adapter-probe
+charlie doctor --adapter-probe
 
 # 2-3. Same as the manual loop: status, intake
-devin-orch status --json
-devin-orch intake
+charlie roll-call --json
+charlie intake
 
 # 4. Dispatch launches a `devin --print` process per selected issue (instead
 #    of only writing a manifest) and labels agent:in-progress immediately —
 #    a real worker was launched, not just a manifest written
-devin-orch dispatch --limit 3
+charlie work --limit 3
 
 # 5. Poll for liveness/completion instead of pasting anything by hand.
-#    `devin-orch doctor --adapter-probe` reports failed/exited sessions, or
+#    `charlie doctor --adapter-probe` reports failed/exited sessions, or
 #    read the sidecars directly:
-python -c "from pathlib import Path; from devin_orchestrator.devin_shell import read_session_records, is_session_alive; recs = read_session_records(Path('.var/devin-orchestrator/dispatches/sessions')); [print(r.issue_number, is_session_alive(r)) for r in recs]"
+python -c "from pathlib import Path; from charlie_work.devin_shell import read_session_records, is_session_alive; recs = read_session_records(Path('.var/charlie-work/dispatches/sessions')); [print(r.issue_number, is_session_alive(r)) for r in recs]"
 
-# 6-9. Same review/record-review/merge-ready sequence as the manual loop
-devin-orch review --pr 123
-devin-orch record-review --pr 123 --decision approved --summary-file review.md
-devin-orch merge-ready --pr 123
+# 6-9. Same why-charlie-hate/verdict/ship-it sequence as the manual loop
+charlie why-charlie-hate --pr 123
+charlie verdict --pr 123 --decision approved --summary-file review.md
+charlie ship-it --pr 123
 ```
 
 Respect the documented single-threaded SQLite-contention ceiling on the
@@ -130,27 +130,27 @@ permissions/hooks for free — no separate config plumbing needed for that.
 ```powershell
 # 1. Preflight — with claude-code.yaml as your config, worker_template is
 #    already worker_claude_code.md. --adapter-probe runs claude_code.probe_claude().
-Copy-Item ..\devin-orchestrator\examples\orchestrator.config.claude-code.yaml orchestrator.config.yaml
-devin-orch doctor --adapter-probe
+Copy-Item ..\charlie-work\examples\orchestrator.config.claude-code.yaml orchestrator.config.yaml
+charlie doctor --adapter-probe
 
 # 2-3. status, intake — identical to the other two loops
-devin-orch status --json
-devin-orch intake
+charlie roll-call --json
+charlie intake
 
 # 4. Dispatch creates one worktree + one headless claude -p process per
 #    selected issue, writes an issue-<n>.claude.json sidecar, and labels
 #    agent:in-progress on a confirmed launch
-devin-orch dispatch --limit 3
+charlie work --limit 3
 
 # 5. Worker runs inside its own worktree, opens a PR referencing the issue,
 #    the orchestrator's dispatch loop or a periodic status check picks up
 #    completion via the PR appearing on GitHub (there is no session-status
 #    API for claude -p any more than for devin --print)
 
-# 6-8. Same review/record-review/merge-ready sequence
-devin-orch review --pr 123
-devin-orch record-review --pr 123 --decision approved --summary-file review.md
-devin-orch merge-ready --pr 123
+# 6-8. Same why-charlie-hate/verdict/ship-it sequence
+charlie why-charlie-hate --pr 123
+charlie verdict --pr 123 --decision approved --summary-file review.md
+charlie ship-it --pr 123
 ```
 
 **Worktree cleanup after the PR merges or is abandoned** must go through
@@ -173,17 +173,17 @@ Enabled by config (`cross_family.enabled: true`, as in
 `review()` for every non-draft PR:
 
 ```powershell
-devin-orch review --pr 123
+charlie why-charlie-hate --pr 123
 # cross-family-review.md is written to
-# .var/devin-orchestrator/prs/pr-123/cross-family-review.md
+# .var/charlie-work/prs/pr-123/cross-family-review.md
 # and its section is folded into review-prompt.md automatically
 ```
 
 Or override per-call regardless of config default:
 
 ```powershell
-devin-orch review --pr 123 --cross-family      # force on
-devin-orch review --pr 123 --no-cross-family   # force off
+charlie why-charlie-hate --pr 123 --cross-family      # force on
+charlie why-charlie-hate --pr 123 --no-cross-family   # force off
 ```
 
 A non-empty successful report is **reused** on repeated `review()`/`loop()`
@@ -198,11 +198,11 @@ independent of `cross_family.enabled` (that flag only governs the automatic
 PR-review path) and always runs when invoked:
 
 ```powershell
-devin-orch spec-review --file docs/SPEC.md
+charlie why-charlie-hate-spec --file docs/SPEC.md
 ```
 
 Writes `spec-<slug>-prompt.md` and `spec-<slug>-review.md` under
-`.var/devin-orchestrator/cross-family/`, using the same non-Claude model
+`.var/charlie-work/cross-family/`, using the same non-Claude model
 configured under `cross_family.*`. Use this before committing to an
 implementation plan, the same way you'd request a second opinion on a
 design doc from a different reviewer.

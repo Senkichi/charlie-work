@@ -1,4 +1,4 @@
-# devin-orchestrator config — Claude-Code-workers profile.
+# charlie-work config — Claude-Code-workers profile.
 # Copy to your repo root as `orchestrator.config.yaml` and adjust.
 
 labels:
@@ -27,14 +27,14 @@ auto_merge:
   require_approved_review: true
   # MUST match the check-run names GitHub reports for your CI
   # (see the job `name:` fields in .github/workflows/*.yml).
-  # `devin-orch doctor` verifies these against your workflows.
+  # `charlie doctor` verifies these against your workflows.
   required_checks:
     - Test
     - "Lint, Types & Pre-commit"
   allow_auto_merge_when_pending: false
 
 runtime:
-  state_dir: .var/devin-orchestrator
+  state_dir: .var/charlie-work
   # Repo-local templates override package templates by filename. Point this at
   # a tracked dir holding your specialized worker prompt (repo invariants,
   # canonical commands) — see the empericus setup for the pattern.
@@ -42,19 +42,19 @@ runtime:
 
 devin:
   # claude-code launches each worker headless in an isolated git worktree with
-  # the shared venv junctioned in. Verify with `devin-orch doctor
+  # the shared venv junctioned in. Verify with `charlie doctor
   # --adapter-probe`. Fall back to `adapter: manual` to paste prompts by hand.
   adapter: claude-code
-  session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
-  session_results: .var/devin-orchestrator/dispatches/session-results.json
-  sessions_dir: .var/devin-orchestrator/dispatches/sessions
+  session_manifest: .var/charlie-work/dispatches/session-manifest.json
+  session_results: .var/charlie-work/dispatches/session-results.json
+  sessions_dir: .var/charlie-work/dispatches/sessions
 
 claude_code:
   # Launch command; empty uses the built-in default shown here. The rendered
   # worker prompt is fed via stdin unless the command names {prompt_path}.
   # command: [claude, -p, --permission-mode, acceptEdits]
-  # Worktrees live under .var/devin-orchestrator/worktrees unless overridden.
-  # worktrees_dir: .var/devin-orchestrator/worktrees
+  # Worktrees live under .var/charlie-work/worktrees unless overridden.
+  # worktrees_dir: .var/charlie-work/worktrees
   # Junctioned into each worktree so workers share one venv. NEVER remove a
   # worktree before its .venv junction is deleted (remove_worktree handles
   # the ordering). Set to null to disable venv sharing.
