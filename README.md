@@ -28,13 +28,17 @@ union of both forks plus the fixes each learned separately.
   file under `.var/devin-orchestrator/`.
 - **Workers**: hermetic one-shot sessions, each bound to exactly one issue,
   driven by a generated `worker-prompt.md`.
-- **Review**: the orchestrator generates an adversarial review packet per PR
-  (diff, checks, metadata) and optionally runs a **cross-family pass** — a
-  non-Claude model (codex via the Devin CLI) attacks the PR; its findings are
-  leads, never merge gates.
+- **Review**: a deterministic **janitor gate** runs first (draft/conflict/red-CI/
+  no-issue-link checks) and short-circuits obviously-not-ready PRs before any
+  LLM spend. PRs that pass get an adversarial review packet (diff, checks,
+  metadata) and optionally a **cross-family pass** — a non-Claude model (codex
+  via the Devin CLI) attacks the PR; its findings are leads, never merge gates.
 - **Merge**: gated on required CI checks + a recorded `approved` decision.
   Branch deletion is remote-only and best-effort — it can never abort the
   merge/label sequence.
+- **Reconcile**: `devin-orch reconcile` detects drift when humans act outside
+  the orchestrator (a PR merged by hand leaving stale labels) — read-only by
+  default, `--fix` to repair.
 
 ## Quickstart
 
@@ -50,15 +54,17 @@ uv sync
 cp ../devin-orchestrator/examples/orchestrator.config.devin.yaml orchestrator.config.yaml
 
 devin-orch doctor              # preflight: env, labels, CI-check names, config
+devin-orch doctor --adapter-probe   # also probe the worker CLI + surface stale sessions
 devin-orch bootstrap-labels    # create the agent:* labels once
 devin-orch status --json       # what is ready / active / linked
 devin-orch dispatch --limit 3  # newest-first wave
 devin-orch dispatch --issues 565,570   # dependency-ordered wave
-devin-orch review --pr 123     # generate adversarial review packet
+devin-orch review --pr 123     # janitor gate → adversarial review packet
 devin-orch record-review --pr 123 --decision approved --summary-file review.md
 devin-orch merge-ready --pr 123
 devin-orch loop --limit 3      # intake + dispatch + review + merge in one pass
 devin-orch spec-review --file docs/SPEC.md   # cross-family pass on a design doc
+devin-orch reconcile           # detect label/state drift (--fix to repair)
 ```
 
 ## Configuration
@@ -73,10 +79,19 @@ the two shipped profiles:
 | `orchestrator.config.claude-code.yaml` | Claude Code | direct-shell worker loop, Claude-only review |
 
 Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
-`branch_prefix` / `worker_template`, `review.max_rework_cycles`,
+`branch_prefix` / `worker_template`, `review.max_rework_cycles` (past this many
+`request_changes` cycles a PR escalates to `agent:human-needed`),
 `auto_merge.required_checks` (verify with `doctor`), `runtime.prompts_dir`
-(repo-local template overrides), `devin.adapter` (`manual` | `command`),
-`cross_family.*` (non-Claude adversarial pass).
+(repo-local template overrides), `devin.adapter` (`manual` | `command` |
+`devin-shell` | `claude-code`), `claude_code.*` (worktree/venv settings for the
+claude-code adapter), `cross_family.*` (non-Claude adversarial pass).
+
+**Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
+the operator to paste; `command` runs a blocking per-issue launcher;
+`devin-shell` launches headless `devin --print` sessions non-blocking with
+sidecar tracking; `claude-code` launches `claude -p` workers in isolated git
+worktrees (shared venv junctioned in — teardown is junction-safe). Probe the
+configured adapter with `devin-orch doctor --adapter-probe`.
 
 ## Prompt templates
 
@@ -85,7 +100,10 @@ directory (`runtime.prompts_dir`) overrides them **by filename** — drop in
 your own `worker.md` carrying your repo's invariants and canonical commands,
 and everything else keeps the defaults. `worker.md` targets Devin sessions;
 `worker_claude_code.md` targets Claude Code workers
-(`dispatch.worker_template` selects).
+(`dispatch.worker_template` selects). Blocks shared by both worker templates
+live as partials under `prompts/worker_sections/` and render as
+`$section_<stem>` — repo-local `worker_sections/` dirs override by filename
+too, so a shared change lands in one place instead of drifting across forks.
 
 ## State
 

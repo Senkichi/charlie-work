@@ -6,3 +6,6 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .var/
+.coverage
+coverage.xml
+htmlcov/
