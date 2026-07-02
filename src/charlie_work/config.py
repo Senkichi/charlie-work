@@ -121,6 +121,15 @@ class ClaudeCodeConfig:
     # Relative to the consumer repo root; junctioned into each worktree so
     # workers share one venv (operator decision 2026-07-01). None disables.
     venv_source: str | None = ".venv"
+    # Extra environment variables merged over the orchestrator's env in every
+    # worker's launch process. Primary use: bound local test parallelism on a
+    # shared host — set PYTEST_XDIST_AUTO_NUM_WORKERS to cap `pytest -n auto` at
+    # the launch boundary (so K concurrent workers stay near one xdist worker
+    # per core instead of oversubscribing into swap) WITHOUT editing the suite's
+    # pyproject addopts — CI never sees this var, so it keeps full parallelism.
+    # See docs/RUNBOOK.md "Local host saturation ceiling (claude-code adapter)".
+    # A non-mapping value is rejected with ConfigError at load; values -> str.
+    worker_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -208,6 +217,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     claude_command = claude_code_data.get("command")
     if isinstance(claude_command, list):
         claude_code_data["command"] = tuple(str(item) for item in claude_command)
+    worker_env = claude_code_data.get("worker_env")
+    if worker_env is not None:
+        if not isinstance(worker_env, dict):
+            raise ConfigError(
+                "config section 'claude_code' key 'worker_env' must be a mapping of "
+                f"env-var names to values, got {type(worker_env).__name__}"
+            )
+        claude_code_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
     claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
     cross_family_data = _section(data, "cross_family")
     cf_command = cross_family_data.get("command")

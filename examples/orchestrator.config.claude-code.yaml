@@ -5,6 +5,12 @@ labels:
   ready: automated-ready
 
 dispatch:
+  # Each unit of default_limit is one LOCAL worker (its own worktree + claude -p
+  # + test run) on THIS host — unlike the Devin adapters, which run in the
+  # cloud. Total host load ≈ default_limit × the suite's xdist worker count, so
+  # keep that product near your physical core count and bound the consumer
+  # suite's `-n` (don't let it inherit `-n auto`). See RUNBOOK.md
+  # "Local host saturation ceiling (claude-code adapter)".
   default_limit: 3
   branch_prefix: agent/issue
   worker_model_tier: capable
@@ -59,5 +65,17 @@ claude_code:
   # worktree before its .venv junction is deleted (remove_worktree handles
   # the ordering). Set to null to disable venv sharing.
   venv_source: .venv
+  # Extra env merged over the orchestrator's env in every worker process. Each
+  # claude-code worker runs LOCALLY on this host, so a default_limit-wide wave
+  # stacks K test runs here. PYTEST_XDIST_AUTO_NUM_WORKERS caps `pytest -n auto`
+  # at the launch boundary (xdist reads it when resolving `-n auto`/`-n logical`)
+  # so the fleet doesn't oversubscribe cores into swap — WITHOUT touching the
+  # suite's pyproject addopts, so CI (which never sees this var) keeps full
+  # parallelism. "2" is a starting point for a ~6-8 core box; raise/lower so
+  # default_limit x value ~= your physical cores. Only bounds `-n auto`/
+  # `-n logical` (not an explicit `-n N`). See RUNBOOK.md
+  # "Local host saturation ceiling (claude-code adapter)".
+  worker_env:
+    PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
 
 # cross_family omitted → disabled (Claude-only review).

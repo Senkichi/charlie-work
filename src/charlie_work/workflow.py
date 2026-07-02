@@ -86,6 +86,7 @@ class OrchestratorApp:
             claude_command=claude.command,
             worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
             venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
+            worker_env=claude.worker_env,
         )
 
     def status(self) -> CommandResult:

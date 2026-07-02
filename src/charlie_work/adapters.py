@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,10 @@ class AdapterSettings:
     claude_command: tuple[str, ...] = ()
     worktrees_dir: Path | None = None
     venv_source: Path | None = None
+    # Extra env merged over the orchestrator's env in each claude-code worker
+    # process (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound local test
+    # parallelism). Empty means no overrides.
+    worker_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -217,6 +221,7 @@ def _run_claude_code_adapter(
         sessions_dir=sessions_dir,
         worktrees_dir=settings.worktrees_dir,
         venv_source=settings.venv_source,
+        env=settings.worker_env,
         **kwargs,
     )
     ok = record.error is None and record.pid is not None

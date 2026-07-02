@@ -654,6 +654,46 @@ def test_config_parses_cross_family_command_list_to_tuple(tmp_path: Path) -> Non
     assert config.cross_family.timeout_seconds == 120
 
 
+def test_claude_code_example_config_sets_bounded_xdist_worker_env() -> None:
+    config = load_config(EXAMPLES_DIR / "orchestrator.config.claude-code.yaml")
+
+    # The shipped example bounds local test parallelism at the launch boundary
+    # (the RUNBOOK "Local host saturation ceiling" section references this).
+    assert config.claude_code.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+
+
+def test_config_worker_env_coerces_values_to_str(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "claude_code:\n  worker_env:\n    PYTEST_XDIST_AUTO_NUM_WORKERS: 2\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    # YAML parses the bare 2 as an int; env values must be strings for Popen.
+    assert config.claude_code.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+
+
+def test_config_rejects_non_mapping_worker_env(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    # A plausible operator typo: a scalar instead of a name->value mapping.
+    # Must fail at load, not as an AttributeError when a worker launches.
+    path.write_text('claude_code:\n  worker_env: "2"\n', encoding="utf-8")
+
+    try:
+        load_config(path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "worker_env" in message
+    assert "claude_code" in message
+
+
 def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}

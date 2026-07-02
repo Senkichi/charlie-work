@@ -18,6 +18,7 @@ sidecar so ``doctor``/reconcile code can treat both worker kinds uniformly.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -129,6 +130,7 @@ def launch_claude_worker(
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
+    env: dict[str, str] | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -179,6 +181,12 @@ def launch_claude_worker(
         command_template, prompt_path, issue_number=issue_number, branch=branch
     )
     feed_stdin = "{prompt_path}" not in "".join(command_template)
+    # Workers inherit the orchestrator's environment, with config-provided
+    # overrides merged on top — e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound a
+    # worker's local `pytest -n auto` so a fleet of them doesn't oversubscribe
+    # the shared host (see docs/RUNBOOK.md "Local host saturation ceiling
+    # (claude-code adapter)"). `env` is a validated mapping (see config.py).
+    worker_env = {**os.environ, **{str(k): str(v) for k, v in (env or {}).items()}}
 
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
@@ -190,6 +198,7 @@ def launch_claude_worker(
                         stdin=prompt_handle,
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
+                        env=worker_env,
                         creationflags=_CREATE_NEW_PROCESS_GROUP,
                     )
             else:
@@ -199,6 +208,7 @@ def launch_claude_worker(
                     stdin=subprocess.DEVNULL,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
+                    env=worker_env,
                     creationflags=_CREATE_NEW_PROCESS_GROUP,
                 )
     except OSError as exc:

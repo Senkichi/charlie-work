@@ -32,7 +32,13 @@ $section_scope_contract
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change at the right abstraction layer.
 5. Add or update regression tests unless genuinely not applicable (justify if so).
-6. Run the test suite with the repository's canonical test command (see `CLAUDE.md`).
+6. Run the tests that COVER your change with the repository's canonical test
+   command (see `CLAUDE.md`) — scope the run to your diff, not the whole suite.
+   CI runs the full matrix as the regression authority; your local run is a fast
+   pre-flight, not the merge gate. **You share this host's cores and RAM with
+   other concurrent workers** — if the suite uses `pytest-xdist`, bound the pool
+   (e.g. `-n 2`, not `-n auto`) so the fleet stays near one worker per core
+   instead of paging the machine into swap.
 7. Match CI locally before pushing and COMMIT anything the formatters touch — an
    uncommitted reflow is the #1 cause of green-locally / red-on-CI.
 8. Commit with a Conventional-Commits message (`type(scope): description`).

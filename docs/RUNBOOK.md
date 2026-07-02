@@ -208,6 +208,57 @@ location) and re-link surviving worktrees, or simply tear down and recreate
 every active worktree — there is no partial-recovery path once the target
 directory's contents are gone.
 
+## Local host saturation ceiling (claude-code adapter)
+
+The `claude-code` adapter runs every worker as a **local** `claude -p` process
+in its own worktree on the *same machine* — unlike the Devin adapters, whose
+sessions execute in Devin's cloud VMs. (The `command` adapter can also run
+locally; if its `dispatch_command` spawns a host-local worker the same ceiling
+applies, but charlie can't inject the cap into an operator-supplied command —
+bound xdist inside that command yourself.) So a `default_limit`-wide wave puts K
+full worker toolchains (each running the repo's tests, and often a heavy
+eval/ML import stack) on one host at once. The throughput ceiling here is
+**CPU/RAM oversubscription, not the shared-venv junction** — the junction is a
+*cleanup* hazard (see the section above), never a runtime bottleneck; a reparse
+point is transparent to reads.
+
+The dominant stall is stacked `pytest-xdist` pools. A suite whose `addopts`
+carries `-n auto` spawns one worker **per core** on *every* invocation —
+including the small targeted runs a worker does for a one-file change. K
+concurrent worktrees each doing that is K × cores test processes on a
+cores-count box; add each worker's eval-stack RSS and the machine pages into
+swap and stalls long before any worker-CLI quota is hit.
+
+Mitigations (the fleet is charlie-work's, but the test config is the
+*consumer* repo's — that's where these land):
+
+- **Bound xdist so `default_limit × n ≈ physical cores`**, not `-n auto`. On an
+  8-core box with the default 3-wide fleet, `-n 2` (→ 6 workers) leaves
+  headroom; `-n auto` (→ 16 × 3 on a 16-thread box) does not. The claude-code
+  adapter enforces this at the launch boundary: set
+  `claude_code.worker_env: {PYTEST_XDIST_AUTO_NUM_WORKERS: "2"}` (the shipped
+  example already does) and every `pytest -n auto` a worker runs is capped to 2
+  without editing the suite's `addopts` — CI never sees the var, so it keeps
+  every core. Size the value so `default_limit × value ≈ physical cores`. The
+  var only governs `-n auto`/`-n logical` resolution — an explicit `-n N` (in a
+  worker command or the suite's `addopts`) is not bounded, and a consumer
+  `conftest` `pytest_xdist_auto_num_workers` hook overrides it; that's why the
+  worker-prompt discipline (below) is the complementary half, not redundant.
+- **CI is the gate; local is targeted verify.** Workers should run only the
+  tests covering their diff (plus any fast schema/migration guard set) locally
+  and delegate full-suite correctness to the CI matrix. `worker_claude_code.md`
+  instructs this; reinforce it in the consumer's `CLAUDE.md` canonical test
+  command.
+- **Exclude the worktrees root from Windows Defender real-time scanning** — it
+  re-scans the shared tree on every file touch across all K workers and is the
+  single biggest Windows multiplier. From an *elevated* PowerShell:
+  `Add-MpPreference -ExclusionPath '<worktrees-root>'` (check first with
+  `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`, which itself
+  needs admin).
+- **Do not give each worktree its own full venv** to dodge this — it costs disk
+  and sync time and does not touch the CPU/RAM ceiling. The shared-venv junction
+  (`claude_code.venv_source`) is correct; bound parallelism instead.
+
 ## Session-limit / quota discipline
 
 Both non-blocking adapters (`devin_shell.py`'s `launch_devin_session()`,

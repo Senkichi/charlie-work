@@ -141,6 +141,56 @@ def test_launch_claude_worker_process_receives_prompt_via_stdin(
     assert marker_path.read_text(encoding="utf-8") == "prompt payload for stdin"
 
 
+def test_launch_claude_worker_injects_worker_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # An inherited var must survive the merge; the injected var must appear.
+    monkeypatch.setenv("CHARLIE_INHERITED", "inherited-value")
+
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-probe.txt").write_text(
+                os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "<unset>")
+                + "|"
+                + os.environ.get("CHARLIE_INHERITED", "<unset>"),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        99,
+        "agent/issue-99-env",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+        env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"},
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-probe.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    # Injected var present AND orchestrator env inherited (merge, not replace).
+    assert probe_path.read_text(encoding="utf-8") == "2|inherited-value"
+
+
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
