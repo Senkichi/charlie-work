@@ -3,7 +3,7 @@ name = "devin-orchestrator"
 version = "0.1.0"
 description = "Deterministic GitHub-issue orchestrator for AI worker fleets — Devin workers by default, Claude Code workers first-class"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = ["pyyaml>=6.0"]
 
