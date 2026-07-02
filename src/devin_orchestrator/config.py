@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
+
+
+class ConfigError(ValueError):
+    """A config file was structurally invalid (unknown keys, wrong shapes)."""
 
 
 @dataclass(frozen=True)
@@ -143,28 +147,42 @@ def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
+    """Construct a config dataclass, turning unknown YAML keys into a readable
+    error (a bare ``TypeError`` from ``cls(**data)`` names neither the section
+    nor the valid keys — hostile to consumers mid-migration)."""
+    valid = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - valid)
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) in config section '{name}': {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(valid))})"
+        )
+    return cls(**data)
+
+
 def load_config(path: Path | None = None) -> OrchestratorConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path and path.exists() else {}
     data = raw if isinstance(raw, dict) else {}
-    labels = LabelConfig(**_section(data, "labels"))
-    dispatch = DispatchConfig(**_section(data, "dispatch"))
-    review = ReviewConfig(**_section(data, "review"))
+    labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
+    dispatch = _build_section(DispatchConfig, "dispatch", _section(data, "dispatch"))
+    review = _build_section(ReviewConfig, "review", _section(data, "review"))
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
         auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
-    auto_merge = AutoMergeConfig(**auto_merge_data)
-    runtime = RuntimeConfig(**_section(data, "runtime"))
+    auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
+    runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))
     devin_data = _section(data, "devin")
     dispatch_command = devin_data.get("dispatch_command")
     if isinstance(dispatch_command, list):
         devin_data["dispatch_command"] = tuple(str(item) for item in dispatch_command)
-    devin = DevinConfig(**devin_data)
+    devin = _build_section(DevinConfig, "devin", devin_data)
     cross_family_data = _section(data, "cross_family")
     cf_command = cross_family_data.get("command")
     if isinstance(cf_command, list):
         cross_family_data["command"] = tuple(str(item) for item in cf_command)
-    cross_family = CrossFamilyConfig(**cross_family_data)
+    cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,

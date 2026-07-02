@@ -171,6 +171,26 @@ def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
     assert payload["generated_at"].endswith("Z")
 
 
+def test_load_config_names_unknown_keys_and_section(tmp_path: Path) -> None:
+    from devin_orchestrator.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "review:\n  max_rework_cycles: 2\n  max_rework_cylces: 3\n", encoding="utf-8"
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "section 'review'" in message
+    assert "max_rework_cylces" in message
+    assert "max_rework_cycles" in message  # valid keys listed for the operator
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
