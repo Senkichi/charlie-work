@@ -22,7 +22,15 @@ def render_prompt(
     *,
     search_dirs: Sequence[Path] = (),
 ) -> str:
+    from .prompt_sections import section_variables
+
     template_path = resolve_template(template_name, search_dirs)
     template = Template(template_path.read_text(encoding="utf-8"))
-    safe_values = {key: str(value) for key, value in values.items()}
-    return template.safe_substitute(safe_values)
+    # Explicit values win over section text on any future key collision.
+    merged = {**section_variables(search_dirs=tuple(search_dirs)), **values}
+    safe_values = {key: str(value) for key, value in merged.items()}
+    # Two passes: injected $section_* text carries its own $placeholders, and
+    # safe_substitute never re-scans replacement text. A single pass ships
+    # literal "$issue_number" inside the shared sections to real workers.
+    once = template.safe_substitute(safe_values)
+    return Template(once).safe_substitute(safe_values)

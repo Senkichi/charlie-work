@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import json
+import sys
+import textwrap
+import time
+from pathlib import Path
+
+import pytest
+
+from devin_orchestrator import claude_code
+from devin_orchestrator.claude_code import (
+    ClaudeWorkerRecord,
+    launch_claude_worker,
+    probe_claude,
+    read_worker_records,
+)
+from devin_orchestrator.worktree import WorktreeInfo
+
+
+def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
+    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
+
+
+def _install_fake_create_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
+) -> None:
+    def fake_create_worktree(
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None
+    ):
+        if calls is not None:
+            calls.append(
+                {
+                    "repo_root": repo_root,
+                    "branch": branch,
+                    "base_ref": base_ref,
+                    "worktrees_dir": worktrees_dir,
+                    "venv_source": venv_source,
+                }
+            )
+        return _fake_worktree(tmp_path, branch)
+
+    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+
+
+def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:
+    """A Python script standing in for the `claude` binary: reads stdin (the
+    prompt), writes a marker file next to cwd, and exits 0."""
+    script_path = tmp_path / "fake_claude.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            data = sys.stdin.read()
+            Path("worker-ran.txt").write_text(data, encoding="utf-8")
+            print("ok")
+            """
+        ),
+        encoding="utf-8",
+    )
+    return (sys.executable, str(script_path))
+
+
+def test_launch_claude_worker_writes_prompt_and_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=calls)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert record.ok
+    assert record.error is None
+    assert record.issue_number == 42
+    assert record.branch == "agent/issue-42-fix"
+    assert record.pid is not None
+    assert record.started_at.endswith("Z")
+
+    worktree_path = Path(record.worktree_path)
+    prompt_path = worktree_path / ".orchestrator-prompt.md"
+    assert prompt_path.read_text(encoding="utf-8") == "Do the thing."
+    assert record.prompt_path == str(prompt_path)
+
+    # create_worktree got the right args, including venv_source/worktrees_dir passthrough.
+    assert calls[0]["branch"] == "agent/issue-42-fix"
+    assert calls[0]["repo_root"] == repo_root
+
+    # Sidecar JSON is present and matches the returned record.
+    sidecar_path = sessions_dir / "issue-42.claude.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["issue_number"] == 42
+    assert payload["branch"] == "agent/issue-42-fix"
+    assert payload["error"] is None
+
+    log_path = Path(record.log_path)
+    assert log_path == sessions_dir / "issue-42.claude.log"
+
+
+def test_launch_claude_worker_process_receives_prompt_via_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        7,
+        "agent/issue-7-x",
+        "prompt payload for stdin",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert record.ok
+    worktree_path = Path(record.worktree_path)
+
+    # Wait for the fake claude subprocess (very fast: reads stdin, writes, exits).
+    marker_path = worktree_path / "worker-ran.txt"
+    deadline = time.time() + 10
+    while not marker_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert marker_path.exists()
+    assert marker_path.read_text(encoding="utf-8") == "prompt payload for stdin"
+
+
+def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    script_path = tmp_path / "fake_claude_argv.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            prompt_path = Path(sys.argv[1])
+            Path("worker-ran.txt").write_text(prompt_path.read_text(encoding="utf-8"), encoding="utf-8")
+            print("ok")
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        8,
+        "agent/issue-8-x",
+        "prompt payload for argv",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path), "{prompt_path}"),
+    )
+
+    assert record.ok
+    assert record.command[-1] == record.prompt_path
+
+    worktree_path = Path(record.worktree_path)
+    marker_path = worktree_path / "worker-ran.txt"
+    deadline = time.time() + 10
+    while not marker_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert marker_path.exists()
+    assert marker_path.read_text(encoding="utf-8") == "prompt payload for argv"
+
+
+def test_launch_claude_worker_missing_binary_returns_error_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        99,
+        "agent/issue-99-x",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+    )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to launch claude" in record.error
+    assert record.pid is None
+
+    # The worktree itself must not leak: remove_worktree was attempted (best
+    # effort — a fake worktree isn't a real git worktree, so the git command
+    # inside it fails, but that's covered separately below). The sidecar must
+    # still be written with the error regardless.
+    sidecar_path = sessions_dir / "issue-99.claude.json"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["error"] == record.error
+
+
+def test_launch_claude_worker_create_worktree_failure_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    def failing_create_worktree(
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None
+    ):
+        raise RuntimeError("git worktree add failed: branch already exists")
+
+    monkeypatch.setattr(claude_code, "create_worktree", failing_create_worktree)
+
+    record = launch_claude_worker(
+        13,
+        "agent/issue-13-x",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert not record.ok
+    assert "worktree creation failed" in record.error
+    assert record.worktree_path == ""
+    assert record.pid is None
+
+    sidecar_path = sessions_dir / "issue-13.claude.json"
+    assert sidecar_path.exists()
+
+
+def test_launch_claude_worker_remove_worktree_called_on_launch_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    removed: list[Path] = []
+
+    def fake_remove_worktree(repo_root, worktree_path, *, force=False):
+        removed.append(worktree_path)
+        return True
+
+    monkeypatch.setattr(claude_code, "remove_worktree", fake_remove_worktree)
+
+    record = launch_claude_worker(
+        21,
+        "agent/issue-21-x",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+    )
+
+    assert not record.ok
+    assert len(removed) == 1
+    assert removed[0] == Path(record.worktree_path)
+
+
+def test_read_worker_records_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    launch_claude_worker(
+        1,
+        "agent/issue-1-a",
+        "prompt a",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+    launch_claude_worker(
+        2,
+        "agent/issue-2-b",
+        "prompt b",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    records = read_worker_records(sessions_dir)
+
+    assert len(records) == 2
+    assert {r.issue_number for r in records} == {1, 2}
+    assert all(isinstance(r, ClaudeWorkerRecord) for r in records)
+
+
+def test_read_worker_records_empty_dir_returns_empty_list(tmp_path: Path) -> None:
+    assert read_worker_records(tmp_path / "does-not-exist") == []
+
+
+def test_read_worker_records_skips_corrupt_sidecar(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "issue-5.claude.json").write_text("not json{{{", encoding="utf-8")
+
+    assert read_worker_records(sessions_dir) == []
+
+
+def test_read_worker_records_skips_sidecar_missing_required_fields(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "issue-6.claude.json").write_text(
+        json.dumps({"branch": "agent/issue-6-x"}), encoding="utf-8"
+    )
+
+    assert read_worker_records(sessions_dir) == []
+
+
+def test_probe_claude_missing_binary_never_raises(tmp_path: Path) -> None:
+    result = probe_claude(tmp_path)
+
+    assert result.ok is False
+    assert result.error is not None
+
+
+def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[tuple] = []
+
+    def fake_run_captured(command, *, cwd, timeout_seconds, shell=False):
+        calls.append((command, cwd, timeout_seconds))
+        from devin_orchestrator.subprocess_runner import RunResult
+
+        return RunResult(returncode=0, stdout="1.0.0", stderr="")
+
+    monkeypatch.setattr(claude_code, "run_captured", fake_run_captured)
+
+    result = probe_claude(tmp_path)
+
+    assert result.ok
+    assert calls[0][0] == ["claude", "--version"]
+    assert calls[0][1] == tmp_path

@@ -7,14 +7,17 @@ from pathlib import Path
 from typing import Any
 
 from . import CLI_NAME
-from .adapters import SessionRequest, dispatch_sessions
+from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .cross_family import CrossFamilyResult, run_cross_family_review
 from .github import GitHub, GitHubError, label_names, linked_issue_number
+from .janitor import run_janitor
 from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
+from .reconcile import detect_drift
+from .reconcile import apply_fixes as apply_drift_fixes
 from .state import append_event, load_state, save_state, utc_now
 
 
@@ -23,6 +26,17 @@ class CommandResult:
     ok: bool
     message: str
     data: dict[str, Any]
+
+
+def _janitor_section(warnings: tuple[str, ...]) -> str:
+    if not warnings:
+        return ""
+    lines = "\n".join(f"- {warning}" for warning in warnings)
+    return (
+        "\n## Janitor warnings (non-blocking)\n\n"
+        f"{lines}\n\n"
+        "These deterministic pre-checks passed the gate but deserve reviewer attention.\n"
+    )
 
 
 def slugify(value: str, *, max_length: int = 48) -> str:
@@ -55,6 +69,24 @@ class OrchestratorApp:
 
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
+
+    def _resolve(self, value: str) -> Path:
+        # pathlib keeps an absolute right-hand side as-is, so this handles
+        # both repo-relative and absolute config paths.
+        return self.repo_root / value
+
+    def _adapter_settings(self) -> AdapterSettings:
+        claude = self.config.claude_code
+        return AdapterSettings(
+            adapter=self.config.devin.adapter,
+            dispatch_command=self.config.devin.dispatch_command,
+            command_timeout_seconds=self.config.devin.command_timeout_seconds,
+            sessions_dir=self._resolve(self.config.devin.sessions_dir),
+            shell_command=self.config.devin.shell_command,
+            claude_command=claude.command,
+            worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
+            venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
+        )
 
     def status(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
@@ -158,9 +190,7 @@ class OrchestratorApp:
             self.repo_root,
             manifest_path,
             results_path,
-            self.config.devin.adapter,
-            self.config.devin.dispatch_command,
-            self.config.devin.command_timeout_seconds,
+            self._adapter_settings(),
             session_requests,
         )
         successful_issue_numbers = {
@@ -229,6 +259,38 @@ class OrchestratorApp:
         issue_number = linked_issue_number(pr)
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
+        # Deterministic janitor gate BEFORE any packet/cross-family spend: an
+        # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
+        # must cost zero review tokens. Failures don't move labels — they are
+        # the worker's/CI's to fix, not a review decision.
+        verdict = run_janitor(pr, checks, self.config)
+        if not verdict.ok:
+            state = load_state(self.paths.state_file)
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "janitor_blocked",
+                "janitor_ok": False,
+                "janitor_failures": list(verdict.failures),
+            }
+            append_event(
+                state,
+                "janitor_gate",
+                {"pr_number": pr_number, "failures": list(verdict.failures)},
+            )
+            save_state(self.paths.state_file, state)
+            return CommandResult(
+                False,
+                f"janitor gate blocked PR #{pr_number}: " + "; ".join(verdict.failures),
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "janitor_ok": False,
+                    "janitor_failures": list(verdict.failures),
+                    "janitor_warnings": list(verdict.warnings),
+                },
+            )
         diff = self.gh.pr_diff(pr_number)
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +321,7 @@ class OrchestratorApp:
                 "checks_json_path": pr_dir / "checks.json",
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
+                "janitor_section": _janitor_section(verdict.warnings),
                 "decision_command": f"{CLI_NAME} record-review --pr {pr_number} --decision approved --summary-file <path>",
             },
         )
@@ -288,6 +351,8 @@ class OrchestratorApp:
             "prompt_path": str(prompt_path),
             "decision_path": str(decision_path),
             "status": "reviewing",
+            "janitor_ok": True,
+            "janitor_warnings": list(verdict.warnings),
             "cross_family_report": cf_result.report_path if cf_result else None,
             "cross_family_ok": cf_result.ok if cf_result else None,
         }
@@ -532,6 +597,29 @@ class OrchestratorApp:
             timeout_seconds=cfg.timeout_seconds,
         )
         return self._cross_family_section(result.report_path), result
+
+    def reconcile(self, *, fix: bool = False) -> CommandResult:
+        """Detect (and optionally repair) drift between GitHub reality and the
+        orchestrator's labels/state — e.g. a PR merged by hand outside
+        merge-ready leaving `agent:in-progress` stale forever. Read-only unless
+        ``fix`` is passed."""
+        state = load_state(self.paths.state_file)
+        drift = detect_drift(self.gh, state, self.config)
+        fixed = False
+        if fix and drift:
+            new_state = apply_drift_fixes(self.gh, state, drift, self.config)
+            save_state(self.paths.state_file, new_state)
+            fixed = True
+        message = f"found {len(drift)} drift item(s)"
+        if fixed:
+            message += " — fixed"
+        elif drift:
+            message += " (read-only; pass --fix to repair)"
+        return CommandResult(
+            True,
+            message,
+            {"drift": [asdict(item) for item in drift], "fixed": fixed},
+        )
 
     @staticmethod
     def _cross_family_section(report_path: str | Path) -> str:

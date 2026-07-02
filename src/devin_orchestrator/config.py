@@ -92,11 +92,35 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class DevinConfig:
+    # "manual" writes a session manifest for the operator; "command" runs a
+    # blocking dispatch_command per issue; "devin-shell" launches headless
+    # `devin` CLI sessions non-blocking with sidecar tracking (devin_shell.py);
+    # "claude-code" launches Claude Code workers in isolated git worktrees
+    # (claude_code.py, configured under the claude_code section).
     adapter: str = "manual"
     session_manifest: str = ".var/devin-orchestrator/dispatches/session-manifest.json"
     session_results: str = ".var/devin-orchestrator/dispatches/session-results.json"
     dispatch_command: str | tuple[str, ...] = ""
     command_timeout_seconds: int = 300
+    # devin-shell adapter: sidecar JSON + per-session logs live here.
+    sessions_dir: str = ".var/devin-orchestrator/dispatches/sessions"
+    # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
+    # Placeholders: {prompt_path} {issue_number} {branch}.
+    shell_command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaudeCodeConfig:
+    """Settings for the claude-code worker adapter (devin.adapter: claude-code)."""
+
+    # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
+    # prompt is fed via stdin unless the template names {prompt_path}.
+    command: tuple[str, ...] = ()
+    # None -> worktree.py default (<repo_root>/.var/devin-orchestrator/worktrees).
+    worktrees_dir: str | None = None
+    # Relative to the consumer repo root; junctioned into each worktree so
+    # workers share one venv (operator decision 2026-07-01). None disables.
+    venv_source: str | None = ".venv"
 
 
 @dataclass(frozen=True)
@@ -129,6 +153,7 @@ class OrchestratorConfig:
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
+    claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
 
 
@@ -174,10 +199,16 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))
     devin_data = _section(data, "devin")
-    dispatch_command = devin_data.get("dispatch_command")
-    if isinstance(dispatch_command, list):
-        devin_data["dispatch_command"] = tuple(str(item) for item in dispatch_command)
+    for command_key in ("dispatch_command", "shell_command"):
+        command_value = devin_data.get(command_key)
+        if isinstance(command_value, list):
+            devin_data[command_key] = tuple(str(item) for item in command_value)
     devin = _build_section(DevinConfig, "devin", devin_data)
+    claude_code_data = _section(data, "claude_code")
+    claude_command = claude_code_data.get("command")
+    if isinstance(claude_command, list):
+        claude_code_data["command"] = tuple(str(item) for item in claude_command)
+    claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
     cross_family_data = _section(data, "cross_family")
     cf_command = cross_family_data.get("command")
     if isinstance(cf_command, list):
@@ -190,5 +221,6 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
+        claude_code=claude_code,
         cross_family=cross_family,
     )

@@ -23,9 +23,29 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status")
-    subparsers.add_parser("doctor")
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument(
+        "--adapter-probe",
+        action="store_true",
+        dest="adapter_probe",
+        help=(
+            "Also execute the configured worker adapter's CLI probe (e.g. "
+            "'devin --version') and surface stale/failed launched sessions. "
+            "Off by default because probes run external binaries."
+        ),
+    )
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
+
+    reconcile = subparsers.add_parser("reconcile")
+    reconcile.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Apply label/state repairs for detected drift. Without this flag "
+            "reconcile is strictly read-only."
+        ),
+    )
 
     dispatch = subparsers.add_parser("dispatch")
     dispatch.add_argument("--limit", type=int, default=None)
@@ -90,7 +110,9 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     config = load_config(config_path)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
-    ok, checks = run_doctor(repo_root, paths, config, config_path, gh)
+    ok, checks = run_doctor(
+        repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe
+    )
     failed = [check for check in checks if not check.ok]
     message = (
         "doctor: all checks passed"
@@ -109,6 +131,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         return app.bootstrap_labels()
     if args.command == "intake":
         return app.intake()
+    if args.command == "reconcile":
+        return app.reconcile(fix=args.fix)
     if args.command == "dispatch":
         return app.dispatch(args.limit, only_issues=args.issues)
     if args.command == "review":

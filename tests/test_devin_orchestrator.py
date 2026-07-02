@@ -254,12 +254,13 @@ class FakeGitHub:
                 "labels": [{"name": "automated-ready"}],
             }
         ]
+        # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
         self.pr = {
             "number": 456,
             "title": "Fix #123: search",
             "url": "https://example.test/pull/456",
             "headRefName": "agent/issue-123-fix-search",
-            "body": "Closes #123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
         }
         self.labels_added: list[tuple[int, str]] = []
@@ -727,7 +728,11 @@ def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> 
 
     result = app.review(456)
 
-    assert result.data["cross_family_ok"] is None
+    # The janitor gate now blocks drafts before any review spend — even
+    # earlier than the old cross-family draft skip this test pinned.
+    assert result.ok is False
+    assert result.data["janitor_ok"] is False
+    assert any("draft" in failure.lower() for failure in result.data["janitor_failures"])
 
 
 def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None:
@@ -882,3 +887,156 @@ def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert result.stdout == "caf�"  # invalid UTF-8 replaced, never raises
+
+
+# --- integration wiring: new adapters, janitor gate, reconcile ----------------
+
+
+def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path) -> None:
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+    sidecar = (
+        tmp_path / ".var" / "devin-orchestrator" / "dispatches" / "sessions" / "issue-123.json"
+    )
+    assert sidecar.exists()
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+
+def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> None:
+    from devin_orchestrator.claude_code import ClaudeWorkerRecord
+
+    captured: dict[str, object] = {}
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        captured["prompt_text"] = prompt_text
+        captured["venv_source"] = kwargs.get("venv_source")
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+        )
+
+    monkeypatch.setattr("devin_orchestrator.claude_code.launch_claude_worker", _fake_launch)
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert "Issue #123" in str(captured["prompt_text"])  # rendered prompt fed through
+    assert captured["venv_source"] == tmp_path / ".venv"  # junction default ON
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+
+
+def test_claude_code_dispatch_failure_stays_out_of_progress(tmp_path: Path, monkeypatch) -> None:
+    from devin_orchestrator.claude_code import ClaudeWorkerRecord
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path="",
+            prompt_path="",
+            command=("claude", "-p"),
+            pid=None,
+            started_at="2026-07-02T00:00:00Z",
+            log_path="",
+            error="claude not found on PATH",
+        )
+
+    monkeypatch.setattr("devin_orchestrator.claude_code.launch_claude_worker", _fake_launch)
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is False
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+
+
+def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr = {**fake_gh.pr, "isDraft": True}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    packet = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456" / "review-prompt.md"
+    assert not packet.exists()  # zero packet spend on a blocked PR
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+
+
+def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr = {**fake_gh.pr, "additions": 2000, "deletions": 10}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456" / "review-prompt.md"
+    assert "Janitor warnings" in packet.read_text(encoding="utf-8")
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["janitor_ok"] is True
+    assert state["prs"]["456"]["janitor_warnings"]
+
+
+def test_reconcile_wiring_reports_clean_repo(tmp_path: Path) -> None:
+    class QuietGitHub(FakeGitHub):
+        def run(self, arguments, *, json_output=False, allow_failure=False):
+            return []
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, QuietGitHub())
+
+    result = app.reconcile()
+
+    assert result.ok is True
+    assert result.data["drift"] == []
+    assert result.data["fixed"] is False
+
+
+def test_cli_routes_reconcile_fix_flag(monkeypatch, capsys) -> None:
+    seen: dict[str, object] = {}
+
+    class StubApp:
+        def reconcile(self, *, fix: bool = False):
+            seen["fix"] = fix
+            return cli.CommandResult(True, "ok", {})
+
+    monkeypatch.setattr(cli, "build_app", lambda args: StubApp())
+
+    assert cli.main(["reconcile", "--fix"]) == 0
+    assert seen["fix"] is True

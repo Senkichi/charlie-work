@@ -17,6 +17,26 @@ class SessionRequest:
 
 
 @dataclass(frozen=True)
+class AdapterSettings:
+    """Everything an adapter needs, resolved by the caller (paths absolute).
+
+    ``adapter`` values: "manual" (manifest for the operator), "command"
+    (blocking per-issue dispatch_command), "devin-shell" (non-blocking headless
+    devin CLI with sidecar tracking), "claude-code" (worktree-isolated Claude
+    Code workers).
+    """
+
+    adapter: str = "manual"
+    dispatch_command: str | tuple[str, ...] = ""
+    command_timeout_seconds: int = 300
+    sessions_dir: Path | None = None
+    shell_command: tuple[str, ...] = ()
+    claude_command: tuple[str, ...] = ()
+    worktrees_dir: Path | None = None
+    venv_source: Path | None = None
+
+
+@dataclass(frozen=True)
 class SessionDispatchResult:
     issue_number: int
     issue_title: str
@@ -50,17 +70,29 @@ def dispatch_sessions(
     repo_root: Path,
     manifest_path: Path,
     results_path: Path,
-    adapter: str,
-    dispatch_command: str | tuple[str, ...],
-    command_timeout_seconds: int,
+    settings: AdapterSettings,
     requests: list[SessionRequest],
 ) -> list[SessionDispatchResult]:
+    adapter = settings.adapter
     write_session_manifest(manifest_path, requests, adapter=adapter)
+    sessions_dir = settings.sessions_dir or manifest_path.parent / "sessions"
     if adapter == "manual":
         results = [_manual_result(request) for request in requests]
     elif adapter == "command":
         results = [
-            _run_command_adapter(repo_root, request, dispatch_command, command_timeout_seconds)
+            _run_command_adapter(
+                repo_root, request, settings.dispatch_command, settings.command_timeout_seconds
+            )
+            for request in requests
+        ]
+    elif adapter == "devin-shell":
+        results = [
+            _run_devin_shell_adapter(repo_root, request, sessions_dir, settings.shell_command)
+            for request in requests
+        ]
+    elif adapter == "claude-code":
+        results = [
+            _run_claude_code_adapter(repo_root, request, sessions_dir, settings)
             for request in requests
         ]
     else:
@@ -101,6 +133,18 @@ def _instructions(adapter: str) -> list[str]:
             "Each command receives one issue prompt and must create exactly one worker session.",
             "Only successful command results are labeled in progress.",
         ]
+    if adapter == "devin-shell":
+        return [
+            "Worker sessions were launched headless via the devin CLI (non-blocking).",
+            "Per-session sidecar JSON and logs live under the sessions directory.",
+            "Use doctor to probe the adapter and surface stale or failed sessions.",
+        ]
+    if adapter == "claude-code":
+        return [
+            "Claude Code workers were launched headless in isolated git worktrees.",
+            "Per-worker sidecar JSON and logs live under the sessions directory.",
+            "Never remove a worktree before deleting its .venv junction.",
+        ]
     return [
         "Open one Devin worker session per request.",
         "Paste the prompt file contents as the worker task.",
@@ -120,6 +164,69 @@ def _request_dict(request: SessionRequest) -> dict[str, Any]:
 
 def _manual_result(request: SessionRequest) -> SessionDispatchResult:
     return _result(request, adapter="manual", ok=True)
+
+
+def _run_devin_shell_adapter(
+    repo_root: Path,
+    request: SessionRequest,
+    sessions_dir: Path,
+    shell_command: tuple[str, ...],
+) -> SessionDispatchResult:
+    from .devin_shell import DEFAULT_COMMAND_TEMPLATE, launch_devin_session
+
+    record = launch_devin_session(
+        request.issue_number,
+        request.branch_name,
+        request.prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=shell_command or DEFAULT_COMMAND_TEMPLATE,
+    )
+    # Non-blocking launch: there is no returncode/stdout to report — liveness
+    # and output live in the sidecar JSON and per-session log.
+    ok = record.error is None and record.pid is not None
+    return _result(
+        request,
+        adapter="devin-shell",
+        ok=ok,
+        command=list(record.command),
+        error=record.error if not ok else None,
+    )
+
+
+def _run_claude_code_adapter(
+    repo_root: Path,
+    request: SessionRequest,
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> SessionDispatchResult:
+    from .claude_code import launch_claude_worker
+
+    try:
+        prompt_text = request.prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _result(request, adapter="claude-code", ok=False, error=str(exc))
+    kwargs: dict[str, Any] = {}
+    if settings.claude_command:
+        kwargs["command_template"] = settings.claude_command
+    record = launch_claude_worker(
+        request.issue_number,
+        request.branch_name,
+        prompt_text,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        worktrees_dir=settings.worktrees_dir,
+        venv_source=settings.venv_source,
+        **kwargs,
+    )
+    ok = record.error is None and record.pid is not None
+    return _result(
+        request,
+        adapter="claude-code",
+        ok=ok,
+        command=list(record.command),
+        error=record.error if not ok else None,
+    )
 
 
 def _run_command_adapter(

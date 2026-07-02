@@ -13,7 +13,10 @@ dispatch:
   worker_template: worker.md
 
 review:
-  max_rework_cycles: 3
+  # Past this many request_changes cycles the PR escalates to
+  # agent:human-needed instead of another rework dispatch — iteration past
+  # ~2 rounds thrashes (wrong brief or unimplementable criteria).
+  max_rework_cycles: 2
   require_tests_or_rationale: true
   require_issue_link: true
 
@@ -40,13 +43,20 @@ runtime:
   # prompts_dir: orchestrator-prompts
 
 devin:
-  adapter: manual
+  # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,
+  # with sidecar JSON + per-session logs under sessions_dir. Verify with
+  # `devin-orch doctor --adapter-probe` before the first wave.
+  # Fall back to `adapter: manual` (operator pastes prompts from the session
+  # manifest) if the devin CLI is unavailable on this machine.
+  adapter: devin-shell
   session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
   session_results: .var/devin-orchestrator/dispatches/session-results.json
-  # When a working one-session-per-issue launcher is available, switch to
-  # adapter: command and configure the command shape, e.g.
-  # dispatch_command: [devin, --prompt-file, "{prompt_path}", -p]
-  # command_timeout_seconds: 300
+  sessions_dir: .var/devin-orchestrator/dispatches/sessions
+  # Launch command; empty uses the built-in default shown here. Placeholders:
+  # {prompt_path} {issue_number} {branch}. A list runs without a shell.
+  # shell_command: [devin, --prompt-file, "{prompt_path}", --print]
+  # A blocking alternative is adapter: command with dispatch_command +
+  # command_timeout_seconds (one blocking launcher call per issue).
 
 cross_family:
   # Auto adversarial pass by a NON-Claude model (codex via the Devin CLI) on

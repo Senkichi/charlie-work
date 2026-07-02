@@ -76,12 +76,68 @@ def _check_name_matches(required: str, job_names: set[str]) -> bool:
     return False
 
 
+def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
+    """Execute the configured adapter's CLI probe (runs an external binary,
+    so only behind --adapter-probe)."""
+    adapter = config.devin.adapter
+    if adapter == "devin-shell":
+        from .devin_shell import probe_devin
+
+        probe = probe_devin(repo_root)
+        add(
+            "devin CLI probe",
+            probe.ok,
+            (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
+        )
+    elif adapter == "claude-code":
+        from .claude_code import probe_claude
+
+        probe = probe_claude(repo_root)
+        add(
+            "claude CLI probe",
+            probe.ok,
+            (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
+        )
+    else:
+        add(
+            "adapter probe",
+            True,
+            f"adapter `{adapter}` launches nothing itself — no CLI probe applies",
+            severity="warning",
+        )
+
+
+def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
+    """Flag launched sessions that failed or whose process died without the
+    orchestrator recording an outcome (orphans reconcile cannot see)."""
+    from .claude_code import read_worker_records
+    from .devin_shell import is_session_alive, read_session_records
+
+    sessions_dir = repo_root / config.devin.sessions_dir
+    if not sessions_dir.is_dir():
+        add("launched sessions", True, "no sessions directory yet", severity="warning")
+        return
+    records = [*read_session_records(sessions_dir), *read_worker_records(sessions_dir)]
+    failed = [record for record in records if record.error is not None]
+    # is_session_alive only reads .pid, so both record kinds duck-type through.
+    exited = [
+        record for record in records if record.error is None and not is_session_alive(record)
+    ]
+    detail = f"{len(records)} sidecar record(s): {len(failed)} failed, {len(exited)} exited"
+    if failed or exited:
+        issues = sorted({record.issue_number for record in [*failed, *exited]})
+        detail += f" (issues: {issues}) — check per-session logs in {sessions_dir}"
+    add("launched sessions", not failed, detail, severity="warning")
+
+
 def run_doctor(
     repo_root: Path,
     paths: RuntimePaths,
     config: OrchestratorConfig,
     config_path: Path | None,
     gh: GitHub,
+    *,
+    adapter_probe: bool = False,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
 
@@ -178,6 +234,10 @@ def run_doctor(
         add("dispatch adapter", False, "adapter is `command` but dispatch_command is empty")
     else:
         add("dispatch adapter", True, config.devin.adapter)
+
+    if adapter_probe:
+        _probe_adapter(add, repo_root, config)
+        _surface_sessions(add, repo_root, config)
 
     if config.cross_family.enabled:
         command = config.cross_family.command

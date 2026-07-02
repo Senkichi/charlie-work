@@ -19,7 +19,7 @@ You are the senior orchestrator performing a critical, adversarial review. Do no
 - PR JSON: `$pr_json_path`
 - Checks JSON: `$checks_json_path`
 - Diff patch: `$diff_path`
-$cross_family_section
+$cross_family_section$janitor_section
 ## Review procedure
 
 1. Read the original issue and acceptance intent.

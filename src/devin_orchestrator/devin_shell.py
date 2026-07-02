@@ -1,0 +1,246 @@
+"""Headless Devin CLI dispatch — non-blocking session launch with a durable
+sidecar so the orchestrator and ``doctor`` can see what is in flight.
+
+There is no Devin session-creation API (see docs/design/extraction-dossier.md,
+"headless"/"--prompt-file"). Production reality is spawning the ``devin`` CLI
+in print mode: ``devin --prompt-file <path> --print``. Sessions run for many
+minutes, so dispatch must return immediately after ``Popen`` — callers must
+never block on the worker finishing. Each launch writes a JSON sidecar file
+(``sessions_dir/issue-<n>.json``) atomically (tmp + replace, matching
+``adapters._write_json``) *before* returning, so a crash of the orchestrator
+process itself never loses track of a session that was actually spawned.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from .state import utc_now
+from .subprocess_runner import RunResult, run_captured
+
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_STILL_ACTIVE = 259
+
+DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = ("devin", "--prompt-file", "{prompt_path}", "--print")
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    issue_number: int
+    branch: str
+    prompt_path: str
+    command: tuple[str, ...]
+    pid: int | None
+    started_at: str
+    log_path: str
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["command"] = list(self.command)
+        return payload
+
+    @staticmethod
+    def from_dict(payload: dict[str, Any]) -> SessionRecord:
+        command = payload.get("command") or []
+        return SessionRecord(
+            issue_number=int(payload["issue_number"]),
+            branch=str(payload.get("branch", "")),
+            prompt_path=str(payload.get("prompt_path", "")),
+            command=tuple(str(part) for part in command),
+            pid=int(payload["pid"]) if payload.get("pid") is not None else None,
+            started_at=str(payload.get("started_at", "")),
+            log_path=str(payload.get("log_path", "")),
+            error=payload.get("error"),
+        )
+
+
+def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
+    return sessions_dir / f"issue-{issue_number}.json"
+
+
+def _log_path(sessions_dir: Path, issue_number: int) -> Path:
+    return sessions_dir / f"issue-{issue_number}.log"
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def _render_command(
+    command_template: tuple[str, ...], *, issue_number: int, branch: str, prompt_path: Path
+) -> tuple[str, ...]:
+    values = {
+        "prompt_path": str(prompt_path),
+        "issue_number": str(issue_number),
+        "branch": branch,
+    }
+    return tuple(part.format(**values) for part in command_template)
+
+
+def launch_devin_session(
+    issue_number: int,
+    branch: str,
+    prompt_path: Path,
+    *,
+    repo_root: Path,
+    sessions_dir: Path,
+    command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
+) -> SessionRecord:
+    """Launch a headless Devin CLI session for one issue and return immediately.
+
+    Non-blocking: uses ``Popen`` (never waits for the process). stdout/stderr
+    are redirected to a per-session log file since the worker can run for many
+    minutes. The sidecar JSON is written atomically before this function
+    returns, so any crash after that point still leaves a durable record for
+    ``read_session_records``/``doctor`` to find. Never raises — a missing
+    ``devin`` binary (or any other ``OSError``) comes back as a record with
+    ``pid=None`` and ``error`` set.
+    """
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    command = _render_command(
+        command_template, issue_number=issue_number, branch=branch, prompt_path=prompt_path
+    )
+    log_path = _log_path(sessions_dir, issue_number)
+    started_at = utc_now()
+
+    kwargs: dict[str, Any] = {}
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    pid: int | None = None
+    error: str | None = None
+    try:
+        with log_path.open("w", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                list(command),
+                cwd=str(repo_root),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                **kwargs,
+            )
+        pid = process.pid
+    except OSError as exc:
+        error = str(exc)
+
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=branch,
+        prompt_path=str(prompt_path),
+        command=command,
+        pid=pid,
+        started_at=started_at,
+        log_path=str(log_path),
+        error=error,
+    )
+    _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+    return record
+
+
+def read_session_records(sessions_dir: Path) -> list[SessionRecord]:
+    """Read every sidecar JSON in ``sessions_dir`` back into ``SessionRecord``s.
+
+    Unreadable or malformed sidecars are skipped rather than raising — a
+    corrupt file must not take down doctor/status reporting for every other
+    in-flight session.
+    """
+    if not sessions_dir.is_dir():
+        return []
+    records: list[SessionRecord] = []
+    for path in sorted(sessions_dir.glob("issue-*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            records.append(SessionRecord.from_dict(payload))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return records
+
+
+def probe_devin(
+    repo_root: Path, *, command: tuple[str, ...] = ("devin", "--version")
+) -> RunResult:
+    """Run a cheap Devin CLI probe (e.g. ``devin --version``) for
+    ``doctor --adapter-probe``. Delegates to ``run_captured``, so a missing
+    binary or non-zero exit comes back as a not-ok result, never an exception.
+    """
+    return run_captured(list(command), cwd=repo_root, timeout_seconds=30)
+
+
+def _win_is_alive(pid: int) -> bool:
+    """Windows PID liveness via ``OpenProcess`` + ``GetExitCodeProcess``.
+
+    ``os.kill(pid, 0)`` is NOT usable for this on Windows: CPython's Windows
+    implementation of signal 0 does not probe the process at all (there is no
+    real "probe" signal in the Win32 API) — it was empirically verified
+    (see ``test_is_session_alive_reflects_real_process``) to keep reporting a
+    long-dead, already-``wait()``-ed PID as alive indefinitely. Instead, open
+    a limited-info handle and ask the kernel for the actual exit code:
+    ``STILL_ACTIVE`` (259) means running, anything else (or a failed
+    ``OpenProcess``, e.g. the PID never existed or was already reused) means
+    not running.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == _WIN_STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def is_session_alive(record: SessionRecord) -> bool:
+    """Check whether the process behind ``record`` is still running.
+
+    Dispatches to a platform-appropriate liveness probe: ``OpenProcess`` +
+    ``GetExitCodeProcess`` on Windows, ``os.kill(pid, 0)`` on POSIX (where it
+    is the standard, reliable idiom). This avoids a hard `psutil` dependency
+    and the slow `tasklist` subprocess round trip.
+    """
+    if record.pid is None or record.pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _win_is_alive(record.pid)
+    return _posix_is_alive(record.pid)
+
+
+__all__ = [
+    "DEFAULT_COMMAND_TEMPLATE",
+    "SessionRecord",
+    "launch_devin_session",
+    "read_session_records",
+    "probe_devin",
+    "is_session_alive",
+]

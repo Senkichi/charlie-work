@@ -13,7 +13,8 @@ dispatch:
   worker_template: worker_claude_code.md
 
 review:
-  max_rework_cycles: 3
+  # Escalates to agent:human-needed past this many request_changes cycles.
+  max_rework_cycles: 2
   require_tests_or_rationale: true
   require_issue_link: true
 
@@ -40,8 +41,23 @@ runtime:
   # prompts_dir: orchestrator-prompts
 
 devin:
-  adapter: manual
+  # claude-code launches each worker headless in an isolated git worktree with
+  # the shared venv junctioned in. Verify with `devin-orch doctor
+  # --adapter-probe`. Fall back to `adapter: manual` to paste prompts by hand.
+  adapter: claude-code
   session_manifest: .var/devin-orchestrator/dispatches/session-manifest.json
   session_results: .var/devin-orchestrator/dispatches/session-results.json
+  sessions_dir: .var/devin-orchestrator/dispatches/sessions
+
+claude_code:
+  # Launch command; empty uses the built-in default shown here. The rendered
+  # worker prompt is fed via stdin unless the command names {prompt_path}.
+  # command: [claude, -p, --permission-mode, acceptEdits]
+  # Worktrees live under .var/devin-orchestrator/worktrees unless overridden.
+  # worktrees_dir: .var/devin-orchestrator/worktrees
+  # Junctioned into each worktree so workers share one venv. NEVER remove a
+  # worktree before its .venv junction is deleted (remove_worktree handles
+  # the ordering). Set to null to disable venv sharing.
+  venv_source: .venv
 
 # cross_family omitted → disabled (Claude-only review).

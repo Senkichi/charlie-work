@@ -1,0 +1,1093 @@
+{
+  "_fixture_unknown_field": "synthetic-field-not-emitted-by-current-state.py-must-survive-roundtrip",
+  "events": [
+    {
+      "at": "2026-06-24T19:02:36Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T19:02:47Z",
+      "kind": "dispatch",
+      "payload": {
+        "issue_numbers": [
+          567,
+          566,
+          565
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T19:06:03Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T19:06:15Z",
+      "kind": "dispatch",
+      "payload": {
+        "issue_numbers": [
+          564,
+          563,
+          562
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T19:06:22Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 392,
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-06-24T19:13:55Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "request_changes",
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-06-24T19:15:51Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T19:16:03Z",
+      "kind": "dispatch",
+      "payload": {
+        "issue_numbers": [
+          561,
+          560,
+          559
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T19:16:10Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 392,
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-06-24T21:13:18Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T21:13:22Z",
+      "kind": "dispatch",
+      "payload": {
+        "failed_issue_numbers": [],
+        "issue_numbers": [
+          558
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T21:13:29Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 392,
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-06-24T21:14:33Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T21:14:50Z",
+      "kind": "dispatch",
+      "payload": {
+        "failed_issue_numbers": [],
+        "issue_numbers": [
+          553,
+          554,
+          555,
+          556,
+          557
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T21:14:56Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 392,
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-06-24T21:15:13Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-06-24T21:15:17Z",
+      "kind": "dispatch",
+      "payload": {
+        "failed_issue_numbers": [],
+        "issue_numbers": [
+          552
+        ]
+      }
+    },
+    {
+      "at": "2026-06-24T21:15:25Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 392,
+        "pr_number": 497
+      }
+    },
+    {
+      "at": "2026-07-01T02:22:39Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 28
+      }
+    },
+    {
+      "at": "2026-07-01T03:08:50Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 32
+      }
+    },
+    {
+      "at": "2026-07-01T03:52:50Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 578,
+        "pr_number": 602
+      }
+    },
+    {
+      "at": "2026-07-01T03:53:33Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 602
+      }
+    },
+    {
+      "at": "2026-07-01T04:03:36Z",
+      "kind": "review_packet",
+      "payload": {
+        "issue_number": 589,
+        "pr_number": 603
+      }
+    },
+    {
+      "at": "2026-07-01T04:05:02Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 603
+      }
+    },
+    {
+      "at": "2026-07-01T07:42:46Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 20
+      }
+    },
+    {
+      "at": "2026-07-01T07:44:14Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 20
+      }
+    },
+    {
+      "at": "2026-07-01T17:56:44Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 13
+      }
+    },
+    {
+      "at": "2026-07-01T18:19:48Z",
+      "kind": "spec_review",
+      "payload": {
+        "artifact": "C:\\example\\repo\\.planning\\redacted-artifact.md",
+        "model": "codex",
+        "ok": true
+      }
+    },
+    {
+      "at": "2026-07-01T18:32:14Z",
+      "kind": "review_packet",
+      "payload": {
+        "cross_family_ok": true,
+        "cross_family_reused": false,
+        "issue_number": 633,
+        "pr_number": 637
+      }
+    },
+    {
+      "at": "2026-07-01T18:43:04Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 637
+      }
+    },
+    {
+      "at": "2026-07-01T19:03:59Z",
+      "kind": "spec_review",
+      "payload": {
+        "artifact": "C:\\example\\repo\\.planning\\redacted-artifact.md",
+        "model": "codex",
+        "ok": true
+      }
+    },
+    {
+      "at": "2026-07-01T19:10:26Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 17
+      }
+    },
+    {
+      "at": "2026-07-01T19:33:59Z",
+      "kind": "review_packet",
+      "payload": {
+        "cross_family_ok": true,
+        "cross_family_reused": false,
+        "issue_number": 649,
+        "pr_number": 652
+      }
+    },
+    {
+      "at": "2026-07-01T19:39:46Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 652
+      }
+    },
+    {
+      "at": "2026-07-01T19:49:19Z",
+      "kind": "review_packet",
+      "payload": {
+        "cross_family_ok": true,
+        "cross_family_reused": false,
+        "issue_number": 558,
+        "pr_number": 650
+      }
+    },
+    {
+      "at": "2026-07-01T19:52:34Z",
+      "kind": "review_packet",
+      "payload": {
+        "cross_family_ok": false,
+        "cross_family_reused": false,
+        "issue_number": 566,
+        "pr_number": 651
+      }
+    },
+    {
+      "at": "2026-07-01T19:55:46Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 650
+      }
+    },
+    {
+      "at": "2026-07-01T19:55:48Z",
+      "kind": "record_review",
+      "payload": {
+        "decision": "approved",
+        "pr_number": 651
+      }
+    },
+    {
+      "at": "2026-07-01T20:02:20Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 15
+      }
+    },
+    {
+      "at": "2026-07-01T22:43:49Z",
+      "kind": "intake",
+      "payload": {
+        "issue_count": 19
+      }
+    }
+  ],
+  "generated_at": "2026-07-01T22:43:49Z",
+  "issues": {
+    "392": {
+      "labels": [
+        "agent:needs-rework",
+        "agent:pr-open",
+        "agent:reviewing",
+        "automated-ready",
+        "data-integrity-cohort"
+      ],
+      "number": 392,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-392\\worker-prompt.md",
+      "title": "Issue 392 title redacted",
+      "updated_at": "2026-06-24T21:15:24Z",
+      "url": "https://example.test/example-org/example-repo/issues/392"
+    },
+    "552": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 552,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-552\\worker-prompt.md",
+      "title": "Issue 552 title redacted",
+      "updated_at": "2026-07-01T17:41:34Z",
+      "url": "https://example.test/example-org/example-repo/issues/552"
+    },
+    "553": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 553,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-553\\worker-prompt.md",
+      "title": "Issue 553 title redacted",
+      "updated_at": "2026-06-24T21:14:48Z",
+      "url": "https://example.test/example-org/example-repo/issues/553"
+    },
+    "554": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 554,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-554\\worker-prompt.md",
+      "title": "Issue 554 title redacted",
+      "updated_at": "2026-06-24T21:14:46Z",
+      "url": "https://example.test/example-org/example-repo/issues/554"
+    },
+    "555": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 555,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-555\\worker-prompt.md",
+      "title": "Issue 555 title redacted",
+      "updated_at": "2026-07-01T17:41:35Z",
+      "url": "https://example.test/example-org/example-repo/issues/555"
+    },
+    "556": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 556,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-556\\worker-prompt.md",
+      "title": "Issue 556 title redacted",
+      "updated_at": "2026-07-01T17:41:37Z",
+      "url": "https://example.test/example-org/example-repo/issues/556"
+    },
+    "557": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 557,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-557\\worker-prompt.md",
+      "title": "Issue 557 title redacted",
+      "updated_at": "2026-07-01T21:14:24Z",
+      "url": "https://example.test/example-org/example-repo/issues/557"
+    },
+    "558": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 558,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-558\\worker-prompt.md",
+      "title": "Issue 558 title redacted",
+      "updated_at": "2026-07-01T18:49:40Z",
+      "url": "https://example.test/example-org/example-repo/issues/558"
+    },
+    "559": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 559,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-559\\worker-prompt.md",
+      "title": "Issue 559 title redacted",
+      "updated_at": "2026-06-24T19:16:01Z",
+      "url": "https://example.test/example-org/example-repo/issues/559"
+    },
+    "560": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 560,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-560\\worker-prompt.md",
+      "title": "Issue 560 title redacted",
+      "updated_at": "2026-06-24T19:15:58Z",
+      "url": "https://example.test/example-org/example-repo/issues/560"
+    },
+    "561": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 561,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-561\\worker-prompt.md",
+      "title": "Issue 561 title redacted",
+      "updated_at": "2026-07-01T18:53:45Z",
+      "url": "https://example.test/example-org/example-repo/issues/561"
+    },
+    "562": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 562,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-562\\worker-prompt.md",
+      "title": "Issue 562 title redacted",
+      "updated_at": "2026-06-24T19:06:13Z",
+      "url": "https://example.test/example-org/example-repo/issues/562"
+    },
+    "563": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 563,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-563\\worker-prompt.md",
+      "title": "Issue 563 title redacted",
+      "updated_at": "2026-06-24T19:06:10Z",
+      "url": "https://example.test/example-org/example-repo/issues/563"
+    },
+    "564": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 564,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-564\\worker-prompt.md",
+      "title": "Issue 564 title redacted",
+      "updated_at": "2026-06-24T19:06:06Z",
+      "url": "https://example.test/example-org/example-repo/issues/564"
+    },
+    "565": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 565,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-565\\worker-prompt.md",
+      "title": "Issue 565 title redacted",
+      "updated_at": "2026-07-01T19:35:42Z",
+      "url": "https://example.test/example-org/example-repo/issues/565"
+    },
+    "566": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 566,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-566\\worker-prompt.md",
+      "title": "Issue 566 title redacted",
+      "updated_at": "2026-07-01T19:09:42Z",
+      "url": "https://example.test/example-org/example-repo/issues/566"
+    },
+    "567": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 567,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-567\\worker-prompt.md",
+      "title": "Issue 567 title redacted",
+      "updated_at": "2026-06-24T19:02:38Z",
+      "url": "https://example.test/example-org/example-repo/issues/567"
+    },
+    "575": {
+      "labels": [
+        "automated-ready",
+        "data-integrity-cohort",
+        "enhancement"
+      ],
+      "number": 575,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-575\\worker-prompt.md",
+      "title": "Issue 575 title redacted",
+      "updated_at": "2026-06-30T19:29:00Z",
+      "url": "https://example.test/example-org/example-repo/issues/575"
+    },
+    "578": {
+      "labels": [
+        "automated-ready",
+        "bug",
+        "data-integrity-cohort"
+      ],
+      "number": 578,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-578\\worker-prompt.md",
+      "title": "Issue 578 title redacted",
+      "updated_at": "2026-06-30T21:08:00Z",
+      "url": "https://example.test/example-org/example-repo/issues/578"
+    },
+    "581": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 581,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-581\\worker-prompt.md",
+      "title": "Issue 581 title redacted",
+      "updated_at": "2026-07-01T07:40:51Z",
+      "url": "https://example.test/example-org/example-repo/issues/581"
+    },
+    "582": {
+      "labels": [
+        "automated-ready",
+        "bug"
+      ],
+      "number": 582,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-582\\worker-prompt.md",
+      "title": "Issue 582 title redacted",
+      "updated_at": "2026-07-01T00:15:36Z",
+      "url": "https://example.test/example-org/example-repo/issues/582"
+    },
+    "583": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 583,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-583\\worker-prompt.md",
+      "title": "Issue 583 title redacted",
+      "updated_at": "2026-07-01T00:15:38Z",
+      "url": "https://example.test/example-org/example-repo/issues/583"
+    },
+    "584": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 584,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-584\\worker-prompt.md",
+      "title": "Issue 584 title redacted",
+      "updated_at": "2026-07-01T00:15:53Z",
+      "url": "https://example.test/example-org/example-repo/issues/584"
+    },
+    "586": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 586,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-586\\worker-prompt.md",
+      "title": "Issue 586 title redacted",
+      "updated_at": "2026-07-01T00:40:39Z",
+      "url": "https://example.test/example-org/example-repo/issues/586"
+    },
+    "587": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 587,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-587\\worker-prompt.md",
+      "title": "Issue 587 title redacted",
+      "updated_at": "2026-07-01T00:40:40Z",
+      "url": "https://example.test/example-org/example-repo/issues/587"
+    },
+    "588": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 588,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-588\\worker-prompt.md",
+      "title": "Issue 588 title redacted",
+      "updated_at": "2026-07-01T00:40:41Z",
+      "url": "https://example.test/example-org/example-repo/issues/588"
+    },
+    "589": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 589,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-589\\worker-prompt.md",
+      "title": "Issue 589 title redacted",
+      "updated_at": "2026-07-01T00:40:43Z",
+      "url": "https://example.test/example-org/example-repo/issues/589"
+    },
+    "590": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 590,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-590\\worker-prompt.md",
+      "title": "Issue 590 title redacted",
+      "updated_at": "2026-07-01T00:53:48Z",
+      "url": "https://example.test/example-org/example-repo/issues/590"
+    },
+    "591": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 591,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-591\\worker-prompt.md",
+      "title": "Issue 591 title redacted",
+      "updated_at": "2026-07-01T05:21:19Z",
+      "url": "https://example.test/example-org/example-repo/issues/591"
+    },
+    "592": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 592,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-592\\worker-prompt.md",
+      "title": "Issue 592 title redacted",
+      "updated_at": "2026-07-01T00:40:47Z",
+      "url": "https://example.test/example-org/example-repo/issues/592"
+    },
+    "593": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 593,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-593\\worker-prompt.md",
+      "title": "Issue 593 title redacted",
+      "updated_at": "2026-07-01T00:40:48Z",
+      "url": "https://example.test/example-org/example-repo/issues/593"
+    },
+    "596": {
+      "labels": [
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 596,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-596\\worker-prompt.md",
+      "title": "Issue 596 title redacted",
+      "updated_at": "2026-07-01T02:36:01Z",
+      "url": "https://example.test/example-org/example-repo/issues/596"
+    },
+    "597": {
+      "labels": [
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 597,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-597\\worker-prompt.md",
+      "title": "Issue 597 title redacted",
+      "updated_at": "2026-07-01T02:36:03Z",
+      "url": "https://example.test/example-org/example-repo/issues/597"
+    },
+    "598": {
+      "labels": [
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 598,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-598\\worker-prompt.md",
+      "title": "Issue 598 title redacted",
+      "updated_at": "2026-07-01T02:36:05Z",
+      "url": "https://example.test/example-org/example-repo/issues/598"
+    },
+    "599": {
+      "labels": [
+        "agent:in-progress",
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 599,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-599\\worker-prompt.md",
+      "title": "Issue 599 title redacted",
+      "updated_at": "2026-07-01T06:12:59Z",
+      "url": "https://example.test/example-org/example-repo/issues/599"
+    },
+    "600": {
+      "labels": [
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 600,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-600\\worker-prompt.md",
+      "title": "Issue 600 title redacted",
+      "updated_at": "2026-07-01T07:43:52Z",
+      "url": "https://example.test/example-org/example-repo/issues/600"
+    },
+    "604": {
+      "labels": [
+        "agent:in-progress",
+        "apply-features-cohort",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 604,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-604\\worker-prompt.md",
+      "title": "Issue 604 title redacted",
+      "updated_at": "2026-07-01T16:59:48Z",
+      "url": "https://example.test/example-org/example-repo/issues/604"
+    },
+    "633": {
+      "labels": [
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 633,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-633\\worker-prompt.md",
+      "title": "Issue 633 title redacted",
+      "updated_at": "2026-07-01T17:56:09Z",
+      "url": "https://example.test/example-org/example-repo/issues/633"
+    },
+    "639": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "bug",
+        "dedup-subentity-cohort"
+      ],
+      "number": 639,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-639\\worker-prompt.md",
+      "title": "Issue 639 title redacted",
+      "updated_at": "2026-07-01T20:02:05Z",
+      "url": "https://example.test/example-org/example-repo/issues/639"
+    },
+    "640": {
+      "labels": [
+        "agent:in-progress",
+        "automated-ready",
+        "dedup-subentity-cohort",
+        "enhancement"
+      ],
+      "number": 640,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-640\\worker-prompt.md",
+      "title": "Issue 640 title redacted",
+      "updated_at": "2026-07-01T22:24:54Z",
+      "url": "https://example.test/example-org/example-repo/issues/640"
+    },
+    "641": {
+      "labels": [
+        "automated-ready",
+        "dedup-subentity-cohort",
+        "enhancement"
+      ],
+      "number": 641,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-641\\worker-prompt.md",
+      "title": "Issue 641 title redacted",
+      "updated_at": "2026-07-01T18:36:57Z",
+      "url": "https://example.test/example-org/example-repo/issues/641"
+    },
+    "642": {
+      "labels": [
+        "automated-ready",
+        "dedup-subentity-cohort",
+        "enhancement"
+      ],
+      "number": 642,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-642\\worker-prompt.md",
+      "title": "Issue 642 title redacted",
+      "updated_at": "2026-07-01T18:36:59Z",
+      "url": "https://example.test/example-org/example-repo/issues/642"
+    },
+    "643": {
+      "labels": [
+        "automated-ready",
+        "dedup-subentity-cohort",
+        "enhancement"
+      ],
+      "number": 643,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-643\\worker-prompt.md",
+      "title": "Issue 643 title redacted",
+      "updated_at": "2026-07-01T18:37:00Z",
+      "url": "https://example.test/example-org/example-repo/issues/643"
+    },
+    "644": {
+      "labels": [
+        "automated-ready",
+        "dedup-subentity-cohort",
+        "enhancement"
+      ],
+      "number": 644,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-644\\worker-prompt.md",
+      "title": "Issue 644 title redacted",
+      "updated_at": "2026-07-01T18:37:02Z",
+      "url": "https://example.test/example-org/example-repo/issues/644"
+    },
+    "649": {
+      "labels": [
+        "agent:in-progress",
+        "agent:pr-open",
+        "agent:reviewing",
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 649,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-649\\worker-prompt.md",
+      "title": "Issue 649 title redacted",
+      "updated_at": "2026-07-01T19:33:59Z",
+      "url": "https://example.test/example-org/example-repo/issues/649"
+    },
+    "653": {
+      "labels": [
+        "automated-ready"
+      ],
+      "number": 653,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-653\\worker-prompt.md",
+      "title": "Issue 653 title redacted",
+      "updated_at": "2026-07-01T19:40:06Z",
+      "url": "https://example.test/example-org/example-repo/issues/653"
+    },
+    "657": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "measurement-cohort"
+      ],
+      "number": 657,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-657\\worker-prompt.md",
+      "title": "Issue 657 title redacted",
+      "updated_at": "2026-07-01T20:47:50Z",
+      "url": "https://example.test/example-org/example-repo/issues/657"
+    },
+    "658": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 658,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-658\\worker-prompt.md",
+      "title": "Issue 658 title redacted",
+      "updated_at": "2026-07-01T20:48:22Z",
+      "url": "https://example.test/example-org/example-repo/issues/658"
+    },
+    "659": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "marquee-coverage-cohort"
+      ],
+      "number": 659,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-659\\worker-prompt.md",
+      "title": "Issue 659 title redacted",
+      "updated_at": "2026-07-01T20:48:23Z",
+      "url": "https://example.test/example-org/example-repo/issues/659"
+    },
+    "660": {
+      "labels": [
+        "automated-ready",
+        "cold-start-cohort",
+        "enhancement"
+      ],
+      "number": 660,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-660\\worker-prompt.md",
+      "title": "Issue 660 title redacted",
+      "updated_at": "2026-07-01T20:49:00Z",
+      "url": "https://example.test/example-org/example-repo/issues/660"
+    },
+    "661": {
+      "labels": [
+        "automated-ready",
+        "cold-start-cohort",
+        "enhancement"
+      ],
+      "number": 661,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-661\\worker-prompt.md",
+      "title": "Issue 661 title redacted",
+      "updated_at": "2026-07-01T20:49:03Z",
+      "url": "https://example.test/example-org/example-repo/issues/661"
+    },
+    "662": {
+      "labels": [
+        "automated-ready",
+        "cold-start-cohort",
+        "enhancement"
+      ],
+      "number": 662,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-662\\worker-prompt.md",
+      "title": "Issue 662 title redacted",
+      "updated_at": "2026-07-01T20:49:05Z",
+      "url": "https://example.test/example-org/example-repo/issues/662"
+    },
+    "666": {
+      "labels": [
+        "automated-ready",
+        "enhancement",
+        "reliability-cohort"
+      ],
+      "number": 666,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-666\\worker-prompt.md",
+      "title": "Issue 666 title redacted",
+      "updated_at": "2026-07-01T21:15:21Z",
+      "url": "https://example.test/example-org/example-repo/issues/666"
+    },
+    "667": {
+      "labels": [
+        "automated-ready",
+        "enhancement"
+      ],
+      "number": 667,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-667\\worker-prompt.md",
+      "title": "Issue 667 title redacted",
+      "updated_at": "2026-07-01T21:15:24Z",
+      "url": "https://example.test/example-org/example-repo/issues/667"
+    },
+    "668": {
+      "labels": [
+        "automated-ready",
+        "documentation"
+      ],
+      "number": 668,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\issues\\issue-668\\worker-prompt.md",
+      "title": "Issue 668 title redacted",
+      "updated_at": "2026-07-01T21:55:56Z",
+      "url": "https://example.test/example-org/example-repo/issues/668"
+    }
+  },
+  "prs": {
+    "497": {
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-497\\review-decision.json",
+      "issue_number": 392,
+      "number": 497,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-497\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/497"
+    },
+    "602": {
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-602\\review-decision.json",
+      "issue_number": 578,
+      "number": 602,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-602\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/602"
+    },
+    "603": {
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-603\\review-decision.json",
+      "issue_number": 589,
+      "number": 603,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-603\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/603"
+    },
+    "637": {
+      "cross_family_ok": true,
+      "cross_family_report": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-637\\cross-family-review.md",
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-637\\review-decision.json",
+      "issue_number": 633,
+      "number": 637,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-637\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/637"
+    },
+    "650": {
+      "cross_family_ok": true,
+      "cross_family_report": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-650\\cross-family-review.md",
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-650\\review-decision.json",
+      "issue_number": 558,
+      "number": 650,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-650\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/650"
+    },
+    "651": {
+      "cross_family_ok": false,
+      "cross_family_report": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-651\\cross-family-review.md",
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-651\\review-decision.json",
+      "issue_number": 566,
+      "number": 651,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-651\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/651"
+    },
+    "652": {
+      "cross_family_ok": true,
+      "cross_family_report": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-652\\cross-family-review.md",
+      "decision": "approved",
+      "decision_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-652\\review-decision.json",
+      "issue_number": 649,
+      "number": 652,
+      "prompt_path": "C:\\example\\repo\\.var\\devin-orchestrator\\prs\\pr-652\\review-prompt.md",
+      "status": "reviewing",
+      "url": "https://example.test/example-org/example-repo/pull/652"
+    }
+  },
+  "version": 1
+}
