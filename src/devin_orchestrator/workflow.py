@@ -11,7 +11,8 @@ from .adapters import SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .cross_family import CrossFamilyResult, run_cross_family_review
-from .github import GitHub, label_names, linked_issue_number
+from .github import GitHub, GitHubError, label_names, linked_issue_number
+from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .state import append_event, load_state, save_state, utc_now
@@ -106,7 +107,10 @@ class OrchestratorApp:
             issue_json = issue_dir / "issue.json"
             self._write_json(issue_json, full_issue)
             prompt_path = self._write_worker_prompt(full_issue)
+            # Merge-update, never replace: intake used to clobber dispatch
+            # status recorded by earlier passes (production-confirmed).
             state["issues"][str(issue_number)] = {
+                **state["issues"].get(str(issue_number), {}),
                 "number": issue_number,
                 "title": full_issue.get("title"),
                 "url": full_issue.get("url"),
@@ -165,23 +169,32 @@ class OrchestratorApp:
         failed_issue_numbers = {
             result.issue_number for result in dispatch_results if not result.ok
         }
+        # The manual adapter's ok means "manifest written, awaiting the
+        # operator" — no worker exists yet, so the issue is queued, not
+        # in-progress. Only an adapter that actually launched something may
+        # promote to in-progress.
+        manual = self.config.devin.adapter == "manual"
         for request in session_requests:
             full_issue = full_issues[request.issue_number]
-            if request.issue_number in successful_issue_numbers:
-                self.gh.add_issue_label(request.issue_number, self.config.labels.in_progress)
-                self.gh.remove_issue_label(request.issue_number, self.config.labels.queued)
+            ok = request.issue_number in successful_issue_numbers
+            if ok:
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    request.issue_number,
+                    "queued" if manual else "dispatched",
+                )
             state["issues"][str(request.issue_number)] = {
+                **state["issues"].get(str(request.issue_number), {}),
                 "number": request.issue_number,
                 "title": full_issue.get("title"),
                 "url": full_issue.get("url"),
                 "branch_name": request.branch_name,
                 "prompt_path": str(request.prompt_path),
-                "status": "dispatched"
-                if request.issue_number in successful_issue_numbers
+                "status": ("manifest_written" if manual else "dispatched")
+                if ok
                 else "dispatch_failed",
-                "dispatched_at": utc_now()
-                if request.issue_number in successful_issue_numbers
-                else None,
+                "dispatched_at": utc_now() if ok else None,
             }
         append_event(
             state,
@@ -262,10 +275,13 @@ class OrchestratorApp:
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
         if issue_number is not None:
-            self.gh.add_issue_label(issue_number, self.config.labels.pr_open)
-            self.gh.add_issue_label(issue_number, self.config.labels.reviewing)
+            transition(self.gh, self.config.labels, issue_number, "review_started")
         state = load_state(self.paths.state_file)
+        # Merge-update, never replace: wholesale assignment here used to erase
+        # recorded review decisions on repeated review()/loop() passes
+        # (production-confirmed, pr-497).
         state["prs"][str(pr_number)] = {
+            **state["prs"].get(str(pr_number), {}),
             "number": pr_number,
             "url": pr.get("url"),
             "issue_number": issue_number,
@@ -323,31 +339,55 @@ class OrchestratorApp:
             "summary": summary_text,
             "reviewed_at": utc_now(),
         }
-        decision_path = pr_dir / "review-decision.json"
-        self._write_json(decision_path, decision_payload)
+        state = load_state(self.paths.state_file)
         rework_path: str | None = None
+        escalated = False
         if decision == "request_changes":
-            rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
-            if issue_number is not None:
-                self.gh.add_issue_label(issue_number, self.config.labels.needs_rework)
-                self.gh.remove_issue_label(issue_number, self.config.labels.reviewing)
+            # Rework cap: past max_rework_cycles the evidence says iteration
+            # thrashes (wrong brief or unimplementable criteria) — escalate to
+            # a human instead of dispatching another cycle. The count derives
+            # from the events already recorded; no new schema field.
+            prior_cycles = sum(
+                1
+                for event in state.get("events", [])
+                if event.get("kind") == "record_review"
+                and event.get("payload", {}).get("pr_number") == pr_number
+                and event.get("payload", {}).get("decision") == "request_changes"
+            )
+            escalated = prior_cycles >= self.config.review.max_rework_cycles
+            if escalated:
+                if issue_number is not None:
+                    transition(self.gh, self.config.labels, issue_number, "escalated")
+            else:
+                rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
+                if issue_number is not None:
+                    transition(self.gh, self.config.labels, issue_number, "rework_requested")
             if comment and summary_text:
                 self._comment_pr(pr_number, summary_text)
         elif decision == "blocked" and issue_number is not None:
-            self.gh.add_issue_label(issue_number, self.config.labels.human_needed)
-        state = load_state(self.paths.state_file)
+            transition(self.gh, self.config.labels, issue_number, "blocked")
+        decision_payload["escalated"] = escalated
+        decision_path = pr_dir / "review-decision.json"
+        self._write_json(decision_path, decision_payload)
         state["prs"].setdefault(str(pr_number), {})["decision"] = decision
         state["prs"][str(pr_number)]["decision_path"] = str(decision_path)
         append_event(state, "record_review", {"pr_number": pr_number, "decision": decision})
         save_state(self.paths.state_file, state)
+        message = (
+            f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
+            "escalated to human"
+            if escalated
+            else "review recorded"
+        )
         return CommandResult(
             True,
-            "review recorded",
+            message,
             {
                 "pr": pr_number,
                 "decision": decision,
                 "decision_path": str(decision_path),
                 "rework_path": rework_path,
+                "escalated": escalated,
             },
         )
 
@@ -374,9 +414,7 @@ class OrchestratorApp:
             # `gh pr merge --delete-branch` behavior did.
             merge_output = self.gh.merge_pr(pr_number, self.config.auto_merge.strategy)
             if issue_number is not None:
-                self.gh.add_issue_label(issue_number, self.config.labels.done)
-                for label in self.config.labels.active:
-                    self.gh.remove_issue_label(issue_number, label)
+                transition(self.gh, self.config.labels, issue_number, "merged")
             if self.config.auto_merge.delete_branch:
                 head_ref = str(pr.get("headRefName") or "")
                 branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
@@ -461,12 +499,17 @@ class OrchestratorApp:
         if not use or pr.get("isDraft"):
             return "", None
         report_path = pr_dir / "cross-family-review.md"
-        # Idempotent: a non-empty report is reused, so repeated review()/loop() passes
-        # don't re-burn the cross-family model on the same PR.
+        # Idempotent: a non-empty SUCCESS report is reused, so repeated
+        # review()/loop() passes don't re-burn the cross-family model on the
+        # same PR. Failure stubs (headed "(UNAVAILABLE)") must NOT satisfy
+        # this check — reusing them turned one codex timeout into a permanent
+        # silent skip on every subsequent pass.
         if report_path.exists() and report_path.stat().st_size > 0:
-            return self._cross_family_section(report_path), CrossFamilyResult(
-                ok=True, report_path=str(report_path), model=cfg.model, reused=True
-            )
+            first_line = report_path.read_text(encoding="utf-8").splitlines()[0]
+            if "(UNAVAILABLE)" not in first_line:
+                return self._cross_family_section(report_path), CrossFamilyResult(
+                    ok=True, report_path=str(report_path), model=cfg.model, reused=True
+                )
         prompt_text = self._render(
             "cross_family_review.md",
             {
@@ -505,23 +548,37 @@ class OrchestratorApp:
         dispatch = self.dispatch(limit)
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         for pr in self.gh.pr_list():
             issue_number = linked_issue_number(pr)
             if issue_number is None:
                 continue
-            review = self.review(int(pr["number"]))
-            reviews.append(review.data)
-            decision = self._review_decision(int(pr["number"]))
-            if decision.get("decision") == "approved":
-                merges.append(self.merge_ready(int(pr["number"])).data)
+            pr_number = int(pr["number"])
+            # Per-PR isolation: one PR's merge conflict or gh failure must not
+            # abort review/merge of every remaining PR in the batch.
+            try:
+                review = self.review(pr_number)
+                reviews.append(review.data)
+                decision = self._review_decision(pr_number)
+                if decision.get("decision") == "approved":
+                    merges.append(self.merge_ready(pr_number).data)
+            except GitHubError as exc:
+                errors.append({"pr": pr_number, "error": str(exc)})
+        ok = dispatch.ok and not errors
+        message = "loop complete"
+        if not dispatch.ok:
+            message = "loop completed with dispatch failures"
+        if errors:
+            message = f"loop completed with {len(errors)} PR error(s)"
         return CommandResult(
-            dispatch.ok,
-            "loop complete" if dispatch.ok else "loop completed with dispatch failures",
+            ok,
+            message,
             {
                 "intake": intake.data,
                 "dispatch": dispatch.data,
                 "reviews": reviews,
                 "merges": merges,
+                "errors": errors,
             },
         )
 

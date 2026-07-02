@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .subprocess_runner import run_captured
 
 
 @dataclass(frozen=True)
@@ -138,43 +139,21 @@ def _run_command_adapter(
             ok=False,
             error="devin.dispatch_command is required when devin.adapter is command",
         )
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            timeout=command_timeout_seconds,
-            shell=isinstance(command, str),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return _result(
-            request,
-            adapter="command",
-            ok=False,
-            command=command,
-            stdout=str(exc.stdout or ""),
-            stderr=str(exc.stderr or ""),
-            error=f"Dispatch command timed out after {command_timeout_seconds}s",
-        )
-    except OSError as exc:
-        return _result(
-            request,
-            adapter="command",
-            ok=False,
-            command=command,
-            error=str(exc),
-        )
+    run = run_captured(
+        command,
+        cwd=repo_root,
+        timeout_seconds=command_timeout_seconds,
+        shell=isinstance(command, str),
+    )
     return _result(
         request,
         adapter="command",
-        ok=completed.returncode == 0,
+        ok=run.ok,
         command=command,
-        returncode=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-        error=None if completed.returncode == 0 else "Dispatch command failed",
+        returncode=run.returncode,
+        stdout=run.stdout,
+        stderr=run.stderr,
+        error=None if run.ok else (run.error or "Dispatch command failed"),
     )
 
 
@@ -191,7 +170,18 @@ def _render_command(
         command = [str(part).format(**values) for part in dispatch_command]
         return command if command else None
     text = str(dispatch_command or "").strip()
-    return text.format(**values) if text else None
+    if not text:
+        return None
+    # String-form commands run through a shell. issue_title is attacker
+    # controlled (anyone can title a GitHub issue), so interpolating it into
+    # a shell string is command injection — refuse it. List-form commands
+    # execute without a shell and may use every placeholder.
+    if "{issue_title}" in text:
+        raise ValueError(
+            "devin.dispatch_command: {issue_title} is not allowed in string-form "
+            "(shell) commands — use the list form, which runs without a shell"
+        )
+    return text.format(**values)
 
 
 def _result(

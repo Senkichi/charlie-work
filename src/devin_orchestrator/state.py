@@ -25,8 +25,18 @@ def empty_state() -> dict[str, Any]:
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return empty_state()
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        # Never crash the orchestrator on a truncated/corrupt state file, and
+        # never silently discard it either — quarantine it for forensics.
+        quarantine = path.with_name(f"{path.name}.corrupt-{utc_now().replace(':', '')}")
+        try:
+            path.replace(quarantine)
+        except OSError:
+            pass
+        return empty_state()
     if not isinstance(data, dict):
         return empty_state()
     data.setdefault("version", STATE_VERSION)

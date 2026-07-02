@@ -312,7 +312,10 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
     assert "Closes #123" in prompt_path.read_text(encoding="utf-8")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["sessions"][0]["branch_name"] == "agent/issue-123-fix-search"
-    assert (123, "agent:in-progress") in fake_gh.labels_added
+    # Manual adapter honesty: a written manifest means QUEUED — no worker has
+    # been independently confirmed, so in-progress must not be applied.
+    assert (123, "agent:queued") in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
@@ -327,7 +330,7 @@ def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert result.data["selected_count"] == 1
-    assert (123, "agent:in-progress") in fake_gh.labels_added
+    assert (123, "agent:queued") in fake_gh.labels_added
 
 
 def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) -> None:
@@ -735,3 +738,127 @@ def test_spec_review_missing_file_returns_error(tmp_path: Path) -> None:
     result = app.spec_review(tmp_path / "nope.md")
 
     assert result.ok is False
+
+
+# --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
+
+
+def test_load_state_quarantines_corrupt_file(tmp_path: Path) -> None:
+    from devin_orchestrator.state import load_state as _load
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{truncated garbage", encoding="utf-8")
+
+    state = _load(state_path)
+
+    assert state["issues"] == {}
+    assert not state_path.exists()
+    quarantined = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert "truncated garbage" in quarantined[0].read_text(encoding="utf-8")
+
+
+def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
+    from devin_orchestrator.state import load_state as _load
+    from devin_orchestrator.state import save_state as _save
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    state = _load(paths.state_file)
+    state["prs"]["456"] = {"decision": "approved", "custom": "kept"}
+    _save(paths.state_file, state)
+
+    app.review(456)
+
+    after = _load(paths.state_file)
+    assert after["prs"]["456"]["decision"] == "approved"  # was clobbered pre-fix
+    assert after["prs"]["456"]["custom"] == "kept"
+    assert after["prs"]["456"]["status"] == "reviewing"
+
+
+def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}")
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    assert "list form" in result.data["dispatch_results"][0]["error"]
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
+    config = OrchestratorConfig()  # max_rework_cycles = 2
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    first = app.record_review(456, "request_changes", summary="fix A")
+    second = app.record_review(456, "request_changes", summary="fix B")
+    third = app.record_review(456, "request_changes", summary="fix C")
+
+    assert first.data["escalated"] is False and first.data["rework_path"]
+    assert second.data["escalated"] is False and second.data["rework_path"]
+    assert third.data["escalated"] is True
+    assert third.data["rework_path"] is None  # no third rework prompt
+    assert fake_gh.labels_added.count((123, "agent:needs-rework")) == 2
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+
+def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) -> None:
+    app = _cross_family_app(tmp_path, enabled=True)
+    pr_dir = tmp_path / ".var" / "devin-orchestrator" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `codex` (UNAVAILABLE)\n\n> timed out\n",
+        encoding="utf-8",
+    )
+    calls = {"n": 0}
+
+    def _fake_run(**kwargs):
+        calls["n"] += 1
+        Path(kwargs["report_path"]).write_text("# real findings", encoding="utf-8")
+        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
+
+    monkeypatch.setattr("devin_orchestrator.workflow.run_cross_family_review", _fake_run)
+
+    result = app.review(456)
+
+    assert calls["n"] == 1  # the stub did NOT satisfy the reuse check
+    assert result.data["cross_family_ok"] is True
+
+
+def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
+    from devin_orchestrator.github import GitHubError as _GitHubError
+
+    class ExplodingGitHub(FakeGitHub):
+        def pr_view(self, number: int):
+            raise _GitHubError("merge conflict boom")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, ExplodingGitHub())
+
+    result = app.loop(limit=0)
+
+    assert result.data["errors"] == [{"pr": 456, "error": "merge conflict boom"}]
+    assert result.ok is False
+
+
+def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
+    from devin_orchestrator.subprocess_runner import run_captured
+
+    result = run_captured(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'caf' + bytes([0xE9]))"],
+        cwd=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert result.ok is True
+    assert result.stdout == "caf�"  # invalid UTF-8 replaced, never raises

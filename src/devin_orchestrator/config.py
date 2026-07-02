@@ -58,7 +58,10 @@ class DispatchConfig:
 
 @dataclass(frozen=True)
 class ReviewConfig:
-    max_rework_cycles: int = 3
+    # Enforced in record_review: past this many request_changes cycles the PR
+    # escalates to a human instead of another rework dispatch. 2 per operator
+    # decision (2026-07-01) — iteration past ~2 rounds thrashes.
+    max_rework_cycles: int = 2
     require_tests_or_rationale: bool = True
     require_issue_link: bool = True
 
