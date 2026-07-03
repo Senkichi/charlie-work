@@ -1741,6 +1741,7 @@ class OrchestratorApp:
                 "pr_url": pr.get("url", ""),
                 "issue_number": issue_number or "UNKNOWN",
                 "review_summary": summary,
+                "branch_name": pr.get("headRefName", ""),
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")

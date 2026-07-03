@@ -60,3 +60,19 @@ $section_scope_contract
 You are done only when the PR is open against `main`, linked to issue
 #$issue_number via `Closes #$issue_number`, CI has been given a clean tree, and
 the PR body contains a clear verification summary.
+
+**Committing locally is NOT done.** The PR must exist and point at your pushed head.
+
+After your final commit:
+
+1. Push your branch:
+   ```bash
+   git push -u origin $branch_name
+   ```
+2. Verify the PR exists and points at your commit:
+   ```bash
+   gh pr view $branch_name --json headRefOid
+   ```
+   Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
+
+Only when the PR head points at your pushed commit is the task complete.
