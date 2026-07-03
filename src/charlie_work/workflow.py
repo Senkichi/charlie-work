@@ -535,12 +535,21 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
+        # Issue #11: reject empty summary for request_changes/blocked decisions
+        # before any state/label mutation
+        if decision in {"request_changes", "blocked"} and not summary_text.strip():
+            return CommandResult(
+                False,
+                f"--summary or --summary-file is required for decision '{decision}'",
+                {},
+            )
         reviewed_head_sha = pr.get("headRefOid") if pr else None
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
             "decision": decision,
             "summary": summary_text,
+            "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_at": utc_now(),
         }
