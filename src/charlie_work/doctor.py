@@ -8,6 +8,7 @@ config, but its validity is never asserted by hand.
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,6 @@ from .config import OrchestratorConfig
 from .github import GitHub, GitHubError
 from .paths import RuntimePaths
 from .prompts import resolve_template
-from .state import load_state
 
 
 @dataclass(frozen=True)
@@ -78,12 +78,21 @@ def _check_name_matches(required: str, job_names: set[str]) -> bool:
 
 def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
     """Execute the configured adapter's CLI probe (runs an external binary,
-    so only behind --adapter-probe)."""
+    so only behind --adapter-probe).
+
+    The binary is derived from the configured command template so that a
+    custom wrapper set in ``devin.shell_command`` / ``claude_code.command`` is
+    exercised — not the hardcoded default name.
+    """
     adapter = config.devin.adapter
     if adapter == "devin-shell":
-        from .devin_shell import probe_devin
+        from .devin_shell import DEFAULT_COMMAND_TEMPLATE, probe_devin
 
-        probe = probe_devin(repo_root)
+        # Use the operator-configured template; fall back to the package default
+        # when empty.  Probe with --version substituted for the dispatch args.
+        effective_template = config.devin.shell_command or DEFAULT_COMMAND_TEMPLATE
+        binary = effective_template[0]
+        probe = probe_devin(repo_root, command=(binary, "--version"))
         add(
             "devin CLI probe",
             probe.ok,
@@ -92,7 +101,12 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
     elif adapter == "claude-code":
         from .claude_code import probe_claude
 
-        probe = probe_claude(repo_root)
+        # Use the operator-configured command; fall back to the package default
+        # when empty.
+        _default_claude_binary = "claude"
+        effective_command = config.claude_code.command
+        binary = effective_command[0] if effective_command else _default_claude_binary
+        probe = probe_claude(repo_root, command=(binary, "--version"))
         add(
             "claude CLI probe",
             probe.ok,
@@ -218,16 +232,37 @@ def run_doctor(
         add("github labels", False, f"could not list labels: {exc}", severity="warning")
 
     # -- state ---------------------------------------------------------------
-    try:
-        state = load_state(paths.state_file)
+    # Read-only preflight: parse the raw bytes with json.loads so we never
+    # trigger load_state's quarantine side-effect (which renames state.json to
+    # state.json.corrupt-*).  A missing file is fine (first run).
+    if not paths.state_file.exists():
+        add("state file", True, f"{paths.state_file} (not yet created)")
+    else:
+        try:
+            raw_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+            if not isinstance(raw_state, dict):
+                raise ValueError("state file is not a JSON object")
+            add(
+                "state file",
+                True,
+                f"{paths.state_file} (issues: {len(raw_state.get('issues', {}))}, "
+                f"prs: {len(raw_state.get('prs', {}))})",
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            add("state file", False, f"{paths.state_file}: {exc}")
+
+    # Surface any previously-quarantined corrupt state files so the operator
+    # knows to inspect or clean them up.
+    corrupt_files = sorted(paths.state_file.parent.glob(f"{paths.state_file.name}.corrupt-*"))
+    if corrupt_files:
+        names = ", ".join(p.name for p in corrupt_files)
         add(
-            "state file",
-            True,
-            f"{paths.state_file} (issues: {len(state.get('issues', {}))}, "
-            f"prs: {len(state.get('prs', {}))})",
+            "state file quarantine",
+            False,
+            f"{len(corrupt_files)} quarantined corrupt state file(s) in "
+            f"{paths.state_file.parent}: {names}",
+            severity="warning",
         )
-    except (OSError, ValueError) as exc:
-        add("state file", False, f"{paths.state_file}: {exc}")
 
     # -- adapters ------------------------------------------------------------
     if config.devin.adapter == "command" and not config.devin.dispatch_command:

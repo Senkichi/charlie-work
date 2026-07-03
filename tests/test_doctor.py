@@ -267,3 +267,120 @@ def test_doctor_without_adapter_probe_omits_probe_checks(tmp_path: Path) -> None
     names = {check.name for check in checks}
     assert "devin CLI probe" not in names
     assert "launched sessions" not in names
+
+
+# ---------------------------------------------------------------------------
+# Issue-17 regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_corrupt_state_is_not_quarantined(tmp_path: Path) -> None:
+    """doctor must report a failure on corrupt state WITHOUT renaming the file."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    # Write a corrupt (non-JSON) state file.
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("NOT JSON {{{", encoding="utf-8")
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    # The original file must still exist — doctor must not quarantine it.
+    assert paths.state_file.exists(), "doctor must not rename/quarantine the state file"
+    # Doctor should surface the corruption as a check failure.
+    by_name = {check.name: check for check in checks}
+    assert by_name["state file"].ok is False
+
+
+def test_doctor_surfaces_existing_quarantine_files_as_warning(tmp_path: Path) -> None:
+    """Pre-existing *.corrupt-* files must appear as a warning-severity check."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    # Simulate a previously-quarantined corrupt state file.
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = paths.state_file.parent / f"{paths.state_file.name}.corrupt-20260101T000000Z"
+    corrupt.write_text("{}", encoding="utf-8")
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "state file quarantine" in by_name
+    quarantine_check = by_name["state file quarantine"]
+    assert quarantine_check.ok is False
+    assert quarantine_check.severity == "warning"
+    assert "1 quarantined" in quarantine_check.detail
+    # A warning-only finding must not block doctor.
+    assert ok is True
+
+
+def test_doctor_no_quarantine_check_when_none_exist(tmp_path: Path) -> None:
+    """No quarantine check emitted when there are no corrupt-* files."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    names = {check.name for check in checks}
+    assert "state file quarantine" not in names
+
+
+def test_doctor_adapter_probe_uses_configured_devin_binary(tmp_path: Path, monkeypatch) -> None:
+    """probe_devin must be called with the binary from devin.shell_command."""
+    captured: list[tuple[str, ...]] = []
+
+    def fake_probe_devin(repo_root, **kwargs):
+        captured.append(kwargs.get("command", ()))
+        return RunResult(returncode=0, stdout="custom-devin 9.9", stderr="")
+
+    monkeypatch.setattr("charlie_work.devin_shell.probe_devin", fake_probe_devin)
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(
+            adapter="devin-shell",
+            sessions_dir="sessions",
+            shell_command=("my-devin-wrapper", "--prompt-file", "{prompt_path}", "--print"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
+
+    assert len(captured) == 1
+    assert captured[0][0] == "my-devin-wrapper", (
+        "probe must use the configured binary, not the hardcoded default"
+    )
+
+
+def test_doctor_adapter_probe_uses_configured_claude_binary(tmp_path: Path, monkeypatch) -> None:
+    """probe_claude must be called with the binary from claude_code.command."""
+    captured: list[tuple[str, ...]] = []
+
+    def fake_probe_claude(repo_root, **kwargs):
+        captured.append(kwargs.get("command", ()))
+        return RunResult(returncode=0, stdout="my-claude 5.0", stderr="")
+
+    monkeypatch.setattr("charlie_work.claude_code.probe_claude", fake_probe_claude)
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        claude_code=ClaudeCodeConfig(
+            command=("my-claude-wrapper", "-p", "--permission-mode", "acceptEdits"),
+            venv_source="",
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
+
+    assert len(captured) == 1
+    assert captured[0][0] == "my-claude-wrapper", (
+        "probe must use the configured binary, not the hardcoded default"
+    )
