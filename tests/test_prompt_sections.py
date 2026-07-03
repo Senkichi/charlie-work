@@ -173,3 +173,96 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
 
     assert "merge the PR's base branch" in prompt
     assert "incorporate any base changes" in prompt
+
+
+def test_rework_prompt_includes_push_then_verify_final_step() -> None:
+    """Verify that the rework prompt includes the push-then-verify FINAL STEP with resolved placeholders.
+
+    This test goes through the REAL call site (_write_rework_prompt) to ensure the branch_name
+    is correctly extracted from PR headRefName and rendered without unresolved placeholders.
+    """
+    from pathlib import Path
+    import tempfile
+
+    # Use the real workflow._write_rework_prompt call site
+    from charlie_work.workflow import OrchestratorApp
+    from charlie_work.config import OrchestratorConfig, DevinConfig
+    from charlie_work.paths import runtime_paths
+
+    # Minimal mock GitHub client - only what _write_rework_prompt needs
+    class MinimalFakeGitHub:
+        def __init__(self):
+            self.labels_added = []
+            self.labels_removed = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        config = OrchestratorConfig(
+            devin=DevinConfig(adapter="manual"),
+        )
+        paths = runtime_paths(tmp_path, config.runtime.state_dir)
+        fake_gh = MinimalFakeGitHub()
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+        # PR dict with headRefName (the real source of branch_name)
+        pr = {
+            "number": 456,
+            "title": "fix: search is broken",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+        }
+
+        # Call the real _write_rework_prompt method
+        # The method expects the PR directory to exist
+        pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        rework_path = app._write_rework_prompt(pr, 123, "Fix the typo in the search function.")
+
+        # Read the rendered prompt
+        prompt = rework_path.read_text(encoding="utf-8")
+
+        # Verify the FINAL STEP section exists
+        assert "## FINAL STEP — push and verify" in prompt
+        # Verify the key instruction about local commits not being done
+        assert "Committing locally is NOT done" in prompt
+        # Verify the full test suite instruction
+        assert "uv run --extra dev pytest -q --tb=short" in prompt
+        # Verify the push instruction with RESOLVED branch name (from headRefName)
+        assert "git push origin agent/issue-123-fix-search" in prompt
+        # Verify the PR head verification with RESOLVED PR number
+        assert "gh pr view 456 --json headRefOid" in prompt
+        # Verify the comparison instruction
+        assert "headRefOid" in prompt
+        assert "git rev-parse HEAD" in prompt
+        # CRITICAL: assert NO unresolved $ placeholders remain anywhere
+        assert "$" not in prompt, f"Unresolved placeholders found in rendered prompt:\n{prompt}"
+
+
+def test_worker_prompt_includes_push_then_verify() -> None:
+    """Verify that the worker.md prompt includes push-then-verify in the Done condition."""
+    prompt = _render_worker_with_sections("worker.md")
+
+    # Verify the key instruction about local commits not being done
+    assert "Committing locally is NOT done" in prompt
+    # Verify the push instruction with resolved branch name
+    assert "git push origin agent/issue-123-fix-search" in prompt
+    # Verify the PR head verification
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
+    # Verify the comparison instruction
+    assert "headRefOid" in prompt
+    assert "git rev-parse HEAD" in prompt
+
+
+def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
+    """Verify that the worker_claude_code.md prompt includes push-then-verify in the Done condition."""
+    prompt = _render_worker_with_sections("worker_claude_code.md")
+
+    # Verify the key instruction about local commits not being done
+    assert "Committing locally is NOT done" in prompt
+    # Verify the push instruction with resolved branch name
+    assert "git push -u origin agent/issue-123-fix-search" in prompt
+    # Verify the PR head verification
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
+    # Verify the comparison instruction
+    assert "headRefOid" in prompt
+    assert "git rev-parse HEAD" in prompt
