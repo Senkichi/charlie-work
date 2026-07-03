@@ -30,7 +30,7 @@ def _install_fake_create_worktree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
 ) -> None:
     def fake_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False, recovery=None
     ):
         if calls is not None:
             calls.append(
@@ -41,6 +41,7 @@ def _install_fake_create_worktree(
                     "worktrees_dir": worktrees_dir,
                     "venv_source": venv_source,
                     "rework": rework,
+                    "recovery": recovery,
                 }
             )
         return _fake_worktree(tmp_path, branch)
@@ -278,7 +279,7 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
     sessions_dir = tmp_path / "sessions"
 
     def failing_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False, recovery=None
     ):
         raise RuntimeError("git worktree add failed: branch already exists")
 

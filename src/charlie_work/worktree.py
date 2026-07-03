@@ -18,6 +18,7 @@ import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .subprocess_runner import run_captured
 
@@ -92,6 +93,7 @@ def create_worktree(
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
     rework: bool = False,
+    recovery: dict[str, Any] | None = None,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -108,10 +110,128 @@ def create_worktree(
       to the origin tip instead of failing.
     - Otherwise, use ``git worktree add <path> <branch>`` (no ``-b``) to
       attach to the existing branch at its origin tip.
+
+    If ``recovery`` is provided (a dict with state file dispatch record),
+    this is a dead-worker recovery re-dispatch. The dict must contain
+    ``branch_name`` matching the requested ``branch``. Recovery mode:
+    - If the leftover worktree/branch has NO commits beyond the merge-base
+      with ``base_ref`` (crashed before committing): remove worktree + branch
+      and create fresh — a clean restart.
+    - If it HAS commits or a dirty tree (crashed mid-work): reuse via the
+      existing rework-style attach (fetch/ff if possible), so the relaunched
+      worker continues from the partial work.
+    - If the branch exists WITHOUT a matching state record (foreign state):
+      fail loudly — that protects against clobbering anything that is not ours.
     """
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
+
+    # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
+    if recovery is not None:
+        # Validate that the recovery record matches the requested branch
+        recovery_branch = recovery.get("branch_name")
+        if recovery_branch != branch:
+            raise RuntimeError(
+                f"Recovery record branch_name {recovery_branch!r} does not match "
+                f"requested branch {branch!r}"
+            )
+
+        # Check if the branch/worktree exists
+        existing_worktrees = list_worktrees(repo_root)
+        existing_wt = next(
+            (
+                wt
+                for wt in existing_worktrees
+                if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch
+            ),
+            None,
+        )
+
+        if existing_wt:
+            # Worktree exists: check if it has commits beyond the merge-base
+            wt_path = Path(existing_wt["worktree"])
+            # Check for dirty working tree
+            dirty_result = run_captured(
+                ["git", "status", "--porcelain"],
+                cwd=wt_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            has_dirty = dirty_result.ok and bool(dirty_result.stdout.strip())
+
+            # Check for commits beyond merge-base with base_ref
+            merge_base_result = run_captured(
+                ["git", "merge-base", base_ref, branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if merge_base_result.ok:
+                merge_base = merge_base_result.stdout.strip()
+                # Count commits from merge-base to branch tip
+                rev_list_result = run_captured(
+                    ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                has_commits = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+            else:
+                # If merge-base fails, assume has commits to be safe
+                has_commits = True
+
+            if has_commits or has_dirty:
+                # Has work: reuse via rework-style attach
+                # Fall through to rework logic below by setting rework=True
+                rework = True
+            else:
+                # Clean: remove worktree and branch, then create fresh
+                if not remove_worktree(repo_root, wt_path, force=True):
+                    raise RuntimeError(
+                        f"Failed to remove leftover worktree {wt_path} for recovery"
+                    )
+                # Delete the branch
+                run_captured(
+                    ["git", "branch", "-D", branch],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # Fall through to fresh dispatch below (rework=False)
+        else:
+            # No worktree exists, but branch might exist
+            # Check if branch exists
+            branch_result = run_captured(
+                ["git", "branch", "--list", branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if branch_result.ok and branch_result.stdout.strip():
+                # Branch exists without worktree: check commits and reuse or delete
+                merge_base_result = run_captured(
+                    ["git", "merge-base", base_ref, branch],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                if merge_base_result.ok:
+                    merge_base = merge_base_result.stdout.strip()
+                    rev_list_result = run_captured(
+                        ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                    has_commits = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+                else:
+                    has_commits = True
+
+                if has_commits:
+                    # Has commits: reuse via rework-style attach
+                    rework = True
+                else:
+                    # Clean: delete branch and create fresh
+                    run_captured(
+                        ["git", "branch", "-D", branch],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                    # Fall through to fresh dispatch below (rework=False)
 
     if rework:
         # Rework mode: branch already exists, reuse or attach to it

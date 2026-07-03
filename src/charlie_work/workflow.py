@@ -363,12 +363,21 @@ class OrchestratorApp:
                 full_issues[issue_number] = full_issue
                 prompt_path = self._write_worker_prompt(full_issue)
                 branch_name = self._branch_name(full_issue)
+
+                # Check if this is a dead-worker recovery (same logic as real dispatch)
+                recovery_record: dict[str, Any] | None = None
+                prev_entry = state.get("issues", {}).get(str(issue_number), {})
+                prev_branch = prev_entry.get("branch_name")
+                if prev_branch == branch_name and prev_entry.get("status") == "dispatched":
+                    recovery_record = prev_entry
+
                 session_requests.append(
                     SessionRequest(
                         issue_number=issue_number,
                         issue_title=str(full_issue.get("title") or ""),
                         prompt_path=prompt_path,
                         branch_name=branch_name,
+                        recovery=recovery_record,
                     )
                 )
 
@@ -471,12 +480,25 @@ class OrchestratorApp:
             full_issues[issue_number] = full_issue
             prompt_path = self._write_worker_prompt(full_issue)
             branch_name = self._branch_name(full_issue)
+
+            # Check if this is a dead-worker recovery: the issue has a previous
+            # dispatch record with the same branch name (i.e., our own crashed attempt)
+            recovery_record: dict[str, Any] | None = None
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                prev_entry = state.get("issues", {}).get(str(issue_number), {})
+                prev_branch = prev_entry.get("branch_name")
+                if prev_branch == branch_name and prev_entry.get("status") == "dispatched":
+                    # This is our own crashed attempt - pass the record for recovery
+                    recovery_record = prev_entry
+
             session_requests.append(
                 SessionRequest(
                     issue_number=issue_number,
                     issue_title=str(full_issue.get("title") or ""),
                     prompt_path=prompt_path,
                     branch_name=branch_name,
+                    recovery=recovery_record,
                 )
             )
         manifest_path = self.repo_root / self.config.devin.session_manifest

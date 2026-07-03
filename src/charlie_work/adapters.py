@@ -15,6 +15,7 @@ class SessionRequest:
     prompt_path: Path
     branch_name: str
     rework: bool = False
+    recovery: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ def _request_dict(request: SessionRequest) -> dict[str, Any]:
         "prompt_path": str(request.prompt_path),
         "branch_name": request.branch_name,
         "rework": request.rework,
+        "recovery": request.recovery,
     }
 
 
@@ -207,6 +209,7 @@ def _run_devin_shell_adapter(
             command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
             worker_model=settings.worker_model,
             rework=request.rework,
+            recovery=request.recovery,
         )
         # Non-blocking launch: there is no returncode/stdout to report — liveness
         # and output live in the sidecar JSON and per-session log.
@@ -254,6 +257,7 @@ def _run_claude_code_adapter(
         venv_source=settings.venv_source,
         env=settings.worker_env,
         rework=request.rework,
+        recovery=request.recovery,
         **kwargs,
     )
     ok = record.error is None and record.pid is not None
