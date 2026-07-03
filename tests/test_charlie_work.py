@@ -35,7 +35,13 @@ from charlie_work.cross_family import (
 from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
-from charlie_work.state import load_state, save_state, state_lock
+from charlie_work.state import (
+    is_throttled,
+    load_state,
+    save_state,
+    set_throttled_until,
+    state_lock,
+)
 from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
@@ -3614,6 +3620,102 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
+def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -> None:
+    """Test that loop() classifies dead sessions and sets throttled_until in state.
+
+    This is a loop-path integration test: it constructs the app with a fake adapter,
+    simulates a session that died with the rate-limit signature, runs a loop pass,
+    then asserts (a) throttled_until is persisted in state and (b) a subsequent
+    dispatch() defers launches until it expires.
+
+    The test MUST fail when _classify_dead_sessions_and_update_throttle_state is
+    removed from loop() — this is the acceptance test for the exact regression class.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime, timedelta
+
+    # Use command adapter to avoid needing real devin binary
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Ensure state directory exists
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a sessions directory with a dead session that has a rate-limit log
+    # Use the config's sessions_dir path
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run a loop pass with limit=0 (no actual dispatch, just the classification logic)
+    # We don't assert result.ok because dispatch may fail with no issues to process
+    # The key is that the classification logic runs regardless
+    app.loop(limit=0)
+
+    # Verify throttled_until was set in state by the loop's classification pass
+    state = load_state(paths.state_file)
+    assert state.get("throttled_until") is not None
+
+    # Verify the cooldown reflects the parsed 10 minutes
+    throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    # Allow 2 second tolerance for test execution time
+    assert abs((throttle_time - expected_time).total_seconds()) < 2
+
+    # Verify that a subsequent dispatch() defers launches while throttled
+    # Add a dispatchable issue
+    fake_gh.issues = [
+        {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "body": "Search is broken",
+            "labels": [{"name": "automated-ready"}],
+        }
+    ]
+
+    dispatch_result = app.dispatch(limit=1)
+    # Dispatch should be deferred due to throttle (ok=False is expected for deferral)
+    assert dispatch_result.ok is False
+    assert "deferred" in dispatch_result.message.lower()
+    # Should defer launch due to throttle
+    assert dispatch_result.data["selected_count"] == 0
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
@@ -3828,6 +3930,142 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     assert result.data["concurrency_limit"] == 2
     assert result.data["live_session_count"] == 1
     assert result.data["available_slots"] == 1
+
+
+def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
+    """When provider throttle window is active, dispatch should defer and report why."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the future
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        # Set throttled_until to 1 hour in the future
+        from datetime import UTC, datetime, timedelta
+
+        future_time = datetime.now(UTC) + timedelta(hours=1)
+        throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch()
+
+    # Should defer with provider_throttled reason
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled"
+    assert result.data["throttled_until"] is not None
+    assert result.data["selected_count"] == 0
+    assert result.data["attempted_count"] == 0
+
+
+def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
+    """When provider throttle window has passed, dispatch should proceed normally."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the past
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        from datetime import UTC, datetime, timedelta
+
+        past_time = datetime.now(UTC) - timedelta(hours=1)
+        throttled_until = past_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch()
+
+    # Should proceed normally (not throttled)
+    assert result.ok is True
+    assert result.data["selected_count"] == 1  # One ready issue
+    assert "deferred_reason" not in result.data
+
+
+def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
+    """When provider throttle window is active, rework dispatch should also defer."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Add a needs-rework issue with an open PR
+    fake_gh.issues.append(
+        {
+            "number": 42,
+            "title": "Fix something",
+            "url": "https://example.test/issues/42",
+            "body": "Fix it",
+            "labels": [{"name": "agent:needs-rework"}],
+        }
+    )
+    # Replace the default PR with one linked to issue 42
+    fake_gh.pr = {
+        "number": 100,
+        "title": "Fix something",
+        "url": "https://example.test/pr/100",
+        "state": "OPEN",
+        "headRefName": "agent/issue-42-fix",
+        "headRefOid": "sha-abc123",
+        "baseRefName": "main",
+        "isCrossRepository": False,
+        "body": "Closes #42",
+        "labels": [],
+    }
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the future
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        from datetime import UTC, datetime, timedelta
+
+        future_time = datetime.now(UTC) + timedelta(hours=1)
+        throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch_rework()
+
+    # Should defer with provider_throttled reason
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled"
+    assert result.data["throttled_until"] is not None
+    assert result.data["selected_count"] == 0
+
+
+def test_is_throttled_checks_against_current_time(tmp_path: Path) -> None:
+    """is_throttled should return True only when now < throttled_until."""
+    from datetime import UTC, datetime, timedelta
+
+    # Test with future timestamp
+    future_time = datetime.now(UTC) + timedelta(hours=1)
+    throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    state = {"throttled_until": throttled_until}
+    assert is_throttled(state) is True
+
+    # Test with past timestamp
+    past_time = datetime.now(UTC) - timedelta(hours=1)
+    throttled_until = past_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    state = {"throttled_until": throttled_until}
+    assert is_throttled(state) is False
+
+    # Test with no throttled_until
+    state = {"throttled_until": None}
+    assert is_throttled(state) is False
+
+    # Test with malformed timestamp
+    state = {"throttled_until": "invalid-timestamp"}
+    assert is_throttled(state) is False
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
