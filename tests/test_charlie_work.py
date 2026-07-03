@@ -686,7 +686,6 @@ class FakeGitHub:
                 "body": "Closes #123\n\nTests: regression coverage added.",
                 "labels": [],
                 "isCrossRepository": False,
-                "state": "OPEN",
             }
         ]
         self.labels_added: list[tuple[int, str]] = []
@@ -4013,7 +4012,6 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                     "title": "PR for issue 123",
                     "url": "https://example.test/pr/456",
                     "headRefOid": "abc123",
-                    "state": "OPEN",
                     "isCrossRepository": False,
                     "headRefName": "agent/issue-123",
                 },
@@ -4022,7 +4020,6 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                     "title": "PR for issue 124",
                     "url": "https://example.test/pr/457",
                     "headRefOid": "def456",
-                    "state": "OPEN",
                     "isCrossRepository": False,
                     "headRefName": "agent/issue-124",
                 },
@@ -4124,7 +4121,6 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
                 "headRefOid": "abc123",
-                "state": "OPEN",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }
@@ -4176,7 +4172,6 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
                 "headRefOid": "sha-abc123",
-                "state": "OPEN",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }
@@ -4223,7 +4218,6 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
                 "headRefOid": "sha-abc123",
-                "state": "OPEN",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }
@@ -4262,7 +4256,6 @@ def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
                 "headRefOid": "sha-abc123",
-                "state": "OPEN",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }

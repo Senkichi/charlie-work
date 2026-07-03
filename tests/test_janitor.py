@@ -45,7 +45,6 @@ def _green_pr(**overrides) -> dict:
         "headRefName": "agent/issue-123-fix-search",
         "body": "Closes #123.\n\nTests: added unit tests for the search path.",
         "isDraft": False,
-        "state": "OPEN",
         "mergeable": "MERGEABLE",
         "additions": 10,
         "deletions": 5,
