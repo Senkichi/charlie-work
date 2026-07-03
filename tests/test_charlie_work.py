@@ -1136,31 +1136,44 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
     config = OrchestratorConfig()
 
     class DriftGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self._pr = {
+                "number": 456,
+                "title": "fix",
+                "url": "u",
+                "headRefName": "agent/issue-123-x",
+                "baseRefName": "main",
+                "body": "",
+                "state": "MERGED",
+                "labels": [],
+            }
+            self._issue = {
+                "number": 123,
+                "title": "t",
+                "url": "u",
+                "body": "",
+                "labels": [{"name": "agent:in-progress"}],
+            }
+
         def run(self, arguments, *, json_output=False, allow_failure=False):
             if arguments[:2] == ["pr", "list"]:
-                return [
-                    {
-                        "number": 456,
-                        "title": "fix",
-                        "url": "u",
-                        "headRefName": "agent/issue-123-x",
-                        "baseRefName": "main",
-                        "body": "",
-                        "state": "MERGED",
-                        "labels": [],
-                    }
-                ]
+                return [self._pr]
             if arguments[:2] == ["issue", "list"]:
-                return [
-                    {
-                        "number": 123,
-                        "title": "t",
-                        "url": "u",
-                        "body": "",
-                        "labels": [{"name": "agent:in-progress"}],
-                    }
-                ]
+                return [self._issue]
             return []
+
+        def remove_issue_label(self, number: int, label: str) -> None:
+            super().remove_issue_label(number, label)
+            self._issue["labels"] = [
+                item for item in self._issue["labels"] if item.get("name") != label
+            ]
+
+        def add_issue_label(self, number: int, label: str) -> None:
+            super().add_issue_label(number, label)
+            names = {item.get("name") for item in self._issue["labels"]}
+            if label not in names:
+                self._issue["labels"].append({"name": label})
 
     app = OrchestratorApp(
         tmp_path, runtime_paths(tmp_path, config.runtime.state_dir), config, DriftGitHub()
@@ -1170,6 +1183,50 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert result.data["fixed"] is True
+    assert result.data["drift_before"] == 1
+    assert result.data["drift_after"] == 0
+    assert result.data["remaining_drift"] == []
+
+
+def test_reconcile_partial_fix_failure_reports_remaining_drift(tmp_path: Path) -> None:
+    """mop-up --fix must exit non-zero when a label removal silently fails."""
+    config = OrchestratorConfig()
+
+    class FailingRemoveGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self._issue = {
+                "number": 30,
+                "title": "t",
+                "url": "u",
+                "body": "",
+                "labels": [{"name": "agent:in-progress"}],
+            }
+
+        def run(self, arguments, *, json_output=False, allow_failure=False):
+            if arguments[:2] == ["pr", "list"]:
+                return []
+            if arguments[:2] == ["issue", "list"]:
+                return [self._issue]
+            return []
+
+        def remove_issue_label(self, number: int, label: str) -> None:
+            # Simulate allow_failure=True silently dropping the removal.
+            pass
+
+    app = OrchestratorApp(
+        tmp_path, runtime_paths(tmp_path, config.runtime.state_dir), config, FailingRemoveGitHub()
+    )
+
+    result = app.reconcile(fix=True)
+
+    assert result.ok is False
+    assert result.data["fixed"] is False
+    assert result.data["drift_before"] == 1
+    assert result.data["drift_after"] == 1
+    assert len(result.data["remaining_drift"]) == 1
+    assert result.data["remaining_drift"][0]["kind"] == "issue_active_label_no_open_pr"
+    assert "partially fixed" in result.message
 
 
 # --- --repo path validation ----------------------------------------------------
