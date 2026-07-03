@@ -173,3 +173,63 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
 
     assert "merge the PR's base branch" in prompt
     assert "incorporate any base changes" in prompt
+
+
+def test_rework_prompt_includes_push_then_verify_final_step() -> None:
+    """Verify that the rework prompt includes the push-then-verify FINAL STEP with resolved placeholders."""
+    from pathlib import Path
+
+    rework_values = {
+        "pr_number": 456,
+        "pr_title": "fix: search is broken",
+        "pr_url": "https://example.test/pull/456",
+        "issue_number": 123,
+        "review_summary": "Fix the typo in the search function.",
+        "branch_name": "agent/issue-123-fix-search",
+    }
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
+
+    # Verify the FINAL STEP section exists
+    assert "## FINAL STEP — push and verify" in prompt
+    # Verify the key instruction about local commits not being done
+    assert "Committing locally is NOT done" in prompt
+    # Verify the full test suite instruction
+    assert "uv run --extra dev pytest -q --tb=short" in prompt
+    # Verify the push instruction with resolved branch name
+    assert "git push origin agent/issue-123-fix-search" in prompt
+    # Verify the PR head verification with resolved PR number
+    assert "gh pr view 456 --json headRefOid" in prompt
+    # Verify the comparison instruction
+    assert "headRefOid" in prompt
+    assert "git rev-parse HEAD" in prompt
+
+
+def test_worker_prompt_includes_push_then_verify() -> None:
+    """Verify that the worker.md prompt includes push-then-verify in the Done condition."""
+    prompt = _render_worker_with_sections("worker.md")
+
+    # Verify the key instruction about local commits not being done
+    assert "Committing locally is NOT done" in prompt
+    # Verify the push instruction with resolved branch name
+    assert "git push origin agent/issue-123-fix-search" in prompt
+    # Verify the PR head verification
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
+    # Verify the comparison instruction
+    assert "headRefOid" in prompt
+    assert "git rev-parse HEAD" in prompt
+
+
+def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
+    """Verify that the worker_claude_code.md prompt includes push-then-verify in the Done condition."""
+    prompt = _render_worker_with_sections("worker_claude_code.md")
+
+    # Verify the key instruction about local commits not being done
+    assert "Committing locally is NOT done" in prompt
+    # Verify the push instruction with resolved branch name
+    assert "git push -u origin agent/issue-123-fix-search" in prompt
+    # Verify the PR head verification
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
+    # Verify the comparison instruction
+    assert "headRefOid" in prompt
+    assert "git rev-parse HEAD" in prompt
