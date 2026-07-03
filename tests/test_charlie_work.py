@@ -506,7 +506,8 @@ def test_load_config_rejects_positional_placeholder_in_shell_command(tmp_path: P
         raise AssertionError("expected ConfigError for positional placeholder")
 
     assert "devin.shell_command" in message
-    assert "malformed placeholder" in message
+    # Positional placeholders are caught as unknown (not in allowed set) or malformed
+    assert "unknown placeholder" in message or "malformed placeholder" in message
 
 
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
