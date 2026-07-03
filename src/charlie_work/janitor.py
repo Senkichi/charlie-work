@@ -26,9 +26,6 @@ if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig
 
 
-# Branch-issue reference pattern (matches github.py's _BRANCH_ISSUE_REF)
-_BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
-
 # Case-insensitive markers scanned for in the PR body when
 # `config.review.require_tests_or_rationale` is set. Presence of any one of
 # these substrings is treated as evidence the author addressed testing or
@@ -192,9 +189,7 @@ def _check_base_movement(
     if not head.startswith(config.dispatch.branch_prefix):
         return
 
-    # Get the behindBy count from PR data
-    behind = pr.get("behindBy")
-    if not isinstance(behind, int) or behind <= 0:
-        return
-
-    warnings.append(f"Base moved {behind} commit(s) since branch")
+    # Check mergeStateStatus for BEHIND indication
+    merge_status = pr.get("mergeStateStatus")
+    if merge_status == "BEHIND":
+        warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")

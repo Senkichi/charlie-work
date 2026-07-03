@@ -171,5 +171,5 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
     prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
 
-    assert "merge `origin/main`" in prompt
+    assert "merge the PR's base branch" in prompt
     assert "incorporate any base changes" in prompt
