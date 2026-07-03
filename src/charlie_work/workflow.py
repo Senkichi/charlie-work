@@ -10,7 +10,7 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
-from .cross_family import CrossFamilyResult, run_cross_family_review
+from .cross_family import CrossFamilyResult, report_body_is_valid, run_cross_family_review
 from .github import GitHub, GitHubError, label_names, linked_issue_number
 from .janitor import run_janitor
 from .labels import transition
@@ -762,14 +762,16 @@ class OrchestratorApp:
         if not use or pr.get("isDraft"):
             return "", None
         report_path = pr_dir / "cross-family-review.md"
-        # Idempotent: a non-empty SUCCESS report is reused, so repeated
-        # review()/loop() passes don't re-burn the cross-family model on the
-        # same PR. Failure stubs (headed "(UNAVAILABLE)") must NOT satisfy
-        # this check — reusing them turned one codex timeout into a permanent
+        # Idempotent: a non-empty, semantically valid SUCCESS report is reused,
+        # so repeated review()/loop() passes don't re-burn the cross-family model
+        # on the same PR. Failure stubs (headed "(UNAVAILABLE)") and exit-zero
+        # but empty/blocked reports must NOT satisfy this check — reusing them
+        # turned one codex timeout and one blocked refusal into a permanent
         # silent skip on every subsequent pass.
         if report_path.exists() and report_path.stat().st_size > 0:
-            first_line = report_path.read_text(encoding="utf-8").splitlines()[0]
-            if "(UNAVAILABLE)" not in first_line:
+            text = report_path.read_text(encoding="utf-8")
+            first_line = text.splitlines()[0]
+            if "(UNAVAILABLE)" not in first_line and report_body_is_valid(text):
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )

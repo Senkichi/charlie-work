@@ -15,7 +15,9 @@ failure is captured as a stub report and a not-ok result instead.
 
 from __future__ import annotations
 
+import re
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +31,41 @@ _CAVEAT = (
     "it in, reject over-escalations with a reason, and never let this report "
     "gate a merge on its own."
 )
+
+# Transient provider failures that merit one bounded in-process retry.
+_TRANSIENT_RE = re.compile(
+    r"(?:rate\s+limit|too\s+many\s+requests|temporarily\s+unavailable|"
+    r"try\s+again\s+later|reset\s+in\s+.*?minute|please\s+try\s+again)",
+    re.IGNORECASE,
+)
+
+_BLOCKED_RE = re.compile(
+    r"\b(?:blocked|permission|re-run|rejected|refused|unavailable)\b", re.IGNORECASE
+)
+
+_VERDICT_RE = re.compile(r"^\s*verdict\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def _looks_transient(*texts: str) -> bool:
+    return bool(_TRANSIENT_RE.search("\n".join(texts)))
+
+
+def report_body_is_valid(body: str) -> bool:
+    """Return True if the captured model output looks like a real review.
+
+    A real review must contain at least one severity marker (**SEVERITY**) or a
+    final ``Verdict:`` line.  Blocked/refusal messages that happen to include a
+    verdict line are still rejected so they cannot be cached as a success report.
+    """
+    text = body.strip()
+    if not text:
+        return False
+    has_severity = "**" in text
+    has_verdict = bool(_VERDICT_RE.search(text))
+    looks_blocked = bool(_BLOCKED_RE.search(text))
+    if has_severity:
+        return True
+    return has_verdict and not looks_blocked
 
 
 @dataclass(frozen=True)
@@ -64,46 +101,60 @@ def run_cross_family_review(
     report_path: Path,
     timeout_seconds: int,
     runner: Runner = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> CrossFamilyResult:
     """Write ``prompt_text`` to ``prompt_path``, run the cross-family model from
     ``repo_root`` (so it can read the real code), and capture stdout to
-    ``report_path``. Returns a result; never raises."""
+    ``report_path``. Returns a result; never raises.
+
+    One bounded retry is performed when the runner fails with a transient
+    provider error (rate-limit/temporarily-unavailable text).  Exit-zero output
+    that is semantically empty or blocked is written as an ``(UNAVAILABLE)``
+    stub instead of a reusable success report.
+    """
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
     rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
-    try:
-        completed = runner(
-            rendered,
-            cwd=str(repo_root),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=timeout_seconds,
-            shell=isinstance(rendered, str),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = (
-            exc.stdout.decode("utf-8", "replace")
-            if isinstance(exc.stdout, bytes)
-            else (exc.stdout or "")
-        )
-        return _fail(
-            report_path,
-            model,
-            f"cross-family review timed out after {timeout_seconds}s",
-            partial=str(partial),
-        )
-    except OSError as exc:
-        return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
-    except subprocess.SubprocessError as exc:  # any other subprocess failure
-        return _fail(report_path, model, f"cross-family review errored: {exc}")
+    for attempt in range(2):
+        try:
+            completed = runner(
+                rendered,
+                cwd=str(repo_root),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+                shell=isinstance(rendered, str),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            return _fail(
+                report_path,
+                model,
+                f"cross-family review timed out after {timeout_seconds}s",
+                partial=str(partial),
+            )
+        except OSError as exc:
+            return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
+        except subprocess.SubprocessError as exc:  # any other subprocess failure
+            return _fail(report_path, model, f"cross-family review errored: {exc}")
 
-    stdout = completed.stdout or ""
-    if completed.returncode != 0:
+        stdout = completed.stdout or ""
+        if completed.returncode == 0:
+            break
+
         detail = (completed.stderr or "").strip()
+        if attempt == 0 and _looks_transient(stdout, detail):
+            sleep(90.0)
+            continue
+
         return _fail(
             report_path,
             model,
@@ -111,6 +162,15 @@ def run_cross_family_review(
             + (f": {detail}" if detail else ""),
             partial=stdout,
             returncode=completed.returncode,
+        )
+
+    if not report_body_is_valid(stdout):
+        return _fail(
+            report_path,
+            model,
+            "cross-family review produced an empty or blocked report",
+            partial=stdout,
+            returncode=0,
         )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
