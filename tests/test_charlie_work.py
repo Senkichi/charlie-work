@@ -1912,27 +1912,27 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    
+
     class ReworkGitHub(FakeGitHub):
         def __init__(self) -> None:
             super().__init__()
             # Add needs-rework label to the issue
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-        
+
         def issue_list(self, ready_label: str):
             if ready_label == "agent:needs-rework":
                 return self.issues
             return []
-    
+
     fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    
+
     # Create a rework prompt
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
-    
+
     result = app.dispatch_rework()
 
     assert result.ok is True
@@ -1955,26 +1955,26 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    
+
     class ReworkGitHub(FakeGitHub):
         def __init__(self) -> None:
             super().__init__()
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-        
+
         def issue_list(self, ready_label: str):
             if ready_label == "agent:needs-rework":
                 return self.issues
             return []
-    
+
     fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    
+
     # Create a rework prompt
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
-    
+
     result = app.dispatch_rework()
 
     assert result.ok is True

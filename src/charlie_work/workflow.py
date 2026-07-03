@@ -1023,7 +1023,7 @@ class OrchestratorApp:
         self, limit: int | None = None, *, only_issues: str | None = None
     ) -> CommandResult:
         """Dispatch rework workers for issues in needs-rework state with open PRs.
-        
+
         This is only for non-manual adapters. The manual adapter's human-paste
         path remains intact.
         """
@@ -1033,36 +1033,38 @@ class OrchestratorApp:
                 "rework dispatch skipped for manual adapter",
                 {"adapter": "manual", "dispatched_count": 0},
             )
-        
+
         # Find issues with needs-rework label
         issues = self.gh.issue_list(self.config.labels.needs_rework)
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
-        
+
         # Filter to issues with open PRs
         prs = self.gh.pr_list()
-        pr_by_issue = {linked_issue_number(pr): pr for pr in prs if linked_issue_number(pr) is not None}
-        
+        pr_by_issue = {
+            linked_issue_number(pr): pr for pr in prs if linked_issue_number(pr) is not None
+        }
+
         candidates = [
             issue
             for issue in issues
             if int(issue["number"]) in pr_by_issue
             and pr_by_issue[int(issue["number"])]["state"] == "OPEN"
         ]
-        
+
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
             selected = [by_number[number] for number in wanted if number in by_number]
         else:
             selected = candidates[:rework_limit]
-        
+
         if not selected:
             return CommandResult(
                 True,
                 "no rework candidates found",
                 {"adapter": self.config.devin.adapter, "dispatched_count": 0},
             )
-        
+
         # First lock: claim issues by marking them as dispatch_pending
         selected_issue_numbers: list[int] = []
         with state_lock(self.paths.state_file):
@@ -1079,9 +1081,7 @@ class OrchestratorApp:
                 ):
                     live_dispatched.add(int(number))
             # Filter out already-dispatched issues
-            selected = [
-                issue for issue in selected if int(issue["number"]) not in live_dispatched
-            ]
+            selected = [issue for issue in selected if int(issue["number"]) not in live_dispatched]
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Mark selected issues as "dispatch_pending"
             for issue_number in selected_issue_numbers:
@@ -1092,14 +1092,14 @@ class OrchestratorApp:
                     "dispatch_pending_at": utc_now(),
                 }
             save_state(self.paths.state_file, state)
-        
+
         if not selected_issue_numbers:
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
                 {"adapter": self.config.devin.adapter, "dispatched_count": 0},
             )
-        
+
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
@@ -1123,14 +1123,14 @@ class OrchestratorApp:
                     branch_name=branch_name,
                 )
             )
-        
+
         if not session_requests:
             return CommandResult(
                 True,
                 "no valid rework prompts found",
                 {"adapter": self.config.devin.adapter, "dispatched_count": 0},
             )
-        
+
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
         dispatch_results = dispatch_sessions(
@@ -1140,14 +1140,14 @@ class OrchestratorApp:
             self._adapter_settings(),
             session_requests,
         )
-        
+
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
         failed_issue_numbers = {
             result.issue_number for result in dispatch_results if not result.ok
         }
-        
+
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         label_errors: list[int] = []
         with state_lock(self.paths.state_file):
@@ -1191,7 +1191,7 @@ class OrchestratorApp:
                 },
             )
             save_state(self.paths.state_file, state)
-        
+
         result_dicts = [result.to_dict() for result in dispatch_results]
         message = "rework dispatch complete"
         if failed_issue_numbers:
