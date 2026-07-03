@@ -53,7 +53,6 @@ class DispatchConfig:
     default_limit: int = 3
     branch_prefix: str = "agent/issue"
     worker_model_tier: str = "capable"
-    orchestrator_model_tier: str = "top-reasoning"
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -79,7 +78,6 @@ class AutoMergeConfig:
     delete_branch: bool = True
     require_approved_review: bool = True
     required_checks: tuple[str, ...] = ()
-    allow_auto_merge_when_pending: bool = False
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,6 @@ dispatch:
   default_limit: 3
   branch_prefix: agent/issue
   worker_model_tier: capable
-  orchestrator_model_tier: top-reasoning
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
 
@@ -37,7 +36,6 @@ auto_merge:
   required_checks:
     - Test
     - "Lint, Types & Pre-commit"
-  allow_auto_merge_when_pending: false
 
 runtime:
   state_dir: .var/charlie-work

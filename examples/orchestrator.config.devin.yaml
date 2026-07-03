@@ -8,7 +8,6 @@ dispatch:
   default_limit: 3
   branch_prefix: agent/issue
   worker_model_tier: capable
-  orchestrator_model_tier: top-reasoning
   # Devin worker sessions use the skills-based loop.
   worker_template: worker.md
 
@@ -34,7 +33,6 @@ auto_merge:
     - Tests passed
     - Lint & Format
     - Pre-commit
-  allow_auto_merge_when_pending: false
 
 runtime:
   state_dir: .var/charlie-work
