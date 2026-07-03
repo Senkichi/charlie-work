@@ -682,8 +682,8 @@ def test_no_op_rework_skips_when_no_current_sha() -> None:
     assert not any("PR head unchanged" in f for f in verdict.failures)
 
 
-def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
-    """Detect no-op rework when PR head advanced only by merge commits (base-update)."""
+def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) -> None:
+    """Merge commits that bring in non-merge commits clear the no-op gate (real git path)."""
     # Set up a local "remote" repo
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -739,8 +739,8 @@ def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
         capture_output=True,
     )
 
-    # Advance the branch with a merge-only commit (simulate base-update)
-    # First, add a commit to main in the remote
+    # Advance the branch with a merge that brings in a non-merge commit
+    # Create a commit on main in the remote
     subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
     (remote_repo / "main-change.txt").write_text("main branch change")
     subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
@@ -751,7 +751,7 @@ def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
         capture_output=True,
     )
 
-    # Then merge main into the agent branch (merge-only advance)
+    # In the local repo, fetch and merge main into agent branch
     subprocess.run(
         ["git", "checkout", "agent/issue-123-test"],
         cwd=local_repo,
@@ -795,10 +795,9 @@ def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
 
     verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
 
-    # Should FAIL (merge-only advance is a no-op rework)
-    assert verdict.ok is False
-    assert any("advanced only by merge commits" in f for f in verdict.failures)
-    # Should NOT have a degradation warning (git succeeded)
+    # Should PASS (the merge brings in a non-merge commit, so it's real work)
+    assert verdict.ok is True
+    # Should NOT have a degradation warning (git succeeded, real path exercised)
     assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
 
 
