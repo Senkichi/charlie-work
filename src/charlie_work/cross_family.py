@@ -49,29 +49,48 @@ _BLOCKED_RE = re.compile(
 
 _VERDICT_RE = re.compile(r"^\s*verdict\s*:", re.IGNORECASE | re.MULTILINE)
 
+_SEVERITY_RE = re.compile(r"\*\*(BLOCKER|MAJOR|MINOR|NIT)\*\*")
+
 
 def _looks_transient(*texts: str) -> bool:
     return bool(_TRANSIENT_RE.search("\n".join(texts)))
 
 
+def extract_report_body(text: str) -> str:
+    """Return the model-generated body from a full report.
+
+    If ``text`` starts with the orchestrator report header, strip the header,
+    caveat, and first ``---`` separator so validation operates on the model
+    output rather than on wrapper text that itself contains bold markdown.
+    """
+    text = text.strip()
+    if not text.startswith("# Cross-family adversarial review"):
+        return text
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            return "\n".join(lines[i + 1 :]).strip()
+    return text
+
+
 def report_body_is_valid(body: str) -> bool:
     """Return True if the captured model output looks like a real review.
 
-    A real review must contain at least one severity marker (**SEVERITY**) or a
-    non-refusal ``Verdict:`` line.  Blocked/refusal messages (e.g. "blocked from
-    performing the review", "all tool calls are being rejected", "please re-run")
-    are rejected even if they include a verdict line, so they cannot be cached as a
-    success report.
+    A real review must contain at least one strict severity marker
+    (**BLOCKER**, **MAJOR**, **MINOR**, or **NIT**) or a non-refusal
+    ``Verdict:`` line.  Blocked/refusal messages (e.g. "blocked from performing
+    the review", "all tool calls are being rejected", "please re-run") are
+    rejected even if they include a severity marker or verdict line, so they
+    cannot be cached as a success report.
     """
-    text = body.strip()
+    text = extract_report_body(body)
     if not text:
         return False
-    has_severity = "**" in text
-    has_verdict = bool(_VERDICT_RE.search(text))
-    looks_blocked = bool(_BLOCKED_RE.search(text))
-    if has_severity:
+    if _BLOCKED_RE.search(text):
+        return False
+    if _SEVERITY_RE.search(text):
         return True
-    return has_verdict and not looks_blocked
+    return bool(_VERDICT_RE.search(text))
 
 
 @dataclass(frozen=True)

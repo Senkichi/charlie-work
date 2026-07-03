@@ -10,7 +10,12 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
-from .cross_family import CrossFamilyResult, report_body_is_valid, run_cross_family_review
+from .cross_family import (
+    CrossFamilyResult,
+    extract_report_body,
+    report_body_is_valid,
+    run_cross_family_review,
+)
 from .github import GitHub, GitHubError, label_names, linked_issue_number
 from .janitor import run_janitor
 from .labels import transition
@@ -771,7 +776,11 @@ class OrchestratorApp:
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
             first_line = text.splitlines()[0]
-            if "(UNAVAILABLE)" not in first_line and report_body_is_valid(text):
+            # The file is a wrapped report (header + caveat + body).  Validate the
+            # model body only, not the wrapper text that itself contains bold
+            # markdown ("**leads, not verdicts**").
+            body = extract_report_body(text)
+            if "(UNAVAILABLE)" not in first_line and report_body_is_valid(body):
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )

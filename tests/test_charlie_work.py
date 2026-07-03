@@ -18,7 +18,9 @@ from charlie_work.config import (
     load_config,
 )
 from charlie_work.cross_family import (
+    _CAVEAT,
     CrossFamilyResult,
+    extract_report_body,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
@@ -938,6 +940,35 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
     assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
 
 
+def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, monkeypatch) -> None:
+    """Regression for issue #38: a legacy wrapped report whose body is a blocked
+    refusal must not be reused as a success report on subsequent passes.
+    """
+    app = _cross_family_app(tmp_path, enabled=True)
+    calls = {"n": 0}
+
+    def _fake_run(**kwargs):
+        calls["n"] += 1
+        Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
+        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+
+    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    report_path = prs_dir / "cross-family-review.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    blocked = "I'm blocked from performing the review. Tool calls rejected. Please re-run."
+    report_path.write_text(
+        f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{blocked}\n",
+        encoding="utf-8",
+    )
+
+    app.review(456)
+
+    assert calls["n"] == 1
+    assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
+
+
 def test_report_body_is_valid_detects_real_review_vs_blocked() -> None:
     assert report_body_is_valid("**MAJOR**\nissue\n\nVerdict: safe") is True
     assert report_body_is_valid("Verdict: safe") is True
@@ -948,6 +979,21 @@ def test_report_body_is_valid_detects_real_review_vs_blocked() -> None:
     assert report_body_is_valid(blocked) is False
     assert report_body_is_valid("Verdict: blocked from performing the review") is False
     assert report_body_is_valid("") is False
+
+
+def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None:
+    """Regression for issue #38: bold markdown in a blocked refusal must not
+    short-circuit validation and allow the blocked output to be cached.
+    """
+    blocked_with_bold = "**Unable to review** — all tool calls are being rejected. Please re-run."
+    assert report_body_is_valid(blocked_with_bold) is False
+
+
+def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
+    body = "**MAJOR**\nissue\n\nVerdict: safe"
+    wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert extract_report_body(wrapped) == body
+    assert extract_report_body(body) == body
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
