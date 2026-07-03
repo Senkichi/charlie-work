@@ -3,7 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from charlie_work.config import OrchestratorConfig
-from charlie_work.reconcile import DriftItem, apply_fixes, detect_drift
+from charlie_work.github import _LIST_LIMIT as github_list_limit
+from charlie_work.reconcile import (
+    DriftItem,
+    _LIST_LIMIT as reconcile_list_limit,
+    apply_fixes,
+    detect_drift,
+)
 from charlie_work.state import empty_state
 
 
@@ -346,3 +352,8 @@ def test_apply_fixes_handles_quote_containing_label() -> None:
     apply_fixes(gh, state, drift, config)
 
     assert gh.labels_removed == [(50, quote_label)]
+
+
+def test_reconcile_and_github_share_list_limit_constant() -> None:
+    """Issue #45: reconcile and github.py must derive limits from the same constant."""
+    assert reconcile_list_limit == github_list_limit
