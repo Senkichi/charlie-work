@@ -6,13 +6,18 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
+from charlie_work import devin_shell
 from charlie_work.devin_shell import (
+    DEFAULT_COMMAND_TEMPLATE,
     SessionRecord,
     is_session_alive,
     launch_devin_session,
     probe_devin,
     read_session_records,
 )
+from charlie_work.worktree import WorktreeInfo
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
 # sys.executable to dodge PATH entirely (mirrors the sys.executable fake-binary
@@ -37,13 +42,143 @@ def _write_fake_devin(tmp_path: Path, body: str) -> Path:
     return script
 
 
-def test_launch_writes_sidecar_json_with_expected_fields(tmp_path: Path) -> None:
+def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
+    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
+
+
+def _install_fake_create_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
+) -> None:
+    def fake_create_worktree(
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None
+    ):
+        if calls is not None:
+            calls.append(
+                {
+                    "repo_root": repo_root,
+                    "branch": branch,
+                    "worktrees_dir": worktrees_dir,
+                }
+            )
+        return _fake_worktree(tmp_path, branch)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", fake_create_worktree)
+
+
+# ---------------------------------------------------------------------------
+# Regression: DEFAULT_COMMAND_TEMPLATE must include --permission-mode dangerous
+# ---------------------------------------------------------------------------
+
+
+def test_default_command_template_contains_permission_mode_dangerous() -> None:
+    """Devin CLI defaults to --permission-mode auto (read-only); headless
+    workers stall the moment they need git/uv/gh. The default template must
+    explicitly pass --permission-mode dangerous."""
+    template = DEFAULT_COMMAND_TEMPLATE
+    template_str = " ".join(template)
+    assert "--permission-mode" in template_str, (
+        "DEFAULT_COMMAND_TEMPLATE must contain '--permission-mode'"
+    )
+    assert "dangerous" in template_str, (
+        "DEFAULT_COMMAND_TEMPLATE must set --permission-mode dangerous"
+    )
+
+
+def test_default_command_template_permission_mode_flag_is_adjacent() -> None:
+    """--permission-mode and dangerous must be consecutive argv tokens."""
+    tpl = list(DEFAULT_COMMAND_TEMPLATE)
+    idx = tpl.index("--permission-mode")
+    assert tpl[idx + 1] == "dangerous", (
+        f"Expected 'dangerous' after '--permission-mode', got {tpl[idx + 1]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: launch cwd must be the worktree, not repo_root
+# ---------------------------------------------------------------------------
+
+
+def test_launch_cwd_is_worktree_not_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers must run inside an isolated per-issue worktree, not in repo_root.
+
+    Concurrent workers sharing repo_root fight over one checkout (competing
+    `git checkout -b`, index mutations, test artifacts)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+
+    # Script writes its cwd to stdout so we can verify it.
+    cwd_script = tmp_path / "echo_cwd.py"
+    cwd_script.write_text(
+        "import os, sys\nsys.stdout.write(os.getcwd() + '\\n')\nsys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    record = launch_devin_session(
+        55,
+        "agent/issue-55-test",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(cwd_script)),
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    # worktree creation must have been called
+    assert len(worktree_calls) == 1
+    assert worktree_calls[0]["branch"] == "agent/issue-55-test"
+    assert worktree_calls[0]["repo_root"] == repo_root
+
+    # worktree_path in record must not be repo_root
+    assert record.worktree_path != str(repo_root), (
+        "launch cwd should be the worktree, not repo_root"
+    )
+    assert record.worktree_path  # non-empty
+
+    # The sidecar must also record worktree_path
+    sidecar = json.loads((sessions_dir / "issue-55.json").read_text(encoding="utf-8"))
+    assert sidecar["worktree_path"] == record.worktree_path
+
+    # Give the subprocess a moment, then verify it actually ran in the worktree
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text = Path(record.log_path).read_text(encoding="utf-8")
+        if log_text.strip():
+            break
+        time.sleep(0.05)
+    log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
+    assert Path(log_text).resolve() == Path(record.worktree_path).resolve(), (
+        f"Process cwd was {log_text!r}, expected worktree {record.worktree_path!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Core launch behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_launch_writes_sidecar_json_with_expected_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("do the thing", encoding="utf-8")
     script = _write_fake_devin(tmp_path, _FAKE_DEVIN_SLEEP)
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
 
     record = launch_devin_session(
         123,
@@ -62,6 +197,7 @@ def test_launch_writes_sidecar_json_with_expected_fields(tmp_path: Path) -> None
     assert record.pid is not None
     assert record.started_at  # non-empty ISO-ish timestamp
     assert record.log_path == str(sessions_dir / "issue-123.log")
+    assert record.worktree_path  # non-empty
 
     sidecar_path = sessions_dir / "issue-123.json"
     assert sidecar_path.is_file()
@@ -72,6 +208,7 @@ def test_launch_writes_sidecar_json_with_expected_fields(tmp_path: Path) -> None
     assert payload["pid"] == record.pid
     assert payload["log_path"] == str(sessions_dir / "issue-123.log")
     assert payload["error"] is None
+    assert payload["worktree_path"] == record.worktree_path
 
     # Non-blocking: launch_devin_session must not have waited for the
     # subprocess (which sleeps 0.2s) — give it a moment then check the log.
@@ -82,10 +219,14 @@ def test_launch_writes_sidecar_json_with_expected_fields(tmp_path: Path) -> None
     assert "fake-devin argv=" in log_text
 
 
-def test_launch_with_missing_binary_yields_error_record_not_exception(tmp_path: Path) -> None:
+def test_launch_with_missing_binary_yields_error_record_not_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
 
     record = launch_devin_session(
         7,
@@ -110,7 +251,38 @@ def test_launch_with_missing_binary_yields_error_record_not_exception(tmp_path: 
     assert payload["error"] is not None
 
 
-def test_read_session_records_round_trips(tmp_path: Path) -> None:
+def test_launch_worktree_creation_failure_yields_error_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If worktree creation fails, launch must return an error record, not raise."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    def failing_create_worktree(*args, **kwargs):
+        raise RuntimeError("git worktree add failed: branch already exists")
+
+    monkeypatch.setattr(devin_shell, "create_worktree", failing_create_worktree)
+
+    record = launch_devin_session(
+        8,
+        "agent/issue-8-conflict",
+        tmp_path / "prompt.md",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+    )
+
+    assert record.pid is None
+    assert record.error is not None
+    assert "worktree creation failed" in record.error
+    assert record.worktree_path == ""
+
+    payload = json.loads((sessions_dir / "issue-8.json").read_text(encoding="utf-8"))
+    assert payload["pid"] is None
+    assert payload["error"] is not None
+
+
+def test_read_session_records_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
@@ -119,6 +291,8 @@ def test_read_session_records_round_trips(tmp_path: Path) -> None:
     prompt_b = tmp_path / "b.md"
     prompt_a.write_text("a", encoding="utf-8")
     prompt_b.write_text("b", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
 
     launch_devin_session(
         1,
@@ -169,6 +343,7 @@ def test_read_session_records_skips_claude_code_sidecars(tmp_path: Path) -> None
     devin_payload = {
         "issue_number": 5,
         "branch": "agent/issue-5",
+        "worktree_path": "/tmp/wt/issue-5",
         "prompt_path": "p.md",
         "command": ["devin", "--print"],
         "pid": 1234,
@@ -222,6 +397,7 @@ def test_is_session_alive_reflects_real_process(tmp_path: Path) -> None:
         alive_record = SessionRecord(
             issue_number=1,
             branch="agent/issue-1",
+            worktree_path="/tmp/wt/issue-1",
             prompt_path="p.md",
             command=("x",),
             pid=process.pid,
@@ -240,6 +416,7 @@ def test_is_session_alive_reflects_real_process(tmp_path: Path) -> None:
     dead_record = SessionRecord(
         issue_number=1,
         branch="agent/issue-1",
+        worktree_path="/tmp/wt/issue-1",
         prompt_path="p.md",
         command=("x",),
         pid=process.pid,
@@ -253,6 +430,7 @@ def test_is_session_alive_false_for_none_pid() -> None:
     record = SessionRecord(
         issue_number=1,
         branch="agent/issue-1",
+        worktree_path="",
         prompt_path="p.md",
         command=("x",),
         pid=None,
@@ -271,6 +449,7 @@ def test_is_session_alive_false_for_implausible_pid() -> None:
     record = SessionRecord(
         issue_number=1,
         branch="agent/issue-1",
+        worktree_path="",
         prompt_path="p.md",
         command=("x",),
         pid=999_999_999,
@@ -281,13 +460,17 @@ def test_is_session_alive_false_for_implausible_pid() -> None:
     assert is_session_alive(record) is False
 
 
-def test_command_template_renders_issue_and_branch_placeholders(tmp_path: Path) -> None:
+def test_command_template_renders_issue_and_branch_placeholders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("x", encoding="utf-8")
     script = _write_fake_devin(tmp_path, _FAKE_DEVIN_SLEEP)
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
 
     record = launch_devin_session(
         42,

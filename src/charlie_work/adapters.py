@@ -91,7 +91,7 @@ def dispatch_sessions(
         ]
     elif adapter == "devin-shell":
         results = [
-            _run_devin_shell_adapter(repo_root, request, sessions_dir, settings.shell_command)
+            _run_devin_shell_adapter(repo_root, request, sessions_dir, settings)
             for request in requests
         ]
     elif adapter == "claude-code":
@@ -174,7 +174,7 @@ def _run_devin_shell_adapter(
     repo_root: Path,
     request: SessionRequest,
     sessions_dir: Path,
-    shell_command: tuple[str, ...],
+    settings: AdapterSettings,
 ) -> SessionDispatchResult:
     from .devin_shell import DEFAULT_COMMAND_TEMPLATE, launch_devin_session
 
@@ -184,7 +184,8 @@ def _run_devin_shell_adapter(
         request.prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
-        command_template=shell_command or DEFAULT_COMMAND_TEMPLATE,
+        worktrees_dir=settings.worktrees_dir,
+        command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
     )
     # Non-blocking launch: there is no returncode/stdout to report — liveness
     # and output live in the sidecar JSON and per-session log.

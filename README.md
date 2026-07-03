@@ -126,10 +126,12 @@ claude-code adapter), `cross_family.*` (non-Claude adversarial pass).
 
 **Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
 the operator to paste; `command` runs a blocking per-issue launcher;
-`devin-shell` launches headless `devin --print` sessions non-blocking with
-sidecar tracking; `claude-code` launches `claude -p` workers in isolated git
-worktrees (shared venv junctioned in — teardown is junction-safe). Probe the
-configured adapter with `charlie doctor --adapter-probe`.
+`devin-shell` launches headless `devin --print --permission-mode dangerous`
+sessions non-blocking, each in an isolated per-issue git worktree (creation
+before launch; junction-safe teardown on failure), with sidecar tracking;
+`claude-code` launches `claude -p` workers in isolated git worktrees (shared
+venv junctioned in — teardown is junction-safe). Probe the configured adapter
+with `charlie doctor --adapter-probe`.
 
 ## Prompt templates
 

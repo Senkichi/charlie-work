@@ -3,12 +3,17 @@ sidecar so the orchestrator and ``doctor`` can see what is in flight.
 
 There is no Devin session-creation API (see docs/design/extraction-dossier.md,
 "headless"/"--prompt-file"). Production reality is spawning the ``devin`` CLI
-in print mode: ``devin --prompt-file <path> --print``. Sessions run for many
-minutes, so dispatch must return immediately after ``Popen`` — callers must
-never block on the worker finishing. Each launch writes a JSON sidecar file
-(``sessions_dir/issue-<n>.json``) atomically (tmp + replace, matching
-``adapters._write_json``) *before* returning, so a crash of the orchestrator
-process itself never loses track of a session that was actually spawned.
+in print mode: ``devin --prompt-file <path> --print --permission-mode
+dangerous``. Sessions run for many minutes, so dispatch must return immediately
+after ``Popen`` — callers must never block on the worker finishing. Each launch
+writes a JSON sidecar file (``sessions_dir/issue-<n>.json``) atomically (tmp +
+replace, matching ``adapters._write_json``) *before* returning, so a crash of
+the orchestrator process itself never loses track of a session that was actually
+spawned.
+
+Each worker is launched in an isolated per-issue git worktree (created via
+``worktree.create_worktree()``, mirroring the claude-code adapter) so
+concurrent sessions do not contend over the shared checkout.
 """
 
 from __future__ import annotations
@@ -23,17 +28,29 @@ from typing import Any
 
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
+from .worktree import WorktreeInfo, create_worktree, remove_worktree
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
 
-DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = ("devin", "--prompt-file", "{prompt_path}", "--print")
+# ``--permission-mode dangerous`` is required for headless workers: without it
+# the Devin CLI defaults to ``auto`` (read-only tools), stalls on any
+# git/uv/gh call, and exits asking the operator to restart with this flag.
+DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
+    "devin",
+    "--prompt-file",
+    "{prompt_path}",
+    "--print",
+    "--permission-mode",
+    "dangerous",
+)
 
 
 @dataclass(frozen=True)
 class SessionRecord:
     issue_number: int
     branch: str
+    worktree_path: str
     prompt_path: str
     command: tuple[str, ...]
     pid: int | None
@@ -52,6 +69,7 @@ class SessionRecord:
         return SessionRecord(
             issue_number=int(payload["issue_number"]),
             branch=str(payload.get("branch", "")),
+            worktree_path=str(payload.get("worktree_path", "")),
             prompt_path=str(payload.get("prompt_path", "")),
             command=tuple(str(part) for part in command),
             pid=int(payload["pid"]) if payload.get("pid") is not None else None,
@@ -96,24 +114,53 @@ def launch_devin_session(
     *,
     repo_root: Path,
     sessions_dir: Path,
+    worktrees_dir: Path | None = None,
     command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
+
+    Creates an isolated per-issue git worktree (via ``worktree.create_worktree``)
+    and launches the Devin CLI inside it, so concurrent workers do not contend
+    over a shared checkout. Mirrors the claude-code adapter's worktree lifecycle:
+    creation before launch; ``remove_worktree`` (junction-safe) on failure.
 
     Non-blocking: uses ``Popen`` (never waits for the process). stdout/stderr
     are redirected to a per-session log file since the worker can run for many
     minutes. The sidecar JSON is written atomically before this function
     returns, so any crash after that point still leaves a durable record for
-    ``read_session_records``/``doctor`` to find. Never raises — a missing
-    ``devin`` binary (or any other ``OSError``) comes back as a record with
-    ``pid=None`` and ``error`` set.
+    ``read_session_records``/``doctor`` to find. Never raises — worktree-
+    creation failures, a missing ``devin`` binary, or any other ``OSError``
+    comes back as a record with ``pid=None`` and ``error`` set.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _log_path(sessions_dir, issue_number)
+
+    # --- worktree creation ---------------------------------------------------
+    try:
+        worktree: WorktreeInfo = create_worktree(
+            repo_root,
+            branch,
+            worktrees_dir=worktrees_dir,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path="",
+            prompt_path=str(prompt_path),
+            command=command_template,
+            pid=None,
+            started_at=utc_now(),
+            log_path=str(log_path),
+            error=f"worktree creation failed: {exc}",
+        )
+        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        return record
+
+    # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     command = _render_command(
         command_template, issue_number=issue_number, branch=branch, prompt_path=prompt_path
     )
-    log_path = _log_path(sessions_dir, issue_number)
-    started_at = utc_now()
 
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
@@ -125,7 +172,7 @@ def launch_devin_session(
         with log_path.open("w", encoding="utf-8") as log_handle:
             process = subprocess.Popen(
                 list(command),
-                cwd=str(repo_root),
+                cwd=str(worktree.path),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -133,15 +180,17 @@ def launch_devin_session(
             )
         pid = process.pid
     except OSError as exc:
-        error = str(exc)
+        remove_worktree(repo_root, worktree.path, force=True)
+        error = f"failed to launch devin: {exc}"
 
     record = SessionRecord(
         issue_number=issue_number,
         branch=branch,
+        worktree_path=str(worktree.path),
         prompt_path=str(prompt_path),
         command=command,
         pid=pid,
-        started_at=started_at,
+        started_at=utc_now(),
         log_path=str(log_path),
         error=error,
     )
