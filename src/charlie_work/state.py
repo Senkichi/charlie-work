@@ -132,6 +132,7 @@ def empty_state() -> dict[str, Any]:
         "issues": {},
         "prs": {},
         "events": [],
+        "throttled_until": None,  # ISO timestamp when provider throttle cooldown ends
     }
 
 
@@ -157,6 +158,7 @@ def load_state(path: Path) -> dict[str, Any]:
     data.setdefault("issues", {})
     data.setdefault("prs", {})
     data.setdefault("events", [])
+    data.setdefault("throttled_until", None)  # Backward compatibility
     return data
 
 
@@ -179,3 +181,27 @@ def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> di
     if len(events) > 200:
         events = events[-200:]
     return {**data, "events": events}
+
+
+def is_throttled(data: dict[str, Any]) -> bool:
+    """Check if the orchestrator is currently in a provider throttle cooldown window.
+
+    Returns True if now < throttled_until, False otherwise.
+    """
+    throttled_until = data.get("throttled_until")
+    if not throttled_until:
+        return False
+    try:
+        throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+        return datetime.now(UTC) < throttle_time
+    except (ValueError, TypeError):
+        # Malformed timestamp — treat as not throttled to be safe
+        return False
+
+
+def set_throttled_until(data: dict[str, Any], throttled_until: str) -> dict[str, Any]:
+    """Set the provider throttle cooldown window.
+
+    Returns a new state dict with throttled_until set; does not mutate ``data``.
+    """
+    return {**data, "throttled_until": throttled_until}
