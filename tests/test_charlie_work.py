@@ -195,7 +195,7 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     checks = [
         {"name": "Tests passed", "state": "SUCCESS"},
         {"name": "Lint & Format", "bucket": "pass"},
-        {"name": "Pre-commit", "conclusion": "FAILURE"},
+        {"name": "Pre-commit", "state": "FAILURE"},
     ]
 
     summary = summarize_checks(checks, ("Tests passed", "Lint & Format", "Pre-commit"))
@@ -203,6 +203,76 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     assert summary.ready is False
     assert summary.passed == ("Tests passed", "Lint & Format")
     assert summary.failed == ("Pre-commit",)
+
+
+def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
+    """Regression test for issue #1: duplicate runs with FAILURE then SUCCESS should classify as failed."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
+    """Regression test for issue #1: duplicate runs with SUCCESS then FAILURE should classify as failed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_all_success() -> None:
+    """Duplicate runs with all SUCCESS should classify as passed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is True
+    assert summary.passed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
+    """Duplicate runs with PENDING then SUCCESS should classify as pending."""
+    checks = [
+        {"name": "test", "state": "PENDING"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
+    """Duplicate runs with FAILURE then PENDING should classify as failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "PENDING"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.pending == ()
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
