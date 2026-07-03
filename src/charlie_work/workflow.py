@@ -107,8 +107,7 @@ class OrchestratorApp:
             for pr in prs
             if linked_issue_number(
                 pr,
-                head_repository_owner=pr.get("headRepositoryOwner"),
-                base_repository_owner=pr.get("baseRepositoryOwner"),
+                is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
             )
             is not None
@@ -393,8 +392,7 @@ class OrchestratorApp:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
         issue_number = linked_issue_number(
             pr,
-            head_repository_owner=pr.get("headRepositoryOwner"),
-            base_repository_owner=pr.get("baseRepositoryOwner"),
+            is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
         )
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
@@ -561,8 +559,7 @@ class OrchestratorApp:
         issue_number = (
             linked_issue_number(
                 pr,
-                head_repository_owner=pr.get("headRepositoryOwner"),
-                base_repository_owner=pr.get("baseRepositoryOwner"),
+                is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
             )
             if pr
@@ -696,8 +693,7 @@ class OrchestratorApp:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
         issue_number = linked_issue_number(
             pr,
-            head_repository_owner=pr.get("headRepositoryOwner"),
-            base_repository_owner=pr.get("baseRepositoryOwner"),
+            is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
         )
         decision = self._review_decision(pr_number)
@@ -984,8 +980,7 @@ class OrchestratorApp:
         for pr in self.gh.pr_list():
             issue_number = linked_issue_number(
                 pr,
-                head_repository_owner=pr.get("headRepositoryOwner"),
-                base_repository_owner=pr.get("baseRepositoryOwner"),
+                is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
             )
             if issue_number is None:
@@ -1131,8 +1126,7 @@ class OrchestratorApp:
             "url": pr.get("url"),
             "issue_number": linked_issue_number(
                 pr,
-                head_repository_owner=pr.get("headRepositoryOwner"),
-                base_repository_owner=pr.get("baseRepositoryOwner"),
+                is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
             ),
             "head": pr.get("headRefName"),

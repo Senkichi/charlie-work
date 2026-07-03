@@ -128,8 +128,7 @@ def _check_linked_issue(
     if (
         linked_issue_number(
             pr,
-            head_repository_owner=pr.get("headRepositoryOwner"),
-            base_repository_owner=pr.get("baseRepositoryOwner"),
+            is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
         )
         is None

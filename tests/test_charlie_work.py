@@ -146,8 +146,7 @@ def test_linked_issue_number_from_branch_body_or_title() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "agent/issue-456-fix"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 456
@@ -155,8 +154,7 @@ def test_linked_issue_number_from_branch_body_or_title() -> None:
     assert (
         linked_issue_number(
             {"body": "Closes #789"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 789
@@ -164,8 +162,7 @@ def test_linked_issue_number_from_branch_body_or_title() -> None:
     assert (
         linked_issue_number(
             {"title": "Fix #321: thing"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 321
@@ -178,8 +175,7 @@ def test_linked_issue_number_ignores_unqualified_body_references() -> None:
     assert (
         linked_issue_number(
             {"body": body},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         is None
@@ -1814,8 +1810,7 @@ def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     assert (
         linked_issue_number(
             {"title": "Refactor everything #1 nicely"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         is None
@@ -1823,8 +1818,7 @@ def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     assert (
         linked_issue_number(
             {"title": "see #5 for context", "body": "no link"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         is None
@@ -1833,8 +1827,7 @@ def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     assert (
         linked_issue_number(
             {"title": "Fix #321: thing"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 321
@@ -1842,8 +1835,7 @@ def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     assert (
         linked_issue_number(
             {"body": "Resolves #7"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 7
@@ -1852,8 +1844,7 @@ def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "agent/issue-456-x", "title": "#999"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 456
@@ -1866,8 +1857,7 @@ def test_linked_issue_number_fork_pr_branch_name_does_not_bind() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "issue-42-fix"},
-            head_repository_owner="attacker",
-            base_repository_owner="owner",
+            is_cross_repository=True,
             branch_prefix="agent/issue",
         )
         is None
@@ -1876,8 +1866,7 @@ def test_linked_issue_number_fork_pr_branch_name_does_not_bind() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "agent/issue-42-fix"},
-            head_repository_owner="attacker",
-            base_repository_owner="owner",
+            is_cross_repository=True,
             branch_prefix="agent/issue",
         )
         is None
@@ -1889,8 +1878,7 @@ def test_linked_issue_number_same_repo_branch_with_prefix_binds() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "agent/issue-42-fix"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 42
@@ -1899,21 +1887,41 @@ def test_linked_issue_number_same_repo_branch_with_prefix_binds() -> None:
     assert (
         linked_issue_number(
             {"headRefName": "issue-42-fix"},
-            head_repository_owner="owner",
-            base_repository_owner="owner",
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         is None
     )
 
 
-def test_linked_issue_number_fork_pr_closing_keyword_binds() -> None:
-    # Issue #9: Fork PRs can still bind via closing keywords (that's intentional).
+def test_linked_issue_number_fork_pr_closing_keyword_does_not_bind() -> None:
+    # Issue #9: Fork PRs must NOT bind via closing keywords for lifecycle purposes.
+    # (GitHub's own auto-close on merge is GitHub's policy for issue state;
+    # the orchestrator's label lifecycle is ours.)
     assert (
         linked_issue_number(
             {"body": "Closes #42"},
-            head_repository_owner="attacker",
-            base_repository_owner="owner",
+            is_cross_repository=True,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    assert (
+        linked_issue_number(
+            {"title": "Fix #42: security issue"},
+            is_cross_repository=True,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_same_repo_closing_keyword_binds() -> None:
+    # Same-repo PRs should still bind via closing keywords.
+    assert (
+        linked_issue_number(
+            {"body": "Closes #42"},
+            is_cross_repository=False,
             branch_prefix="agent/issue",
         )
         == 42
@@ -1921,8 +1929,28 @@ def test_linked_issue_number_fork_pr_closing_keyword_binds() -> None:
     assert (
         linked_issue_number(
             {"title": "Fix #42: security issue"},
-            head_repository_owner="attacker",
-            base_repository_owner="owner",
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 42
+    )
+
+
+def test_linked_issue_number_none_is_cross_repository_treats_as_same_repo() -> None:
+    # When is_cross_repository is None (e.g., old code paths), treat as same-repo
+    # for backward compatibility. This should only happen in tests or legacy code.
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-42-fix"},
+            is_cross_repository=None,
+            branch_prefix="agent/issue",
+        )
+        == 42
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Closes #42"},
+            is_cross_repository=None,
             branch_prefix="agent/issue",
         )
         == 42

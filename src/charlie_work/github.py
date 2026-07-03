@@ -108,7 +108,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,headRepositoryOwner,baseRepositoryOwner",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository",
             ],
             limit=_LIST_LIMIT,
             kind="open PRs",
@@ -121,7 +121,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,headRepositoryOwner,baseRepositoryOwner",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository",
             ],
             json_output=True,
         )
@@ -223,35 +223,37 @@ _BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
 def linked_issue_number(
     pr: dict[str, Any],
     *,
-    head_repository_owner: str | None = None,
-    base_repository_owner: str | None = None,
-    branch_prefix: str = "agent/issue",
+    is_cross_repository: bool | None = None,
+    branch_prefix: str,
 ) -> int | None:
     """Resolve the issue a PR is bound to, safe against hijack.
 
     A bare ``#N`` substring in an attacker-controlled PR *title* must never
     bind the PR to issue N — that let any external PR author drive another
     issue's label/merge transitions. So: trust the head ref only when the PR
-    is same-repo (headRepositoryOwner == baseRepositoryOwner) AND the branch
-    starts with the configured ``branch_prefix``. For fork PRs, only trust the
-    closing keyword in title/body (the same set GitHub itself uses to
-    auto-close), never a lone ``#N`` or a branch ref the attacker controls.
+    is same-repo (isCrossRepository == false) AND the branch starts with the
+    configured ``branch_prefix``. For fork PRs, never bind for lifecycle
+    purposes — return None before any keyword scan. (GitHub's own auto-close
+    on merge is GitHub's policy for issue state; the orchestrator's label
+    lifecycle is ours.)
+
+    When is_cross_repository is None (e.g., legacy code paths), treat as
+    same-repo for backward compatibility.
     """
+    # Cross-repo PRs never bind for lifecycle purposes
+    if is_cross_repository is True:
+        return None
+
     head = str(pr.get("headRefName") or "")
     match = _BRANCH_ISSUE_REF.search(head)
     if match:
         # Only trust the branch ref when:
-        # 1. PR is same-repo (not a fork)
+        # 1. PR is same-repo (is_cross_repository is not True)
         # 2. Branch starts with the configured prefix
-        is_same_repo = (
-            head_repository_owner is not None
-            and base_repository_owner is not None
-            and head_repository_owner == base_repository_owner
-        )
         has_correct_prefix = head.startswith(branch_prefix)
-        if is_same_repo and has_correct_prefix:
+        if has_correct_prefix:
             return int(match.group(1))
-    # For all PRs (including forks), trust closing keywords in title/body
+    # For same-repo PRs, trust closing keywords in title/body
     for text in (str(pr.get("title") or ""), str(pr.get("body") or "")):
         match = _CLOSING_KEYWORD_REF.search(text)
         if match:
