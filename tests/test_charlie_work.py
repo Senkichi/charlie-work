@@ -3621,20 +3621,41 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
 
 
 def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -> None:
-    """Test that loop() classifies dead sessions and sets throttled_until in state."""
+    """Test that loop() classifies dead sessions and sets throttled_until in state.
+
+    This is a loop-path integration test: it constructs the app with a fake adapter,
+    simulates a session that died with the rate-limit signature, runs a loop pass,
+    then asserts (a) throttled_until is persisted in state and (b) a subsequent
+    dispatch() defers launches until it expires.
+
+    The test MUST fail when _classify_dead_sessions_and_update_throttle_state is
+    removed from loop() — this is the acceptance test for the exact regression class.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
     from charlie_work.devin_shell import SessionRecord
-    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
     from datetime import UTC, datetime, timedelta
 
-    config = _required_checks_config()
+    # Use command adapter to avoid needing real devin binary
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Ensure state directory exists
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Create a sessions directory with a dead session that has a rate-limit log
-    sessions_dir = tmp_path / "sessions"
-    sessions_dir.mkdir()
+    # Use the config's sessions_dir path
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a session log with rate-limit signature
     log_path = sessions_dir / "issue-42.log"
@@ -3660,18 +3681,39 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    # Call the classification function directly
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, paths.state_file)
+    # Run a loop pass with limit=0 (no actual dispatch, just the classification logic)
+    # We don't assert result.ok because dispatch may fail with no issues to process
+    # The key is that the classification logic runs regardless
+    app.loop(limit=0)
 
-    # Verify throttled_until was set in state
+    # Verify throttled_until was set in state by the loop's classification pass
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
 
     # Verify the cooldown reflects the parsed 10 minutes
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
     expected_time = datetime.now(UTC) + timedelta(minutes=10)
-    # Allow 1 second tolerance for test execution time
-    assert abs((throttle_time - expected_time).total_seconds()) < 1
+    # Allow 2 second tolerance for test execution time
+    assert abs((throttle_time - expected_time).total_seconds()) < 2
+
+    # Verify that a subsequent dispatch() defers launches while throttled
+    # Add a dispatchable issue
+    fake_gh.issues = [
+        {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "body": "Search is broken",
+            "labels": [{"name": "automated-ready"}],
+        }
+    ]
+
+    dispatch_result = app.dispatch(limit=1)
+    # Dispatch should be deferred due to throttle (ok=False is expected for deferral)
+    assert dispatch_result.ok is False
+    assert "deferred" in dispatch_result.message.lower()
+    # Should defer launch due to throttle
+    assert dispatch_result.data["selected_count"] == 0
 
 
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
