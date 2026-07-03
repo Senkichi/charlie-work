@@ -743,6 +743,24 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
+            # Update the linked issue's status when request_changes is recorded:
+            # the previous worker session is definitionally finished, so clear the
+            # dispatched claim to make the issue selectable for rework dispatch.
+            # Escalated requests must NOT mark the issue selectable.
+            if decision == "request_changes" and issue_number is not None:
+                if not escalated:
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "status": "rework_requested",
+                    }
+                else:
+                    # Clear rework_requested status when escalated to prevent selection
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "status": "escalated",
+                    }
             state = append_event(
                 state,
                 "record_review",
@@ -1334,6 +1352,15 @@ class OrchestratorApp:
         selected_issue_numbers: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Filter out issues whose PR is in escalated state (rework cap exhausted)
+            selected = [
+                issue
+                for issue in selected
+                if state["prs"]
+                .get(str(pr_by_issue[int(issue["number"])]["number"]), {})
+                .get("status")
+                != "escalated"
+            ]
             live_dispatched = set()
             for number, entry in state.get("issues", {}).items():
                 if not isinstance(entry, dict):
