@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ PROMPT_FILENAME = ".orchestrator-prompt.md"
 # orchestrator doesn't propagate into an in-flight `claude` session. Absent
 # on non-Windows platforms, where Popen simply ignores creationflags=0.
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_STILL_ACTIVE = 259
 
 
 @dataclass(frozen=True)
@@ -292,10 +296,63 @@ def probe_claude(
     return run_captured(list(command), cwd=repo_root, timeout_seconds=15)
 
 
+def _win_is_alive(pid: int) -> bool:
+    """Windows PID liveness via ``OpenProcess`` + ``GetExitCodeProcess``.
+
+    ``os.kill(pid, 0)`` is NOT usable for this on Windows: CPython's Windows
+    implementation of signal 0 does not probe the process at all (there is no
+    real "probe" signal in the Win32 API) — it was empirically verified
+    (see ``test_is_session_alive_reflects_real_process``) to keep reporting a
+    long-dead, already-``wait()``-ed PID as alive indefinitely. Instead, open
+    a limited-info handle and ask the kernel for the actual exit code:
+    ``STILL_ACTIVE`` (259) means running, anything else (or a failed
+    ``OpenProcess``, e.g. the PID never existed or was already reused) means
+    not running.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == _WIN_STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def is_worker_alive(record: ClaudeWorkerRecord) -> bool:
+    """Check whether the process behind ``record`` is still running.
+
+    Dispatches to a platform-appropriate liveness probe: ``OpenProcess`` +
+    ``GetExitCodeProcess`` on Windows, ``os.kill(pid, 0)`` on POSIX (where it
+    is the standard, reliable idiom). This avoids a hard `psutil` dependency
+    and the slow `tasklist` subprocess round trip.
+    """
+    if record.pid is None or record.pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _win_is_alive(record.pid)
+    return _posix_is_alive(record.pid)
+
+
 __all__ = [
     "PROMPT_FILENAME",
     "ClaudeWorkerRecord",
     "launch_claude_worker",
     "read_worker_records",
     "probe_claude",
+    "is_worker_alive",
 ]
