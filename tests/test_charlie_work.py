@@ -1347,15 +1347,17 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
     assert merged_state["status"] == "merged"
     assert merged_state["merged"] is True
 
-    # A subsequent evaluation-only pass must keep the durable merged fields.
+    # A subsequent evaluation-only pass short-circuits via the idempotence guard
+    # and reports the PR as already merged without re-calling gh pr merge.
     eval_result = app.merge_ready(456, merge=False)
-    assert eval_result.data["merged"] is False
+    assert eval_result.ok is True
+    assert eval_result.data["already_merged"] is True
+    assert eval_result.data["merged"] is True
+    # merge_pr must NOT have been called again.
+    assert fake_gh.merged == [(456, "squash")]  # only the first merge
     persisted = load_state(paths.state_file)["prs"]["456"]
     assert persisted["status"] == "merged"
     assert persisted["merged"] is True
-    assert "can_merge" not in persisted
-    assert "checks" not in persisted
-    assert "merge_output" not in persisted
 
 
 def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path: Path) -> None:
@@ -1552,3 +1554,61 @@ def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
 
     assert cli.main(["roll-call"]) == 2
     assert "GitHub error: boom" in capsys.readouterr().err
+
+
+# --- Issue #18: idempotence of ship-it and loop --------------------------------
+
+
+def test_merge_ready_already_merged_is_noop(tmp_path: Path) -> None:
+    """ship-it on a PR whose state records status='merged' must return ok=True
+    without re-attempting `gh pr merge` (which would fail on an already-merged PR)."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Seed state as if a prior merge_ready already merged this PR.
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {"number": 456, "issue_number": 123, "status": "merged", "merged": True}
+    save_state(paths.state_file, state)
+
+    result = app.merge_ready(456)
+
+    assert result.ok is True
+    assert result.data["already_merged"] is True
+    assert result.data["merged"] is True
+    # merge_pr must NOT have been called — the fake would record it.
+    assert fake_gh.merged == []
+
+
+def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
+    """A second loop() pass over an approved-but-unmerged PR must NOT rewrite
+    the review packet or re-fire label transitions — it should go straight to
+    merge_ready."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Record an approved decision in state (as record_review would).
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "decision": "approved",
+        "status": "approved",
+    }
+    save_state(paths.state_file, state)
+    # Also write the decision file so merge_ready can read it.
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved"}), encoding="utf-8"
+    )
+
+    result = app.loop(limit=0)
+
+    # review() was skipped — no review packet written, no reviewing label fired.
+    assert result.data["reviews"] == []
+    # merge_ready was attempted (straight to merge evaluation).
+    assert len(result.data["merges"]) == 1
+    # The reviewing label must NOT have been re-added (would indicate review() ran).
+    assert (123, "agent:reviewing") not in fake_gh.labels_added

@@ -549,6 +549,23 @@ class OrchestratorApp:
         )
 
     def merge_ready(self, pr_number: int, *, merge: bool | None = None) -> CommandResult:
+        # Idempotence: if state already records this PR as merged, short-circuit
+        # to a success no-op. Re-running `ship-it` on a completed PR must not
+        # re-attempt `gh pr merge` (which fails on an already-merged PR and
+        # propagates GitHubError → exit 2).
+        state = load_state(self.paths.state_file)
+        existing_pr_state = state["prs"].get(str(pr_number), {})
+        if existing_pr_state.get("status") == "merged":
+            return CommandResult(
+                True,
+                f"PR #{pr_number} already merged",
+                {
+                    "pr": pr_number,
+                    "issue": existing_pr_state.get("issue_number"),
+                    "already_merged": True,
+                    "merged": True,
+                },
+            )
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
@@ -771,11 +788,25 @@ class OrchestratorApp:
             # Per-PR isolation: one PR's merge conflict or gh failure must not
             # abort review/merge of every remaining PR in the batch.
             try:
-                review = self.review(pr_number)
-                reviews.append(review.data)
-                decision = self._review_decision(pr_number)
-                if decision.get("decision") == "approved":
+                # Idempotence: if the PR already has an approved decision in
+                # state and isn't in a rework/blocked state, skip the expensive
+                # review() pass (packet regeneration + label transitions) and
+                # go straight to merge_ready. This prevents a second loop() pass
+                # from rewriting the review packet or re-firing labels for a PR
+                # that's simply waiting on pending checks.
+                state = load_state(self.paths.state_file)
+                pr_state = state["prs"].get(str(pr_number), {})
+                already_approved = pr_state.get("decision") == "approved" and pr_state.get(
+                    "status"
+                ) not in ("request_changes", "escalated", "blocked")
+                if already_approved:
                     merges.append(self.merge_ready(pr_number).data)
+                else:
+                    review = self.review(pr_number)
+                    reviews.append(review.data)
+                    decision = self._review_decision(pr_number)
+                    if decision.get("decision") == "approved":
+                        merges.append(self.merge_ready(pr_number).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         ok = dispatch.ok and not errors
