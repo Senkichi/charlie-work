@@ -425,6 +425,143 @@ cross_family:
     assert config.cross_family.command == ("devin", "{model}", "{prompt_path}")
 
 
+def test_load_config_rejects_bare_brace_in_shell_command(tmp_path: Path) -> None:
+    """Issue #4: bare { in shell_command is rejected at load."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'devin:\n  shell_command:\n    - devin\n    - "test{"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bare brace")
+
+    assert "devin.shell_command" in message
+    assert "malformed placeholder" in message
+
+
+def test_load_config_rejects_unclosed_brace_in_shell_command(tmp_path: Path) -> None:
+    """Issue #4: unclosed {prompt_path in shell_command is rejected at load."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'devin:\n  shell_command:\n    - devin\n    - "{prompt_path"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unclosed brace")
+
+    assert "devin.shell_command" in message
+    assert "malformed placeholder" in message
+
+
+def test_load_config_rejects_stray_closing_brace_in_shell_command(tmp_path: Path) -> None:
+    """Issue #4: stray } in shell_command is rejected at load."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'devin:\n  shell_command:\n    - devin\n    - "test}"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for stray closing brace")
+
+    assert "devin.shell_command" in message
+    assert "malformed placeholder" in message
+
+
+def test_load_config_rejects_positional_placeholder_in_shell_command(tmp_path: Path) -> None:
+    """Issue #4: positional {0} in shell_command is rejected at load."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'devin:\n  shell_command:\n    - devin\n    - "{0}"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for positional placeholder")
+
+    assert "devin.shell_command" in message
+    assert "malformed placeholder" in message
+
+
+def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
+    """Issue #4: unknown placeholder in dispatch_command is rejected at load."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'devin:\n  dispatch_command:\n    - echo\n    - "{bad_token}"',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown placeholder")
+
+    assert "devin.dispatch_command" in message
+    assert "bad_token" in message
+
+
+def test_command_adapter_render_error_returns_error_record(tmp_path: Path) -> None:
+    """Defense-in-depth: render errors past the load gate return error records, not exceptions."""
+    from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="Test",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-1",
+    )
+
+    settings = AdapterSettings(
+        adapter="command",
+        dispatch_command=("echo", "{unknown_placeholder}"),
+        command_timeout_seconds=300,
+    )
+
+    results = dispatch_sessions(repo_root, manifest_path, results_path, settings, [request])
+
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert results[0].error is not None
+    assert "unknown_placeholder" in results[0].error
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit

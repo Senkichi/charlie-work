@@ -39,6 +39,14 @@ def _validate_command_placeholders(
                     f"config section '{config_key}': unknown placeholder {{{match}}} "
                     f"(allowed: {', '.join(sorted(allowed_placeholders))})"
                 )
+        # Simulate render to catch malformed placeholders that the regex misses
+        # (bare {, unclosed {prompt_path, stray }, positional {0})
+        try:
+            part.format(**{p: "" for p in allowed_placeholders})
+        except (ValueError, KeyError, IndexError) as e:
+            raise ConfigError(
+                f"config section '{config_key}': malformed placeholder in '{part}': {e}"
+            ) from e
 
 
 @dataclass(frozen=True)
@@ -257,6 +265,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         command_value = devin_data.get(command_key)
         if isinstance(command_value, list):
             devin_data[command_key] = tuple(str(item) for item in command_value)
+    # Validate dispatch_command placeholders (after list->tuple conversion)
+    dispatch_command = devin_data.get("dispatch_command")
+    if dispatch_command:
+        _validate_command_placeholders(
+            dispatch_command,
+            {"prompt_path", "issue_number", "branch"},
+            "devin.dispatch_command",
+        )
     # Validate shell_command placeholders (after list->tuple conversion)
     shell_command = devin_data.get("shell_command")
     if shell_command:
