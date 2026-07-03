@@ -103,7 +103,7 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     config = load_config(find_config_path(repo_root, args.config))
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
-    return OrchestratorApp(repo_root, paths, config, gh)
+    return OrchestratorApp(repo_root, paths, config, gh, dry_run=args.dry_run)
 
 
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:

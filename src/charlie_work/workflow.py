@@ -55,12 +55,19 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
 
 class OrchestratorApp:
     def __init__(
-        self, repo_root: Path, paths: RuntimePaths, config: OrchestratorConfig, gh: GitHub
+        self,
+        repo_root: Path,
+        paths: RuntimePaths,
+        config: OrchestratorConfig,
+        gh: GitHub,
+        *,
+        dry_run: bool = False,
     ):
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
         self.gh = gh
+        self.dry_run = dry_run
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -92,6 +99,7 @@ class OrchestratorApp:
             venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
             worker_env=claude.worker_env,
             worker_model=self.config.devin.worker_model,
+            dry_run=self.dry_run,
         )
 
     def status(self) -> CommandResult:
@@ -432,6 +440,7 @@ class OrchestratorApp:
             issue_number=issue_number,
             diff_path=diff_path,
             enabled=cross_family,
+            dry_run=self.dry_run,
         )
         prompt_path = pr_dir / "review-prompt.md"
         prompt = self._render(
@@ -849,6 +858,7 @@ class OrchestratorApp:
         issue_number: int | None,
         diff_path: Path,
         enabled: bool | None,
+        dry_run: bool = False,
     ) -> tuple[str, CrossFamilyResult | None]:
         cfg: CrossFamilyConfig = self.config.cross_family
         use = cfg.enabled if enabled is None else enabled
@@ -892,6 +902,7 @@ class OrchestratorApp:
             prompt_path=pr_dir / "cross-family-prompt.md",
             report_path=report_path,
             timeout_seconds=cfg.timeout_seconds,
+            dry_run=dry_run,
         )
         return self._cross_family_section(result.report_path), result
 

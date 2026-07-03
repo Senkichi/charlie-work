@@ -2215,6 +2215,66 @@ def test_is_mutating_classifies_readonly_and_mutating() -> None:
         assert _is_mutating(mutating) is True
 
 
+def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
+    """Test that --dry-run prevents worker process launch and worktree creation."""
+    from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+
+    subprocess_calls: list[list[str]] = []
+
+    def fake_subprocess(*args, **kwargs):
+        subprocess_calls.append(args[0])
+        raise AssertionError("subprocess should not be called in dry-run mode")
+
+    monkeypatch.setattr("charlie_work.claude_code.subprocess.Popen", fake_subprocess)
+    monkeypatch.setattr("charlie_work.devin_shell.subprocess.Popen", fake_subprocess)
+    monkeypatch.setattr("charlie_work.subprocess_runner.subprocess.run", fake_subprocess)
+
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("test prompt", encoding="utf-8")
+    settings = AdapterSettings(adapter="claude-code", dry_run=True)
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="Test issue",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-1-test",
+    )
+
+    results = dispatch_sessions(tmp_path, manifest_path, results_path, settings, [request])
+
+    assert len(results) == 1
+    assert results[0].ok is True
+    assert results[0].error == "DRY-RUN: worker not launched"
+    assert len(subprocess_calls) == 0  # No subprocess should be invoked
+
+
+def test_dry_run_skips_cross_family_review(monkeypatch, tmp_path: Path) -> None:
+    """Test that --dry-run prevents cross-family model subprocess execution."""
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        subprocess_calls.append(args[0])
+        raise AssertionError("subprocess.run should not be called in dry-run mode")
+
+    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
+
+    result = run_cross_family_review(
+        model="test-model",
+        command=["echo", "test"],
+        repo_root=tmp_path,
+        prompt_text="test prompt",
+        prompt_path=tmp_path / "prompt.md",
+        report_path=tmp_path / "report.md",
+        timeout_seconds=30,
+        dry_run=True,
+    )
+
+    assert result.ok is False
+    assert result.error == "DRY-RUN: cross-family review not executed"
+    assert len(subprocess_calls) == 0  # No subprocess should be invoked
+
+
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
     from charlie_work.github import GitHubError as _GitHubError
 
