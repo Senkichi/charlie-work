@@ -18,20 +18,12 @@ ISSUE_VALUES = {
 
 
 def _render_worker_with_sections(template_name: str) -> str:
-    """Mirror the future `render_prompt` integration: merge section_variables()
-    into the context, then substitute twice.
+    """Render a worker prompt with section variables merged in.
 
-    `string.Template.safe_substitute` is not recursive — injected section text
-    that itself contains `$issue_number`-style placeholders is only resolved
-    on a second pass. `render_prompt` renders once, so until the orchestrator
-    wires `section_variables()` + a second substitution pass into it, tests
-    here perform that second pass explicitly to prove the templates are
-    semantically correct once that wiring lands.
+    `render_prompt` now handles section resolution internally, so this helper
+    just passes the issue values directly.
     """
-    context = {**ISSUE_VALUES, **section_variables()}
-    once = render_prompt(template_name, context)
-    str_values = {key: str(value) for key, value in context.items()}
-    return Template(once).safe_substitute(str_values)
+    return render_prompt(template_name, ISSUE_VALUES)
 
 
 def test_section_variables_discovers_package_sections() -> None:
@@ -118,3 +110,46 @@ def test_worker_templates_reference_section_variables_in_source() -> None:
         # The extracted blocks must be gone from the template body itself —
         # otherwise this isn't deduplication, it's just an unused partial.
         assert "Do not perform opportunistic refactors." not in text
+
+
+def test_attacker_controlled_placeholders_not_expanded() -> None:
+    """Verify that attacker-controlled values containing $placeholders are not expanded.
+
+    This is the security fix for issue #8: an issue body containing $section_* or
+    $issue_number should render as literal text, not be expanded in a second pass.
+    """
+    malicious_values = {
+        "issue_number": 8,
+        "issue_title": "Test issue",
+        "issue_url": "https://example.test/issues/8",
+        "issue_body": "This contains $section_scope_contract and $issue_number",
+        "branch_name": "agent/issue-8-test",
+        "worker_model_tier": "capable",
+    }
+
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = render_prompt(template_name, malicious_values)
+
+        # The literal placeholder text should appear in the prompt
+        assert "$section_scope_contract" in prompt, "Expected $section_scope_contract in prompt"
+        assert "$issue_number" in prompt, "Expected $issue_number in prompt"
+        # The attacker's placeholders should NOT be expanded to their values
+        # (i.e., we should NOT see "This contains [resolved section text] and 8")
+        assert "This contains $section_scope_contract and $issue_number" in prompt
+
+
+def test_legitimate_partial_placeholders_still_resolve() -> None:
+    """Verify that $placeholders inside worker_sections/*.md partials still resolve.
+
+    The fix must not break the legitimate use case: partials can contain $issue_number
+    and other placeholders, which should be resolved when the partial is rendered.
+    """
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = render_prompt(template_name, ISSUE_VALUES)
+
+        # These should be resolved from the section partials
+        assert "- Number: #123" in prompt
+        assert "- Solve only issue #123." in prompt
+        assert "- Model tier target: capable" in prompt
+        # No leftover $section_ placeholders
+        assert "$section_" not in prompt

@@ -29,8 +29,18 @@ def render_prompt(
     # Explicit values win over section text on any future key collision.
     merged = {**section_variables(search_dirs=tuple(search_dirs)), **values}
     safe_values = {key: str(value) for key, value in merged.items()}
-    # Two passes: injected $section_* text carries its own $placeholders, and
-    # safe_substitute never re-scans replacement text. A single pass ships
-    # literal "$issue_number" inside the shared sections to real workers.
-    once = template.safe_substitute(safe_values)
-    return Template(once).safe_substitute(safe_values)
+    # Render section partials first: each partial's internal $placeholders are
+    # resolved against safe_values, producing fully-resolved section strings.
+    # This prevents attacker-controlled values (issue_body, etc.) from being
+    # re-scanned in a second pass, which would allow prompt injection.
+    resolved_sections = {
+        key: Template(section_text).safe_substitute(safe_values)
+        for key, section_text in section_variables(search_dirs=tuple(search_dirs)).items()
+    }
+    # Merge resolved sections with explicit values (explicit values still win).
+    final_values = {**resolved_sections, **values}
+    # Convert all values to strings for the final substitution
+    final_safe_values = {key: str(value) for key, value in final_values.items()}
+    # Single substitution over the template: attacker-supplied values are leaf
+    # replacements that are never re-scanned.
+    return template.safe_substitute(final_safe_values)
