@@ -197,9 +197,7 @@ def _check_base_movement(
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
 
 
-def check_operator_containment(
-    repo_root: Path, pr_diff: str, pr_number: int
-) -> tuple[str, ...]:
+def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
     """Check for worker edits leaked into the operator checkout.
 
     Runs ``git status --porcelain`` at ``repo_root`` to detect uncommitted changes.

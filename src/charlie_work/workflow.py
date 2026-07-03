@@ -513,9 +513,7 @@ class OrchestratorApp:
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
         # Run containment check for worker edits leaked into operator checkout
-        containment_warnings = check_operator_containment(
-            self.repo_root, diff, pr_number
-        )
+        containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         # Merge containment warnings with janitor warnings
         merged_warnings = tuple(list(verdict.warnings) + list(containment_warnings))
         cross_family_section, cf_result = self._cross_family_for_pr(
@@ -830,9 +828,7 @@ class OrchestratorApp:
         summary = summarize_checks(checks, self.config.auto_merge.required_checks)
         # Run containment check for worker edits leaked into operator checkout
         diff = self.gh.pr_diff(pr_number)
-        containment_warnings = check_operator_containment(
-            self.repo_root, diff, pr_number
-        )
+        containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         if containment_warnings:
             # Log containment warnings as a pre-merge gate warning
             # This is report-only, not blocking (per issue directive)
