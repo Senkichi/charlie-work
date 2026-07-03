@@ -41,6 +41,21 @@ def _default_worktrees_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "worktrees"
 
 
+def _has_origin_remote(repo_root: Path) -> bool:
+    """Check if the repo has an 'origin' remote configured.
+
+    Returns True if 'git remote get-url origin' succeeds (exit code 0),
+    False otherwise. This is a deterministic check for remote existence
+    before attempting fetch operations.
+    """
+    result = run_captured(
+        ["git", "remote", "get-url", "origin"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def is_junction(path: Path) -> bool:
     """Return True if ``path`` is a reparse point (Windows junction/symlink)
     or, on non-Windows platforms, a symlink. ``os.path.islink()`` alone is
@@ -114,32 +129,29 @@ def create_worktree(
         if existing_wt:
             # Reuse existing worktree: fetch and fast-forward to origin tip
             worktree_path = Path(existing_wt["worktree"])
-            # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
-            fetch_result = run_captured(
-                ["git", "fetch", "origin", branch],
-                cwd=repo_root,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-            )
-            # Fast-forward inside the worktree if fetch succeeded
-            if fetch_result.ok:
-                ff_result = run_captured(
-                    ["git", "merge", "--ff-only", f"origin/{branch}"],
-                    cwd=worktree_path,
+            # Only fetch if origin remote exists (deterministic check)
+            if _has_origin_remote(repo_root):
+                # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
+                fetch_result = run_captured(
+                    ["git", "fetch", "origin", branch],
+                    cwd=repo_root,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
-                # If fast-forward fails (diverged history), fail the launch
-                if not ff_result.ok:
-                    raise RuntimeError(
-                        f"Cannot fast-forward rework branch {branch!r} to origin tip: "
-                        f"{ff_result.error or ff_result.stderr}"
+                # Fast-forward inside the worktree if fetch succeeded
+                if fetch_result.ok:
+                    ff_result = run_captured(
+                        ["git", "merge", "--ff-only", f"origin/{branch}"],
+                        cwd=worktree_path,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
-            # If fetch failed, check if it's because there's no remote (test repos)
-            # vs a real network/error failure. Distinguish these cases.
-            # Don't fail on "no remote" - the worktree is still usable for tests
-            # But do fail on other fetch errors to avoid silent stale launches
-            if not fetch_result.ok and fetch_result.stderr:
-                # Check if the error indicates no remote configured
-                if "remote" not in fetch_result.stderr.lower():
+                    # If fast-forward fails (diverged history), fail the launch
+                    if not ff_result.ok:
+                        raise RuntimeError(
+                            f"Cannot fast-forward rework branch {branch!r} to origin tip: "
+                            f"{ff_result.error or ff_result.stderr}"
+                        )
+                # If fetch failed with origin present, raise (real network/error failure)
+                if not fetch_result.ok:
                     raise RuntimeError(
                         f"Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
@@ -156,17 +168,15 @@ def create_worktree(
             return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
         else:
             # No existing worktree: attach to existing branch (no -b flag)
-            # Fetch first to ensure we materialize at the origin tip
-            fetch_result = run_captured(
-                ["git", "fetch", "origin", f"{branch}:{branch}"],
-                cwd=repo_root,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-            )
-            # If fetch failed, check if it's because there's no remote (test repos)
-            # vs a real network/error failure. Distinguish these cases.
-            if not fetch_result.ok and fetch_result.stderr:
-                # Check if the error indicates no remote configured
-                if "remote" not in fetch_result.stderr.lower():
+            # Fetch first to ensure we materialize at the origin tip, but only if origin exists
+            if _has_origin_remote(repo_root):
+                fetch_result = run_captured(
+                    ["git", "fetch", "origin", f"{branch}:{branch}"],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # If fetch failed with origin present, raise (real network/error failure)
+                if not fetch_result.ok:
                     raise RuntimeError(
                         f"Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"

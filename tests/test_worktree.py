@@ -354,3 +354,23 @@ def test_rework_attach_fetches_to_origin_tip(tmp_path: Path) -> None:
     assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
 
     remove_worktree(repo_root, info.path)
+
+
+def test_rework_fetch_failure_raises_when_origin_exists(tmp_path: Path) -> None:
+    """Rework with origin present but fetch failure should raise RuntimeError."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create the agent branch locally (no worktree) and push it to origin.
+    branch_name = "agent/issue-3-fetch-fail"
+    _git(repo_root, "branch", branch_name)
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Break the origin remote to simulate a fetch failure
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+    # Rework attach path should raise on fetch failure
+    with pytest.raises(RuntimeError, match="Fetch failed for rework branch"):
+        create_worktree(repo_root, branch_name, rework=True)
