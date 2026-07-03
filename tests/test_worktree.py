@@ -28,6 +28,22 @@ def _init_repo(repo_root: Path) -> None:
     run(["git", "commit", "-m", "initial commit"])
 
 
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # A fresh clone has no committer identity on CI runners.
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+
+
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -277,123 +293,64 @@ def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
 
 
 def test_rework_reuse_fetches_and_fast_forwards_to_origin_tip(tmp_path: Path) -> None:
-    """Rework reuse path should fetch and fast-forward to origin tip when local is behind."""
-    # Create a "remote" repo (second clone)
+    """Rework reuse path must fast-forward the existing worktree to the origin tip."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
-
-    # Clone it to create the main repo
     repo_root = tmp_path / "repo"
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-    )
+    _clone_repo(remote_repo, repo_root)
 
-    # Create a branch and worktree in the main repo
+    # Create the agent branch + worktree locally and push it to origin.
     branch_name = "agent/issue-1-rework-ff"
     info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
     (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "file1.txt"],
-        cwd=info1.path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "add file1"],
-        cwd=info1.path,
-        check=True,
-        capture_output=True,
-    )
-    # Push to remote
-    subprocess.run(
-        ["git", "push", "origin", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "add file1")
+    _git(repo_root, "push", "origin", branch_name)
 
-    # Add a commit to the remote branch directly (simulating a remote update)
+    # Advance the AGENT branch on the remote so the local worktree is behind.
+    _git(remote_repo, "checkout", branch_name)
     (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "file2.txt"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "add file2"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
 
-    # In rework mode, create_worktree should fetch and fast-forward
-    # The test verifies that the fetch is called and the result is used
-    # (no F841 lint error). The actual fast-forward behavior is git-dependent.
     info2 = create_worktree(repo_root, branch_name, rework=True)
 
-    # Should return the same path
+    # Same worktree, fast-forwarded to the origin tip.
     assert info2.path == info1.path
-    # Original file should still exist
     assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "remote change\n"
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
 
-    # Clean up
     remove_worktree(repo_root, info1.path)
 
 
 def test_rework_attach_fetches_to_origin_tip(tmp_path: Path) -> None:
-    """Rework attach path should fetch and materialize at origin tip."""
-    # Create a "remote" repo (second clone)
+    """Rework attach path must materialize the existing branch at the origin tip."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
-
-    # Clone it to create the main repo
     repo_root = tmp_path / "repo"
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-    )
+    _clone_repo(remote_repo, repo_root)
 
-    # Create a branch in the main repo and push it
+    # Create the agent branch locally (no worktree) and push it to origin.
     branch_name = "agent/issue-2-attach-ff"
-    subprocess.run(
-        ["git", "branch", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "push", "origin", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    _git(repo_root, "branch", branch_name)
+    _git(repo_root, "push", "origin", branch_name)
 
-    # Add a commit to the remote branch directly
+    # Advance the AGENT branch on the remote so the local ref is behind.
+    _git(remote_repo, "checkout", branch_name)
     (remote_repo / "file1.txt").write_text("remote change\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "file1.txt"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "add file1"],
-        cwd=remote_repo,
-        check=True,
-        capture_output=True,
-    )
+    _git(remote_repo, "add", "file1.txt")
+    _git(remote_repo, "commit", "-m", "add file1")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
 
-    # In rework mode, create_worktree should attach to the existing branch
-    # and fetch to get the origin tip. The test verifies that the fetch is called
-    # and the result is used (no F841 lint error).
     info = create_worktree(repo_root, branch_name, rework=True)
 
+    # Attached to the existing branch at the origin tip.
     assert info.branch == branch_name
-    assert info.path.exists()
+    assert (info.path / "file1.txt").read_text(encoding="utf-8") == "remote change\n"
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
 
-    # Clean up
     remove_worktree(repo_root, info.path)
