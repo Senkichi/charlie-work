@@ -63,7 +63,10 @@ def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
 
         _winapi.CreateJunction(str(target_path), str(link_path))
     else:
-        os.symlink(target_path, link_path, target_is_directory=True)
+        try:
+            os.symlink(target_path, link_path, target_is_directory=True)
+        except FileExistsError as exc:
+            raise RuntimeError(f"venv link target already exists: {link_path}") from exc
 
 
 def create_worktree(
@@ -116,7 +119,8 @@ def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False
          and even then, only the worktree-local directory is removed, never
          a junction target.
       2. If it is a junction/symlink, unlink the reparse point itself
-         (``os.rmdir`` on Windows removes the link, not the target).
+         (``os.rmdir`` on Windows; ``os.unlink`` on POSIX — never follows
+         into the target).
       3. ``git worktree remove``.
       4. On failure, ``git worktree prune`` to clear stale metadata.
 
@@ -133,7 +137,14 @@ def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False
         # never raise, so one worktree's teardown can't crash the whole batch.
         try:
             if is_junction(venv_path):
-                os.rmdir(venv_path)
+                # Windows junctions (reparse points) are removed with os.rmdir,
+                # which unlinks only the reparse point — never follows into the
+                # target. On POSIX, symlinks must be removed with os.unlink;
+                # os.rmdir raises NotADirectoryError/OSError on a symlink.
+                if os.name == "nt":
+                    os.rmdir(venv_path)
+                else:
+                    os.unlink(venv_path)
             elif venv_path.is_dir():
                 if not force:
                     return False
