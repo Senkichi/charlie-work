@@ -196,6 +196,14 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
 def load_config(path: Path | None = None) -> OrchestratorConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path and path.exists() else {}
     data = raw if isinstance(raw, dict) else {}
+    # Validate top-level keys before processing sections
+    known_sections = {f.name for f in fields(OrchestratorConfig)}
+    unknown = sorted(set(data) - known_sections)
+    if unknown:
+        raise ConfigError(
+            f"unknown config section(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(known_sections))})"
+        )
     labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
     dispatch = _build_section(DispatchConfig, "dispatch", _section(data, "dispatch"))
     review = _build_section(ReviewConfig, "review", _section(data, "review"))

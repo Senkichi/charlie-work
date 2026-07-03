@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import summarize_checks
@@ -193,6 +195,39 @@ def test_load_config_names_unknown_keys_and_section(tmp_path: Path) -> None:
     assert "section 'review'" in message
     assert "max_rework_cylces" in message
     assert "max_rework_cycles" in message  # valid keys listed for the operator
+
+
+def test_load_config_rejects_unknown_top_level_sections(tmp_path: Path) -> None:
+    """Issue #12: typo'd top-level config section is rejected, not silently ignored."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("auto-merge:\n  enabled: false\n", encoding="utf-8")
+
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown top-level section")
+
+    assert "unknown config section(s)" in message
+    assert "auto-merge" in message
+    assert "auto_merge" in message  # valid section name listed
+
+
+def test_load_config_rejects_broken_yaml(tmp_path: Path) -> None:
+    """Issue #12: malformed YAML yields YAMLError, not raw traceback."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("labels:\n  ready: automated-ready\n  bad: [unclosed", encoding="utf-8")
+
+    try:
+        load_config(config_path)
+    except yaml.YAMLError:
+        # Expected: YAML parsing error
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected YAMLError for malformed YAML")
 
 
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
@@ -2017,6 +2052,31 @@ def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
 
     assert cli.main(["roll-call"]) == 2
     assert "GitHub error: boom" in capsys.readouterr().err
+
+
+def test_cli_main_maps_config_error_to_exit_2(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Issue #12: ConfigError (e.g., unknown top-level section) yields exit 2."""
+    from charlie_work.config import ConfigError as _ConfigError
+
+    def _boom(args):
+        raise _ConfigError("unknown config section(s): auto-merge")
+
+    monkeypatch.setattr(cli, "build_app", _boom)
+
+    assert cli.main(["roll-call"]) == 2
+    assert "config error: unknown config section(s): auto-merge" in capsys.readouterr().err
+
+
+def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Issue #12: YAMLError (malformed config) yields exit 2."""
+
+    def _boom(args):
+        raise yaml.YAMLError("malformed YAML")
+
+    monkeypatch.setattr(cli, "build_app", _boom)
+
+    assert cli.main(["roll-call"]) == 2
+    assert "YAML error: malformed YAML" in capsys.readouterr().err
 
 
 # --- Issue #18: idempotence of ship-it and loop --------------------------------
