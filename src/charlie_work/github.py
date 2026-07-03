@@ -12,6 +12,21 @@ logger = logging.getLogger(__name__)
 
 _LIST_LIMIT = 500
 
+# Module-level constants for gh --json field lists.
+# These are the single source of truth for all JSON field queries to GitHub.
+# All call sites must use these constants — no inline field-list literals.
+ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt"
+ISSUE_VIEW_FIELDS = "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt"
+PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus"
+PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository,mergeStateStatus"
+PR_CHECKS_FIELDS = "name,state,bucket,link"
+LABEL_LIST_FIELDS = "name"
+# Minimal field lists for drift detection (reconcile.py)
+RECONCILE_PR_FIELDS = (
+    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
+)
+RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
+
 
 class GitHubError(RuntimeError):
     pass
@@ -79,7 +94,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                "number,title,url,body,labels,assignees,author,createdAt,updatedAt",
+                ISSUE_LIST_FIELDS,
             ],
             limit=_LIST_LIMIT,
             kind=f"ready-labeled open issues (label={ready_label})",
@@ -92,7 +107,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt",
+                ISSUE_VIEW_FIELDS,
             ],
             json_output=True,
         )
@@ -108,7 +123,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus",
+                PR_LIST_FIELDS,
             ],
             limit=_LIST_LIMIT,
             kind="open PRs",
@@ -121,7 +136,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository,mergeStateStatus",
+                PR_VIEW_FIELDS,
             ],
             json_output=True,
         )
@@ -133,7 +148,7 @@ class GitHub:
 
     def pr_checks(self, number: int) -> list[dict[str, Any]]:
         result = self.run(
-            ["pr", "checks", str(number), "--json", "name,state,bucket,link"],
+            ["pr", "checks", str(number), "--json", PR_CHECKS_FIELDS],
             json_output=True,
             allow_failure=True,
         )
@@ -152,7 +167,9 @@ class GitHub:
         self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
 
     def label_list(self) -> list[dict[str, Any]]:
-        result = self.run(["label", "list", "--limit", "200", "--json", "name"], json_output=True)
+        result = self.run(
+            ["label", "list", "--limit", "200", "--json", LABEL_LIST_FIELDS], json_output=True
+        )
         return result if isinstance(result, list) else []
 
     def label_create(self, label: str, color: str, description: str) -> None:

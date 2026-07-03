@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 from pathlib import Path
 
 from charlie_work.config import (
@@ -450,3 +452,182 @@ def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: 
 
     names = {check.name for check in checks}
     assert "devin-shell worker model" not in names
+
+
+def test_gh_field_lists_use_constants_no_inline_literals() -> None:
+    """All gh --json field lists must use module-level constants, not inline literals.
+
+    This test scans src/charlie_work/*.py for gh.run() calls with --json arguments
+    and verifies that the field list value (the argument after --json) references a
+    constant from github.py rather than a string literal. This prevents the contract
+    drift issue described in #64 by ensuring all field lists are centralized and not
+    scattered as inline strings.
+    """
+    import ast
+    from pathlib import Path
+
+    import charlie_work.github as github_module
+
+    # Get the expected constant names from github.py
+    expected_constants = {
+        "ISSUE_LIST_FIELDS",
+        "ISSUE_VIEW_FIELDS",
+        "PR_LIST_FIELDS",
+        "PR_VIEW_FIELDS",
+        "PR_CHECKS_FIELDS",
+        "LABEL_LIST_FIELDS",
+        "RECONCILE_PR_FIELDS",
+        "RECONCILE_ISSUE_FIELDS",
+    }
+
+    # Verify constants exist
+    for const in expected_constants:
+        assert hasattr(github_module, const), f"Missing constant: {const}"
+        value = getattr(github_module, const)
+        assert isinstance(value, str), f"{const} must be a string"
+        assert value, f"{const} must not be empty"
+
+    # Scan all Python files in src/charlie_work/ for gh.run() calls with --json
+    src_dir = Path(__file__).parent.parent / "src" / "charlie_work"
+    violations: list[tuple[str, int, str]] = []
+
+    for py_file in src_dir.glob("*.py"):
+        if py_file.name == "github.py":
+            # Constant definitions are allowed in github.py
+            continue
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (OSError, SyntaxError):
+            continue
+
+        # Walk the AST to find gh.run() calls
+        for node in ast.walk(tree):
+            # Look for Call nodes where the function is gh.run
+            if isinstance(node, ast.Call):
+                # Check if this is a call to something named 'run'
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "run":
+                    # Look for --json in the arguments and check the next argument
+                    args = node.args
+                    for i, arg in enumerate(args):
+                        # Handle string constants (Python 3.8+)
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            if arg.value == "--json" and i + 1 < len(args):
+                                # Check if the next argument is a string literal (violation)
+                                next_arg = args[i + 1]
+                                if isinstance(next_arg, ast.Constant) and isinstance(
+                                    next_arg.value, str
+                                ):
+                                    # This is a field list as a string literal - violation
+                                    violations.append(
+                                        (str(py_file), next_arg.lineno, next_arg.value)
+                                    )
+                                elif isinstance(next_arg, ast.JoinedStr):
+                                    # f-string field list - violation
+                                    violations.append(
+                                        (str(py_file), next_arg.lineno, "f-string field list")
+                                    )
+                    # Also check keyword arguments with list values
+                    for keyword in node.keywords:
+                        if keyword.arg in ("args",) and isinstance(keyword.value, ast.List):
+                            list_items = keyword.value.elts
+                            for i, item in enumerate(list_items):
+                                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                                    if item.value == "--json" and i + 1 < len(list_items):
+                                        next_item = list_items[i + 1]
+                                        if isinstance(next_item, ast.Constant) and isinstance(
+                                            next_item.value, str
+                                        ):
+                                            violations.append(
+                                                (str(py_file), next_item.lineno, next_item.value)
+                                            )
+                                        elif isinstance(next_item, ast.JoinedStr):
+                                            violations.append(
+                                                (
+                                                    str(py_file),
+                                                    next_item.lineno,
+                                                    "f-string field list",
+                                                )
+                                            )
+
+    if violations:
+        violation_msg = "\n".join(
+            f"  {file}:{line}: {repr(literal)}" for file, line, literal in violations
+        )
+        raise AssertionError(
+            f"Found {len(violations)} field list string literal(s) in gh.run() calls that should use constants:\n"
+            f"{violation_msg}\n"
+            f"Use the constants from github.py instead (e.g., ISSUE_LIST_FIELDS)."
+        )
+
+
+def test_fake_github_payloads_align_with_field_constants() -> None:
+    """FakeGitHub test double payloads must not have keys outside the field constants.
+
+    This prevents the third instance of the #64 bug class: a fake growing a key
+    the real gh CLI never returns, which lets dead code pass CI and crash live.
+    The dispatch_rework KeyError hotfix on main was caused by exactly this.
+    """
+    import charlie_work.github as github_module
+
+    # Get the field sets from the constants
+    pr_list_fields = set(github_module.PR_LIST_FIELDS.split(","))
+    issue_list_fields = set(github_module.ISSUE_LIST_FIELDS.split(","))
+    reconcile_pr_fields = set(github_module.RECONCILE_PR_FIELDS.split(","))
+    reconcile_issue_fields = set(github_module.RECONCILE_ISSUE_FIELDS.split(","))
+
+    # Check the main FakeGitHub in test_charlie_work.py
+    # Import dynamically to avoid module import issues
+    test_charlie_work_path = Path(__file__).parent / "test_charlie_work.py"
+    spec = importlib.util.spec_from_file_location("test_charlie_work", test_charlie_work_path)
+    test_charlie_work = importlib.util.module_from_spec(spec)
+    sys.modules["test_charlie_work"] = test_charlie_work
+    spec.loader.exec_module(test_charlie_work)
+
+    MainFakeGitHub = test_charlie_work.FakeGitHub
+    fake_gh = MainFakeGitHub()
+
+    # Verify PR payload keys are subset of PR_LIST_FIELDS
+    pr_keys = set(fake_gh.pr.keys())
+    extra_pr_keys = pr_keys - pr_list_fields
+    assert not extra_pr_keys, (
+        f"FakeGitHub.pr has keys not in PR_LIST_FIELDS: {extra_pr_keys}. "
+        f"Either remove these keys from the fake or add them to PR_LIST_FIELDS."
+    )
+
+    # Verify issue payload keys are subset of ISSUE_LIST_FIELDS
+    issue_keys = set(fake_gh.issues[0].keys())
+    extra_issue_keys = issue_keys - issue_list_fields
+    assert not extra_issue_keys, (
+        f"FakeGitHub.issues[0] has keys not in ISSUE_LIST_FIELDS: {extra_issue_keys}. "
+        f"Either remove these keys from the fake or add them to ISSUE_LIST_FIELDS."
+    )
+
+    # Check the FakeGitHub in test_reconcile.py
+    test_reconcile_path = Path(__file__).parent / "test_reconcile.py"
+    spec = importlib.util.spec_from_file_location("test_reconcile", test_reconcile_path)
+    test_reconcile = importlib.util.module_from_spec(spec)
+    sys.modules["test_reconcile"] = test_reconcile
+    spec.loader.exec_module(test_reconcile)
+
+    _pr = test_reconcile._pr
+    _issue = test_reconcile._issue
+
+    # Verify _pr helper keys are subset of RECONCILE_PR_FIELDS (not PR_LIST_FIELDS)
+    # because test_reconcile uses the reconcile field list which includes 'state'
+    sample_pr = _pr(1, "OPEN")
+    pr_keys = set(sample_pr.keys())
+    extra_pr_keys = pr_keys - reconcile_pr_fields
+    assert not extra_pr_keys, (
+        f"test_reconcile._pr has keys not in RECONCILE_PR_FIELDS: {extra_pr_keys}. "
+        f"Either remove these keys from the fake or add them to RECONCILE_PR_FIELDS."
+    )
+
+    # Verify _issue helper keys are subset of RECONCILE_ISSUE_FIELDS
+    sample_issue = _issue(1, [])
+    issue_keys = set(sample_issue.keys())
+    extra_issue_keys = issue_keys - reconcile_issue_fields
+    assert not extra_issue_keys, (
+        f"test_reconcile._issue has keys not in RECONCILE_ISSUE_FIELDS: {extra_issue_keys}. "
+        f"Either remove these keys from the fake or add them to RECONCILE_ISSUE_FIELDS."
+    )
