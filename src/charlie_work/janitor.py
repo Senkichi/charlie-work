@@ -125,7 +125,14 @@ def _check_linked_issue(
 ) -> None:
     if not config.review.require_issue_link:
         return
-    if linked_issue_number(pr) is None:
+    if (
+        linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        is None
+    ):
         failures.append("No linked issue found (branch name, title, or body)")
 
 
