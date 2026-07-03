@@ -266,8 +266,10 @@ def detect_drift(
                     # Session exited without error - classify the failure
                     from .devin_shell import update_session_record_with_failure_classification
 
-                    failure_kind, throttled_until = update_session_record_with_failure_classification(
-                        sessions_dir, record.issue_number
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
                     )
                     if failure_kind and throttled_until:
                         # Update state with throttle window
@@ -291,8 +293,10 @@ def detect_drift(
                     # Session exited without error - classify the failure
                     from .claude_code import update_worker_record_with_failure_classification
 
-                    failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                        sessions_dir, record.issue_number
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
                     )
                     if failure_kind and throttled_until:
                         # Update state with throttle window

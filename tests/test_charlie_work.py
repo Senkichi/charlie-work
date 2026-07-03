@@ -35,7 +35,13 @@ from charlie_work.cross_family import (
 from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
-from charlie_work.state import is_throttled, load_state, save_state, set_throttled_until, state_lock
+from charlie_work.state import (
+    is_throttled,
+    load_state,
+    save_state,
+    set_throttled_until,
+    state_lock,
+)
 from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"

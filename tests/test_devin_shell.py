@@ -656,8 +656,7 @@ def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) 
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
-        "Some work done...\n"
-        "Error: Reached overall message rate limit. Please try again later.\n",
+        "Some work done...\nError: Reached overall message rate limit. Please try again later.\n",
         encoding="utf-8",
     )
 
@@ -696,8 +695,7 @@ def test_classify_session_failure_no_throttle(tmp_path: Path) -> None:
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
-        "Some work done...\n"
-        "Error: something went wrong with the task\n",
+        "Some work done...\nError: something went wrong with the task\n",
         encoding="utf-8",
     )
 
@@ -727,17 +725,19 @@ def test_update_session_record_with_failure_classification(tmp_path: Path) -> No
     # Create a session sidecar
     sidecar_path = sessions_dir / "issue-42.json"
     sidecar_path.write_text(
-        json.dumps({
-            "issue_number": 42,
-            "branch": "agent/issue-42",
-            "worktree_path": "/tmp/wt/issue-42",
-            "prompt_path": "p.md",
-            "command": ["devin", "--print"],
-            "pid": 1234,
-            "started_at": "2026-01-01T00:00:00Z",
-            "log_path": str(sessions_dir / "issue-42.log"),
-            "error": None,
-        }),
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -769,18 +769,20 @@ def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
     # Create a session sidecar with existing classification
     sidecar_path = sessions_dir / "issue-42.json"
     sidecar_path.write_text(
-        json.dumps({
-            "issue_number": 42,
-            "branch": "agent/issue-42",
-            "worktree_path": "/tmp/wt/issue-42",
-            "prompt_path": "p.md",
-            "command": ["devin", "--print"],
-            "pid": 1234,
-            "started_at": "2026-01-01T00:00:00Z",
-            "log_path": str(sessions_dir / "issue-42.log"),
-            "error": None,
-            "failure_kind": "rate_limited",  # Already classified
-        }),
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+                "failure_kind": "rate_limited",  # Already classified
+            }
+        ),
         encoding="utf-8",
     )
 

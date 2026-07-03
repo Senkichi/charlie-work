@@ -155,7 +155,9 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
 
         # Surface rate-limited deaths specifically
         rate_limited = [r for r in records if getattr(r, "failure_kind", None) == "rate_limited"]
-        quota_exhausted = [r for r in records if getattr(r, "failure_kind", None) == "quota_exhausted"]
+        quota_exhausted = [
+            r for r in records if getattr(r, "failure_kind", None) == "quota_exhausted"
+        ]
         if rate_limited:
             rl_issues = sorted({r.issue_number for r in rate_limited})
             detail += f" | rate-limited: {rl_issues}"

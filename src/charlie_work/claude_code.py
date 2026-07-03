@@ -123,7 +123,9 @@ def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
         else:
             cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
         throttled_until = datetime.now(UTC) + cooldown
-        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
     # Check for rate limiting
     if _RATE_LIMIT_PATTERN.search(tail):
@@ -135,7 +137,9 @@ def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
         else:
             cooldown = timedelta(minutes=_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES)
         throttled_until = datetime.now(UTC) + cooldown
-        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
     return None, None
 

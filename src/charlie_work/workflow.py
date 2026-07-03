@@ -28,7 +28,6 @@ from .state import (
     is_throttled,
     load_state,
     save_state,
-    set_throttled_until,
     state_lock,
     utc_now,
 )
@@ -1208,7 +1207,9 @@ class OrchestratorApp:
                 # The label removals above use allow_failure=True, so a failed
                 # removal is silently swallowed. Re-detect against the new state to
                 # verify the repairs actually landed before reporting success.
-                post_fix_drift = detect_drift(self.gh, new_state, self.config, repo_root=self.repo_root)
+                post_fix_drift = detect_drift(
+                    self.gh, new_state, self.config, repo_root=self.repo_root
+                )
                 fixed = len(post_fix_drift) == 0
         message = f"found {len(drift)} drift item(s)"
         if fixed:

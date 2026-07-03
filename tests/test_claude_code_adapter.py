@@ -519,17 +519,19 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
     # Create a worker sidecar
     sidecar_path = sessions_dir / "issue-42.claude.json"
     sidecar_path.write_text(
-        json.dumps({
-            "issue_number": 42,
-            "branch": "agent/issue-42",
-            "worktree_path": "/tmp/wt/issue-42",
-            "prompt_path": "p.md",
-            "command": ["claude", "-p"],
-            "pid": 1234,
-            "started_at": "2026-01-01T00:00:00Z",
-            "log_path": str(sessions_dir / "issue-42.claude.log"),
-            "error": None,
-        }),
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
         encoding="utf-8",
     )
 
