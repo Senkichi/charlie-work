@@ -90,7 +90,7 @@ class GitHub:
                 "--limit",
                 "200",
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid",
             ],
             json_output=True,
         )
@@ -103,7 +103,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid",
             ],
             json_output=True,
         )

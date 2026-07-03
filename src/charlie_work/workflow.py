@@ -400,6 +400,15 @@ class OrchestratorApp:
         decision_path = pr_dir / "review-decision.json"
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
+        else:
+            # An approval is pinned to a specific head. If the PR has moved on,
+            # the old verdict is void and must not survive into the new packet.
+            existing_decision = self._review_decision(pr_number)
+            reviewed_head_sha = existing_decision.get("reviewed_head_sha")
+            if existing_decision.get("decision") == "approved" and (
+                reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
+            ):
+                self._write_json(decision_path, decision_template)
         if issue_number is not None:
             transition(self.gh, self.config.labels, issue_number, "review_started")
         state = load_state(self.paths.state_file)
@@ -460,11 +469,13 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
+        reviewed_head_sha = pr.get("headRefOid") if pr else None
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
             "decision": decision,
             "summary": summary_text,
+            "reviewed_head_sha": reviewed_head_sha,
             "reviewed_at": utc_now(),
         }
         state = load_state(self.paths.state_file)
@@ -496,6 +507,7 @@ class OrchestratorApp:
             "issue_number": issue_number,
             "decision": decision,
             "decision_path": str(decision_path),
+            "reviewed_head_sha": reviewed_head_sha,
             "request_changes_count": request_changes_count,
             "status": "escalated" if escalated else decision,
         }
@@ -540,6 +552,7 @@ class OrchestratorApp:
                 "pr": pr_number,
                 "decision": decision,
                 "decision_path": str(decision_path),
+                "reviewed_head_sha": reviewed_head_sha,
                 "rework_path": rework_path,
                 "escalated": escalated,
                 "request_changes_count": request_changes_count,
@@ -569,10 +582,56 @@ class OrchestratorApp:
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
         issue_number = linked_issue_number(pr)
-        checks = self.gh.pr_checks(pr_number)
-        summary = summarize_checks(checks, self.config.auto_merge.required_checks)
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
+        if approved:
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+            live_head_sha = pr.get("headRefOid")
+            if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
+                message = "PR head moved since approval — re-review required"
+                label_error: str | None = None
+                try:
+                    if issue_number is not None:
+                        transition(self.gh, self.config.labels, issue_number, "review_started")
+                except GitHubError as exc:
+                    label_error = str(exc)
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    "status": "reviewing",
+                    "head_moved": True,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                }
+                state = append_event(
+                    state,
+                    "head_moved",
+                    {
+                        "pr_number": pr_number,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "live_head_sha": live_head_sha,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+                return CommandResult(
+                    False,
+                    message,
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "can_merge": False,
+                        "merged": False,
+                        "head_moved": True,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "live_head_sha": live_head_sha,
+                        "review_decision": decision,
+                        "label_error": label_error,
+                    },
+                )
+        checks = self.gh.pr_checks(pr_number)
+        summary = summarize_checks(checks, self.config.auto_merge.required_checks)
         can_merge = summary.ready and (
             approved or not self.config.auto_merge.require_approved_review
         )
@@ -813,7 +872,21 @@ class OrchestratorApp:
                     "status"
                 ) not in ("request_changes", "escalated", "blocked")
                 if already_approved:
-                    merges.append(self.merge_ready(pr_number).data)
+                    reviewed_head_sha = pr_state.get("reviewed_head_sha")
+                    live_head_sha = pr.get("headRefOid")
+                    head_matches = (
+                        reviewed_head_sha is not None
+                        and live_head_sha is not None
+                        and live_head_sha == reviewed_head_sha
+                    )
+                    if head_matches:
+                        merges.append(self.merge_ready(pr_number).data)
+                    else:
+                        review = self.review(pr_number)
+                        reviews.append(review.data)
+                        decision = self._review_decision(pr_number)
+                        if decision.get("decision") == "approved":
+                            merges.append(self.merge_ready(pr_number).data)
                 else:
                     review = self.review(pr_number)
                     reviews.append(review.data)
