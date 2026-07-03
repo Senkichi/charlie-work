@@ -126,7 +126,31 @@ class OrchestratorApp:
         for label in self.config.labels.all:
             color = "0E8A16" if label == self.config.labels.ready else "5319E7"
             self.gh.label_create(label, color, descriptions[label])
-        return CommandResult(True, "labels ensured", {"labels": self.config.labels.all})
+        # Verify: check which labels actually exist after creation attempts.
+        # label_create uses allow_failure=True, so silent failures are possible
+        # (e.g. no auth, wrong repo). Don't report success we can't vouch for.
+        try:
+            live = {
+                str(item.get("name") or "")
+                for item in self.gh.label_list()
+                if isinstance(item, dict)
+            }
+            missing = [name for name in self.config.labels.all if name not in live]
+        except GitHubError as exc:
+            return CommandResult(
+                False,
+                f"labels created but verification failed: {exc}",
+                {"labels": self.config.labels.all, "missing": None},
+            )
+        if missing:
+            return CommandResult(
+                False,
+                f"bootstrap incomplete — {len(missing)} label(s) still missing: {missing}",
+                {"labels": self.config.labels.all, "missing": missing},
+            )
+        return CommandResult(
+            True, "labels ensured", {"labels": self.config.labels.all, "missing": []}
+        )
 
     def intake(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
@@ -710,8 +734,11 @@ class OrchestratorApp:
             message += " — fixed"
         elif drift:
             message += " (read-only; pass --fix to repair)"
+        # ok=False when drift is present and not fixed: scripts and CI can gate
+        # on exit code to detect unresolved drift, matching how `doctor` gates.
+        ok = not drift or fixed
         return CommandResult(
-            True,
+            ok,
             message,
             {"drift": [asdict(item) for item in drift], "fixed": fixed},
         )

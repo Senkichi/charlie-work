@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+class RepoNotFoundError(ValueError):
+    """Raised when ``--repo`` points at a path that is not a git work tree."""
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     root: Path
@@ -19,8 +23,20 @@ class RuntimePaths:
             path.mkdir(parents=True, exist_ok=True)
 
 
-def find_repo_root(cwd: Path | None = None) -> Path:
+def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
+    """Return the git work-tree root for *cwd* (defaults to ``Path.cwd()``).
+
+    When *explicit* is True the caller supplied ``cwd`` directly from a
+    user-facing ``--repo`` flag.  In that case the path must exist and must
+    be inside a git work tree; a clear :class:`RepoNotFoundError` is raised
+    otherwise so the operator sees the mistake instead of a silent phantom repo.
+    """
     start = (cwd or Path.cwd()).resolve()
+    if explicit:
+        if not start.exists():
+            raise RepoNotFoundError(f"--repo path does not exist: {start}")
+        if not start.is_dir():
+            raise RepoNotFoundError(f"--repo path is not a directory: {start}")
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -34,6 +50,8 @@ def find_repo_root(cwd: Path | None = None) -> Path:
         for candidate in (start, *start.parents):
             if (candidate / ".git").exists():
                 return candidate
+    if explicit:
+        raise RepoNotFoundError(f"--repo path is not inside a git work tree: {start}")
     return start
 
 
