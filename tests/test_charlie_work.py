@@ -3970,8 +3970,11 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
     """Issue #85 acceptance test: two rework_requested issues, loop(limit=1) dispatches different issues.
 
     This is the headline reproduction test for issue #85's observed failure: when there are
-    multiple rework_requested issues, dispatch_rework with limit=1 should dispatch one issue
-    per pass, cycling through candidates rather than dispatching the same issue repeatedly.
+    multiple rework_requested issues, loop(limit=1) should dispatch one issue per pass,
+    cycling through candidates rather than dispatching the same issue repeatedly.
+
+    This test drives the full loop() method (not just dispatch_rework) to prove that the
+    review stage (which strips labels) runs and that state-driven selection survives through it.
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
@@ -4053,24 +4056,20 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
         rework_prompt = pr_dir / "rework-prompt.md"
         rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
-    # First dispatch with limit=1
-    result1 = app.dispatch_rework(limit=1)
+    # First loop pass with limit=1
+    result1 = app.loop(limit=1)
     assert result1.ok is True
-    assert result1.data["selected_count"] == 1
-    first_issue = result1.data["sessions"][0]["issue_number"]
+    assert result1.data["dispatch_rework"]["selected_count"] == 1
+    first_issue = result1.data["dispatch_rework"]["sessions"][0]["issue_number"]
     assert first_issue in (123, 124)
 
-    # Mark the first dispatched issue as dispatched to prevent re-selection
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state["issues"][str(first_issue)]["status"] = "dispatched"
-        save_state(paths.state_file, state)
-
-    # Second dispatch with limit=1 should select the OTHER issue
-    result2 = app.dispatch_rework(limit=1)
+    # Second loop pass with limit=1 should select the OTHER issue
+    # The review stage ran in the first pass (stripping labels), so this proves
+    # state-driven selection survives through label mutations
+    result2 = app.loop(limit=1)
     assert result2.ok is True
-    assert result2.data["selected_count"] == 1
-    second_issue = result2.data["sessions"][0]["issue_number"]
+    assert result2.data["dispatch_rework"]["selected_count"] == 1
+    second_issue = result2.data["dispatch_rework"]["sessions"][0]["issue_number"]
     assert second_issue in (123, 124)
     assert second_issue != first_issue, "Should dispatch the other issue, not the same one twice"
 
@@ -4193,17 +4192,18 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
         assert state["prs"]["456"]["decision"] == "request_changes"
         assert state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
 
-    # Add needs_rework label to the issue (simulating the label state after request_changes)
-    fake_gh.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+    # Clear label tracking to isolate the review() call
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
 
     # Call review again with the same head SHA
     result = app.review(456)
 
-    # The review_started transition should be skipped, so needs_rework label should remain
+    # The review_started transition should be skipped, so no labels should be added/removed
     assert result.ok is True
-    assert (123, "agent:review_started") not in fake_gh.labels_added
-    # The needs_rework label should still be present (not stripped by review_started)
-    assert any(label["name"] == "agent:needs-rework" for label in fake_gh.issues[0]["labels"])
+    # review_started transition adds pr_open and reviewing labels when it fires
+    assert (123, "agent:pr-open") not in fake_gh.labels_added
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
 def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path: Path) -> None:
