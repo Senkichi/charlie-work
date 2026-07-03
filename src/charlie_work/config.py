@@ -199,16 +199,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path and path.exists() else {}
     data = raw if isinstance(raw, dict) else {}
     # Validate top-level keys before processing sections
-    known_sections = {
-        "labels",
-        "dispatch",
-        "review",
-        "auto_merge",
-        "runtime",
-        "devin",
-        "claude_code",
-        "cross_family",
-    }
+    known_sections = {f.name for f in fields(OrchestratorConfig)}
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise ConfigError(
