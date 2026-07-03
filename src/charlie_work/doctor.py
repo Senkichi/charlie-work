@@ -17,7 +17,18 @@ from typing import Any
 import yaml
 
 from .config import OrchestratorConfig
-from .github import GitHub, GitHubError
+from .github import (
+    GitHub,
+    GitHubError,
+    ISSUE_LIST_FIELDS,
+    ISSUE_VIEW_FIELDS,
+    LABEL_LIST_FIELDS,
+    PR_CHECKS_FIELDS,
+    PR_LIST_FIELDS,
+    PR_VIEW_FIELDS,
+    RECONCILE_ISSUE_FIELDS,
+    RECONCILE_PR_FIELDS,
+)
 from .paths import RuntimePaths
 from .prompts import resolve_template
 
@@ -144,6 +155,130 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     add("launched sessions", not failed, detail, severity="warning")
 
 
+def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
+    """Validate gh --json field lists against the live gh CLI.
+
+    Executes each field list as a read-only query with --limit 1 and reports
+    any invalid/unknown fields with the gh error text. This catches contract
+    drift between the hardcoded field lists and the actual gh CLI schema.
+    """
+
+    # Discover probe targets dynamically instead of hardcoding item #1
+    def _find_pr_number() -> int | None:
+        """Find a real PR number to probe, or None if no PRs exist."""
+        try:
+            result = gh.run(
+                ["pr", "list", "--state", "all", "--limit", "1", "--json", "number"],
+                json_output=True,
+            )
+            if result and isinstance(result, list) and result:
+                return result[0].get("number")
+        except GitHubError:
+            pass
+        return None
+
+    def _find_issue_number() -> int | None:
+        """Find a real issue number to probe, or None if no issues exist."""
+        try:
+            result = gh.run(
+                ["issue", "list", "--state", "all", "--limit", "1", "--json", "number"],
+                json_output=True,
+            )
+            if result and isinstance(result, list) and result:
+                return result[0].get("number")
+        except GitHubError:
+            pass
+        return None
+
+    pr_number = _find_pr_number()
+    issue_number = _find_issue_number()
+
+    # Map of field list name to (command, fields) tuples
+    # Commands that need specific item numbers use placeholders
+    field_lists = {
+        "ISSUE_LIST_FIELDS": (
+            ["issue", "list", "--state", "open", "--limit", "1"],
+            ISSUE_LIST_FIELDS,
+        ),
+        "ISSUE_VIEW_FIELDS": (
+            ["issue", "view", str(issue_number)] if issue_number else None,
+            ISSUE_VIEW_FIELDS,
+        ),
+        "PR_LIST_FIELDS": (["pr", "list", "--state", "open", "--limit", "1"], PR_LIST_FIELDS),
+        "PR_VIEW_FIELDS": (
+            ["pr", "view", str(pr_number)] if pr_number else None,
+            PR_VIEW_FIELDS,
+        ),
+        "PR_CHECKS_FIELDS": (
+            ["pr", "checks", str(pr_number)] if pr_number else None,
+            PR_CHECKS_FIELDS,
+        ),
+        "LABEL_LIST_FIELDS": (["label", "list", "--limit", "1"], LABEL_LIST_FIELDS),
+        "RECONCILE_PR_FIELDS": (
+            ["pr", "list", "--state", "all", "--limit", "1"],
+            RECONCILE_PR_FIELDS,
+        ),
+        "RECONCILE_ISSUE_FIELDS": (
+            ["issue", "list", "--state", "open", "--limit", "1"],
+            RECONCILE_ISSUE_FIELDS,
+        ),
+    }
+
+    for list_name, (base_cmd, fields) in field_lists.items():
+        # Skip if no probe target available
+        if base_cmd is None:
+            if list_name in ("ISSUE_VIEW_FIELDS",):
+                add(
+                    f"gh field list: {list_name}",
+                    True,
+                    "skipped (no issue available to probe)",
+                    severity="warning",
+                )
+            elif list_name in ("PR_VIEW_FIELDS", "PR_CHECKS_FIELDS"):
+                add(
+                    f"gh field list: {list_name}",
+                    True,
+                    "skipped (no PR available to probe)",
+                    severity="warning",
+                )
+            continue
+
+        cmd = [*base_cmd, "--json", fields]
+        try:
+            gh.run(cmd, json_output=True)
+            add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
+        except GitHubError as exc:
+            error_msg = str(exc)
+            # Classify errors: only actual field errors get the "invalid field(s)" label
+            # Field errors have a specific shape: "Unknown JSON field: ..." or "invalid JSON field: ..."
+            is_field_error = any(
+                phrase in error_msg
+                for phrase in ("Unknown JSON field:", "invalid JSON field:", "invalid field")
+            )
+
+            # Special case: gh pr checks fails with non-zero exit when no CI is configured
+            # This is not a field error - it's a missing feature
+            if list_name == "PR_CHECKS_FIELDS" and "no checks reported" in error_msg.lower():
+                add(
+                    f"gh field list: {list_name}",
+                    True,
+                    "skipped (no CI configured on probe PR)",
+                    severity="warning",
+                )
+            elif is_field_error:
+                add(
+                    f"gh field list: {list_name}",
+                    False,
+                    f"invalid field(s): {error_msg}",
+                )
+            else:
+                add(
+                    f"gh field list: {list_name}",
+                    False,
+                    f"probe failed (not a field error): {error_msg}",
+                )
+
+
 def run_doctor(
     repo_root: Path,
     paths: RuntimePaths,
@@ -152,6 +287,7 @@ def run_doctor(
     gh: GitHub,
     *,
     adapter_probe: bool = False,
+    live: bool = False,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
 
@@ -305,6 +441,9 @@ def run_doctor(
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
         _surface_sessions(add, repo_root, config)
+
+    if live:
+        _validate_gh_field_lists(add, gh)
 
     if config.cross_family.enabled:
         command = config.cross_family.command
