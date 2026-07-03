@@ -223,7 +223,7 @@ def test_load_config_rejects_broken_yaml(tmp_path: Path) -> None:
 
     try:
         load_config(config_path)
-    except yaml.YAMLError as exc:
+    except yaml.YAMLError:
         # Expected: YAML parsing error
         pass
     else:  # pragma: no cover
@@ -2069,6 +2069,7 @@ def test_cli_main_maps_config_error_to_exit_2(tmp_path: Path, monkeypatch, capsy
 
 def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys) -> None:
     """Issue #12: YAMLError (malformed config) yields exit 2."""
+
     def _boom(args):
         raise yaml.YAMLError("malformed YAML")
 
