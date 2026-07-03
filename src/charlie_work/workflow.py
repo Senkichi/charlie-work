@@ -284,17 +284,40 @@ class OrchestratorApp:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 # Same dispatchability logic as the real dispatch, but read-only
+                # Issue #5: also check worker liveness for "dispatched" status
+                from .devin_shell import is_session_alive, read_session_records
+                from .claude_code import is_worker_alive, read_worker_records
+
+                sessions_dir = self._resolve(self.config.devin.sessions_dir)
                 live_dispatched = set()
                 for number, entry in state.get("issues", {}).items():
                     if not isinstance(entry, dict):
                         continue
                     status = entry.get("status")
-                    if status == "dispatched":
-                        live_dispatched.add(int(number))
-                    elif status == "dispatch_pending" and not is_claim_stale(
+                    if status == "dispatch_pending" and not is_claim_stale(
                         entry.get("dispatch_pending_at")
                     ):
                         live_dispatched.add(int(number))
+                    elif status == "dispatched":
+                        # Check if the worker is actually alive before excluding
+                        # from re-dispatch. If the worker crashed, the issue should
+                        # become dispatchable again.
+                        issue_number = int(number)
+                        worker_alive = False
+                        # Check devin-shell sessions
+                        for record in read_session_records(sessions_dir):
+                            if record.issue_number == issue_number and is_session_alive(record):
+                                worker_alive = True
+                                break
+                        # Check claude-code sessions
+                        if not worker_alive:
+                            for record in read_worker_records(sessions_dir):
+                                if record.issue_number == issue_number and is_worker_alive(record):
+                                    worker_alive = True
+                                    break
+                        # Only exclude if worker is actually alive
+                        if worker_alive:
+                            live_dispatched.add(issue_number)
                 candidates = [
                     issue
                     for issue in issues
@@ -359,17 +382,41 @@ class OrchestratorApp:
             # _is_dispatchable is label-only; this closes the launched-but-unlabeled
             # window that would otherwise spawn a second worker on the same issue.
             # Stale claims (crashed phase-2) are excluded to allow re-dispatch.
+            # Issue #5: also check worker liveness for "dispatched" status to recover
+            # from crashed workers before PR opens.
+            from .devin_shell import is_session_alive, read_session_records
+            from .claude_code import is_worker_alive, read_worker_records
+
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
             live_dispatched = set()
             for number, entry in state.get("issues", {}).items():
                 if not isinstance(entry, dict):
                     continue
                 status = entry.get("status")
-                if status == "dispatched":
-                    live_dispatched.add(int(number))
-                elif status == "dispatch_pending" and not is_claim_stale(
+                if status == "dispatch_pending" and not is_claim_stale(
                     entry.get("dispatch_pending_at")
                 ):
                     live_dispatched.add(int(number))
+                elif status == "dispatched":
+                    # Check if the worker is actually alive before excluding
+                    # from re-dispatch. If the worker crashed, the issue should
+                    # become dispatchable again.
+                    issue_number = int(number)
+                    worker_alive = False
+                    # Check devin-shell sessions
+                    for record in read_session_records(sessions_dir):
+                        if record.issue_number == issue_number and is_session_alive(record):
+                            worker_alive = True
+                            break
+                    # Check claude-code sessions
+                    if not worker_alive:
+                        for record in read_worker_records(sessions_dir):
+                            if record.issue_number == issue_number and is_worker_alive(record):
+                                worker_alive = True
+                                break
+                    # Only exclude if worker is actually alive
+                    if worker_alive:
+                        live_dispatched.add(issue_number)
             candidates = [
                 issue
                 for issue in issues
