@@ -14,6 +14,7 @@ class SessionRequest:
     issue_title: str
     prompt_path: Path
     branch_name: str
+    rework: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ def _request_dict(request: SessionRequest) -> dict[str, Any]:
         "issue_title": request.issue_title,
         "prompt_path": str(request.prompt_path),
         "branch_name": request.branch_name,
+        "rework": request.rework,
     }
 
 
@@ -180,26 +182,37 @@ def _run_devin_shell_adapter(
 ) -> SessionDispatchResult:
     from .devin_shell import DEFAULT_COMMAND_TEMPLATE, launch_devin_session
 
-    record = launch_devin_session(
-        request.issue_number,
-        request.branch_name,
-        request.prompt_path,
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        worktrees_dir=settings.worktrees_dir,
-        command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
-        worker_model=settings.worker_model,
-    )
-    # Non-blocking launch: there is no returncode/stdout to report — liveness
-    # and output live in the sidecar JSON and per-session log.
-    ok = record.error is None and record.pid is not None
-    return _result(
-        request,
-        adapter="devin-shell",
-        ok=ok,
-        command=list(record.command),
-        error=record.error if not ok else None,
-    )
+    try:
+        record = launch_devin_session(
+            request.issue_number,
+            request.branch_name,
+            request.prompt_path,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            worktrees_dir=settings.worktrees_dir,
+            command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
+            worker_model=settings.worker_model,
+            rework=request.rework,
+        )
+        # Non-blocking launch: there is no returncode/stdout to report — liveness
+        # and output live in the sidecar JSON and per-session log.
+        ok = record.error is None and record.pid is not None
+        return _result(
+            request,
+            adapter="devin-shell",
+            ok=ok,
+            command=list(record.command),
+            error=record.error if not ok else None,
+        )
+    except Exception as exc:
+        # Catch any unexpected exception and return as a failure result
+        # (CLAUDE.md invariant: errors from external processes come back as values)
+        return _result(
+            request,
+            adapter="devin-shell",
+            ok=False,
+            error=f"launch failed: {exc}",
+        )
 
 
 def _run_claude_code_adapter(
@@ -226,6 +239,7 @@ def _run_claude_code_adapter(
         worktrees_dir=settings.worktrees_dir,
         venv_source=settings.venv_source,
         env=settings.worker_env,
+        rework=request.rework,
         **kwargs,
     )
     ok = record.error is None and record.pid is not None

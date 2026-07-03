@@ -196,3 +196,66 @@ def test_is_junction_true_for_windows_junction(tmp_path: Path) -> None:
     _winapi.CreateJunction(str(target), str(link))
 
     assert is_junction(link) is True
+
+
+def test_rework_reuses_existing_worktree(tmp_path: Path) -> None:
+    """Rework mode should reuse an existing worktree and fetch+fast-forward it."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch and worktree (simulating a previous PR cycle)
+    branch_name = "agent/issue-1-rework"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "file1.txt"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file1"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+    )
+
+    # In rework mode, create_worktree should reuse the existing worktree
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    # Should return the same path
+    assert info2.path == info1.path
+    # File should still exist
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+
+
+def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
+    """Rework mode should attach to an existing branch when no worktree exists."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch without a worktree (simulating a branch that exists but
+    # its worktree was cleaned up after merge)
+    branch_name = "agent/issue-2-reattach"
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # In rework mode, create_worktree should attach to the existing branch
+    # (no -b flag, so it doesn't try to create a new branch)
+    info = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info.branch == branch_name
+    assert info.path.exists()
+    # Should be on the existing branch, not a new one
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == branch_name

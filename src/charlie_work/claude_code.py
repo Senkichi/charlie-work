@@ -131,6 +131,7 @@ def launch_claude_worker(
     venv_source: Path | None = None,
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
     env: dict[str, str] | None = None,
+    rework: bool = False,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -138,6 +139,9 @@ def launch_claude_worker(
     failures both come back as an error record. If the worktree was created
     but the process failed to launch, the worktree is removed best-effort so
     a failed launch doesn't leak a half-made worktree.
+
+    If ``rework`` is True, the worktree is created in rework mode (reuse existing
+    worktree or attach to existing branch instead of creating a new branch).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number)
@@ -148,6 +152,7 @@ def launch_claude_worker(
             branch,
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
+            rework=rework,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(

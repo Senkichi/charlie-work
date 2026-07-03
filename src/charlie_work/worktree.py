@@ -76,6 +76,7 @@ def create_worktree(
     base_ref: str = "HEAD",
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
+    rework: bool = False,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -85,20 +86,58 @@ def create_worktree(
     RuntimeError if that link target already exists in the fresh worktree
     (programmer error / stale state — fail loudly rather than silently
     reusing or overwriting it).
+
+    If ``rework`` is True, the branch is assumed to already exist (from a
+    previous PR cycle). In rework mode:
+    - If a worktree for the branch already exists, fetch and fast-forward it
+      to the origin tip instead of failing.
+    - Otherwise, use ``git worktree add <path> <branch>`` (no ``-b``) to
+      attach to the existing branch at its origin tip.
     """
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
 
-    result = run_captured(
-        ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
-        cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        raise RuntimeError(
-            f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+    if rework:
+        # Rework mode: branch already exists, reuse or attach to it
+        existing_worktrees = list_worktrees(repo_root)
+        existing_wt = next((wt for wt in existing_worktrees if wt.get("branch") == branch), None)
+
+        if existing_wt:
+            # Reuse existing worktree: fetch and fast-forward to origin tip
+            worktree_path = Path(existing_wt["worktree"])
+            # Fetch the branch from origin to get latest changes
+            fetch_result = run_captured(
+                ["git", "fetch", "origin", f"{branch}:{branch}"],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not fetch_result.ok:
+                raise RuntimeError(
+                    f"git fetch failed for rework branch {branch!r}: {fetch_result.error or fetch_result.stderr}"
+                )
+        else:
+            # No existing worktree: attach to existing branch (no -b flag)
+            result = run_captured(
+                ["git", "worktree", "add", str(worktree_path), branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    f"git worktree add failed for rework branch {branch!r}: {result.error or result.stderr}"
+                )
+    else:
+        # Fresh dispatch: create new branch off base_ref
+        result = run_captured(
+            ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
+        if not result.ok:
+            raise RuntimeError(
+                f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+            )
 
     venv_junction: Path | None = None
     if venv_source is not None:

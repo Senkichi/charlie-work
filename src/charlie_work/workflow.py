@@ -973,8 +973,14 @@ class OrchestratorApp:
 
     def loop(self, limit: int | None = None) -> CommandResult:
         intake = self.intake()
-        dispatch = self.dispatch(limit)
+        # Share a single wave budget between fresh and rework dispatch
+        # Rework-first, then fresh fills the remainder
         dispatch_rework = self.dispatch_rework(limit)
+        rework_count = dispatch_rework.data.get("selected_count", 0)
+        fresh_limit = None
+        if limit is not None:
+            fresh_limit = max(0, limit - rework_count)
+        dispatch = self.dispatch(fresh_limit)
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -1069,9 +1075,19 @@ class OrchestratorApp:
 
         # Filter to issues with open PRs
         prs = self.gh.pr_list()
-        pr_by_issue = {
-            linked_issue_number(pr): pr for pr in prs if linked_issue_number(pr) is not None
-        }
+        pr_by_issue = {}
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None:
+                # If multiple PRs link to the same issue, keep the lowest PR number
+                if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                    pr_by_issue[issue_number]["number"]
+                ):
+                    pr_by_issue[issue_number] = pr
 
         candidates = [
             issue
@@ -1132,6 +1148,7 @@ class OrchestratorApp:
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
+        skipped_issue_numbers: list[int] = []
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -1142,7 +1159,9 @@ class OrchestratorApp:
             # Use the rework prompt from the PR directory
             rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
             if not rework_prompt_path.exists():
-                # Skip if rework prompt doesn't exist (shouldn't happen in normal flow)
+                # Skip if rework prompt doesn't exist — record as dispatch_failed
+                # to release the claim and avoid blocking re-dispatch for 30 min
+                skipped_issue_numbers.append(issue_number)
                 continue
             session_requests.append(
                 SessionRequest(
@@ -1150,6 +1169,7 @@ class OrchestratorApp:
                     issue_title=str(full_issue.get("title") or ""),
                     prompt_path=rework_prompt_path,
                     branch_name=branch_name,
+                    rework=True,
                 )
             )
 
@@ -1181,6 +1201,20 @@ class OrchestratorApp:
         label_errors: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Record skipped issues (missing rework prompt) as dispatch_failed
+            for issue_number in skipped_issue_numbers:
+                full_issue = full_issues[issue_number]
+                entry = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "title": full_issue.get("title"),
+                    "url": full_issue.get("url"),
+                    "status": "dispatch_failed",
+                    "dispatched_at": None,
+                }
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
+                state["issues"][str(issue_number)] = entry
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
@@ -1216,6 +1250,7 @@ class OrchestratorApp:
                 {
                     "issue_numbers": sorted(successful_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
+                    "skipped_issue_numbers": sorted(skipped_issue_numbers),
                     "label_errors": sorted(label_errors),
                 },
             )
