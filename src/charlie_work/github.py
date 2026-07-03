@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_LIST_LIMIT = 500
 
 
 class GitHubError(RuntimeError):
@@ -49,8 +54,21 @@ class GitHub:
         except json.JSONDecodeError as exc:
             raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
 
+    def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
+        result = self.run(args, json_output=True)
+        items = result if isinstance(result, list) else []
+        if len(items) >= limit:
+            logger.warning(
+                "GitHub returned %d %s, matching the page limit (%d); "
+                "further items may be truncated",
+                len(items),
+                kind,
+                limit,
+            )
+        return items
+
     def issue_list(self, ready_label: str) -> list[dict[str, Any]]:
-        result = self.run(
+        return self._list_json(
             [
                 "issue",
                 "list",
@@ -59,13 +77,13 @@ class GitHub:
                 "--label",
                 ready_label,
                 "--limit",
-                "200",
+                str(_LIST_LIMIT),
                 "--json",
                 "number,title,url,body,labels,assignees,author,createdAt,updatedAt",
             ],
-            json_output=True,
+            limit=_LIST_LIMIT,
+            kind=f"ready-labeled open issues (label={ready_label})",
         )
-        return result if isinstance(result, list) else []
 
     def issue_view(self, number: int) -> dict[str, Any]:
         result = self.run(
@@ -81,20 +99,20 @@ class GitHub:
         return result if isinstance(result, dict) else {}
 
     def pr_list(self) -> list[dict[str, Any]]:
-        result = self.run(
+        return self._list_json(
             [
                 "pr",
                 "list",
                 "--state",
                 "open",
                 "--limit",
-                "200",
+                str(_LIST_LIMIT),
                 "--json",
                 "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid",
             ],
-            json_output=True,
+            limit=_LIST_LIMIT,
+            kind="open PRs",
         )
-        return result if isinstance(result, list) else []
 
     def pr_view(self, number: int) -> dict[str, Any]:
         result = self.run(
