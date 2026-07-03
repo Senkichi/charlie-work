@@ -574,6 +574,9 @@ def test_launch_claude_worker_render_error_returns_error_record_and_tears_down_w
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Defense-in-depth: render errors past the load gate return error records, not exceptions."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
     worktree_removed = []
 
     def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
@@ -689,3 +692,95 @@ def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
 
     assert record2.ok
     assert record2.branch == branch_name
+
+
+def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
+    """Rework-mode launch failure should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Initialize a real git repo
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-43-rework"
+
+    # Create the branch first (simulating a previous PR cycle)
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Rework-mode launch fails (binary doesn't exist)
+    record = launch_claude_worker(
+        43,
+        branch_name,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+        rework=True,
+    )
+
+    assert not record.ok
+    assert "failed to launch claude" in record.error
+
+    # Verify the branch is preserved (not deleted)
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )

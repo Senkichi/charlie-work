@@ -250,7 +250,7 @@ def launch_claude_worker(
     try:
         prompt_path.write_text(prompt_text, encoding="utf-8")
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=branch)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -267,7 +267,7 @@ def launch_claude_worker(
             command_template, prompt_path, issue_number=issue_number, branch=branch
         )
     except (KeyError, IndexError, ValueError) as exc:
-        remove_worktree(repo_root, worktree.path, force=True)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -311,7 +311,7 @@ def launch_claude_worker(
                     creationflags=_CREATE_NEW_PROCESS_GROUP,
                 )
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=branch)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,

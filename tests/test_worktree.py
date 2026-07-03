@@ -481,6 +481,55 @@ def test_junction_creation_failure_cleans_up_worktree_and_branch(tmp_path: Path)
     assert branch_name not in result.stdout
 
 
+def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) -> None:
+    """Junction creation failure in rework mode should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch first (simulating a previous PR cycle)
+    branch_name = "agent/issue-5-junction-fail-rework"
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Create a non-existent venv_source to trigger junction failure in rework mode
+    venv_source = tmp_path / "nonexistent-venv"
+
+    with pytest.raises((OSError, RuntimeError)):
+        create_worktree(repo_root, branch_name, rework=True, venv_source=venv_source)
+
+    # Verify the branch is preserved (not deleted)
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
 def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
     """Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
     repo_root = tmp_path / "repo"
@@ -559,6 +608,58 @@ def test_recovery_with_dirty_tree_reuses_worktree(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path, force=True)
 
 
+def test_remove_worktree_branch_deletion_independent_of_worktree_removal(tmp_path: Path) -> None:
+    """Branch deletion should be attempted even when worktree removal fails."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-4-branch-delete-on-wt-fail"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Force worktree removal to fail by making the worktree path non-writable
+    # (simulating a Windows file lock scenario)
+    # We'll do this by removing the worktree from git's metadata first
+    subprocess.run(
+        ["git", "worktree", "remove", str(info.path)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Now the directory still exists but git doesn't know about it
+    # remove_worktree should fail on the git worktree remove step
+    # but still attempt branch deletion
+    removed = remove_worktree(repo_root, info.path, branch=branch_name)
+
+    # Should return False because worktree removal failed
+    assert removed is False
+
+    # But the branch should still be deleted
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name not in result.stdout
+
+    # Clean up the orphaned directory
+    import shutil
+
+    shutil.rmtree(info.path)
+
+
 def test_recovery_branch_mismatch_raises(tmp_path: Path) -> None:
     """Recovery mode with branch name mismatch: raise RuntimeError."""
     repo_root = tmp_path / "repo"
@@ -635,4 +736,3 @@ def test_recovery_with_venv_dir_reuses_worktree(tmp_path: Path) -> None:
 
     # Clean up with force=True since .venv is a real directory
     remove_worktree(repo_root, info2.path, force=True)
->>>>>>> origin/main

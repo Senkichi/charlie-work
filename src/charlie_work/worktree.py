@@ -415,21 +415,25 @@ def remove_worktree(
     if force:
         args.append("--force")
     result = run_captured(args, cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
-    if not result.ok:
+    worktree_removed = result.ok
+    if not worktree_removed:
         run_captured(
             ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
         )
-        return False
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
+    # Attempt branch deletion independently of worktree-removal success to avoid
+    # leaking branches when worktree removal itself fails (e.g., Windows file locks)
+    branch_deleted = True
     if branch is not None:
-        run_captured(
+        branch_result = run_captured(
             ["git", "branch", "-D", branch],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
+        branch_deleted = branch_result.ok
 
-    return True
+    return worktree_removed and branch_deleted
 
 
 def list_worktrees(repo_root: Path) -> list[dict]:
