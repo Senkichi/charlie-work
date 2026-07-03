@@ -309,6 +309,10 @@ class FakeGitHub:
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
 
+    def label_list(self) -> list[dict[str, object]]:
+        # Return all labels that have been created — simulates creation success.
+        return [{"name": name} for name, _color, _desc in self.labels_created]
+
     def pr_comment(self, number: int, body_file: Path) -> None:
         pass
 
@@ -1073,6 +1077,134 @@ def test_cli_routes_reconcile_fix_flag(monkeypatch, capsys) -> None:
     assert seen["fix"] is True
 
 
+def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -> None:
+    """mop-up without --fix must exit non-zero when drift is present (CI gateable)."""
+
+    class DriftGitHub(FakeGitHub):
+        def run(self, arguments, *, json_output=False, allow_failure=False):
+            # pr list: one open PR linked to issue 123
+            if arguments[:2] == ["pr", "list"]:
+                return [
+                    {
+                        "number": 456,
+                        "title": "fix",
+                        "url": "u",
+                        "headRefName": "agent/issue-123-x",
+                        "baseRefName": "main",
+                        "body": "",
+                        "state": "MERGED",
+                        "labels": [],
+                    }
+                ]
+            # issue list: issue 123 still has agent:in-progress (drift)
+            if arguments[:2] == ["issue", "list"]:
+                return [
+                    {
+                        "number": 123,
+                        "title": "t",
+                        "url": "u",
+                        "body": "",
+                        "labels": [{"name": "agent:in-progress"}],
+                    }
+                ]
+            return []
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, DriftGitHub())
+
+    result = app.reconcile(fix=False)
+
+    assert result.ok is False
+    assert result.data["fixed"] is False
+    assert len(result.data["drift"]) > 0
+
+
+def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
+    """mop-up --fix must exit zero when all drift is repaired."""
+    config = OrchestratorConfig()
+
+    class DriftGitHub(FakeGitHub):
+        def run(self, arguments, *, json_output=False, allow_failure=False):
+            if arguments[:2] == ["pr", "list"]:
+                return [
+                    {
+                        "number": 456,
+                        "title": "fix",
+                        "url": "u",
+                        "headRefName": "agent/issue-123-x",
+                        "baseRefName": "main",
+                        "body": "",
+                        "state": "MERGED",
+                        "labels": [],
+                    }
+                ]
+            if arguments[:2] == ["issue", "list"]:
+                return [
+                    {
+                        "number": 123,
+                        "title": "t",
+                        "url": "u",
+                        "body": "",
+                        "labels": [{"name": "agent:in-progress"}],
+                    }
+                ]
+            return []
+
+    app = OrchestratorApp(
+        tmp_path, runtime_paths(tmp_path, config.runtime.state_dir), config, DriftGitHub()
+    )
+
+    result = app.reconcile(fix=True)
+
+    assert result.ok is True
+    assert result.data["fixed"] is True
+
+
+# --- --repo path validation ----------------------------------------------------
+
+
+def test_cli_repo_nonexistent_path_errors(tmp_path: Path, capsys) -> None:
+    """charlie --repo <nonexistent> must error cleanly (exit 2), not create dirs."""
+    ghost = tmp_path / "ghost-repo"
+    assert not ghost.exists()
+
+    exit_code = cli.main(["--repo", str(ghost), "roll-call"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "ghost-repo" in err or "--repo" in err
+    # Must NOT have created the phantom directory.
+    assert not ghost.exists()
+
+
+def test_find_repo_root_explicit_raises_on_missing_path(tmp_path: Path) -> None:
+    from charlie_work.paths import RepoNotFoundError, find_repo_root
+
+    missing = tmp_path / "no-such-dir"
+
+    try:
+        find_repo_root(missing, explicit=True)
+    except RepoNotFoundError as exc:
+        assert "does not exist" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected RepoNotFoundError")
+
+
+def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> None:
+    from charlie_work.paths import RepoNotFoundError, find_repo_root
+
+    non_git = tmp_path / "plain-dir"
+    non_git.mkdir()
+
+    try:
+        find_repo_root(non_git, explicit=True)
+    except RepoNotFoundError as exc:
+        assert "git work tree" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected RepoNotFoundError")
+
+
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
 
 
@@ -1279,11 +1411,56 @@ def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.bootstrap_labels()
+    result = app.bootstrap_labels()
 
     created = {name for name, _color, _desc in fake_gh.labels_created}
     assert created == set(config.labels.all)
     assert all(desc for _n, _c, desc in fake_gh.labels_created)
+    # All labels verified present — must report honest success.
+    assert result.ok is True
+    assert result.data["missing"] == []
+
+
+def test_bootstrap_labels_fails_when_creation_silently_missed(tmp_path: Path) -> None:
+    """If label_create silently fails (e.g. no auth), bootstrap must report failure."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FailingCreateGitHub(FakeGitHub):
+        def label_create(self, label: str, color: str, description: str) -> None:
+            # Silently drop all creates — simulates no-auth / wrong-repo scenario.
+            pass
+
+        def label_list(self) -> list[dict[str, object]]:
+            return []  # nothing was created
+
+    fake_gh = FailingCreateGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.bootstrap_labels()
+
+    assert result.ok is False
+    assert result.data["missing"] == config.labels.all
+
+
+def test_bootstrap_labels_fails_when_label_list_raises(tmp_path: Path) -> None:
+    """If label_list fails (e.g. network error), bootstrap must report failure."""
+    from charlie_work.github import GitHubError
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ErrorListGitHub(FakeGitHub):
+        def label_list(self) -> list[dict[str, object]]:
+            raise GitHubError("could not list labels: HTTP 401")
+
+    fake_gh = ErrorListGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.bootstrap_labels()
+
+    assert result.ok is False
+    assert "verification failed" in result.message
 
 
 def test_status_aggregates_counts(tmp_path: Path) -> None:
