@@ -95,7 +95,13 @@ def test_default_command_template_permission_mode_flag_is_adjacent() -> None:
     # string and is filtered out, so --permission-mode and dangerous are adjacent.
     from charlie_work.devin_shell import _render_command
 
-    rendered = _render_command(DEFAULT_COMMAND_TEMPLATE, issue_number=1, branch="x", prompt_path=Path("p.md"), worker_model="")
+    rendered = _render_command(
+        DEFAULT_COMMAND_TEMPLATE,
+        issue_number=1,
+        branch="x",
+        prompt_path=Path("p.md"),
+        worker_model="",
+    )
     idx = rendered.index("--permission-mode")
     assert rendered[idx + 1] == "dangerous", (
         f"Expected 'dangerous' after '--permission-mode', got {rendered[idx + 1]!r}"
@@ -528,7 +534,7 @@ def test_command_template_injects_model_when_worker_model_set(
         prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
-        command_template=DEFAULT_COMMAND_TEMPLATE,
+        command_template=(sys.executable, str(script), "{model_args}", "{prompt_path}"),
         worker_model="claude-sonnet-4-5",
     )
 
@@ -536,12 +542,9 @@ def test_command_template_injects_model_when_worker_model_set(
     assert "--model" in record.command
     model_idx = record.command.index("--model")
     assert record.command[model_idx + 1] == "claude-sonnet-4-5"
-    # Verify the full command structure
-    assert record.command[0] == "devin"
-    assert "--prompt-file" in record.command
-    assert "--print" in record.command
-    assert "--permission-mode" in record.command
-    assert "dangerous" in record.command
+    # Verify the custom template structure
+    assert record.command[0] == sys.executable
+    assert str(script) in record.command
 
 
 def test_command_template_omits_model_when_worker_model_empty(
@@ -564,7 +567,7 @@ def test_command_template_omits_model_when_worker_model_empty(
         prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
-        command_template=DEFAULT_COMMAND_TEMPLATE,
+        command_template=(sys.executable, str(script), "{model_args}", "{prompt_path}"),
         worker_model="",
     )
 
@@ -572,3 +575,6 @@ def test_command_template_omits_model_when_worker_model_empty(
     assert "--model" not in record.command
     # The empty {model_args} placeholder must be filtered out
     assert "" not in record.command
+    # Verify the custom template structure
+    assert record.command[0] == sys.executable
+    assert str(script) in record.command

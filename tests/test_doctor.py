@@ -433,9 +433,7 @@ def test_doctor_reports_cli_default_when_worker_model_empty(tmp_path: Path) -> N
     assert ok is True  # warning-only, not a blocking failure
 
 
-def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(
-    tmp_path: Path
-) -> None:
+def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: Path) -> None:
     """When adapter is not devin-shell, the worker model check must not appear."""
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
