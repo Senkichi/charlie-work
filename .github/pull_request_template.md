@@ -12,6 +12,7 @@ Closes #<!-- issue number -->
      The janitor gate checks for test evidence or an explicit rationale. -->
 
 ```
+uv sync --all-extras
 uv run pytest -q --tb=short
 # paste output here
 ```

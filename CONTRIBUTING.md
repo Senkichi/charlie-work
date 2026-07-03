@@ -3,7 +3,7 @@
 ## Dev setup
 
 ```bash
-uv sync          # install all deps (including dev extras)
+uv sync --all-extras   # install all deps including the dev extra (pytest, ruff)
 ```
 
 Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).

@@ -3,7 +3,7 @@
 ## Commands
 
 ```bash
-uv sync                          # install / refresh deps
+uv sync --all-extras             # install all deps (including dev extras: pytest, ruff)
 uv run pytest -q --tb=short      # run tests
 uv run ruff check .              # lint
 uv run ruff format .             # format
