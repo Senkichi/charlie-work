@@ -44,17 +44,20 @@ runtime:
 
 devin:
   # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,
-  # with sidecar JSON + per-session logs under sessions_dir. Verify with
-  # `charlie doctor --adapter-probe` before the first wave.
-  # Fall back to `adapter: manual` (operator pastes prompts from the session
-  # manifest) if the devin CLI is unavailable on this machine.
+  # with sidecar JSON + per-session logs under sessions_dir. Each worker runs
+  # in an isolated per-issue git worktree so concurrent sessions do not fight
+  # over the shared checkout. Verify with `charlie doctor --adapter-probe`
+  # before the first wave. Fall back to `adapter: manual` (operator pastes
+  # prompts from the session manifest) if the devin CLI is unavailable.
   adapter: devin-shell
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
   session_results: .var/charlie-work/dispatches/session-results.json
   sessions_dir: .var/charlie-work/dispatches/sessions
-  # Launch command; empty uses the built-in default shown here. Placeholders:
-  # {prompt_path} {issue_number} {branch}. A list runs without a shell.
-  # shell_command: [devin, --prompt-file, "{prompt_path}", --print]
+  # Launch command override; empty uses the built-in default (shown below).
+  # Placeholders: {prompt_path} {issue_number} {branch}. A list runs without a
+  # shell. --permission-mode dangerous is required for headless workers; without
+  # it the Devin CLI defaults to auto (read-only tools) and stalls on git/uv/gh.
+  # shell_command: [devin, --prompt-file, "{prompt_path}", --print, --permission-mode, dangerous]
   # A blocking alternative is adapter: command with dispatch_command +
   # command_timeout_seconds (one blocking launcher call per issue).
 

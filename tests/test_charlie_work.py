@@ -925,7 +925,18 @@ def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
 # --- integration wiring: new adapters, janitor gate, reconcile ----------------
 
 
-def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path) -> None:
+def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path, monkeypatch) -> None:
+    from charlie_work import devin_shell
+    from charlie_work.worktree import WorktreeInfo
+
+    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    def _fake_create_worktree(repo_root, branch, **kwargs):
+        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
+
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="devin-shell",
@@ -1211,8 +1222,18 @@ def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path:
     assert result.data["attempted_count"] == 0  # not re-dispatched
 
 
-def test_dispatch_isolates_label_write_failure(tmp_path: Path) -> None:
+def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
+    from charlie_work import devin_shell
     from charlie_work.github import GitHubError as _GitHubError
+    from charlie_work.worktree import WorktreeInfo
+
+    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    def _fake_create_worktree(repo_root, branch, **kwargs):
+        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
 
     class LabelFailGitHub(FakeGitHub):
         def add_issue_label(self, number: int, label: str) -> None:
