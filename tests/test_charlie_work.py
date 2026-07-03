@@ -1790,17 +1790,58 @@ def test_claude_code_dispatch_failure_stays_out_of_progress(tmp_path: Path, monk
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+
+
+def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeypatch) -> None:
+    """Issue #81: verify recovery record is passed through dispatch() to the adapter.
+
+    This test MUST fail if the ordering fix in workflow.py is reverted (i.e., if
+    recovery_record is forced to None by the status overwrite bug).
+    """
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    captured: dict[str, object] = {}
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        captured["recovery"] = kwargs.get("recovery")
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Override pr_list to return empty list (no open PRs, so recovery is allowed)
+    fake_gh.pr_list = lambda: []
 
+    # Simulate a prior dispatch that crashed (status: dispatched, same branch)
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",  # Same branch as would be generated
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
 
-    assert result.ok is False
-    assert (123, "agent:in-progress") not in fake_gh.labels_added
-    state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert result.ok is True
+    # The critical assertion: recovery record must be passed to the adapter
+    assert captured["recovery"] is not None
+    assert captured["recovery"]["status"] == "dispatched"
+    assert captured["recovery"]["branch_name"] == "agent/issue-123-fix-search"
+    assert (123, "agent:in-progress") in fake_gh.labels_added
 
 
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:

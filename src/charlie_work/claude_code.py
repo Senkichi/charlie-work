@@ -137,6 +137,7 @@ def launch_claude_worker(
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
     env: dict[str, str] | None = None,
     rework: bool = False,
+    recovery: dict[str, Any] | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -147,6 +148,11 @@ def launch_claude_worker(
 
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
+
+    If ``recovery`` is provided (a dict with state file dispatch record), this is
+    a dead-worker recovery re-dispatch. The worktree layer will inspect the
+    leftover worktree/branch and either clean it (no commits) or reuse it (has
+    commits/dirty work).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
@@ -158,6 +164,7 @@ def launch_claude_worker(
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
             rework=rework,
+            recovery=recovery,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(
