@@ -19,6 +19,7 @@ from charlie_work.config import (
     DispatchConfig,
     LabelConfig,
     OrchestratorConfig,
+    ReviewConfig,
     RuntimeConfig,
     find_config_path,
     load_config,
@@ -2847,9 +2848,6 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 ) -> None:
     """Issue #72: request_changes (non-escalated) updates issue status to rework_requested
     so dispatch_rework can select it."""
-    # The fix is in place in workflow.py: when decision == "request_changes" and not escalated
-    # and issue_number is not None, the issue status is updated to "rework_requested"
-    # This test verifies the code path works correctly
     from charlie_work.github import linked_issue_number
 
     config = OrchestratorConfig()
@@ -2870,6 +2868,178 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 
     assert result.ok is True
     assert result.data["escalated"] is False
+
+    # Assert the actual state change: issue status should be rework_requested
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
+def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> None:
+    """Issue #72 acceptance criterion 1: standard-lifecycle end-to-end rework dispatch.
+
+    Fresh dispatch marks the issue dispatched → record_review(request_changes) →
+    dispatch_rework SELECTS the issue and launches via a command-adapter fake,
+    firing the rework_dispatched label transition.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Step 1: Fresh dispatch marks the issue as dispatched
+    dispatch_result = app.dispatch(limit=1)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["selected_count"] == 1
+
+    # Verify issue is marked as dispatched in state
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+    # Step 2: record_review(request_changes) updates issue status to rework_requested
+    review_result = app.record_review(456, "request_changes", summary="fix A")
+    assert review_result.ok is True
+    assert review_result.data["escalated"] is False
+
+    # Verify issue status is now rework_requested
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+    # Step 3: Create a rework prompt (normally written by record_review)
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # Step 4: dispatch_rework SELECTS the issue and launches via command adapter
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Add needs-rework label to the issue
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+
+    rework_gh = ReworkGitHub()
+    rework_app = OrchestratorApp(tmp_path, paths, config, rework_gh)
+    rework_result = rework_app.dispatch_rework()
+
+    # Verify dispatch_rework selected and launched the issue
+    assert rework_result.ok is True
+    assert rework_result.data["selected_count"] == 1
+    assert rework_result.data["dispatch_results"][0]["stdout"].strip() == "123"
+
+    # Verify the rework_dispatched label transition was fired
+    # (adds in_progress, removes needs_rework)
+    assert (123, "agent:in-progress") in rework_gh.labels_added
+    assert (123, "agent:needs-rework") in rework_gh.labels_removed
+
+
+def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path) -> None:
+    """Issue #72 acceptance criterion 2: escalated request_changes must NOT make issue selectable.
+
+    After an escalated verdict (request_changes_count at max), assert the issue's state status
+    is NOT rework_requested and dispatch_rework does not select it.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_rework_cycles=2),  # Set max to 2 for this test
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Step 1: Fresh dispatch marks the issue as dispatched
+    dispatch_result = app.dispatch(limit=1)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["selected_count"] == 1
+
+    # Step 2: Record first request_changes (count = 1, not escalated)
+    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    assert review_result_1.ok is True
+    assert review_result_1.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+    # Step 3: Record second request_changes (count = 2, not escalated yet)
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    assert review_result_2.ok is True
+    assert review_result_2.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+    # Step 4: Record third request_changes (count stays at 2, escalated because max_rework_cycles = 2)
+    # When escalated, the count is NOT incremented (see workflow.py line 731-734)
+    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    assert review_result_3.ok is True
+    assert review_result_3.data["escalated"] is True  # Should be escalated
+
+    # Verify PR status is escalated
+    state = load_state(paths.state_file)
+    assert (
+        state["prs"]["456"]["request_changes_count"] == 2
+    )  # Count does NOT increment when escalated
+    assert state["prs"]["456"]["status"] == "escalated"
+    # Issue status should now be escalated (cleared from rework_requested)
+    assert state["issues"]["123"]["status"] == "escalated"
+
+    # Step 5: Verify the escalated label transition was fired (adds human_needed, removes reviewing)
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # The escalated transition removes reviewing but does NOT remove needs_rework
+    # (this is by design per labels.py: "escalated": ((labels.human_needed,), (labels.reviewing,)))
+
+    # Step 6: dispatch_rework should still NOT select the escalated issue
+    # because the issue status is "escalated" (not "rework_requested")
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # The escalated issue still has needs-rework label (from previous non-escalated request_changes)
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+
+    rework_gh = ReworkGitHub()
+    rework_app = OrchestratorApp(tmp_path, paths, config, rework_gh)
+    rework_result = rework_app.dispatch_rework()
+
+    # Verify dispatch_rework did NOT select the escalated issue
+    # (even though it has needs_rework label, the issue status is escalated so it's filtered out)
+    assert rework_result.ok is True
+    assert rework_result.data["selected_count"] == 0
+    # No in_progress label should have been added (rework_dispatched transition)
+    assert (123, "agent:in-progress") not in rework_gh.labels_added
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
