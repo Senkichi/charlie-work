@@ -4,6 +4,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import yaml
@@ -31,7 +32,7 @@ from charlie_work.cross_family import (
 from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
-from charlie_work.state import load_state, save_state
+from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
@@ -175,6 +176,55 @@ def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
 
     assert payload["version"] == 1
     assert payload["generated_at"].endswith("Z")
+
+
+def test_concurrent_state_access_serializes_with_lock(tmp_path: Path) -> None:
+    """Regression test for issue #16: concurrent load→save cycles must serialize.
+
+    Two threads incrementing a counter should never lose updates when using
+    the lock context manager. Without the lock, one thread can overwrite the
+    other's update (last writer wins).
+    """
+    state_path = tmp_path / "state.json"
+    # Initialize state with a counter
+    save_state(state_path, {"version": 1, "issues": {}, "prs": {}, "events": [], "counter": 0})
+
+    # Number of increments per thread
+    increments_per_thread = 100
+    errors = []
+
+    def increment_counter(thread_id: int) -> None:
+        for _ in range(increments_per_thread):
+            try:
+                with state_lock(state_path):
+                    state = load_state(state_path)
+                    current = state.get("counter", 0)
+                    # Simulate some work
+                    state["counter"] = current + 1
+                    save_state(state_path, state)
+            except Exception as exc:
+                errors.append((thread_id, exc))
+
+    # Run two threads concurrently
+    thread1 = threading.Thread(target=increment_counter, args=(1,))
+    thread2 = threading.Thread(target=increment_counter, args=(2,))
+
+    thread1.start()
+    thread2.start()
+
+    thread1.join()
+    thread2.join()
+
+    # Verify no errors occurred
+    assert not errors, f"Errors during concurrent access: {errors}"
+
+    # Verify the counter is the sum of both increments (no lost updates)
+    final_state = load_state(state_path)
+    expected_count = increments_per_thread * 2
+    assert final_state.get("counter") == expected_count, (
+        f"Expected counter to be {expected_count}, got {final_state.get('counter')} "
+        f"— indicates lost updates due to race condition"
+    )
 
 
 def test_load_config_names_unknown_keys_and_section(tmp_path: Path) -> None:
