@@ -917,6 +917,105 @@ def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
     assert result.ok is False
 
 
+# --- Issue #14: error-isolation hardening --------------------------------------
+
+
+def test_corrupt_review_decision_treated_as_not_approved(tmp_path: Path) -> None:
+    """A corrupt review-decision.json must not crash merge_ready/loop; it must
+    be treated as a non-approval so the PR waits for a real review."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text("{truncated", encoding="utf-8")
+
+    result = app.merge_ready(456)
+
+    assert result.data["review_decision"] == {"decision": "invalid"}
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+
+
+def test_intake_isolates_per_issue_github_error(tmp_path: Path) -> None:
+    """One failing gh issue view must not abort intake or lose other issues'
+    progress."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    class FlakyIntakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 123,
+                    "title": "Good issue",
+                    "url": "https://example.test/issues/123",
+                    "body": "ok",
+                    "labels": [{"name": "automated-ready"}],
+                },
+                {
+                    "number": 124,
+                    "title": "Broken issue",
+                    "url": "https://example.test/issues/124",
+                    "body": "broken",
+                    "labels": [{"name": "automated-ready"}],
+                },
+            ]
+
+        def issue_view(self, number: int):
+            if number == 124:
+                raise _GitHubError("transient gh issue view failure")
+            for issue in self.issues:
+                if int(issue["number"]) == number:
+                    return issue
+            raise _GitHubError(f"issue #{number} not found")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FlakyIntakeGitHub())
+
+    result = app.intake()
+
+    assert result.ok is False
+    assert len(result.data["issues"]) == 1
+    assert result.data["issues"][0]["issue"] == 123
+    assert result.data["failed"] == [{"issue": 124, "error": "transient gh issue view failure"}]
+    state = load_state(paths.state_file)
+    assert "123" in state["issues"]
+    assert state["issues"]["123"]["title"] == "Good issue"
+    assert "124" not in state["issues"]
+    assert any(e.get("kind") == "intake_failed" for e in state["events"])
+
+
+def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None:
+    """A GitHubError during the review_started label transition must still
+    leave the review packet persisted in state and report label_error."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    config = OrchestratorConfig()
+    reviewing_label = config.labels.reviewing
+
+    class LabelFailReviewGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> None:
+            if label == reviewing_label:
+                raise _GitHubError("label transition failed")
+            super().add_issue_label(number, label)
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailReviewGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["label_error"] == "label transition failed"
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "reviewing"
+    assert state["prs"]["456"]["label_error"] == "label transition failed"
+    assert Path(state["prs"]["456"]["decision_path"]).exists()
+
+
 def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
     from charlie_work.subprocess_runner import run_captured
 

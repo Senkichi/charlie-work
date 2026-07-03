@@ -155,9 +155,20 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         state = load_state(self.paths.state_file)
         written: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
         for issue in issues:
             issue_number = int(issue["number"])
-            full_issue = self.gh.issue_view(issue_number)
+            try:
+                full_issue = self.gh.issue_view(issue_number)
+            except GitHubError as exc:
+                failed.append({"issue": issue_number, "error": str(exc)})
+                state = append_event(
+                    state,
+                    "intake_failed",
+                    {"issue_number": issue_number, "error": str(exc)},
+                )
+                save_state(self.paths.state_file, state)
+                continue
             issue_dir = self.paths.issues / f"issue-{issue_number}"
             issue_dir.mkdir(parents=True, exist_ok=True)
             issue_json = issue_dir / "issue.json"
@@ -175,9 +186,19 @@ class OrchestratorApp:
                 "updated_at": full_issue.get("updatedAt"),
             }
             written.append({"issue": issue_number, "prompt_path": str(prompt_path)})
-        state = append_event(state, "intake", {"issue_count": len(issues)})
+            save_state(self.paths.state_file, state)
+        state = append_event(
+            state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
+        )
         save_state(self.paths.state_file, state)
-        return CommandResult(True, "intake complete", {"issues": written})
+        message = "intake complete"
+        if failed:
+            message = f"intake completed with {len(failed)} failure(s)"
+        return CommandResult(
+            not failed,
+            message,
+            {"issues": written, "failed": failed},
+        )
 
     def dispatch(
         self, limit: int | None = None, *, only_issues: str | None = None
@@ -409,8 +430,6 @@ class OrchestratorApp:
                 reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
-        if issue_number is not None:
-            transition(self.gh, self.config.labels, issue_number, "review_started")
         state = load_state(self.paths.state_file)
         # Merge-update, never replace: wholesale assignment here used to erase
         # recorded review decisions on repeated review()/loop() passes
@@ -439,9 +458,23 @@ class OrchestratorApp:
             },
         )
         save_state(self.paths.state_file, state)
+        # GitHub label side effects are best-effort and isolated: the durable
+        # packet above is the authority; a label failure is reported, not fatal.
+        label_error: str | None = None
+        if issue_number is not None:
+            try:
+                transition(self.gh, self.config.labels, issue_number, "review_started")
+            except GitHubError as exc:
+                label_error = str(exc)
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)]["label_error"] = label_error
+                save_state(self.paths.state_file, state)
+        message = "review packet generated"
+        if label_error:
+            message += f" (label update failed: {label_error})"
         return CommandResult(
             True,
-            "review packet generated",
+            message,
             {
                 "pr": pr_number,
                 "issue": issue_number,
@@ -449,6 +482,7 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
+                "label_error": label_error,
             },
         )
 
@@ -966,8 +1000,11 @@ class OrchestratorApp:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         if not decision_path.exists():
             return {"decision": "missing"}
-        with decision_path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
+        try:
+            with decision_path.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {"decision": "invalid"}
         return value if isinstance(value, dict) else {"decision": "invalid"}
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
