@@ -28,6 +28,7 @@ def _green_pr(**overrides) -> dict:
         "mergeable": "MERGEABLE",
         "additions": 10,
         "deletions": 5,
+        "isCrossRepository": False,
     }
     base.update(overrides)
     return base
