@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import OrchestratorConfig
-from .github import GitHub, label_names, linked_issue_number
+from .github import GitHub, _LIST_LIMIT, label_names, linked_issue_number
 from .labels import transition
 from .state import append_event
 
@@ -44,7 +44,7 @@ class DriftItem:
 
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
     result = gh.run(
-        ["pr", "list", "--state", "all", "--limit", "500", "--json", _PR_FIELDS],
+        ["pr", "list", "--state", "all", "--limit", str(_LIST_LIMIT), "--json", _PR_FIELDS],
         json_output=True,
     )
     return result if isinstance(result, list) else []
@@ -52,7 +52,7 @@ def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
 
 def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
     result = gh.run(
-        ["issue", "list", "--state", "open", "--limit", "500", "--json", _ISSUE_FIELDS],
+        ["issue", "list", "--state", "open", "--limit", str(_LIST_LIMIT), "--json", _ISSUE_FIELDS],
         json_output=True,
     )
     return result if isinstance(result, list) else []
