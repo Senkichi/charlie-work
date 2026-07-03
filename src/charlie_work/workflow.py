@@ -929,12 +929,14 @@ class OrchestratorApp:
                         merges.append(self.merge_ready(pr_number).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
-        ok = dispatch.ok and not errors
+        ok = intake.ok and dispatch.ok and not errors
         message = "loop complete"
-        if not dispatch.ok:
-            message = "loop completed with dispatch failures"
         if errors:
             message = f"loop completed with {len(errors)} PR error(s)"
+        elif not intake.ok:
+            message = "loop completed with intake failures"
+        elif not dispatch.ok:
+            message = "loop completed with dispatch failures"
         return CommandResult(
             ok,
             message,

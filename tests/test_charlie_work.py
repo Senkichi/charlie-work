@@ -1016,6 +1016,72 @@ def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None
     assert Path(state["prs"]["456"]["decision_path"]).exists()
 
 
+def test_loop_honors_intake_failure_signal(tmp_path: Path) -> None:
+    """loop() must propagate intake() failures into its ok flag and message so
+    a partially failed intake is not silently reported as a clean loop."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    class FlakyIntakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 123,
+                    "title": "Good issue",
+                    "url": "https://example.test/issues/123",
+                    "body": "ok",
+                    "labels": [{"name": "automated-ready"}],
+                },
+                {
+                    "number": 124,
+                    "title": "Broken issue",
+                    "url": "https://example.test/issues/124",
+                    "body": "broken",
+                    "labels": [{"name": "automated-ready"}],
+                },
+            ]
+
+        def issue_view(self, number: int):
+            if number == 124:
+                raise _GitHubError("transient gh issue view failure")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FlakyIntakeGitHub())
+
+    result = app.loop(limit=0)
+
+    assert result.ok is False
+    assert "intake failures" in result.message
+    assert result.data["intake"]["failed"] == [
+        {"issue": 124, "error": "transient gh issue view failure"}
+    ]
+    assert result.data["errors"] == []
+
+
+def test_loop_corrupt_review_decision_does_not_crash_or_merge(tmp_path: Path) -> None:
+    """A corrupt review-decision.json on the loop path must be treated as a
+    non-approval: the loop re-reviews the PR and never attempts to merge."""
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=False),
+        auto_merge=_approved_automerge(),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text("{truncated", encoding="utf-8")
+
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    assert result.data["merges"] == []
+    assert fake_gh.merged == []
+    assert len(result.data["reviews"]) == 1
+
+
 def test_run_captured_decodes_bytes_safely(tmp_path: Path) -> None:
     from charlie_work.subprocess_runner import run_captured
 
