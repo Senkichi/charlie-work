@@ -57,6 +57,9 @@ class DispatchConfig:
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
     worker_template: str = "worker.md"
+    # Global concurrency governor: cap total live worker sessions across fresh,
+    # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
+    max_concurrent_sessions: int = 0
 
 
 @dataclass(frozen=True)
