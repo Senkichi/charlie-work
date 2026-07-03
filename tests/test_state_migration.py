@@ -181,7 +181,7 @@ def test_append_event_caps_at_200_keeping_newest() -> None:
     """
     state = empty_state()
     for index in range(205):
-        append_event(state, "dispatch", {"seq": index})
+        state = append_event(state, "dispatch", {"seq": index})
 
     events = state["events"]
     assert len(events) == 200
@@ -194,9 +194,25 @@ def test_append_event_caps_at_200_keeping_newest() -> None:
 def test_append_event_below_cap_keeps_all() -> None:
     state = empty_state()
     for index in range(3):
-        append_event(state, "intake", {"seq": index})
+        state = append_event(state, "intake", {"seq": index})
 
     assert [event["payload"]["seq"] for event in state["events"]] == [0, 1, 2]
+
+
+def test_append_event_and_save_state_do_not_mutate_caller_dict(tmp_path: Path) -> None:
+    state = empty_state()
+    original_events = state["events"]
+    original_id = id(state)
+
+    new_state = append_event(state, "intake", {"count": 1})
+    save_state(tmp_path / "state.json", state)
+
+    assert id(state) == original_id
+    assert state["events"] is original_events
+    assert state["events"] == []
+    assert new_state is not state
+    assert new_state["events"] is not original_events
+    assert len(new_state["events"]) == 1
 
 
 def test_old_orchestrator_state_file_loads_cleanly_end_to_end(tmp_path: Path) -> None:

@@ -9,9 +9,9 @@ then permanently disagree with reality — e.g. ``agent:in-progress`` /
 
 ``detect_drift`` is read-only: it issues exactly one PR list query and one
 issue list query via ``gh.run`` and never calls a mutating GitHub method.
-``apply_fixes`` is the only function in this module that mutates GitHub or
-state, and it is never invoked implicitly — callers gate it behind an
-explicit ``--fix`` flag. It reuses ``labels.transition`` for the one drift
+``apply_fixes`` is the only function in this module that mutates GitHub, and
+it is never invoked implicitly — callers gate it behind an explicit
+``--fix`` flag. It reuses ``labels.transition`` for the one drift
 kind that maps onto a standard lifecycle edge (a PR merged outside the
 orchestrator behaves exactly like a normal merge once discovered) and issues
 direct ``remove_issue_label`` calls only for label combinations that
@@ -39,6 +39,7 @@ class DriftItem:
     pr_number: int | None
     detail: str
     fix_actions: tuple[str, ...]
+    remove_labels: tuple[str, ...] = ()
 
 
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
@@ -133,6 +134,7 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
                             f"remove label '{label}' from issue #{issue_number}"
                             for label in sorted(issue_active_labels)
                         ),
+                        remove_labels=tuple(sorted(issue_active_labels)),
                     )
                 )
 
@@ -160,26 +162,22 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
         terminal_present = issue_labels & labels_cfg.terminal
 
         if active_present and not prs_linking_issue.get(issue_number):
-            has_open_pr = any(
-                int(pr["number"]) in open_prs_by_number
-                for pr in prs_linking_issue.get(issue_number, [])
-            )
-            if not has_open_pr:
-                drift.append(
-                    DriftItem(
-                        kind="issue_active_label_no_open_pr",
-                        issue_number=issue_number,
-                        pr_number=None,
-                        detail=(
-                            f"issue #{issue_number} carries active labels "
-                            f"{sorted(active_present)} but no open PR links to it"
-                        ),
-                        fix_actions=tuple(
-                            f"remove label '{label}' from issue #{issue_number}"
-                            for label in sorted(active_present)
-                        ),
-                    )
+            drift.append(
+                DriftItem(
+                    kind="issue_active_label_no_open_pr",
+                    issue_number=issue_number,
+                    pr_number=None,
+                    detail=(
+                        f"issue #{issue_number} carries active labels "
+                        f"{sorted(active_present)} but no PR links to it"
+                    ),
+                    fix_actions=tuple(
+                        f"remove label '{label}' from issue #{issue_number}"
+                        for label in sorted(active_present)
+                    ),
+                    remove_labels=tuple(sorted(active_present)),
                 )
+            )
 
         if terminal_present and active_present:
             drift.append(
@@ -195,6 +193,7 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
                         f"remove label '{label}' from issue #{issue_number}"
                         for label in sorted(active_present)
                     ),
+                    remove_labels=tuple(sorted(active_present)),
                 )
             )
 
@@ -204,7 +203,7 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
 def apply_fixes(
     gh: GitHub, state: dict[str, Any], drift: list[DriftItem], config: OrchestratorConfig
 ) -> dict[str, Any]:
-    """Apply ``fix_actions`` for each drift item and return a NEW state dict.
+    """Apply the structured fixes for each drift item and return a NEW state dict.
 
     ``state`` (and its nested ``issues``/``prs`` dicts) are never mutated in
     place — every touched entry is replaced via ``{**existing, ...}``.
@@ -223,9 +222,8 @@ def apply_fixes(
 
         elif item.kind == "closed_unmerged_pr_active_labels":
             if item.issue_number is not None:
-                for label in config.labels.active:
-                    if f"'{label}'" in " ".join(item.fix_actions):
-                        gh.remove_issue_label(item.issue_number, label)
+                for label in item.remove_labels:
+                    gh.remove_issue_label(item.issue_number, label)
 
         elif item.kind == "state_pr_missing_on_github":
             if item.pr_number is not None:
@@ -233,13 +231,10 @@ def apply_fixes(
 
         elif item.kind in ("issue_active_label_no_open_pr", "done_label_with_active_labels"):
             if item.issue_number is not None:
-                for label in config.labels.active:
-                    if f"'{label}'" in " ".join(item.fix_actions):
-                        gh.remove_issue_label(item.issue_number, label)
+                for label in item.remove_labels:
+                    gh.remove_issue_label(item.issue_number, label)
 
-        new_events = list(new_state.get("events", []))
-        new_state = {**new_state, "events": new_events}
-        append_event(
+        new_state = append_event(
             new_state,
             "reconcile",
             {
