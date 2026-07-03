@@ -187,9 +187,23 @@ def launch_claude_worker(
         )
         return _write_record(sessions_dir, record)
 
-    command = _render_command(
-        command_template, prompt_path, issue_number=issue_number, branch=branch
-    )
+    try:
+        command = _render_command(
+            command_template, prompt_path, issue_number=issue_number, branch=branch
+        )
+    except (KeyError, IndexError, ValueError) as exc:
+        remove_worktree(repo_root, worktree.path, force=True)
+        record = _error_record(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            log_path=str(log_path),
+            error=f"command template rendering failed: {exc}",
+        )
+        return _write_record(sessions_dir, record)
+
     feed_stdin = "{prompt_path}" not in "".join(command_template)
     # Workers inherit the orchestrator's environment, with config-provided
     # overrides merged on top — e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound a
