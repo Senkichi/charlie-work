@@ -76,6 +76,7 @@ def create_worktree(
     base_ref: str = "HEAD",
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
+    rework: bool = False,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -85,20 +86,111 @@ def create_worktree(
     RuntimeError if that link target already exists in the fresh worktree
     (programmer error / stale state — fail loudly rather than silently
     reusing or overwriting it).
+
+    If ``rework`` is True, the branch is assumed to already exist (from a
+    previous PR cycle). In rework mode:
+    - If a worktree for the branch already exists, fetch and fast-forward it
+      to the origin tip instead of failing.
+    - Otherwise, use ``git worktree add <path> <branch>`` (no ``-b``) to
+      attach to the existing branch at its origin tip.
     """
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
 
-    result = run_captured(
-        ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
-        cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        raise RuntimeError(
-            f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+    if rework:
+        # Rework mode: branch already exists, reuse or attach to it
+        existing_worktrees = list_worktrees(repo_root)
+        # Branch names in git worktree list may have refs/heads/ prefix
+        existing_wt = next(
+            (
+                wt
+                for wt in existing_worktrees
+                if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch
+            ),
+            None,
         )
+
+        if existing_wt:
+            # Reuse existing worktree: fetch and fast-forward to origin tip
+            worktree_path = Path(existing_wt["worktree"])
+            # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
+            fetch_result = run_captured(
+                ["git", "fetch", "origin", branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            # Fast-forward inside the worktree if fetch succeeded
+            if fetch_result.ok:
+                ff_result = run_captured(
+                    ["git", "merge", "--ff-only", f"origin/{branch}"],
+                    cwd=worktree_path,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # If fast-forward fails (diverged history), fail the launch
+                if not ff_result.ok:
+                    raise RuntimeError(
+                        f"Cannot fast-forward rework branch {branch!r} to origin tip: "
+                        f"{ff_result.error or ff_result.stderr}"
+                    )
+            # If fetch failed, check if it's because there's no remote (test repos)
+            # vs a real network/error failure. Distinguish these cases.
+            # Don't fail on "no remote" - the worktree is still usable for tests
+            # But do fail on other fetch errors to avoid silent stale launches
+            if not fetch_result.ok and fetch_result.stderr:
+                # Check if the error indicates no remote configured
+                if "remote" not in fetch_result.stderr.lower():
+                    raise RuntimeError(
+                        f"Fetch failed for rework branch {branch!r}: "
+                        f"{fetch_result.error or fetch_result.stderr}"
+                    )
+            # Skip venv junction creation for reused worktrees (already exists)
+            venv_junction = None
+            if venv_source is not None:
+                venv_link = worktree_path / ".venv"
+                if venv_link.exists() or is_junction(venv_link):
+                    venv_junction = venv_link
+                else:
+                    _create_junction_or_symlink(venv_link, venv_source)
+                    venv_junction = venv_link
+            return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
+        else:
+            # No existing worktree: attach to existing branch (no -b flag)
+            # Fetch first to ensure we materialize at the origin tip
+            fetch_result = run_captured(
+                ["git", "fetch", "origin", f"{branch}:{branch}"],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            # If fetch failed, check if it's because there's no remote (test repos)
+            # vs a real network/error failure. Distinguish these cases.
+            if not fetch_result.ok and fetch_result.stderr:
+                # Check if the error indicates no remote configured
+                if "remote" not in fetch_result.stderr.lower():
+                    raise RuntimeError(
+                        f"Fetch failed for rework branch {branch!r}: "
+                        f"{fetch_result.error or fetch_result.stderr}"
+                    )
+            result = run_captured(
+                ["git", "worktree", "add", str(worktree_path), branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    f"git worktree add failed for rework branch {branch!r}: {result.error or result.stderr}"
+                )
+    else:
+        # Fresh dispatch: create new branch off base_ref
+        result = run_captured(
+            ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not result.ok:
+            raise RuntimeError(
+                f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+            )
 
     venv_junction: Path | None = None
     if venv_source is not None:

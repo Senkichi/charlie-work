@@ -87,8 +87,9 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int) -> Path:
-    return sessions_dir / f"issue-{issue_number}.log"
+def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+    suffix = "-rework.log" if rework else ".log"
+    return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -140,6 +141,7 @@ def launch_devin_session(
     worktrees_dir: Path | None = None,
     command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
     worker_model: str = "",
+    rework: bool = False,
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -155,9 +157,12 @@ def launch_devin_session(
     ``read_session_records``/``doctor`` to find. Never raises — worktree-
     creation failures, a missing ``devin`` binary, or any other ``OSError``
     comes back as a record with ``pid=None`` and ``error`` set.
+
+    If ``rework`` is True, the worktree is created in rework mode (reuse existing
+    worktree or attach to existing branch instead of creating a new branch).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework)
 
     # --- worktree creation ---------------------------------------------------
     try:
@@ -165,6 +170,7 @@ def launch_devin_session(
             repo_root,
             branch,
             worktrees_dir=worktrees_dir,
+            rework=rework,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = SessionRecord(

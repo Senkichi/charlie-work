@@ -22,6 +22,8 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         # passes don't permanently stack reviewing on top of needs_rework.
         "review_started": ((labels.pr_open, labels.reviewing), (labels.needs_rework,)),
         "rework_requested": ((labels.needs_rework,), (labels.reviewing,)),
+        # rework worker launched for non-manual adapters
+        "rework_dispatched": ((labels.in_progress,), (labels.needs_rework,)),
         # reviewer approved; waiting on merge. pr_open (kept) without reviewing
         # is the "approved, not yet merged" state — distinct from under-review.
         "review_approved": ((), (labels.reviewing, labels.needs_rework)),

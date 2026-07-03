@@ -52,7 +52,7 @@ def _install_fake_create_worktree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
 ) -> None:
     def fake_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None
+        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False
     ):
         if calls is not None:
             calls.append(
@@ -60,6 +60,7 @@ def _install_fake_create_worktree(
                     "repo_root": repo_root,
                     "branch": branch,
                     "worktrees_dir": worktrees_dir,
+                    "rework": rework,
                 }
             )
         return _fake_worktree(tmp_path, branch)
@@ -293,6 +294,48 @@ def test_launch_worktree_creation_failure_yields_error_record(
     payload = json.loads((sessions_dir / "issue-8.json").read_text(encoding="utf-8"))
     assert payload["pid"] is None
     assert payload["error"] is not None
+
+
+def test_launch_devin_session_passes_rework_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rework flag should be passed through to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    rework_calls = []
+
+    def tracking_create_worktree(*args, **kwargs):
+        rework_calls.append(kwargs.get("rework", False))
+        # Return a fake WorktreeInfo to avoid actual git operations
+        from charlie_work.worktree import WorktreeInfo
+
+        return WorktreeInfo(path=tmp_path / "fake-wt", branch="test", venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", tracking_create_worktree)
+
+    # Test with rework=False (default)
+    launch_devin_session(
+        1,
+        "agent/issue-1",
+        tmp_path / "prompt.md",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        rework=False,
+    )
+
+    # Test with rework=True
+    launch_devin_session(
+        2,
+        "agent/issue-2",
+        tmp_path / "prompt.md",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        rework=True,
+    )
+
+    assert rework_calls == [False, True]
 
 
 def test_read_session_records_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

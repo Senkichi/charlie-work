@@ -28,6 +28,22 @@ def _init_repo(repo_root: Path) -> None:
     run(["git", "commit", "-m", "initial commit"])
 
 
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # A fresh clone has no committer identity on CI runners.
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+
+
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -196,3 +212,145 @@ def test_is_junction_true_for_windows_junction(tmp_path: Path) -> None:
     _winapi.CreateJunction(str(target), str(link))
 
     assert is_junction(link) is True
+
+
+def test_rework_reuses_existing_worktree(tmp_path: Path) -> None:
+    """Rework mode should reuse an existing worktree and fetch+fast-forward it."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch and worktree (simulating a previous PR cycle)
+    branch_name = "agent/issue-1-rework"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "file1.txt"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file1"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the worktree is in the list
+    worktrees = list_worktrees(repo_root)
+    assert any(
+        wt.get("branch", "").endswith(f"/{branch_name}") or wt.get("branch") == branch_name
+        for wt in worktrees
+    )
+
+    # In rework mode, create_worktree should reuse the existing worktree
+    # The fetch will fail in a test repo without a remote, but the reuse logic
+    # should still work (we just skip the fetch in this case)
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    # Should return the same path
+    assert info2.path == info1.path
+    # File should still exist
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+
+    # Clean up
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
+    """Rework mode should attach to an existing branch when no worktree exists."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch without a worktree (simulating a branch that exists but
+    # its worktree was cleaned up after merge)
+    branch_name = "agent/issue-2-reattach"
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # In rework mode, create_worktree should attach to the existing branch
+    # (no -b flag, so it doesn't try to create a new branch)
+    info = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info.branch == branch_name
+    assert info.path.exists()
+    # Should be on the existing branch, not a new one
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == branch_name
+
+    # Clean up
+    remove_worktree(repo_root, info.path)
+
+
+def test_rework_reuse_fetches_and_fast_forwards_to_origin_tip(tmp_path: Path) -> None:
+    """Rework reuse path must fast-forward the existing worktree to the origin tip."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create the agent branch + worktree locally and push it to origin.
+    branch_name = "agent/issue-1-rework-ff"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "add file1")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance the AGENT branch on the remote so the local worktree is behind.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    # Same worktree, fast-forwarded to the origin tip.
+    assert info2.path == info1.path
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "remote change\n"
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_attach_fetches_to_origin_tip(tmp_path: Path) -> None:
+    """Rework attach path must materialize the existing branch at the origin tip."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create the agent branch locally (no worktree) and push it to origin.
+    branch_name = "agent/issue-2-attach-ff"
+    _git(repo_root, "branch", branch_name)
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance the AGENT branch on the remote so the local ref is behind.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file1.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file1.txt")
+    _git(remote_repo, "commit", "-m", "add file1")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info = create_worktree(repo_root, branch_name, rework=True)
+
+    # Attached to the existing branch at the origin tip.
+    assert info.branch == branch_name
+    assert (info.path / "file1.txt").read_text(encoding="utf-8") == "remote change\n"
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    remove_worktree(repo_root, info.path)

@@ -62,8 +62,9 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.claude.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int) -> Path:
-    return sessions_dir / f"issue-{issue_number}.claude.log"
+def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+    suffix = "-rework.claude.log" if rework else ".claude.log"
+    return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -131,6 +132,7 @@ def launch_claude_worker(
     venv_source: Path | None = None,
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
     env: dict[str, str] | None = None,
+    rework: bool = False,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -138,9 +140,12 @@ def launch_claude_worker(
     failures both come back as an error record. If the worktree was created
     but the process failed to launch, the worktree is removed best-effort so
     a failed launch doesn't leak a half-made worktree.
+
+    If ``rework`` is True, the worktree is created in rework mode (reuse existing
+    worktree or attach to existing branch instead of creating a new branch).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework)
 
     try:
         worktree: WorktreeInfo = create_worktree(
@@ -148,6 +153,7 @@ def launch_claude_worker(
             branch,
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
+            rework=rework,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(
