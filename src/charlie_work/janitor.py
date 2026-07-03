@@ -16,7 +16,9 @@ JSON) for packet generation, so it feeds that same data in here first.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import summarize_checks
@@ -193,3 +195,226 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
+    """Check for worker edits leaked into the operator checkout.
+
+    Runs ``git status --porcelain --untracked-files=no`` at ``repo_root`` to detect
+    uncommitted changes (excluding untracked files). When dirty in the context of a
+    candidate PR, diffs dirty files against the PR's patch to distinguish:
+    - **Leaked worker edits**: files whose working-tree diff against HEAD is byte-identical
+      to the PR's diff (provably redundant leaks)
+    - **Generic dirty tree**: other dirty files (could be legitimate operator work)
+
+    Untracked files are ignored unless they are introduced by the PR diff as new files.
+
+    NOTE: If main has advanced past the PR base, hunk line numbers can shift and a genuine
+    leak may read as unrelated-dirty (false negative). This is a report-only feature and
+    acceptable degradation.
+
+    Returns a tuple of warning messages. Never modifies or deletes files.
+    """
+    warnings: list[str] = []
+
+    # Check for uncommitted changes in the operator checkout (excluding untracked files)
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        dirty_output = result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If git fails, skip the check rather than blocking
+        return ()
+
+    # Parse dirty files from git status --porcelain -z (NUL-separated, robust parsing)
+    # Also check for untracked files that might be in the PR diff
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "-z"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        all_status_output = result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        all_status_output = ""
+
+    if not dirty_output and not all_status_output:
+        # Clean tree — no containment issues
+        return ()
+
+    # Parse NUL-separated records from git status --porcelain -z
+    # Format: XY filename\0 (or XY newname\0oldname\0 for renames/copies with -z)
+    dirty_files: set[str] = set()
+    untracked_files: set[str] = set()
+
+    if all_status_output:
+        records = all_status_output.split("\0")
+        i = 0
+        while i < len(records):
+            record = records[i]
+            if not record:
+                i += 1
+                continue
+            # Extract status (first 2 characters)
+            if len(record) < 3:
+                i += 1
+                continue
+            status = record[:2]
+            # Extract filename (skip the 2-character status and the space after it)
+            # The record format is: XY<space>filename
+            rest_of_record = record[2:]
+            if rest_of_record.startswith(" "):
+                rest_of_record = rest_of_record[1:]
+
+            # For renames (R) and copies (C) with -z, the next field is the old path
+            # Format: XY newname\0oldname\0
+            if status.startswith(("R", "C")):
+                # Skip the next record (old path) and use the new name
+                filename = rest_of_record
+                i += 2  # Skip both current and next record
+            else:
+                filename = rest_of_record
+                i += 1
+
+            if not filename:
+                continue
+
+            # Track untracked files separately (status starts with ?)
+            if status.startswith("?"):
+                untracked_files.add(filename)
+            # Track dirty files (modified, added, deleted, etc.)
+            else:
+                dirty_files.add(filename)
+
+    if not dirty_files and not untracked_files:
+        return ()
+
+    # Parse the PR diff to extract hunks for each file
+    # We compare hunks directly instead of reconstructing content
+    # Split on diff --git section boundaries to avoid multi-file clobbering
+    pr_file_hunks: dict[str, str] = {}
+    pr_new_files: set[str] = set()
+
+    # Split the diff into sections (each file starts with "diff --git")
+    sections = pr_diff.split("\ndiff --git")
+    for section in sections:
+        if not section.strip():
+            continue
+
+        # Re-add the "diff --git" prefix that was stripped by split
+        if not section.startswith("diff --git"):
+            section = "diff --git" + section
+
+        # Extract the file path from the +++ line
+        current_file: str | None = None
+        current_hunks: list[str] = []
+        is_new_file = False
+
+        for line in section.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]  # Strip "+++ b/" prefix
+            elif line.startswith("new file mode"):
+                is_new_file = True
+            elif line.startswith("@@"):
+                # Start of a hunk - include the hunk header
+                current_hunks.append(line)
+            elif current_hunks:
+                # Include all hunk lines (context, additions, deletions)
+                # Skip diff metadata lines (starting with \)
+                if not line.startswith("\\"):
+                    current_hunks.append(line)
+
+        # Save the file's hunks
+        if current_file is not None:
+            pr_file_hunks[current_file] = "\n".join(current_hunks)
+            if is_new_file:
+                pr_new_files.add(current_file)
+
+    # Check each dirty file against the PR's hunks
+    leaked_files: list[str] = []
+    unrelated_dirty_files: list[str] = []
+
+    for dirty_file in dirty_files:
+        file_path = repo_root / dirty_file
+        if not file_path.exists():
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Check if this file is in the PR diff
+        if dirty_file not in pr_file_hunks:
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Get the working-tree diff against HEAD for this file
+        try:
+            result = subprocess.run(
+                ["git", "diff", "HEAD", "--", dirty_file],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            working_tree_diff = result.stdout
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Strip index/hash header lines from both diffs for comparison
+        # The header lines vary (hashes, timestamps) but the hunks should match
+        def normalize_diff(diff: str) -> str:
+            lines = diff.splitlines()
+            normalized = []
+            for line in lines:
+                # Skip header lines that vary between runs
+                if (
+                    line.startswith("diff --git")
+                    or line.startswith("index ")
+                    or line.startswith("--- ")
+                    or line.startswith("+++ ")
+                ):
+                    continue
+                # Skip diff metadata lines
+                if line.startswith("\\"):
+                    continue
+                normalized.append(line)
+            return "\n".join(normalized)
+
+        pr_hunks_normalized = normalize_diff(pr_file_hunks[dirty_file])
+        working_tree_hunks_normalized = normalize_diff(working_tree_diff)
+
+        # Compare hunks - byte-identical hunks mean leak
+        if working_tree_hunks_normalized == pr_hunks_normalized:
+            leaked_files.append(dirty_file)
+        else:
+            unrelated_dirty_files.append(dirty_file)
+
+    # Check untracked files - only warn if they're introduced by the PR diff
+    for untracked_file in untracked_files:
+        if untracked_file in pr_new_files:
+            # Untracked file that matches a new file in the PR - likely a leak
+            leaked_files.append(untracked_file)
+        # Otherwise, ignore untracked files entirely (no warning)
+
+    # Generate warnings
+    if leaked_files:
+        remediation = " ".join(f"git checkout -- {f}" for f in leaked_files)
+        warnings.append(
+            f"Containment leak detected: PR #{pr_number} edits leaked into operator checkout. "
+            f"Files with byte-identical diff to PR: {', '.join(leaked_files)}. "
+            f"Remediation: {remediation}"
+        )
+
+    if unrelated_dirty_files:
+        warnings.append(
+            f"Operator checkout has uncommitted changes (not a leak): {', '.join(unrelated_dirty_files)}. "
+            f"This may be legitimate operator work or requires manual cleanup."
+        )
+
+    return tuple(warnings)

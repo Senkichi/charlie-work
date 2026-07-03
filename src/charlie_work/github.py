@@ -253,7 +253,7 @@ _BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
 def linked_issue_number(
     pr: dict[str, Any],
     *,
-    is_cross_repository: bool | None = None,
+    is_cross_repository: bool | None,
     branch_prefix: str,
 ) -> int | None:
     """Resolve the issue a PR is bound to, safe against hijack.
@@ -267,11 +267,12 @@ def linked_issue_number(
     on merge is GitHub's policy for issue state; the orchestrator's label
     lifecycle is ours.)
 
-    When is_cross_repository is None (e.g., legacy code paths), treat as
-    same-repo for backward compatibility.
+    When is_cross_repository is None (provenance unknown), treat as
+    cross-repo for trust purposes — bind nothing via branch name or closing
+    keyword (fail closed).
     """
-    # Cross-repo PRs never bind for lifecycle purposes
-    if is_cross_repository is True:
+    # Cross-repo PRs or unknown provenance never bind for lifecycle purposes
+    if is_cross_repository is True or is_cross_repository is None:
         return None
 
     head = str(pr.get("headRefName") or "")
