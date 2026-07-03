@@ -103,22 +103,47 @@ def create_worktree(
         existing_worktrees = list_worktrees(repo_root)
         # Branch names in git worktree list may have refs/heads/ prefix
         existing_wt = next(
-            (wt for wt in existing_worktrees if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch),
-            None
+            (
+                wt
+                for wt in existing_worktrees
+                if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch
+            ),
+            None,
         )
 
         if existing_wt:
             # Reuse existing worktree: fetch and fast-forward to origin tip
             worktree_path = Path(existing_wt["worktree"])
-            # Fetch the branch from origin to get latest changes
-            # If there's no remote (e.g., in tests), skip the fetch
+            # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
             fetch_result = run_captured(
-                ["git", "fetch", "origin", f"{branch}:{branch}"],
+                ["git", "fetch", "origin", branch],
                 cwd=repo_root,
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
-            # Don't fail on fetch errors - the worktree is still usable
-            # (e.g., in test repos without a remote)
+            # Fast-forward inside the worktree if fetch succeeded
+            if fetch_result.ok:
+                ff_result = run_captured(
+                    ["git", "merge", "--ff-only", f"origin/{branch}"],
+                    cwd=worktree_path,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # If fast-forward fails (diverged history), fail the launch
+                if not ff_result.ok:
+                    raise RuntimeError(
+                        f"Cannot fast-forward rework branch {branch!r} to origin tip: "
+                        f"{ff_result.error or ff_result.stderr}"
+                    )
+            # If fetch failed, check if it's because there's no remote (test repos)
+            # vs a real network/error failure. Distinguish these cases.
+            # Don't fail on "no remote" - the worktree is still usable for tests
+            # But do fail on other fetch errors to avoid silent stale launches
+            if not fetch_result.ok and fetch_result.stderr:
+                # Check if the error indicates no remote configured
+                if "remote" not in fetch_result.stderr.lower():
+                    raise RuntimeError(
+                        f"Fetch failed for rework branch {branch!r}: "
+                        f"{fetch_result.error or fetch_result.stderr}"
+                    )
             # Skip venv junction creation for reused worktrees (already exists)
             venv_junction = None
             if venv_source is not None:
@@ -131,6 +156,21 @@ def create_worktree(
             return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
         else:
             # No existing worktree: attach to existing branch (no -b flag)
+            # Fetch first to ensure we materialize at the origin tip
+            fetch_result = run_captured(
+                ["git", "fetch", "origin", f"{branch}:{branch}"],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            # If fetch failed, check if it's because there's no remote (test repos)
+            # vs a real network/error failure. Distinguish these cases.
+            if not fetch_result.ok and fetch_result.stderr:
+                # Check if the error indicates no remote configured
+                if "remote" not in fetch_result.stderr.lower():
+                    raise RuntimeError(
+                        f"Fetch failed for rework branch {branch!r}: "
+                        f"{fetch_result.error or fetch_result.stderr}"
+                    )
             result = run_captured(
                 ["git", "worktree", "add", str(worktree_path), branch],
                 cwd=repo_root,

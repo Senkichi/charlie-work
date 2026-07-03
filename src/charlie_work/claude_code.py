@@ -62,8 +62,9 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.claude.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int) -> Path:
-    return sessions_dir / f"issue-{issue_number}.claude.log"
+def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+    suffix = "-rework.claude.log" if rework else ".claude.log"
+    return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -144,7 +145,7 @@ def launch_claude_worker(
     worktree or attach to existing branch instead of creating a new branch).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework)
 
     try:
         worktree: WorktreeInfo = create_worktree(

@@ -975,11 +975,11 @@ class OrchestratorApp:
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
-        dispatch_rework = self.dispatch_rework(limit)
+        # Resolve the effective budget once
+        effective_limit = limit if limit is not None else self.config.dispatch.default_limit
+        dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
-        fresh_limit = None
-        if limit is not None:
-            fresh_limit = max(0, limit - rework_count)
+        fresh_limit = max(0, effective_limit - rework_count)
         dispatch = self.dispatch(fresh_limit)
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
@@ -1066,7 +1066,7 @@ class OrchestratorApp:
             return CommandResult(
                 True,
                 "rework dispatch skipped for manual adapter",
-                {"adapter": "manual", "dispatched_count": 0},
+                {"adapter": "manual", "selected_count": 0},
             )
 
         # Find issues with needs-rework label
@@ -1107,7 +1107,7 @@ class OrchestratorApp:
             return CommandResult(
                 True,
                 "no rework candidates found",
-                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+                {"adapter": self.config.devin.adapter, "selected_count": 0},
             )
 
         # First lock: claim issues by marking them as dispatch_pending
@@ -1142,7 +1142,7 @@ class OrchestratorApp:
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
-                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+                {"adapter": self.config.devin.adapter, "selected_count": 0},
             )
 
         # Do all network calls, file writes, and worker launches outside the lock
@@ -1174,10 +1174,37 @@ class OrchestratorApp:
             )
 
         if not session_requests:
+            # Release the dispatch_pending claims for all skipped issues
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number in skipped_issue_numbers:
+                    full_issue = full_issues[issue_number]
+                    entry = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "title": full_issue.get("title"),
+                        "url": full_issue.get("url"),
+                        "status": "dispatch_failed",
+                        "dispatched_at": None,
+                    }
+                    entry.pop("dispatch_pending_at", None)
+                    entry.pop("label_error", None)
+                    state["issues"][str(issue_number)] = entry
+                state = append_event(
+                    state,
+                    "dispatch_rework",
+                    {
+                        "issue_numbers": [],
+                        "failed_issue_numbers": [],
+                        "skipped_issue_numbers": sorted(skipped_issue_numbers),
+                        "label_errors": [],
+                    },
+                )
+                save_state(self.paths.state_file, state)
             return CommandResult(
                 True,
                 "no valid rework prompts found",
-                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+                {"adapter": self.config.devin.adapter, "selected_count": 0},
             )
 
         manifest_path = self.repo_root / self.config.devin.session_manifest
@@ -1202,6 +1229,7 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Record skipped issues (missing rework prompt) as dispatch_failed
+            # This handles the mixed case where some issues have prompts and some don't
             for issue_number in skipped_issue_numbers:
                 full_issue = full_issues[issue_number]
                 entry = {

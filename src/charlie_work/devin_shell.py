@@ -87,8 +87,9 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int) -> Path:
-    return sessions_dir / f"issue-{issue_number}.log"
+def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+    suffix = "-rework.log" if rework else ".log"
+    return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -161,7 +162,7 @@ def launch_devin_session(
     worktree or attach to existing branch instead of creating a new branch).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework)
 
     # --- worktree creation ---------------------------------------------------
     try:
