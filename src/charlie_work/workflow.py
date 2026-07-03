@@ -22,7 +22,7 @@ from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
-from .state import append_event, load_state, save_state, state_lock, utc_now
+from .state import append_event, is_claim_stale, load_state, save_state, state_lock, utc_now
 
 
 @dataclass(frozen=True)
@@ -223,21 +223,29 @@ class OrchestratorApp:
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
-        # First lock: claim issues by marking them as dispatching
+        # First lock: claim issues by marking them as dispatch_pending
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Defence-in-depth against double-dispatch: an issue whose state records
-            # a live launched worker (status "dispatched") is not re-dispatchable
-            # even if its GitHub label write failed after the worker launched.
+            # a live launched worker (status "dispatched") or a fresh pending claim
+            # (status "dispatch_pending" not yet stale) is not re-dispatchable even
+            # if its GitHub label write failed after the worker launched.
             # _is_dispatchable is label-only; this closes the launched-but-unlabeled
             # window that would otherwise spawn a second worker on the same issue.
-            live_dispatched = {
-                int(number)
-                for number, entry in state.get("issues", {}).items()
-                if isinstance(entry, dict) and entry.get("status") == "dispatched"
-            }
+            # Stale claims (crashed phase-2) are excluded to allow re-dispatch.
+            live_dispatched = set()
+            for number, entry in state.get("issues", {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                status = entry.get("status")
+                if status == "dispatched":
+                    live_dispatched.add(int(number))
+                elif status == "dispatch_pending" and not is_claim_stale(
+                    entry.get("dispatch_pending_at")
+                ):
+                    live_dispatched.add(int(number))
             candidates = [
                 issue
                 for issue in issues
@@ -251,12 +259,13 @@ class OrchestratorApp:
             else:
                 selected = candidates[:dispatch_limit]
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
-            # Mark selected issues as "dispatching" to claim them
+            # Mark selected issues as "dispatch_pending" to claim them before launching
             for issue_number in selected_issue_numbers:
                 state["issues"][str(issue_number)] = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
-                    "status": "dispatching",
+                    "status": "dispatch_pending",
+                    "dispatch_pending_at": utc_now(),
                 }
             save_state(self.paths.state_file, state)
         # Do all network calls, file writes, and worker launches outside the lock
@@ -290,7 +299,7 @@ class OrchestratorApp:
         failed_issue_numbers = {
             result.issue_number for result in dispatch_results if not result.ok
         }
-        # Second lock: update state with results
+        # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         manual = self.config.devin.adapter == "manual"
         label_errors: list[int] = []
         with state_lock(self.paths.state_file):
@@ -310,6 +319,8 @@ class OrchestratorApp:
                     else "dispatch_failed",
                     "dispatched_at": utc_now() if ok else None,
                 }
+                # Clear the claim timestamp on successful upgrade
+                entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
                 state["issues"][str(request.issue_number)] = entry
                 # Persist the launched worker BEFORE touching GitHub labels: a

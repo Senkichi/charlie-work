@@ -26,7 +26,7 @@ from typing import Any
 from .config import OrchestratorConfig
 from .github import GitHub, _LIST_LIMIT, label_names, linked_issue_number
 from .labels import transition
-from .state import append_event
+from .state import append_event, is_claim_stale
 
 _PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels"
 _ISSUE_FIELDS = "number,title,url,body,labels"
@@ -197,6 +197,30 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
                 )
             )
 
+    # Detect stale dispatch_pending claims (crashed phase-2)
+    state_issues: dict[str, Any] = state.get("issues", {})
+    for issue_number_str, entry in state_issues.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            issue_number = int(issue_number_str)
+        except ValueError:
+            continue
+        status = entry.get("status")
+        if status == "dispatch_pending" and is_claim_stale(entry.get("dispatch_pending_at")):
+            drift.append(
+                DriftItem(
+                    kind="stale_dispatch_pending_claim",
+                    issue_number=issue_number,
+                    pr_number=None,
+                    detail=(
+                        f"issue #{issue_number} has a stale dispatch_pending claim "
+                        f"(crashed phase-2) and should be re-dispatchable"
+                    ),
+                    fix_actions=(f"clear dispatch_pending claim for issue #{issue_number}",),
+                )
+            )
+
     return drift
 
 
@@ -233,6 +257,12 @@ def apply_fixes(
             if item.issue_number is not None:
                 for label in item.remove_labels:
                     gh.remove_issue_label(item.issue_number, label)
+
+        elif item.kind == "stale_dispatch_pending_claim":
+            if item.issue_number is not None:
+                issue_key = str(item.issue_number)
+                # Clear the stale claim by removing the entry entirely
+                new_issues.pop(issue_key, None)
 
         new_state = append_event(
             new_state,

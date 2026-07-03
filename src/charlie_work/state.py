@@ -4,7 +4,7 @@ import json
 import logging
 import sys
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +13,32 @@ STATE_VERSION = 1
 # Cross-process lock timeout (seconds) — best-effort to prevent wedging
 _LOCK_TIMEOUT_SECONDS = 30
 
+# Stale claim timeout (minutes) — claims older than this are re-dispatchable
+# to prevent crashed phase-2 from wedging issues
+_STALE_CLAIM_TIMEOUT_MINUTES = 30
+
 logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def is_claim_stale(claim_timestamp: str | None) -> bool:
+    """Check if a dispatch_pending claim is stale and should be re-dispatchable.
+
+    A claim is stale if it's older than _STALE_CLAIM_TIMEOUT_MINUTES.
+    This prevents crashed phase-2 processes from wedging issues permanently.
+    """
+    if not claim_timestamp:
+        return False
+    try:
+        claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
+        age = datetime.now(UTC) - claim_time
+        return age > timedelta(minutes=_STALE_CLAIM_TIMEOUT_MINUTES)
+    except (ValueError, TypeError):
+        # Malformed timestamp — treat as stale to be safe
+        return True
 
 
 @contextmanager

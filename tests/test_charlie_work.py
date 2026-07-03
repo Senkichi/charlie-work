@@ -1976,6 +1976,88 @@ def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:
     assert "999" in result.message
 
 
+def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> None:
+    """A dispatch_pending claim must block a second dispatch for the same issue."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First dispatch creates a dispatch_pending claim
+    first_result = app.dispatch(limit=1)
+    assert first_result.data["attempted_count"] == 1
+
+    # Verify the claim was created
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"  # Upgraded after successful launch
+
+    # Simulate a crashed phase-2 by manually setting status back to dispatch_pending
+    state["issues"]["123"]["status"] = "dispatch_pending"
+    state["issues"]["123"]["dispatch_pending_at"] = "2099-01-01T00:00:00Z"  # Far future = not stale
+    save_state(paths.state_file, state)
+
+    # Second dispatch should be blocked by the fresh claim
+    second_result = app.dispatch(limit=1)
+    assert second_result.data["attempted_count"] == 0  # Blocked by claim
+
+    # Verify the claim is still in place
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_pending"
+
+
+def test_stale_dispatch_pending_claim_is_redispatchable(tmp_path: Path, monkeypatch) -> None:
+    """A stale dispatch_pending claim (crashed phase-2) must be re-dispatchable."""
+    from charlie_work.state import is_claim_stale, utc_now
+    from datetime import timedelta
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed state with a stale dispatch_pending claim (simulating crashed phase-2)
+    seed = load_state(paths.state_file)
+    # Create a timestamp older than the staleness threshold
+    stale_time = (utc_now().replace("Z", "+00:00") if "Z" in utc_now() else utc_now())
+    # We need to mock is_claim_stale to return True for our test timestamp
+    original_is_claim_stale = is_claim_stale
+
+    def _mock_is_claim_stale(claim_timestamp: str | None) -> bool:
+        if claim_timestamp == "2020-01-01T00:00:00+00:00":
+            return True  # Treat this specific timestamp as stale
+        return original_is_claim_stale(claim_timestamp)
+
+    monkeypatch.setattr("charlie_work.state.is_claim_stale", _mock_is_claim_stale)
+    monkeypatch.setattr("charlie_work.workflow.is_claim_stale", _mock_is_claim_stale)
+
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatch_pending",
+        "dispatch_pending_at": "2020-01-01T00:00:00+00:00",  # Stale timestamp
+    }
+    save_state(paths.state_file, seed)
+
+    # Dispatch should re-dispatch the stale claim
+    result = app.dispatch(limit=1)
+
+    assert result.data["attempted_count"] == 1  # Re-dispatched
+    state = load_state(paths.state_file)
+    # Status should now be "dispatched" (upgraded from stale claim)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    # Stale claim timestamp should be cleared
+    assert "dispatch_pending_at" not in state["issues"]["123"]
+
+
 def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

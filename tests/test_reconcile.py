@@ -10,7 +10,7 @@ from charlie_work.reconcile import (
     apply_fixes,
     detect_drift,
 )
-from charlie_work.state import empty_state
+from charlie_work.state import empty_state, is_claim_stale
 
 
 class FakeGitHub:
@@ -352,6 +352,71 @@ def test_apply_fixes_handles_quote_containing_label() -> None:
     apply_fixes(gh, state, drift, config)
 
     assert gh.labels_removed == [(50, quote_label)]
+
+
+def test_detect_drift_surfaces_stale_dispatch_pending_claims() -> None:
+    """Stale dispatch_pending claims must be detected as drift."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Mock is_claim_stale to return True for our test timestamp
+    original_is_claim_stale = is_claim_stale
+
+    def _mock_is_claim_stale(claim_timestamp: str | None) -> bool:
+        if claim_timestamp == "2020-01-01T00:00:00+00:00":
+            return True  # Treat this specific timestamp as stale
+        return original_is_claim_stale(claim_timestamp)
+
+    # Temporarily replace is_claim_stale in the reconcile module
+    import charlie_work.reconcile as reconcile_module
+    original_reconcile_is_claim_stale = reconcile_module.is_claim_stale
+    reconcile_module.is_claim_stale = _mock_is_claim_stale
+
+    try:
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatch_pending",
+            "dispatch_pending_at": "2020-01-01T00:00:00+00:00",  # Stale timestamp
+        }
+
+        drift = detect_drift(gh, state, config)
+
+        stale_claim_drift = [d for d in drift if d.kind == "stale_dispatch_pending_claim"]
+        assert len(stale_claim_drift) == 1
+        assert stale_claim_drift[0].issue_number == 123
+        assert "stale dispatch_pending claim" in stale_claim_drift[0].detail
+    finally:
+        # Restore original function
+        reconcile_module.is_claim_stale = original_reconcile_is_claim_stale
+
+
+def test_apply_fixes_clears_stale_dispatch_pending_claims() -> None:
+    """apply_fixes must clear stale dispatch_pending claims from state."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    state["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatch_pending",
+        "dispatch_pending_at": "2020-01-01T00:00:00+00:00",
+    }
+
+    drift = [
+        DriftItem(
+            kind="stale_dispatch_pending_claim",
+            issue_number=123,
+            pr_number=None,
+            detail="issue #123 has a stale dispatch_pending claim",
+            fix_actions=("clear dispatch_pending claim for issue #123",),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # The stale claim should be removed from state
+    assert "123" not in new_state["issues"]
+    assert "123" in state["issues"]  # Original state unchanged
 
 
 def test_reconcile_and_github_share_list_limit_constant() -> None:
