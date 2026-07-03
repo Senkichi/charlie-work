@@ -35,7 +35,7 @@ from charlie_work.cross_family import (
 from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
-from charlie_work.state import load_state, save_state, state_lock
+from charlie_work.state import is_throttled, load_state, save_state, set_throttled_until, state_lock
 from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
@@ -3535,6 +3535,142 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     assert result.data["concurrency_limit"] == 2
     assert result.data["live_session_count"] == 1
     assert result.data["available_slots"] == 1
+
+
+def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
+    """When provider throttle window is active, dispatch should defer and report why."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the future
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        # Set throttled_until to 1 hour in the future
+        from datetime import UTC, datetime, timedelta
+
+        future_time = datetime.now(UTC) + timedelta(hours=1)
+        throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch()
+
+    # Should defer with provider_throttled reason
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled"
+    assert result.data["throttled_until"] is not None
+    assert result.data["selected_count"] == 0
+    assert result.data["attempted_count"] == 0
+
+
+def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
+    """When provider throttle window has passed, dispatch should proceed normally."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the past
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        from datetime import UTC, datetime, timedelta
+
+        past_time = datetime.now(UTC) - timedelta(hours=1)
+        throttled_until = past_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch()
+
+    # Should proceed normally (not throttled)
+    assert result.ok is True
+    assert result.data["selected_count"] == 1  # One ready issue
+    assert "deferred_reason" not in result.data
+
+
+def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
+    """When provider throttle window is active, rework dispatch should also defer."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Add a needs-rework issue with an open PR
+    fake_gh.issues.append(
+        {
+            "number": 42,
+            "title": "Fix something",
+            "url": "https://example.test/issues/42",
+            "body": "Fix it",
+            "labels": [{"name": "agent:needs-rework"}],
+        }
+    )
+    # Replace the default PR with one linked to issue 42
+    fake_gh.pr = {
+        "number": 100,
+        "title": "Fix something",
+        "url": "https://example.test/pr/100",
+        "state": "OPEN",
+        "headRefName": "agent/issue-42-fix",
+        "headRefOid": "sha-abc123",
+        "baseRefName": "main",
+        "isCrossRepository": False,
+        "body": "Closes #42",
+        "labels": [],
+    }
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Set a throttle window in the future
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        from datetime import UTC, datetime, timedelta
+
+        future_time = datetime.now(UTC) + timedelta(hours=1)
+        throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = set_throttled_until(state, throttled_until)
+        save_state(paths.state_file, state)
+
+    result = app.dispatch_rework()
+
+    # Should defer with provider_throttled reason
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled"
+    assert result.data["throttled_until"] is not None
+    assert result.data["selected_count"] == 0
+
+
+def test_is_throttled_checks_against_current_time(tmp_path: Path) -> None:
+    """is_throttled should return True only when now < throttled_until."""
+    from datetime import UTC, datetime, timedelta
+
+    # Test with future timestamp
+    future_time = datetime.now(UTC) + timedelta(hours=1)
+    throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    state = {"throttled_until": throttled_until}
+    assert is_throttled(state) is True
+
+    # Test with past timestamp
+    past_time = datetime.now(UTC) - timedelta(hours=1)
+    throttled_until = past_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    state = {"throttled_until": throttled_until}
+    assert is_throttled(state) is False
+
+    # Test with no throttled_until
+    state = {"throttled_until": None}
+    assert is_throttled(state) is False
+
+    # Test with malformed timestamp
+    state = {"throttled_until": "invalid-timestamp"}
+    assert is_throttled(state) is False
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:

@@ -152,6 +152,17 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     if failed or exited:
         issues = sorted({record.issue_number for record in [*failed, *exited]})
         detail += f" (issues: {issues}) — check per-session logs in {sessions_dir}"
+
+        # Surface rate-limited deaths specifically
+        rate_limited = [r for r in records if getattr(r, "failure_kind", None) == "rate_limited"]
+        quota_exhausted = [r for r in records if getattr(r, "failure_kind", None) == "quota_exhausted"]
+        if rate_limited:
+            rl_issues = sorted({r.issue_number for r in rate_limited})
+            detail += f" | rate-limited: {rl_issues}"
+        if quota_exhausted:
+            qe_issues = sorted({r.issue_number for r in quota_exhausted})
+            detail += f" | quota-exhausted: {qe_issues}"
+
     add("launched sessions", not failed, detail, severity="warning")
 
 

@@ -22,7 +22,16 @@ from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
-from .state import append_event, is_claim_stale, load_state, save_state, state_lock, utc_now
+from .state import (
+    append_event,
+    is_claim_stale,
+    is_throttled,
+    load_state,
+    save_state,
+    set_throttled_until,
+    state_lock,
+    utc_now,
+)
 
 
 @dataclass(frozen=True)
@@ -297,6 +306,33 @@ class OrchestratorApp:
             if available_slots < dispatch_limit:
                 dispatch_limit = available_slots
                 concurrency_clamped = True
+
+        # Apply provider throttle cooldown check
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            if is_throttled(state):
+                throttled_until = state.get("throttled_until")
+                # Return immediately with deferral reason
+                data = {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "skipped_issue_numbers": [],
+                    "label_errors": [],
+                    "sessions": [],
+                    "dispatch_results": [],
+                    "deferred_reason": "provider_throttled",
+                    "throttled_until": throttled_until,
+                }
+                if concurrency_clamped:
+                    data["concurrency_limit"] = max_concurrent
+                    data["live_session_count"] = live_count
+                    data["available_slots"] = available_slots
+                return CommandResult(
+                    False,
+                    f"dispatch deferred: provider throttled until {throttled_until}",
+                    data,
+                )
 
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
@@ -1163,7 +1199,7 @@ class OrchestratorApp:
         ``fix`` is passed."""
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            drift = detect_drift(self.gh, state, self.config)
+            drift = detect_drift(self.gh, state, self.config, repo_root=self.repo_root)
             fixed = False
             post_fix_drift: list[DriftItem] = []
             if fix and drift:
@@ -1172,7 +1208,7 @@ class OrchestratorApp:
                 # The label removals above use allow_failure=True, so a failed
                 # removal is silently swallowed. Re-detect against the new state to
                 # verify the repairs actually landed before reporting success.
-                post_fix_drift = detect_drift(self.gh, new_state, self.config)
+                post_fix_drift = detect_drift(self.gh, new_state, self.config, repo_root=self.repo_root)
                 fixed = len(post_fix_drift) == 0
         message = f"found {len(drift)} drift item(s)"
         if fixed:
@@ -1379,6 +1415,28 @@ class OrchestratorApp:
             if available_slots < rework_limit:
                 rework_limit = available_slots
                 concurrency_clamped = True
+
+        # Apply provider throttle cooldown check
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            if is_throttled(state):
+                throttled_until = state.get("throttled_until")
+                # Return immediately with deferral reason
+                data = {
+                    "adapter": self.config.devin.adapter,
+                    "selected_count": 0,
+                    "deferred_reason": "provider_throttled",
+                    "throttled_until": throttled_until,
+                }
+                if concurrency_clamped:
+                    data["concurrency_limit"] = max_concurrent
+                    data["live_session_count"] = live_count
+                    data["available_slots"] = available_slots
+                return CommandResult(
+                    False,
+                    f"rework dispatch deferred: provider throttled until {throttled_until}",
+                    data,
+                )
 
         # Filter to issues with open PRs
         prs = self.gh.pr_list()

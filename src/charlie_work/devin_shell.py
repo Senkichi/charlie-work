@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,25 @@ from .worktree import WorktreeInfo, create_worktree, remove_worktree
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
+
+# Provider throttle signatures — matched against session log tails to classify
+# failure kinds. Keep these in one adapter-owned constant, not scattered.
+# Pattern for rate-limit errors (e.g., "Reached overall message rate limit")
+_RATE_LIMIT_PATTERN = re.compile(
+    r"Reached overall message rate limit|rate limit|too many requests",
+    re.IGNORECASE,
+)
+# Pattern for quota-exhaustion errors (e.g., "daily usage quota has been exhausted")
+_QUOTA_EXHAUSTED_PATTERN = re.compile(
+    r"daily usage quota has been exhausted|quota exceeded|usage limit",
+    re.IGNORECASE,
+)
+# Pattern for "resets in N minutes" to extract cooldown duration
+_RESETS_IN_PATTERN = re.compile(r"resets in (\d+) minutes?", re.IGNORECASE)
+
+# Default cooldown durations when we can't parse a specific reset time
+_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
+_DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 
 # ``--permission-mode dangerous`` is required for headless workers: without it
 # the Devin CLI defaults to ``auto`` (read-only tools), stalls on any
@@ -61,6 +82,7 @@ class SessionRecord:
     started_at: str
     log_path: str
     error: str | None = None
+    failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -80,6 +102,7 @@ class SessionRecord:
             started_at=str(payload.get("started_at", "")),
             log_path=str(payload.get("log_path", "")),
             error=payload.get("error"),
+            failure_kind=payload.get("failure_kind"),
         )
 
 
@@ -90,6 +113,53 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
 def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
     suffix = "-rework.log" if rework else ".log"
     return sessions_dir / f"issue-{issue_number}{suffix}"
+
+
+def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
+    """Classify a session failure by matching the log tail against provider throttle signatures.
+
+    Returns a tuple of (failure_kind, throttled_until_iso):
+    - failure_kind: "rate_limited" | "quota_exhausted" | None
+    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
+
+    This is called after a session exits to detect provider throttling and set a cool-down window.
+    """
+    if not log_path.exists():
+        return None, None
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+
+    # Check the last 2KB of the log (where error messages appear)
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Check for quota exhaustion first (more severe)
+    if _QUOTA_EXHAUSTED_PATTERN.search(tail):
+        # Try to parse "resets in N minutes" or similar
+        match = _RESETS_IN_PATTERN.search(tail)
+        if match:
+            minutes = int(match.group(1))
+            cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)  # Use default for quota
+        else:
+            cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
+        throttled_until = datetime.now(UTC) + cooldown
+        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    # Check for rate limiting
+    if _RATE_LIMIT_PATTERN.search(tail):
+        # Try to parse "resets in N minutes"
+        match = _RESETS_IN_PATTERN.search(tail)
+        if match:
+            minutes = int(match.group(1))
+            cooldown = timedelta(minutes=minutes)
+        else:
+            cooldown = timedelta(minutes=_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES)
+        throttled_until = datetime.now(UTC) + cooldown
+        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    return None, None
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -324,6 +394,48 @@ def is_session_alive(record: SessionRecord) -> bool:
     return _posix_is_alive(record.pid)
 
 
+def update_session_record_with_failure_classification(
+    sessions_dir: Path, issue_number: int
+) -> tuple[str | None, str | None]:
+    """Update a session record with failure classification after the session exits.
+
+    This reads the existing sidecar, classifies the failure from the log tail,
+    and writes back an updated record with failure_kind set.
+
+    Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
+    update runtime state if needed.
+    """
+    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    if not sidecar_path.exists():
+        return None, None
+
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+    if not isinstance(payload, dict):
+        return None, None
+
+    # Skip if already classified
+    if payload.get("failure_kind") is not None:
+        return payload.get("failure_kind"), None
+
+    log_path_str = payload.get("log_path")
+    if not log_path_str:
+        return None, None
+
+    log_path = Path(log_path_str)
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    if failure_kind:
+        payload["failure_kind"] = failure_kind
+        _write_json(sidecar_path, payload)
+
+    return failure_kind, throttled_until
+
+
 __all__ = [
     "DEFAULT_COMMAND_TEMPLATE",
     "SessionRecord",
@@ -331,4 +443,5 @@ __all__ = [
     "read_session_records",
     "probe_devin",
     "is_session_alive",
+    "update_session_record_with_failure_classification",
 ]
