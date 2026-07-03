@@ -25,7 +25,7 @@ def _validate_command_placeholders(
     """
     # Pattern to match {placeholder} tokens
     placeholder_pattern = re.compile(r"\{([^{}]*)\}")
-    
+
     parts = command if isinstance(command, tuple) else (command,)
     for part in parts:
         matches = placeholder_pattern.findall(part)

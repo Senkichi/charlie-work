@@ -317,7 +317,7 @@ def test_load_config_rejects_unknown_shell_command_placeholder(tmp_path: Path) -
 
     config_path = tmp_path / "orchestrator.config.yaml"
     config_path.write_text(
-        "devin:\n  shell_command:\n    - devin\n    - \"{unknown_placeholder}\"",
+        'devin:\n  shell_command:\n    - devin\n    - "{unknown_placeholder}"',
         encoding="utf-8",
     )
 
@@ -338,7 +338,7 @@ def test_load_config_rejects_empty_placeholder_in_shell_command(tmp_path: Path) 
 
     config_path = tmp_path / "orchestrator.config.yaml"
     config_path.write_text(
-        "devin:\n  shell_command:\n    - devin\n    - \"{}\"",
+        'devin:\n  shell_command:\n    - devin\n    - "{}"',
         encoding="utf-8",
     )
 
@@ -359,7 +359,7 @@ def test_load_config_rejects_unknown_claude_code_command_placeholder(tmp_path: P
 
     config_path = tmp_path / "orchestrator.config.yaml"
     config_path.write_text(
-        "claude_code:\n  command:\n    - claude\n    - \"{bad_token}\"",
+        'claude_code:\n  command:\n    - claude\n    - "{bad_token}"',
         encoding="utf-8",
     )
 
@@ -380,7 +380,7 @@ def test_load_config_rejects_unknown_cross_family_command_placeholder(tmp_path: 
 
     config_path = tmp_path / "orchestrator.config.yaml"
     config_path.write_text(
-        "cross_family:\n  enabled: true\n  command:\n    - devin\n    - \"{invalid}\"",
+        'cross_family:\n  enabled: true\n  command:\n    - devin\n    - "{invalid}"',
         encoding="utf-8",
     )
 
