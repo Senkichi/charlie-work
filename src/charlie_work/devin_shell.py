@@ -195,13 +195,29 @@ def launch_devin_session(
         return record
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
-    command = _render_command(
-        command_template,
-        issue_number=issue_number,
-        branch=branch,
-        prompt_path=prompt_path,
-        worker_model=worker_model,
-    )
+    try:
+        command = _render_command(
+            command_template,
+            issue_number=issue_number,
+            branch=branch,
+            prompt_path=prompt_path,
+            worker_model=worker_model,
+        )
+    except (KeyError, IndexError, ValueError) as exc:
+        remove_worktree(repo_root, worktree.path, force=True)
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            pid=None,
+            started_at=utc_now(),
+            log_path=str(log_path),
+            error=f"command template rendering failed: {exc}",
+        )
+        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        return record
 
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):

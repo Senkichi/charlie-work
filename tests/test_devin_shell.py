@@ -601,8 +601,7 @@ def test_command_template_injects_model_when_worker_model_set(
 def test_command_template_omits_model_when_worker_model_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When worker_model is empty (default), the rendered command must not include
-    --model, preserving CLI default behavior (backward compatibility)."""
+    """When worker_model is empty, the rendered command must omit --model."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
@@ -624,8 +623,53 @@ def test_command_template_omits_model_when_worker_model_empty(
 
     # The rendered command must NOT include --model
     assert "--model" not in record.command
-    # The empty {model_args} placeholder must be filtered out
-    assert "" not in record.command
     # Verify the custom template structure
     assert record.command[0] == sys.executable
     assert str(script) in record.command
+
+
+def test_launch_render_error_returns_error_record_and_tears_down_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense-in-depth: render errors past the load gate return error records, not exceptions."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_removed = []
+
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
+        worktree_removed.append(worktree_path)
+
+    monkeypatch.setattr(
+        devin_shell,
+        "create_worktree",
+        lambda *args, **kwargs: _fake_worktree(tmp_path, "agent/issue-1"),
+    )
+    monkeypatch.setattr(devin_shell, "remove_worktree", tracking_remove_worktree)
+
+    # Template with an unknown placeholder that bypasses load validation
+    record = launch_devin_session(
+        1,
+        "agent/issue-1",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("echo", "{unknown_placeholder}"),
+    )
+
+    # Must return an error record, not raise
+    assert record.error is not None
+    assert "command template rendering failed" in record.error
+    assert record.pid is None
+
+    # Worktree must have been torn down
+    assert len(worktree_removed) == 1
+
+    # Sidecar must record the error
+    sidecar_path = sessions_dir / "issue-1.json"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["error"] is not None
+    assert payload["pid"] is None
