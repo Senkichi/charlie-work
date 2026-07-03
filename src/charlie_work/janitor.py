@@ -41,6 +41,24 @@ _CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|refactor|docs|test|chore|perf|
 # count flags the PR as a warning (not a block) for reviewer awareness.
 _OVERSIZED_DIFF_THRESHOLD = 1500
 
+# PR dict keys read by janitor gate functions.
+# This is the single source of truth for what fields the janitor needs from PR data.
+# All keys here must be present in github.PR_VIEW_FIELDS or the corresponding gate will be silently disabled.
+JANITOR_PR_KEYS = frozenset(
+    {
+        "isDraft",  # _check_draft
+        "state",  # _check_state
+        "mergeable",  # _check_mergeable
+        "isCrossRepository",  # _check_linked_issue, _check_base_movement
+        "headRefName",  # _check_linked_issue, _check_base_movement
+        "body",  # _check_body
+        "title",  # _check_title_conventional
+        "additions",  # _check_diff_size
+        "deletions",  # _check_diff_size
+        "mergeStateStatus",  # _check_base_movement
+    }
+)
+
 
 @dataclass(frozen=True)
 class JanitorVerdict:

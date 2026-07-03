@@ -4,7 +4,13 @@ import subprocess
 from pathlib import Path
 
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
-from charlie_work.janitor import JanitorVerdict, check_operator_containment, run_janitor
+from charlie_work.github import PR_VIEW_FIELDS
+from charlie_work.janitor import (
+    JANITOR_PR_KEYS,
+    JanitorVerdict,
+    check_operator_containment,
+    run_janitor,
+)
 
 REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 
@@ -583,100 +589,6 @@ index 1234567..abcdef0 100644
     assert "git checkout --" in warnings[0]
 
 
-def test_closed_pr_blocked_with_real_pr_view_fields() -> None:
-    """CLOSED PR is blocked when using real pr_view field set (regression test for issue #2)."""
-    # This PR dict mirrors the real pr_view field set after the fix
-    # Before the fix, state/mergeable/additions/deletions were missing
-    pr = {
-        "number": 456,
-        "title": "fix: search is broken",
-        "url": "https://example.test/pull/456",
-        "headRefName": "agent/issue-123-fix-search",
-        "baseRefName": "main",
-        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
-        "isDraft": False,
-        "labels": [],
-        "author": {"login": "testuser"},
-        "updatedAt": "2024-01-01T00:00:00Z",
-        "reviewDecision": "APPROVED",
-        "statusCheckRollup": [],
-        "state": "CLOSED",  # This field was missing before the fix
-        "mergeable": "MERGEABLE",  # This field was missing before the fix
-        "additions": 10,  # This field was missing before the fix
-        "deletions": 5,  # This field was missing before the fix
-        "headRefOid": "abc123",
-        "isCrossRepository": False,
-        "mergeStateStatus": "CLEAN",
-    }
-
-    verdict = run_janitor(pr, _green_checks(), _config())
-
-    assert verdict.ok is False
-    assert any("CLOSED" in f for f in verdict.failures)
-
-
-def test_conflicting_pr_blocked_with_real_pr_view_fields() -> None:
-    """CONFLICTING PR is blocked when using real pr_view field set (regression test for issue #2)."""
-    # This PR dict mirrors the real pr_view field set after the fix
-    pr = {
-        "number": 456,
-        "title": "fix: search is broken",
-        "url": "https://example.test/pull/456",
-        "headRefName": "agent/issue-123-fix-search",
-        "baseRefName": "main",
-        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
-        "isDraft": False,
-        "labels": [],
-        "author": {"login": "testuser"},
-        "updatedAt": "2024-01-01T00:00:00Z",
-        "reviewDecision": "APPROVED",
-        "statusCheckRollup": [],
-        "state": "OPEN",  # This field was missing before the fix
-        "mergeable": "CONFLICTING",  # This field was missing before the fix
-        "additions": 10,  # This field was missing before the fix
-        "deletions": 5,  # This field was missing before the fix
-        "headRefOid": "abc123",
-        "isCrossRepository": False,
-        "mergeStateStatus": "DIRTY",
-    }
-
-    verdict = run_janitor(pr, _green_checks(), _config())
-
-    assert verdict.ok is False
-    assert any("conflict" in f.lower() for f in verdict.failures)
-
-
-def test_oversized_diff_warning_with_real_pr_view_fields() -> None:
-    """Oversized diff warning fires when using real pr_view field set (regression test for issue #2)."""
-    # This PR dict mirrors the real pr_view field set after the fix
-    pr = {
-        "number": 456,
-        "title": "fix: search is broken",
-        "url": "https://example.test/pull/456",
-        "headRefName": "agent/issue-123-fix-search",
-        "baseRefName": "main",
-        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
-        "isDraft": False,
-        "labels": [],
-        "author": {"login": "testuser"},
-        "updatedAt": "2024-01-01T00:00:00Z",
-        "reviewDecision": "APPROVED",
-        "statusCheckRollup": [],
-        "state": "OPEN",  # This field was missing before the fix
-        "mergeable": "MERGEABLE",  # This field was missing before the fix
-        "additions": 1000,  # This field was missing before the fix
-        "deletions": 600,  # This field was missing before the fix
-        "headRefOid": "abc123",
-        "isCrossRepository": False,
-        "mergeStateStatus": "CLEAN",
-    }
-
-    verdict = run_janitor(pr, _green_checks(), _config())
-
-    assert verdict.ok is True
-    assert any("oversized diff" in w.lower() for w in verdict.warnings)
-
-
 def test_body_word_boundary_matching_prevents_false_positives() -> None:
     """Word-boundary matching prevents 'test' in 'latest' from passing the gate (regression test for issue #2)."""
     pr = _green_pr(body="Closes #123. Updated to latest version.")
@@ -694,3 +606,21 @@ def test_body_word_boundary_matching_allows_legitimate_markers() -> None:
     verdict = run_janitor(pr, _green_checks(), _config())
 
     assert verdict.ok is True
+
+
+def test_janitor_pr_keys_contained_in_pr_view_fields() -> None:
+    """All PR keys read by janitor gates must be present in PR_VIEW_FIELDS (regression test for issue #2).
+
+    This test prevents the regression that issue #2 fixed: if a janitor gate reads a PR key
+    that is not in PR_VIEW_FIELDS, the gate will be silently disabled because gh pr view will
+    not fetch that field. This test FAILS if any janitor-read key is dropped from PR_VIEW_FIELDS.
+    """
+    # Parse PR_VIEW_FIELDS into a set of field names
+    pr_view_field_set = set(PR_VIEW_FIELDS.split(","))
+
+    # Assert every janitor-read key is in PR_VIEW_FIELDS
+    missing_keys = JANITOR_PR_KEYS - pr_view_field_set
+    assert not missing_keys, (
+        f"Janitor reads PR keys not in PR_VIEW_FIELDS: {missing_keys}. "
+        f"Add these keys to PR_VIEW_FIELDS in github.py or the corresponding gates will be silently disabled."
+    )
