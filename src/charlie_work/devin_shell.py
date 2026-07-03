@@ -36,8 +36,12 @@ _WIN_STILL_ACTIVE = 259
 # ``--permission-mode dangerous`` is required for headless workers: without it
 # the Devin CLI defaults to ``auto`` (read-only tools), stalls on any
 # git/uv/gh call, and exits asking the operator to restart with this flag.
+# {model_args} is a placeholder for config-driven model selection (e.g.
+# "--model claude-sonnet-4-5"). When devin.worker_model is empty, this renders
+# to an empty string, preserving CLI default behavior.
 DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
     "devin",
+    "{model_args}",
     "--prompt-file",
     "{prompt_path}",
     "--print",
@@ -97,14 +101,33 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _render_command(
-    command_template: tuple[str, ...], *, issue_number: int, branch: str, prompt_path: Path
+    command_template: tuple[str, ...],
+    *,
+    issue_number: int,
+    branch: str,
+    prompt_path: Path,
+    worker_model: str = "",
 ) -> tuple[str, ...]:
+    model_args = f"--model {worker_model}" if worker_model else ""
     values = {
         "prompt_path": str(prompt_path),
         "issue_number": str(issue_number),
         "branch": branch,
+        "model_args": model_args,
     }
-    return tuple(part.format(**values) for part in command_template)
+    rendered = tuple(part.format(**values) for part in command_template)
+    # Filter out empty-string placeholders to avoid spurious empty argv tokens.
+    # Also split model_args into separate tokens if it contains --model.
+    result: list[str] = []
+    for part in rendered:
+        if not part:
+            continue
+        if part.startswith("--model "):
+            # Split "--model <value>" into two separate tokens
+            result.extend(part.split())
+        else:
+            result.append(part)
+    return tuple(result)
 
 
 def launch_devin_session(
@@ -116,6 +139,7 @@ def launch_devin_session(
     sessions_dir: Path,
     worktrees_dir: Path | None = None,
     command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
+    worker_model: str = "",
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -159,7 +183,11 @@ def launch_devin_session(
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     command = _render_command(
-        command_template, issue_number=issue_number, branch=branch, prompt_path=prompt_path
+        command_template,
+        issue_number=issue_number,
+        branch=branch,
+        prompt_path=prompt_path,
+        worker_model=worker_model,
     )
 
     kwargs: dict[str, Any] = {}

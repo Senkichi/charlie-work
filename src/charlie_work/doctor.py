@@ -270,6 +270,23 @@ def run_doctor(
     else:
         add("dispatch adapter", True, config.devin.adapter)
 
+    # Report the effective devin-shell worker model so the operator can see
+    # what dispatch will actually launch.
+    if config.devin.adapter == "devin-shell":
+        if config.devin.worker_model:
+            add(
+                "devin-shell worker model",
+                True,
+                f"config-driven: {config.devin.worker_model}",
+            )
+        else:
+            add(
+                "devin-shell worker model",
+                True,
+                "CLI default (no devin.worker_model configured)",
+                severity="warning",
+            )
+
     # claude-code worktrees junction a shared venv in; surface a missing
     # venv_source at preflight rather than deferring it to the first dispatch.
     if config.devin.adapter == "claude-code" and config.claude_code.venv_source:
