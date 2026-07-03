@@ -684,49 +684,107 @@ def test_no_op_rework_skips_when_no_current_sha() -> None:
 
 def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
     """Detect no-op rework when PR head advanced only by merge commits (base-update)."""
-    # Set up a git repo to simulate the merge-only scenario
-    _init_repo(tmp_path)
-    # Create initial commit
-    (tmp_path / "test.txt").write_text("initial content")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    # Set up a local "remote" repo
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    # Create initial commit on main
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=tmp_path,
+        cwd=remote_repo,
         check=True,
         capture_output=True,
     )
     initial_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=tmp_path,
+        cwd=remote_repo,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
 
-    # Create a merge commit (simulate base-update)
+    # Clone the remote repo to create a local repo
+    local_repo = tmp_path / "local"
     subprocess.run(
-        ["git", "checkout", "-b", "agent/issue-123-test"],
-        cwd=tmp_path,
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
         check=True,
         capture_output=True,
     )
-    # Create a merge commit by merging a non-existent branch (will fail, so we use a different approach)
-    # Instead, we'll just create a regular commit and then test the git failure path
-    (tmp_path / "test2.txt").write_text("merge content")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-m", "merge commit"],
-        cwd=tmp_path,
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create agent branch and push it at the reviewed head
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Advance the branch with a merge-only commit (simulate base-update)
+    # First, add a commit to main in the remote
+    subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
+    (remote_repo / "main-change.txt").write_text("main branch change")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "main branch change"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Then merge main into the agent branch (merge-only advance)
+    subprocess.run(
+        ["git", "checkout", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "fetch", "origin"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "origin/main"],
+        cwd=local_repo,
         check=True,
         capture_output=True,
     )
     merge_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=tmp_path,
+        cwd=local_repo,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+    # Push the merge commit
+    subprocess.run(
+        ["git", "push", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
 
     # Test with a PR that has advanced by a merge commit
     pr = _green_pr(headRefOid=merge_sha, headRefName="agent/issue-123-test")
@@ -735,19 +793,115 @@ def test_no_op_rework_merge_only_advance_fails(tmp_path: Path) -> None:
         "reviewed_head_sha": initial_sha,
     }
 
-    # This test will hit the git failure path since we can't actually set up origin
-    # The implementation should fall back to a warning, not a failure
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
 
-    # Should pass (git failure falls back to warning, not failure)
-    assert verdict.ok is True
-    # Should have a warning about git failure
-    assert any("git fetch/rev-list failed" in w for w in verdict.warnings)
+    # Should FAIL (merge-only advance is a no-op rework)
+    assert verdict.ok is False
+    assert any("advanced only by merge commits" in f for f in verdict.failures)
+    # Should NOT have a degradation warning (git succeeded)
+    assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
 
 
 def test_no_op_rework_real_commit_clears_gate(tmp_path: Path) -> None:
     """Real non-merge commits since verdict clear the no-op gate."""
-    # Set up a git repo
+    # Set up a local "remote" repo
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    # Create initial commit on main
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    initial_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Clone the remote repo to create a local repo
+    local_repo = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create agent branch and push it at the reviewed head
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Advance the branch with a real non-merge commit
+    (local_repo / "test2.txt").write_text("real work")
+    subprocess.run(["git", "add", "."], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "real work"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    real_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Push the real commit
+    subprocess.run(
+        ["git", "push", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Test with a PR that has advanced by a real commit
+    pr = _green_pr(headRefOid=real_sha, headRefName="agent/issue-123-test")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": initial_sha,
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
+
+    # Should PASS (real non-merge commit clears the gate)
+    assert verdict.ok is True
+    # Should NOT have a degradation warning (git succeeded)
+    assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_git_failure_degrades_to_warning(tmp_path: Path) -> None:
+    """Git failures in criterion-2 detection degrade to warning, not failure."""
+    # Set up a git repo WITHOUT origin (so git fetch will fail)
     _init_repo(tmp_path)
     # Create initial commit
     (tmp_path / "test.txt").write_text("initial content")
@@ -766,22 +920,22 @@ def test_no_op_rework_real_commit_clears_gate(tmp_path: Path) -> None:
         text=True,
     ).stdout.strip()
 
-    # Create a real non-merge commit
+    # Create a branch and advance it (no origin, so fetch will fail)
     subprocess.run(
         ["git", "checkout", "-b", "agent/issue-123-test"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
     )
-    (tmp_path / "test2.txt").write_text("real work")
+    (tmp_path / "test2.txt").write_text("some work")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-m", "real work"],
+        ["git", "commit", "-m", "some work"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
     )
-    real_sha = subprocess.run(
+    advanced_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=tmp_path,
         check=True,
@@ -789,18 +943,16 @@ def test_no_op_rework_real_commit_clears_gate(tmp_path: Path) -> None:
         text=True,
     ).stdout.strip()
 
-    # Test with a PR that has advanced by a real commit
-    pr = _green_pr(headRefOid=real_sha, headRefName="agent/issue-123-test")
+    # Test with a PR that has advanced but no origin (git fetch will fail)
+    pr = _green_pr(headRefOid=advanced_sha, headRefName="agent/issue-123-test")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": initial_sha,
     }
 
-    # This test will hit the git failure path since we can't actually set up origin
-    # The implementation should fall back to a warning, not a failure
     verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
 
-    # Should pass (git failure falls back to warning, not failure)
+    # Should PASS (git failure degrades to warning, not failure)
     assert verdict.ok is True
     # Should have a warning about git failure
     assert any("git fetch/rev-list failed" in w for w in verdict.warnings)

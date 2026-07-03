@@ -271,6 +271,7 @@ def _check_no_op_rework(
         # Fetch the PR head ref from origin
         subprocess.run(
             ["git", "fetch", "origin", head_ref],
+            cwd=repo_root,
             capture_output=True,
             check=True,
             text=True,
@@ -278,6 +279,7 @@ def _check_no_op_rework(
         # Count non-merge commits since the reviewed head
         result = subprocess.run(
             ["git", "rev-list", "--no-merges", "--count", f"{reviewed_head_sha}..FETCH_HEAD"],
+            cwd=repo_root,
             capture_output=True,
             check=True,
             text=True,
