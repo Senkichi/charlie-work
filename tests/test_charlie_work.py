@@ -30,7 +30,7 @@ from charlie_work.cross_family import (
 from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
-from charlie_work.state import _state_lock, load_state, save_state
+from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
@@ -194,7 +194,7 @@ def test_concurrent_state_access_serializes_with_lock(tmp_path: Path) -> None:
     def increment_counter(thread_id: int) -> None:
         for _ in range(increments_per_thread):
             try:
-                with _state_lock(state_path):
+                with state_lock(state_path):
                     state = load_state(state_path)
                     current = state.get("counter", 0)
                     # Simulate some work

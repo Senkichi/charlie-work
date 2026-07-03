@@ -22,7 +22,7 @@ from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
-from .state import _state_lock, append_event, load_state, save_state, utc_now
+from .state import append_event, load_state, save_state, state_lock, utc_now
 
 
 @dataclass(frozen=True)
@@ -160,39 +160,51 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         written: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        with _state_lock(self.paths.state_file):
+        # Gather all network results and write files outside the lock
+        for issue in issues:
+            issue_number = int(issue["number"])
+            try:
+                full_issue = self.gh.issue_view(issue_number)
+            except GitHubError as exc:
+                failed.append({"issue": issue_number, "error": str(exc)})
+                continue
+            issue_dir = self.paths.issues / f"issue-{issue_number}"
+            issue_dir.mkdir(parents=True, exist_ok=True)
+            issue_json = issue_dir / "issue.json"
+            self._write_json(issue_json, full_issue)
+            prompt_path = self._write_worker_prompt(full_issue)
+            written.append(
+                {
+                    "issue": issue_number,
+                    "prompt_path": str(prompt_path),
+                    "title": full_issue.get("title"),
+                    "url": full_issue.get("url"),
+                    "labels": sorted(label_names(full_issue)),
+                    "updated_at": full_issue.get("updatedAt"),
+                }
+            )
+        # Single lock for all state updates
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            for issue in issues:
-                issue_number = int(issue["number"])
-                try:
-                    full_issue = self.gh.issue_view(issue_number)
-                except GitHubError as exc:
-                    failed.append({"issue": issue_number, "error": str(exc)})
-                    state = append_event(
-                        state,
-                        "intake_failed",
-                        {"issue_number": issue_number, "error": str(exc)},
-                    )
-                    save_state(self.paths.state_file, state)
-                    continue
-                issue_dir = self.paths.issues / f"issue-{issue_number}"
-                issue_dir.mkdir(parents=True, exist_ok=True)
-                issue_json = issue_dir / "issue.json"
-                self._write_json(issue_json, full_issue)
-                prompt_path = self._write_worker_prompt(full_issue)
+            for entry in written:
+                issue_number = entry["issue"]
                 # Merge-update, never replace: intake used to clobber dispatch
                 # status recorded by earlier passes (production-confirmed).
                 state["issues"][str(issue_number)] = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
-                    "title": full_issue.get("title"),
-                    "url": full_issue.get("url"),
-                    "labels": sorted(label_names(full_issue)),
-                    "prompt_path": str(prompt_path),
-                    "updated_at": full_issue.get("updatedAt"),
+                    "title": entry["title"],
+                    "url": entry["url"],
+                    "labels": entry["labels"],
+                    "prompt_path": entry["prompt_path"],
+                    "updated_at": entry["updated_at"],
                 }
-                written.append({"issue": issue_number, "prompt_path": str(prompt_path)})
-                save_state(self.paths.state_file, state)
+            for failure in failed:
+                state = append_event(
+                    state,
+                    "intake_failed",
+                    {"issue_number": failure["issue"], "error": failure["error"]},
+                )
             state = append_event(
                 state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
             )
@@ -211,7 +223,10 @@ class OrchestratorApp:
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
-        with _state_lock(self.paths.state_file):
+        # First lock: claim issues by marking them as dispatching
+        selected_issue_numbers: list[int] = []
+        skipped_issue_numbers: list[int] = []
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Defence-in-depth against double-dispatch: an issue whose state records
             # a live launched worker (status "dispatched") is not re-dispatchable
@@ -228,7 +243,6 @@ class OrchestratorApp:
                 for issue in issues
                 if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
             ]
-            skipped_issue_numbers: list[int] = []
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in candidates}
@@ -236,43 +250,51 @@ class OrchestratorApp:
                 skipped_issue_numbers = sorted(set(wanted) - set(by_number))
             else:
                 selected = candidates[:dispatch_limit]
-            session_requests: list[SessionRequest] = []
-            full_issues: dict[int, dict[str, Any]] = {}
-            for issue in selected:
-                issue_number = int(issue["number"])
-                full_issue = self.gh.issue_view(issue_number)
-                full_issues[issue_number] = full_issue
-                prompt_path = self._write_worker_prompt(full_issue)
-                branch_name = self._branch_name(full_issue)
-                session_requests.append(
-                    SessionRequest(
-                        issue_number=issue_number,
-                        issue_title=str(full_issue.get("title") or ""),
-                        prompt_path=prompt_path,
-                        branch_name=branch_name,
-                    )
+            selected_issue_numbers = [int(issue["number"]) for issue in selected]
+            # Mark selected issues as "dispatching" to claim them
+            for issue_number in selected_issue_numbers:
+                state["issues"][str(issue_number)] = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "status": "dispatching",
+                }
+            save_state(self.paths.state_file, state)
+        # Do all network calls, file writes, and worker launches outside the lock
+        session_requests: list[SessionRequest] = []
+        full_issues: dict[int, dict[str, Any]] = {}
+        for issue_number in selected_issue_numbers:
+            full_issue = self.gh.issue_view(issue_number)
+            full_issues[issue_number] = full_issue
+            prompt_path = self._write_worker_prompt(full_issue)
+            branch_name = self._branch_name(full_issue)
+            session_requests.append(
+                SessionRequest(
+                    issue_number=issue_number,
+                    issue_title=str(full_issue.get("title") or ""),
+                    prompt_path=prompt_path,
+                    branch_name=branch_name,
                 )
-            manifest_path = self.repo_root / self.config.devin.session_manifest
-            results_path = self.repo_root / self.config.devin.session_results
-            dispatch_results = dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._adapter_settings(),
-                session_requests,
             )
-            successful_issue_numbers = {
-                result.issue_number for result in dispatch_results if result.ok
-            }
-            failed_issue_numbers = {
-                result.issue_number for result in dispatch_results if not result.ok
-            }
-            # The manual adapter's ok means "manifest written, awaiting the
-            # operator" — no worker exists yet, so the issue is queued, not
-            # in-progress. Only an adapter that actually launched something may
-            # promote to in-progress.
-            manual = self.config.devin.adapter == "manual"
-            label_errors: list[int] = []
+        manifest_path = self.repo_root / self.config.devin.session_manifest
+        results_path = self.repo_root / self.config.devin.session_results
+        dispatch_results = dispatch_sessions(
+            self.repo_root,
+            manifest_path,
+            results_path,
+            self._adapter_settings(),
+            session_requests,
+        )
+        successful_issue_numbers = {
+            result.issue_number for result in dispatch_results if result.ok
+        }
+        failed_issue_numbers = {
+            result.issue_number for result in dispatch_results if not result.ok
+        }
+        # Second lock: update state with results
+        manual = self.config.devin.adapter == "manual"
+        label_errors: list[int] = []
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
@@ -356,7 +378,7 @@ class OrchestratorApp:
         # the worker's/CI's to fix, not a review decision.
         verdict = run_janitor(pr, checks, self.config)
         if not verdict.ok:
-            with _state_lock(self.paths.state_file):
+            with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
                     **state["prs"].get(str(pr_number), {}),
@@ -438,7 +460,7 @@ class OrchestratorApp:
                 reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Merge-update, never replace: wholesale assignment here used to erase
             # recorded review decisions on repeated review()/loop() passes
@@ -475,7 +497,7 @@ class OrchestratorApp:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
             except GitHubError as exc:
                 label_error = str(exc)
-                with _state_lock(self.paths.state_file):
+                with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
                     state["prs"][str(pr_number)]["label_error"] = label_error
                     save_state(self.paths.state_file, state)
@@ -522,30 +544,30 @@ class OrchestratorApp:
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_at": utc_now(),
         }
-        state = load_state(self.paths.state_file)
-        pr_state = state["prs"].get(str(pr_number), {})
-        rework_path: str | None = None
-        escalated = False
-        # Durable per-PR rework counter — NOT derived from the global events
-        # log, which append_event truncates to the last 200 entries: on a busy
-        # repo that eviction silently reset the count and defeated the cap
-        # (a PR could rework forever instead of escalating to a human).
-        request_changes_count = int(pr_state.get("request_changes_count", 0))
-        if decision == "request_changes":
-            # Rework cap: past max_rework_cycles the evidence says iteration
-            # thrashes (wrong brief or unimplementable criteria) — escalate to
-            # a human instead of dispatching another cycle.
-            escalated = request_changes_count >= self.config.review.max_rework_cycles
-            if not escalated:
-                request_changes_count += 1
-                rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
-        decision_payload["escalated"] = escalated
         decision_path = pr_dir / "review-decision.json"
         self._write_json(decision_path, decision_payload)
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
         # durable decision/counter from what actually happened.
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            rework_path: str | None = None
+            escalated = False
+            # Durable per-PR rework counter — NOT derived from the global events
+            # log, which append_event truncates to the last 200 entries: on a busy
+            # repo that eviction silently reset the count and defeated the cap
+            # (a PR could rework forever instead of escalating to a human).
+            request_changes_count = int(pr_state.get("request_changes_count", 0))
+            if decision == "request_changes":
+                # Rework cap: past max_rework_cycles the evidence says iteration
+                # thrashes (wrong brief or unimplementable criteria) — escalate to
+                # a human instead of dispatching another cycle.
+                escalated = request_changes_count >= self.config.review.max_rework_cycles
+                if not escalated:
+                    request_changes_count += 1
+                    rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
+            decision_payload["escalated"] = escalated
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,
@@ -610,7 +632,7 @@ class OrchestratorApp:
         # to a success no-op. Re-running `ship-it` on a completed PR must not
         # re-attempt `gh pr merge` (which fails on an already-merged PR and
         # propagates GitHubError → exit 2).
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing_pr_state = state["prs"].get(str(pr_number), {})
             if existing_pr_state.get("status") == "merged":
@@ -641,7 +663,7 @@ class OrchestratorApp:
                         transition(self.gh, self.config.labels, issue_number, "review_started")
                 except GitHubError as exc:
                     label_error = str(exc)
-                with _state_lock(self.paths.state_file):
+                with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
                     state["prs"][str(pr_number)] = {
                         **state["prs"].get(str(pr_number), {}),
@@ -695,7 +717,7 @@ class OrchestratorApp:
             # reconcile false-positive on every clean auto-merge and lost the
             # merged fact entirely on a crash between merge and save.
             merge_output = self.gh.merge_pr(pr_number, self.config.auto_merge.strategy)
-            with _state_lock(self.paths.state_file):
+            with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
                     **state["prs"].get(str(pr_number), {}),
@@ -728,7 +750,7 @@ class OrchestratorApp:
             "checks": asdict(summary),
             "label_error": label_error,
         }
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
             prs_entry: dict[str, Any] = {
@@ -777,7 +799,7 @@ class OrchestratorApp:
             report_path=reviews_dir / f"spec-{slug}-review.md",
             timeout_seconds=cfg.timeout_seconds,
         )
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             state = append_event(
                 state, "spec_review", {"artifact": str(path), "ok": result.ok, "model": cfg.model}
@@ -857,7 +879,7 @@ class OrchestratorApp:
         orchestrator's labels/state — e.g. a PR merged by hand outside
         merge-ready leaving `agent:in-progress` stale forever. Read-only unless
         ``fix`` is passed."""
-        with _state_lock(self.paths.state_file):
+        with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             drift = detect_drift(self.gh, state, self.config)
             fixed = False

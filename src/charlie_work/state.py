@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -12,13 +13,15 @@ STATE_VERSION = 1
 # Cross-process lock timeout (seconds) — best-effort to prevent wedging
 _LOCK_TIMEOUT_SECONDS = 30
 
+logger = logging.getLogger(__name__)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @contextmanager
-def _state_lock(state_path: Path):
+def state_lock(state_path: Path):
     """Cross-process advisory lock for state.json read-modify-write cycles.
 
     Uses platform-specific file locking (Windows: msvcrt.locking, POSIX: fcntl.flock)
@@ -31,6 +34,7 @@ def _state_lock(state_path: Path):
     """
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
     lock_file = None
+    acquired = False
 
     try:
         # Create lock file if it doesn't exist
@@ -50,13 +54,17 @@ def _state_lock(state_path: Path):
                 try:
                     # Try non-blocking lock first
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
                     break
                 except OSError:
                     # Lock held, wait and retry
                     time.sleep(0.1)
             else:
                 # Timeout — proceed anyway (best-effort)
-                pass
+                logger.warning(
+                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s "
+                    f"— proceeding without lock"
+                )
         else:
             import fcntl
             import time
@@ -66,17 +74,21 @@ def _state_lock(state_path: Path):
             while time.time() - start < _LOCK_TIMEOUT_SECONDS:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
                     break
                 except (IOError, BlockingIOError):
                     # Lock held, wait and retry
                     time.sleep(0.1)
             else:
                 # Timeout — proceed anyway (best-effort)
-                pass
+                logger.warning(
+                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s "
+                    f"— proceeding without lock"
+                )
 
         yield
     finally:
-        if lock_file is not None:
+        if lock_file is not None and acquired:
             try:
                 if sys.platform == "win32":
                     import msvcrt
