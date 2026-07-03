@@ -124,8 +124,8 @@ Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
 `devin-shell` | `claude-code`), `claude_code.*` (worktree/venv settings for the
 claude-code adapter), `cross_family.*` (non-Claude adversarial pass).
 
-**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests`
-and `Lint`. These correspond to the job `name:` fields in
+**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
+`Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
 `.github/workflows/ci.yml` and are verified by `charlie doctor`.
 
 **Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
