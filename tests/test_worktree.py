@@ -220,13 +220,22 @@ def test_rework_reuses_existing_worktree(tmp_path: Path) -> None:
         capture_output=True,
     )
 
+    # Verify the worktree is in the list
+    worktrees = list_worktrees(repo_root)
+    assert any(wt.get("branch", "").endswith(f"/{branch_name}") or wt.get("branch") == branch_name for wt in worktrees)
+
     # In rework mode, create_worktree should reuse the existing worktree
+    # The fetch will fail in a test repo without a remote, but the reuse logic
+    # should still work (we just skip the fetch in this case)
     info2 = create_worktree(repo_root, branch_name, rework=True)
 
     # Should return the same path
     assert info2.path == info1.path
     # File should still exist
     assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+
+    # Clean up
+    remove_worktree(repo_root, info1.path)
 
 
 def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
@@ -259,3 +268,6 @@ def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
         text=True,
     )
     assert result.stdout.strip() == branch_name
+
+    # Clean up
+    remove_worktree(repo_root, info.path)

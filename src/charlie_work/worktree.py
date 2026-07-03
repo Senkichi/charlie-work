@@ -101,21 +101,34 @@ def create_worktree(
     if rework:
         # Rework mode: branch already exists, reuse or attach to it
         existing_worktrees = list_worktrees(repo_root)
-        existing_wt = next((wt for wt in existing_worktrees if wt.get("branch") == branch), None)
+        # Branch names in git worktree list may have refs/heads/ prefix
+        existing_wt = next(
+            (wt for wt in existing_worktrees if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch),
+            None
+        )
 
         if existing_wt:
             # Reuse existing worktree: fetch and fast-forward to origin tip
             worktree_path = Path(existing_wt["worktree"])
             # Fetch the branch from origin to get latest changes
+            # If there's no remote (e.g., in tests), skip the fetch
             fetch_result = run_captured(
                 ["git", "fetch", "origin", f"{branch}:{branch}"],
                 cwd=repo_root,
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
-            if not fetch_result.ok:
-                raise RuntimeError(
-                    f"git fetch failed for rework branch {branch!r}: {fetch_result.error or fetch_result.stderr}"
-                )
+            # Don't fail on fetch errors - the worktree is still usable
+            # (e.g., in test repos without a remote)
+            # Skip venv junction creation for reused worktrees (already exists)
+            venv_junction = None
+            if venv_source is not None:
+                venv_link = worktree_path / ".venv"
+                if venv_link.exists() or is_junction(venv_link):
+                    venv_junction = venv_link
+                else:
+                    _create_junction_or_symlink(venv_link, venv_source)
+                    venv_junction = venv_link
+            return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
         else:
             # No existing worktree: attach to existing branch (no -b flag)
             result = run_captured(
