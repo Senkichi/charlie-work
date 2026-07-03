@@ -16,8 +16,7 @@ from .janitor import run_janitor
 from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
-from .reconcile import detect_drift
-from .reconcile import apply_fixes as apply_drift_fixes
+from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
 from .state import append_event, load_state, save_state, utc_now
 
 
@@ -746,22 +745,36 @@ class OrchestratorApp:
         state = load_state(self.paths.state_file)
         drift = detect_drift(self.gh, state, self.config)
         fixed = False
+        post_fix_drift: list[DriftItem] = []
         if fix and drift:
             new_state = apply_drift_fixes(self.gh, state, drift, self.config)
             save_state(self.paths.state_file, new_state)
-            fixed = True
+            # The label removals above use allow_failure=True, so a failed
+            # removal is silently swallowed. Re-detect against the new state to
+            # verify the repairs actually landed before reporting success.
+            post_fix_drift = detect_drift(self.gh, new_state, self.config)
+            fixed = len(post_fix_drift) == 0
         message = f"found {len(drift)} drift item(s)"
         if fixed:
             message += " — fixed"
         elif drift:
-            message += " (read-only; pass --fix to repair)"
+            if fix and post_fix_drift:
+                message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
+            else:
+                message += " (read-only; pass --fix to repair)"
         # ok=False when drift is present and not fixed: scripts and CI can gate
         # on exit code to detect unresolved drift, matching how `doctor` gates.
         ok = not drift or fixed
         return CommandResult(
             ok,
             message,
-            {"drift": [asdict(item) for item in drift], "fixed": fixed},
+            {
+                "drift": [asdict(item) for item in drift],
+                "fixed": fixed,
+                "drift_before": len(drift),
+                "drift_after": len(post_fix_drift),
+                "remaining_drift": [asdict(item) for item in post_fix_drift],
+            },
         )
 
     @staticmethod
