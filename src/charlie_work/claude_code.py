@@ -274,9 +274,16 @@ def read_worker_records(sessions_dir: Path) -> list[ClaudeWorkerRecord]:
     return records
 
 
-def probe_claude(repo_root: Path) -> RunResult:
-    """Check the ``claude`` CLI is on PATH and runnable, for `doctor`."""
-    return run_captured(["claude", "--version"], cwd=repo_root, timeout_seconds=15)
+def probe_claude(
+    repo_root: Path, *, command: tuple[str, ...] = ("claude", "--version")
+) -> RunResult:
+    """Check the ``claude`` CLI is on PATH and runnable, for ``doctor``.
+
+    ``command`` defaults to the package-default binary so callers that do not
+    configure a custom ``claude_code.command`` get the standard probe.  Pass a
+    custom tuple to exercise a configured wrapper binary.
+    """
+    return run_captured(list(command), cwd=repo_root, timeout_seconds=15)
 
 
 __all__ = [
