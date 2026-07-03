@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import textwrap
 import time
@@ -11,6 +12,7 @@ import pytest
 from charlie_work import claude_code
 from charlie_work.claude_code import (
     ClaudeWorkerRecord,
+    is_worker_alive,
     launch_claude_worker,
     probe_claude,
     read_worker_records,
@@ -405,3 +407,58 @@ def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert result.ok
     assert calls[0][0] == ["claude", "--version"]
     assert calls[0][1] == tmp_path
+
+
+def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
+    """Mirror of test_is_session_alive_reflects_real_process from test_devin_shell.py."""
+    # Spawn a short-lived process
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        alive_record = ClaudeWorkerRecord(
+            issue_number=1,
+            branch="agent/issue-1",
+            worktree_path="/tmp/wt/issue-1",
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+        )
+        assert is_worker_alive(alive_record) is True
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+    # Regression guard for the Windows os.kill(pid, 0) trap: that call keeps
+    # reporting a reaped PID as alive indefinitely (verified empirically —
+    # see is_worker_alive's docstring), so this must be an exact
+    # post-wait() assertion, not a "poll until it settles" retry loop.
+    dead_record = ClaudeWorkerRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/wt/issue-1",
+        prompt_path="p.md",
+        command=("x",),
+        pid=process.pid,
+        started_at="2026-01-01T00:00:00Z",
+        log_path="log.txt",
+    )
+    assert is_worker_alive(dead_record) is False
+
+    # pid=None case (never launched)
+    none_record = ClaudeWorkerRecord(
+        issue_number=2,
+        branch="agent/issue-2",
+        worktree_path="/tmp/wt/issue-2",
+        prompt_path="p2.md",
+        command=("y",),
+        pid=None,
+        started_at="2026-01-01T00:00:00Z",
+        log_path="log2.txt",
+    )
+    assert is_worker_alive(none_record) is False

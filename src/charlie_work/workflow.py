@@ -53,6 +53,28 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
     return [int(part) for part in only_issues.replace(" ", "").split(",") if part]
 
 
+def _count_live_sessions(sessions_dir: Path) -> int:
+    """Count the number of currently alive worker sessions across both adapters.
+
+    Reads session sidecar files from both devin-shell and claude-code adapters,
+    then checks each record's PID liveness using the adapter-specific liveness
+    probe. Returns the total count of sessions with alive PIDs.
+    """
+    from .devin_shell import is_session_alive, read_session_records
+    from .claude_code import is_worker_alive, read_worker_records
+
+    live_count = 0
+    # Count devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if is_session_alive(record):
+            live_count += 1
+    # Count claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if is_worker_alive(record):
+            live_count += 1
+    return live_count
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -242,6 +264,18 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
 
+        # Apply global concurrency governor cap
+        max_concurrent = self.config.dispatch.max_concurrent_sessions
+        concurrency_clamped = False
+        available_slots = dispatch_limit
+        if max_concurrent > 0:
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_count = _count_live_sessions(sessions_dir)
+            available_slots = max(0, max_concurrent - live_count)
+            if available_slots < dispatch_limit:
+                dispatch_limit = available_slots
+                concurrency_clamped = True
+
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
@@ -293,18 +327,23 @@ class OrchestratorApp:
                 )
 
             # Return planning data without touching state, labels, or manifest/results files
+            data = {
+                "selected_count": len(session_requests),
+                "attempted_count": len(session_requests),
+                "failed_count": 0,
+                "skipped_issue_numbers": skipped_issue_numbers,
+                "label_errors": [],
+                "sessions": [asdict(request) for request in session_requests],
+                "dispatch_results": [],
+            }
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 f"dry-run: would dispatch {len(session_requests)} issue(s)",
-                {
-                    "selected_count": len(session_requests),
-                    "attempted_count": len(session_requests),
-                    "failed_count": 0,
-                    "skipped_issue_numbers": skipped_issue_numbers,
-                    "label_errors": [],
-                    "sessions": [asdict(request) for request in session_requests],
-                    "dispatch_results": [],
-                },
+                data,
             )
 
         # Real dispatch: claim issues, launch workers, update state and labels
@@ -445,20 +484,25 @@ class OrchestratorApp:
             message += f" (skipped non-dispatchable: {skipped_issue_numbers})"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
+        data = {
+            "selected_count": len(successful_issue_numbers),
+            "attempted_count": len(session_requests),
+            "failed_count": len(failed_issue_numbers),
+            "skipped_issue_numbers": skipped_issue_numbers,
+            "label_errors": sorted(label_errors),
+            "session_manifest": str(manifest_path),
+            "session_results": str(results_path),
+            "sessions": [asdict(request) for request in session_requests],
+            "dispatch_results": result_dicts,
+        }
+        if concurrency_clamped:
+            data["concurrency_limit"] = max_concurrent
+            data["live_session_count"] = live_count
+            data["available_slots"] = available_slots
         return CommandResult(
             not failed_issue_numbers,
             message,
-            {
-                "selected_count": len(successful_issue_numbers),
-                "attempted_count": len(session_requests),
-                "failed_count": len(failed_issue_numbers),
-                "skipped_issue_numbers": skipped_issue_numbers,
-                "label_errors": sorted(label_errors),
-                "session_manifest": str(manifest_path),
-                "session_results": str(results_path),
-                "sessions": [asdict(request) for request in session_requests],
-                "dispatch_results": result_dicts,
-            },
+            data,
         )
 
     def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
@@ -1121,6 +1165,18 @@ class OrchestratorApp:
         # Rework-first, then fresh fills the remainder
         # Resolve the effective budget once
         effective_limit = limit if limit is not None else self.config.dispatch.default_limit
+
+        # Apply global concurrency governor cap to the total wave budget
+        max_concurrent = self.config.dispatch.max_concurrent_sessions
+        live_count = 0
+        available_slots = effective_limit
+        if max_concurrent > 0:
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_count = _count_live_sessions(sessions_dir)
+            available_slots = max(0, max_concurrent - live_count)
+            if available_slots < effective_limit:
+                effective_limit = available_slots
+
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
         fresh_limit = max(0, effective_limit - rework_count)
@@ -1185,17 +1241,23 @@ class OrchestratorApp:
             message = "loop completed with dispatch failures"
         elif not dispatch_rework.ok:
             message = "loop completed with rework dispatch failures"
+        data = {
+            "intake": intake.data,
+            "dispatch": dispatch.data,
+            "dispatch_rework": dispatch_rework.data,
+            "reviews": reviews,
+            "merges": merges,
+            "errors": errors,
+        }
+        # Propagate concurrency clamp info from dispatch results
+        if max_concurrent > 0:
+            data["concurrency_limit"] = max_concurrent
+            data["live_session_count"] = live_count
+            data["available_slots"] = available_slots
         return CommandResult(
             ok,
             message,
-            {
-                "intake": intake.data,
-                "dispatch": dispatch.data,
-                "dispatch_rework": dispatch_rework.data,
-                "reviews": reviews,
-                "merges": merges,
-                "errors": errors,
-            },
+            data,
         )
 
     def dispatch_rework(
@@ -1216,6 +1278,18 @@ class OrchestratorApp:
         # Find issues with needs-rework label
         issues = self.gh.issue_list(self.config.labels.needs_rework)
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
+
+        # Apply global concurrency governor cap
+        max_concurrent = self.config.dispatch.max_concurrent_sessions
+        concurrency_clamped = False
+        available_slots = rework_limit
+        if max_concurrent > 0:
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_count = _count_live_sessions(sessions_dir)
+            available_slots = max(0, max_concurrent - live_count)
+            if available_slots < rework_limit:
+                rework_limit = available_slots
+                concurrency_clamped = True
 
         # Filter to issues with open PRs
         prs = self.gh.pr_list()
@@ -1245,10 +1319,15 @@ class OrchestratorApp:
             selected = candidates[:rework_limit]
 
         if not selected:
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "no rework candidates found",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         # First lock: claim issues by marking them as dispatch_pending
@@ -1280,10 +1359,15 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         if not selected_issue_numbers:
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         # Do all network calls, file writes, and worker launches outside the lock
@@ -1342,10 +1426,15 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "no valid rework prompts found",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         manifest_path = self.repo_root / self.config.devin.session_manifest
@@ -1431,19 +1520,24 @@ class OrchestratorApp:
             message = "rework dispatch completed with failures"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
+        data = {
+            "selected_count": len(successful_issue_numbers),
+            "attempted_count": len(session_requests),
+            "failed_count": len(failed_issue_numbers),
+            "label_errors": sorted(label_errors),
+            "session_manifest": str(manifest_path),
+            "session_results": str(results_path),
+            "sessions": [asdict(request) for request in session_requests],
+            "dispatch_results": result_dicts,
+        }
+        if concurrency_clamped:
+            data["concurrency_limit"] = max_concurrent
+            data["live_session_count"] = live_count
+            data["available_slots"] = available_slots
         return CommandResult(
             not failed_issue_numbers,
             message,
-            {
-                "selected_count": len(successful_issue_numbers),
-                "attempted_count": len(session_requests),
-                "failed_count": len(failed_issue_numbers),
-                "label_errors": sorted(label_errors),
-                "session_manifest": str(manifest_path),
-                "session_results": str(results_path),
-                "sessions": [asdict(request) for request in session_requests],
-                "dispatch_results": result_dicts,
-            },
+            data,
         )
 
     def _is_dispatchable(self, issue: dict[str, Any]) -> bool:
