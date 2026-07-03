@@ -3543,7 +3543,7 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
 
 def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
     """Issue #85 acceptance criterion 1: state-driven selection works.
-    
+
     State-driven selection ensures that issues with rework_requested status are selected
     regardless of label state. This test verifies that the selection logic uses state
     instead of labels.

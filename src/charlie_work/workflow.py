@@ -730,7 +730,7 @@ class OrchestratorApp:
                     and live_head_sha == reviewed_head_sha
                 ):
                     should_skip_transition = True
-            
+
             if not should_skip_transition:
                 try:
                     transition(self.gh, self.config.labels, issue_number, "review_started")
@@ -1391,7 +1391,7 @@ class OrchestratorApp:
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-        
+
         # Find issues with rework_requested status
         rework_issues = []
         for number, entry in state.get("issues", {}).items():
@@ -1406,7 +1406,7 @@ class OrchestratorApp:
                 except GitHubError:
                     # Skip issues that can't be fetched (deleted, etc.)
                     continue
-        
+
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
