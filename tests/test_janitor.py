@@ -43,6 +43,7 @@ def _green_pr(**overrides) -> dict:
         "title": "fix: search is broken",
         "url": "https://example.test/pull/456",
         "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "abc123",
         "body": "Closes #123.\n\nTests: added unit tests for the search path.",
         "isDraft": False,
         "state": "OPEN",
@@ -581,3 +582,84 @@ index 1234567..abcdef0 100644
     assert "PR #123" in warnings[0]
     assert "b_module.py" in warnings[0]
     assert "git checkout --" in warnings[0]
+
+
+def test_no_op_rework_detects_unchanged_head() -> None:
+    """Detect no-op rework when PR head is unchanged since request_changes verdict."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state)
+
+    assert verdict.ok is False
+    assert any("PR head unchanged since request_changes verdict" in f for f in verdict.failures)
+    assert "abc123" in verdict.failures[0]
+
+
+def test_no_op_rework_skips_when_no_verdict() -> None:
+    """Skip no-op rework check when there's no request_changes verdict."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state)
+
+    assert verdict.ok is True
+    assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_skips_when_head_advanced() -> None:
+    """Skip no-op rework check when PR head has advanced since verdict."""
+    pr = _green_pr(headRefOid="def456")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state)
+
+    assert verdict.ok is True
+    assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_skips_when_no_pr_state() -> None:
+    """Skip no-op rework check when pr_state is None."""
+    pr = _green_pr(headRefOid="abc123")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+    assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_skips_when_no_reviewed_sha() -> None:
+    """Skip no-op rework check when reviewed_head_sha is missing."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state)
+
+    assert verdict.ok is True
+    assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_skips_when_no_current_sha() -> None:
+    """Skip no-op rework check when current headRefOid is missing."""
+    pr = _green_pr()
+    pr.pop("headRefOid", None)
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state)
+
+    assert verdict.ok is True
+    assert not any("PR head unchanged" in f for f in verdict.failures)

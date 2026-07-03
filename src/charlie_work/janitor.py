@@ -60,7 +60,11 @@ class JanitorVerdict:
 
 
 def run_janitor(
-    pr: dict[str, Any], checks: list[dict[str, Any]], config: OrchestratorConfig
+    pr: dict[str, Any],
+    checks: list[dict[str, Any]],
+    config: OrchestratorConfig,
+    *,
+    pr_state: dict[str, Any] | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -80,6 +84,7 @@ def run_janitor(
     _check_title_conventional(pr, warnings)
     _check_diff_size(pr, warnings)
     _check_base_movement(pr, config, warnings)
+    _check_no_op_rework(pr, pr_state, failures)
 
     return JanitorVerdict(ok=not failures, failures=tuple(failures), warnings=tuple(warnings))
 
@@ -195,6 +200,44 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def _check_no_op_rework(
+    pr: dict[str, Any],
+    pr_state: dict[str, Any] | None,
+    failures: list[str],
+) -> None:
+    """Check if the PR head is unchanged since a request_changes verdict.
+
+    When a PR has a request_changes verdict in its state, compare the current
+    headRefOid against the reviewed_head_sha from that verdict. If they match,
+    the rework produced no pushed commits (no-op rework).
+
+    GitHub update-branch merges (base-update commits) are excluded: only non-merge
+    commits since the verdict are considered real work.
+    """
+    if not pr_state:
+        return
+
+    # Check if the most recent verdict was request_changes
+    decision = pr_state.get("decision")
+    if decision != "request_changes":
+        return
+
+    reviewed_head_sha = pr_state.get("reviewed_head_sha")
+    if not reviewed_head_sha:
+        return
+
+    current_head_sha = pr.get("headRefOid")
+    if not current_head_sha:
+        return
+
+    # If heads match exactly, it's a no-op rework
+    if current_head_sha == reviewed_head_sha:
+        failures.append(
+            f"PR head unchanged since request_changes verdict ({reviewed_head_sha}) — "
+            f"the rework produced no pushed commits; check the branch worktree for unpushed work before re-reviewing."
+        )
 
 
 def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
