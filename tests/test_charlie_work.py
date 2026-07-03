@@ -18,8 +18,11 @@ from charlie_work.config import (
     load_config,
 )
 from charlie_work.cross_family import (
+    _CAVEAT,
     CrossFamilyResult,
+    extract_report_body,
     render_command,
+    report_body_is_valid,
     run_cross_family_review,
 )
 from charlie_work.github import label_names, linked_issue_number
@@ -514,7 +517,9 @@ def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path)
 # --- Cross-family adversarial review ------------------------------------------
 
 
-def _fake_completed(returncode: int = 0, stdout: str = "## MAJOR\nx", stderr: str = ""):
+def _fake_completed(
+    returncode: int = 0, stdout: str = "**MAJOR**\nx\n\nVerdict: safe", stderr: str = ""
+):
     def _runner(command, **kwargs):
         return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr)
 
@@ -547,7 +552,7 @@ def test_run_cross_family_writes_report_with_caveat(tmp_path: Path) -> None:
         prompt_path=prompt,
         report_path=report,
         timeout_seconds=5,
-        runner=_fake_completed(0, "## BLOCKER\nboom"),
+        runner=_fake_completed(0, "**BLOCKER**\nboom\n\nVerdict: safe"),
     )
 
     assert result.ok is True
@@ -555,7 +560,8 @@ def test_run_cross_family_writes_report_with_caveat(tmp_path: Path) -> None:
     assert prompt.read_text(encoding="utf-8") == "attack this"
     body = report.read_text(encoding="utf-8")
     assert "leads, not verdicts" in body
-    assert "## BLOCKER" in body
+    assert "**BLOCKER**" in body
+    assert "Verdict: safe" in body
     assert "codex" in body
 
 
@@ -706,9 +712,11 @@ def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkey
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}
 
+    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
+
     def _fake_run(**kwargs):
         calls["n"] += 1
-        Path(kwargs["report_path"]).write_text("codex findings", encoding="utf-8")
+        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
@@ -727,10 +735,11 @@ def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkey
 def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}
+    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
 
     def _fake_run(**kwargs):
         calls["n"] += 1
-        Path(kwargs["report_path"]).write_text("codex findings", encoding="utf-8")
+        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
@@ -783,9 +792,11 @@ def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
+    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
+
     def _fake_run(**kwargs):
         assert "My spec" in kwargs["prompt_text"]  # artifact text inlined into the prompt
-        Path(kwargs["report_path"]).write_text("spec findings", encoding="utf-8")
+        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
@@ -793,7 +804,7 @@ def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None
     result = app.spec_review(spec)
 
     assert result.ok is True
-    assert Path(result.data["report_path"]).read_text(encoding="utf-8") == "spec findings"
+    assert Path(result.data["report_path"]).read_text(encoding="utf-8") == VALID_REPORT
 
 
 def test_spec_review_missing_file_returns_error(tmp_path: Path) -> None:
@@ -804,6 +815,185 @@ def test_spec_review_missing_file_returns_error(tmp_path: Path) -> None:
     result = app.spec_review(tmp_path / "nope.md")
 
     assert result.ok is False
+
+
+# --- Issue #38 regression: transient retry + empty/blocked report guard --------
+
+
+VALID_CROSS_FAMILY_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
+
+
+def test_run_cross_family_retries_once_on_transient_rate_limit_then_success(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+    calls: list[str] = []
+    rate_msg = (
+        "Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 1 minute."
+    )
+
+    def _runner(command, **kwargs):
+        if not calls:
+            calls.append("fail")
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr=rate_msg)
+        calls.append("success")
+        return subprocess.CompletedProcess(command, 0, stdout=VALID_CROSS_FAMILY_REPORT, stderr="")
+
+    sleep_calls: list[float] = []
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=tmp_path,
+        prompt_text="attack this",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_runner,
+        sleep=lambda s: sleep_calls.append(s),
+    )
+
+    assert result.ok is True
+    assert result.returncode == 0
+    assert calls == ["fail", "success"]
+    assert sleep_calls == [90.0]
+    assert "**MAJOR**" in report.read_text(encoding="utf-8")
+
+
+def test_run_cross_family_rate_limit_retry_exhausted_then_fails(tmp_path: Path) -> None:
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+    rate_msg = "Rate limit exceeded. Try again later."
+    calls: list[str] = []
+
+    def _runner(command, **kwargs):
+        calls.append("fail")
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=rate_msg)
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=tmp_path,
+        prompt_text="x",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_runner,
+        sleep=lambda s: None,
+    )
+
+    assert result.ok is False
+    assert result.returncode == 1
+    assert calls == ["fail", "fail"]
+    assert "UNAVAILABLE" in report.read_text(encoding="utf-8")
+
+
+def test_run_cross_family_exit_zero_blocked_output_is_stubbed(tmp_path: Path) -> None:
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+    blocked = (
+        "I'm blocked from performing the review. All tool calls are being rejected. Please re-run."
+    )
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=tmp_path,
+        prompt_text="x",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_fake_completed(0, blocked),
+    )
+
+    assert result.ok is False
+    assert result.returncode == 0
+    assert "UNAVAILABLE" in report.read_text(encoding="utf-8")
+    assert "empty or blocked report" in (result.error or "")
+
+
+def test_review_does_not_reuse_semantically_empty_cross_family_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _cross_family_app(tmp_path, enabled=True)
+    calls = {"n": 0}
+
+    def _fake_run(**kwargs):
+        calls["n"] += 1
+        Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
+        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+
+    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    report_path = prs_dir / "cross-family-review.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "I'm blocked from performing the review. Tool calls rejected. Please re-run.",
+        encoding="utf-8",
+    )
+
+    app.review(456)
+
+    assert calls["n"] == 1
+    assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
+
+
+def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, monkeypatch) -> None:
+    """Regression for issue #38: a legacy wrapped report whose body is a blocked
+    refusal must not be reused as a success report on subsequent passes.
+    """
+    app = _cross_family_app(tmp_path, enabled=True)
+    calls = {"n": 0}
+
+    def _fake_run(**kwargs):
+        calls["n"] += 1
+        Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
+        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+
+    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    report_path = prs_dir / "cross-family-review.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    blocked = "I'm blocked from performing the review. Tool calls rejected. Please re-run."
+    report_path.write_text(
+        f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{blocked}\n",
+        encoding="utf-8",
+    )
+
+    app.review(456)
+
+    assert calls["n"] == 1
+    assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
+
+
+def test_report_body_is_valid_detects_real_review_vs_blocked() -> None:
+    assert report_body_is_valid("**MAJOR**\nissue\n\nVerdict: safe") is True
+    assert report_body_is_valid("Verdict: safe") is True
+    assert report_body_is_valid("Verdict: no permission issues found") is True
+    blocked = (
+        "I'm blocked from performing the review. All tool calls are being rejected. Please re-run."
+    )
+    assert report_body_is_valid(blocked) is False
+    assert report_body_is_valid("Verdict: blocked from performing the review") is False
+    assert report_body_is_valid("") is False
+
+
+def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None:
+    """Regression for issue #38: bold markdown in a blocked refusal must not
+    short-circuit validation and allow the blocked output to be cached.
+    """
+    blocked_with_bold = "**Unable to review** — all tool calls are being rejected. Please re-run."
+    assert report_body_is_valid(blocked_with_bold) is False
+
+
+def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
+    body = "**MAJOR**\nissue\n\nVerdict: safe"
+    wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert extract_report_body(wrapped) == body
+    assert extract_report_body(body) == body
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
