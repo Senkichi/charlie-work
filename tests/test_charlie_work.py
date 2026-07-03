@@ -143,24 +143,33 @@ def test_label_names_accepts_gh_shape() -> None:
 
 
 def test_linked_issue_number_from_branch_body_or_title() -> None:
-    assert linked_issue_number(
-        {"headRefName": "agent/issue-456-fix"},
-        head_repository_owner="owner",
-        base_repository_owner="owner",
-        branch_prefix="agent/issue",
-    ) == 456
-    assert linked_issue_number(
-        {"body": "Closes #789"},
-        head_repository_owner="owner",
-        base_repository_owner="owner",
-        branch_prefix="agent/issue",
-    ) == 789
-    assert linked_issue_number(
-        {"title": "Fix #321: thing"},
-        head_repository_owner="owner",
-        base_repository_owner="owner",
-        branch_prefix="agent/issue",
-    ) == 321
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-456-fix"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 456
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Closes #789"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 789
+    )
+    assert (
+        linked_issue_number(
+            {"title": "Fix #321: thing"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 321
+    )
 
 
 def test_linked_issue_number_ignores_unqualified_body_references() -> None:
