@@ -17,7 +17,7 @@ from .cross_family import (
     run_cross_family_review,
 )
 from .github import GitHub, GitHubError, label_names, linked_issue_number
-from .janitor import run_janitor
+from .janitor import check_operator_containment, run_janitor
 from .labels import transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
@@ -556,6 +556,10 @@ class OrchestratorApp:
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
+        # Run containment check for worker edits leaked into operator checkout
+        containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
+        # Merge containment warnings with janitor warnings
+        merged_warnings = tuple(list(verdict.warnings) + list(containment_warnings))
         cross_family_section, cf_result = self._cross_family_for_pr(
             pr=pr,
             issue=issue,
@@ -579,7 +583,7 @@ class OrchestratorApp:
                 "checks_json_path": pr_dir / "checks.json",
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
-                "janitor_section": _janitor_section(verdict.warnings),
+                "janitor_section": _janitor_section(merged_warnings),
                 "decision_command": f"{CLI_NAME} verdict --pr {pr_number} --decision approved --summary-file <path>",
             },
         )
@@ -618,7 +622,7 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "status": "reviewing",
                 "janitor_ok": True,
-                "janitor_warnings": list(verdict.warnings),
+                "janitor_warnings": list(merged_warnings),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
             }
@@ -866,6 +870,23 @@ class OrchestratorApp:
                 )
         checks = self.gh.pr_checks(pr_number)
         summary = summarize_checks(checks, self.config.auto_merge.required_checks)
+        # Run containment check for worker edits leaked into operator checkout
+        diff = self.gh.pr_diff(pr_number)
+        containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
+        if containment_warnings:
+            # Log containment warnings as a pre-merge gate warning
+            # This is report-only, not blocking (per issue directive)
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state = append_event(
+                    state,
+                    "containment_check",
+                    {
+                        "pr_number": pr_number,
+                        "warnings": list(containment_warnings),
+                    },
+                )
+                save_state(self.paths.state_file, state)
         can_merge = summary.ready and (
             approved or not self.config.auto_merge.require_approved_review
         )
@@ -919,6 +940,7 @@ class OrchestratorApp:
             "checks": asdict(summary),
             "label_error": label_error,
             "update_open_prs_results": update_results,
+            "containment_warnings": list(containment_warnings),
         }
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
