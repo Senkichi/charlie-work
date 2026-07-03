@@ -78,6 +78,11 @@ class AutoMergeConfig:
     delete_branch: bool = True
     require_approved_review: bool = True
     required_checks: tuple[str, ...] = ()
+    # After a successful ship-it merge, update remaining open agent PRs
+    # (same-repo + configured branch prefix) to rebase them against the
+    # new base. Default false to preserve existing behavior; per-PR failures
+    # (e.g., conflicts) are reported as values and never abort the merge pass.
+    update_open_prs: bool = False
 
 
 @dataclass(frozen=True)

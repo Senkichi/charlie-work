@@ -17,6 +17,8 @@ $review_summary
 
 ## Required behavior
 
+- First, merge `origin/main` into your branch to incorporate any base changes that landed
+  since the branch was created. This catches skew even when auto-update is off.
 - Update the existing PR. Do not open a new PR unless the branch is unrecoverable.
 - Address every required change directly.
 - Preserve the original issue scope.

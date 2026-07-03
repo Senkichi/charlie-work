@@ -108,7 +108,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,behindBy",
             ],
             limit=_LIST_LIMIT,
             kind="open PRs",
@@ -121,7 +121,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository,behindBy",
             ],
             json_output=True,
         )
@@ -197,6 +197,38 @@ class GitHub:
         except GitHubError:
             return False
         return True
+
+    def pr_commits_behind_base(self, pr_number: int) -> int:
+        """Return the number of commits the PR head is behind its base branch.
+
+        Uses `gh pr view` with the `--json behindBy` field. Returns 0 if the
+        field is missing or the command fails (graceful degradation).
+        """
+        try:
+            result = self.run(
+                ["pr", "view", str(pr_number), "--json", "behindBy"],
+                json_output=True,
+                allow_failure=True,
+            )
+            if isinstance(result, dict):
+                behind = result.get("behindBy")
+                return int(behind) if isinstance(behind, int) else 0
+        except (GitHubError, ValueError, TypeError):
+            pass
+        return 0
+
+    def pr_update_branch(self, pr_number: int) -> bool:
+        """Update a PR's branch with the latest changes from its base.
+
+        Uses `gh pr update-branch`. Returns True on success, False on failure
+        (conflicts, network errors, etc.). Never raises — per-PR failures are
+        reported as values and must not abort a batch operation.
+        """
+        try:
+            self.run(["pr", "update-branch", str(pr_number)], allow_failure=True)
+            return True
+        except GitHubError:
+            return False
 
 
 def label_names(item: dict[str, Any]) -> set[str]:

@@ -829,6 +829,7 @@ class OrchestratorApp:
         merge_output: str | None = None
         branch_deleted: bool | None = None
         label_error: str | None = None
+        update_results: list[dict[str, Any]] = []
         if can_merge and should_merge:
             # Merge, then labels, then best-effort branch deletion — in that
             # order. merge_pr is the irreversible step: persist status="merged"
@@ -859,6 +860,9 @@ class OrchestratorApp:
                     branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
             except GitHubError as exc:
                 label_error = str(exc)
+            # Update remaining open agent PRs after successful merge (if configured)
+            if self.config.auto_merge.update_open_prs:
+                update_results = self._update_open_agent_prs(pr_number)
         data = {
             "pr": pr_number,
             "issue": issue_number,
@@ -870,6 +874,7 @@ class OrchestratorApp:
             "review_decision": decision,
             "checks": asdict(summary),
             "label_error": label_error,
+            "update_open_prs_results": update_results,
         }
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -1046,6 +1051,47 @@ class OrchestratorApp:
             "Verify each against live code before folding it in, reject over-escalations with a "
             "reason, and never let it gate the merge on its own.\n"
         )
+
+    def _update_open_agent_prs(self, merged_pr_number: int) -> list[dict[str, Any]]:
+        """Update remaining open agent PRs after a successful merge.
+
+        Calls `gh pr update-branch` on all open PRs that:
+        - Are same-repo (not forks)
+        - Have the configured branch prefix
+        - Are not the just-merged PR
+
+        Per-PR failures (conflicts, network errors) are reported as values and
+        never abort the batch operation.
+        """
+        results: list[dict[str, Any]] = []
+        prs = self.gh.pr_list()
+        branch_prefix = self.config.dispatch.branch_prefix
+
+        for pr in prs:
+            pr_number = int(pr.get("number", 0))
+            if pr_number == merged_pr_number:
+                continue
+
+            # Skip fork PRs
+            if pr.get("isCrossRepository"):
+                continue
+
+            # Only update PRs with the configured branch prefix
+            head = str(pr.get("headRefName") or "")
+            if not head.startswith(branch_prefix):
+                continue
+
+            # Attempt to update the branch
+            success = self.gh.pr_update_branch(pr_number)
+            results.append(
+                {
+                    "pr_number": pr_number,
+                    "head_ref": head,
+                    "updated": success,
+                }
+            )
+
+        return results
 
     def loop(self, limit: int | None = None) -> CommandResult:
         intake = self.intake()

@@ -25,6 +25,10 @@ from charlie_work.github import linked_issue_number
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig
 
+
+# Branch-issue reference pattern (matches github.py's _BRANCH_ISSUE_REF)
+_BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
+
 # Case-insensitive markers scanned for in the PR body when
 # `config.review.require_tests_or_rationale` is set. Presence of any one of
 # these substrings is treated as evidence the author addressed testing or
@@ -76,6 +80,7 @@ def run_janitor(
     _check_body(pr, config, failures)
     _check_title_conventional(pr, warnings)
     _check_diff_size(pr, warnings)
+    _check_base_movement(pr, config, warnings)
 
     return JanitorVerdict(ok=not failures, failures=tuple(failures), warnings=tuple(warnings))
 
@@ -167,3 +172,29 @@ def _check_diff_size(pr: dict[str, Any], warnings: list[str]) -> None:
     total = additions + deletions
     if total > _OVERSIZED_DIFF_THRESHOLD:
         warnings.append(f"Oversized diff: {total} lines changed (additions+deletions)")
+
+
+def _check_base_movement(
+    pr: dict[str, Any], config: OrchestratorConfig, warnings: list[str]
+) -> None:
+    """Check if the PR's base has moved since the branch was created.
+
+    Only applies to same-repo PRs with the configured branch prefix (agent PRs).
+    Fork PRs and non-prefix branches are excluded to avoid false positives on
+    external contributions or unrelated branches.
+    """
+    # Skip fork PRs entirely
+    if pr.get("isCrossRepository"):
+        return
+
+    # Only check PRs with the configured branch prefix
+    head = str(pr.get("headRefName") or "")
+    if not head.startswith(config.dispatch.branch_prefix):
+        return
+
+    # Get the behindBy count from PR data
+    behind = pr.get("behindBy")
+    if not isinstance(behind, int) or behind <= 0:
+        return
+
+    warnings.append(f"Base moved {behind} commit(s) since branch")
