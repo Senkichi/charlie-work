@@ -1567,6 +1567,8 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
+    # Override pr_list to return empty list (no open PRs, so recovery is allowed)
+    fake_gh.pr_list = lambda: []
 
     # Simulate a prior dispatch that crashed (status: dispatched, same branch)
     seed = load_state(paths.state_file)
