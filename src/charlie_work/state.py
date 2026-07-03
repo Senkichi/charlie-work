@@ -1,15 +1,95 @@
 from __future__ import annotations
 
 import json
+import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 STATE_VERSION = 1
 
+# Cross-process lock timeout (seconds) — best-effort to prevent wedging
+_LOCK_TIMEOUT_SECONDS = 30
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+@contextmanager
+def _state_lock(state_path: Path):
+    """Cross-process advisory lock for state.json read-modify-write cycles.
+
+    Uses platform-specific file locking (Windows: msvcrt.locking, POSIX: fcntl.flock)
+    on a lockfile alongside state.json. The lock is advisory and time-bounded to
+    prevent wedging on stale locks.
+
+    Best-effort: if locking fails, the context manager still yields — the orchestrator
+    prefers forward progress over perfect serialization, and atomic writes already
+    prevent torn files.
+    """
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_file = None
+
+    try:
+        # Create lock file if it doesn't exist
+        lock_path.touch(exist_ok=True)
+
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_file = lock_path.open("r+b", encoding=None)
+            # msvcrt.locking mode: 0 = lock, 1 = unlock
+            # LK_NBLCK = non-blocking lock, LK_LOCK = blocking lock
+            # We use a retry loop with timeout for bounded waiting
+            import time
+
+            start = time.time()
+            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+                try:
+                    # Try non-blocking lock first
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    # Lock held, wait and retry
+                    time.sleep(0.1)
+            else:
+                # Timeout — proceed anyway (best-effort)
+                pass
+        else:
+            import fcntl
+            import time
+
+            lock_file = lock_path.open("r+b", encoding=None)
+            start = time.time()
+            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (IOError, BlockingIOError):
+                    # Lock held, wait and retry
+                    time.sleep(0.1)
+            else:
+                # Timeout — proceed anyway (best-effort)
+                pass
+
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            except OSError:
+                # Best-effort unlock — ignore failures
+                pass
 
 
 def empty_state() -> dict[str, Any]:
