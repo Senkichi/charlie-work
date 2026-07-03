@@ -114,7 +114,7 @@ with descriptions.
 ## 5. First cycle: intake → dispatch → review → merge
 
 Label a real issue `automated-ready` on GitHub, then run the loop by hand
-(one step at a time, so you can see each artifact) or via `loop` (all
+(one step at a time, so you can see each artifact) or via `bash-rats` (all
 steps, one pass):
 
 ```powershell
