@@ -695,6 +695,16 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
+            # Update the linked issue's status when request_changes is recorded:
+            # the previous worker session is definitionally finished, so clear the
+            # dispatched claim to make the issue selectable for rework dispatch.
+            # Escalated requests must NOT mark the issue selectable.
+            if decision == "request_changes" and not escalated and issue_number is not None:
+                state["issues"][str(issue_number)] = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "status": "rework_requested",
+                }
             state = append_event(
                 state,
                 "record_review",

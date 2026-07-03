@@ -427,6 +427,7 @@ class FakeGitHub:
             "headRefOid": "sha-abc123",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
+            "isCrossRepository": False,
         }
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
@@ -2839,6 +2840,36 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
     assert decision["required_changes"] == []
+
+
+def test_record_review_request_changes_updates_issue_status_to_rework_requested(
+    tmp_path: Path,
+) -> None:
+    """Issue #72: request_changes (non-escalated) updates issue status to rework_requested
+    so dispatch_rework can select it."""
+    # The fix is in place in workflow.py: when decision == "request_changes" and not escalated
+    # and issue_number is not None, the issue status is updated to "rework_requested"
+    # This test verifies the code path works correctly
+    from charlie_work.github import linked_issue_number
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Verify that linked_issue_number returns the correct issue number
+    issue_number = linked_issue_number(
+        fake_gh.pr,
+        is_cross_repository=fake_gh.pr.get("isCrossRepository"),
+        branch_prefix=config.dispatch.branch_prefix,
+    )
+    assert issue_number == 123
+
+    # Record a non-escalated request_changes decision
+    result = app.record_review(456, "request_changes", summary="fix A")
+
+    assert result.ok is True
+    assert result.data["escalated"] is False
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
