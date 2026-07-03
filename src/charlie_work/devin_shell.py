@@ -214,7 +214,7 @@ def launch_devin_session(
             )
         pid = process.pid
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True)
+        remove_worktree(repo_root, worktree.path, force=True, branch=branch)
         error = f"failed to launch devin: {exc}"
 
     record = SessionRecord(

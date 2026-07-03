@@ -163,8 +163,13 @@ def create_worktree(
                 if venv_link.exists() or is_junction(venv_link):
                     venv_junction = venv_link
                 else:
-                    _create_junction_or_symlink(venv_link, venv_source)
-                    venv_junction = venv_link
+                    try:
+                        _create_junction_or_symlink(venv_link, venv_source)
+                        venv_junction = venv_link
+                    except (OSError, RuntimeError):
+                        # Clean up the orphan worktree (but not the branch, which already exists in rework mode)
+                        remove_worktree(repo_root, worktree_path, force=True, branch=None)
+                        raise
             return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
         else:
             # No existing worktree: attach to existing branch (no -b flag)
@@ -205,13 +210,23 @@ def create_worktree(
     venv_junction: Path | None = None
     if venv_source is not None:
         venv_link = worktree_path / ".venv"
-        _create_junction_or_symlink(venv_link, venv_source)
-        venv_junction = venv_link
+        try:
+            _create_junction_or_symlink(venv_link, venv_source)
+            venv_junction = venv_link
+        except (OSError, RuntimeError):
+            # Clean up the orphan worktree and branch if junction creation fails
+            # (to prevent leaks on stale .venv or bad venv_source)
+            # In rework mode, the branch already exists, so don't delete it
+            delete_branch = None if rework else branch
+            remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
+            raise
 
     return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
 
 
-def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False) -> bool:
+def remove_worktree(
+    repo_root: Path, worktree_path: Path, *, force: bool = False, branch: str | None = None
+) -> bool:
     """Remove a worktree, taking care never to follow a ``.venv`` junction
     into a shared virtualenv.
 
@@ -225,6 +240,7 @@ def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False
          into the target).
       3. ``git worktree remove``.
       4. On failure, ``git worktree prune`` to clear stale metadata.
+      5. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
     command failure); never raises for those. Programmer errors (e.g. a
@@ -265,6 +281,15 @@ def remove_worktree(repo_root: Path, worktree_path: Path, *, force: bool = False
             ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
         )
         return False
+
+    # Delete the branch if provided (to prevent branch leaks on launch failure)
+    if branch is not None:
+        run_captured(
+            ["git", "branch", "-D", branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+
     return True
 
 
