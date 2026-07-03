@@ -338,7 +338,7 @@ class OrchestratorApp:
             }
             if concurrency_clamped:
                 data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = max_concurrent - available_slots
+                data["live_session_count"] = live_count
                 data["available_slots"] = available_slots
             return CommandResult(
                 True,
@@ -497,7 +497,7 @@ class OrchestratorApp:
         }
         if concurrency_clamped:
             data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = max_concurrent - available_slots
+            data["live_session_count"] = live_count
             data["available_slots"] = available_slots
         return CommandResult(
             not failed_issue_numbers,
@@ -1297,10 +1297,15 @@ class OrchestratorApp:
             selected = candidates[:rework_limit]
 
         if not selected:
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "no rework candidates found",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         # First lock: claim issues by marking them as dispatch_pending
@@ -1332,10 +1337,15 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         if not selected_issue_numbers:
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         # Do all network calls, file writes, and worker launches outside the lock
@@ -1394,10 +1404,15 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            if concurrency_clamped:
+                data["concurrency_limit"] = max_concurrent
+                data["live_session_count"] = live_count
+                data["available_slots"] = available_slots
             return CommandResult(
                 True,
                 "no valid rework prompts found",
-                {"adapter": self.config.devin.adapter, "selected_count": 0},
+                data,
             )
 
         manifest_path = self.repo_root / self.config.devin.session_manifest
@@ -1495,7 +1510,7 @@ class OrchestratorApp:
         }
         if concurrency_clamped:
             data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = max_concurrent - available_slots
+            data["live_session_count"] = live_count
             data["available_slots"] = available_slots
         return CommandResult(
             not failed_issue_numbers,

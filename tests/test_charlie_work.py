@@ -3089,54 +3089,54 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
 def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch) -> None:
     """Concurrency governor should also clamp rework dispatch."""
 
-    # Mock _count_live_sessions to return 1 live session
+    # Mock _count_live_sessions to return 2 live sessions (at the cap)
     def mock_count_live(sessions_dir):
-        return 1
+        return 2
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Add needs-rework label to the issue
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+
+    fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Add a needs-rework issue with an open PR
-    fake_gh.issues.append(
-        {
-            "number": 125,
-            "title": "Needs rework",
-            "url": "https://example.test/issues/125",
-            "body": "Fix this",
-            "labels": [{"name": "agent:needs-rework"}],
-        }
-    )
-
-    # Override pr_list to return the rework PR
-    def pr_list_with_rework():
-        return [
-            {
-                "number": 999,
-                "title": "Fix #125",
-                "url": "https://example.test/pull/999",
-                "headRefName": "agent/issue-125-fix",
-                "body": "Closes #125",
-                "labels": [],
-                "isCrossRepository": False,
-            }
-        ]
-
-    fake_gh.pr_list = pr_list_with_rework
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
     result = app.dispatch_rework()
 
-    # Should clamp to 1 since 1 session is alive and cap is 2
+    # Should clamp to 0 since 2 sessions are alive and cap is 2
     assert result.ok is True
-    assert result.data["selected_count"] == 0  # Manual adapter skips rework
-    # Even though manual adapter skips, the concurrency data should be present
-    # if the cap was checked (but manual adapter returns early, so this is expected)
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 2
+    assert result.data["live_session_count"] == 2
+    assert result.data["available_slots"] == 0
 
 
 def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatch) -> None:
@@ -3149,21 +3149,32 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_concurrent_sessions=3, default_limit=5),
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
         devin=DevinConfig(adapter="manual"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
+    # Add a second ready issue to test truncation
+    fake_gh.issues.append(
+        {
+            "number": 124,
+            "title": "Another fix",
+            "url": "https://example.test/issues/124",
+            "body": "Another issue",
+            "labels": [{"name": "automated-ready"}],
+        }
+    )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.dispatch()
 
-    # Should allow 2 launches since 1 session is alive and cap is 3
+    # Should allow only 1 launch since 1 session is alive and cap is 2
+    # (2 candidates available, but only 1 slot)
     assert result.ok is True
-    assert result.data["selected_count"] == 1  # Only 1 issue available in FakeGitHub
-    assert result.data["concurrency_limit"] == 3
+    assert result.data["selected_count"] == 1
+    assert result.data["concurrency_limit"] == 2
     assert result.data["live_session_count"] == 1
-    assert result.data["available_slots"] == 2
+    assert result.data["available_slots"] == 1
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
