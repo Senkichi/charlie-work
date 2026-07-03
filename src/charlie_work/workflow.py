@@ -463,6 +463,13 @@ class OrchestratorApp:
             else:
                 selected = candidates[:dispatch_limit]
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
+            # Capture previous entries for recovery detection BEFORE overwriting status
+            # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
+            # to recover from a crashed worker. This snapshot must be taken before we overwrite
+            # the status to "dispatch_pending".
+            previous_entries: dict[int, dict[str, Any]] = {}
+            for issue_number in selected_issue_numbers:
+                previous_entries[issue_number] = state["issues"].get(str(issue_number), {})
             # Mark selected issues as "dispatch_pending" to claim them before launching
             for issue_number in selected_issue_numbers:
                 state["issues"][str(issue_number)] = {
@@ -483,14 +490,13 @@ class OrchestratorApp:
 
             # Check if this is a dead-worker recovery: the issue has a previous
             # dispatch record with the same branch name (i.e., our own crashed attempt)
+            # Use the snapshot captured before status overwrite (Issue #81 fix)
             recovery_record: dict[str, Any] | None = None
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                prev_entry = state.get("issues", {}).get(str(issue_number), {})
-                prev_branch = prev_entry.get("branch_name")
-                if prev_branch == branch_name and prev_entry.get("status") == "dispatched":
-                    # This is our own crashed attempt - pass the record for recovery
-                    recovery_record = prev_entry
+            prev_entry = previous_entries.get(issue_number, {})
+            prev_branch = prev_entry.get("branch_name")
+            if prev_branch == branch_name and prev_entry.get("status") == "dispatched":
+                # This is our own crashed attempt - pass the record for recovery
+                recovery_record = prev_entry
 
             session_requests.append(
                 SessionRequest(

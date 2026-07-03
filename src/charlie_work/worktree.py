@@ -137,19 +137,28 @@ def create_worktree(
                 f"requested branch {branch!r}"
             )
 
-        # Check if the branch/worktree exists
+        # Check if a worktree exists at the expected path (by slug)
         existing_worktrees = list_worktrees(repo_root)
         existing_wt = next(
-            (
-                wt
-                for wt in existing_worktrees
-                if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch
-            ),
+            (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
             None,
         )
 
         if existing_wt:
-            # Worktree exists: check if it has commits beyond the merge-base
+            # AC #3: Fail loudly if the worktree at the expected path is on a FOREIGN branch
+            # (i.e., a worktree whose branch does not match our recovery record).
+            # This protects against clobbering work that is not ours.
+            wt_branch = existing_wt.get("branch", "")
+            # Normalize branch names for comparison (strip refs/heads/ prefix)
+            normalized_wt_branch = wt_branch.replace("refs/heads/", "")
+            if normalized_wt_branch != branch and normalized_wt_branch != f"refs/heads/{branch}":
+                raise RuntimeError(
+                    f"Recovery mode found leftover worktree at {worktree_path} on foreign branch {normalized_wt_branch!r}, "
+                    f"but recovery record specifies branch {branch!r}. "
+                    f"This is not our crashed worker — refusing to clobber foreign work."
+                )
+
+            # Worktree exists on the correct branch: check if it has commits beyond the merge-base
             wt_path = Path(existing_wt["worktree"])
             # Check for dirty working tree
             dirty_result = run_captured(
@@ -188,12 +197,17 @@ def create_worktree(
                     raise RuntimeError(
                         f"Failed to remove leftover worktree {wt_path} for recovery"
                     )
-                # Delete the branch
-                run_captured(
+                # Delete the branch and check the result
+                branch_delete_result = run_captured(
                     ["git", "branch", "-D", branch],
                     cwd=repo_root,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
+                if not branch_delete_result.ok:
+                    raise RuntimeError(
+                        f"Failed to delete branch {branch!r} for recovery: "
+                        f"{branch_delete_result.error or branch_delete_result.stderr}"
+                    )
                 # Fall through to fresh dispatch below (rework=False)
         else:
             # No worktree exists, but branch might exist
@@ -226,11 +240,16 @@ def create_worktree(
                     rework = True
                 else:
                     # Clean: delete branch and create fresh
-                    run_captured(
+                    branch_delete_result = run_captured(
                         ["git", "branch", "-D", branch],
                         cwd=repo_root,
                         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
+                    if not branch_delete_result.ok:
+                        raise RuntimeError(
+                            f"Failed to delete branch {branch!r} for recovery: "
+                            f"{branch_delete_result.error or branch_delete_result.stderr}"
+                        )
                     # Fall through to fresh dispatch below (rework=False)
 
     if rework:

@@ -469,19 +469,64 @@ def test_recovery_branch_mismatch_raises(tmp_path: Path) -> None:
 
 
 def test_recovery_foreign_branch_fails_loudly(tmp_path: Path) -> None:
-    """Recovery mode with no matching state record (foreign branch): fail loudly as today."""
+    """AC #3: Recovery mode with leftover worktree on foreign branch: fail loudly."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
-    # Create a branch that exists but has no state record (foreign state)
+    # Create a worktree on a branch
     branch_name = "agent/issue-4-foreign"
-    _git(repo_root, "branch", branch_name)
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "foreign.txt").write_text("foreign work\n", encoding="utf-8")
+    _git(info1.path, "add", "foreign.txt")
+    _git(info1.path, "commit", "-m", "foreign work")
 
-    # No recovery record (None) - this simulates foreign state
-    # The branch exists but we have no record of dispatching it
-    # This should fail because we're not in recovery mode and the branch already exists
-    with pytest.raises(RuntimeError, match="git worktree add failed"):
-        create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=None)
+    # Manually switch the worktree to a different branch to simulate foreign state
+    # (the worktree path is the same, but the branch is different)
+    _git(info1.path, "checkout", "-b", "agent/issue-5-different")
+
+    # Try to recover with a record for the original branch, but the worktree is now on a different branch
+    recovery_record = {"branch_name": "agent/issue-4-foreign", "status": "dispatched"}
+
+    with pytest.raises(RuntimeError, match="Recovery mode found leftover worktree"):
+        create_worktree(
+            repo_root, "agent/issue-4-foreign", base_ref="HEAD", recovery=recovery_record
+        )
 
     # Clean up
-    _git(repo_root, "branch", "-D", branch_name)
+    remove_worktree(repo_root, info1.path)
+
+
+def test_recovery_with_venv_dir_reuses_worktree(tmp_path: Path) -> None:
+    """Recovery mode with .venv directory (documented danger case): reuse via rework-style attach."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Simulate a previous dispatch that created a worktree with a real .venv directory
+    # (the documented danger case: worker cold-built its own venv instead of junctioning)
+    branch_name = "agent/issue-5-recovery-venv"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Create a real .venv directory (not a junction)
+    real_venv = info1.path / ".venv"
+    real_venv.mkdir()
+    (real_venv / "pyvenv.cfg").write_text("home = somewhere\n", encoding="utf-8")
+
+    # Add a commit to ensure we reuse (not remove-and-recreate)
+    (info1.path / "file1.txt").write_text("partial work\n", encoding="utf-8")
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "partial work")
+
+    # Recovery dispatch should reuse the worktree despite the .venv directory
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # Should reuse the same worktree
+    assert info2.path == info1.path
+    # The partial work should still be there
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "partial work\n"
+    # The .venv directory should still be there (not deleted)
+    assert (info2.path / ".venv").exists()
+    assert (info2.path / ".venv" / "pyvenv.cfg").exists()
+
+    # Clean up with force=True since .venv is a real directory
+    remove_worktree(repo_root, info2.path, force=True)
