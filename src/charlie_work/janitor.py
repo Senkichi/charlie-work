@@ -125,7 +125,12 @@ def _check_linked_issue(
 ) -> None:
     if not config.review.require_issue_link:
         return
-    if linked_issue_number(pr) is None:
+    if linked_issue_number(
+        pr,
+        head_repository_owner=pr.get("headRepositoryOwner"),
+        base_repository_owner=pr.get("baseRepositoryOwner"),
+        branch_prefix=config.dispatch.branch_prefix,
+    ) is None:
         failures.append("No linked issue found (branch name, title, or body)")
 
 

@@ -102,7 +102,17 @@ class OrchestratorApp:
             issue for issue in issues if label_names(issue) & self.config.labels.active
         ]
         available_issues = [issue for issue in issues if self._is_dispatchable(issue)]
-        linked_prs = [self._summarize_pr(pr) for pr in prs if linked_issue_number(pr) is not None]
+        linked_prs = [
+            self._summarize_pr(pr)
+            for pr in prs
+            if linked_issue_number(
+                pr,
+                head_repository_owner=pr.get("headRepositoryOwner"),
+                base_repository_owner=pr.get("baseRepositoryOwner"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            is not None
+        ]
         data = {
             "ready_issue_count": len(issues),
             "available_issue_count": len(available_issues),
@@ -381,7 +391,12 @@ class OrchestratorApp:
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
-        issue_number = linked_issue_number(pr)
+        issue_number = linked_issue_number(
+            pr,
+            head_repository_owner=pr.get("headRepositoryOwner"),
+            base_repository_owner=pr.get("baseRepositoryOwner"),
+            branch_prefix=self.config.dispatch.branch_prefix,
+        )
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
@@ -543,7 +558,16 @@ class OrchestratorApp:
                 False, "decision must be approved, request_changes, or blocked", {}
             )
         pr = self.gh.pr_view(pr_number)
-        issue_number = linked_issue_number(pr) if pr else None
+        issue_number = (
+            linked_issue_number(
+                pr,
+                head_repository_owner=pr.get("headRepositoryOwner"),
+                base_repository_owner=pr.get("baseRepositoryOwner"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if pr
+            else None
+        )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
@@ -670,7 +694,12 @@ class OrchestratorApp:
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
-        issue_number = linked_issue_number(pr)
+        issue_number = linked_issue_number(
+            pr,
+            head_repository_owner=pr.get("headRepositoryOwner"),
+            base_repository_owner=pr.get("baseRepositoryOwner"),
+            branch_prefix=self.config.dispatch.branch_prefix,
+        )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
         if approved:
@@ -953,7 +982,12 @@ class OrchestratorApp:
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for pr in self.gh.pr_list():
-            issue_number = linked_issue_number(pr)
+            issue_number = linked_issue_number(
+                pr,
+                head_repository_owner=pr.get("headRepositoryOwner"),
+                base_repository_owner=pr.get("baseRepositoryOwner"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
             if issue_number is None:
                 continue
             pr_number = int(pr["number"])
@@ -1095,7 +1129,12 @@ class OrchestratorApp:
             "number": pr.get("number"),
             "title": pr.get("title"),
             "url": pr.get("url"),
-            "issue_number": linked_issue_number(pr),
+            "issue_number": linked_issue_number(
+                pr,
+                head_repository_owner=pr.get("headRepositoryOwner"),
+                base_repository_owner=pr.get("baseRepositoryOwner"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            ),
             "head": pr.get("headRefName"),
             "is_draft": pr.get("isDraft"),
             "reviewDecision": pr.get("reviewDecision"),

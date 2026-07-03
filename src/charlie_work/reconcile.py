@@ -28,7 +28,7 @@ from .github import GitHub, _LIST_LIMIT, label_names, linked_issue_number
 from .labels import transition
 from .state import append_event, is_claim_stale
 
-_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels"
+_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,headRepositoryOwner,baseRepositoryOwner"
 _ISSUE_FIELDS = "number,title,url,body,labels"
 
 
@@ -82,7 +82,12 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
         gh_state = str(pr.get("state") or "").upper()
         if gh_state == "OPEN":
             open_prs_by_number[pr_number] = pr
-        issue_number = linked_issue_number(pr)
+        issue_number = linked_issue_number(
+            pr,
+            head_repository_owner=pr.get("headRepositoryOwner"),
+            base_repository_owner=pr.get("baseRepositoryOwner"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
         if issue_number is not None:
             prs_linking_issue.setdefault(issue_number, []).append(pr)
 

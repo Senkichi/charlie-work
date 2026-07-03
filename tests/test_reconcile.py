@@ -45,6 +45,8 @@ def _pr(
     head_ref: str | None = None,
     body: str = "",
     title: str = "",
+    head_repository_owner: str = "owner",
+    base_repository_owner: str = "owner",
 ) -> dict[str, Any]:
     return {
         "number": number,
@@ -55,6 +57,8 @@ def _pr(
         "body": body,
         "state": state,
         "labels": [],
+        "headRepositoryOwner": head_repository_owner,
+        "baseRepositoryOwner": base_repository_owner,
     }
 
 
@@ -423,3 +427,61 @@ def test_apply_fixes_clears_stale_dispatch_pending_claims() -> None:
 def test_reconcile_and_github_share_list_limit_constant() -> None:
     """Issue #45: reconcile and github.py must derive limits from the same constant."""
     assert reconcile_list_limit == github_list_limit
+
+
+def test_detect_drift_fork_pr_branch_name_does_not_bind() -> None:
+    """Issue #9: Fork PRs must not bind via branch name (attacker-controlled)."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[
+            _pr(
+                1,
+                "MERGED",
+                head_ref="agent/issue-42-fix",
+                head_repository_owner="attacker",
+                base_repository_owner="owner",
+            )
+        ],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+
+    drift = detect_drift(gh, state, config)
+
+    # The fork PR should NOT bind to issue 42 via branch name, so drift
+    # should be detected for the PR status but NOT for the issue labels.
+    matches = [item for item in drift if item.kind == "merged_outside_orchestrator"]
+    assert len(matches) == 1
+    # The drift item should have issue_number=None because the fork PR
+    # didn't bind to issue 42.
+    assert matches[0].issue_number is None
+    assert matches[0].pr_number == 1
+
+
+def test_detect_drift_fork_pr_closing_keyword_binds() -> None:
+    """Issue #9: Fork PRs can still bind via closing keywords (that's intentional)."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[
+            _pr(
+                1,
+                "MERGED",
+                head_ref="attacker-branch",
+                body="Closes #42",
+                head_repository_owner="attacker",
+                base_repository_owner="owner",
+            )
+        ],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+
+    drift = detect_drift(gh, state, config)
+
+    # The fork PR should bind to issue 42 via closing keyword, so drift should
+    # be detected.
+    matches = [item for item in drift if item.kind == "merged_outside_orchestrator"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 42

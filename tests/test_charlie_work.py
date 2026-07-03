@@ -143,15 +143,38 @@ def test_label_names_accepts_gh_shape() -> None:
 
 
 def test_linked_issue_number_from_branch_body_or_title() -> None:
-    assert linked_issue_number({"headRefName": "agent/issue-456-fix"}) == 456
-    assert linked_issue_number({"body": "Closes #789"}) == 789
-    assert linked_issue_number({"title": "Fix #321: thing"}) == 321
+    assert linked_issue_number(
+        {"headRefName": "agent/issue-456-fix"},
+        head_repository_owner="owner",
+        base_repository_owner="owner",
+        branch_prefix="agent/issue",
+    ) == 456
+    assert linked_issue_number(
+        {"body": "Closes #789"},
+        head_repository_owner="owner",
+        base_repository_owner="owner",
+        branch_prefix="agent/issue",
+    ) == 789
+    assert linked_issue_number(
+        {"title": "Fix #321: thing"},
+        head_repository_owner="owner",
+        base_repository_owner="owner",
+        branch_prefix="agent/issue",
+    ) == 321
 
 
 def test_linked_issue_number_ignores_unqualified_body_references() -> None:
     body = "Bumps actions/checkout. See dependabot/dependabot-core#2454 for details."
 
-    assert linked_issue_number({"body": body}) is None
+    assert (
+        linked_issue_number(
+            {"body": body},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
 
 
 def test_summarize_checks_requires_all_configured_checks() -> None:
@@ -1637,6 +1660,8 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
                 "body": "",
                 "state": "MERGED",
                 "labels": [],
+                "headRepositoryOwner": "owner",
+                "baseRepositoryOwner": "owner",
             }
             self._issue = {
                 "number": 123,
@@ -1777,13 +1802,122 @@ def _approved_automerge():
 def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     # A bare #N substring in an attacker-controlled title must NOT bind the PR
     # to issue N (label/merge hijack). Only a closing keyword counts.
-    assert linked_issue_number({"title": "Refactor everything #1 nicely"}) is None
-    assert linked_issue_number({"title": "see #5 for context", "body": "no link"}) is None
+    assert (
+        linked_issue_number(
+            {"title": "Refactor everything #1 nicely"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    assert (
+        linked_issue_number(
+            {"title": "see #5 for context", "body": "no link"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
     # Closing-keyword forms still resolve.
-    assert linked_issue_number({"title": "Fix #321: thing"}) == 321
-    assert linked_issue_number({"body": "Resolves #7"}) == 7
+    assert (
+        linked_issue_number(
+            {"title": "Fix #321: thing"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 321
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Resolves #7"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 7
+    )
     # Orchestrator's own branch convention is the trusted head-ref signal.
-    assert linked_issue_number({"headRefName": "agent/issue-456-x", "title": "#999"}) == 456
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-456-x", "title": "#999"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 456
+    )
+
+
+def test_linked_issue_number_fork_pr_branch_name_does_not_bind() -> None:
+    # Issue #9: Fork PRs must not bind via branch name (attacker-controlled).
+    # A fork PR with branch name "issue-42" should NOT bind to issue 42.
+    assert (
+        linked_issue_number(
+            {"headRefName": "issue-42-fix"},
+            head_repository_owner="attacker",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    # Even with the orchestrator's prefix, fork PRs must not bind via branch.
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-42-fix"},
+            head_repository_owner="attacker",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_same_repo_branch_with_prefix_binds() -> None:
+    # Issue #9: Same-repo PRs with correct branch prefix should still bind.
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-42-fix"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 42
+    )
+    # Same-repo PR with wrong prefix should not bind via branch.
+    assert (
+        linked_issue_number(
+            {"headRefName": "issue-42-fix"},
+            head_repository_owner="owner",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_fork_pr_closing_keyword_binds() -> None:
+    # Issue #9: Fork PRs can still bind via closing keywords (that's intentional).
+    assert (
+        linked_issue_number(
+            {"body": "Closes #42"},
+            head_repository_owner="attacker",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 42
+    )
+    assert (
+        linked_issue_number(
+            {"title": "Fix #42: security issue"},
+            head_repository_owner="attacker",
+            base_repository_owner="owner",
+            branch_prefix="agent/issue",
+        )
+        == 42
+    )
 
 
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
