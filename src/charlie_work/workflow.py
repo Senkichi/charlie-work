@@ -448,7 +448,7 @@ class OrchestratorApp:
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(verdict.warnings),
-                "decision_command": f"{CLI_NAME} record-review --pr {pr_number} --decision approved --summary-file <path>",
+                "decision_command": f"{CLI_NAME} verdict --pr {pr_number} --decision approved --summary-file <path>",
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
