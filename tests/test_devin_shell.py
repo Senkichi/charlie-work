@@ -16,6 +16,7 @@ from charlie_work.devin_shell import (
     launch_devin_session,
     probe_devin,
     read_session_records,
+    update_session_record_with_failure_classification,
 )
 from charlie_work.worktree import WorktreeInfo
 
@@ -626,6 +627,194 @@ def test_command_template_omits_model_when_worker_model_empty(
     # Verify the custom template structure
     assert record.command[0] == sys.executable
     assert str(script) in record.command
+
+
+# ---------------------------------------------------------------------------
+# Throttle death classification tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> None:
+    """Test that rate-limit errors with 'resets in N minutes' are classified correctly."""
+    from charlie_work.devin_shell import _classify_session_failure
+    from datetime import UTC, datetime, timedelta
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    # Verify it's a valid ISO timestamp
+    assert "T" in throttled_until
+    assert "Z" in throttled_until
+    # Verify the cooldown reflects the parsed 10 minutes
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    # Allow 1 second tolerance for test execution time
+    assert abs((throttle_time - expected_time).total_seconds()) < 1
+
+
+def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) -> None:
+    """Test that rate-limit errors without reset time use default cooldown."""
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Some work done...\nError: Reached overall message rate limit. Please try again later.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    # Should use default 15 minute cooldown
+    assert "T" in throttled_until
+    assert "Z" in throttled_until
+
+
+def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
+    """Test that quota-exhaustion errors are classified correctly."""
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: daily usage quota has been exhausted. Please try again tomorrow.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind == "quota_exhausted"
+    assert throttled_until is not None
+    # Should use default 24 hour cooldown
+    assert "T" in throttled_until
+    assert "Z" in throttled_until
+
+
+def test_classify_session_failure_no_throttle(tmp_path: Path) -> None:
+    """Test that non-throttle errors return None."""
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Some work done...\nError: something went wrong with the task\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_missing_log(tmp_path: Path) -> None:
+    """Test that missing log files return None."""
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "nonexistent.log"
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_update_session_record_with_failure_classification(tmp_path: Path) -> None:
+    """Test that session records are updated with failure classification."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Create a session sidecar
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Create a log file with rate-limit error
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+
+    # Verify the sidecar was updated
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
+    """Test that already-classified records are not re-classified."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Create a session sidecar with existing classification
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+                "failure_kind": "rate_limited",  # Already classified
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Create a log file with a different error (should be ignored)
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: daily usage quota has been exhausted.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42
+    )
+
+    # Should return the existing classification, not re-classify
+    assert failure_kind == "rate_limited"
+    assert throttled_until is None  # No new throttled_until
+
+    # Verify the sidecar was not changed
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
 
 
 def test_launch_render_error_returns_error_record_and_tears_down_worktree(
