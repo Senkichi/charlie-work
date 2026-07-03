@@ -182,7 +182,7 @@ def _dry_run_result(request: SessionRequest, adapter: str) -> SessionDispatchRes
         request,
         adapter=adapter,
         ok=True,
-        error="DRY-RUN: worker not launched",
+        error=None,
     )
 
 
