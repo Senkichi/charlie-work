@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
-from charlie_work.janitor import JanitorVerdict, run_janitor
+from charlie_work.janitor import JanitorVerdict, check_operator_containment, run_janitor
 
 REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 
@@ -284,3 +286,164 @@ def test_base_movement_no_warning_when_field_missing() -> None:
 
     assert verdict.ok is True
     assert not any("Base moved" in w for w in verdict.warnings)
+
+
+def test_containment_clean_tree_no_warnings() -> None:
+    """Clean operator checkout produces no containment warnings."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        # Initialize a git repo
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        # Create an initial commit
+        (repo_root / "test.txt").write_text("initial content")
+        subprocess.run(["git", "add", "."], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+
+        # Empty diff (no PR changes)
+        diff = ""
+        warnings = check_operator_containment(repo_root, diff, 123)
+
+        assert warnings == ()
+
+
+def test_containment_leak_detection() -> None:
+    """Detect leaked worker edits: working-tree file byte-identical to PR post-image."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        # Initialize a git repo
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        # Create an initial commit
+        (repo_root / "test.txt").write_text("initial content")
+        subprocess.run(["git", "add", "."], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+
+        # Simulate a leak: modify the file to match PR post-image
+        leaked_content = "leaked content from PR"
+        (repo_root / "test.txt").write_text(leaked_content)
+
+        # Create a diff that matches the leaked content
+        diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdefg 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1 +1 @@
+-initial content
++leaked content from PR
+"""
+
+        warnings = check_operator_containment(repo_root, diff, 123)
+
+        assert len(warnings) == 1
+        assert "Containment leak detected" in warnings[0]
+        assert "PR #123" in warnings[0]
+        assert "test.txt" in warnings[0]
+        assert "git checkout --" in warnings[0]
+
+
+def test_containment_unrelated_dirty_file() -> None:
+    """Unrelated dirty files produce generic warning, not leak warning."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        # Initialize a git repo
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+        # Create an initial commit
+        (repo_root / "test.txt").write_text("initial content")
+        subprocess.run(["git", "add", "."], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+
+        # Modify file to content NOT in the PR diff
+        (repo_root / "test.txt").write_text("unrelated local work")
+
+        # Create a diff that doesn't match the dirty file
+        diff = """diff --git a/other.txt b/other.txt
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/other.txt
+@@ -0,0 +1 @@
++other file content
+"""
+
+        warnings = check_operator_containment(repo_root, diff, 123)
+
+        assert len(warnings) == 1
+        assert "not a leak" in warnings[0]
+        assert "test.txt" in warnings[0]
+        assert "Containment leak" not in warnings[0]
+
+
+def test_containment_git_failure_graceful_degradation() -> None:
+    """Git failures produce no warnings rather than blocking."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        # Not a git repo, so git status will fail
+        diff = ""
+        warnings = check_operator_containment(repo_root, diff, 123)
+
+        # Should return empty tuple on git failure (graceful degradation)
+        assert warnings == ()

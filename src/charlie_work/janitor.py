@@ -16,7 +16,9 @@ JSON) for packet generation, so it feeds that same data in here first.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import summarize_checks
@@ -193,3 +195,145 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def check_operator_containment(
+    repo_root: Path, pr_diff: str, pr_number: int
+) -> tuple[str, ...]:
+    """Check for worker edits leaked into the operator checkout.
+
+    Runs ``git status --porcelain`` at ``repo_root`` to detect uncommitted changes.
+    When dirty in the context of a candidate PR, diffs dirty files against the PR's
+    patch to distinguish:
+    - **Leaked worker edits**: files whose working-tree content is byte-identical to
+      the PR's post-image (provably redundant leaks)
+    - **Generic dirty tree**: other dirty files (could be legitimate operator work)
+
+    Returns a tuple of warning messages. Never modifies or deletes files.
+    """
+    warnings: list[str] = []
+
+    # Check for uncommitted changes in the operator checkout
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        dirty_output = result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If git fails, skip the check rather than blocking
+        return ()
+
+    if not dirty_output:
+        # Clean tree — no containment issues
+        return ()
+
+    # Parse dirty files from git status --porcelain
+    # Format: XY filename (X=staging, Y=worktree) or " XY filename" (with leading space)
+    dirty_files: set[str] = set()
+    for line in dirty_output.splitlines():
+        if not line:
+            continue
+        # Strip leading whitespace (git status --porcelain can have leading space)
+        line = line.lstrip()
+        # Extract filename (skip the 2-character status prefix and the space after it)
+        # Handle both "XY filename" and "XY filename -> newname" (renames)
+        if len(line) > 2:
+            # Skip the first 2 characters (XY status)
+            rest_of_line = line[2:]
+            # Skip the space after XY
+            if rest_of_line.startswith(" "):
+                rest_of_line = rest_of_line[1:]
+            # Split on whitespace and take the first part (the filename)
+            parts = rest_of_line.split()
+            filename = parts[0] if parts else ""
+            if filename:
+                dirty_files.add(filename)
+
+    if not dirty_files:
+        return ()
+
+    # Parse the PR diff to extract post-image content for each file
+    # The post-image is what the file looks like after applying the PR
+    pr_file_contents: dict[str, str] = {}
+    current_file: str | None = None
+    current_content: list[str] = []
+    in_hunk = False
+
+    for line in pr_diff.splitlines():
+        if line.startswith("+++ b/"):
+            # New file in the diff - save previous file's content
+            if current_file is not None:
+                pr_file_contents[current_file] = "\n".join(current_content)
+            current_file = line[6:]  # Strip "+++ b/" prefix
+            current_content = []
+            in_hunk = False
+        elif line.startswith("@@"):
+            # Start of a hunk
+            in_hunk = True
+        elif in_hunk:
+            if line.startswith(" "):
+                # Context line - present in both pre and post image
+                current_content.append(line[1:])
+            elif line.startswith("+") and not line.startswith("++"):
+                # Added line - only in post image
+                current_content.append(line[1:])
+            elif line.startswith("-"):
+                # Removed line - only in pre image, skip for post-image
+                continue
+            elif line.startswith("\\"):
+                # Diff metadata (e.g., " No newline at end of file")
+                continue
+
+    # Don't forget the last file
+    if current_file is not None:
+        pr_file_contents[current_file] = "\n".join(current_content)
+
+    # Check each dirty file against the PR's post-image
+    leaked_files: list[str] = []
+    unrelated_dirty_files: list[str] = []
+
+    for dirty_file in dirty_files:
+        file_path = repo_root / dirty_file
+        if not file_path.exists():
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Read the working-tree content
+        try:
+            working_tree_content = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Check if this file is in the PR diff
+        if dirty_file not in pr_file_contents:
+            unrelated_dirty_files.append(dirty_file)
+            continue
+
+        # Compare byte-identical content
+        pr_content = pr_file_contents[dirty_file]
+        if working_tree_content == pr_content:
+            leaked_files.append(dirty_file)
+        else:
+            unrelated_dirty_files.append(dirty_file)
+
+    # Generate warnings
+    if leaked_files:
+        remediation = " ".join(f"git checkout -- {f}" for f in leaked_files)
+        warnings.append(
+            f"Containment leak detected: PR #{pr_number} edits leaked into operator checkout. "
+            f"Files with byte-identical content to PR post-image: {', '.join(leaked_files)}. "
+            f"Remediation: {remediation}"
+        )
+
+    if unrelated_dirty_files:
+        warnings.append(
+            f"Operator checkout has uncommitted changes (not a leak): {', '.join(unrelated_dirty_files)}. "
+            f"This may be legitimate operator work or requires manual cleanup."
+        )
+
+    return tuple(warnings)
