@@ -33,3 +33,25 @@ $review_summary
 ## Done condition
 
 You are done only when the existing PR has new commits addressing the review and the PR includes updated verification evidence.
+
+## FINAL STEP — push and verify
+
+**Committing locally is NOT done.** The PR head must advance to reflect your work.
+
+After your final commit:
+
+1. Run the full test suite before pushing:
+   ```bash
+   uv run --extra dev pytest -q --tb=short
+   ```
+2. Push your branch:
+   ```bash
+   git push origin $branch_name
+   ```
+3. Verify the PR head advanced:
+   ```bash
+   gh pr view $pr_number --json headRefOid
+   ```
+   Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
+
+Only when the PR head points at your pushed commit is the rework complete.

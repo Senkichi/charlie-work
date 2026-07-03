@@ -18,7 +18,7 @@ _LIST_LIMIT = 500
 ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt"
 ISSUE_VIEW_FIELDS = "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt"
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus"
-PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository,mergeStateStatus"
+PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_CHECKS_FIELDS = "name,state,bucket,link"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)

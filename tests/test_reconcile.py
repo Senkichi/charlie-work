@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from charlie_work.config import OrchestratorConfig
@@ -484,3 +485,98 @@ def test_detect_drift_fork_pr_closing_keyword_does_not_bind() -> None:
     # didn't bind to issue 42.
     assert matches[0].issue_number is None
     assert matches[0].pr_number == 1
+
+
+def test_detect_drift_provider_throttle_detected_with_repo_root(tmp_path: Path) -> None:
+    """Test that detect_drift with repo_root detects dead sessions and classifies throttling."""
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Create a sessions directory with a dead session that has a rate-limit log
+    # Use the default sessions_dir path from config
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run detect_drift with repo_root to enable session checking
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Should detect provider throttle
+    throttle_drift = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert len(throttle_drift) == 1
+    assert throttle_drift[0].issue_number == 42
+    assert "rate_limited" in throttle_drift[0].detail
+    assert "throttled_until" in throttle_drift[0].fix_actions[0]
+
+
+def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
+    """Test that apply_fixes correctly sets throttled_until for provider throttle drift."""
+    from datetime import UTC, datetime, timedelta
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Create a provider throttle drift item
+    throttled_until = (
+        (datetime.now(UTC) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    )
+    drift = [
+        DriftItem(
+            kind="provider_throttle_detected",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died with rate_limited",
+            fix_actions=(f"set throttled_until={throttled_until}",),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Verify throttled_until is set in the new state
+    assert new_state.get("throttled_until") == throttled_until
+    # Original state should be unchanged
+    assert state.get("throttled_until") is None
+
+
+def test_detect_drift_without_repo_root_skips_session_check() -> None:
+    """Test that detect_drift without repo_root does not check sessions."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Run detect_drift without repo_root
+    drift = detect_drift(gh, state, config, repo_root=None)
+
+    # Should not detect any provider throttle drift
+    throttle_drift = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert len(throttle_drift) == 0
