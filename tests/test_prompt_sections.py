@@ -93,6 +93,8 @@ def test_rendered_worker_prompts_contain_shared_section_text_and_no_placeholders
         assert "## Scope contract" in prompt
         assert "- Solve only issue #123." in prompt
         assert "If the fix touches security-sensitive behavior" in prompt
+        assert "**Containment:**" in prompt
+        assert "never resolve, cd into, or modify any other checkout" in prompt
         assert not re.search(r"\$section_\w+", prompt), (
             f"leftover $section_ placeholder in rendered {template_name}"
         )
