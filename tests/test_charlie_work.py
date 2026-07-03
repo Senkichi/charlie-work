@@ -397,6 +397,7 @@ class FakeGitHub:
             "headRefOid": "sha-abc123",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
+            "state": "OPEN",
         }
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
@@ -1880,6 +1881,104 @@ def test_review_started_clears_needs_rework() -> None:
 
     assert (123, "agent:pr-open") in fake_gh.labels_added
     assert (123, "agent:reviewing") in fake_gh.labels_added
+    assert (123, "agent:needs-rework") in fake_gh.labels_removed
+
+
+def test_dispatch_rework_skips_manual_adapter(tmp_path: Path) -> None:
+    """Rework dispatch must skip manual adapters to preserve human-paste path."""
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["adapter"] == "manual"
+    assert result.data["dispatched_count"] == 0
+
+
+def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path) -> None:
+    """Rework dispatch must find issues with needs-rework label and open PRs."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Add needs-rework label to the issue
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+        
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+    
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+    
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert str(result.data["sessions"][0]["prompt_path"]).endswith("rework-prompt.md")
+    assert result.data["sessions"][0]["branch_name"] == "agent/issue-123-fix-search"
+
+
+def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> None:
+    """Rework dispatch must transition to rework_dispatched label on success."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+        
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+    
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+    
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert (123, "agent:in-progress") in fake_gh.labels_added
     assert (123, "agent:needs-rework") in fake_gh.labels_removed
 
 

@@ -949,6 +949,7 @@ class OrchestratorApp:
     def loop(self, limit: int | None = None) -> CommandResult:
         intake = self.intake()
         dispatch = self.dispatch(limit)
+        dispatch_rework = self.dispatch_rework(limit)
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -995,7 +996,7 @@ class OrchestratorApp:
                         merges.append(self.merge_ready(pr_number).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
-        ok = intake.ok and dispatch.ok and not errors
+        ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors
         message = "loop complete"
         if errors:
             message = f"loop completed with {len(errors)} PR error(s)"
@@ -1003,15 +1004,212 @@ class OrchestratorApp:
             message = "loop completed with intake failures"
         elif not dispatch.ok:
             message = "loop completed with dispatch failures"
+        elif not dispatch_rework.ok:
+            message = "loop completed with rework dispatch failures"
         return CommandResult(
             ok,
             message,
             {
                 "intake": intake.data,
                 "dispatch": dispatch.data,
+                "dispatch_rework": dispatch_rework.data,
                 "reviews": reviews,
                 "merges": merges,
                 "errors": errors,
+            },
+        )
+
+    def dispatch_rework(
+        self, limit: int | None = None, *, only_issues: str | None = None
+    ) -> CommandResult:
+        """Dispatch rework workers for issues in needs-rework state with open PRs.
+        
+        This is only for non-manual adapters. The manual adapter's human-paste
+        path remains intact.
+        """
+        if self.config.devin.adapter == "manual":
+            return CommandResult(
+                True,
+                "rework dispatch skipped for manual adapter",
+                {"adapter": "manual", "dispatched_count": 0},
+            )
+        
+        # Find issues with needs-rework label
+        issues = self.gh.issue_list(self.config.labels.needs_rework)
+        rework_limit = limit if limit is not None else self.config.dispatch.default_limit
+        
+        # Filter to issues with open PRs
+        prs = self.gh.pr_list()
+        pr_by_issue = {linked_issue_number(pr): pr for pr in prs if linked_issue_number(pr) is not None}
+        
+        candidates = [
+            issue
+            for issue in issues
+            if int(issue["number"]) in pr_by_issue
+            and pr_by_issue[int(issue["number"])]["state"] == "OPEN"
+        ]
+        
+        if only_issues:
+            wanted = parse_issue_numbers(only_issues)
+            by_number = {int(issue["number"]): issue for issue in candidates}
+            selected = [by_number[number] for number in wanted if number in by_number]
+        else:
+            selected = candidates[:rework_limit]
+        
+        if not selected:
+            return CommandResult(
+                True,
+                "no rework candidates found",
+                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+            )
+        
+        # First lock: claim issues by marking them as dispatch_pending
+        selected_issue_numbers: list[int] = []
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            live_dispatched = set()
+            for number, entry in state.get("issues", {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                status = entry.get("status")
+                if status == "dispatched":
+                    live_dispatched.add(int(number))
+                elif status == "dispatch_pending" and not is_claim_stale(
+                    entry.get("dispatch_pending_at")
+                ):
+                    live_dispatched.add(int(number))
+            # Filter out already-dispatched issues
+            selected = [
+                issue for issue in selected if int(issue["number"]) not in live_dispatched
+            ]
+            selected_issue_numbers = [int(issue["number"]) for issue in selected]
+            # Mark selected issues as "dispatch_pending"
+            for issue_number in selected_issue_numbers:
+                state["issues"][str(issue_number)] = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "status": "dispatch_pending",
+                    "dispatch_pending_at": utc_now(),
+                }
+            save_state(self.paths.state_file, state)
+        
+        if not selected_issue_numbers:
+            return CommandResult(
+                True,
+                "all rework candidates already dispatched",
+                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+            )
+        
+        # Do all network calls, file writes, and worker launches outside the lock
+        session_requests: list[SessionRequest] = []
+        full_issues: dict[int, dict[str, Any]] = {}
+        for issue_number in selected_issue_numbers:
+            full_issue = self.gh.issue_view(issue_number)
+            full_issues[issue_number] = full_issue
+            pr = pr_by_issue[issue_number]
+            pr_number = int(pr["number"])
+            # Use the existing PR branch instead of creating a new one
+            branch_name = pr.get("headRefName", "")
+            # Use the rework prompt from the PR directory
+            rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
+            if not rework_prompt_path.exists():
+                # Skip if rework prompt doesn't exist (shouldn't happen in normal flow)
+                continue
+            session_requests.append(
+                SessionRequest(
+                    issue_number=issue_number,
+                    issue_title=str(full_issue.get("title") or ""),
+                    prompt_path=rework_prompt_path,
+                    branch_name=branch_name,
+                )
+            )
+        
+        if not session_requests:
+            return CommandResult(
+                True,
+                "no valid rework prompts found",
+                {"adapter": self.config.devin.adapter, "dispatched_count": 0},
+            )
+        
+        manifest_path = self.repo_root / self.config.devin.session_manifest
+        results_path = self.repo_root / self.config.devin.session_results
+        dispatch_results = dispatch_sessions(
+            self.repo_root,
+            manifest_path,
+            results_path,
+            self._adapter_settings(),
+            session_requests,
+        )
+        
+        successful_issue_numbers = {
+            result.issue_number for result in dispatch_results if result.ok
+        }
+        failed_issue_numbers = {
+            result.issue_number for result in dispatch_results if not result.ok
+        }
+        
+        # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
+        label_errors: list[int] = []
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for request in session_requests:
+                full_issue = full_issues[request.issue_number]
+                ok = request.issue_number in successful_issue_numbers
+                entry = {
+                    **state["issues"].get(str(request.issue_number), {}),
+                    "number": request.issue_number,
+                    "title": full_issue.get("title"),
+                    "url": full_issue.get("url"),
+                    "branch_name": request.branch_name,
+                    "prompt_path": str(request.prompt_path),
+                    "status": "dispatched" if ok else "dispatch_failed",
+                    "dispatched_at": utc_now() if ok else None,
+                }
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
+                state["issues"][str(request.issue_number)] = entry
+                save_state(self.paths.state_file, state)
+                if ok:
+                    try:
+                        transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "rework_dispatched",
+                        )
+                    except GitHubError as exc:
+                        entry["label_error"] = str(exc)
+                        label_errors.append(request.issue_number)
+                        save_state(self.paths.state_file, state)
+            state = append_event(
+                state,
+                "dispatch_rework",
+                {
+                    "issue_numbers": sorted(successful_issue_numbers),
+                    "failed_issue_numbers": sorted(failed_issue_numbers),
+                    "label_errors": sorted(label_errors),
+                },
+            )
+            save_state(self.paths.state_file, state)
+        
+        result_dicts = [result.to_dict() for result in dispatch_results]
+        message = "rework dispatch complete"
+        if failed_issue_numbers:
+            message = "rework dispatch completed with failures"
+        if label_errors:
+            message += f" (launched but label write failed: {sorted(label_errors)})"
+        return CommandResult(
+            not failed_issue_numbers,
+            message,
+            {
+                "selected_count": len(successful_issue_numbers),
+                "attempted_count": len(session_requests),
+                "failed_count": len(failed_issue_numbers),
+                "label_errors": sorted(label_errors),
+                "session_manifest": str(manifest_path),
+                "session_results": str(results_path),
+                "sessions": [asdict(request) for request in session_requests],
+                "dispatch_results": result_dicts,
             },
         )
 
