@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -235,6 +236,51 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
     )
 
     assert result == [{"name": "Tests passed", "state": "FAILURE"}]
+
+
+# --- Issue #15 regression: list limits must match reconcile and warn on truncation
+
+
+def test_issue_list_raises_limit_to_500_and_warns_on_truncation(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.WARNING)
+    limit = github_module._LIST_LIMIT
+
+    def fake_run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+        assert json_output is True
+        assert args[:2] == ["issue", "list"]
+        assert str(limit) in args, f"expected --limit {limit} in {args}"
+        return [{"number": i} for i in range(limit)]
+
+    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
+    gh = github_module.GitHub(tmp_path)
+
+    result = gh.issue_list("automated-ready")
+
+    assert len(result) == limit
+    assert any("truncated" in record.message for record in caplog.records)
+
+
+def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.WARNING)
+    limit = github_module._LIST_LIMIT
+
+    def fake_run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+        assert json_output is True
+        assert args[:2] == ["pr", "list"]
+        assert str(limit) in args, f"expected --limit {limit} in {args}"
+        return [{"number": i} for i in range(limit)]
+
+    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
+    gh = github_module.GitHub(tmp_path)
+
+    result = gh.pr_list()
+
+    assert len(result) == limit
+    assert any("truncated" in record.message for record in caplog.records)
 
 
 def _required_checks_config(**kwargs) -> OrchestratorConfig:
