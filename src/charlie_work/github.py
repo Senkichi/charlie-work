@@ -108,7 +108,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus",
             ],
             limit=_LIST_LIMIT,
             kind="open PRs",
@@ -121,7 +121,7 @@ class GitHub:
                 "view",
                 str(number),
                 "--json",
-                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository",
+                "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,files,commits,headRefOid,isCrossRepository,mergeStateStatus",
             ],
             json_output=True,
         )
@@ -197,6 +197,19 @@ class GitHub:
         except GitHubError:
             return False
         return True
+
+    def pr_update_branch(self, pr_number: int) -> bool:
+        """Update a PR's branch with the latest changes from its base.
+
+        Uses `gh pr update-branch`. Returns True on success, False on failure
+        (conflicts, network errors, etc.). Never raises — per-PR failures are
+        reported as values and must not abort a batch operation.
+        """
+        try:
+            self.run(["pr", "update-branch", str(pr_number)])
+            return True
+        except GitHubError:
+            return False
 
 
 def label_names(item: dict[str, Any]) -> set[str]:

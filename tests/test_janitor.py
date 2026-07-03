@@ -233,3 +233,54 @@ def test_multiple_failures_all_reported() -> None:
 
     assert verdict.ok is False
     assert len(verdict.failures) >= 4
+
+
+def test_base_movement_warns_for_agent_pr() -> None:
+    pr = _green_pr(mergeStateStatus="BEHIND")
+    config = _config()
+
+    verdict = run_janitor(pr, _green_checks(), config)
+
+    assert verdict.ok is True
+    assert any(
+        "Base branch has moved since branch (mergeStateStatus=BEHIND)" in w
+        for w in verdict.warnings
+    )
+
+
+def test_base_movement_skips_fork_pr() -> None:
+    pr = _green_pr(mergeStateStatus="BEHIND", isCrossRepository=True)
+
+    verdict = run_janitor(pr, _green_checks(), _config(require_issue_link=False))
+
+    assert verdict.ok is True
+    assert not any("Base moved" in w for w in verdict.warnings)
+
+
+def test_base_movement_skips_non_prefix_branch() -> None:
+    pr = _green_pr(mergeStateStatus="BEHIND", headRefName="feature/something")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+    assert not any("Base moved" in w for w in verdict.warnings)
+
+
+def test_base_movement_no_warning_when_up_to_date() -> None:
+    pr = _green_pr(mergeStateStatus="CLEAN")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+    assert not any("Base moved" in w for w in verdict.warnings)
+
+
+def test_base_movement_no_warning_when_field_missing() -> None:
+    pr = _green_pr()
+    # Remove mergeStateStatus if it exists
+    pr.pop("mergeStateStatus", None)
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+    assert not any("Base moved" in w for w in verdict.warnings)

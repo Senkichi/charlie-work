@@ -154,3 +154,22 @@ def test_legitimate_partial_placeholders_still_resolve() -> None:
         assert "- Model tier target: capable" in prompt
         # No leftover $section_ placeholders
         assert "$section_" not in prompt
+
+
+def test_rework_prompt_includes_merge_main_instruction() -> None:
+    """Verify that the rework prompt instructs workers to merge origin/main first."""
+    from pathlib import Path
+
+    rework_values = {
+        "pr_number": 456,
+        "pr_title": "fix: search is broken",
+        "pr_url": "https://example.test/pull/456",
+        "issue_number": 123,
+        "review_summary": "Fix the typo in the search function.",
+    }
+    # The rework.md template is in the package prompts dir, not repo-local
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
+
+    assert "merge the PR's base branch" in prompt
+    assert "incorporate any base changes" in prompt

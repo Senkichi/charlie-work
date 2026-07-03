@@ -434,6 +434,7 @@ class FakeGitHub:
         self.merged: list[tuple[int, str]] = []
         self.deleted_branches: list[str] = []
         self.delete_branch_ok = True
+        self.update_branch_ok = True
 
     def issue_list(self, ready_label: str):
         return self.issues
@@ -470,6 +471,9 @@ class FakeGitHub:
     def delete_branch(self, branch: str) -> bool:
         self.deleted_branches.append(branch)
         return self.delete_branch_ok
+
+    def pr_update_branch(self, pr_number: int) -> bool:
+        return self.update_branch_ok
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -2956,3 +2960,85 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
     assert len(result.data["merges"]) == 1
     assert result.data["merges"][0]["merged"] is True
     assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
+    """Test that pr_update_branch failures are reported as values, not successes."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Add a second PR to test batch behavior
+    fake_gh.pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-abc123",
+        "body": "Closes #123\n\nTests: regression coverage added.",
+        "labels": [],
+    }
+    fake_gh.issues = [
+        {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "body": "Search is broken",
+            "labels": [{"name": "automated-ready"}],
+        },
+        {
+            "number": 124,
+            "title": "Fix another",
+            "url": "https://example.test/issues/124",
+            "body": "Another issue",
+            "labels": [{"name": "automated-ready"}],
+        },
+    ]
+    # Make update-branch fail for the second PR
+    fake_gh.update_branch_ok = False
+
+    # Override pr_list to return two PRs
+    def pr_list_with_two():
+        return [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "url": "https://example.test/pull/456",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "body": "Closes #123\n\nTests: regression coverage added.",
+                "labels": [],
+                "isCrossRepository": False,
+            },
+            {
+                "number": 789,
+                "title": "Fix #124: another",
+                "url": "https://example.test/pull/789",
+                "headRefName": "agent/issue-124-fix-another",
+                "headRefOid": "sha-def456",
+                "body": "Closes #124\n\nTests: added.",
+                "labels": [],
+                "isCrossRepository": False,
+            },
+        ]
+
+    fake_gh.pr_list = pr_list_with_two
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Call _update_open_agent_prs directly
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # Should have results for both PRs (excluding the merged one)
+    assert len(results) == 1  # Only PR 789 (456 is excluded as the merged PR)
+
+    # The second PR should show updated: False due to the failure
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["head_ref"] == "agent/issue-124-fix-another"
