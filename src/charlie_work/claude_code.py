@@ -137,6 +137,7 @@ def launch_claude_worker(
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
     env: dict[str, str] | None = None,
     rework: bool = False,
+    recovery: dict[str, Any] | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -147,6 +148,11 @@ def launch_claude_worker(
 
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
+
+    If ``recovery`` is provided (a dict with state file dispatch record), this is
+    a dead-worker recovery re-dispatch. The worktree layer will inspect the
+    leftover worktree/branch and either clean it (no commits) or reuse it (has
+    commits/dirty work).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
@@ -158,6 +164,7 @@ def launch_claude_worker(
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
             rework=rework,
+            recovery=recovery,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(
@@ -187,9 +194,23 @@ def launch_claude_worker(
         )
         return _write_record(sessions_dir, record)
 
-    command = _render_command(
-        command_template, prompt_path, issue_number=issue_number, branch=branch
-    )
+    try:
+        command = _render_command(
+            command_template, prompt_path, issue_number=issue_number, branch=branch
+        )
+    except (KeyError, IndexError, ValueError) as exc:
+        remove_worktree(repo_root, worktree.path, force=True)
+        record = _error_record(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            log_path=str(log_path),
+            error=f"command template rendering failed: {exc}",
+        )
+        return _write_record(sessions_dir, record)
+
     feed_stdin = "{prompt_path}" not in "".join(command_template)
     # Workers inherit the orchestrator's environment, with config-provided
     # overrides merged on top — e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound a
