@@ -211,6 +211,7 @@ def launch_devin_session(
     command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
     worker_model: str = "",
     rework: bool = False,
+    recovery: dict[str, Any] | None = None,
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -229,6 +230,11 @@ def launch_devin_session(
 
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
+
+    If ``recovery`` is provided (a dict with state file dispatch record), this is
+    a dead-worker recovery re-dispatch. The worktree layer will inspect the
+    leftover worktree/branch and either clean it (no commits) or reuse it (has
+    commits/dirty work).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
@@ -240,6 +246,7 @@ def launch_devin_session(
             branch,
             worktrees_dir=worktrees_dir,
             rework=rework,
+            recovery=recovery,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = SessionRecord(
@@ -257,13 +264,29 @@ def launch_devin_session(
         return record
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
-    command = _render_command(
-        command_template,
-        issue_number=issue_number,
-        branch=branch,
-        prompt_path=prompt_path,
-        worker_model=worker_model,
-    )
+    try:
+        command = _render_command(
+            command_template,
+            issue_number=issue_number,
+            branch=branch,
+            prompt_path=prompt_path,
+            worker_model=worker_model,
+        )
+    except (KeyError, IndexError, ValueError) as exc:
+        remove_worktree(repo_root, worktree.path, force=True)
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            pid=None,
+            started_at=utc_now(),
+            log_path=str(log_path),
+            error=f"command template rendering failed: {exc}",
+        )
+        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        return record
 
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):

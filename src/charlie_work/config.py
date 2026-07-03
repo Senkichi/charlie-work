@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,41 @@ DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 class ConfigError(ValueError):
     """A config file was structurally invalid (unknown keys, wrong shapes)."""
+
+
+def _validate_command_placeholders(
+    command: str | tuple[str, ...],
+    allowed_placeholders: set[str],
+    config_key: str,
+) -> None:
+    """Validate that a command template uses only allowed placeholders.
+
+    Raises ConfigError if an unknown or malformed placeholder is found.
+    """
+    # Pattern to match {placeholder} tokens
+    placeholder_pattern = re.compile(r"\{([^{}]*)\}")
+
+    parts = command if isinstance(command, tuple) else (command,)
+    for part in parts:
+        matches = placeholder_pattern.findall(part)
+        for match in matches:
+            if match == "":
+                raise ConfigError(
+                    f"config section '{config_key}': empty placeholder {{}} is not allowed"
+                )
+            if match not in allowed_placeholders:
+                raise ConfigError(
+                    f"config section '{config_key}': unknown placeholder {{{match}}} "
+                    f"(allowed: {', '.join(sorted(allowed_placeholders))})"
+                )
+        # Simulate render to catch malformed placeholders that the regex misses
+        # (bare {, unclosed {prompt_path, stray }, positional {0})
+        try:
+            part.format(**{p: "" for p in allowed_placeholders})
+        except (ValueError, KeyError, IndexError) as e:
+            raise ConfigError(
+                f"config section '{config_key}': malformed placeholder in '{part}': {e}"
+            ) from e
 
 
 @dataclass(frozen=True)
@@ -229,11 +265,35 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         command_value = devin_data.get(command_key)
         if isinstance(command_value, list):
             devin_data[command_key] = tuple(str(item) for item in command_value)
+    # Validate dispatch_command placeholders (after list->tuple conversion)
+    dispatch_command = devin_data.get("dispatch_command")
+    if dispatch_command:
+        _validate_command_placeholders(
+            dispatch_command,
+            {"prompt_path", "issue_number", "branch"},
+            "devin.dispatch_command",
+        )
+    # Validate shell_command placeholders (after list->tuple conversion)
+    shell_command = devin_data.get("shell_command")
+    if shell_command:
+        _validate_command_placeholders(
+            shell_command,
+            {"prompt_path", "issue_number", "branch", "model_args"},
+            "devin.shell_command",
+        )
     devin = _build_section(DevinConfig, "devin", devin_data)
     claude_code_data = _section(data, "claude_code")
     claude_command = claude_code_data.get("command")
     if isinstance(claude_command, list):
         claude_code_data["command"] = tuple(str(item) for item in claude_command)
+    # Validate claude_code.command placeholders
+    claude_command = claude_code_data.get("command")
+    if claude_command:
+        _validate_command_placeholders(
+            claude_command,
+            {"prompt_path", "issue_number", "branch"},
+            "claude_code.command",
+        )
     worker_env = claude_code_data.get("worker_env")
     if worker_env is not None:
         if not isinstance(worker_env, dict):
@@ -247,6 +307,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     cf_command = cross_family_data.get("command")
     if isinstance(cf_command, list):
         cross_family_data["command"] = tuple(str(item) for item in cf_command)
+    # Validate cross_family.command placeholders
+    cf_command = cross_family_data.get("command")
+    if cf_command:
+        _validate_command_placeholders(
+            cf_command,
+            {"prompt_path", "issue_number", "branch", "model"},
+            "cross_family.command",
+        )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
     return OrchestratorConfig(
         labels=labels,

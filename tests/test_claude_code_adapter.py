@@ -31,7 +31,14 @@ def _install_fake_create_worktree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
 ) -> None:
     def fake_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
     ):
         if calls is not None:
             calls.append(
@@ -42,6 +49,7 @@ def _install_fake_create_worktree(
                     "worktrees_dir": worktrees_dir,
                     "venv_source": venv_source,
                     "rework": rework,
+                    "recovery": recovery,
                 }
             )
         return _fake_worktree(tmp_path, branch)
@@ -279,7 +287,14 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
     sessions_dir = tmp_path / "sessions"
 
     def failing_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
     ):
         raise RuntimeError("git worktree add failed: branch already exists")
 
@@ -553,3 +568,50 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
     # Verify the sidecar was updated
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_launch_claude_worker_render_error_returns_error_record_and_tears_down_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Defense-in-depth: render errors past the load gate return error records, not exceptions."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    worktree_removed = []
+
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
+        worktree_removed.append(worktree_path)
+        return True
+
+    monkeypatch.setattr(
+        claude_code,
+        "create_worktree",
+        lambda *args, **kwargs: _fake_worktree(tmp_path, "agent/issue-1"),
+    )
+    monkeypatch.setattr(claude_code, "remove_worktree", tracking_remove_worktree)
+
+    # Template with an unknown placeholder that bypasses load validation
+    record = launch_claude_worker(
+        1,
+        "agent/issue-1",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("echo", "{unknown_placeholder}"),
+    )
+
+    # Must return an error record, not raise
+    assert not record.ok
+    assert record.error is not None
+    assert "command template rendering failed" in record.error
+    assert record.pid is None
+
+    # Worktree must have been torn down
+    assert len(worktree_removed) == 1
+
+    # Sidecar must record the error
+    sidecar_path = sessions_dir / "issue-1.claude.json"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["error"] is not None
+    assert payload["pid"] is None
