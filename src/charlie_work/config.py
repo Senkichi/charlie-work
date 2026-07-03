@@ -103,8 +103,11 @@ class DevinConfig:
     # devin-shell adapter: sidecar JSON + per-session logs live here.
     sessions_dir: str = ".var/charlie-work/dispatches/sessions"
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
-    # Placeholders: {prompt_path} {issue_number} {branch}.
+    # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
     shell_command: tuple[str, ...] = ()
+    # devin-shell worker model; empty string means CLI default. When set,
+    # injects "--model <value>" into the rendered command via {model_args}.
+    worker_model: str = ""
 
 
 @dataclass(frozen=True)

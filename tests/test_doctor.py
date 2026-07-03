@@ -384,3 +384,71 @@ def test_doctor_adapter_probe_uses_configured_claude_binary(tmp_path: Path, monk
     assert captured[0][0] == "my-claude-wrapper", (
         "probe must use the configured binary, not the hardcoded default"
     )
+
+
+def test_doctor_reports_config_driven_worker_model(tmp_path: Path) -> None:
+    """When devin.worker_model is set, doctor must report the config-driven model."""
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(
+            adapter="devin-shell",
+            sessions_dir="sessions",
+            worker_model="claude-sonnet-4-5",
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "devin-shell worker model" in by_name
+    model_check = by_name["devin-shell worker model"]
+    assert model_check.ok is True
+    assert "config-driven: claude-sonnet-4-5" in model_check.detail
+    assert ok is True
+
+
+def test_doctor_reports_cli_default_when_worker_model_empty(tmp_path: Path) -> None:
+    """When devin.worker_model is empty (default), doctor must report CLI default."""
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(
+            adapter="devin-shell",
+            sessions_dir="sessions",
+            worker_model="",
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "devin-shell worker model" in by_name
+    model_check = by_name["devin-shell worker model"]
+    assert model_check.ok is True
+    assert "CLI default" in model_check.detail
+    assert model_check.severity == "warning"
+    assert ok is True  # warning-only, not a blocking failure
+
+
+def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(
+    tmp_path: Path
+) -> None:
+    """When adapter is not devin-shell, the worker model check must not appear."""
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(
+            adapter="claude-code",
+            sessions_dir="sessions",
+            worker_model="claude-sonnet-4-5",
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    names = {check.name for check in checks}
+    assert "devin-shell worker model" not in names

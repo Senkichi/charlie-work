@@ -51,10 +51,18 @@ devin:
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
   session_results: .var/charlie-work/dispatches/session-results.json
   sessions_dir: .var/charlie-work/dispatches/sessions
+  # Worker model for devin-shell sessions; empty string means CLI default
+  # (currently claude-opus-4-8-medium, the premium tier). Set to a specific
+  # model name (e.g. "claude-sonnet-4-5") to control cost. The rendered command
+  # will include "--model <value>" when set. Run `charlie doctor` to verify the
+  # effective model before dispatching.
+  worker_model: ""
   # Launch command override; empty uses the built-in default (shown below).
-  # Placeholders: {prompt_path} {issue_number} {branch}. A list runs without a
+  # Placeholders: {prompt_path} {issue_number} {branch} {model_args}. A list runs without a
   # shell. --permission-mode dangerous is required for headless workers; without
   # it the Devin CLI defaults to auto (read-only tools) and stalls on git/uv/gh.
+  # The {model_args} placeholder is replaced with "--model <worker_model>" when
+  # worker_model is set, or an empty string when unset (CLI default).
   # shell_command: [devin, --prompt-file, "{prompt_path}", --print, --permission-mode, dangerous]
   # A blocking alternative is adapter: command with dispatch_command +
   # command_timeout_seconds (one blocking launcher call per issue).

@@ -91,6 +91,7 @@ class OrchestratorApp:
             worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
             venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
             worker_env=claude.worker_env,
+            worker_model=self.config.devin.worker_model,
         )
 
     def status(self) -> CommandResult:

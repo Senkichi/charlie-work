@@ -38,6 +38,8 @@ class AdapterSettings:
     # process (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound local test
     # parallelism). Empty means no overrides.
     worker_env: dict[str, str] = field(default_factory=dict)
+    # devin-shell worker model; empty string means CLI default.
+    worker_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,7 @@ def _run_devin_shell_adapter(
         sessions_dir=sessions_dir,
         worktrees_dir=settings.worktrees_dir,
         command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
+        worker_model=settings.worker_model,
     )
     # Non-blocking launch: there is no returncode/stdout to report — liveness
     # and output live in the sidecar JSON and per-session log.
