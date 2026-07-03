@@ -941,8 +941,12 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
 def test_report_body_is_valid_detects_real_review_vs_blocked() -> None:
     assert report_body_is_valid("**MAJOR**\nissue\n\nVerdict: safe") is True
     assert report_body_is_valid("Verdict: safe") is True
-    assert report_body_is_valid("I'm blocked. Please re-run.") is False
-    assert report_body_is_valid("Verdict: blocked") is False
+    assert report_body_is_valid("Verdict: no permission issues found") is True
+    blocked = (
+        "I'm blocked from performing the review. All tool calls are being rejected. Please re-run."
+    )
+    assert report_body_is_valid(blocked) is False
+    assert report_body_is_valid("Verdict: blocked from performing the review") is False
     assert report_body_is_valid("") is False
 
 

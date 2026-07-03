@@ -40,7 +40,11 @@ _TRANSIENT_RE = re.compile(
 )
 
 _BLOCKED_RE = re.compile(
-    r"\b(?:blocked|permission|re-run|rejected|refused|unavailable)\b", re.IGNORECASE
+    r"(?:blocked from performing|blocked from completing|"
+    r"all tool calls are being rejected|permission denied|please re-run|"
+    r"re-run the review|i'm blocked|i am blocked|cannot perform the review|"
+    r"unable to perform the review|tool use has been disabled|refused to execute)",
+    re.IGNORECASE,
 )
 
 _VERDICT_RE = re.compile(r"^\s*verdict\s*:", re.IGNORECASE | re.MULTILINE)
@@ -54,8 +58,10 @@ def report_body_is_valid(body: str) -> bool:
     """Return True if the captured model output looks like a real review.
 
     A real review must contain at least one severity marker (**SEVERITY**) or a
-    final ``Verdict:`` line.  Blocked/refusal messages that happen to include a
-    verdict line are still rejected so they cannot be cached as a success report.
+    non-refusal ``Verdict:`` line.  Blocked/refusal messages (e.g. "blocked from
+    performing the review", "all tool calls are being rejected", "please re-run")
+    are rejected even if they include a verdict line, so they cannot be cached as a
+    success report.
     """
     text = body.strip()
     if not text:
