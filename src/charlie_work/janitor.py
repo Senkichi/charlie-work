@@ -209,6 +209,10 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
 
     Untracked files are ignored unless they are introduced by the PR diff as new files.
 
+    NOTE: If main has advanced past the PR base, hunk line numbers can shift and a genuine
+    leak may read as unrelated-dirty (false negative). This is a report-only feature and
+    acceptable degradation.
+
     Returns a tuple of warning messages. Never modifies or deletes files.
     """
     warnings: list[str] = []
@@ -246,29 +250,38 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
         return ()
 
     # Parse NUL-separated records from git status --porcelain -z
-    # Format: XY filename\0 (or XY filename -> newname\0 for renames)
+    # Format: XY filename\0 (or XY newname\0oldname\0 for renames/copies with -z)
     dirty_files: set[str] = set()
     untracked_files: set[str] = set()
 
     if all_status_output:
         records = all_status_output.split("\0")
-        for record in records:
+        i = 0
+        while i < len(records):
+            record = records[i]
             if not record:
+                i += 1
                 continue
             # Extract status (first 2 characters)
             if len(record) < 3:
+                i += 1
                 continue
             status = record[:2]
             # Extract filename (skip the 2-character status and the space after it)
-            # The record format is: XY<space>filename or XY<space>filename -> newname
+            # The record format is: XY<space>filename
             rest_of_record = record[2:]
             if rest_of_record.startswith(" "):
                 rest_of_record = rest_of_record[1:]
-            # For renames, take the new name (after " -> ")
-            if " -> " in rest_of_record:
-                filename = rest_of_record.split(" -> ")[1]
+
+            # For renames (R) and copies (C) with -z, the next field is the old path
+            # Format: XY newname\0oldname\0
+            if status.startswith(("R", "C")):
+                # Skip the next record (old path) and use the new name
+                filename = rest_of_record
+                i += 2  # Skip both current and next record
             else:
                 filename = rest_of_record
+                i += 1
 
             if not filename:
                 continue
@@ -285,43 +298,44 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
 
     # Parse the PR diff to extract hunks for each file
     # We compare hunks directly instead of reconstructing content
+    # Split on diff --git section boundaries to avoid multi-file clobbering
     pr_file_hunks: dict[str, str] = {}
     pr_new_files: set[str] = set()
-    current_file: str | None = None
-    current_hunks: list[str] = []
-    in_hunk = False
 
-    for line in pr_diff.splitlines():
-        if line.startswith("+++ b/"):
-            # New file in the diff - save previous file's hunks
-            if current_file is not None:
-                pr_file_hunks[current_file] = "\n".join(current_hunks)
-            current_file = line[6:]  # Strip "+++ b/" prefix
-            current_hunks = []
-            in_hunk = False
-        elif line.startswith("new file mode"):
-            # Mark this as a new file in the PR
-            if current_file is not None:
-                pr_new_files.add(current_file)
-        elif line.startswith("@@"):
-            # Start of a hunk - include the hunk header
-            in_hunk = True
-            current_hunks.append(line)
-        elif in_hunk:
-            # Include all hunk lines (context, additions, deletions)
-            # Skip diff metadata lines (starting with \)
-            if not line.startswith("\\"):
+    # Split the diff into sections (each file starts with "diff --git")
+    sections = pr_diff.split("\ndiff --git")
+    for section in sections:
+        if not section.strip():
+            continue
+
+        # Re-add the "diff --git" prefix that was stripped by split
+        if not section.startswith("diff --git"):
+            section = "diff --git" + section
+
+        # Extract the file path from the +++ line
+        current_file: str | None = None
+        current_hunks: list[str] = []
+        is_new_file = False
+
+        for line in section.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]  # Strip "+++ b/" prefix
+            elif line.startswith("new file mode"):
+                is_new_file = True
+            elif line.startswith("@@"):
+                # Start of a hunk - include the hunk header
                 current_hunks.append(line)
-            # End of hunk when we hit a new file or end of diff
-            if line.startswith("diff --git"):
-                in_hunk = False
-                if current_file is not None:
-                    pr_file_hunks[current_file] = "\n".join(current_hunks)
-                current_hunks = []
+            elif current_hunks:
+                # Include all hunk lines (context, additions, deletions)
+                # Skip diff metadata lines (starting with \)
+                if not line.startswith("\\"):
+                    current_hunks.append(line)
 
-    # Don't forget the last file
-    if current_file is not None:
-        pr_file_hunks[current_file] = "\n".join(current_hunks)
+        # Save the file's hunks
+        if current_file is not None:
+            pr_file_hunks[current_file] = "\n".join(current_hunks)
+            if is_new_file:
+                pr_new_files.add(current_file)
 
     # Check each dirty file against the PR's hunks
     leaked_files: list[str] = []
@@ -359,7 +373,12 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
             normalized = []
             for line in lines:
                 # Skip header lines that vary between runs
-                if line.startswith("diff --git") or line.startswith("index ") or line.startswith("--- ") or line.startswith("+++ "):
+                if (
+                    line.startswith("diff --git")
+                    or line.startswith("index ")
+                    or line.startswith("--- ")
+                    or line.startswith("+++ ")
+                ):
                     continue
                 # Skip diff metadata lines
                 if line.startswith("\\"):
