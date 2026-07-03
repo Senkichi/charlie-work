@@ -36,6 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default because probes run external binaries."
         ),
     )
+    doctor.add_argument(
+        "--live",
+        action="store_true",
+        dest="live",
+        help=(
+            "Validate gh --json field lists against the live gh CLI by executing "
+            "read-only queries. Off by default because it requires network access "
+            "to GitHub."
+        ),
+    )
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -113,7 +123,7 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
     ok, checks = run_doctor(
-        repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe
+        repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe, live=args.live
     )
     failed = [check for check in checks if not check.ok]
     message = (
