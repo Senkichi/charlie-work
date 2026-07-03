@@ -834,23 +834,36 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
-            # Update the linked issue's status when request_changes is recorded:
-            # the previous worker session is definitionally finished, so clear the
-            # dispatched claim to make the issue selectable for rework dispatch.
-            # Escalated requests must NOT mark the issue selectable.
-            if decision == "request_changes" and issue_number is not None:
-                if not escalated:
+            # Update the linked issue's status to reconcile out of rework_requested:
+            # the previous worker session is definitionally finished, so the issue
+            # status must reflect the actual decision. This prevents state-driven
+            # dispatch_rework from selecting approved/blocked PRs for duplicate work.
+            if issue_number is not None:
+                if decision == "request_changes":
+                    if not escalated:
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "rework_requested",
+                        }
+                    else:
+                        # Clear rework_requested status when escalated to prevent selection
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "escalated",
+                        }
+                elif decision == "approved":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "rework_requested",
+                        "status": "approved",
                     }
-                else:
-                    # Clear rework_requested status when escalated to prevent selection
+                elif decision == "blocked":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "escalated",
+                        "status": "blocked",
                     }
             state = append_event(
                 state,

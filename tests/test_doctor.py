@@ -588,10 +588,10 @@ def test_fake_github_payloads_align_with_field_constants() -> None:
     fake_gh = MainFakeGitHub()
 
     # Verify PR payload keys are subset of PR_LIST_FIELDS
-    pr_keys = set(fake_gh.pr.keys())
+    pr_keys = set(fake_gh.prs[0].keys())
     extra_pr_keys = pr_keys - pr_list_fields
     assert not extra_pr_keys, (
-        f"FakeGitHub.pr has keys not in PR_LIST_FIELDS: {extra_pr_keys}. "
+        f"FakeGitHub.prs[0] has keys not in PR_LIST_FIELDS: {extra_pr_keys}. "
         f"Either remove these keys from the fake or add them to PR_LIST_FIELDS."
     )
 
