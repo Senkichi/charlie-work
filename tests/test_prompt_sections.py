@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from string import Template
 
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import render_prompt
