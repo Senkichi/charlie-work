@@ -370,6 +370,7 @@ def test_detect_drift_surfaces_stale_dispatch_pending_claims() -> None:
 
     # Temporarily replace is_claim_stale in the reconcile module
     import charlie_work.reconcile as reconcile_module
+
     original_reconcile_is_claim_stale = reconcile_module.is_claim_stale
     reconcile_module.is_claim_stale = _mock_is_claim_stale
 
