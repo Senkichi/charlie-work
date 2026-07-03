@@ -427,7 +427,6 @@ class FakeGitHub:
             "headRefOid": "sha-abc123",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
-            "state": "OPEN",
         }
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []

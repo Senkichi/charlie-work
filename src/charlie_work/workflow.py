@@ -1165,12 +1165,9 @@ class OrchestratorApp:
                 ):
                     pr_by_issue[issue_number] = pr
 
-        candidates = [
-            issue
-            for issue in issues
-            if int(issue["number"]) in pr_by_issue
-            and pr_by_issue[int(issue["number"])]["state"] == "OPEN"
-        ]
+        # pr_list() returns only open PRs by contract (--state open); its field
+        # list does not include "state", so no per-PR state check here.
+        candidates = [issue for issue in issues if int(issue["number"]) in pr_by_issue]
 
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
