@@ -75,10 +75,10 @@ which:
    reasoning.
 2. **Rework cap exhausted** (`"decision": "request_changes", "escalated":
    true`) — the PR has been through `review.max_rework_cycles` (default `2`;
-   `3` in both shipped example profiles) rounds of `request_changes` without
-   converging. This usually means the issue brief was wrong, ambiguous, or
-   the acceptance criteria are unimplementable as written — not that "one
-   more rework round" will fix it.
+   both shipped example profiles also set `2`) rounds of `request_changes`
+   without converging. This usually means the issue brief was wrong,
+   ambiguous, or the acceptance criteria are unimplementable as written —
+   not that "one more rework round" will fix it.
 
 **Recovery**: fix the underlying problem (rewrite the issue, resolve the
 product ambiguity, or manually push a fix to the PR branch yourself), then
@@ -153,10 +153,13 @@ PR, and contradictory label sets (a terminal label alongside active ones).
 Configured via `review.max_rework_cycles` (default `2` in `config.py` and in
 both shipped `examples/*.yaml` profiles — "iteration past ~2 rounds thrashes"
 per the operator decision recorded in `config.py`'s `ReviewConfig`
-docstring). `record_review()` recomputes the prior-cycle
-count fresh from `state["events"]` on every call — counting `record_review`
-events for that exact PR number with `decision == "request_changes"` — so
-there is no separate mutable counter to get out of sync. Practical
+docstring). `record_review()` reads and increments a **durable per-PR
+counter** — `state["prs"][<pr_number>]["request_changes_count"]` — and bases
+the escalation decision on that field. This counter is intentionally **not**
+derived from `state["events"]`: `append_event` truncates the events log to the
+last 200 entries (`state.py`), so on a busy repo that eviction could silently
+reset an events-derived count and allow a PR to rework indefinitely instead of
+escalating. The durable counter survives the events log rolling over. Practical
 implication: **the count is per-PR, not per-issue** — if a rework cycle
 requires closing a PR and opening a fresh one for the same issue (branch
 unrecoverable), the cycle count resets, because it's keyed by

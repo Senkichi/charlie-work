@@ -94,13 +94,13 @@ predictable.
 | Command | What it does |
 |---|---|
 | `charlie roll-call` | show what's ready / active / linked (the `status` view) |
-| `charlie intake` | label eligible open issues `automated-ready` |
+| `charlie intake` | write worker prompts and state for issues already labeled `automated-ready` |
 | `charlie work` | dispatch a newest-first wave of one-issue worker sessions |
 | `charlie why-charlie-hate` | janitor gate + adversarial review packet for a PR |
 | `charlie why-charlie-hate-spec` | cross-family adversarial pass on a design doc |
 | `charlie verdict` | record a review decision (`approved` / `request_changes` / `blocked`) |
 | `charlie ship-it` | merge a PR once it's approved and required checks are green |
-| `charlie bash-rats` | run the whole cycle (intake → work → review → merge) until the queue's dry |
+| `charlie bash-rats` | run one pass of intake → work → review → merge |
 | `charlie mop-up` | detect (and with `--fix`, repair) label/state drift |
 | `charlie doctor` | preflight diagnostics (env, labels, CI-check names, config, adapter) |
 | `charlie bootstrap-labels` | create the nine `agent:*` / `automated-ready` labels once |
