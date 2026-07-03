@@ -2414,6 +2414,7 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
             # Add needs-rework label to the issue (for display)
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
+
     # Initialize state with the issue in rework_requested status
     # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -2464,6 +2465,7 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
             super().__init__()
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
+
     # Initialize state with the issue in rework_requested status
     # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -2512,6 +2514,7 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
         def __init__(self) -> None:
             super().__init__()
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
 
     # Initialize state with the issue in rework_requested status
     # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
@@ -3795,6 +3798,7 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
             # Add needs-rework label to the issue
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
+
         def issue_list(self, ready_label: str):
             if ready_label == "agent:needs-rework":
                 return self.issues
@@ -3883,6 +3887,7 @@ def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
             # Add needs-rework label to the issue (for display)
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
+
     # Initialize state with the issue in rework_requested status
     # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -3935,6 +3940,7 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
             super().__init__()
             # Issue does NOT have needs-rework label
             self.issues[0]["labels"] = []
+
 
     # Initialize state with the issue in rework_requested status (label is missing)
     # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
