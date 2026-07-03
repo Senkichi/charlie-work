@@ -3057,10 +3057,10 @@ def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
     assert "concurrency_limit" not in result.data
 
 
-def test_concurrency_governor_clamps_dispatch_when_sessions_alive(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
+    tmp_path: Path, monkeypatch
+) -> None:
     """When max_concurrent_sessions is set and there are live sessions, dispatch should be clamped."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
 
     # Mock _count_live_sessions to return 2 live sessions
     def mock_count_live(sessions_dir):
@@ -3088,8 +3088,6 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(tmp_path: Path
 
 def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch) -> None:
     """Concurrency governor should also clamp rework dispatch."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
 
     # Mock _count_live_sessions to return 1 live session
     def mock_count_live(sessions_dir):
@@ -3115,8 +3113,8 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
             "labels": [{"name": "agent:needs-rework"}],
         }
     )
+
     # Override pr_list to return the rework PR
-    original_pr_list = fake_gh.pr_list
     def pr_list_with_rework():
         return [
             {
@@ -3129,6 +3127,7 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
                 "isCrossRepository": False,
             }
         ]
+
     fake_gh.pr_list = pr_list_with_rework
 
     result = app.dispatch_rework()
@@ -3142,8 +3141,6 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
 
 def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatch) -> None:
     """When some slots are available, dispatch should launch up to that limit."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
 
     # Mock _count_live_sessions to return 1 live session
     def mock_count_live(sessions_dir):
@@ -3192,6 +3189,7 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     )
     devin_path = sessions_dir / "issue-1.json"
     import json
+
     devin_path.write_text(json.dumps(devin_record.to_dict()), encoding="utf-8")
 
     # Create a claude-code session record
