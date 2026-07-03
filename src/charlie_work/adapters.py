@@ -274,7 +274,7 @@ def _run_command_adapter(
 ) -> SessionDispatchResult:
     try:
         command = _render_command(dispatch_command, request)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:
         return _result(request, adapter="command", ok=False, error=str(exc))
     if not command:
         return _result(
