@@ -46,7 +46,7 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 # Pattern for "resets in N minutes" to extract cooldown duration
-_RESETS_IN_PATTERN = re.compile(r"resets in (\d+) minutes?", re.IGNORECASE)
+_RESETS_IN_PATTERN = re.compile(r"resets? in (\d+) minutes?", re.IGNORECASE)
 
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
@@ -115,13 +115,8 @@ def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
 
     # Check for quota exhaustion first (more severe)
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
-        # Try to parse "resets in N minutes" or similar
-        match = _RESETS_IN_PATTERN.search(tail)
-        if match:
-            minutes = int(match.group(1))
-            cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)  # Use default for quota
-        else:
-            cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
+        # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
         throttled_until = datetime.now(UTC) + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"

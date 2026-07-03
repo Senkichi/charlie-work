@@ -632,6 +632,7 @@ def test_command_template_omits_model_when_worker_model_empty(
 def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> None:
     """Test that rate-limit errors with 'resets in N minutes' are classified correctly."""
     from charlie_work.devin_shell import _classify_session_failure
+    from datetime import UTC, datetime, timedelta
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -648,6 +649,11 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
     # Verify it's a valid ISO timestamp
     assert "T" in throttled_until
     assert "Z" in throttled_until
+    # Verify the cooldown reflects the parsed 10 minutes
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    # Allow 1 second tolerance for test execution time
+    assert abs((throttle_time - expected_time).total_seconds()) < 1
 
 
 def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) -> None:

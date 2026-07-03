@@ -3327,6 +3327,60 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
+def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -> None:
+    """Test that loop() classifies dead sessions and sets throttled_until in state."""
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+    from datetime import UTC, datetime, timedelta
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Ensure state directory exists
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a sessions directory with a dead session that has a rate-limit log
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Call the classification function directly
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, paths.state_file)
+
+    # Verify throttled_until was set in state
+    state = load_state(paths.state_file)
+    assert state.get("throttled_until") is not None
+
+    # Verify the cooldown reflects the parsed 10 minutes
+    throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    # Allow 1 second tolerance for test execution time
+    assert abs((throttle_time - expected_time).total_seconds()) < 1
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig

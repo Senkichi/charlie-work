@@ -83,6 +83,55 @@ def _count_live_sessions(sessions_dir: Path) -> int:
     return live_count
 
 
+def _classify_dead_sessions_and_update_throttle_state(
+    sessions_dir: Path, state_file: Path
+) -> None:
+    """Check for dead sessions, classify their failures, and update throttle state.
+
+    This is called from the production loop to detect provider throttling
+    from worker deaths and set the cooldown window in state.json.
+    """
+    from .devin_shell import (
+        is_session_alive,
+        read_session_records,
+        update_session_record_with_failure_classification,
+    )
+    from .claude_code import (
+        is_worker_alive,
+        read_worker_records,
+        update_worker_record_with_failure_classification,
+    )
+    from .state import load_state, save_state, set_throttled_until, state_lock
+
+    # Check devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if record.error is None and not is_session_alive(record):
+            # Session exited without error - classify the failure
+            failure_kind, throttled_until = update_session_record_with_failure_classification(
+                sessions_dir, record.issue_number
+            )
+            if failure_kind and throttled_until:
+                # Update state with throttle window
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(state, throttled_until)
+                    save_state(state_file, state)
+
+    # Check claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if record.error is None and not is_worker_alive(record):
+            # Session exited without error - classify the failure
+            failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                sessions_dir, record.issue_number
+            )
+            if failure_kind and throttled_until:
+                # Update state with throttle window
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(state, throttled_until)
+                    save_state(state_file, state)
+
+
 def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     """Return the set of issue numbers that have currently alive worker sessions.
 
@@ -1302,6 +1351,11 @@ class OrchestratorApp:
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < effective_limit:
                 effective_limit = available_slots
+
+        # Classify dead sessions and update throttle state (production loop path)
+        # This detects provider throttling from worker deaths and sets cooldown
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        _classify_dead_sessions_and_update_throttle_state(sessions_dir, self.paths.state_file)
 
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
