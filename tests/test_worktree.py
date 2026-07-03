@@ -463,7 +463,9 @@ def test_recovery_branch_mismatch_raises(tmp_path: Path) -> None:
     recovery_record = {"branch_name": "agent/issue-1-other", "status": "dispatched"}
 
     with pytest.raises(RuntimeError, match="Recovery record branch_name"):
-        create_worktree(repo_root, "agent/issue-1-different", base_ref="HEAD", recovery=recovery_record)
+        create_worktree(
+            repo_root, "agent/issue-1-different", base_ref="HEAD", recovery=recovery_record
+        )
 
 
 def test_recovery_foreign_branch_fails_loudly(tmp_path: Path) -> None:

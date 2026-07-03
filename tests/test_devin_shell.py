@@ -52,7 +52,14 @@ def _install_fake_create_worktree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
 ) -> None:
     def fake_create_worktree(
-        repo_root, branch, *, base_ref="HEAD", worktrees_dir=None, venv_source=None, rework=False, recovery=None
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
     ):
         if calls is not None:
             calls.append(
