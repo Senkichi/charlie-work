@@ -6,8 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import CLI_NAME
-from .config import find_config_path, load_config
+from .config import ConfigError, find_config_path, load_config
 from .doctor import run_doctor
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
@@ -184,6 +186,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except OSError as exc:
         print(f"OS error: {exc}", file=sys.stderr)
+        return 2
+    except (ConfigError, ValueError) as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except yaml.YAMLError as exc:
+        print(f"YAML error: {exc}", file=sys.stderr)
         return 2
     print_result(result, json_output=args.json_output)
     return 0 if result.ok else 1
