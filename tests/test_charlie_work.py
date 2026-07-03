@@ -1672,6 +1672,7 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
                         "body": "",
                         "state": "MERGED",
                         "labels": [],
+                        "isCrossRepository": False,
                     }
                 ]
             # issue list: issue 123 still has agent:in-progress (drift)
@@ -1714,6 +1715,7 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
                 "body": "",
                 "state": "MERGED",
                 "labels": [],
+                "isCrossRepository": False,
                 "headRepositoryOwner": "owner",
                 "baseRepositoryOwner": "owner",
             }
@@ -1985,16 +1987,18 @@ def test_linked_issue_number_same_repo_closing_keyword_binds() -> None:
     )
 
 
-def test_linked_issue_number_none_is_cross_repository_treats_as_same_repo() -> None:
-    # When is_cross_repository is None (e.g., old code paths), treat as same-repo
-    # for backward compatibility. This should only happen in tests or legacy code.
+def test_linked_issue_number_none_treats_as_cross_repository() -> None:
+    # When is_cross_repository is None (provenance unknown), treat as cross-repo
+    # for trust purposes — bind nothing via branch name or closing keyword
+    # (fail closed). This hardens against future call sites that omit the
+    # parameter or pass a PR dict missing the isCrossRepository field.
     assert (
         linked_issue_number(
             {"headRefName": "agent/issue-42-fix"},
             is_cross_repository=None,
             branch_prefix="agent/issue",
         )
-        == 42
+        is None
     )
     assert (
         linked_issue_number(
@@ -2002,7 +2006,7 @@ def test_linked_issue_number_none_is_cross_repository_treats_as_same_repo() -> N
             is_cross_repository=None,
             branch_prefix="agent/issue",
         )
-        == 42
+        is None
     )
 
 
@@ -3014,6 +3018,7 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
         "headRefOid": "sha-abc123",
         "body": "Closes #123\n\nTests: regression coverage added.",
         "labels": [],
+        "isCrossRepository": False,
     }
     fake_gh.issues = [
         {
