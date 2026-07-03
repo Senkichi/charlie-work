@@ -28,21 +28,11 @@ if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig
 
 
-# Case-insensitive markers scanned for in the PR body when
-# `config.review.require_tests_or_rationale` is set. Presence of any one of
-# these substrings is treated as evidence the author addressed testing or
-# gave a rationale for omitting it (e.g. "no tests because ...").
-TESTS_OR_RATIONALE_MARKERS = frozenset(
-    {
-        "test",
-        "tests",
-        "tested",
-        "testing",
-        "verified",
-        "verification",
-        "rationale",
-        "no tests because",
-    }
+# Case-insensitive word-boundary regex for tests/rationale markers.
+# Matches whole words only to avoid false positives like "test" in "latest".
+_TESTS_OR_RATIONALE_RE = re.compile(
+    r"\b(?:tests?|tested?|testing|verified?|verification|rationale|no tests because)\b",
+    flags=re.IGNORECASE,
 )
 
 _CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|refactor|docs|test|chore|perf|ci)(\(|:|!)")
@@ -50,6 +40,24 @@ _CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|refactor|docs|test|chore|perf|
 # Oversized-diff warning threshold: additions + deletions above this line
 # count flags the PR as a warning (not a block) for reviewer awareness.
 _OVERSIZED_DIFF_THRESHOLD = 1500
+
+# PR dict keys read by janitor gate functions.
+# This is the single source of truth for what fields the janitor needs from PR data.
+# All keys here must be present in github.PR_VIEW_FIELDS or the corresponding gate will be silently disabled.
+JANITOR_PR_KEYS = frozenset(
+    {
+        "isDraft",  # _check_draft
+        "state",  # _check_state
+        "mergeable",  # _check_mergeable
+        "isCrossRepository",  # _check_linked_issue, _check_base_movement
+        "headRefName",  # _check_linked_issue, _check_base_movement
+        "body",  # _check_body
+        "title",  # _check_title_conventional
+        "additions",  # _check_diff_size
+        "deletions",  # _check_diff_size
+        "mergeStateStatus",  # _check_base_movement
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -148,8 +156,7 @@ def _check_body(pr: dict[str, Any], config: OrchestratorConfig, failures: list[s
         failures.append("PR body is empty")
         return
     if config.review.require_tests_or_rationale:
-        lowered = body.lower()
-        if not any(marker in lowered for marker in TESTS_OR_RATIONALE_MARKERS):
+        if not _TESTS_OR_RATIONALE_RE.search(body):
             failures.append("PR body has no tests/verification/rationale mention")
 
 
