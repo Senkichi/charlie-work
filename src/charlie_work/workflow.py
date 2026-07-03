@@ -75,6 +75,28 @@ def _count_live_sessions(sessions_dir: Path) -> int:
     return live_count
 
 
+def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
+    """Return the set of issue numbers that have currently alive worker sessions.
+
+    Reads session sidecar files from both devin-shell and claude-code adapters,
+    then checks each record's PID liveness using the adapter-specific liveness
+    probe. Returns the set of issue numbers with alive PIDs.
+    """
+    from .devin_shell import is_session_alive, read_session_records
+    from .claude_code import is_worker_alive, read_worker_records
+
+    live_issues = set()
+    # Check devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if is_session_alive(record):
+            live_issues.add(record.issue_number)
+    # Check claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if is_worker_alive(record):
+            live_issues.add(record.issue_number)
+    return live_issues
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -284,17 +306,41 @@ class OrchestratorApp:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 # Same dispatchability logic as the real dispatch, but read-only
+                # Issue #5: also check worker liveness for "dispatched" status
+                sessions_dir = self._resolve(self.config.devin.sessions_dir)
                 live_dispatched = set()
+                # Build open PR → issue map for the recovery condition
+                prs = self.gh.pr_list()
+                pr_by_issue = {}
+                for pr in prs:
+                    issue_number = linked_issue_number(
+                        pr,
+                        is_cross_repository=pr.get("isCrossRepository"),
+                        branch_prefix=self.config.dispatch.branch_prefix,
+                    )
+                    if issue_number is not None:
+                        # If multiple PRs link to the same issue, keep the lowest PR number
+                        if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                            pr_by_issue[issue_number]["number"]
+                        ):
+                            pr_by_issue[issue_number] = pr
+
+                live_worker_issues = _issues_with_live_workers(sessions_dir)
                 for number, entry in state.get("issues", {}).items():
                     if not isinstance(entry, dict):
                         continue
                     status = entry.get("status")
-                    if status == "dispatched":
-                        live_dispatched.add(int(number))
-                    elif status == "dispatch_pending" and not is_claim_stale(
+                    if status == "dispatch_pending" and not is_claim_stale(
                         entry.get("dispatch_pending_at")
                     ):
                         live_dispatched.add(int(number))
+                    elif status == "dispatched":
+                        # Issue #5: only exclude if the worker is alive OR there's an open PR.
+                        # A dead worker with no open PR is recoverable (crashed before PR opened).
+                        # A dead worker with an open PR is mid-review and must not be re-dispatched.
+                        issue_number = int(number)
+                        if issue_number in live_worker_issues or issue_number in pr_by_issue:
+                            live_dispatched.add(issue_number)
                 candidates = [
                     issue
                     for issue in issues
@@ -359,17 +405,42 @@ class OrchestratorApp:
             # _is_dispatchable is label-only; this closes the launched-but-unlabeled
             # window that would otherwise spawn a second worker on the same issue.
             # Stale claims (crashed phase-2) are excluded to allow re-dispatch.
+            # Issue #5: also check worker liveness for "dispatched" status to recover
+            # from crashed workers before PR opens.
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
             live_dispatched = set()
+            # Build open PR → issue map for the recovery condition
+            prs = self.gh.pr_list()
+            pr_by_issue = {}
+            for pr in prs:
+                issue_number = linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=self.config.dispatch.branch_prefix,
+                )
+                if issue_number is not None:
+                    # If multiple PRs link to the same issue, keep the lowest PR number
+                    if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                        pr_by_issue[issue_number]["number"]
+                    ):
+                        pr_by_issue[issue_number] = pr
+
+            live_worker_issues = _issues_with_live_workers(sessions_dir)
             for number, entry in state.get("issues", {}).items():
                 if not isinstance(entry, dict):
                     continue
                 status = entry.get("status")
-                if status == "dispatched":
-                    live_dispatched.add(int(number))
-                elif status == "dispatch_pending" and not is_claim_stale(
+                if status == "dispatch_pending" and not is_claim_stale(
                     entry.get("dispatch_pending_at")
                 ):
                     live_dispatched.add(int(number))
+                elif status == "dispatched":
+                    # Issue #5: only exclude if the worker is alive OR there's an open PR.
+                    # A dead worker with no open PR is recoverable (crashed before PR opened).
+                    # A dead worker with an open PR is mid-review and must not be re-dispatched.
+                    issue_number = int(number)
+                    if issue_number in live_worker_issues or issue_number in pr_by_issue:
+                        live_dispatched.add(issue_number)
             candidates = [
                 issue
                 for issue in issues
