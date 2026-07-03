@@ -2207,6 +2207,93 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     assert result.data["reviewed_head_sha"] == "sha-abc123"
 
 
+# --- Issue #11: reject empty summary for request_changes/blocked decisions ----
+
+
+def test_record_review_request_changes_rejects_empty_summary(tmp_path: Path) -> None:
+    """Issue #11: request_changes with empty summary is rejected before state/label mutation."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "request_changes", summary="")
+
+    assert result.ok is False
+    assert "--summary or --summary-file is required" in result.message
+    # Verify no state/label mutation occurred
+    assert load_state(paths.state_file).get("prs", {}).get("456") is None
+    assert (123, "agent:needs-rework") not in fake_gh.labels_added
+    # Verify no rework prompt was written
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert not rework_prompt.exists()
+
+
+def test_record_review_blocked_rejects_empty_summary(tmp_path: Path) -> None:
+    """Issue #11: blocked with empty summary is rejected before state/label mutation."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "blocked", summary="")
+
+    assert result.ok is False
+    assert "--summary or --summary-file is required" in result.message
+    # Verify no state/label mutation occurred
+    assert load_state(paths.state_file).get("prs", {}).get("456") is None
+    assert (123, "agent:blocked") not in fake_gh.labels_added
+
+
+def test_record_review_request_changes_rejects_whitespace_only_summary(tmp_path: Path) -> None:
+    """Issue #11: request_changes with whitespace-only summary is rejected."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "request_changes", summary="   \n\t  ")
+
+    assert result.ok is False
+    assert "--summary or --summary-file is required" in result.message
+
+
+def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
+    """Issue #11: approved with empty summary is allowed (no validation required)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "approved", summary="")
+
+    assert result.ok is True
+    assert result.message == "review recorded"
+    # Verify state mutation occurred
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
+
+
+def test_record_review_decision_payload_includes_required_changes(tmp_path: Path) -> None:
+    """Issue #11: decision payload always includes required_changes field."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "required_changes" in decision
+    assert decision["required_changes"] == []
+
+    app.record_review(456, "request_changes", summary="fix A")
+
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "required_changes" in decision
+    assert decision["required_changes"] == []
+
+
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
     config = OrchestratorConfig(auto_merge=_approved_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
