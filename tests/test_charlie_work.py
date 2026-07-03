@@ -260,6 +260,7 @@ class FakeGitHub:
             "title": "Fix #123: search",
             "url": "https://example.test/pull/456",
             "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
         }
@@ -445,7 +446,8 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
     decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved"}), encoding="utf-8"
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
     )
 
     ready = app.merge_ready(456)
@@ -470,7 +472,8 @@ def test_merge_ready_branch_delete_failure_never_blocks_labels(tmp_path: Path) -
     decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved"}), encoding="utf-8"
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
     )
 
     ready = app.merge_ready(456)
@@ -488,7 +491,8 @@ def test_merge_ready_honors_delete_branch_false(tmp_path: Path) -> None:
     decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved"}), encoding="utf-8"
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
     )
 
     ready = app.merge_ready(456)
@@ -1380,7 +1384,8 @@ def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Pa
     pr_dir = paths.prs / "pr-456"
     pr_dir.mkdir(parents=True)
     (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved"}), encoding="utf-8"
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
     )
 
     result = app.merge_ready(456, merge=True)
@@ -1652,13 +1657,15 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
         "issue_number": 123,
         "decision": "approved",
         "status": "approved",
+        "reviewed_head_sha": "sha-abc123",
     }
     save_state(paths.state_file, state)
     # Also write the decision file so merge_ready can read it.
     decision_dir = paths.prs / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved"}), encoding="utf-8"
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
     )
 
     result = app.loop(limit=0)
@@ -1668,4 +1675,143 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
     # merge_ready was attempted (straight to merge evaluation).
     assert len(result.data["merges"]) == 1
     # The reviewing label must NOT have been re-added (would indicate review() ran).
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+# --- Issue #31: approvals pinned to PR head SHA --------------------------------
+
+
+def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "approved", summary="lgtm")
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    fake_gh.pr = {**fake_gh.pr, "headRefOid": "sha-new-head"}
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert "PR head moved since approval" in result.message
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert result.data["head_moved"] is True
+    assert fake_gh.merged == []
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "reviewing"
+
+
+def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -> None:
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+
+def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
+    tmp_path: Path,
+) -> None:
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved"}), encoding="utf-8"
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert "PR head moved since approval" in result.message
+    assert result.data["head_moved"] is True
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+
+
+def test_loop_re_reviews_when_head_moved_after_approval(tmp_path: Path) -> None:
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Seed an approved decision pinned to the old head.
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "decision": "approved",
+        "status": "approved",
+        "reviewed_head_sha": "sha-abc123",
+    }
+    save_state(paths.state_file, state)
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+    # New commit pushed after approval.
+    fake_gh.pr = {**fake_gh.pr, "headRefOid": "sha-new-head"}
+
+    result = app.loop(limit=0)
+
+    assert len(result.data["reviews"]) == 1
+    assert result.data["merges"] == []
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "reviewing"
+
+
+def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
+    tmp_path: Path,
+) -> None:
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "decision": "approved",
+        "status": "approved",
+        "reviewed_head_sha": "sha-abc123",
+    }
+    save_state(paths.state_file, state)
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0)
+
+    assert result.data["reviews"] == []
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is True
     assert (123, "agent:reviewing") not in fake_gh.labels_added
