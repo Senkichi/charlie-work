@@ -125,6 +125,7 @@ def run_cross_family_review(
     prompt_path: Path,
     report_path: Path,
     timeout_seconds: int,
+    dry_run: bool = False,
     runner: Runner = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
 ) -> CrossFamilyResult:
@@ -136,7 +137,18 @@ def run_cross_family_review(
     provider error (rate-limit/temporarily-unavailable text).  Exit-zero output
     that is semantically empty or blocked is written as an ``(UNAVAILABLE)``
     stub instead of a reusable success report.
+
+    If ``dry_run`` is True, skip the subprocess and return a synthetic result.
     """
+    if dry_run:
+        return _fail(
+            report_path,
+            model,
+            "DRY-RUN: cross-family review not executed",
+            partial="",
+            returncode=None,
+        )
+
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt_text, encoding="utf-8")
 

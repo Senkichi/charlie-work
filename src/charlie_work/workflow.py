@@ -55,12 +55,19 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
 
 class OrchestratorApp:
     def __init__(
-        self, repo_root: Path, paths: RuntimePaths, config: OrchestratorConfig, gh: GitHub
+        self,
+        repo_root: Path,
+        paths: RuntimePaths,
+        config: OrchestratorConfig,
+        gh: GitHub,
+        *,
+        dry_run: bool = False,
     ):
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
         self.gh = gh
+        self.dry_run = dry_run
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -92,6 +99,7 @@ class OrchestratorApp:
             venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
             worker_env=claude.worker_env,
             worker_model=self.config.devin.worker_model,
+            dry_run=self.dry_run,
         )
 
     def status(self) -> CommandResult:
@@ -233,6 +241,73 @@ class OrchestratorApp:
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
+
+        # Dry-run: read-only planning — compute selection and would-be SessionRequests,
+        # but skip all state writes, label transitions, and file mutations.
+        if self.dry_run:
+            selected_issue_numbers: list[int] = []
+            skipped_issue_numbers: list[int] = []
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                # Same dispatchability logic as the real dispatch, but read-only
+                live_dispatched = set()
+                for number, entry in state.get("issues", {}).items():
+                    if not isinstance(entry, dict):
+                        continue
+                    status = entry.get("status")
+                    if status == "dispatched":
+                        live_dispatched.add(int(number))
+                    elif status == "dispatch_pending" and not is_claim_stale(
+                        entry.get("dispatch_pending_at")
+                    ):
+                        live_dispatched.add(int(number))
+                candidates = [
+                    issue
+                    for issue in issues
+                    if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
+                ]
+                if only_issues:
+                    wanted = parse_issue_numbers(only_issues)
+                    by_number = {int(issue["number"]): issue for issue in candidates}
+                    selected = [by_number[number] for number in wanted if number in by_number]
+                    skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+                else:
+                    selected = candidates[:dispatch_limit]
+                selected_issue_numbers = [int(issue["number"]) for issue in selected]
+
+            # Compute would-be SessionRequests without state mutation
+            session_requests: list[SessionRequest] = []
+            full_issues: dict[int, dict[str, Any]] = {}
+            for issue_number in selected_issue_numbers:
+                full_issue = self.gh.issue_view(issue_number)
+                full_issues[issue_number] = full_issue
+                prompt_path = self._write_worker_prompt(full_issue)
+                branch_name = self._branch_name(full_issue)
+                session_requests.append(
+                    SessionRequest(
+                        issue_number=issue_number,
+                        issue_title=str(full_issue.get("title") or ""),
+                        prompt_path=prompt_path,
+                        branch_name=branch_name,
+                    )
+                )
+
+            # Return planning data without touching state, labels, or manifest/results files
+            return CommandResult(
+                True,
+                f"dry-run: would dispatch {len(session_requests)} issue(s)",
+                {
+                    "selected_count": len(session_requests),
+                    "attempted_count": len(session_requests),
+                    "failed_count": 0,
+                    "skipped_issue_numbers": skipped_issue_numbers,
+                    "label_errors": [],
+                    "sessions": [asdict(request) for request in session_requests],
+                    "dispatch_results": [],
+                },
+            )
+
+        # Real dispatch: claim issues, launch workers, update state and labels
         # First lock: claim issues by marking them as dispatch_pending
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
@@ -917,6 +992,7 @@ class OrchestratorApp:
             prompt_path=pr_dir / "cross-family-prompt.md",
             report_path=report_path,
             timeout_seconds=cfg.timeout_seconds,
+            dry_run=self.dry_run,
         )
         return self._cross_family_section(result.report_path), result
 

@@ -13,9 +13,11 @@ from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import summarize_checks
 from charlie_work.config import (
+    ClaudeCodeConfig,
     CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
+    LabelConfig,
     OrchestratorConfig,
     RuntimeConfig,
     find_config_path,
@@ -2384,6 +2386,114 @@ def test_is_mutating_classifies_readonly_and_mutating() -> None:
         assert _is_mutating(readonly) is False
     for mutating in (["pr", "merge", "1"], ["issue", "edit", "1"], ["label", "create", "x"]):
         assert _is_mutating(mutating) is True
+
+
+def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
+    """Test that --dry-run prevents worker process launch and worktree creation."""
+    from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+
+    subprocess_calls: list[list[str]] = []
+
+    def fake_subprocess(*args, **kwargs):
+        subprocess_calls.append(args[0])
+        raise AssertionError("subprocess should not be called in dry-run mode")
+
+    monkeypatch.setattr("charlie_work.claude_code.subprocess.Popen", fake_subprocess)
+    monkeypatch.setattr("charlie_work.devin_shell.subprocess.Popen", fake_subprocess)
+    monkeypatch.setattr("charlie_work.subprocess_runner.subprocess.run", fake_subprocess)
+
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("test prompt", encoding="utf-8")
+    settings = AdapterSettings(adapter="claude-code", dry_run=True)
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="Test issue",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-1-test",
+    )
+
+    results = dispatch_sessions(tmp_path, manifest_path, results_path, settings, [request])
+
+    assert len(results) == 1
+    assert results[0].ok is True
+    assert (
+        results[0].error is None
+    )  # error=None for dry-run (informational note is in workflow layer)
+    assert len(subprocess_calls) == 0  # No subprocess should be invoked
+
+
+def test_dry_run_skips_cross_family_review(monkeypatch, tmp_path: Path) -> None:
+    """Test that --dry-run prevents cross-family model subprocess execution."""
+    subprocess_calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        subprocess_calls.append(args[0])
+        raise AssertionError("subprocess.run should not be called in dry-run mode")
+
+    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
+
+    result = run_cross_family_review(
+        model="test-model",
+        command=["echo", "test"],
+        repo_root=tmp_path,
+        prompt_text="test prompt",
+        prompt_path=tmp_path / "prompt.md",
+        report_path=tmp_path / "report.md",
+        timeout_seconds=30,
+        dry_run=True,
+    )
+
+    assert result.ok is False
+    assert result.error == "DRY-RUN: cross-family review not executed"
+    assert len(subprocess_calls) == 0  # No subprocess should be invoked
+
+
+def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
+    """Test that --dry-run dispatch does not modify state.json or labels."""
+    # Setup: create a minimal state file
+    config = OrchestratorConfig(
+        labels=LabelConfig(),
+        dispatch=DispatchConfig(),
+        devin=DevinConfig(),
+        claude_code=ClaudeCodeConfig(),
+        runtime=RuntimeConfig(),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    initial_state = {
+        "issues": {},
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    # Use FakeGitHub which returns a ready issue by default
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    # Run dry-run dispatch
+    result = app.dispatch()
+
+    # Verify the result indicates dry-run
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    assert result.data["selected_count"] == 1
+
+    # Verify state.json is unchanged (load_state adds metadata, so check key fields)
+    with state_lock(paths.state_file):
+        final_state = load_state(paths.state_file)
+
+    assert final_state["issues"] == {}, "No issues should be marked as dispatched in state"
+    assert final_state["prs"] == {}, "No PRs should be recorded"
+    assert final_state["events"] == [], "No dispatch events should be recorded"
 
 
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:

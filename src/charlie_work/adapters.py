@@ -40,6 +40,9 @@ class AdapterSettings:
     worker_env: dict[str, str] = field(default_factory=dict)
     # devin-shell worker model; empty string means CLI default.
     worker_model: str = ""
+    # dry_run: if True, adapters return synthetic results without launching
+    # real worker processes or mutating worktrees.
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,9 @@ def dispatch_sessions(
     adapter = settings.adapter
     write_session_manifest(manifest_path, requests, adapter=adapter)
     sessions_dir = settings.sessions_dir or manifest_path.parent / "sessions"
-    if adapter == "manual":
+    if settings.dry_run:
+        results = [_dry_run_result(request, adapter) for request in requests]
+    elif adapter == "manual":
         results = [_manual_result(request) for request in requests]
     elif adapter == "command":
         results = [
@@ -170,6 +175,15 @@ def _request_dict(request: SessionRequest) -> dict[str, Any]:
 
 def _manual_result(request: SessionRequest) -> SessionDispatchResult:
     return _result(request, adapter="manual", ok=True)
+
+
+def _dry_run_result(request: SessionRequest, adapter: str) -> SessionDispatchResult:
+    return _result(
+        request,
+        adapter=adapter,
+        ok=True,
+        error=None,
+    )
 
 
 def _run_devin_shell_adapter(
