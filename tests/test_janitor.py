@@ -12,7 +12,7 @@ REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 def _init_repo(repo_root: Path) -> None:
     """Initialize a git repo with a single commit."""
     repo_root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo_root, check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"],
         cwd=repo_root,
