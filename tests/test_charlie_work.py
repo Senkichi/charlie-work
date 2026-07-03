@@ -2273,6 +2273,9 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
 
 
 def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path: Path) -> None:
+    """A live dispatched issue is not re-dispatched even if label write failed."""
+    from charlie_work.devin_shell import SessionRecord
+
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="devin-shell",
@@ -2286,11 +2289,162 @@ def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path:
     seed = load_state(paths.state_file)
     seed["issues"]["123"] = {"number": 123, "status": "dispatched"}
     save_state(paths.state_file, seed)
+    # Create a genuinely live worker session record
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Spawn a short-lived process
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        record = SessionRecord(
+            issue_number=123,
+            branch="agent/issue-123",
+            worktree_path="/tmp/wt/issue-123",
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+        )
+        # Write the session record manually (mirrors internal _write_json pattern)
+        sidecar_path = sessions_dir / f"issue-{123}.json"
+        tmp = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+        tmp.replace(sidecar_path)
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+        result = app.dispatch(limit=3)
+
+        assert result.data["attempted_count"] == 0  # not re-dispatched
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_dispatch_recovers_dead_worker_without_open_pr(tmp_path: Path) -> None:
+    """Issue #5: a dead worker with no open PR becomes dispatchable again."""
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="manual",  # Use manual to avoid actual worker launch
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Override pr_list to return empty list (no open PRs)
+    fake_gh.pr_list = lambda: []
+    # Simulate a prior dispatch that crashed before PR opened
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "title": "Test issue",
+        "url": "https://github.com/test/repo/issues/123",
+    }
+    save_state(paths.state_file, seed)
+    # Create a session record with a dead PID
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Spawn and immediately wait for a short-lived process to get a dead PID
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    process.wait()  # Ensure it's dead
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123",
+        worktree_path="/tmp/wt/issue-123",
+        prompt_path="p.md",
+        command=("x",),
+        pid=process.pid,
+        started_at="2026-01-01T00:00:00Z",
+        log_path="log.txt",
+    )
+    # Write the session record manually (mirrors internal _write_json pattern)
+    sidecar_path = sessions_dir / f"issue-{123}.json"
+    tmp = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    tmp.replace(sidecar_path)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.dispatch(limit=3)
 
-    assert result.data["attempted_count"] == 0  # not re-dispatched
+    # The issue should be re-dispatched since the worker is dead and there's no open PR
+    assert result.data["attempted_count"] == 1
+    assert result.data["selected_count"] == 1
+    assert 123 in [s["issue_number"] for s in result.data["sessions"]]
+
+
+def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> None:
+    """Issue #5: a dead worker with an open PR is NOT re-dispatched (mid-review)."""
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="manual",  # Use manual to avoid actual worker launch
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Override pr_list to return an open PR for this issue
+    fake_gh.pr_list = lambda: [
+        {
+            "number": 456,
+            "title": "Fix issue 123",
+            "headRefName": "agent/issue-123",
+            "url": "https://github.com/test/repo/pull/456",
+            "isCrossRepository": False,
+        }
+    ]
+    # Simulate a prior dispatch that crashed after PR opened
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "title": "Test issue",
+        "url": "https://github.com/test/repo/issues/123",
+    }
+    save_state(paths.state_file, seed)
+    # Create a session record with a dead PID
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Spawn and immediately wait for a short-lived process to get a dead PID
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    process.wait()  # Ensure it's dead
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123",
+        worktree_path="/tmp/wt/issue-123",
+        prompt_path="p.md",
+        command=("x",),
+        pid=process.pid,
+        started_at="2026-01-01T00:00:00Z",
+        log_path="log.txt",
+    )
+    # Write the session record manually (mirrors internal _write_json pattern)
+    sidecar_path = sessions_dir / f"issue-{123}.json"
+    tmp = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    tmp.replace(sidecar_path)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=3)
+
+    # The issue should NOT be re-dispatched since there's an open PR
+    assert result.data["attempted_count"] == 0
 
 
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
