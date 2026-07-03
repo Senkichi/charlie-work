@@ -581,3 +581,116 @@ index 1234567..abcdef0 100644
     assert "PR #123" in warnings[0]
     assert "b_module.py" in warnings[0]
     assert "git checkout --" in warnings[0]
+
+
+def test_closed_pr_blocked_with_real_pr_view_fields() -> None:
+    """CLOSED PR is blocked when using real pr_view field set (regression test for issue #2)."""
+    # This PR dict mirrors the real pr_view field set after the fix
+    # Before the fix, state/mergeable/additions/deletions were missing
+    pr = {
+        "number": 456,
+        "title": "fix: search is broken",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "baseRefName": "main",
+        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
+        "isDraft": False,
+        "labels": [],
+        "author": {"login": "testuser"},
+        "updatedAt": "2024-01-01T00:00:00Z",
+        "reviewDecision": "APPROVED",
+        "statusCheckRollup": [],
+        "state": "CLOSED",  # This field was missing before the fix
+        "mergeable": "MERGEABLE",  # This field was missing before the fix
+        "additions": 10,  # This field was missing before the fix
+        "deletions": 5,  # This field was missing before the fix
+        "headRefOid": "abc123",
+        "isCrossRepository": False,
+        "mergeStateStatus": "CLEAN",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is False
+    assert any("CLOSED" in f for f in verdict.failures)
+
+
+def test_conflicting_pr_blocked_with_real_pr_view_fields() -> None:
+    """CONFLICTING PR is blocked when using real pr_view field set (regression test for issue #2)."""
+    # This PR dict mirrors the real pr_view field set after the fix
+    pr = {
+        "number": 456,
+        "title": "fix: search is broken",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "baseRefName": "main",
+        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
+        "isDraft": False,
+        "labels": [],
+        "author": {"login": "testuser"},
+        "updatedAt": "2024-01-01T00:00:00Z",
+        "reviewDecision": "APPROVED",
+        "statusCheckRollup": [],
+        "state": "OPEN",  # This field was missing before the fix
+        "mergeable": "CONFLICTING",  # This field was missing before the fix
+        "additions": 10,  # This field was missing before the fix
+        "deletions": 5,  # This field was missing before the fix
+        "headRefOid": "abc123",
+        "isCrossRepository": False,
+        "mergeStateStatus": "DIRTY",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is False
+    assert any("conflict" in f.lower() for f in verdict.failures)
+
+
+def test_oversized_diff_warning_with_real_pr_view_fields() -> None:
+    """Oversized diff warning fires when using real pr_view field set (regression test for issue #2)."""
+    # This PR dict mirrors the real pr_view field set after the fix
+    pr = {
+        "number": 456,
+        "title": "fix: search is broken",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "baseRefName": "main",
+        "body": "Closes #123.\n\nTests: added unit tests for the search path.",
+        "isDraft": False,
+        "labels": [],
+        "author": {"login": "testuser"},
+        "updatedAt": "2024-01-01T00:00:00Z",
+        "reviewDecision": "APPROVED",
+        "statusCheckRollup": [],
+        "state": "OPEN",  # This field was missing before the fix
+        "mergeable": "MERGEABLE",  # This field was missing before the fix
+        "additions": 1000,  # This field was missing before the fix
+        "deletions": 600,  # This field was missing before the fix
+        "headRefOid": "abc123",
+        "isCrossRepository": False,
+        "mergeStateStatus": "CLEAN",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+    assert any("oversized diff" in w.lower() for w in verdict.warnings)
+
+
+def test_body_word_boundary_matching_prevents_false_positives() -> None:
+    """Word-boundary matching prevents 'test' in 'latest' from passing the gate (regression test for issue #2)."""
+    pr = _green_pr(body="Closes #123. Updated to latest version.")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is False
+    assert any("tests/verification/rationale" in f.lower() for f in verdict.failures)
+
+
+def test_body_word_boundary_matching_allows_legitimate_markers() -> None:
+    """Word-boundary matching still allows legitimate test/rationale markers (regression test for issue #2)."""
+    pr = _green_pr(body="Closes #123. Added tests for the fix.")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
