@@ -801,6 +801,9 @@ def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) ->
     assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
 
 
+
+
+
 def test_no_op_rework_real_commit_clears_gate(tmp_path: Path) -> None:
     """Real non-merge commits since verdict clear the no-op gate."""
     # Set up a local "remote" repo
