@@ -17,7 +17,18 @@ from typing import Any
 import yaml
 
 from .config import OrchestratorConfig
-from .github import GitHub, GitHubError
+from .github import (
+    GitHub,
+    GitHubError,
+    ISSUE_LIST_FIELDS,
+    ISSUE_VIEW_FIELDS,
+    LABEL_LIST_FIELDS,
+    PR_CHECKS_FIELDS,
+    PR_LIST_FIELDS,
+    PR_VIEW_FIELDS,
+    RECONCILE_ISSUE_FIELDS,
+    RECONCILE_PR_FIELDS,
+)
 from .paths import RuntimePaths
 from .prompts import resolve_template
 
@@ -144,6 +155,49 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     add("launched sessions", not failed, detail, severity="warning")
 
 
+def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
+    """Validate gh --json field lists against the live gh CLI.
+
+    Executes each field list as a read-only query with --limit 1 and reports
+    any invalid/unknown fields with the gh error text. This catches contract
+    drift between the hardcoded field lists and the actual gh CLI schema.
+    """
+    # Map of field list name to (command, fields) tuples
+    field_lists = {
+        "ISSUE_LIST_FIELDS": (
+            ["issue", "list", "--state", "open", "--limit", "1"],
+            ISSUE_LIST_FIELDS,
+        ),
+        "ISSUE_VIEW_FIELDS": (["issue", "view", "1"], ISSUE_VIEW_FIELDS),
+        "PR_LIST_FIELDS": (["pr", "list", "--state", "open", "--limit", "1"], PR_LIST_FIELDS),
+        "PR_VIEW_FIELDS": (["pr", "view", "1"], PR_VIEW_FIELDS),
+        "PR_CHECKS_FIELDS": (["pr", "checks", "1"], PR_CHECKS_FIELDS),
+        "LABEL_LIST_FIELDS": (["label", "list", "--limit", "1"], LABEL_LIST_FIELDS),
+        "RECONCILE_PR_FIELDS": (
+            ["pr", "list", "--state", "all", "--limit", "1"],
+            RECONCILE_PR_FIELDS,
+        ),
+        "RECONCILE_ISSUE_FIELDS": (
+            ["issue", "list", "--state", "open", "--limit", "1"],
+            RECONCILE_ISSUE_FIELDS,
+        ),
+    }
+
+    for list_name, (base_cmd, fields) in field_lists.items():
+        cmd = [*base_cmd, "--json", fields]
+        try:
+            gh.run(cmd, json_output=True)
+            add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
+        except GitHubError as exc:
+            # gh returns error text like "invalid JSON field: foo" for unknown fields
+            error_msg = str(exc)
+            add(
+                f"gh field list: {list_name}",
+                False,
+                f"invalid field(s): {error_msg}",
+            )
+
+
 def run_doctor(
     repo_root: Path,
     paths: RuntimePaths,
@@ -152,6 +206,7 @@ def run_doctor(
     gh: GitHub,
     *,
     adapter_probe: bool = False,
+    live: bool = False,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
 
@@ -305,6 +360,9 @@ def run_doctor(
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
         _surface_sessions(add, repo_root, config)
+
+    if live:
+        _validate_gh_field_lists(add, gh)
 
     if config.cross_family.enabled:
         command = config.cross_family.command

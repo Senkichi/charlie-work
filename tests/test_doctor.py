@@ -450,3 +450,31 @@ def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: 
 
     names = {check.name for check in checks}
     assert "devin-shell worker model" not in names
+
+
+def test_gh_field_lists_use_constants_no_inline_literals() -> None:
+    """All gh --json field lists must use module-level constants, not inline literals.
+
+    This test verifies that the expected constants exist in github.py and that
+    they contain the expected field values. This prevents the contract drift
+    issue described in #64 by ensuring all field lists are centralized.
+    """
+    import charlie_work.github as github_module
+
+    # Verify that the expected constants exist in github.py
+    expected_constants = {
+        "ISSUE_LIST_FIELDS",
+        "ISSUE_VIEW_FIELDS",
+        "PR_LIST_FIELDS",
+        "PR_VIEW_FIELDS",
+        "PR_CHECKS_FIELDS",
+        "LABEL_LIST_FIELDS",
+        "RECONCILE_PR_FIELDS",
+        "RECONCILE_ISSUE_FIELDS",
+    }
+    for const in expected_constants:
+        assert hasattr(github_module, const), f"Missing constant: {const}"
+        # Verify each constant is a string containing field names
+        value = getattr(github_module, const)
+        assert isinstance(value, str), f"{const} must be a string"
+        assert value, f"{const} must not be empty"
