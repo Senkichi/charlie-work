@@ -47,18 +47,22 @@ def load_state(path: Path) -> dict[str, Any]:
     return data
 
 
-def save_state(path: Path, data: dict[str, Any]) -> None:
-    data["generated_at"] = utc_now()
+def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    """Persist a fresh copy of ``data`` without mutating the caller's dict."""
+    to_save = {**data, "generated_at": utc_now()}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
+        json.dump(to_save, handle, indent=2, sort_keys=True)
         handle.write("\n")
     tmp_path.replace(path)
+    return to_save
 
 
-def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
-    events = data.setdefault("events", [])
+def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a new state dict with the event appended; do not mutate ``data``."""
+    events = list(data.get("events", []))
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
     if len(events) > 200:
-        del events[:-200]
+        events = events[-200:]
+    return {**data, "events": events}

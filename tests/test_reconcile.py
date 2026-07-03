@@ -177,6 +177,7 @@ def test_detect_drift_finds_issue_active_label_no_open_pr() -> None:
     assert matches[0].fix_actions == (
         f"remove label '{config.labels.in_progress}' from issue #30",
     )
+    assert matches[0].remove_labels == (config.labels.in_progress,)
 
 
 def test_detect_drift_issue_active_label_with_open_pr_is_not_drift() -> None:
@@ -206,6 +207,7 @@ def test_detect_drift_finds_done_label_with_active_labels() -> None:
     assert len(matches) == 1
     assert matches[0].issue_number == 40
     assert matches[0].fix_actions == (f"remove label '{config.labels.reviewing}' from issue #40",)
+    assert matches[0].remove_labels == (config.labels.reviewing,)
 
 
 def test_apply_fixes_returns_new_state_without_mutating_original() -> None:
@@ -270,6 +272,7 @@ def test_apply_fixes_contradiction_removes_active_labels_directly() -> None:
             pr_number=None,
             detail="issue #40 has done + reviewing",
             fix_actions=(f"remove label '{config.labels.reviewing}' from issue #40",),
+            remove_labels=(config.labels.reviewing,),
         )
     ]
 
@@ -311,6 +314,7 @@ def test_apply_fixes_appends_reconcile_event() -> None:
             pr_number=None,
             detail="issue #30 stale",
             fix_actions=(f"remove label '{config.labels.in_progress}' from issue #30",),
+            remove_labels=(config.labels.in_progress,),
         )
     ]
 
@@ -320,3 +324,25 @@ def test_apply_fixes_appends_reconcile_event() -> None:
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["issue_number"] == 30
     assert state["events"] == []
+
+
+def test_apply_fixes_handles_quote_containing_label() -> None:
+    """Structured remove_labels means quote characters in label names don't parse ambiguously."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    quote_label = "agent:has'quote"
+    drift = [
+        DriftItem(
+            kind="done_label_with_active_labels",
+            issue_number=50,
+            pr_number=None,
+            detail="issue #50 has done + quote label",
+            fix_actions=(f"remove label '{quote_label}' from issue #50",),
+            remove_labels=(quote_label,),
+        )
+    ]
+
+    apply_fixes(gh, state, drift, config)
+
+    assert gh.labels_removed == [(50, quote_label)]

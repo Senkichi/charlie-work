@@ -1113,7 +1113,7 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
     for i in range(300):
-        _append(state, "review_packet", {"pr_number": 90000 + i})
+        state = _append(state, "review_packet", {"pr_number": 90000 + i})
     save_state(paths.state_file, state)
     assert not any(  # prove the earlier request_changes events are gone
         e.get("kind") == "record_review" for e in load_state(paths.state_file)["events"]
@@ -1188,6 +1188,31 @@ def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Pa
     assert result.data["merged"] is True
     assert result.data["label_error"] == "rate limited"
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
+
+
+def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Path) -> None:
+    """A later evaluation-only run must not overwrite a previously recorded merged fact."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    merge_result = app.merge_ready(456, merge=True)
+    assert merge_result.data["merged"] is True
+    merged_state = load_state(paths.state_file)["prs"]["456"]
+    assert merged_state["status"] == "merged"
+    assert merged_state["merged"] is True
+
+    # A subsequent evaluation-only pass must keep the durable merged fields.
+    eval_result = app.merge_ready(456, merge=False)
+    assert eval_result.data["merged"] is False
+    persisted = load_state(paths.state_file)["prs"]["456"]
+    assert persisted["status"] == "merged"
+    assert persisted["merged"] is True
+    assert "can_merge" not in persisted
+    assert "checks" not in persisted
+    assert "merge_output" not in persisted
 
 
 def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path: Path) -> None:

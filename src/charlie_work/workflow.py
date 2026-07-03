@@ -152,7 +152,7 @@ class OrchestratorApp:
                 "updated_at": full_issue.get("updatedAt"),
             }
             written.append({"issue": issue_number, "prompt_path": str(prompt_path)})
-        append_event(state, "intake", {"issue_count": len(issues)})
+        state = append_event(state, "intake", {"issue_count": len(issues)})
         save_state(self.paths.state_file, state)
         return CommandResult(True, "intake complete", {"issues": written})
 
@@ -257,7 +257,7 @@ class OrchestratorApp:
                     entry["label_error"] = str(exc)
                     label_errors.append(request.issue_number)
                     save_state(self.paths.state_file, state)
-        append_event(
+        state = append_event(
             state,
             "dispatch",
             {
@@ -314,7 +314,7 @@ class OrchestratorApp:
                 "janitor_ok": False,
                 "janitor_failures": list(verdict.failures),
             }
-            append_event(
+            state = append_event(
                 state,
                 "janitor_gate",
                 {"pr_number": pr_number, "failures": list(verdict.failures)},
@@ -396,7 +396,7 @@ class OrchestratorApp:
             "cross_family_report": cf_result.report_path if cf_result else None,
             "cross_family_ok": cf_result.ok if cf_result else None,
         }
-        append_event(
+        state = append_event(
             state,
             "review_packet",
             {
@@ -476,7 +476,7 @@ class OrchestratorApp:
             "request_changes_count": request_changes_count,
             "status": "escalated" if escalated else decision,
         }
-        append_event(
+        state = append_event(
             state,
             "record_review",
             {"pr_number": pr_number, "decision": decision, "escalated": escalated},
@@ -582,13 +582,17 @@ class OrchestratorApp:
             "label_error": label_error,
         }
         state = load_state(self.paths.state_file)
-        merged_fields = {"status": "merged"} if merge_output else {}
-        state["prs"][str(pr_number)] = {
-            **state["prs"].get(str(pr_number), {}),
-            **data,
-            **merged_fields,
+        existing = state["prs"].get(str(pr_number), {})
+        prs_entry: dict[str, Any] = {
+            **existing,
+            "number": pr_number,
+            "issue_number": issue_number,
         }
-        append_event(
+        if merge_output:
+            prs_entry["status"] = "merged"
+            prs_entry["merged"] = True
+        state["prs"][str(pr_number)] = prs_entry
+        state = append_event(
             state,
             "merge_ready",
             {"pr_number": pr_number, "can_merge": can_merge, "merged": bool(merge_output)},
@@ -626,7 +630,7 @@ class OrchestratorApp:
             timeout_seconds=cfg.timeout_seconds,
         )
         state = load_state(self.paths.state_file)
-        append_event(
+        state = append_event(
             state, "spec_review", {"artifact": str(path), "ok": result.ok, "model": cfg.model}
         )
         save_state(self.paths.state_file, state)
