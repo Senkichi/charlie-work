@@ -1548,6 +1548,48 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     assert state["prs"]["456"]["janitor_warnings"]
 
 
+def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> None:
+    """Regression test for issue #10: the decision command must use a valid
+    argparse subparser name. The CLI registers 'verdict', not 'record-review'."""
+    from charlie_work.cli import build_parser
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Extract the decision command from the packet
+    import re
+
+    match = re.search(r"charlie (verdict|record-review) --pr", packet_text)
+    assert match is not None, f"decision command not found in packet. Packet text:\n{packet_text}"
+    command_verb = match.group(1)
+
+    # Verify the verb is a registered subparser
+    parser = build_parser()
+    # Find the subparsers action (it's the _SubParsersAction in _actions)
+    subparsers_action = None
+    for action in parser._subparsers._actions:
+        if hasattr(action, "choices") and action.choices:
+            subparsers_action = action
+            break
+    assert subparsers_action is not None, "Could not find subparsers action"
+    subparser_choices = set(subparsers_action.choices.keys())
+    assert command_verb in subparser_choices, (
+        f"decision command uses '{command_verb}' which is not a registered subparser. "
+        f"Valid subparsers: {sorted(subparser_choices)}"
+    )
+    assert command_verb == "verdict", (
+        f"decision command should use 'verdict' subparser, not '{command_verb}'"
+    )
+
+
 def test_reconcile_wiring_reports_clean_repo(tmp_path: Path) -> None:
     class QuietGitHub(FakeGitHub):
         def run(self, arguments, *, json_output=False, allow_failure=False):
