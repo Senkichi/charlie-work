@@ -266,3 +266,48 @@ def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
     # Verify the comparison instruction
     assert "headRefOid" in prompt
     assert "git rev-parse HEAD" in prompt
+
+
+def test_worker_and_rework_templates_contain_identical_canonical_test_command() -> None:
+    """Verify that worker.md and rework.md contain the exact same canonical test command string.
+
+    This prevents silent drift where one template uses the full command and the other
+    uses a partial variant (issue #91).
+    """
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    canonical_command = "uv run --extra dev pytest -q --tb=short"
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        text = (prompts_dir / template_name).read_text(encoding="utf-8")
+        assert canonical_command in text, (
+            f"Template {template_name} does not contain the canonical test command. "
+            f"Expected to find: {canonical_command}"
+        )
+
+
+def test_rendered_worker_prompts_contain_canonical_test_command() -> None:
+    """Verify that rendered worker prompts contain the canonical test command.
+
+    This test goes through the real render_prompt call to ensure the command
+    appears in the final rendered output that workers actually see.
+    """
+    canonical_command = "uv run --extra dev pytest -q --tb=short"
+
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert canonical_command in prompt, (
+            f"Rendered {template_name} does not contain the canonical test command. "
+            f"Expected to find: {canonical_command}"
+        )
+
+
+def test_rendered_worker_prompts_require_completion_report_with_command_and_count() -> None:
+    """Verify that rendered worker prompts require the completion report to quote the command and count."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        # Verify the instruction to quote the exact command
+        assert "Quote the exact command you ran" in prompt
+        # Verify the instruction to quote the collected/passed count
+        assert "collected/passed count" in prompt
+        # Verify the example format
+        assert "300 collected, 300 passed" in prompt
