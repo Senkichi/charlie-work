@@ -9,3 +9,6 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+
+# Local orchestrator profile (self-hosting); machine-specific, keep untracked like job-cannon
+orchestrator.config.yaml
