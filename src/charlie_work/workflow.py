@@ -1391,7 +1391,7 @@ class OrchestratorApp:
             if decision.get("decision") == "approved":
                 reviewed_head_sha = decision.get("reviewed_head_sha")
                 live_head_sha = pr.get("headRefOid")
-                if reviewed_head_sha and live_head_sha == reviewed_head_sha:
+                if reviewed_head_sha is not None and live_head_sha == reviewed_head_sha:
                     # PR is approved and head hasn't moved since approval — skip update
                     results.append(
                         {

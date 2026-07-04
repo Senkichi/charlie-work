@@ -860,7 +860,15 @@ class FakeGitHub:
         return self.delete_branch_ok
 
     def pr_update_branch(self, pr_number: int) -> bool:
-        return self.update_branch_ok
+        # Simulate a base update by moving the PR's head to a new SHA
+        # This reproduces the churn that the fix prevents
+        for pr in self.prs:
+            if pr["number"] == pr_number:
+                # Append a merge-SHA marker to simulate the head moving
+                old_head = pr.get("headRefOid", "")
+                pr["headRefOid"] = f"{old_head}-updated"
+                return self.update_branch_ok
+        return False
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -4135,6 +4143,93 @@ def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Pa
     assert results[0]["pr_number"] == 789
     assert results[0]["updated"] is True
     assert "skipped_reason" not in results[0]
+
+
+def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
+    tmp_path: Path,
+) -> None:
+    """End-to-end test for AC2: shipping two approved PRs in sequence should succeed.
+
+    Regression test for issue #89: when two PRs are approved in the same operator pass,
+    merging the first should not base-update the second (which would move its head and
+    invalidate its approval). This test goes through the full merge_ready() path
+    (not just _update_open_agent_prs) to verify the complete ship-it flow.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two approved PRs
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",  # Live head matches reviewed head
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",  # Live head matches reviewed head
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision files for both PRs (approved state)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Ship the first PR
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.ok is True
+    assert result_456.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # Verify PR 789's head is UNCHANGED (the skip worked)
+    pr_789 = fake_gh.pr_view(789)
+    assert pr_789["headRefOid"] == "sha-def456"  # Still the original head
+
+    # Ship the second PR immediately afterward - should succeed without head-moved error
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.ok is True
+    assert result_789.data["merged"] is True
+    assert result_789.data["can_merge"] is True
+    assert result_789.data.get("head_moved") is not True  # Should not trigger head-moved gate
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
 
 
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
