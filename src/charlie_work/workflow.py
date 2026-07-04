@@ -1461,7 +1461,11 @@ class OrchestratorApp:
 
         return results
 
-    def loop(self, limit: int | None = None) -> CommandResult:
+    def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
+        # merge=False runs the full pass (intake, dispatch, reviews, readiness
+        # evaluation + labels) but skips the actual `gh pr merge` — for
+        # operators sequencing same-surface PR cascades by hand, where the
+        # pr_list (newest-first) merge order would land PRs in the wrong order.
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
@@ -1516,19 +1520,19 @@ class OrchestratorApp:
                         and live_head_sha == reviewed_head_sha
                     )
                     if head_matches:
-                        merges.append(self.merge_ready(pr_number).data)
+                        merges.append(self.merge_ready(pr_number, merge=merge).data)
                     else:
                         review = self.review(pr_number)
                         reviews.append(review.data)
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved":
-                            merges.append(self.merge_ready(pr_number).data)
+                            merges.append(self.merge_ready(pr_number, merge=merge).data)
                 else:
                     review = self.review(pr_number)
                     reviews.append(review.data)
                     decision = self._review_decision(pr_number)
                     if decision.get("decision") == "approved":
-                        merges.append(self.merge_ready(pr_number).data)
+                        merges.append(self.merge_ready(pr_number, merge=merge).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors

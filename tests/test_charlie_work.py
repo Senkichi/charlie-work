@@ -3809,6 +3809,37 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
+def test_loop_no_merge_evaluates_readiness_but_skips_gh_merge(tmp_path: Path) -> None:
+    """bash-rats --no-merge: the pass reviews and evaluates merge readiness but
+    never calls `gh pr merge` — operators sequencing same-surface cascades by
+    hand rely on this to dispatch reworks without out-of-order merges."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "decision": "approved",
+        "status": "approved",
+        "reviewed_head_sha": "sha-abc123",
+    }
+    save_state(paths.state_file, state)
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0, merge=False)
+
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is False
+    assert fake_gh.merged == []
+
+
 def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -> None:
     """Test that loop() classifies dead sessions and sets throttled_until in state.
 
