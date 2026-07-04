@@ -829,7 +829,7 @@ def test_launch_render_error_returns_error_record_and_tears_down_worktree(
 
     worktree_removed = []
 
-    def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False, branch=None):
         worktree_removed.append(worktree_path)
 
     monkeypatch.setattr(
@@ -917,7 +917,7 @@ def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
         command_template=("this-binary-does-not-exist-xyz",),
     )
 
-    assert not record1.ok
+    assert record1.error is not None
     assert "failed to launch devin" in record1.error
 
     # Verify the branch is deleted after the failure
@@ -941,7 +941,7 @@ def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
         command_template=(sys.executable, str(script), "{prompt_path}"),
     )
 
-    assert record2.ok
+    assert record2.error is None
     assert record2.branch == branch_name
 
 
@@ -1017,7 +1017,7 @@ def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
         rework=True,
     )
 
-    assert not record.ok
+    assert record.error is not None
     assert "failed to launch devin" in record.error
 
     # Verify the branch is preserved (not deleted)

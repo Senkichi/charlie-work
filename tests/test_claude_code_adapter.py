@@ -579,7 +579,7 @@ def test_launch_claude_worker_render_error_returns_error_record_and_tears_down_w
     sessions_dir = tmp_path / "sessions"
     worktree_removed = []
 
-    def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False, branch=None):
         worktree_removed.append(worktree_path)
         return True
 

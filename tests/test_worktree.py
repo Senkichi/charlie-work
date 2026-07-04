@@ -654,10 +654,10 @@ def test_remove_worktree_branch_deletion_independent_of_worktree_removal(tmp_pat
     )
     assert branch_name not in result.stdout
 
-    # Clean up the orphaned directory
-    import shutil
-
-    shutil.rmtree(info.path)
+    # Clean up the orphaned directory if it still exists
+    if info.path.exists():
+        import shutil
+        shutil.rmtree(info.path)
 
 
 def test_recovery_branch_mismatch_raises(tmp_path: Path) -> None:
