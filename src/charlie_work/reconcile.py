@@ -21,6 +21,7 @@ direct ``remove_issue_label`` calls only for label combinations that
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import OrchestratorConfig
@@ -33,7 +34,7 @@ from .github import (
     linked_issue_number,
 )
 from .labels import transition
-from .state import append_event, is_claim_stale
+from .state import append_event, is_claim_stale, set_throttled_until
 
 
 @dataclass(frozen=True)
@@ -80,12 +81,17 @@ def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
     return result if isinstance(result, list) else []
 
 
-def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) -> list[DriftItem]:
+def detect_drift(
+    gh: GitHub, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
+) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
     Issues exactly two ``gh.run`` list queries (all PRs, open issues) and
     performs every drift check against those two in-memory snapshots — no
     per-item ``gh`` calls.
+
+    If ``repo_root`` is provided, also checks for dead sessions and classifies
+    their failures to update the provider throttle state.
     """
     labels_cfg = config.labels
     prs = _fetch_prs(gh)
@@ -247,6 +253,66 @@ def detect_drift(gh: GitHub, state: dict[str, Any], config: OrchestratorConfig) 
                 )
             )
 
+    # Detect dead sessions and classify failures for provider throttle state
+    if repo_root is not None:
+        from .claude_code import is_worker_alive, read_worker_records
+        from .devin_shell import is_session_alive, read_session_records
+
+        sessions_dir = repo_root / config.devin.sessions_dir
+        if sessions_dir.is_dir():
+            # Check devin-shell sessions
+            for record in read_session_records(sessions_dir):
+                if record.error is None and not is_session_alive(record):
+                    # Session exited without error - classify the failure
+                    from .devin_shell import update_session_record_with_failure_classification
+
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
+                    )
+                    if failure_kind and throttled_until:
+                        # Update state with throttle window
+                        # This is a no-op drift item that just signals state update
+                        drift.append(
+                            DriftItem(
+                                kind="provider_throttle_detected",
+                                issue_number=record.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{record.issue_number} session died with "
+                                    f"{failure_kind}, throttling until {throttled_until}"
+                                ),
+                                fix_actions=(f"set throttled_until={throttled_until}",),
+                            )
+                        )
+
+            # Check claude-code sessions
+            for record in read_worker_records(sessions_dir):
+                if record.error is None and not is_worker_alive(record):
+                    # Session exited without error - classify the failure
+                    from .claude_code import update_worker_record_with_failure_classification
+
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
+                    )
+                    if failure_kind and throttled_until:
+                        # Update state with throttle window
+                        drift.append(
+                            DriftItem(
+                                kind="provider_throttle_detected",
+                                issue_number=record.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{record.issue_number} session died with "
+                                    f"{failure_kind}, throttling until {throttled_until}"
+                                ),
+                                fix_actions=(f"set throttled_until={throttled_until}",),
+                            )
+                        )
+
     return drift
 
 
@@ -289,6 +355,14 @@ def apply_fixes(
                 issue_key = str(item.issue_number)
                 # Clear the stale claim by removing the entry entirely
                 new_issues.pop(issue_key, None)
+
+        elif item.kind == "provider_throttle_detected":
+            # Extract throttled_until from fix_actions
+            for action in item.fix_actions:
+                if action.startswith("set throttled_until="):
+                    throttled_until = action.split("=", 1)[1]
+                    new_state = set_throttled_until(new_state, throttled_until)
+                    break
 
         new_state = append_event(
             new_state,
