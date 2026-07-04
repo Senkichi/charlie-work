@@ -273,7 +273,7 @@ def launch_devin_session(
             worker_model=worker_model,
         )
     except (KeyError, IndexError, ValueError) as exc:
-        remove_worktree(repo_root, worktree.path, force=True)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
@@ -306,7 +306,7 @@ def launch_devin_session(
             )
         pid = process.pid
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         error = f"failed to launch devin: {exc}"
 
     record = SessionRecord(
