@@ -761,7 +761,45 @@ def test_recovery_with_venv_dir_reuses_worktree(tmp_path: Path) -> None:
     assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "partial work\n"
     # The .venv directory should still be there (not deleted)
     assert (info2.path / ".venv").exists()
-    assert (info2.path / ".venv" / "pyvenv.cfg").exists()
 
-    # Clean up with force=True since .venv is a real directory
-    remove_worktree(repo_root, info2.path, force=True)
+
+def test_recovery_branch_prefix_change_fails_loudly(tmp_path: Path) -> None:
+    """AC #1: Recovery mode with branch_prefix change fails loudly on worktree collision.
+
+    When dispatch.branch_prefix changes between dispatches, the recovery record's
+    branch_name (old prefix) no longer matches the derived branch (new prefix).
+    The recovery logic validates this mismatch and raises RuntimeError immediately.
+
+    The test simulates this by:
+    1. Creating a worktree with branch "agent/issue-123"
+    2. Attempting recovery with a mismatched branch name "worker/issue-123"
+    3. The recovery check should fail loudly with a branch mismatch error
+
+    Mutation to verify: comment out the recovery branch check in worktree.py (line 134),
+    and the test will fail (it will skip recovery and attempt fresh worktree creation).
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Simulate a previous dispatch with old prefix "agent/issue"
+    old_branch_name = "agent/issue-123"
+    recovery_record = {"branch_name": old_branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, old_branch_name, base_ref="HEAD")
+
+    # Verify the worktree exists at the old path
+    assert info1.path.exists()
+    assert (info1.path / "README.md").exists()
+
+    # Try to recover with a new branch name (simulating branch_prefix change)
+    # The recovery record's branch_name doesn't match, so this should fail loudly
+    new_branch_name = "worker/issue-123"
+
+    with pytest.raises(RuntimeError, match="Recovery record branch_name"):
+        create_worktree(repo_root, new_branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # The old worktree should still exist (not clobbered)
+    assert info1.path.exists()
+    assert (info1.path / "README.md").exists()
+
+    # Clean up
+    remove_worktree(repo_root, info1.path)

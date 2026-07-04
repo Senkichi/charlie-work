@@ -221,6 +221,8 @@ def test_launch_writes_sidecar_json_with_expected_fields(
     assert record.started_at  # non-empty ISO-ish timestamp
     assert record.log_path == str(sessions_dir / "issue-123.log")
     assert record.worktree_path  # non-empty
+    # Regression guard: empty strings should not appear in the rendered command
+    assert "" not in record.command
 
     sidecar_path = sessions_dir / "issue-123.json"
     assert sidecar_path.is_file()
@@ -565,6 +567,8 @@ def test_command_template_renders_issue_and_branch_placeholders(
         "--prompt-file",
         str(prompt_path),
     )
+    # Regression guard: empty strings should not appear in the rendered command
+    assert "" not in record.command
 
 
 def test_command_template_injects_model_when_worker_model_set(
@@ -597,6 +601,8 @@ def test_command_template_injects_model_when_worker_model_set(
     # Verify the custom template structure
     assert record.command[0] == sys.executable
     assert str(script) in record.command
+    # Regression guard: empty strings should not appear in the rendered command
+    assert "" not in record.command
 
 
 def test_command_template_omits_model_when_worker_model_empty(
@@ -627,6 +633,8 @@ def test_command_template_omits_model_when_worker_model_empty(
     # Verify the custom template structure
     assert record.command[0] == sys.executable
     assert str(script) in record.command
+    # Regression guard: empty strings should not appear in the rendered command
+    assert "" not in record.command
 
 
 # ---------------------------------------------------------------------------

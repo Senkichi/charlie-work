@@ -639,6 +639,48 @@ def test_command_adapter_render_error_returns_error_record(tmp_path: Path) -> No
     assert "unknown_placeholder" in results[0].error
 
 
+def test_command_adapter_positional_placeholder_returns_error_record(tmp_path: Path) -> None:
+    """AC #2: Command adapter positional placeholder {0} returns error record, not raise.
+
+    The command adapter's render try/except catches IndexError for positional {0} templates.
+    This test verifies that a config built directly (bypassing load_config) with a positional
+    placeholder returns an error record instead of raising.
+
+    Mutation to verify: remove IndexError from the except clause in adapters.py line 281,
+    and the test will fail (it will raise IndexError instead of returning an error record).
+    """
+    from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="Test",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-1",
+    )
+
+    # Config built directly (bypassing load_config) with a positional placeholder
+    settings = AdapterSettings(
+        adapter="command",
+        dispatch_command=("echo", "{0}"),
+        command_timeout_seconds=300,
+    )
+
+    results = dispatch_sessions(repo_root, manifest_path, results_path, settings, [request])
+
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert results[0].error is not None
+    # The error should mention the positional placeholder issue
+    assert "0" in results[0].error or "positional" in results[0].error.lower()
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
