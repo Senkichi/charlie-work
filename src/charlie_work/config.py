@@ -112,6 +112,10 @@ class ReviewConfig:
 class AutoMergeConfig:
     enabled: bool = True
     strategy: str = "squash"
+    # Merge with `gh pr merge --admin` — required when the base branch is
+    # protected (required reviews/checks) and the operator's gh auth has admin
+    # on the repo. Without it, protected-main merges bounce to the operator.
+    admin: bool = False
     # Post-merge branch deletion is best-effort and can never abort the
     # merge/label sequence (the empericus local-worktree failure mode).
     delete_branch: bool = True

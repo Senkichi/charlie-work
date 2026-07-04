@@ -182,8 +182,10 @@ class GitHub:
             allow_failure=True,
         )
 
-    def merge_pr(self, number: int, strategy: str) -> str:
+    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
         args = ["pr", "merge", str(number)]
+        if admin:
+            args.append("--admin")
         if strategy == "merge":
             args.append("--merge")
         elif strategy == "rebase":

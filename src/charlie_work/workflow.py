@@ -1181,7 +1181,9 @@ class OrchestratorApp:
             # merged while state.json still shows "reviewing" — which made
             # reconcile false-positive on every clean auto-merge and lost the
             # merged fact entirely on a crash between merge and save.
-            merge_output = self.gh.merge_pr(pr_number, self.config.auto_merge.strategy)
+            merge_output = self.gh.merge_pr(
+                pr_number, self.config.auto_merge.strategy, admin=self.config.auto_merge.admin
+            )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {

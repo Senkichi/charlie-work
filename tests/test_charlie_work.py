@@ -877,8 +877,10 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> None:
         self.labels_removed.append((number, label))
 
-    def merge_pr(self, number: int, strategy: str) -> str:
+    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
         self.merged.append((number, strategy))
+        self.merged_admin_flags = getattr(self, "merged_admin_flags", [])
+        self.merged_admin_flags.append(admin)
         return "merged"
 
     def delete_branch(self, branch: str) -> bool:
@@ -3698,6 +3700,28 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     assert result.ok is True
     assert result.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
+    # Default config: no --admin
+    assert fake_gh.merged_admin_flags == [False]
+
+
+def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True, admin=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    assert fake_gh.merged_admin_flags == [True]
 
 
 def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
