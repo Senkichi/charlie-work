@@ -11,7 +11,7 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
 ## Common commands
 
 ```bash
-uv run pytest -q --tb=short   # run tests
+uv run --extra dev pytest -q --tb=short   # run tests
 uv run ruff check .           # lint
 uv run ruff format .          # format
 ```
