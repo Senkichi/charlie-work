@@ -41,7 +41,7 @@ class FakeGitHub:
 
 def _pr(
     number: int,
-    state: str,
+    state: str = "OPEN",
     *,
     head_ref: str | None = None,
     body: str = "",
