@@ -53,5 +53,6 @@ After your final commit:
    gh pr view $pr_number --json headRefOid
    ```
    Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
+4. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the rework complete.
