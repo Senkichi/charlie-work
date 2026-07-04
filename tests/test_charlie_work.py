@@ -5165,14 +5165,14 @@ def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> 
     change. This test ensures the original semantics are preserved: fields appear when the governor
     is enabled, not only when it's actively throttling.
     """
-    from charlie_work.config import DevinConfig
+    from charlie_work.config import DevinConfig, DispatchConfig
 
     # Configure with max_concurrent_sessions=5 (enabled but not clamping in this scenario)
     config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=5),
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-            max_concurrent_sessions=5,
         ),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
