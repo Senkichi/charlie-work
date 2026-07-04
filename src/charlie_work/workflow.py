@@ -55,6 +55,11 @@ class ConcurrencyGovernorResult:
     available_slots: int
     dispatch_limit: int
 
+    @property
+    def enabled(self) -> bool:
+        """Return True if the governor is enabled (max_concurrent > 0)."""
+        return self.max_concurrent > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
         return {
@@ -1542,8 +1547,8 @@ class OrchestratorApp:
             "merges": merges,
             "errors": errors,
         }
-        # Propagate concurrency clamp info from dispatch results
-        if gov.clamped:
+        # Propagate concurrency info from dispatch results
+        if gov.enabled:
             data.update(gov.report_fields())
         return CommandResult(
             ok,

@@ -4452,6 +4452,42 @@ def test_concurrency_governor_result_unclamped() -> None:
         "available_slots": 5,
     }
 
+    # Test enabled property
+    assert result.enabled is False  # max_concurrent=0 means disabled
+
+
+def test_concurrency_governor_result_enabled_property() -> None:
+    """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
+    # Disabled (max_concurrent=0)
+    disabled = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+    assert disabled.enabled is False
+
+    # Enabled but not clamped (max_concurrent > 0, available_slots >= dispatch_limit)
+    enabled_unclamped = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=5,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+    assert enabled_unclamped.enabled is True
+
+    # Enabled and clamped (max_concurrent > 0, available_slots < dispatch_limit)
+    enabled_clamped = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=4,
+        available_slots=1,
+        dispatch_limit=5,
+    )
+    assert enabled_clamped.enabled is True
+
 
 def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
     """_apply_concurrency_governor returns unclamped result when max_concurrent is 0."""
@@ -5117,3 +5153,39 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     # Count live sessions (both have pid=None, so count should be 0)
     count = _count_live_sessions(sessions_dir)
     assert count == 0  # No live sessions since both have pid=None
+
+
+def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> None:
+    """Regression test for issue #100: loop() must emit concurrency fields when governor is enabled,
+    even when not clamped.
+
+    On origin/main, loop() emitted concurrency_limit/live_session_count/available_slots whenever
+    max_concurrent > 0 (governor enabled), regardless of whether it actually clamped anything.
+    The initial PR implementation changed this to only emit when clamped, which was a silent behavior
+    change. This test ensures the original semantics are preserved: fields appear when the governor
+    is enabled, not only when it's actively throttling.
+    """
+    from charlie_work.config import DevinConfig
+
+    # Configure with max_concurrent_sessions=5 (enabled but not clamping in this scenario)
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+            max_concurrent_sessions=5,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Run loop with no live sessions (governor enabled but not clamped)
+    result = app.loop(limit=0)
+
+    # Assert that concurrency fields are present even though governor is not clamped
+    assert "concurrency_limit" in result.data
+    assert result.data["concurrency_limit"] == 5
+    assert "live_session_count" in result.data
+    assert result.data["live_session_count"] == 0
+    assert "available_slots" in result.data
+    assert result.data["available_slots"] == 5
