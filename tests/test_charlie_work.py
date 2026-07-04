@@ -42,7 +42,7 @@ from charlie_work.state import (
     set_throttled_until,
     state_lock,
 )
-from charlie_work.workflow import OrchestratorApp, slugify
+from charlie_work.workflow import ConcurrencyGovernorResult, OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
@@ -4394,6 +4394,130 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     assert result.data["concurrency_limit"] == 2
     assert result.data["live_session_count"] == 1
     assert result.data["available_slots"] == 1
+
+
+def test_concurrency_governor_result_dataclass() -> None:
+    """ConcurrencyGovernorResult is a frozen dataclass with all fields bound together."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=2,
+        live_count=1,
+        available_slots=1,
+        dispatch_limit=1,
+    )
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 1
+    assert result.available_slots == 1
+    assert result.dispatch_limit == 1
+
+    # Test report_fields method
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 2,
+        "live_session_count": 1,
+        "available_slots": 1,
+    }
+
+    # Test immutability (frozen dataclass)
+    try:
+        result.clamped = False
+        assert False, "Should not be able to modify frozen dataclass"
+    except (AttributeError, TypeError):
+        pass  # Expected
+
+
+def test_concurrency_governor_result_unclamped() -> None:
+    """ConcurrencyGovernorResult correctly represents unclamped state."""
+    result = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+
+    assert result.clamped is False
+    assert result.max_concurrent == 0
+    assert result.live_count == 0
+    assert result.available_slots == 5
+    assert result.dispatch_limit == 5
+
+    # report_fields should still work even when unclamped
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 0,
+        "live_session_count": 0,
+        "available_slots": 5,
+    }
+
+
+def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
+    """_apply_concurrency_governor returns unclamped result when max_concurrent is 0."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is False
+    assert result.max_concurrent == 0
+    assert result.live_count == 0
+    assert result.available_slots == 5
+    assert result.dispatch_limit == 5
+
+
+def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) -> None:
+    """_apply_concurrency_governor returns clamped result when sessions are alive."""
+    def mock_count_live(sessions_dir):
+        return 2
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 2
+    assert result.available_slots == 0
+    assert result.dispatch_limit == 0
+
+
+def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeypatch) -> None:
+    """_apply_concurrency_governor returns partial clamped result when some slots available."""
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 1
+    assert result.available_slots == 1
+    assert result.dispatch_limit == 1
 
 
 def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:

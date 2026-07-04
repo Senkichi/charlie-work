@@ -40,6 +40,29 @@ class CommandResult:
     data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ConcurrencyGovernorResult:
+    """Result of applying concurrency governor to a dispatch limit.
+
+    This encapsulates the concurrency limiting logic and ensures all related
+    fields are bound together, eliminating Pyright's reportPossiblyUnbound
+    warnings for live_count.
+    """
+    clamped: bool
+    max_concurrent: int
+    live_count: int
+    available_slots: int
+    dispatch_limit: int
+
+    def report_fields(self) -> dict[str, int]:
+        """Return the fields to include in CommandResult.data when clamped."""
+        return {
+            "concurrency_limit": self.max_concurrent,
+            "live_session_count": self.live_count,
+            "available_slots": self.available_slots,
+        }
+
+
 def _janitor_section(warnings: tuple[str, ...]) -> str:
     if not warnings:
         return ""
@@ -203,6 +226,35 @@ class OrchestratorApp:
             dry_run=self.dry_run,
         )
 
+    def _apply_concurrency_governor(self, dispatch_limit: int) -> ConcurrencyGovernorResult:
+        """Apply global concurrency governor cap to a dispatch limit.
+
+        Returns a ConcurrencyGovernorResult with the potentially-clamped limit
+        and all related fields. This eliminates Pyright's reportPossiblyUnbound
+        warnings by ensuring live_count is always bound together with the
+        clamped flag.
+        """
+        max_concurrent = self.config.dispatch.max_concurrent_sessions
+        live_count = 0
+        available_slots = dispatch_limit
+        clamped = False
+
+        if max_concurrent > 0:
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_count = _count_live_sessions(sessions_dir)
+            available_slots = max(0, max_concurrent - live_count)
+            if available_slots < dispatch_limit:
+                dispatch_limit = available_slots
+                clamped = True
+
+        return ConcurrencyGovernorResult(
+            clamped=clamped,
+            max_concurrent=max_concurrent,
+            live_count=live_count,
+            available_slots=available_slots,
+            dispatch_limit=dispatch_limit,
+        )
+
     def status(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
@@ -344,16 +396,8 @@ class OrchestratorApp:
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        concurrency_clamped = False
-        available_slots = dispatch_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < dispatch_limit:
-                dispatch_limit = available_slots
-                concurrency_clamped = True
+        gov = self._apply_concurrency_governor(dispatch_limit)
+        dispatch_limit = gov.dispatch_limit
 
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
@@ -372,10 +416,8 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if concurrency_clamped:
-                    data["concurrency_limit"] = max_concurrent
-                    data["live_session_count"] = live_count
-                    data["available_slots"] = available_slots
+                if gov.clamped:
+                    data.update(gov.report_fields())
                 return CommandResult(
                     False,
                     f"dispatch deferred: provider throttled until {throttled_until}",
@@ -475,10 +517,8 @@ class OrchestratorApp:
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
             }
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 f"dry-run: would dispatch {len(session_requests)} issue(s)",
@@ -678,10 +718,8 @@ class OrchestratorApp:
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
         }
-        if concurrency_clamped:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        if gov.clamped:
+            data.update(gov.report_fields())
         return CommandResult(
             not failed_issue_numbers,
             message,
@@ -1423,15 +1461,8 @@ class OrchestratorApp:
         effective_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap to the total wave budget
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        live_count = 0
-        available_slots = effective_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < effective_limit:
-                effective_limit = available_slots
+        gov = self._apply_concurrency_governor(effective_limit)
+        effective_limit = gov.dispatch_limit
 
         # Classify dead sessions and update throttle state (production loop path)
         # This detects provider throttling from worker deaths and sets cooldown
@@ -1511,10 +1542,8 @@ class OrchestratorApp:
             "errors": errors,
         }
         # Propagate concurrency clamp info from dispatch results
-        if max_concurrent > 0:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        if gov.clamped:
+            data.update(gov.report_fields())
         return CommandResult(
             ok,
             message,
@@ -1562,16 +1591,8 @@ class OrchestratorApp:
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        concurrency_clamped = False
-        available_slots = rework_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < rework_limit:
-                rework_limit = available_slots
-                concurrency_clamped = True
+        gov = self._apply_concurrency_governor(rework_limit)
+        rework_limit = gov.dispatch_limit
 
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
@@ -1585,10 +1606,8 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if concurrency_clamped:
-                    data["concurrency_limit"] = max_concurrent
-                    data["live_session_count"] = live_count
-                    data["available_slots"] = available_slots
+                if gov.clamped:
+                    data.update(gov.report_fields())
                 return CommandResult(
                     False,
                     f"rework dispatch deferred: provider throttled until {throttled_until}",
@@ -1624,10 +1643,8 @@ class OrchestratorApp:
 
         if not selected:
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "no rework candidates found",
@@ -1673,10 +1690,8 @@ class OrchestratorApp:
 
         if not selected_issue_numbers:
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
@@ -1740,10 +1755,8 @@ class OrchestratorApp:
                 )
                 save_state(self.paths.state_file, state)
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "no valid rework prompts found",
@@ -1843,10 +1856,8 @@ class OrchestratorApp:
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
         }
-        if concurrency_clamped:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        if gov.clamped:
+            data.update(gov.report_fields())
         return CommandResult(
             not failed_issue_numbers,
             message,
