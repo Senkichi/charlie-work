@@ -3886,6 +3886,215 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     assert len(results) == 1  # Only PR 789 (456 is excluded as the merged PR)
 
 
+def test_update_open_agent_prs_skips_approved_pending_ship_prs(tmp_path: Path) -> None:
+    """Test that approved-pending-ship PRs are skipped to avoid invalidating approvals.
+
+    Regression test for issue #89: when two PRs are approved in the same operator pass,
+    merging the first should not base-update the second (which would move its head and
+    invalidate its approval, forcing a manual re-approve loop).
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two approved PRs
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",  # Live head matches reviewed head
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",  # Live head matches reviewed head
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision files for both PRs (approved state)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be skipped (approved-pending-ship)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "approved-pending-ship"
+
+    # Verify pr_update_branch was NOT called for PR 789
+    assert fake_gh.update_branch_ok is True  # Should still be True (never called)
+
+
+def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
+    """Test that PRs without approved decisions are still updated normally."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two PRs, one approved, one not
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Only create review decision for PR 456 (approved)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # PR 789 has no decision file (or a non-approved decision)
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes"}, indent=2),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be updated (not approved)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is True
+    assert "skipped_reason" not in results[0]
+
+
+def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Path) -> None:
+    """Test that approved PRs with moved heads are still updated (not skipped).
+
+    This ensures the head-moved gate remains intact for content-bearing moves.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up an approved PR whose head has moved since approval
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-new456",  # Head has moved since approval
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision for PR 789 with old head
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},  # Old head
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be updated (head moved, so not approved-pending-ship)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is True
+    assert "skipped_reason" not in results[0]
+
+
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
     """When max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
     config = OrchestratorConfig(
