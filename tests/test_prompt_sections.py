@@ -336,3 +336,20 @@ def test_rendered_worker_prompt_qualified_test_bullet() -> None:
     assert not bare_test_matches, (
         f"Found bare /test bullet(s) without qualification in rendered worker.md: {bare_test_matches}"
     )
+
+
+def test_worker_and_rework_templates_contain_body_reconciliation_requirement() -> None:
+    """Verify that worker.md, worker_claude_code.md, and rework.md contain the body-reconciliation requirement.
+
+    This prevents silent drift where workers don't reconcile PR body claims with the final pushed head
+    (issue #99). The mutation gate: removing the clause from any one template must fail this test.
+    """
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    body_reconciliation_text = "After verifying the push, re-read your PR body and make every claim literally true at the pushed head"
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        text = (prompts_dir / template_name).read_text(encoding="utf-8")
+        assert body_reconciliation_text in text, (
+            f"Template {template_name} does not contain the body-reconciliation requirement. "
+            f"Expected to find: {body_reconciliation_text}"
+        )
