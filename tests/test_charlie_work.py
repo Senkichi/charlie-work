@@ -641,11 +641,11 @@ def test_command_adapter_render_error_returns_error_record(tmp_path: Path) -> No
 
 def test_command_adapter_positional_placeholder_returns_error_record(tmp_path: Path) -> None:
     """AC #2: Command adapter positional placeholder {0} returns error record, not raise.
-    
+
     The command adapter's render try/except catches IndexError for positional {0} templates.
     This test verifies that a config built directly (bypassing load_config) with a positional
     placeholder returns an error record instead of raising.
-    
+
     Mutation to verify: remove IndexError from the except clause in adapters.py line 281,
     and the test will fail (it will raise IndexError instead of returning an error record).
     """

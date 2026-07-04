@@ -530,16 +530,16 @@ def test_recovery_with_venv_dir_reuses_worktree(tmp_path: Path) -> None:
 
 def test_recovery_branch_prefix_change_fails_loudly(tmp_path: Path) -> None:
     """AC #1: Recovery mode with branch_prefix change fails loudly on worktree collision.
-    
+
     When dispatch.branch_prefix changes between dispatches, the recovery record's
     branch_name (old prefix) no longer matches the derived branch (new prefix).
     The recovery logic validates this mismatch and raises RuntimeError immediately.
-    
+
     The test simulates this by:
     1. Creating a worktree with branch "agent/issue-123"
     2. Attempting recovery with a mismatched branch name "worker/issue-123"
     3. The recovery check should fail loudly with a branch mismatch error
-    
+
     Mutation to verify: comment out the recovery branch check in worktree.py (line 134),
     and the test will fail (it will skip recovery and attempt fresh worktree creation).
     """
@@ -558,7 +558,7 @@ def test_recovery_branch_prefix_change_fails_loudly(tmp_path: Path) -> None:
     # Try to recover with a new branch name (simulating branch_prefix change)
     # The recovery record's branch_name doesn't match, so this should fail loudly
     new_branch_name = "worker/issue-123"
-    
+
     with pytest.raises(RuntimeError, match="Recovery record branch_name"):
         create_worktree(repo_root, new_branch_name, base_ref="HEAD", recovery=recovery_record)
 
