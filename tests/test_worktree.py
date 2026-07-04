@@ -8,6 +8,7 @@ import pytest
 
 from charlie_work.worktree import (
     WorktreeInfo,
+    _default_worktrees_dir,
     create_worktree,
     is_junction,
     list_worktrees,
@@ -376,6 +377,187 @@ def test_rework_fetch_failure_raises_when_origin_exists(tmp_path: Path) -> None:
         create_worktree(repo_root, branch_name, rework=True)
 
 
+def test_remove_worktree_deletes_branch_when_provided(tmp_path: Path) -> None:
+    """remove_worktree should delete the branch when branch parameter is provided."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-delete-branch"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Remove the worktree with branch deletion
+    removed = remove_worktree(repo_root, info.path, branch=branch_name)
+    assert removed is True
+    assert not info.path.exists()
+
+    # Verify the branch is deleted
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name not in result.stdout
+
+
+def test_remove_worktree_without_branch_parameter_preserves_branch(tmp_path: Path) -> None:
+    """remove_worktree without branch parameter should preserve the branch."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-2-preserve-branch"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Remove the worktree without branch deletion
+    removed = remove_worktree(repo_root, info.path)
+    assert removed is True
+    assert not info.path.exists()
+
+    # Verify the branch still exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up the branch manually
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_junction_creation_failure_cleans_up_worktree_and_branch(tmp_path: Path) -> None:
+    """Junction creation failure should clean up the orphan worktree and branch."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a valid venv_source but monkeypatch junction creation to fail
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+    branch_name = "agent/issue-3-junction-fail"
+
+    # Monkeypatch the junction creation function to raise OSError
+    import charlie_work.worktree
+
+    original_create = charlie_work.worktree._create_junction_or_symlink
+
+    def mock_create_junction(*args: object, **kwargs: object) -> None:
+        raise OSError("Mock junction creation failure")
+
+    charlie_work.worktree._create_junction_or_symlink = mock_create_junction
+
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            create_worktree(repo_root, branch_name, base_ref="HEAD", venv_source=venv_source)
+
+        # Verify the worktree is cleaned up
+        worktrees_dir = _default_worktrees_dir(repo_root)
+        worktree_path = worktrees_dir / branch_name.replace("/", "-")
+        assert not worktree_path.exists()
+
+        # Verify the branch is deleted
+        result = subprocess.run(
+            ["git", "branch", "--list", branch_name],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert branch_name not in result.stdout
+    finally:
+        charlie_work.worktree._create_junction_or_symlink = original_create
+
+
+def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) -> None:
+    """Junction creation failure in rework mode should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a branch first (simulating a previous PR cycle)
+    branch_name = "agent/issue-5-junction-fail-rework"
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Create a valid venv_source but monkeypatch junction creation to fail
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+
+    # Monkeypatch the junction creation function to raise OSError
+    import charlie_work.worktree
+
+    original_create = charlie_work.worktree._create_junction_or_symlink
+
+    def mock_create_junction(*args: object, **kwargs: object) -> None:
+        raise OSError("Mock junction creation failure")
+
+    charlie_work.worktree._create_junction_or_symlink = mock_create_junction
+
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            create_worktree(repo_root, branch_name, rework=True, venv_source=venv_source)
+
+        # Verify the branch is preserved (not deleted)
+        result = subprocess.run(
+            ["git", "branch", "--list", branch_name],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert branch_name in result.stdout
+    finally:
+        charlie_work.worktree._create_junction_or_symlink = original_create
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
 def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
     """Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
     repo_root = tmp_path / "repo"
@@ -452,6 +634,59 @@ def test_recovery_with_dirty_tree_reuses_worktree(tmp_path: Path) -> None:
 
     # Clean up
     remove_worktree(repo_root, info2.path, force=True)
+
+
+def test_remove_worktree_branch_deletion_independent_of_worktree_removal(tmp_path: Path) -> None:
+    """Branch deletion should be attempted even when worktree removal fails."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-4-branch-delete-on-wt-fail"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Force worktree removal to fail by making the worktree path non-writable
+    # (simulating a Windows file lock scenario)
+    # We'll do this by removing the worktree from git's metadata first
+    subprocess.run(
+        ["git", "worktree", "remove", str(info.path)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Now the directory still exists but git doesn't know about it
+    # remove_worktree should fail on the git worktree remove step
+    # but still attempt branch deletion
+    removed = remove_worktree(repo_root, info.path, branch=branch_name)
+
+    # Should return False because worktree removal failed
+    assert removed is False
+
+    # But the branch should still be deleted
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name not in result.stdout
+
+    # Clean up the orphaned directory if it still exists
+    if info.path.exists():
+        import shutil
+
+        shutil.rmtree(info.path)
 
 
 def test_recovery_branch_mismatch_raises(tmp_path: Path) -> None:
