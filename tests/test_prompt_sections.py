@@ -311,3 +311,28 @@ def test_rendered_worker_prompts_require_completion_report_with_command_and_coun
         assert "collected/passed count" in prompt
         # Verify the example format
         assert "300 collected, 300 passed" in prompt
+
+
+def test_rendered_worker_prompt_qualified_test_bullet() -> None:
+    """Verify that the rendered worker.md prompt has a qualified /test bullet, not bare /test.
+
+    This test goes through the real render path to ensure the rendered worker prompt
+    no longer advertises unqualified /test (issue #95, AC2). The mutation gate:
+    reverting the worker.md bullet edit must fail this test.
+    """
+    prompt = _render_worker_with_sections("worker.md")
+
+    # Verify the qualified bullet text is present
+    qualified_bullet = "`/test` - Run the test suite and verify all tests pass (only if it wraps the canonical command below)"
+    assert qualified_bullet in prompt, (
+        f"Qualified /test bullet not found in rendered worker.md. "
+        f"Expected to find: {qualified_bullet}"
+    )
+
+    # Verify no bare /test bullet exists (without the qualification)
+    # This regex matches a bullet line with /test that does NOT have the qualification
+    bare_test_pattern = r"^- `/test`[^\(]*$"
+    bare_test_matches = re.findall(bare_test_pattern, prompt, re.MULTILINE)
+    assert not bare_test_matches, (
+        f"Found bare /test bullet(s) without qualification in rendered worker.md: {bare_test_matches}"
+    )
