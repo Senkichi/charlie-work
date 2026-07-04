@@ -458,27 +458,41 @@ def test_junction_creation_failure_cleans_up_worktree_and_branch(tmp_path: Path)
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
-    # Create a non-existent venv_source to trigger junction failure
-    venv_source = tmp_path / "nonexistent-venv"
+    # Create a valid venv_source but monkeypatch junction creation to fail
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
     branch_name = "agent/issue-3-junction-fail"
 
-    with pytest.raises((OSError, RuntimeError)):
-        create_worktree(repo_root, branch_name, base_ref="HEAD", venv_source=venv_source)
+    # Monkeypatch the junction creation function to raise OSError
+    import charlie_work.worktree
 
-    # Verify the worktree is cleaned up
-    worktrees_dir = _default_worktrees_dir(repo_root)
-    worktree_path = worktrees_dir / branch_name.replace("/", "-")
-    assert not worktree_path.exists()
+    original_create = charlie_work.worktree._create_junction_or_symlink
 
-    # Verify the branch is deleted
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert branch_name not in result.stdout
+    def mock_create_junction(*args: object, **kwargs: object) -> None:
+        raise OSError("Mock junction creation failure")
+
+    charlie_work.worktree._create_junction_or_symlink = mock_create_junction
+
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            create_worktree(repo_root, branch_name, base_ref="HEAD", venv_source=venv_source)
+
+        # Verify the worktree is cleaned up
+        worktrees_dir = _default_worktrees_dir(repo_root)
+        worktree_path = worktrees_dir / branch_name.replace("/", "-")
+        assert not worktree_path.exists()
+
+        # Verify the branch is deleted
+        result = subprocess.run(
+            ["git", "branch", "--list", branch_name],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert branch_name not in result.stdout
+    finally:
+        charlie_work.worktree._create_junction_or_symlink = original_create
 
 
 def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) -> None:
@@ -505,21 +519,35 @@ def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) ->
     )
     assert branch_name in result.stdout
 
-    # Create a non-existent venv_source to trigger junction failure in rework mode
-    venv_source = tmp_path / "nonexistent-venv"
+    # Create a valid venv_source but monkeypatch junction creation to fail
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
 
-    with pytest.raises((OSError, RuntimeError)):
-        create_worktree(repo_root, branch_name, rework=True, venv_source=venv_source)
+    # Monkeypatch the junction creation function to raise OSError
+    import charlie_work.worktree
 
-    # Verify the branch is preserved (not deleted)
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert branch_name in result.stdout
+    original_create = charlie_work.worktree._create_junction_or_symlink
+
+    def mock_create_junction(*args: object, **kwargs: object) -> None:
+        raise OSError("Mock junction creation failure")
+
+    charlie_work.worktree._create_junction_or_symlink = mock_create_junction
+
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            create_worktree(repo_root, branch_name, rework=True, venv_source=venv_source)
+
+        # Verify the branch is preserved (not deleted)
+        result = subprocess.run(
+            ["git", "branch", "--list", branch_name],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert branch_name in result.stdout
+    finally:
+        charlie_work.worktree._create_junction_or_symlink = original_create
 
     # Clean up
     subprocess.run(
@@ -657,6 +685,7 @@ def test_remove_worktree_branch_deletion_independent_of_worktree_removal(tmp_pat
     # Clean up the orphaned directory if it still exists
     if info.path.exists():
         import shutil
+
         shutil.rmtree(info.path)
 
 
