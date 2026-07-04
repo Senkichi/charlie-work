@@ -48,6 +48,7 @@ class ConcurrencyGovernorResult:
     fields are bound together, eliminating Pyright's reportPossiblyUnbound
     warnings for live_count.
     """
+
     clamped: bool
     max_concurrent: int
     live_count: int
