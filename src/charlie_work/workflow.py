@@ -824,14 +824,34 @@ class OrchestratorApp:
         # packet above is the authority; a label failure is reported, not fatal.
         label_error: str | None = None
         if issue_number is not None:
-            try:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
-            except GitHubError as exc:
-                label_error = str(exc)
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state["prs"][str(pr_number)]["label_error"] = label_error
-                    save_state(self.paths.state_file, state)
+            # Optimization: skip review_started transition if the PR has an unaddressed
+            # request_changes decision and the head SHA hasn't changed (nothing new to review).
+            # This avoids pointless packet churn and prevents the transition from stripping
+            # the needs_rework label from budget-deferred rework candidates.
+            should_skip_transition = False
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                pr_state = state["prs"].get(str(pr_number), {})
+                existing_decision = pr_state.get("decision")
+                reviewed_head_sha = pr_state.get("reviewed_head_sha")
+                live_head_sha = pr.get("headRefOid")
+                if (
+                    existing_decision == "request_changes"
+                    and reviewed_head_sha is not None
+                    and live_head_sha is not None
+                    and live_head_sha == reviewed_head_sha
+                ):
+                    should_skip_transition = True
+
+            if not should_skip_transition:
+                try:
+                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                except GitHubError as exc:
+                    label_error = str(exc)
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)]["label_error"] = label_error
+                        save_state(self.paths.state_file, state)
         message = "review packet generated"
         if label_error:
             message += f" (label update failed: {label_error})"
@@ -926,23 +946,36 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
-            # Update the linked issue's status when request_changes is recorded:
-            # the previous worker session is definitionally finished, so clear the
-            # dispatched claim to make the issue selectable for rework dispatch.
-            # Escalated requests must NOT mark the issue selectable.
-            if decision == "request_changes" and issue_number is not None:
-                if not escalated:
+            # Update the linked issue's status to reconcile out of rework_requested:
+            # the previous worker session is definitionally finished, so the issue
+            # status must reflect the actual decision. This prevents state-driven
+            # dispatch_rework from selecting approved/blocked PRs for duplicate work.
+            if issue_number is not None:
+                if decision == "request_changes":
+                    if not escalated:
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "rework_requested",
+                        }
+                    else:
+                        # Clear rework_requested status when escalated to prevent selection
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "escalated",
+                        }
+                elif decision == "approved":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "rework_requested",
+                        "status": "approved",
                     }
-                else:
-                    # Clear rework_requested status when escalated to prevent selection
+                elif decision == "blocked":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "escalated",
+                        "status": "blocked",
                     }
             state = append_event(
                 state,
@@ -1475,6 +1508,10 @@ class OrchestratorApp:
 
         This is only for non-manual adapters. The manual adapter's human-paste
         path remains intact.
+
+        Candidate selection is STATE-DRIVEN: an issue is a rework candidate iff
+        state["issues"][n]["status"] == "rework_requested" and it has an open PR.
+        The label is used for display only and never for selection.
         """
         if self.config.devin.adapter == "manual":
             return CommandResult(
@@ -1483,8 +1520,25 @@ class OrchestratorApp:
                 {"adapter": "manual", "selected_count": 0},
             )
 
-        # Find issues with needs-rework label
-        issues = self.gh.issue_list(self.config.labels.needs_rework)
+        # Load state to find rework_requested issues (state-driven selection)
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+
+        # Find issues with rework_requested status
+        rework_issues = []
+        for number, entry in state.get("issues", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "rework_requested":
+                # Fetch the full issue from GitHub to get labels and other metadata
+                try:
+                    issue_number = int(number)
+                    full_issue = self.gh.issue_view(issue_number)
+                    rework_issues.append(full_issue)
+                except GitHubError:
+                    # Skip issues that can't be fetched (deleted, etc.)
+                    continue
+
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
@@ -1539,7 +1593,7 @@ class OrchestratorApp:
 
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
-        candidates = [issue for issue in issues if int(issue["number"]) in pr_by_issue]
+        candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
