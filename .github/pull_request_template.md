@@ -13,7 +13,7 @@ Closes #<!-- issue number -->
 
 ```
 uv sync --all-extras
-uv run pytest -q --tb=short
+uv run --extra dev pytest -q --tb=short
 # paste output here
 ```
 

@@ -53,6 +53,9 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
                 continue
             elif state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
                 name_pending = True
+            elif not state and not bucket:
+                # Null/empty state and bucket means the check-run hasn't populated yet - classify as pending
+                name_pending = True
             else:
                 # Any failure state (FAILURE, CANCELLED, TIMED_OUT, etc.)
                 name_failed = True

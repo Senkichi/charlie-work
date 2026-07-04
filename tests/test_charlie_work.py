@@ -275,6 +275,32 @@ def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
     assert summary.pending == ()
 
 
+def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: null/empty state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": None, "bucket": None},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: empty string state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": "", "bucket": ""},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
+
+
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     save_state(state_path, {"version": 1, "issues": {}, "prs": {}, "events": []})
