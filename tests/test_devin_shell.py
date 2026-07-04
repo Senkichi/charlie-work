@@ -837,7 +837,7 @@ def test_launch_render_error_returns_error_record_and_tears_down_worktree(
 
     worktree_removed = []
 
-    def tracking_remove_worktree(repo_root, worktree_path, *, force=False):
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False, branch=None):
         worktree_removed.append(worktree_path)
 
     monkeypatch.setattr(
@@ -870,3 +870,178 @@ def test_launch_render_error_returns_error_record_and_tears_down_worktree(
     payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert payload["error"] is not None
     assert payload["pid"] is None
+
+
+def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
+    """Launch failure should clean up branch and worktree, allowing retry to succeed."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt text\n", encoding="utf-8")
+
+    # Initialize a real git repo for the worktree to use
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-42-retry"
+
+    # First launch fails (binary doesn't exist)
+    record1 = launch_devin_session(
+        42,
+        branch_name,
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+    )
+
+    assert record1.error is not None
+    assert "failed to launch devin" in record1.error
+
+    # Verify the branch is deleted after the failure
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name not in result.stdout
+
+    # Second launch should succeed (using fake devin script)
+    script = _write_fake_devin(tmp_path, _FAKE_DEVIN_SLEEP)
+    record2 = launch_devin_session(
+        42,
+        branch_name,
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script), "{prompt_path}"),
+    )
+
+    assert record2.error is None
+    assert record2.branch == branch_name
+
+
+def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
+    """Rework-mode launch failure should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt text\n", encoding="utf-8")
+
+    # Initialize a real git repo
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-44-rework"
+
+    # Create the branch first (simulating a previous PR cycle)
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Rework-mode launch fails (binary doesn't exist)
+    record = launch_devin_session(
+        44,
+        branch_name,
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+        rework=True,
+    )
+
+    assert record.error is not None
+    assert "failed to launch devin" in record.error
+
+    # Verify the branch is preserved (not deleted)
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
