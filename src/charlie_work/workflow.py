@@ -1361,6 +1361,7 @@ class OrchestratorApp:
         - Are same-repo (not forks)
         - Have the configured branch prefix
         - Are not the just-merged PR
+        - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
 
         Per-PR failures (conflicts, network errors) are reported as values and
         never abort the batch operation.
@@ -1382,6 +1383,25 @@ class OrchestratorApp:
             head = str(pr.get("headRefName") or "")
             if not head.startswith(branch_prefix):
                 continue
+
+            # Skip approved-pending-ship PRs to avoid invalidating their approvals
+            # These will get base-updated when they themselves are merged (GitHub merges
+            # handle base freshness) or by a later pass after they merge.
+            decision = self._review_decision(pr_number)
+            if decision.get("decision") == "approved":
+                reviewed_head_sha = decision.get("reviewed_head_sha")
+                live_head_sha = pr.get("headRefOid")
+                if reviewed_head_sha is not None and live_head_sha == reviewed_head_sha:
+                    # PR is approved and head hasn't moved since approval — skip update
+                    results.append(
+                        {
+                            "pr_number": pr_number,
+                            "head_ref": head,
+                            "updated": False,
+                            "skipped_reason": "approved-pending-ship",
+                        }
+                    )
+                    continue
 
             # Attempt to update the branch
             success = self.gh.pr_update_branch(pr_number)
