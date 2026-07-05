@@ -16,7 +16,9 @@ _LIST_LIMIT = 500
 # These are the single source of truth for all JSON field queries to GitHub.
 # All call sites must use these constants — no inline field-list literals.
 ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt,state"
-ISSUE_VIEW_FIELDS = "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
+ISSUE_VIEW_FIELDS = (
+    "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
+)
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_CHECKS_FIELDS = "name,state,bucket,link"
@@ -245,7 +247,7 @@ class GitHub:
         """
         if not issue_numbers:
             return set()
-        
+
         open_issues: set[int] = set()
         for number in issue_numbers:
             try:
@@ -257,7 +259,7 @@ class GitHub:
             except (GitHubError, ValueError, TypeError):
                 # Issue doesn't exist or API error — treat as not blocking
                 continue
-        
+
         return open_issues
 
 
@@ -358,13 +360,13 @@ def parse_blockers(text: str) -> list[int]:
     - "Blocked by #N"
     - "Depends on #N"
     - "Blocked-by: #N"
-    
+
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
     Returns an empty list if no blockers are found.
     """
     if not text:
         return []
-    
+
     blockers: set[int] = set()
     # Check if they appear in blocker context
     for pattern in _BLOCKER_PATTERNS:
@@ -378,7 +380,7 @@ def parse_blockers(text: str) -> list[int]:
                 except (ValueError, TypeError):
                     # Skip malformed numbers
                     continue
-    
+
     return sorted(blockers)
 
 
