@@ -240,7 +240,11 @@ def test_kill_process_tree_enumerates_children() -> None:
     # Spawn a real parent process that will spawn a child
     # On POSIX, use start_new_session=True to avoid sharing pytest's process group
     parent_proc = subprocess.Popen(
-        [sys.executable, "-c", "import subprocess; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); import time; time.sleep(10)"],
+        [
+            sys.executable,
+            "-c",
+            "import subprocess; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); import time; time.sleep(10)",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=(os.name != "nt"),
@@ -249,10 +253,12 @@ def test_kill_process_tree_enumerates_children() -> None:
     try:
         # Give the parent time to spawn the child
         import time
+
         time.sleep(0.5)
 
         # Get the actual child PID(s)
         from charlie_work.process_utils import _enumerate_child_pids
+
         child_pids = _enumerate_child_pids(parent_proc.pid)
 
         if not child_pids:
