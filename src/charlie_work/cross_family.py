@@ -183,6 +183,7 @@ def run_cross_family_review(
     rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
     env = _sanitize_env(repo_root)
+    stdout = ""
     for attempt in range(2):
         try:
             completed = runner(
