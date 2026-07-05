@@ -548,12 +548,15 @@ def is_worker_alive(record: ClaudeWorkerRecord) -> bool:
 
 
 def update_worker_record_with_failure_classification(
-    sessions_dir: Path, issue_number: int
+    sessions_dir: Path, issue_number: int, *, failure_kind: str | None = None
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
+
+    If failure_kind is provided directly, it uses that instead of classifying
+    from the log (used by the stall watchdog to mark sessions as "stalled").
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed.
@@ -575,18 +578,24 @@ def update_worker_record_with_failure_classification(
     if payload.get("failure_kind") is not None:
         return payload.get("failure_kind"), None
 
+    # If failure_kind is provided directly, use it
+    if failure_kind is not None:
+        payload["failure_kind"] = failure_kind
+        _write_json_atomic(sidecar_path, payload)
+        return failure_kind, None
+
     log_path_str = payload.get("log_path")
     if not log_path_str:
         return None, None
 
     log_path = Path(log_path_str)
-    failure_kind, throttled_until = _classify_session_failure(log_path)
+    classified_kind, throttled_until = _classify_session_failure(log_path)
 
-    if failure_kind:
-        payload["failure_kind"] = failure_kind
+    if classified_kind:
+        payload["failure_kind"] = classified_kind
         _write_json_atomic(sidecar_path, payload)
 
-    return failure_kind, throttled_until
+    return classified_kind, throttled_until
 
 
 __all__ = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from .state import (
     state_lock,
     utc_now,
 )
+from .process_utils import is_session_stalled, kill_process_tree
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,170 @@ def _count_live_sessions(sessions_dir: Path) -> int:
         if is_worker_alive(record):
             live_count += 1
     return live_count
+
+
+def _detect_stalled_sessions(
+    sessions_dir: Path, config: OrchestratorConfig
+) -> set[int]:
+    """Detect stalled sessions (live PID but dead agent) without handling them.
+
+    A session is stalled when its PID is alive but its log file's mtime is
+    older than the configured threshold, or the log contains a terminal error
+    marker. This is a read-only detection function for status/roll-call.
+
+    Returns the set of issue numbers that are stalled.
+    """
+    from .devin_shell import is_session_alive, read_session_records
+    from .claude_code import is_worker_alive, read_worker_records
+
+    if not config.watchdog.enabled:
+        return set()
+
+    stalled_issues = set()
+    stall_threshold = config.watchdog.stall_minutes
+
+    # Check devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+
+        if not is_session_alive(record):
+            continue
+
+        log_path = Path(record.log_path)
+        is_stalled, _ = is_session_stalled(log_path, stall_threshold)
+
+        if is_stalled:
+            stalled_issues.add(record.issue_number)
+
+    # Check claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+
+        if not is_worker_alive(record):
+            continue
+
+        log_path = Path(record.log_path)
+        is_stalled, _ = is_session_stalled(log_path, stall_threshold)
+
+        if is_stalled:
+            stalled_issues.add(record.issue_number)
+
+    return stalled_issues
+
+
+def _detect_and_handle_stalled_sessions(
+    sessions_dir: Path, state_file: Path, config: OrchestratorConfig
+) -> set[int]:
+    """Detect stalled sessions (live PID but dead agent) and handle them.
+
+    A session is stalled when its PID is alive but its log file's mtime is
+    older than the configured threshold, or the log contains a terminal error
+    marker. On detection, the process tree is killed, the sidecar is marked
+    with failure_kind: stalled, and a session_stalled event is logged.
+
+    Returns the set of issue numbers that were stalled (for exclusion from
+    dispatch in the same pass).
+    """
+    from .devin_shell import (
+        is_session_alive,
+        read_session_records,
+        update_session_record_with_failure_classification,
+    )
+    from .claude_code import (
+        is_worker_alive,
+        read_worker_records,
+        update_worker_record_with_failure_classification,
+    )
+
+    if not config.watchdog.enabled:
+        return set()
+
+    stalled_issues = set()
+    stall_threshold = config.watchdog.stall_minutes
+
+    # Check devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+
+        if not is_session_alive(record):
+            continue
+
+        log_path = Path(record.log_path)
+        is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
+
+        if is_stalled:
+            # Kill the process tree
+            killed_pids = kill_process_tree(record.pid)
+
+            # Mark the sidecar with failure_kind: stalled
+            update_session_record_with_failure_classification(
+                sessions_dir, record.issue_number, failure_kind="stalled"
+            )
+
+            # Log the event
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "session_stalled",
+                    {
+                        "issue_number": record.issue_number,
+                        "pid": record.pid,
+                        "log_mtime": str(
+                            datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
+                        ),
+                        "last_log_line": last_log_line,
+                        "killed_pids": killed_pids,
+                    },
+                )
+                save_state(state_file, state)
+
+            stalled_issues.add(record.issue_number)
+
+    # Check claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+
+        if not is_worker_alive(record):
+            continue
+
+        log_path = Path(record.log_path)
+        is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
+
+        if is_stalled:
+            # Kill the process tree
+            killed_pids = kill_process_tree(record.pid)
+
+            # Mark the sidecar with failure_kind: stalled
+            update_worker_record_with_failure_classification(
+                sessions_dir, record.issue_number, failure_kind="stalled"
+            )
+
+            # Log the event
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "session_stalled",
+                    {
+                        "issue_number": record.issue_number,
+                        "pid": record.pid,
+                        "log_mtime": str(
+                            datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
+                        ),
+                        "last_log_line": last_log_line,
+                        "killed_pids": killed_pids,
+                    },
+                )
+                save_state(state_file, state)
+
+            stalled_issues.add(record.issue_number)
+
+    return stalled_issues
 
 
 def _classify_dead_sessions_and_update_throttle_state(
@@ -335,6 +501,10 @@ class OrchestratorApp:
 
         if max_concurrent > 0:
             sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            # Detect and handle stalled sessions before counting live sessions
+            _detect_and_handle_stalled_sessions(
+                sessions_dir, self.paths.state_file, self.config
+            )
             live_count = _count_live_sessions(sessions_dir)
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < dispatch_limit:
@@ -361,6 +531,10 @@ class OrchestratorApp:
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues = self._filter_blocked_issues(available_issues)
 
+        # Check for stalled sessions (read-only for status/roll-call)
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        stalled_issues = _detect_stalled_sessions(sessions_dir, self.config)
+
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -385,6 +559,7 @@ class OrchestratorApp:
                 {"issue": issue_number, "blockers": blockers}
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
+            "stalled": sorted(stalled_issues) if stalled_issues else [],
         }
         return CommandResult(True, "status complete", data)
 
@@ -533,6 +708,10 @@ class OrchestratorApp:
             skipped_issue_numbers: list[int] = []
             # Gather network results outside the lock (matching intake pattern)
             sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            # Detect and handle stalled sessions before checking live workers
+            stalled_issues = _detect_and_handle_stalled_sessions(
+                sessions_dir, self.paths.state_file, self.config
+            )
             live_worker_issues = _issues_with_live_workers(sessions_dir)
             prs = self.gh.pr_list()
             pr_by_issue = {}
@@ -572,7 +751,9 @@ class OrchestratorApp:
                 candidates = [
                     issue
                     for issue in issues
-                    if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
+                    if self._is_dispatchable(issue)
+                    and int(issue["number"]) not in live_dispatched
+                    and int(issue["number"]) not in stalled_issues
                 ]
 
             # Apply dependency gate: skip issues with open blockers (dry-run)
@@ -652,6 +833,10 @@ class OrchestratorApp:
         skipped_issue_numbers: list[int] = []
         # Gather network results outside the lock (matching intake pattern)
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Detect and handle stalled sessions before checking live workers
+        stalled_issues = _detect_and_handle_stalled_sessions(
+            sessions_dir, self.paths.state_file, self.config
+        )
         live_worker_issues = _issues_with_live_workers(sessions_dir)
         prs = self.gh.pr_list()
         pr_by_issue = {}
@@ -698,7 +883,9 @@ class OrchestratorApp:
             candidates = [
                 issue
                 for issue in issues
-                if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
+                if self._is_dispatchable(issue)
+                and int(issue["number"]) not in live_dispatched
+                and int(issue["number"]) not in stalled_issues
             ]
 
         # Apply dependency gate: skip issues with open blockers

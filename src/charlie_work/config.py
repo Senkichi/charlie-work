@@ -211,6 +211,20 @@ class CrossFamilyConfig:
 
 
 @dataclass(frozen=True)
+class WatchdogConfig:
+    """Stall watchdog for detecting live-PID-but-dead-agent zombies.
+
+    Detects sessions where the PID is alive but the agent loop has died
+    (e.g., tool denial in --print mode leaving child processes holding
+    the stdout pipe open). The watchdog checks log file mtime and terminal
+    error markers to identify stalled sessions.
+    """
+
+    enabled: bool = True
+    stall_minutes: int = 20
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -220,6 +234,7 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -355,6 +370,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "cross_family.command",
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
+    watchdog = _build_section(WatchdogConfig, "watchdog", _section(data, "watchdog"))
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -364,4 +380,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         devin=devin,
         claude_code=claude_code,
         cross_family=cross_family,
+        watchdog=watchdog,
     )
