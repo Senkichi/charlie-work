@@ -305,6 +305,9 @@ def launch_devin_session(
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    # POSIX: detach worker into its own session to prevent killpg from killing the orchestrator
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS)
@@ -536,12 +539,15 @@ def is_session_alive(record: SessionRecord) -> bool:
 
 
 def update_session_record_with_failure_classification(
-    sessions_dir: Path, issue_number: int
+    sessions_dir: Path, issue_number: int, *, failure_kind: str | None = None
 ) -> tuple[str | None, str | None]:
     """Update a session record with failure classification after the session exits.
 
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
+
+    If failure_kind is provided directly, it uses that instead of classifying
+    from the log (used by the stall watchdog to mark sessions as "stalled").
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed.
@@ -563,18 +569,24 @@ def update_session_record_with_failure_classification(
     if payload.get("failure_kind") is not None:
         return payload.get("failure_kind"), None
 
+    # If failure_kind is provided directly, use it
+    if failure_kind is not None:
+        payload["failure_kind"] = failure_kind
+        _write_json(sidecar_path, payload)
+        return failure_kind, None
+
     log_path_str = payload.get("log_path")
     if not log_path_str:
         return None, None
 
     log_path = Path(log_path_str)
-    failure_kind, throttled_until = _classify_session_failure(log_path)
+    classified_kind, throttled_until = _classify_session_failure(log_path)
 
-    if failure_kind:
-        payload["failure_kind"] = failure_kind
+    if classified_kind:
+        payload["failure_kind"] = classified_kind
         _write_json(sidecar_path, payload)
 
-    return failure_kind, throttled_until
+    return classified_kind, throttled_until
 
 
 __all__ = [
