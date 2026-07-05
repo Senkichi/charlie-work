@@ -767,22 +767,22 @@ def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
     gh = github_module.GitHub(tmp_path)
-    gh.merge_pr(123, "squash", admin=False, merge_flags=("--admin", "--auto"))
+    gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto", "--subject"))
 
     assert len(captured_args) == 1
     args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--admin", "--auto", "--squash"]
+    # Expected: ["gh", "pr", "merge", "123", "--auto", "--subject", "--squash"]
     assert args[0] == "gh"
     assert args[1:4] == ["pr", "merge", "123"]
-    assert "--admin" in args
     assert "--auto" in args
+    assert "--subject" in args
     assert "--squash" in args
     # Verify merge_flags come before strategy flag
-    admin_idx = args.index("--admin")
     auto_idx = args.index("--auto")
+    subject_idx = args.index("--subject")
     squash_idx = args.index("--squash")
-    assert admin_idx < squash_idx
     assert auto_idx < squash_idx
+    assert subject_idx < squash_idx
 
 
 def test_github_merge_pr_argv_with_admin_flag(monkeypatch, tmp_path: Path) -> None:
@@ -813,7 +813,11 @@ def test_github_merge_pr_argv_with_admin_flag(monkeypatch, tmp_path: Path) -> No
 
 
 def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path) -> None:
-    """Test that merge_flags takes precedence over admin flag."""
+    """Test that merge_flags takes precedence over admin flag.
+
+    Uses a legal non-managed flag (--auto) with admin=True to ensure the
+    precedence logic is observable (the argv differs depending on which wins).
+    """
     captured_args = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -829,17 +833,62 @@ def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path
 
     gh = github_module.GitHub(tmp_path)
     # Both admin=True and merge_flags set; merge_flags should win
-    gh.merge_pr(123, "squash", admin=True, merge_flags=("--admin",))
+    gh.merge_pr(123, "squash", admin=True, merge_flags=("--auto",))
 
     assert len(captured_args) == 1
     args = captured_args[0]
-    # Should have exactly one --admin (from merge_flags, not from admin)
-    admin_count = args.count("--admin")
-    assert admin_count == 1
-    # Verify --admin comes from merge_flags path (before strategy)
-    admin_idx = args.index("--admin")
+    # Expected: ["gh", "pr", "merge", "123", "--auto", "--squash"]
+    # merge_flags wins, so --auto is present and --admin is NOT present
+    assert "--auto" in args
+    assert "--admin" not in args
+    assert "--squash" in args
+    # Verify exact order: merge_flags before strategy flag
+    auto_idx = args.index("--auto")
     squash_idx = args.index("--squash")
-    assert admin_idx < squash_idx
+    assert auto_idx < squash_idx
+
+
+def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: Path) -> None:
+    """Invariant: every flag merge_pr appends is in ORCHESTRATOR_MANAGED_MERGE_FLAGS.
+
+    This gate ensures that removing a flag from the constant derivation fails tests
+    on BOTH the validation side (config.py) and the argv side (merge_pr), preventing
+    the drift issue #107 where merge_pr could add flags without config validation
+    rejecting them.
+    """
+    captured_args = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_args.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    strategies = ["merge", "squash", "rebase"]
+
+    for strategy in strategies:
+        for admin in (False, True):
+            captured_args.clear()
+            gh.merge_pr(123, strategy, admin=admin, merge_flags=())
+
+            assert len(captured_args) == 1
+            args = captured_args[0]
+
+            # Extract flags (skip "gh", "pr", "merge", and the PR number)
+            flags = [arg for arg in args if arg.startswith("--")]
+
+            # Every flag merge_pr appends must be in ORCHESTRATOR_MANAGED_MERGE_FLAGS
+            for flag in flags:
+                assert flag in github_module.ORCHESTRATOR_MANAGED_MERGE_FLAGS, (
+                    f"Flag {flag} appended by merge_pr(strategy={strategy}, admin={admin}) "
+                    f"is not in ORCHESTRATOR_MANAGED_MERGE_FLAGS"
+                )
 
 
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
@@ -1444,19 +1493,19 @@ def test_config_rejects_merge_flags_not_starting_with_double_dash(tmp_path: Path
 
 def test_config_accepts_valid_merge_flags(tmp_path: Path) -> None:
     path = tmp_path / "c.yaml"
-    # Valid merge_flags with -- prefix.
-    path.write_text('auto_merge:\n  merge_flags: ["--admin", "--auto"]\n', encoding="utf-8")
+    # Valid merge_flags with -- prefix (non-managed flags only).
+    path.write_text('auto_merge:\n  merge_flags: ["--auto", "--subject"]\n', encoding="utf-8")
 
     config = load_config(path)
 
-    assert config.auto_merge.merge_flags == ("--admin", "--auto")
+    assert config.auto_merge.merge_flags == ("--auto", "--subject")
 
 
 def test_config_rejects_orchestrator_managed_merge_flags(tmp_path: Path) -> None:
     from charlie_work.config import ConfigError
 
     # Test each orchestrator-managed flag
-    for flag in ["--merge", "--rebase", "--squash", "--delete-branch"]:
+    for flag in ["--merge", "--rebase", "--squash", "--delete-branch", "--admin"]:
         path = tmp_path / "c.yaml"
         path.write_text(f'auto_merge:\n  merge_flags: ["{flag}"]\n', encoding="utf-8")
 

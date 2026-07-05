@@ -29,12 +29,15 @@ RECONCILE_PR_FIELDS = (
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
 
-# Flags managed by the orchestrator's merge_pr function.
-# These are either appended by merge_pr itself (strategy flags: --merge, --rebase, --squash)
-# or deliberately excluded (--delete-branch is handled separately via delete_branch).
-# This is the single source of truth for config validation — config.py imports this.
+# Flag constants for merge_pr — single source of truth for both argv construction
+# and config validation. Derive ORCHESTRATOR_MANAGED_MERGE_FLAGS from these so that
+# adding a new orchestrator-managed flag to merge_pr automatically rejects it in
+# config validation (prevents drift issue #107).
+_STRATEGY_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
+_DELETE_BRANCH_FLAG = "--delete-branch"
+_ADMIN_FLAG = "--admin"
 ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
-    {"--merge", "--rebase", "--squash", "--delete-branch"}
+    {*_STRATEGY_FLAGS.values(), _DELETE_BRANCH_FLAG, _ADMIN_FLAG}
 )
 
 
@@ -200,14 +203,9 @@ class GitHub:
         if merge_flags:
             args.extend(merge_flags)
         elif admin:
-            args.append("--admin")
+            args.append(_ADMIN_FLAG)
         # Strategy flags are managed here — see ORCHESTRATOR_MANAGED_MERGE_FLAGS
-        if strategy == "merge":
-            args.append("--merge")
-        elif strategy == "rebase":
-            args.append("--rebase")
-        else:
-            args.append("--squash")
+        args.append(_STRATEGY_FLAGS[strategy])
         # Branch deletion is deliberately NOT part of this call: `gh pr merge
         # --delete-branch` also deletes/switches the LOCAL branch and fails when
         # the head branch is checked out in a worktree, which used to abort the
