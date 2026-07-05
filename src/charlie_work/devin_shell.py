@@ -23,11 +23,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from charlie_work.process_utils import parse_proc_stat_starttime
 from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
@@ -84,6 +86,8 @@ class SessionRecord:
     log_path: str
     error: str | None = None
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
+    process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -104,6 +108,8 @@ class SessionRecord:
             log_path=str(payload.get("log_path", "")),
             error=payload.get("error"),
             failure_kind=payload.get("failure_kind"),
+            process_start_time=payload.get("process_start_time"),
+            reclaimed=payload.get("reclaimed"),
         )
 
 
@@ -298,6 +304,7 @@ def launch_devin_session(
 
     pid: int | None = None
     error: str | None = None
+    process_start_time: float | None = None
     try:
         with log_path.open("w", encoding="utf-8") as log_handle:
             process = subprocess.Popen(
@@ -309,6 +316,8 @@ def launch_devin_session(
                 **kwargs,
             )
         pid = process.pid
+        # Capture process creation time immediately after spawn to verify identity later
+        process_start_time = _get_process_start_time(pid)
     except OSError as exc:
         remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         error = f"failed to launch devin: {exc}"
@@ -323,6 +332,8 @@ def launch_devin_session(
         started_at=utc_now(),
         log_path=str(log_path),
         error=error,
+        process_start_time=process_start_time,
+        reclaimed=worktree.reclaimed,
     )
     _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
     return record
@@ -366,6 +377,70 @@ def probe_devin(
     binary or non-zero exit comes back as a not-ok result, never an exception.
     """
     return run_captured(list(command), cwd=repo_root, timeout_seconds=30)
+
+
+def _get_process_start_time(pid: int) -> float | None:
+    """Get the process creation time as a Unix timestamp in seconds.
+
+    Returns None if the process does not exist or the start time cannot be retrieved.
+    This is used to verify that a PID has not been recycled by the OS.
+
+    On Windows: Uses GetProcessTimes via ctypes to retrieve process creation time.
+    On POSIX: Reads /proc/<pid>/stat field 22 (starttime in clock ticks).
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            creation_time = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation_time),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None
+            # Convert FILETIME to Unix timestamp
+            # FILETIME is 100-nanosecond intervals since 1601-01-01
+            # Unix timestamp is seconds since 1970-01-01
+            # Difference between 1601-01-01 and 1970-01-01 is 11644473600 seconds
+            filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
+            unix_time = filetime / 10_000_000 - 11644473600
+            return unix_time
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        # POSIX: read /proc/<pid>/stat
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat = f.read()
+            starttime_ticks = parse_proc_stat_starttime(stat)
+            if starttime_ticks is None:
+                return None
+            # Convert to seconds: need system clock tick frequency
+            tick_hz = os.sysconf("SC_CLK_TCK")
+            if tick_hz <= 0:
+                tick_hz = 100  # Default fallback
+            # Get system uptime to convert to absolute time
+            try:
+                with open("/proc/uptime", "r") as f:
+                    uptime_seconds = float(f.read().split()[0])
+            except (OSError, ValueError, IndexError):
+                return None
+            # Process start time = current time - uptime + process starttime
+            boot_time = time.time() - uptime_seconds
+            return boot_time + (starttime_ticks / tick_hz)
+        except (OSError, ValueError, IndexError):
+            return None
 
 
 def _win_is_alive(pid: int) -> bool:
@@ -412,12 +487,40 @@ def is_session_alive(record: SessionRecord) -> bool:
     ``GetExitCodeProcess`` on Windows, ``os.kill(pid, 0)`` on POSIX (where it
     is the standard, reliable idiom). This avoids a hard `psutil` dependency
     and the slow `tasklist` subprocess round trip.
+
+    Additionally verifies process identity by checking that the current process
+    start time matches the recorded start time (captured at spawn). This prevents
+    false positives from PID recycling: if the OS has reused the PID for a different
+    process, the start time will not match and the session is treated as dead.
+
+    Legacy records without process_start_time fall back to pid-only liveness
+    (vulnerable to recycling but preserves backward compatibility).
     """
     if record.pid is None or record.pid <= 0:
         return False
+
+    # Check basic PID liveness
     if sys.platform == "win32":
-        return _win_is_alive(record.pid)
-    return _posix_is_alive(record.pid)
+        pid_alive = _win_is_alive(record.pid)
+    else:
+        pid_alive = _posix_is_alive(record.pid)
+
+    if not pid_alive:
+        return False
+
+    # Verify process identity via start time if available
+    if record.process_start_time is not None:
+        current_start_time = _get_process_start_time(record.pid)
+        if current_start_time is None:
+            # Failed to get current start time - conservatively treat as dead
+            return False
+        # Allow 1-second tolerance for unit conversion differences
+        if abs(current_start_time - record.process_start_time) > 1.0:
+            # Start time mismatch - PID has been recycled
+            return False
+
+    # Legacy record without process_start_time: pid-only fallback
+    return True
 
 
 def update_session_record_with_failure_classification(
@@ -470,4 +573,5 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
+    "_get_process_start_time",
 ]
