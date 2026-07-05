@@ -314,7 +314,10 @@ def launch_claude_worker(
     # (claude-code adapter)"). `env` is a validated mapping (see config.py).
     # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
     # leaks from the orchestrator, then merge user-provided overrides on top.
-    worker_env = {**_sanitize_env(worktree.path), **{str(k): str(v) for k, v in (env or {}).items()}}
+    worker_env = {
+        **_sanitize_env(worktree.path),
+        **{str(k): str(v) for k, v in (env or {}).items()},
+    }
 
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
