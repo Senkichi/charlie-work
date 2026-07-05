@@ -457,6 +457,7 @@ def _get_process_start_time(pid: int) -> float | None:
             starttime_ticks = int(after_comm[21])
             # Convert to seconds: need system clock tick frequency
             import os
+
             tick_hz = os.sysconf("SC_CLK_TCK")
             if tick_hz <= 0:
                 tick_hz = 100  # Default fallback
