@@ -1444,7 +1444,6 @@ def test_rework_dispatch_does_not_fetch_base_ref(tmp_path: Path) -> None:
     _git(info1.path, "add", "file1.txt")
     _git(info1.path, "commit", "-m", "add file1")
     _git(repo_root, "push", "origin", branch_name)
-    local_tip = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
 
     # Advance the AGENT branch on the remote so the local worktree is behind.
     _git(remote_repo, "checkout", branch_name)
