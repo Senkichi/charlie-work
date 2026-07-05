@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from charlie_work.process_utils import is_session_stalled, kill_process_tree
 
@@ -127,7 +130,6 @@ def test_kill_process_tree_nonexistent_pid() -> None:
 
 def test_kill_process_tree_start_time_verification() -> None:
     """Test that kill_process_tree verifies start time when provided."""
-    import sys
     import subprocess
     from unittest.mock import patch
 
@@ -141,7 +143,6 @@ def test_kill_process_tree_start_time_verification() -> None:
     try:
         # Get the actual start time
         from charlie_work.process_utils import parse_proc_stat_starttime
-        import os
         import time
 
         actual_start_time = None
@@ -216,15 +217,9 @@ def test_kill_process_tree_start_time_verification() -> None:
             proc.wait()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
 def test_kill_process_tree_own_group_guard_posix() -> None:
     """Test that kill_process_tree refuses to kill its own process group on POSIX."""
-    import os
-    import sys
-
-    # This test is only for POSIX systems
-    if sys.platform == "win32":
-        return  # Skip on Windows
-
     # Try to kill our own process group - should refuse
     own_pid = os.getpid()
     os.getpgid(own_pid)

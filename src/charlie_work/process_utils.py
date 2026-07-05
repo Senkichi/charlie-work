@@ -99,34 +99,50 @@ def _enumerate_child_pids(pid: int) -> list[int]:
     """Enumerate child PIDs of a given process.
 
     On POSIX: scans /proc to find processes with the given parent PID.
-    On Windows: uses wmic to query ParentProcessId (if available).
+    On Windows: uses PowerShell CIM to query ParentProcessId (primary) with wmic fallback.
 
     Returns a list of child PIDs (may be empty).
     """
     children = []
 
     if os.name == "nt":
-        # Windows: use wmic to query ParentProcessId
+        # Windows: use PowerShell CIM (primary) with wmic fallback
         try:
             import subprocess
             import shutil
 
-            # Check if wmic is available
-            if not shutil.which("wmic"):
-                # wmic not available - return empty list (best-effort)
-                return children
-
-            result = subprocess.run(
-                ["wmic", "process", "where", f"ParentProcessId={pid}", "get", "ProcessId"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            # Parse output: skip header line, extract PIDs
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line and line.isdigit():
-                    children.append(int(line))
+            # Try PowerShell CIM first (modern Windows 11+)
+            if shutil.which("powershell"):
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        f'Get-CimInstance Win32_Process -Filter "ParentProcessId={pid}" | Select-Object -ExpandProperty ProcessId',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                # Parse output: extract PIDs (one per line)
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if line and line.isdigit():
+                        children.append(int(line))
+            else:
+                # Fallback to wmic if PowerShell not available
+                if shutil.which("wmic"):
+                    result = subprocess.run(
+                        ["wmic", "process", "where", f"ParentProcessId={pid}", "get", "ProcessId"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    # Parse output: skip header line, extract PIDs
+                    for line in result.stdout.splitlines():
+                        line = line.strip()
+                        if line and line.isdigit():
+                            children.append(int(line))
         except (
             subprocess.TimeoutExpired,
             subprocess.SubprocessError,

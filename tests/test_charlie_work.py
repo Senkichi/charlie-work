@@ -3,9 +3,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1200,6 +1202,119 @@ def test_command_dispatch_failure_does_not_label_in_progress(tmp_path: Path) -> 
     assert (123, "agent:in-progress") not in fake_gh.labels_added
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "dispatch_failed"
+
+
+def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
+    """Test that dispatch excludes issues with stalled sessions (dry-run path)."""
+    from datetime import UTC, datetime, timedelta
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Create a session record for issue 123 with a live PID
+    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "issue-123.json"
+    log_file = sessions_dir / "issue-123.log"
+
+    # Write a log file with old mtime (stalled)
+    log_file.write_text("working on issue\nmaking progress\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    os.utime(log_file, (timestamp, timestamp))
+
+    # Create a session record with a fake PID (we'll mock liveness check)
+    session_record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(
+            tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+        ),
+        command=("devin", "--prompt-file", "{prompt_path}"),
+        pid=99999,  # Fake PID - we'll mock liveness to return True
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+        process_start_time=time.time(),
+    )
+    session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
+
+    # Mock the liveness check to return True (simulating a live but stalled process)
+    from unittest.mock import patch
+
+    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+        result = app.dispatch(limit=1)
+
+    # The stalled issue should be excluded from dispatch
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+
+
+def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
+    """Test that dispatch excludes issues with stalled sessions (real dispatch path)."""
+    from datetime import UTC, datetime, timedelta
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a session record for issue 123 with a live PID
+    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "issue-123.json"
+    log_file = sessions_dir / "issue-123.log"
+
+    # Write a log file with old mtime (stalled)
+    log_file.write_text("working on issue\nmaking progress\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    os.utime(log_file, (timestamp, timestamp))
+
+    # Create a session record with a fake PID (we'll mock liveness check)
+    session_record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(
+            tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+        ),
+        command=("devin", "--prompt-file", "{prompt_path}"),
+        pid=99999,  # Fake PID - we'll mock liveness to return True
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+        process_start_time=time.time(),
+    )
+    session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
+
+    # Mock the liveness check to return True (simulating a live but stalled process)
+    from unittest.mock import patch
+
+    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+        result = app.dispatch(limit=1)
+
+    # The stalled issue should be excluded from dispatch
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
 
 
 def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> None:
@@ -7356,10 +7471,11 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
         result = app.status()
 
-    # Check that stalled section contains the issue number
+    # Check that stalled section contains the issue number and pid
     assert "stalled" in result.data
     assert isinstance(result.data["stalled"], list)
-    assert 109 in result.data["stalled"]
+    assert any(entry["issue"] == 109 for entry in result.data["stalled"])
+    assert any(entry["pid"] == 99999 for entry in result.data["stalled"])
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:
@@ -7452,7 +7568,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
 
     # Check that the stalled issue was detected
-    assert 109 in result
+    assert any(entry["issue"] == 109 for entry in result)
 
     # Load state and check for the event
     state = load_state(paths.state_file)
