@@ -43,6 +43,30 @@ def _default_worktrees_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "worktrees"
 
 
+def _resolve_default_branch_ref(repo_root: Path) -> str:
+    """Resolve the repository's default branch as a remote-tracking ref.
+
+    Returns a string like "origin/main" or "origin/master". If the repo has no
+    origin remote or the default branch cannot be determined, returns "HEAD"
+    (fallback to local behavior).
+
+    Uses git symbolic-ref refs/remotes/origin/HEAD which is the standard way
+    to get the default branch without needing the GitHub CLI.
+    """
+    result = run_captured(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if result.ok and result.stdout.strip():
+        # Output is "refs/remotes/origin/main" -> extract "origin/main"
+        ref = result.stdout.strip()
+        if ref.startswith("refs/remotes/"):
+            return ref[len("refs/remotes/") :]
+    # Fallback to HEAD if we can't determine the default branch
+    return "HEAD"
+
+
 def _has_origin_remote(repo_root: Path) -> bool:
     """Check if the repo has an 'origin' remote configured.
 
@@ -241,7 +265,38 @@ def create_worktree(
       worker continues from the partial work.
     - If the branch exists WITHOUT a matching state record (foreign state):
       fail loudly — that protects against clobbering anything that is not ours.
+
+    The ``base_ref`` parameter controls where the new branch bases off:
+    - Empty string ("") means auto-resolve to the repository's default branch
+      as a remote-tracking ref (e.g., "origin/main"). This is the recommended
+      setting for production to ensure fresh worktrees base off the latest
+      remote tip instead of a potentially stale local HEAD.
+    - A remote-tracking ref like "origin/main" or "origin/master" will trigger
+      a git fetch before worktree creation to ensure the ref is up-to-date.
+    - Any other ref (e.g., "HEAD", a commit SHA, or a local branch name) is
+      used as-is without fetching.
     """
+    # Resolve base_ref: empty string means auto-resolve to origin/<default>
+    resolved_base_ref = base_ref
+    if base_ref == "":
+        resolved_base_ref = _resolve_default_branch_ref(repo_root)
+
+    # Fetch if the resolved base_ref is a remote-tracking ref (origin/<branch>)
+    # Only do this for fresh dispatch (not rework/recovery) to avoid moving existing tips
+    if not rework and recovery is None and resolved_base_ref.startswith("origin/"):
+        # Extract the branch name from "origin/<branch>"
+        remote_branch = resolved_base_ref[len("origin/") :]
+        fetch_result = run_captured(
+            ["git", "fetch", "origin", remote_branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not fetch_result.ok:
+            raise RuntimeError(
+                f"Failed to fetch base ref {resolved_base_ref!r} before worktree creation: "
+                f"{fetch_result.error or fetch_result.stderr}"
+            )
+
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
@@ -349,9 +404,9 @@ def create_worktree(
                 # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
                 has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
 
-                # Check for commits beyond merge-base with base_ref
+                # Check for commits beyond merge-base with resolved_base_ref
                 merge_base_result = run_captured(
-                    ["git", "merge-base", base_ref, branch],
+                    ["git", "merge-base", resolved_base_ref, branch],
                     cwd=repo_root,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
@@ -402,7 +457,7 @@ def create_worktree(
                 if branch_result.ok and branch_result.stdout.strip():
                     # Branch exists without worktree: check commits and reuse or delete
                     merge_base_result = run_captured(
-                        ["git", "merge-base", base_ref, branch],
+                        ["git", "merge-base", resolved_base_ref, branch],
                         cwd=repo_root,
                         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
@@ -591,7 +646,7 @@ def create_worktree(
                 )
 
         result = run_captured(
-            ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
+            ["git", "worktree", "add", "-b", branch, str(worktree_path), resolved_base_ref],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )

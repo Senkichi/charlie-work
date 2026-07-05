@@ -98,6 +98,12 @@ class DispatchConfig:
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
+    # Base ref for fresh worktree creation. Empty string (default) means auto-resolve
+    # to origin/<default-branch>. If set, must be a valid git ref (e.g., "origin/main",
+    # "HEAD", or a commit SHA). When the resolved base ref is a remote-tracking ref
+    # (origin/<branch>), git fetch is run before worktree creation to ensure the
+    # worktree bases off the latest remote tip instead of a stale local HEAD.
+    base_ref: str = ""
 
 
 @dataclass(frozen=True)

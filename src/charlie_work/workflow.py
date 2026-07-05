@@ -478,6 +478,7 @@ class OrchestratorApp:
             worker_env=claude.worker_env,
             worker_model=self.config.devin.worker_model,
             dry_run=self.dry_run,
+            base_ref=self.config.dispatch.base_ref,
         )
 
     def _apply_concurrency_governor(self, dispatch_limit: int) -> ConcurrencyGovernorResult:
