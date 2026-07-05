@@ -35,7 +35,15 @@ _TESTS_OR_RATIONALE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-_CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|refactor|docs|test|chore|perf|ci)(\(|:|!)")
+# Single source of truth for conventional-commit types.
+# This tuple must match the documented types in CONTRIBUTING.md and prompts/worker.md.
+CONVENTIONAL_COMMIT_TYPES = frozenset(
+    {"feat", "fix", "refactor", "docs", "test", "chore", "perf", "ci"}
+)
+
+_CONVENTIONAL_COMMIT_RE = re.compile(
+    r"^(" + "|".join(sorted(CONVENTIONAL_COMMIT_TYPES)) + r")(\(|:|!)"
+)
 
 # Oversized-diff warning threshold: additions + deletions above this line
 # count flags the PR as a warning (not a block) for reviewer awareness.
@@ -175,7 +183,9 @@ def _check_title_conventional(pr: dict[str, Any], warnings: list[str]) -> None:
         return
     title = str(pr.get("title") or "")
     if title and not _CONVENTIONAL_COMMIT_RE.match(title):
-        warnings.append("PR title is not conventional-commit shaped")
+        warnings.append(
+            "PR title is not conventional-commit shaped (see prompts/worker.md PR requirements)"
+        )
 
 
 def _check_diff_size(pr: dict[str, Any], warnings: list[str]) -> None:
