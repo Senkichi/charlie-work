@@ -941,8 +941,7 @@ def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
     # The dirty file should NOT be there (it was salvaged)
     assert not (info2.path / "dirty.txt").exists()
 
-    # Verify salvage ref was created (check locally, not on remote)
-    # The salvage ref is created with git update-ref, so check for it
+    # Verify salvage ref was created locally
     salvage_refs = subprocess.run(
         ["git", "show-ref"],
         cwd=repo_root,
