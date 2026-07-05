@@ -237,7 +237,7 @@ verdict (human or orchestrating agent decides)
 ship-it
    - checks.summarize_checks() against auto_merge.required_checks
    - decision.decision == "approved" (or require_approved_review: false)
-   - → merge, then labels, then best-effort branch delete
+   - → merge via gh pr merge (with auto_merge.merge_flags or legacy admin flag for protected bases), then labels, then best-effort branch delete
 ```
 
 `janitor.py` sits **before** `review()`'s packet generation as a

@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
+
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 
@@ -116,6 +118,11 @@ class AutoMergeConfig:
     # protected (required reviews/checks) and the operator's gh auth has admin
     # on the repo. Without it, protected-main merges bounce to the operator.
     admin: bool = False
+    # Extra flags appended to the `gh pr merge` invocation (e.g., ["--admin"]
+    # for single-operator repos, ["--auto"] for merge-queue/auto-merge flows).
+    # Placeholder-free passthrough, validated to start with "--". Default empty
+    # preserves current behavior. Takes precedence over the legacy `admin` field.
+    merge_flags: tuple[str, ...] = ()
     # Post-merge branch deletion is best-effort and can never abort the
     # merge/label sequence (the empericus local-worktree failure mode).
     delete_branch: bool = True
@@ -262,6 +269,34 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
         auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
+    merge_flags = auto_merge_data.get("merge_flags")
+    if merge_flags is not None and not isinstance(merge_flags, list):
+        raise ConfigError(
+            "config section 'auto_merge' key 'merge_flags' must be a list of flags, "
+            f"got {type(merge_flags).__name__}"
+        )
+    if isinstance(merge_flags, list):
+        auto_merge_data["merge_flags"] = tuple(str(item) for item in merge_flags)
+    # Validate merge_flags: each flag must start with "--"
+    merge_flags = auto_merge_data.get("merge_flags")
+    if merge_flags:
+        for flag in merge_flags:
+            if not str(flag).startswith("--"):
+                raise ConfigError(
+                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
+                    f"must start with '--'"
+                )
+        # Reject flags that conflict with orchestrator-managed behavior
+        # These are either appended by merge_pr itself (strategy flags) or
+        # deliberately excluded (branch deletion is handled separately)
+        # Normalize by splitting on '=' to catch --flag=value forms
+        for flag in merge_flags:
+            flag_name = str(flag).split("=", 1)[0]
+            if flag_name in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
+                raise ConfigError(
+                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
+                    f"is managed by the orchestrator and cannot be specified in merge_flags"
+                )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))
     devin_data = _section(data, "devin")
