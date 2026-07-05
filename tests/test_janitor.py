@@ -267,11 +267,12 @@ def test_conventional_commit_types_documentation_consistency() -> None:
     # Extract types from CONTRIBUTING.md
     contributing = repo_root / "CONTRIBUTING.md"
     contributing_content = contributing.read_text()
-    contributing_match = re.search(r"Valid types: `([^`]+)`", contributing_content)
+    contributing_match = re.search(r"Valid types: (`[^`]+`(?:, `[^`]+`)*)", contributing_content)
     if not contributing_match:
         raise AssertionError("Could not find 'Valid types:' line in CONTRIBUTING.md")
 
-    contributing_types = set(contributing_match.group(1).split(", "))
+    types_str = contributing_match.group(1)
+    contributing_types = set(re.findall(r"`([^`]+)`", types_str))
 
     # Extract types from worker.md (from the prose description)
     worker = repo_root / "src" / "charlie_work" / "prompts" / "worker.md"
