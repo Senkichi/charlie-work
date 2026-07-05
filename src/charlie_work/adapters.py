@@ -60,6 +60,7 @@ class SessionDispatchResult:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,6 +75,7 @@ class SessionDispatchResult:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "error": self.error,
+            "reclaimed": self.reclaimed,
         }
 
 
@@ -220,6 +222,7 @@ def _run_devin_shell_adapter(
             ok=ok,
             command=list(record.command),
             error=record.error if not ok else None,
+            reclaimed=record.reclaimed,
         )
     except Exception as exc:
         # Catch any unexpected exception and return as a failure result
@@ -267,6 +270,7 @@ def _run_claude_code_adapter(
         ok=ok,
         command=list(record.command),
         error=record.error if not ok else None,
+        reclaimed=record.reclaimed,
     )
 
 
@@ -342,6 +346,7 @@ def _result(
     stdout: str = "",
     stderr: str = "",
     error: str | None = None,
+    reclaimed: str | None = None,
 ) -> SessionDispatchResult:
     return SessionDispatchResult(
         issue_number=request.issue_number,
@@ -355,6 +360,7 @@ def _result(
         stdout=stdout,
         stderr=stderr,
         error=error,
+        reclaimed=reclaimed,
     )
 
 
