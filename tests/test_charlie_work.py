@@ -1392,6 +1392,80 @@ def test_merge_ready_honors_delete_branch_false(tmp_path: Path) -> None:
     assert ready.data["branch_deleted"] is None
 
 
+def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> None:
+    """Issue #149: when update_open_prs is disabled, update_open_prs_results must be None."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    ready = app.merge_ready(456)
+
+    assert ready.data["merged"] is True
+    assert ready.data["update_open_prs_results"] is None
+
+
+def test_merge_ready_not_merged_returns_none(tmp_path: Path) -> None:
+    """Issue #149: when PR is not merged, update_open_prs_results must be None."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # No approval decision, so PR won't merge
+    ready = app.merge_ready(456)
+
+    assert ready.data["merged"] is False
+    assert ready.data["update_open_prs_results"] is None
+
+
+def test_merge_ready_update_open_prs_zero_matching_returns_empty_list(tmp_path: Path) -> None:
+    """Issue #149: when sweep runs with zero matching PRs, update_open_prs_results must be []."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    ready = app.merge_ready(456)
+
+    assert ready.data["merged"] is True
+    # The sweep ran but found no other open agent PRs to update
+    assert ready.data["update_open_prs_results"] == []
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         raise subprocess.CalledProcessError(1, args, output="", stderr="Reference does not exist")
