@@ -29,6 +29,17 @@ RECONCILE_PR_FIELDS = (
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
 
+# Flag constants for merge_pr — single source of truth for both argv construction
+# and config validation. Derive ORCHESTRATOR_MANAGED_MERGE_FLAGS from these so that
+# adding a new orchestrator-managed flag to merge_pr automatically rejects it in
+# config validation (prevents drift issue #107).
+_STRATEGY_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
+_DELETE_BRANCH_FLAG = "--delete-branch"
+_ADMIN_FLAG = "--admin"
+ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
+    {*_STRATEGY_FLAGS.values(), _DELETE_BRANCH_FLAG, _ADMIN_FLAG}
+)
+
 
 class GitHubError(RuntimeError):
     pass
@@ -184,16 +195,17 @@ class GitHub:
             allow_failure=True,
         )
 
-    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str:
         args = ["pr", "merge", str(number)]
-        if admin:
-            args.append("--admin")
-        if strategy == "merge":
-            args.append("--merge")
-        elif strategy == "rebase":
-            args.append("--rebase")
-        else:
-            args.append("--squash")
+        # merge_flags takes precedence over the legacy admin field
+        if merge_flags:
+            args.extend(merge_flags)
+        elif admin:
+            args.append(_ADMIN_FLAG)
+        # Strategy flags are managed here — see ORCHESTRATOR_MANAGED_MERGE_FLAGS
+        args.append(_STRATEGY_FLAGS[strategy])
         # Branch deletion is deliberately NOT part of this call: `gh pr merge
         # --delete-branch` also deletes/switches the LOCAL branch and fails when
         # the head branch is checked out in a worktree, which used to abort the
@@ -212,6 +224,9 @@ class GitHub:
         Uses the git-refs API so local checkouts and worktrees are never
         touched. Returns False instead of raising — a deletion failure must
         never abort the merge/label sequence.
+
+        Note: --delete-branch is in ORCHESTRATOR_MANAGED_MERGE_FLAGS because
+        it's deliberately excluded from merge_pr to avoid worktree failures.
         """
         try:
             self.run(["api", "-X", "DELETE", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"])
