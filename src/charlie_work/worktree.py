@@ -217,9 +217,7 @@ def _is_git_tracked(repo_root: Path, path: Path) -> bool:
     return result.ok
 
 
-def _materialize_directory(
-    repo_root: Path, worktree_path: Path, dir_path: str
-) -> None:
+def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> None:
     """Copy a directory from repo_root to worktree_path if it's not tracked.
 
     Skip if the path is already tracked by git (it will be in the worktree).
