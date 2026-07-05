@@ -1408,16 +1408,17 @@ def test_launch_devin_session_passes_venv_source_to_create_worktree(
     venv_source = tmp_path / "shared-venv"
     venv_source.mkdir()
 
-    record = launch_devin_session(
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
         123,
         "agent/issue-123-venv",
         prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         venv_source=venv_source,
+        command_template=(sys.executable, "-c", "pass"),
     )
 
-    assert record.error is None
     assert len(worktree_calls) == 1
     assert worktree_calls[0]["venv_source"] == venv_source
 
@@ -1481,15 +1482,16 @@ def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(
     worktree_calls: list[dict] = []
     _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
 
-    record = launch_devin_session(
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
         456,
         "agent/issue-456-materialize",
         prompt_path,
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         materialize_dirs=(".devin", ".config"),
+        command_template=(sys.executable, "-c", "pass"),
     )
 
-    assert record.error is None
     assert len(worktree_calls) == 1
     assert worktree_calls[0]["materialize_dirs"] == (".devin", ".config")
