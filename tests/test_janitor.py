@@ -255,6 +255,57 @@ def test_worker_template_title_format_passes_janitor() -> None:
     )
 
 
+def test_conventional_commit_types_constant_pinned() -> None:
+    """Assert that CONVENTIONAL_COMMIT_TYPES is pinned to the expected set.
+
+    This test serves as a deliberate second anchor for the canonical type list.
+    Removing any type from the constant will fail this test, preventing silent
+    drift where the constant changes but documentation doesn't.
+    """
+    expected = frozenset({"feat", "fix", "refactor", "docs", "test", "chore", "perf", "ci"})
+    assert CONVENTIONAL_COMMIT_TYPES == expected, (
+        f"CONVENTIONAL_COMMIT_TYPES changed from expected {expected} to {CONVENTIONAL_COMMIT_TYPES}. "
+        "If this change is intentional, update this test's expected set."
+    )
+
+
+def test_conventional_commit_regex_behavior() -> None:
+    """Assert that the janitor's conventional-commit regex accepts all valid types and rejects unknown types.
+
+    This test uses explicit example titles for EVERY type (not parametrized over the constant
+    itself, which would be circular). Removing a type from the constant would NOT remove its
+    test case here, ensuring the pin test catches the drift.
+    """
+    repo_root = Path(__file__).parent.parent
+
+    # Test that all valid types pass the janitor check
+    valid_titles = [
+        "feat: add new feature",
+        "fix: correct bug",
+        "refactor: improve code structure",
+        "docs: update documentation",
+        "test: add tests",
+        "chore: maintenance task",
+        "perf: improve performance",
+        "ci: update CI pipeline",
+    ]
+    for title in valid_titles:
+        verdict = run_janitor(
+            _green_pr(title=title), _green_checks(), _config(), repo_root=repo_root
+        )
+        assert not any("conventional-commit" in w.lower() for w in verdict.warnings), (
+            f"Valid title '{title}' should not trigger janitor warning"
+        )
+
+    # Test that an unknown type triggers the warning
+    verdict = run_janitor(
+        _green_pr(title="foo: unknown type"), _green_checks(), _config(), repo_root=repo_root
+    )
+    assert any("conventional-commit" in w.lower() for w in verdict.warnings), (
+        "Unknown type 'foo' should trigger janitor warning"
+    )
+
+
 def test_conventional_commit_types_documentation_consistency() -> None:
     """Assert that documented conventional-commit types match the canonical constant.
 
@@ -264,34 +315,43 @@ def test_conventional_commit_types_documentation_consistency() -> None:
     """
     repo_root = Path(__file__).parent.parent
 
-    # Extract types from CONTRIBUTING.md
+    # Extract types from CONTRIBUTING.md - find ALL "Valid types:" occurrences
     contributing = repo_root / "CONTRIBUTING.md"
     contributing_content = contributing.read_text()
-    contributing_match = re.search(r"Valid types: (`[^`]+`(?:, `[^`]+`)*)", contributing_content)
-    if not contributing_match:
-        raise AssertionError("Could not find 'Valid types:' line in CONTRIBUTING.md")
+    contributing_matches = re.findall(
+        r"Valid types: (`[^`]+`(?:, `[^`]+`)*)", contributing_content
+    )
+    if not contributing_matches:
+        raise AssertionError("Could not find any 'Valid types:' line in CONTRIBUTING.md")
 
-    types_str = contributing_match.group(1)
-    contributing_types = set(re.findall(r"`([^`]+)`", types_str))
-
-    # Extract types from worker.md (from the prose description)
-    worker = repo_root / "src" / "charlie_work" / "prompts" / "worker.md"
-    worker_content = worker.read_text()
-    # The worker template mentions types in prose: "Use `fix` for bug fixes, `feat` for new features, `chore` for maintenance, etc."
-    # We'll validate that the documented examples are subsets of the canonical set
-    worker_examples = set()
-    for type_name in CONVENTIONAL_COMMIT_TYPES:
-        if f"`{type_name}`" in worker_content:
-            worker_examples.add(type_name)
-
-    # All documented types must be in the canonical set
-    assert contributing_types == CONVENTIONAL_COMMIT_TYPES, (
-        f"CONTRIBUTING.md types {contributing_types} != canonical {CONVENTIONAL_COMMIT_TYPES}"
+    # Assert there are at least 2 occurrences (generic section + PR-title section)
+    assert len(contributing_matches) >= 2, (
+        f"Expected at least 2 'Valid types:' occurrences in CONTRIBUTING.md, found {len(contributing_matches)}. "
+        "Deleting a section should be caught by this test."
     )
 
-    # Worker template examples must be subsets of the canonical set
-    assert worker_examples.issubset(CONVENTIONAL_COMMIT_TYPES), (
-        f"worker.md examples {worker_examples} not subset of canonical {CONVENTIONAL_COMMIT_TYPES}"
+    # Assert EVERY occurrence's extracted type set equals the canonical set
+    for i, types_str in enumerate(contributing_matches):
+        contributing_types = set(re.findall(r"`([^`]+)`", types_str))
+        assert contributing_types == CONVENTIONAL_COMMIT_TYPES, (
+            f"CONTRIBUTING.md occurrence {i + 1} types {contributing_types} != canonical {CONVENTIONAL_COMMIT_TYPES}"
+        )
+
+    # Extract types from worker.md - parse the actual enumeration line
+    worker = repo_root / "src" / "charlie_work" / "prompts" / "worker.md"
+    worker_content = worker.read_text()
+    # The worker template explicitly enumerates types on line 62:
+    # "Valid types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`."
+    worker_match = re.search(r"Valid types: (`[^`]+`(?:, `[^`]+`)*)", worker_content)
+    if not worker_match:
+        raise AssertionError("Could not find 'Valid types:' line in worker.md")
+
+    worker_types_str = worker_match.group(1)
+    worker_types = set(re.findall(r"`([^`]+)`", worker_types_str))
+
+    # Assert set EQUALITY (not subset) - worker.md must enumerate ALL types
+    assert worker_types == CONVENTIONAL_COMMIT_TYPES, (
+        f"worker.md types {worker_types} != canonical {CONVENTIONAL_COMMIT_TYPES}"
     )
 
 
