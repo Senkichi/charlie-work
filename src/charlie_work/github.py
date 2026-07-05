@@ -182,9 +182,14 @@ class GitHub:
             allow_failure=True,
         )
 
-    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str:
         args = ["pr", "merge", str(number)]
-        if admin:
+        # merge_flags takes precedence over the legacy admin field
+        if merge_flags:
+            args.extend(merge_flags)
+        elif admin:
             args.append("--admin")
         if strategy == "merge":
             args.append("--merge")

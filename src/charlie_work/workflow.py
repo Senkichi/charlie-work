@@ -1192,7 +1192,10 @@ class OrchestratorApp:
             # reconcile false-positive on every clean auto-merge and lost the
             # merged fact entirely on a crash between merge and save.
             merge_output = self.gh.merge_pr(
-                pr_number, self.config.auto_merge.strategy, admin=self.config.auto_merge.admin
+                pr_number,
+                self.config.auto_merge.strategy,
+                admin=self.config.auto_merge.admin,
+                merge_flags=self.config.auto_merge.merge_flags,
             )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)

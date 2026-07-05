@@ -116,6 +116,11 @@ class AutoMergeConfig:
     # protected (required reviews/checks) and the operator's gh auth has admin
     # on the repo. Without it, protected-main merges bounce to the operator.
     admin: bool = False
+    # Extra flags appended to the `gh pr merge` invocation (e.g., ["--admin"]
+    # for single-operator repos, ["--auto"] for merge-queue/auto-merge flows).
+    # Placeholder-free passthrough, validated to start with "--". Default empty
+    # preserves current behavior. Takes precedence over the legacy `admin` field.
+    merge_flags: tuple[str, ...] = ()
     # Post-merge branch deletion is best-effort and can never abort the
     # merge/label sequence (the empericus local-worktree failure mode).
     delete_branch: bool = True
@@ -262,6 +267,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
         auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
+    merge_flags = auto_merge_data.get("merge_flags")
+    if isinstance(merge_flags, list):
+        auto_merge_data["merge_flags"] = tuple(str(item) for item in merge_flags)
+    # Validate merge_flags: each flag must start with "--"
+    merge_flags = auto_merge_data.get("merge_flags")
+    if merge_flags:
+        for flag in merge_flags:
+            if not str(flag).startswith("--"):
+                raise ConfigError(
+                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
+                    f"must start with '--'"
+                )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))
     devin_data = _section(data, "devin")

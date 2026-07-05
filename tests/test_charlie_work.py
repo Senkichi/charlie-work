@@ -833,6 +833,8 @@ class FakeGitHub:
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_created: list[tuple[str, str, str]] = []
         self.merged: list[tuple[int, str]] = []
+        self.merged_admin_flags: list[bool] = []
+        self.merged_merge_flags: list[tuple[str, ...]] = []
         self.deleted_branches: list[str] = []
         self.delete_branch_ok = True
         self.update_branch_ok = True
@@ -878,10 +880,16 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> None:
         self.labels_removed.append((number, label))
 
-    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str:
         self.merged.append((number, strategy))
-        self.merged_admin_flags = getattr(self, "merged_admin_flags", [])
-        self.merged_admin_flags.append(admin)
+        # merge_flags takes precedence over admin
+        if merge_flags:
+            self.merged_admin_flags.append("--admin" in merge_flags)
+        else:
+            self.merged_admin_flags.append(admin)
+        self.merged_merge_flags.append(merge_flags)
         return "merged"
 
     def delete_branch(self, branch: str) -> bool:
@@ -1047,6 +1055,7 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
     assert ready.data["can_merge"] is True
     assert ready.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
+    assert fake_gh.merged_merge_flags == [()]
     assert (123, "agent:done") in fake_gh.labels_added
     assert fake_gh.deleted_branches == ["agent/issue-123-fix-search"]
     assert ready.data["branch_deleted"] is True
@@ -1295,6 +1304,36 @@ def test_config_rejects_non_mapping_worker_env(tmp_path: Path) -> None:
 
     assert "worker_env" in message
     assert "claude_code" in message
+
+
+def test_config_rejects_merge_flags_not_starting_with_double_dash(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    # A plausible operator typo: a flag without the -- prefix.
+    # Must fail at load with a clear error message.
+    path.write_text('auto_merge:\n  merge_flags: ["admin"]\n', encoding="utf-8")
+
+    try:
+        load_config(path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "merge_flags" in message
+    assert "auto_merge" in message
+    assert "must start with '--'" in message
+
+
+def test_config_accepts_valid_merge_flags(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    # Valid merge_flags with -- prefix.
+    path.write_text('auto_merge:\n  merge_flags: ["--admin", "--auto"]\n', encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.auto_merge.merge_flags == ("--admin", "--auto")
 
 
 def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
@@ -3781,6 +3820,7 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     assert fake_gh.merged == []
     assert (123, "agent:reviewing") in fake_gh.labels_added
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "reviewing"
+    assert fake_gh.merged_merge_flags == []
 
 
 def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -> None:
@@ -3798,6 +3838,7 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     assert fake_gh.merged == [(456, "squash")]
     # Default config: no --admin
     assert fake_gh.merged_admin_flags == [False]
+    assert fake_gh.merged_merge_flags == [()]
 
 
 def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
@@ -3818,6 +3859,81 @@ def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
     assert result.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
     assert fake_gh.merged_admin_flags == [True]
+    assert fake_gh.merged_merge_flags == [()]
+
+
+def test_merge_ready_passes_merge_flags_when_configured(tmp_path: Path) -> None:
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(), require_approved_review=True, merge_flags=("--admin",)
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    assert fake_gh.merged_admin_flags == [True]
+    assert fake_gh.merged_merge_flags == [("--admin",)]
+
+
+def test_merge_ready_merge_flags_takes_precedence_over_admin(tmp_path: Path) -> None:
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            admin=True,
+            merge_flags=("--admin",),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # merge_flags takes precedence, so admin flag should be True (from merge_flags)
+    assert fake_gh.merged_admin_flags == [True]
+    assert fake_gh.merged_merge_flags == [("--admin",)]
+
+
+def test_merge_ready_default_merge_flags_preserves_current_behavior(
+    tmp_path: Path,
+) -> None:
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # Default empty tuple should not add admin flag
+    assert fake_gh.merged_admin_flags == [False]
+    assert fake_gh.merged_merge_flags == [()]
 
 
 def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
