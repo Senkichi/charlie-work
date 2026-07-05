@@ -359,17 +359,7 @@ class OrchestratorApp:
         available_issues = [issue for issue in issues if self._is_dispatchable(issue)]
 
         # Check for blocked issues (dependency gate)
-        blocked_issues: dict[int, list[int]] = {}
-        for issue in available_issues:
-            issue_number = int(issue["number"])
-            declared_blockers, open_blockers = self._get_open_blockers(issue)
-            if open_blockers:
-                blocked_issues[issue_number] = declared_blockers
-
-        # Filter blocked issues from available count
-        truly_available = [
-            issue for issue in available_issues if int(issue["number"]) not in blocked_issues
-        ]
+        truly_available, blocked_issues = self._filter_blocked_issues(available_issues)
 
         linked_prs = [
             self._summarize_pr(pr)
@@ -587,25 +577,24 @@ class OrchestratorApp:
 
             # Apply dependency gate: skip issues with open blockers (dry-run)
             # Done outside the lock to avoid holding it during GitHub API calls
-            blocked_issues: dict[int, list[int]] = {}
-            for issue in candidates:
-                issue_number = int(issue["number"])
-                declared_blockers, open_blockers = self._get_open_blockers(issue)
-                if open_blockers:
-                    blocked_issues[issue_number] = declared_blockers
-
-            # Filter out blocked issues from candidates
-            candidates = [
-                issue for issue in candidates if int(issue["number"]) not in blocked_issues
-            ]
+            candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in candidates}
                 selected = [by_number[number] for number in wanted if number in by_number]
                 skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+                # Apply concurrency governor cap to explicit issue selection
+                if len(selected) > dispatch_limit:
+                    deferred_by_concurrency = [
+                        int(issue["number"]) for issue in selected[dispatch_limit:]
+                    ]
+                    selected = selected[:dispatch_limit]
+                else:
+                    deferred_by_concurrency = []
             else:
                 selected = candidates[:dispatch_limit]
+                deferred_by_concurrency = []
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
@@ -640,9 +629,14 @@ class OrchestratorApp:
                 "attempted_count": len(session_requests),
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
+                "deferred_by_concurrency": deferred_by_concurrency,
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
+                "blocked": [
+                    {"issue": issue_number, "blockers": blockers}
+                    for issue_number, blockers in sorted(blocked_issues.items())
+                ],
             }
             if gov.clamped:
                 data.update(gov.report_fields())
@@ -709,15 +703,7 @@ class OrchestratorApp:
 
         # Apply dependency gate: skip issues with open blockers
         # Done outside the lock to avoid holding it during GitHub API calls
-        blocked_issues: dict[int, list[int]] = {}
-        for issue in candidates:
-            issue_number = int(issue["number"])
-            declared_blockers, open_blockers = self._get_open_blockers(issue)
-            if open_blockers:
-                blocked_issues[issue_number] = declared_blockers
-
-        # Filter out blocked issues from candidates
-        candidates = [issue for issue in candidates if int(issue["number"]) not in blocked_issues]
+        candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
         # Re-enter lock to log events and claim issues
         with state_lock(self.paths.state_file):
@@ -738,8 +724,17 @@ class OrchestratorApp:
                 by_number = {int(issue["number"]): issue for issue in candidates}
                 selected = [by_number[number] for number in wanted if number in by_number]
                 skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+                # Apply concurrency governor cap to explicit issue selection
+                if len(selected) > dispatch_limit:
+                    deferred_by_concurrency = [
+                        int(issue["number"]) for issue in selected[dispatch_limit:]
+                    ]
+                    selected = selected[:dispatch_limit]
+                else:
+                    deferred_by_concurrency = []
             else:
                 selected = candidates[:dispatch_limit]
+                deferred_by_concurrency = []
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Capture previous entries for recovery detection BEFORE overwriting status
             # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
@@ -850,6 +845,7 @@ class OrchestratorApp:
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
+                    "deferred_by_concurrency": deferred_by_concurrency,
                 },
             )
             save_state(self.paths.state_file, state)
@@ -866,6 +862,7 @@ class OrchestratorApp:
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
+            "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -1814,11 +1811,24 @@ class OrchestratorApp:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
             selected = [by_number[number] for number in wanted if number in by_number]
+            # Apply concurrency governor cap to explicit issue selection
+            if len(selected) > rework_limit:
+                deferred_by_concurrency = [
+                    int(issue["number"]) for issue in selected[rework_limit:]
+                ]
+                selected = selected[:rework_limit]
+            else:
+                deferred_by_concurrency = []
         else:
             selected = candidates[:rework_limit]
+            deferred_by_concurrency = []
 
         if not selected:
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -1865,7 +1875,11 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         if not selected_issue_numbers:
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -1926,11 +1940,16 @@ class OrchestratorApp:
                         "issue_numbers": [],
                         "failed_issue_numbers": [],
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
+                        "deferred_by_concurrency": deferred_by_concurrency,
                         "label_errors": [],
                     },
                 )
                 save_state(self.paths.state_file, state)
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -2011,6 +2030,7 @@ class OrchestratorApp:
                     "issue_numbers": sorted(successful_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
+                    "deferred_by_concurrency": deferred_by_concurrency,
                     "label_errors": sorted(label_errors),
                 },
             )
@@ -2026,6 +2046,7 @@ class OrchestratorApp:
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -2092,6 +2113,34 @@ class OrchestratorApp:
             all_blockers.remove(issue_number)
 
         return sorted(all_blockers), sorted(open_blockers)
+
+    def _filter_blocked_issues(
+        self, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[int, list[int]]]:
+        """Filter out issues with open blockers from the candidate list.
+
+        This is a shared helper used by both dry-run and real dispatch paths
+        to ensure single-point-of-enforcement for the dependency gate logic.
+
+        Args:
+            candidates: List of candidate issue dicts from GitHub API
+
+        Returns:
+            Tuple of (filtered_candidates, blocked_issues). filtered_candidates is the
+            input list with blocked issues removed. blocked_issues is a dict mapping
+            blocked issue numbers to their declared blocker lists.
+        """
+        blocked_issues: dict[int, list[int]] = {}
+        for issue in candidates:
+            issue_number = int(issue["number"])
+            declared_blockers, open_blockers = self._get_open_blockers(issue)
+            if open_blockers:
+                blocked_issues[issue_number] = declared_blockers
+
+        filtered_candidates = [
+            issue for issue in candidates if int(issue["number"]) not in blocked_issues
+        ]
+        return filtered_candidates, blocked_issues
 
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"

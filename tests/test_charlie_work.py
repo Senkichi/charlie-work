@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import subprocess
@@ -3688,6 +3689,86 @@ def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
     assert final_state["events"] == [], "No dispatch events should be recorded"
 
 
+def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
+    """Issue #127: dry-run dispatch dependency-gate filter must exclude blocked issues.
+
+    When a blocked issue is ordered ahead of an eligible candidate with
+    dispatch_limit=1, the dry-run report should list the eligible issue as
+    dispatchable and the blocked issue should be excluded from sessions.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with blocked issue first, then eligible issue
+    class FakeGitHubWithDryRunDependencyGate(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with test issues: blocked first, then eligible
+            self.issues = [
+                {
+                    "number": 100,
+                    "title": "Blocked issue (first in order)",
+                    "url": "https://example.test/issues/100",
+                    "body": "Blocked by #200",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 101,
+                    "title": "Eligible issue (second in order)",
+                    "url": "https://example.test/issues/101",
+                    "body": "No blockers",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 200,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Foundation work",
+                    "labels": [],
+                    "state": "open",  # Still open, blocks #100
+                },
+            ]
+
+        def issue_list(self, ready_label: str):
+            # Return both ready issues in order
+            return [
+                issue
+                for issue in self.issues
+                if ready_label in [label["name"] for label in issue.get("labels", [])]
+            ]
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {200}
+
+    fake_gh = FakeGitHubWithDryRunDependencyGate()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    result = app.dispatch(limit=1)
+
+    # Only the eligible issue should be selected (blocked issue doesn't consume slot)
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+
+    # Verify the selected issue is exactly 101 (the eligible one), not 100 (blocked)
+    assert len(result.data["sessions"]) == 1
+    assert result.data["sessions"][0]["issue_number"] == 101
+
+    # Verify issue 100 is absent from sessions
+    dispatched_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 100 not in dispatched_issue_numbers
+
+    # Verify the blocked section contains issue 100 with its declared blockers
+    assert "blocked" in result.data
+    blocked_entries = {entry["issue"]: entry["blockers"] for entry in result.data["blocked"]}
+    assert 100 in blocked_entries
+    assert blocked_entries[100] == [200]
+
+
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
     from charlie_work.github import GitHubError as _GitHubError
 
@@ -5488,8 +5569,349 @@ def test_concurrency_governor_result_dataclass() -> None:
     try:
         result.clamped = False
         assert False, "Should not be able to modify frozen dataclass"
-    except (AttributeError, TypeError):
-        pass  # Expected
+    except dataclasses.FrozenInstanceError:
+        pass
+
+
+def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkeypatch) -> None:
+    """Issue #105: when --issues names more issues than available slots, excess should be deferred by concurrency."""
+
+    # Mock _count_live_sessions to return 0 live sessions
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with 3 ready issues
+    class FakeGitHubWithMultipleIssues(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 101,
+                    "title": "First fix",
+                    "url": "https://example.test/issues/101",
+                    "body": "First issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 102,
+                    "title": "Second fix",
+                    "url": "https://example.test/issues/102",
+                    "body": "Second issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 103,
+                    "title": "Third fix",
+                    "url": "https://example.test/issues/103",
+                    "body": "Third issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+            ]
+
+    fake_gh = FakeGitHubWithMultipleIssues()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Request dispatch of all 3 issues, but cap is 2
+    result = app.dispatch(only_issues="101,102,103")
+
+    # Should dispatch exactly 2, defer the third
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    assert result.data["concurrency_limit"] == 2
+    assert result.data["live_session_count"] == 0
+    assert result.data["available_slots"] == 2
+    assert result.data["deferred_by_concurrency"] == [103]
+    assert result.data["skipped_issue_numbers"] == []
+
+    # Verify deferred issue was NOT marked as dispatched (no label/state mutation)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+    # Only the dispatched issues should be in state
+    assert set(state["issues"].keys()) == {"101", "102"}
+    assert "103" not in state["issues"]
+
+
+def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #105: when --issues names more issues than available slots (with live sessions), excess should be deferred."""
+
+    # Mock _count_live_sessions to return 1 live session
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with 3 ready issues
+    class FakeGitHubWithMultipleIssues(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 101,
+                    "title": "First fix",
+                    "url": "https://example.test/issues/101",
+                    "body": "First issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 102,
+                    "title": "Second fix",
+                    "url": "https://example.test/issues/102",
+                    "body": "Second issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 103,
+                    "title": "Third fix",
+                    "url": "https://example.test/issues/103",
+                    "body": "Third issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+            ]
+
+    fake_gh = FakeGitHubWithMultipleIssues()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Request dispatch of all 3 issues, but only 1 slot available (2 cap - 1 live)
+    result = app.dispatch(only_issues="101,102,103")
+
+    # Should dispatch exactly 1, defer the other 2
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["concurrency_limit"] == 2
+    assert result.data["live_session_count"] == 1
+    assert result.data["available_slots"] == 1
+    assert set(result.data["deferred_by_concurrency"]) == {102, 103}
+    assert result.data["skipped_issue_numbers"] == []
+
+    # Verify deferred issues were NOT marked as dispatched
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+    # Only the dispatched issue should be in state
+    assert set(state["issues"].keys()) == {"101"}
+    assert "102" not in state["issues"]
+    assert "103" not in state["issues"]
+
+
+def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeypatch) -> None:
+    """Issue #105: dry-run with --issues should also respect concurrency governor."""
+
+    # Mock _count_live_sessions to return 0 live sessions
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with 3 ready issues
+    class FakeGitHubWithMultipleIssues(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 101,
+                    "title": "First fix",
+                    "url": "https://example.test/issues/101",
+                    "body": "First issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 102,
+                    "title": "Second fix",
+                    "url": "https://example.test/issues/102",
+                    "body": "Second issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 103,
+                    "title": "Third fix",
+                    "url": "https://example.test/issues/103",
+                    "body": "Third issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+            ]
+
+    fake_gh = FakeGitHubWithMultipleIssues()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Request dry-run dispatch of all 3 issues, but cap is 2
+    result = app.dispatch(only_issues="101,102,103")
+
+    # Should report exactly 2 would be dispatched, third deferred
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    assert result.data["concurrency_limit"] == 2
+    assert result.data["live_session_count"] == 0
+    assert result.data["available_slots"] == 2
+    assert result.data["deferred_by_concurrency"] == [103]
+    assert result.data["skipped_issue_numbers"] == []
+
+    # Verify state is unchanged in dry-run
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+    assert state["issues"] == {}
+    assert state["events"] == []
+
+
+def test_concurrency_governor_clamps_only_issues_rework_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #105: dispatch_rework with --issues should also respect concurrency governor."""
+
+    # Mock _count_live_sessions to return 0 live sessions
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with 3 issues needing rework
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 101,
+                    "title": "First rework",
+                    "url": "https://example.test/issues/101",
+                    "body": "First issue",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "open",
+                },
+                {
+                    "number": 102,
+                    "title": "Second rework",
+                    "url": "https://example.test/issues/102",
+                    "body": "Second issue",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "open",
+                },
+                {
+                    "number": 103,
+                    "title": "Third rework",
+                    "url": "https://example.test/issues/103",
+                    "body": "Third issue",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "open",
+                },
+            ]
+            # Add corresponding PRs (matching FakeGitHub's default PR 456 pattern)
+            self.prs = [
+                {
+                    "number": 456,
+                    "title": "Fix #101",
+                    "url": "https://example.test/pull/456",
+                    "headRefName": "agent/issue-101",
+                    "headRefOid": "sha-abc101",
+                    "body": "Closes #101",
+                    "labels": [],
+                    "isCrossRepository": False,
+                },
+                {
+                    "number": 457,
+                    "title": "Fix #102",
+                    "url": "https://example.test/pull/457",
+                    "headRefName": "agent/issue-102",
+                    "headRefOid": "sha-abc102",
+                    "body": "Closes #102",
+                    "labels": [],
+                    "isCrossRepository": False,
+                },
+                {
+                    "number": 458,
+                    "title": "Fix #103",
+                    "url": "https://example.test/pull/458",
+                    "headRefName": "agent/issue-103",
+                    "headRefOid": "sha-abc103",
+                    "body": "Closes #103",
+                    "labels": [],
+                    "isCrossRepository": False,
+                },
+            ]
+
+        def issue_list(self, ready_label: str):
+            if ready_label == "agent:needs-rework":
+                return self.issues
+            return []
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Initialize state with rework_requested status for all 3 issues
+    from charlie_work.state import save_state
+
+    initial_state = {
+        "issues": {
+            "101": {"status": "rework_requested", "branch": "agent/issue-101"},
+            "102": {"status": "rework_requested", "branch": "agent/issue-102"},
+            "103": {"status": "rework_requested", "branch": "agent/issue-103"},
+        },
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    # Create rework prompts for all 3 PRs
+    for pr_num in [456, 457, 458]:
+        pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_num}"
+        pr_dir.mkdir(parents=True)
+        rework_prompt = pr_dir / "rework-prompt.md"
+        rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # Request rework dispatch of all 3 issues, but cap is 2
+    result = app.dispatch_rework(only_issues="101,102,103")
+
+    # Should dispatch exactly 2, defer the third
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    assert result.data["concurrency_limit"] == 2
+    assert result.data["live_session_count"] == 0
+    assert result.data["available_slots"] == 2
+    assert result.data["deferred_by_concurrency"] == [103]
+    # dispatch_rework doesn't include skipped_issue_numbers in its result
 
 
 def test_concurrency_governor_result_unclamped() -> None:
