@@ -209,6 +209,7 @@ def launch_claude_worker(
     venv_source: Path | None = None,
     command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
     env: dict[str, str] | None = None,
+    materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
 ) -> ClaudeWorkerRecord:
@@ -236,6 +237,7 @@ def launch_claude_worker(
             branch,
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
+            materialize_dirs=materialize_dirs,
             rework=rework,
             recovery=recovery,
         )

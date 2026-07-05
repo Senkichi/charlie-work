@@ -1502,6 +1502,43 @@ def test_config_rejects_non_mapping_worker_env(tmp_path: Path) -> None:
     assert "claude_code" in message
 
 
+def test_config_rejects_non_mapping_devin_worker_env(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    # Same validation for devin.worker_env
+    path.write_text('devin:\n  worker_env: "2"\n', encoding="utf-8")
+
+    try:
+        load_config(path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "worker_env" in message
+    assert "devin" in message
+
+
+def test_config_rejects_non_list_materialize_dirs(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    # A plausible operator typo: a scalar instead of a list.
+    path.write_text('dispatch:\n  materialize_dirs: ".devin"\n', encoding="utf-8")
+
+    try:
+        load_config(path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "materialize_dirs" in message
+    assert "dispatch" in message
+    assert "list" in message
+
+
 def test_config_rejects_merge_flags_not_starting_with_double_dash(tmp_path: Path) -> None:
     from charlie_work.config import ConfigError
 

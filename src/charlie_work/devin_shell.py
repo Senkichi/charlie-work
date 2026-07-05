@@ -217,6 +217,9 @@ def launch_devin_session(
     worktrees_dir: Path | None = None,
     command_template: tuple[str, ...] = DEFAULT_COMMAND_TEMPLATE,
     worker_model: str = "",
+    venv_source: Path | None = None,
+    worker_env: dict[str, str] | None = None,
+    materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
 ) -> SessionRecord:
@@ -252,6 +255,8 @@ def launch_devin_session(
             repo_root,
             branch,
             worktrees_dir=worktrees_dir,
+            venv_source=venv_source,
+            materialize_dirs=materialize_dirs,
             rework=rework,
             recovery=recovery,
         )
@@ -299,8 +304,13 @@ def launch_devin_session(
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
-    kwargs["env"] = sanitize_env(worktree.path)
+    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
+    # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS)
+    worker_env_dict = {
+        **sanitize_env(worktree.path),
+        **{str(k): str(v) for k, v in (worker_env or {}).items()},
+    }
+    kwargs["env"] = worker_env_dict
 
     pid: int | None = None
     error: str | None = None

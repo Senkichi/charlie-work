@@ -98,6 +98,11 @@ class DispatchConfig:
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
+    # Repo-root-relative paths copied into each worktree after creation
+    # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
+    # skip-if-tracked (tracked paths are already present). Errors surface as
+    # values in SessionRecord.error.
+    materialize_dirs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,18 @@ class DevinConfig:
     # devin-shell worker model; empty string means CLI default. When set,
     # injects "--model <value>" into the rendered command via {model_args}.
     worker_model: str = ""
+    # Relative to the consumer repo root; junctioned into each worktree so
+    # workers share one venv (operator decision 2026-07-01). None disables.
+    venv_source: str | None = ".venv"
+    # Extra environment variables merged over the orchestrator's env in every
+    # devin-shell worker's launch process. Primary use: bound local test
+    # parallelism on a shared host — set PYTEST_XDIST_AUTO_NUM_WORKERS to cap
+    # `pytest -n auto` at the launch boundary (so K concurrent workers stay
+    # near one xdist worker per core instead of oversubscribing into swap)
+    # WITHOUT editing the suite's pyproject addopts — CI never sees this var,
+    # so it keeps full parallelism. A non-mapping value is rejected with
+    # ConfigError at load; values -> str.
+    worker_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -263,7 +280,16 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"(valid: {', '.join(sorted(known_sections))})"
         )
     labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
-    dispatch = _build_section(DispatchConfig, "dispatch", _section(data, "dispatch"))
+    dispatch_data = _section(data, "dispatch")
+    materialize_dirs = dispatch_data.get("materialize_dirs")
+    if materialize_dirs is not None:
+        if not isinstance(materialize_dirs, list):
+            raise ConfigError(
+                "config section 'dispatch' key 'materialize_dirs' must be a list of "
+                f"directory paths, got {type(materialize_dirs).__name__}"
+            )
+        dispatch_data["materialize_dirs"] = tuple(str(item) for item in materialize_dirs)
+    dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
@@ -320,6 +346,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             {"prompt_path", "issue_number", "branch", "model_args"},
             "devin.shell_command",
         )
+    worker_env = devin_data.get("worker_env")
+    if worker_env is not None:
+        if not isinstance(worker_env, dict):
+            raise ConfigError(
+                "config section 'devin' key 'worker_env' must be a mapping of "
+                f"env-var names to values, got {type(worker_env).__name__}"
+            )
+        devin_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
     devin = _build_section(DevinConfig, "devin", devin_data)
     claude_code_data = _section(data, "claude_code")
     claude_command = claude_code_data.get("command")
