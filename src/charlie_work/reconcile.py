@@ -45,6 +45,7 @@ class DriftItem:
     detail: str
     fix_actions: tuple[str, ...]
     remove_labels: tuple[str, ...] = ()
+    add_labels: tuple[str, ...] = ()
 
 
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
@@ -101,15 +102,17 @@ def detect_drift(
 
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
-    open_prs_by_number: dict[int, dict[str, Any]] = {}
+    open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Track issues already handled by session relabel to avoid double-emission
+    # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
+    issues_handled_by_session_relabel: set[int] = set()
+
     for pr in prs:
         pr_number = pr.get("number")
         if pr_number is None:
             continue
         pr_number = int(pr_number)
         gh_state = str(pr.get("state") or "").upper()
-        if gh_state == "OPEN":
-            open_prs_by_number[pr_number] = pr
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -117,6 +120,8 @@ def detect_drift(
         )
         if issue_number is not None:
             prs_linking_issue.setdefault(issue_number, []).append(pr)
+            if gh_state == "OPEN":
+                open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
         state_entry = state_prs.get(str(pr_number))
 
@@ -187,13 +192,160 @@ def detect_drift(
                 )
             )
 
+    # Detect dead sessions and classify failures for provider throttle state
+    # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
+    # the issue loop (to populate issues_handled_by_session_relabel for mutual exclusion)
+    if repo_root is not None:
+        from .claude_code import is_worker_alive, read_worker_records
+        from .devin_shell import is_session_alive, read_session_records
+
+        sessions_dir = repo_root / config.devin.sessions_dir
+        if sessions_dir.is_dir():
+            # Check devin-shell sessions
+            for record in read_session_records(sessions_dir):
+                if record.error is None and not is_session_alive(record):
+                    # Session exited without error - classify the failure
+                    from .devin_shell import update_session_record_with_failure_classification
+
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
+                    )
+                    if failure_kind and throttled_until:
+                        # Update state with throttle window
+                        # This is a no-op drift item that just signals state update
+                        drift.append(
+                            DriftItem(
+                                kind="provider_throttle_detected",
+                                issue_number=record.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{record.issue_number} session died with "
+                                    f"{failure_kind}, throttling until {throttled_until}"
+                                ),
+                                fix_actions=(f"set throttled_until={throttled_until}",),
+                            )
+                        )
+
+                    # Issue #118: reconcile labels for dead sessions with no open PR
+                    # A dead worker with no open PR is recoverable and should be relabeled
+                    # as dispatchable (remove active labels, ensure ready label present)
+                    # Only count OPEN PRs (not CLOSED/MERGED) for the guard
+                    if record.issue_number not in open_prs_by_issue:
+                        issue = issues_by_number.get(record.issue_number)
+                        if issue:
+                            issue_labels = label_names(issue)
+                            active_labels = issue_labels & labels_cfg.active
+                            if active_labels:
+                                # Remove all active labels and ensure ready label is present
+                                fix_actions = [
+                                    f"remove label '{label}' from issue #{record.issue_number}"
+                                    for label in sorted(active_labels)
+                                ]
+                                add_labels: tuple[str, ...] = ()
+                                if labels_cfg.ready not in issue_labels:
+                                    fix_actions.append(
+                                        f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
+                                    )
+                                    add_labels = (labels_cfg.ready,)
+
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_failed_relabeled",
+                                        issue_number=record.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{record.issue_number} session died with "
+                                            f"{failure_kind or 'unknown failure'}, no open PR, "
+                                            f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                        ),
+                                        fix_actions=tuple(fix_actions),
+                                        remove_labels=tuple(sorted(active_labels)),
+                                        add_labels=add_labels,
+                                    )
+                                )
+                                # Mark this issue as handled to avoid double-emission with
+                                # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
+                                issues_handled_by_session_relabel.add(record.issue_number)
+
+            # Check claude-code sessions
+            for record in read_worker_records(sessions_dir):
+                if record.error is None and not is_worker_alive(record):
+                    # Session exited without error - classify the failure
+                    from .claude_code import update_worker_record_with_failure_classification
+
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir, record.issue_number
+                        )
+                    )
+                    if failure_kind and throttled_until:
+                        # Update state with throttle window
+                        drift.append(
+                            DriftItem(
+                                kind="provider_throttle_detected",
+                                issue_number=record.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{record.issue_number} session died with "
+                                    f"{failure_kind}, throttling until {throttled_until}"
+                                ),
+                                fix_actions=(f"set throttled_until={throttled_until}",),
+                            )
+                        )
+
+                    # Issue #118: reconcile labels for dead sessions with no open PR
+                    # Only count OPEN PRs (not CLOSED/MERGED) for the guard
+                    if record.issue_number not in open_prs_by_issue:
+                        issue = issues_by_number.get(record.issue_number)
+                        if issue:
+                            issue_labels = label_names(issue)
+                            active_labels = issue_labels & labels_cfg.active
+                            if active_labels:
+                                fix_actions = [
+                                    f"remove label '{label}' from issue #{record.issue_number}"
+                                    for label in sorted(active_labels)
+                                ]
+                                add_labels: tuple[str, ...] = ()
+                                if labels_cfg.ready not in issue_labels:
+                                    fix_actions.append(
+                                        f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
+                                    )
+                                    add_labels = (labels_cfg.ready,)
+
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_failed_relabeled",
+                                        issue_number=record.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{record.issue_number} session died with "
+                                            f"{failure_kind or 'unknown failure'}, no open PR, "
+                                            f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                        ),
+                                        fix_actions=tuple(fix_actions),
+                                        remove_labels=tuple(sorted(active_labels)),
+                                        add_labels=add_labels,
+                                    )
+                                )
+                                # Mark this issue as handled to avoid double-emission with
+                                # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
+                                issues_handled_by_session_relabel.add(record.issue_number)
+
     for issue in issues:
         issue_number = int(issue["number"])
         issue_labels = label_names(issue)
         active_present = issue_labels & labels_cfg.active
         terminal_present = issue_labels & labels_cfg.terminal
 
-        if active_present and not prs_linking_issue.get(issue_number):
+        # Skip issue_active_label_no_open_pr if already handled by session relabel
+        # (both fire for dead-session-with-no-PR-ever scenario)
+        if (
+            active_present
+            and not prs_linking_issue.get(issue_number)
+            and issue_number not in issues_handled_by_session_relabel
+        ):
             drift.append(
                 DriftItem(
                     kind="issue_active_label_no_open_pr",
@@ -253,66 +405,6 @@ def detect_drift(
                 )
             )
 
-    # Detect dead sessions and classify failures for provider throttle state
-    if repo_root is not None:
-        from .claude_code import is_worker_alive, read_worker_records
-        from .devin_shell import is_session_alive, read_session_records
-
-        sessions_dir = repo_root / config.devin.sessions_dir
-        if sessions_dir.is_dir():
-            # Check devin-shell sessions
-            for record in read_session_records(sessions_dir):
-                if record.error is None and not is_session_alive(record):
-                    # Session exited without error - classify the failure
-                    from .devin_shell import update_session_record_with_failure_classification
-
-                    failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir, record.issue_number
-                        )
-                    )
-                    if failure_kind and throttled_until:
-                        # Update state with throttle window
-                        # This is a no-op drift item that just signals state update
-                        drift.append(
-                            DriftItem(
-                                kind="provider_throttle_detected",
-                                issue_number=record.issue_number,
-                                pr_number=None,
-                                detail=(
-                                    f"issue #{record.issue_number} session died with "
-                                    f"{failure_kind}, throttling until {throttled_until}"
-                                ),
-                                fix_actions=(f"set throttled_until={throttled_until}",),
-                            )
-                        )
-
-            # Check claude-code sessions
-            for record in read_worker_records(sessions_dir):
-                if record.error is None and not is_worker_alive(record):
-                    # Session exited without error - classify the failure
-                    from .claude_code import update_worker_record_with_failure_classification
-
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir, record.issue_number
-                        )
-                    )
-                    if failure_kind and throttled_until:
-                        # Update state with throttle window
-                        drift.append(
-                            DriftItem(
-                                kind="provider_throttle_detected",
-                                issue_number=record.issue_number,
-                                pr_number=None,
-                                detail=(
-                                    f"issue #{record.issue_number} session died with "
-                                    f"{failure_kind}, throttling until {throttled_until}"
-                                ),
-                                fix_actions=(f"set throttled_until={throttled_until}",),
-                            )
-                        )
-
     return drift
 
 
@@ -363,6 +455,16 @@ def apply_fixes(
                     throttled_until = action.split("=", 1)[1]
                     new_state = set_throttled_until(new_state, throttled_until)
                     break
+
+        elif item.kind == "session_failed_relabeled":
+            # Issue #118: reconcile labels for dead sessions with no open PR
+            if item.issue_number is not None:
+                # Remove active labels
+                for label in item.remove_labels:
+                    gh.remove_issue_label(item.issue_number, label)
+                # Add ready label if needed (structured field)
+                for label in item.add_labels:
+                    gh.add_issue_label(item.issue_number, label)
 
         new_state = append_event(
             new_state,

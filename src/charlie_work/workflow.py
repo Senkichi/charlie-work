@@ -120,12 +120,16 @@ def _count_live_sessions(sessions_dir: Path) -> int:
 
 
 def _classify_dead_sessions_and_update_throttle_state(
-    sessions_dir: Path, state_file: Path
+    sessions_dir: Path, state_file: Path, gh: GitHub, config: OrchestratorConfig
 ) -> None:
     """Check for dead sessions, classify their failures, and update throttle state.
 
     This is called from the production loop to detect provider throttling
     from worker deaths and set the cooldown window in state.json.
+
+    Also reconciles labels for dead sessions with no open PR (issue #118):
+    a dead worker with no open PR is recoverable and should be relabeled
+    as dispatchable (remove active labels, ensure ready label present).
     """
     from .devin_shell import (
         is_session_alive,
@@ -137,7 +141,22 @@ def _classify_dead_sessions_and_update_throttle_state(
         read_worker_records,
         update_worker_record_with_failure_classification,
     )
-    from .state import load_state, save_state, set_throttled_until, state_lock
+    from .state import append_event, load_state, save_state, set_throttled_until, state_lock
+
+    # Fetch open PRs for the "no open PR" guard
+    prs = gh.pr_list()
+    open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    for pr in prs:
+        pr_state = str(pr.get("state") or "").upper()
+        if pr_state != "OPEN":
+            continue
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if issue_number is not None:
+            open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
     # Check devin-shell sessions
     for record in read_session_records(sessions_dir):
@@ -153,6 +172,37 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
 
+            # Issue #118: reconcile labels for dead sessions with no open PR
+            if record.issue_number not in open_prs_by_issue:
+                try:
+                    issue = gh.issue_view(record.issue_number)
+                except Exception:
+                    # Issue may have been deleted or we lack access; skip relabel
+                    continue
+                issue_labels = label_names(issue)
+                active_labels = issue_labels & config.labels.active
+                if active_labels:
+                    # Remove all active labels (error-as-value)
+                    for label in sorted(active_labels):
+                        gh.remove_issue_label(record.issue_number, label)
+                    # Ensure ready label is present (error-as-value)
+                    if config.labels.ready not in issue_labels:
+                        gh.add_issue_label(record.issue_number, config.labels.ready)
+                    # Record the relabel event
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        state = append_event(
+                            state,
+                            "session_failed_relabeled",
+                            {
+                                "issue_number": record.issue_number,
+                                "failure_kind": failure_kind,
+                                "removed_labels": sorted(active_labels),
+                                "added_ready": config.labels.ready not in issue_labels,
+                            },
+                        )
+                        save_state(state_file, state)
+
     # Check claude-code sessions
     for record in read_worker_records(sessions_dir):
         if record.error is None and not is_worker_alive(record):
@@ -166,6 +216,37 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
+
+            # Issue #118: reconcile labels for dead sessions with no open PR
+            if record.issue_number not in open_prs_by_issue:
+                try:
+                    issue = gh.issue_view(record.issue_number)
+                except Exception:
+                    # Issue may have been deleted or we lack access; skip relabel
+                    continue
+                issue_labels = label_names(issue)
+                active_labels = issue_labels & config.labels.active
+                if active_labels:
+                    # Remove all active labels (error-as-value)
+                    for label in sorted(active_labels):
+                        gh.remove_issue_label(record.issue_number, label)
+                    # Ensure ready label is present (error-as-value)
+                    if config.labels.ready not in issue_labels:
+                        gh.add_issue_label(record.issue_number, config.labels.ready)
+                    # Record the relabel event
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        state = append_event(
+                            state,
+                            "session_failed_relabeled",
+                            {
+                                "issue_number": record.issue_number,
+                                "failure_kind": failure_kind,
+                                "removed_labels": sorted(active_labels),
+                                "added_ready": config.labels.ready not in issue_labels,
+                            },
+                        )
+                        save_state(state_file, state)
 
 
 def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
@@ -1530,8 +1611,11 @@ class OrchestratorApp:
 
         # Classify dead sessions and update throttle state (production loop path)
         # This detects provider throttling from worker deaths and sets cooldown
+        # Also reconciles labels for dead sessions with no open PR (issue #118)
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        _classify_dead_sessions_and_update_throttle_state(sessions_dir, self.paths.state_file)
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, self.paths.state_file, self.gh, self.config
+        )
 
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
