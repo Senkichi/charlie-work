@@ -9,6 +9,7 @@ import pytest
 from charlie_work.worktree import (
     WorktreeInfo,
     _default_worktrees_dir,
+    _resolve_default_branch_ref,
     create_worktree,
     is_junction,
     list_worktrees,
@@ -1285,10 +1286,6 @@ def test_dirty_probe_failure_treats_as_dirty(tmp_path: Path) -> None:
         assert info1.path.exists()
         # Verify the dirty file is still there
         assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
-
-        # Clean up
-        _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
-        remove_worktree(repo_root, info1.path, force=True)
     finally:
         charlie_work.worktree.run_captured = original_run_captured
 
@@ -1319,6 +1316,80 @@ def test_list_worktrees_porcelain_parser_handles_flag_lines(tmp_path: Path) -> N
             assert wt["bare"] is True
         if "detached" in wt:
             assert wt["detached"] is True
+
+    # Clean up
+    remove_worktree(repo_root, info.path)
+
+
+def test_resolve_default_branch_ref_with_origin(tmp_path: Path) -> None:
+    """_resolve_default_branch_ref should return origin/<branch> when origin exists."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Set up origin/HEAD to point to origin/main
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    default_ref = _resolve_default_branch_ref(repo_root)
+    assert default_ref == "origin/main"
+
+
+def test_resolve_default_branch_ref_without_origin(tmp_path: Path) -> None:
+    """_resolve_default_branch_ref should return HEAD when origin doesn't exist."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    default_ref = _resolve_default_branch_ref(repo_root)
+    assert default_ref == "HEAD"
+
+
+def test_fresh_dispatch_with_base_ref_fetches_remote_ref(tmp_path: Path) -> None:
+    """Fresh dispatch with base_ref=origin/main should fetch before worktree creation."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Set up origin/HEAD to point to origin/main
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    # Add a commit to the remote main branch
+    (remote_repo / "remote-file.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "remote-file.txt")
+    _git(remote_repo, "commit", "-m", "add remote file")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Park the local repo on a side branch with unique commits
+    _git(repo_root, "checkout", "-b", "side-branch")
+    (repo_root / "local-file.txt").write_text("local change\n", encoding="utf-8")
+    _git(repo_root, "add", "local-file.txt")
+    _git(repo_root, "commit", "-m", "add local file")
+    local_tip = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    # Verify local is ahead of origin
+    assert local_tip != remote_tip
+
+    # Fresh dispatch with base_ref="" (auto-resolves to origin/main)
+    branch_name = "agent/issue-103-fresh-fetch"
+    info = create_worktree(repo_root, branch_name, base_ref="")
+
+    # The worktree should be based on the remote tip, not the local side branch
+    worktree_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_tip == remote_tip
+    assert worktree_tip != local_tip
 
     # Clean up
     remove_worktree(repo_root, info.path)
@@ -1516,3 +1587,170 @@ branch refs/heads/{branch_name}
     finally:
         charlie_work.worktree.run_captured = original_run_captured
         remove_worktree(repo_root, info1.path)
+
+
+def test_fresh_dispatch_with_explicit_base_ref_fetches(tmp_path: Path) -> None:
+    """Fresh dispatch with explicit base_ref=origin/main should fetch before worktree creation."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Add a commit to the remote main branch
+    (remote_repo / "remote-file.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "remote-file.txt")
+    _git(remote_repo, "commit", "-m", "add remote file")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Park the local repo on a side branch with unique commits
+    _git(repo_root, "checkout", "-b", "side-branch")
+    (repo_root / "local-file.txt").write_text("local change\n", encoding="utf-8")
+    _git(repo_root, "add", "local-file.txt")
+    _git(repo_root, "commit", "-m", "add local file")
+    local_tip = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    # Fresh dispatch with explicit base_ref="origin/main"
+    branch_name = "agent/issue-103-explicit-base-ref"
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+
+    # The worktree should be based on the remote tip, not the local side branch
+    worktree_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_tip == remote_tip
+    assert worktree_tip != local_tip
+
+    # Clean up
+    remove_worktree(repo_root, info.path)
+
+
+def test_fresh_dispatch_with_local_base_ref_does_not_fetch(tmp_path: Path) -> None:
+    """Fresh dispatch with base_ref=HEAD should not fetch (local ref)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Add a commit to the remote main branch
+    (remote_repo / "remote-file.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "remote-file.txt")
+    _git(remote_repo, "commit", "-m", "add remote file")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Park the local repo on a side branch with unique commits
+    _git(repo_root, "checkout", "-b", "side-branch")
+    (repo_root / "local-file.txt").write_text("local change\n", encoding="utf-8")
+    _git(repo_root, "add", "local-file.txt")
+    _git(repo_root, "commit", "-m", "add local file")
+    local_tip = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    # Fresh dispatch with base_ref="HEAD" (local ref, no fetch)
+    branch_name = "agent/issue-103-local-base-ref"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # The worktree should be based on the local tip, not the remote tip
+    worktree_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_tip == local_tip
+    assert worktree_tip != remote_tip
+
+    # Clean up
+    remove_worktree(repo_root, info.path)
+
+
+def test_rework_dispatch_does_not_fetch_base_ref(tmp_path: Path) -> None:
+    """Rework dispatch should not fetch base_ref (preserves existing tip)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create the agent branch + worktree locally and push it to origin.
+    branch_name = "agent/issue-103-rework-no-fetch"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "add file1")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance the AGENT branch on the remote so the local worktree is behind.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    # Rework dispatch with base_ref="" (should NOT fetch base_ref, only the branch itself)
+    info2 = create_worktree(repo_root, branch_name, rework=True, base_ref="")
+
+    # The worktree should be fast-forwarded to the origin tip (via rework logic),
+    # but the base_ref fetch should not have happened (it's rework mode)
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_recovery_dispatch_does_not_fetch_base_ref(tmp_path: Path) -> None:
+    """Recovery dispatch should not fetch base_ref (only the branch itself in rework mode)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create the agent branch + worktree locally with commits and push it
+    branch_name = "agent/issue-103-recovery-no-fetch"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "file1.txt").write_text("original\n", encoding="utf-8")
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "add file1")
+    _git(repo_root, "push", "origin", branch_name)
+    local_tip = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
+
+    # Add a commit to the remote main branch (this should NOT be fetched during recovery)
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "remote-file.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "remote-file.txt")
+    _git(remote_repo, "commit", "-m", "add remote file")
+    remote_main_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Recovery dispatch with base_ref="" (should NOT fetch base_ref, only the branch itself)
+    info2 = create_worktree(repo_root, branch_name, base_ref="", recovery=recovery_record)
+
+    # The worktree should be reused (same path)
+    assert info2.path == info1.path
+    # The local commit should still be present (file1.txt exists)
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "original\n"
+    # The worktree tip should still be the local tip (recovery reuses existing worktree)
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == local_tip
+    # The remote main tip should NOT have been fetched into the worktree
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() != remote_main_tip
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_fresh_dispatch_fetch_failure_raises_error(tmp_path: Path) -> None:
+    """Fresh dispatch with base_ref fetch failure should raise RuntimeError."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Set up origin/HEAD to point to origin/main
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    # Break the origin remote to simulate a fetch failure
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+    # Fresh dispatch with base_ref="" should raise on fetch failure
+    branch_name = "agent/issue-103-fetch-fail"
+    with pytest.raises(RuntimeError, match="Failed to fetch base ref"):
+        create_worktree(repo_root, branch_name, base_ref="")
+
+    # Clean up
+    _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
