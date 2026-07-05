@@ -228,6 +228,41 @@ def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
             raise RuntimeError(f"venv link target already exists: {link_path}") from exc
 
 
+def _is_git_tracked(repo_root: Path, path: Path) -> bool:
+    """Check if a path is tracked by git in the repo.
+
+    Returns True if the path is tracked, False if it's untracked or doesn't exist.
+    """
+    result = run_captured(
+        ["git", "ls-files", "--error-unmatch", str(path.relative_to(repo_root))],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
+def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> None:
+    """Copy a directory from repo_root to worktree_path if it's not tracked.
+
+    Skip if the path is already tracked by git (it will be in the worktree).
+    Copy-not-link (workers may write marker files). Errors surface as OSError.
+    """
+    source = repo_root / dir_path
+    if not source.exists():
+        return  # Source doesn't exist, nothing to copy
+
+    # Check if the path is tracked by git
+    if _is_git_tracked(repo_root, source):
+        return  # Tracked paths are already in the worktree
+
+    # Copy the directory to the worktree
+    target = worktree_path / dir_path
+    if target.exists():
+        return  # Already exists in worktree (shouldn't happen, but be safe)
+
+    shutil.copytree(source, target)
+
+
 def create_worktree(
     repo_root: Path,
     branch: str,
@@ -235,6 +270,7 @@ def create_worktree(
     base_ref: str = "HEAD",
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
+    materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
 ) -> WorktreeInfo:
@@ -668,6 +704,18 @@ def create_worktree(
             delete_branch = None if rework else branch
             remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
             raise
+
+    # Materialize git-excluded directories into the worktree
+    for dir_path in materialize_dirs:
+        try:
+            _materialize_directory(repo_root, worktree_path, dir_path)
+        except OSError as exc:
+            # Clean up the worktree and branch if materialization fails
+            delete_branch = None if rework else branch
+            remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
+            raise RuntimeError(
+                f"Failed to materialize directory {dir_path} into worktree: {exc}"
+            ) from exc
 
     return WorktreeInfo(
         path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
