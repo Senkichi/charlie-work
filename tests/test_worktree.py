@@ -15,6 +15,8 @@ from charlie_work.worktree import (
     is_junction,
     list_worktrees,
     remove_worktree,
+    _is_git_tracked,
+    _materialize_directory,
 )
 
 
@@ -1291,6 +1293,147 @@ def test_dirty_probe_failure_treats_as_dirty(tmp_path: Path) -> None:
         charlie_work.worktree.run_captured = original_run_captured
 
 
+# ---------------------------------------------------------------------------
+# Tests for materialize_dirs functionality
+# ---------------------------------------------------------------------------
+
+
+def test_is_git_tracked_returns_true_for_tracked_file(tmp_path: Path) -> None:
+    """_is_git_tracked should return True for tracked files."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # README.md is tracked by default
+    assert _is_git_tracked(repo_root, repo_root / "README.md") is True
+
+
+def test_is_git_tracked_returns_false_for_untracked_file(tmp_path: Path) -> None:
+    """_is_git_tracked should return False for untracked files."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create an untracked file
+    untracked = repo_root / "untracked.txt"
+    untracked.write_text("untracked\n", encoding="utf-8")
+
+    assert _is_git_tracked(repo_root, untracked) is False
+
+
+def test_is_git_tracked_returns_false_for_nonexistent_path(tmp_path: Path) -> None:
+    """_is_git_tracked should return False for nonexistent paths."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    nonexistent = repo_root / "does-not-exist.txt"
+    assert _is_git_tracked(repo_root, nonexistent) is False
+
+
+def test_materialize_directory_copies_untracked_dir(tmp_path: Path) -> None:
+    """_materialize_directory should copy untracked directories."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create an untracked directory in repo_root
+    untracked_dir = repo_root / ".devin"
+    untracked_dir.mkdir()
+    (untracked_dir / "config.json").write_text("config\n", encoding="utf-8")
+
+    # Create a worktree
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Materialize the directory
+    _materialize_directory(repo_root, worktree_path, ".devin")
+
+    # Verify the directory was copied
+    target_dir = worktree_path / ".devin"
+    assert target_dir.exists()
+    assert (target_dir / "config.json").read_text(encoding="utf-8") == "config\n"
+
+
+def test_materialize_directory_skips_tracked_dir(tmp_path: Path) -> None:
+    """_materialize_directory should skip tracked directories."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # README.md is tracked by default
+    # Create a worktree
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Try to materialize a tracked file's parent directory
+    # This should be skipped because it's tracked
+    _materialize_directory(repo_root, worktree_path, ".")
+
+    # The worktree should still be empty (nothing was copied)
+    assert not (worktree_path / "README.md").exists()
+
+
+def test_materialize_directory_skips_nonexistent_source(tmp_path: Path) -> None:
+    """_materialize_directory should skip nonexistent source directories."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Try to materialize a nonexistent directory - should not raise
+    _materialize_directory(repo_root, worktree_path, "does-not-exist")
+
+    # Worktree should still be empty
+    assert not (worktree_path / "does-not-exist").exists()
+
+
+def test_materialize_directory_skips_if_target_exists(tmp_path: Path) -> None:
+    """_materialize_directory should skip if target already exists."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create an untracked directory in repo_root
+    untracked_dir = repo_root / ".devin"
+    untracked_dir.mkdir()
+    (untracked_dir / "config.json").write_text("original\n", encoding="utf-8")
+
+    # Create a worktree with a pre-existing .devin directory
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    target_dir = worktree_path / ".devin"
+    target_dir.mkdir()
+    (target_dir / "existing.txt").write_text("existing\n", encoding="utf-8")
+
+    # Materialize the directory - should skip because target exists
+    _materialize_directory(repo_root, worktree_path, ".devin")
+
+    # The existing file should still be there (not overwritten)
+    assert (target_dir / "existing.txt").read_text(encoding="utf-8") == "existing\n"
+    # The source file should not have been copied
+    assert not (target_dir / "config.json").exists()
+
+
+def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
+    """create_worktree should materialize specified directories."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create an untracked directory in repo_root
+    untracked_dir = repo_root / ".devin"
+    untracked_dir.mkdir()
+    (untracked_dir / "hooks.json").write_text("hooks\n", encoding="utf-8")
+
+    # Create a worktree with materialize_dirs
+    info = create_worktree(
+        repo_root,
+        "agent/issue-1-materialize",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    # Verify the directory was copied to the worktree
+    target_dir = info.path / ".devin"
+    assert target_dir.exists()
+    assert (target_dir / "hooks.json").read_text(encoding="utf-8") == "hooks\n"
+
+
 def test_resolve_default_branch_ref_with_origin(tmp_path: Path) -> None:
     """_resolve_default_branch_ref should return origin/<branch> when origin exists."""
     remote_repo = tmp_path / "remote"
@@ -1363,6 +1506,53 @@ def test_fresh_dispatch_with_base_ref_fetches_remote_ref(tmp_path: Path) -> None
 
     # Clean up
     remove_worktree(repo_root, info.path)
+
+
+def test_create_worktree_materialize_dirs_error_cleanup(tmp_path: Path) -> None:
+    """Materialization failure should clean up the worktree and branch."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create an untracked directory in repo_root
+    untracked_dir = repo_root / ".devin"
+    untracked_dir.mkdir()
+    (untracked_dir / "config.json").write_text("config\n", encoding="utf-8")
+
+    # Monkeypatch _materialize_directory to raise an error
+    import charlie_work.worktree
+
+    original_materialize = charlie_work.worktree._materialize_directory
+
+    def mock_materialize(*args: object, **kwargs: object) -> None:
+        raise OSError("Mock materialization failure")
+
+    charlie_work.worktree._materialize_directory = mock_materialize
+
+    try:
+        with pytest.raises(RuntimeError, match="Failed to materialize directory"):
+            create_worktree(
+                repo_root,
+                "agent/issue-2-materialize-fail",
+                base_ref="HEAD",
+                materialize_dirs=(".devin",),
+            )
+
+        # Verify the worktree was cleaned up
+        worktrees_dir = _default_worktrees_dir(repo_root)
+        worktree_path = worktrees_dir / "agent-issue-2-materialize-fail"
+        assert not worktree_path.exists()
+
+        # Verify the branch was deleted
+        result = subprocess.run(
+            ["git", "branch", "--list", "agent/issue-2-materialize-fail"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "agent/issue-2-materialize-fail" not in result.stdout
+    finally:
+        charlie_work.worktree._materialize_directory = original_materialize
 
 
 def test_fresh_dispatch_with_explicit_base_ref_fetches(tmp_path: Path) -> None:
