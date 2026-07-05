@@ -7253,6 +7253,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     """Issue #109: status (roll-call) should include stalled section."""
     from datetime import UTC, datetime, timedelta
     import os
+    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="manual"),
@@ -7295,7 +7296,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     timestamp = old_time.timestamp()
     os.utime(log_file, (timestamp, timestamp))
 
-    # Create a sidecar with a fake PID (we'll mock is_session_alive to return True)
+    # Create a sidecar with a fake PID
     sidecar = sessions_dir / "issue-109.json"
     sidecar.write_text(
         json.dumps(
@@ -7314,10 +7315,204 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # For this test, we'll just verify the stalled section exists in the data structure
-    # The actual stall detection logic is tested in test_process_utils.py
-    result = app.status()
+    # Mock is_session_alive to return True for PID 99999 so detection runs
+    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+        result = app.status()
 
-    # Check that stalled section is present (even if empty in this simple test)
+    # Check that stalled section contains the issue number
     assert "stalled" in result.data
     assert isinstance(result.data["stalled"], list)
+    assert 109 in result.data["stalled"]
+
+
+def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:
+    """Issue #109: stalled session detection should emit session_stalled event with required fields."""
+    from datetime import UTC, datetime, timedelta
+    import os
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),  # Use devin-shell adapter for watchdog support
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub
+    class FakeGitHubForEvent(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, ready_label: str):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubForEvent()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a fake stalled session sidecar
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a log file with old mtime (stalled by time)
+    log_file = sessions_dir / "issue-109.log"
+    log_file.write_text("working on issue\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    os.utime(log_file, (timestamp, timestamp))
+
+    # Create a sidecar with a fake PID
+    sidecar = sessions_dir / "issue-109.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 109,
+                "branch": "agent/issue-109",
+                "worktree_path": "/fake/path",
+                "prompt_path": "/fake/prompt",
+                "command": ["devin", "--print"],
+                "pid": 99999,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_file),
+                "error": None,
+                "process_start_time": 1234567890.0,  # Fake start time
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Mock read_session_records to return a fake record
+    from charlie_work.devin_shell import SessionRecord
+
+    fake_record = SessionRecord(
+        issue_number=109,
+        branch="agent/issue-109",
+        worktree_path="/fake/path",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=99999,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+        error=None,
+        process_start_time=None,  # No start time verification in this test
+    )
+
+    # Mock is_session_alive to return True and kill_process_tree to return killed PIDs
+    with (
+        patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
+        patch("charlie_work.devin_shell.is_session_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch(
+            "charlie_work.devin_shell.update_session_record_with_failure_classification",
+            return_value=(None, None),
+        ),
+    ):
+        # Run the stall detection and handling
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    # Check that the stalled issue was detected
+    assert 109 in result
+
+    # Load state and check for the event
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+
+    # Find the session_stalled event
+    stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
+    assert len(stalled_events) == 1
+
+    event = stalled_events[0]
+    # Check required fields (they're in the payload)
+    payload = event.get("payload", {})
+    assert payload.get("issue_number") == 109
+    assert payload.get("pid") == 99999
+    assert "log_mtime" in payload
+    assert "last_log_line" in payload
+    assert payload.get("killed_pids") == [99999]
+
+
+def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None:
+    """Issue #109: when watchdog.enabled=False, no detection, no kill, no event."""
+    from datetime import UTC, datetime, timedelta
+    import os
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=False, stall_minutes=20),  # Disabled
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub
+    class FakeGitHubDisabled(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, ready_label: str):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubDisabled()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a fake stalled session sidecar
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a log file with old mtime (stalled by time)
+    log_file = sessions_dir / "issue-109.log"
+    log_file.write_text("working on issue\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    os.utime(log_file, (timestamp, timestamp))
+
+    # Create a sidecar with a fake PID
+    sidecar = sessions_dir / "issue-109.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 109,
+                "branch": "agent/issue-109",
+                "worktree_path": "/fake/path",
+                "prompt_path": "/fake/prompt",
+                "command": ["devin", "--print"],
+                "pid": 99999,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_file),
+                "error": None,
+                "process_start_time": 1234567890.0,  # Fake start time
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Mock is_session_alive and kill_process_tree to track calls
+    with (
+        patch("charlie_work.devin_shell.is_session_alive", return_value=True) as mock_alive,
+        patch("charlie_work.process_utils.kill_process_tree", return_value=[]) as mock_kill,
+    ):
+        # Run the stall detection and handling
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    # Check that is_session_alive was NOT called (detection skipped)
+    mock_alive.assert_not_called()
+
+    # Check that kill_process_tree was NOT called (no kill)
+    mock_kill.assert_not_called()
+
+    # Load state and check for the event
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+
+    # Find the session_stalled event
+    stalled_events = [e for e in events if e.get("type") == "session_stalled"]
+    assert len(stalled_events) == 0  # No event emitted

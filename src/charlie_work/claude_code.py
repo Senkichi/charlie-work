@@ -311,6 +311,7 @@ def launch_claude_worker(
                         stderr=subprocess.STDOUT,
                         env=worker_env,
                         creationflags=_CREATE_NEW_PROCESS_GROUP,
+                        start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
             else:
                 process = subprocess.Popen(
@@ -321,6 +322,7 @@ def launch_claude_worker(
                     stderr=subprocess.STDOUT,
                     env=worker_env,
                     creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                 )
     except OSError as exc:
         remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)

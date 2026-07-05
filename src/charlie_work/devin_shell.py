@@ -300,6 +300,9 @@ def launch_devin_session(
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    # POSIX: detach worker into its own session to prevent killpg from killing the orchestrator
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
     kwargs["env"] = sanitize_env(worktree.path)

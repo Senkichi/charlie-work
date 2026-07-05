@@ -212,8 +212,8 @@ def _detect_and_handle_stalled_sessions(
         is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
 
         if is_stalled:
-            # Kill the process tree
-            killed_pids = kill_process_tree(record.pid)
+            # Kill the process tree (with start-time verification to prevent PID recycling)
+            killed_pids = kill_process_tree(record.pid, record.process_start_time)
 
             # Mark the sidecar with failure_kind: stalled
             update_session_record_with_failure_classification(
@@ -250,8 +250,8 @@ def _detect_and_handle_stalled_sessions(
         is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
 
         if is_stalled:
-            # Kill the process tree
-            killed_pids = kill_process_tree(record.pid)
+            # Kill the process tree (with start-time verification to prevent PID recycling)
+            killed_pids = kill_process_tree(record.pid, record.process_start_time)
 
             # Mark the sidecar with failure_kind: stalled
             update_worker_record_with_failure_classification(
