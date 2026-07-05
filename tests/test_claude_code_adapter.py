@@ -12,6 +12,7 @@ import pytest
 from charlie_work import claude_code
 from charlie_work.claude_code import (
     ClaudeWorkerRecord,
+    _sanitize_env,
     is_worker_alive,
     launch_claude_worker,
     probe_claude,
@@ -616,236 +617,262 @@ def test_launch_claude_worker_render_error_returns_error_record_and_tears_down_w
     assert payload["pid"] is None
 
 
-def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
-    """Launch failure should clean up branch and worktree, allowing retry to succeed."""
+def test_launch_claude_worker_with_venv_source_junction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When venv_source is configured, the junction is copied into the worktree."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
 
-    # Initialize a real git repo for the worktree to use
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.test"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "README.md"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "initial commit"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    # Create a fake venv source
+    venv_source = tmp_path / "shared_venv"
+    venv_source.mkdir()
+    (venv_source / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
 
-    branch_name = "agent/issue-42-retry"
+    # Track the venv_source argument passed to create_worktree
+    calls: list[dict] = []
 
-    # First launch fails (binary doesn't exist)
-    record1 = launch_claude_worker(
+    def tracking_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
+    ):
+        calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "base_ref": base_ref,
+                "worktrees_dir": worktrees_dir,
+                "venv_source": venv_source,
+                "rework": rework,
+                "recovery": recovery,
+            }
+        )
+        return _fake_worktree(tmp_path, branch)
+
+    monkeypatch.setattr(claude_code, "create_worktree", tracking_create_worktree)
+
+    record = launch_claude_worker(
         42,
-        branch_name,
-        "prompt text",
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        command_template=("this-binary-does-not-exist-xyz",),
-    )
-
-    assert not record1.ok
-    assert "failed to launch claude" in record1.error
-
-    # Verify the branch is deleted after the failure
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert branch_name not in result.stdout
-
-    # Second launch should succeed (using fake claude script)
-    record2 = launch_claude_worker(
-        42,
-        branch_name,
-        "prompt text",
+        "agent/issue-42-venv",
+        "prompt",
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         command_template=_fake_claude_script(tmp_path),
+        venv_source=venv_source,
     )
 
-    assert record2.ok
-    assert record2.branch == branch_name
+    assert record.ok
+    assert len(calls) == 1
+    assert calls[0]["venv_source"] == venv_source
 
 
-def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
-    """Rework-mode launch failure should preserve the existing branch."""
+def test_launch_claude_worker_with_custom_worktrees_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When worktrees_dir is configured, it's passed to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    custom_worktrees_dir = tmp_path / "custom_worktrees"
+
+    # Track the worktrees_dir argument passed to create_worktree
+    calls: list[dict] = []
+
+    def tracking_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
+    ):
+        calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "base_ref": base_ref,
+                "worktrees_dir": worktrees_dir,
+                "venv_source": venv_source,
+                "rework": rework,
+                "recovery": recovery,
+            }
+        )
+        return _fake_worktree(tmp_path, branch)
+
+    monkeypatch.setattr(claude_code, "create_worktree", tracking_create_worktree)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-custom-dir",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        worktrees_dir=custom_worktrees_dir,
+    )
+
+    assert record.ok
+    assert len(calls) == 1
+    assert calls[0]["worktrees_dir"] == custom_worktrees_dir
+
+
+def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In rework mode, create_worktree is called with rework=True."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
 
-    # Initialize a real git repo
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.test"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "README.md"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "initial commit"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    calls: list[dict] = []
 
-    branch_name = "agent/issue-43-rework"
+    def tracking_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
+    ):
+        calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "base_ref": base_ref,
+                "worktrees_dir": worktrees_dir,
+                "venv_source": venv_source,
+                "rework": rework,
+                "recovery": recovery,
+            }
+        )
+        return _fake_worktree(tmp_path, branch)
 
-    # Create the branch first (simulating a previous PR cycle)
-    subprocess.run(
-        ["git", "branch", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    monkeypatch.setattr(claude_code, "create_worktree", tracking_create_worktree)
 
-    # Verify the branch exists
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert branch_name in result.stdout
-
-    # Rework-mode launch fails (binary doesn't exist)
     record = launch_claude_worker(
-        43,
-        branch_name,
-        "prompt text",
+        42,
+        "agent/issue-42-rework",
+        "prompt",
         repo_root=repo_root,
         sessions_dir=sessions_dir,
-        command_template=("this-binary-does-not-exist-xyz",),
+        command_template=_fake_claude_script(tmp_path),
         rework=True,
     )
 
-    assert not record.ok
-    assert "failed to launch claude" in record.error
-
-    # Verify the branch is preserved (not deleted)
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert branch_name in result.stdout
-
-    # Clean up
-    subprocess.run(
-        ["git", "branch", "-D", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    assert record.ok
+    assert len(calls) == 1
+    assert calls[0]["rework"] is True
 
 
-def test_rework_prompt_write_failure_preserves_branch(
+def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Rework-mode prompt-write failure should preserve the existing branch."""
+    """In recovery mode, the recovery dict is passed to create_worktree."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
 
-    # Initialize a real git repo
-    subprocess.run(
-        ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.test"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "README.md"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "initial commit"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
+    recovery_dict = {
+        "worktree_path": "/tmp/wt/issue-42",
+        "branch": "agent/issue-42",
+        "has_commits": True,
+    }
+
+    calls: list[dict] = []
+
+    def tracking_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        rework=False,
+        recovery=None,
+    ):
+        calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "base_ref": base_ref,
+                "worktrees_dir": worktrees_dir,
+                "venv_source": venv_source,
+                "rework": rework,
+                "recovery": recovery,
+            }
+        )
+        return _fake_worktree(tmp_path, branch)
+
+    monkeypatch.setattr(claude_code, "create_worktree", tracking_create_worktree)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-recovery",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        recovery=recovery_dict,
     )
 
-    branch_name = "agent/issue-44-rework-prompt-fail"
+    assert record.ok
+    assert len(calls) == 1
+    assert calls[0]["recovery"] == recovery_dict
 
-    # Create the branch first (simulating a previous PR cycle)
-    subprocess.run(
-        ["git", "branch", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
+
+def test_launch_claude_worker_rework_log_suffix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In rework mode, the log file uses the -rework suffix."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-rework",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        rework=True,
     )
 
-    # Verify the branch exists
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
+    assert record.ok
+    assert record.log_path.endswith("-rework.claude.log")
+
+
+def test_launch_claude_worker_prompt_write_failure_tears_down_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If writing the prompt file fails, the worktree is torn down."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    worktree_removed = []
+
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False, branch=None):
+        worktree_removed.append(worktree_path)
+        return True
+
+    monkeypatch.setattr(
+        claude_code,
+        "create_worktree",
+        lambda *args, **kwargs: _fake_worktree(tmp_path, "agent/issue-1"),
     )
-    assert branch_name in result.stdout
+    monkeypatch.setattr(claude_code, "remove_worktree", tracking_remove_worktree)
 
     # Monkeypatch Path.write_text to raise OSError on the prompt file
     original_write_text = Path.write_text
@@ -857,34 +884,256 @@ def test_rework_prompt_write_failure_preserves_branch(
 
     monkeypatch.setattr(Path, "write_text", failing_write_text)
 
-    # Rework-mode launch fails on prompt write
     record = launch_claude_worker(
-        44,
-        branch_name,
+        1,
+        "agent/issue-1",
         "prompt text",
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         command_template=_fake_claude_script(tmp_path),
-        rework=True,
     )
 
     assert not record.ok
     assert "failed to write prompt file" in record.error
+    assert len(worktree_removed) == 1
 
-    # Verify the branch is preserved (not deleted)
-    result = subprocess.run(
-        ["git", "branch", "--list", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
+
+# ---------------------------------------------------------------------------
+# Regression: VIRTUAL_ENV sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When worktree has no .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when worktree has no .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when worktree has no .venv"
     )
-    assert branch_name in result.stdout
 
-    # Clean up
-    subprocess.run(
-        ["git", "branch", "-D", branch_name],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
+
+def test_sanitize_env_sets_worktree_venv_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When worktree has .venv, VIRTUAL_ENV must be set to that path."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
+        "VIRTUAL_ENV must be set to worktree .venv"
+    )
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when worktree has .venv"
+    )
+
+
+def test_sanitize_env_preserves_other_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Other environment variables must be preserved."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert env.get("PATH") == "/usr/bin:/bin", "PATH must be preserved"
+    assert env.get("HOME") == "/home/user", "HOME must be preserved"
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped"
+
+
+def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """launch_claude_worker must sanitize the environment before spawning the worker."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Seed parent env with leak variables
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    # Script that writes the actual env it received to a file
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-received.txt").write_text(
+                str(os.environ.get("VIRTUAL_ENV", "<unset>"))
+                + "|"
+                + str(os.environ.get("UV_PROJECT_ENVIRONMENT", "<unset>")),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        117,
+        "agent/issue-117-sanitize",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-received.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    received = probe_path.read_text(encoding="utf-8")
+    # Both variables must be absent (worktree has no .venv in this test)
+    assert received == "<unset>|<unset>", (
+        f"Both VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be absent, got: {received}"
+    )
+
+
+def test_launch_sanitizes_with_worktree_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When worktree has .venv, VIRTUAL_ENV must be set to that path."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Create a fake worktree with .venv
+    worktree_path = tmp_path / "worktrees" / "agent-issue-117-venv"
+    worktree_path.mkdir(parents=True)
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+
+    def fake_create_worktree(*args, **kwargs):
+        return WorktreeInfo(path=worktree_path, branch="agent/issue-117-venv", venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+
+    # Seed parent env with leak variables
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    # Script that writes the actual env it received to a file
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-received.txt").write_text(
+                str(os.environ.get("VIRTUAL_ENV", "<unset>"))
+                + "|"
+                + str(os.environ.get("UV_PROJECT_ENVIRONMENT", "<unset>")),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        117,
+        "agent/issue-117-venv",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-received.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    received = probe_path.read_text(encoding="utf-8")
+    # VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent
+    assert received == f"{str(worktree_venv)}|<unset>", (
+        f"VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent, got: {received}"
+    )
+
+
+def test_launch_preserves_worker_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit worker_env VIRTUAL_ENV override must survive sanitization."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Seed parent env with leak variables
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    # Script that writes the actual env it received to a file
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-received.txt").write_text(
+                str(os.environ.get("VIRTUAL_ENV", "<unset>"))
+                + "|"
+                + str(os.environ.get("UV_PROJECT_ENVIRONMENT", "<unset>"))
+                + "|"
+                + str(os.environ.get("CUSTOM_VAR", "<unset>")),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        117,
+        "agent/issue-117-override",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+        env={"VIRTUAL_ENV": "/custom/.venv", "CUSTOM_VAR": "custom-value"},
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-received.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    received = probe_path.read_text(encoding="utf-8")
+    # User-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped
+    assert received == "/custom/.venv|<unset>|custom-value", (
+        f"User VIRTUAL_ENV override must win, got: {received}"
     )
