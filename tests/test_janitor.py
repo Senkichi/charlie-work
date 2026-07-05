@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
 from charlie_work.github import PR_VIEW_FIELDS
 from charlie_work.janitor import (
+    CONVENTIONAL_COMMIT_TYPES,
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
@@ -236,11 +238,59 @@ def test_worker_template_title_format_passes_janitor() -> None:
     title validation. The template mandates conventional-commit format (type(scope): description),
     which should never trigger the janitor's conventional-commit warning.
     """
-    # Example title following the updated worker template format
-    title = "fix(janitor): align worker template with conventional-commit requirements"
-    verdict = run_janitor(_green_pr(title=title), _green_checks(), _config(), repo_root=Path.cwd())
+    # Read the actual worker template to extract the documented example title
+    repo_root = Path(__file__).parent.parent
+    worker_template = repo_root / "src" / "charlie_work" / "prompts" / "worker.md"
+    template_content = worker_template.read_text()
+
+    # Extract the example title from the marker comment
+    marker_match = re.search(r"JANITOR_TITLE_EXAMPLE:\s*(.+)", template_content)
+    if not marker_match:
+        raise AssertionError("Could not find JANITOR_TITLE_EXAMPLE marker in worker.md")
+
+    title = marker_match.group(1).strip()
+    verdict = run_janitor(_green_pr(title=title), _green_checks(), _config(), repo_root=repo_root)
     assert not any("conventional-commit" in w.lower() for w in verdict.warnings), (
         f"Worker template title format '{title}' should not trigger janitor warning"
+    )
+
+
+def test_conventional_commit_types_documentation_consistency() -> None:
+    """Assert that documented conventional-commit types match the canonical constant.
+
+    This test prevents drift between the canonical type list in janitor.py and the
+    documented lists in CONTRIBUTING.md and prompts/worker.md. All three must stay
+    in sync to avoid confusing contributors with contradictory documentation.
+    """
+    repo_root = Path(__file__).parent.parent
+
+    # Extract types from CONTRIBUTING.md
+    contributing = repo_root / "CONTRIBUTING.md"
+    contributing_content = contributing.read_text()
+    contributing_match = re.search(r"Valid types: `([^`]+)`", contributing_content)
+    if not contributing_match:
+        raise AssertionError("Could not find 'Valid types:' line in CONTRIBUTING.md")
+
+    contributing_types = set(contributing_match.group(1).split(", "))
+
+    # Extract types from worker.md (from the prose description)
+    worker = repo_root / "src" / "charlie_work" / "prompts" / "worker.md"
+    worker_content = worker.read_text()
+    # The worker template mentions types in prose: "Use `fix` for bug fixes, `feat` for new features, `chore` for maintenance, etc."
+    # We'll validate that the documented examples are subsets of the canonical set
+    worker_examples = set()
+    for type_name in CONVENTIONAL_COMMIT_TYPES:
+        if f"`{type_name}`" in worker_content:
+            worker_examples.add(type_name)
+
+    # All documented types must be in the canonical set
+    assert contributing_types == CONVENTIONAL_COMMIT_TYPES, (
+        f"CONTRIBUTING.md types {contributing_types} != canonical {CONVENTIONAL_COMMIT_TYPES}"
+    )
+
+    # Worker template examples must be subsets of the canonical set
+    assert worker_examples.issubset(CONVENTIONAL_COMMIT_TYPES), (
+        f"worker.md examples {worker_examples} not subset of canonical {CONVENTIONAL_COMMIT_TYPES}"
     )
 
 

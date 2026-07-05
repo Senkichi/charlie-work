@@ -35,7 +35,15 @@ _TESTS_OR_RATIONALE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-_CONVENTIONAL_COMMIT_RE = re.compile(r"^(feat|fix|refactor|docs|test|chore|perf|ci)(\(|:|!)")
+# Single source of truth for conventional-commit types.
+# This tuple must match the documented types in CONTRIBUTING.md and prompts/worker.md.
+CONVENTIONAL_COMMIT_TYPES = frozenset(
+    {"feat", "fix", "refactor", "docs", "test", "chore", "perf", "ci"}
+)
+
+_CONVENTIONAL_COMMIT_RE = re.compile(
+    r"^(" + "|".join(sorted(CONVENTIONAL_COMMIT_TYPES)) + r")(\(|:|!)"
+)
 
 # Oversized-diff warning threshold: additions + deletions above this line
 # count flags the PR as a warning (not a block) for reviewer awareness.
