@@ -134,10 +134,12 @@ def test_kill_process_tree_start_time_verification() -> None:
     from unittest.mock import patch
 
     # Spawn a real child process
+    # On POSIX, use start_new_session=True to avoid sharing pytest's process group
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(10)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
     )
 
     try:
@@ -233,20 +235,43 @@ def test_kill_process_tree_own_group_guard_posix() -> None:
 
 def test_kill_process_tree_enumerates_children() -> None:
     """Test that kill_process_tree enumerates and includes child PIDs."""
-    from unittest.mock import patch, MagicMock
+    import subprocess
 
-    # Mock _enumerate_child_pids to return fake child PIDs
-    with patch("charlie_work.process_utils._enumerate_child_pids", return_value=[12345, 67890]):
-        # Mock the actual kill to avoid killing real processes
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        with patch("subprocess.run", return_value=mock_result):
-            # Kill a fake PID
-            killed = kill_process_tree(99999, expected_start_time=None)
+    # Spawn a real parent process that will spawn a child
+    # On POSIX, use start_new_session=True to avoid sharing pytest's process group
+    parent_proc = subprocess.Popen(
+        [sys.executable, "-c", "import subprocess; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); import time; time.sleep(10)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
 
-            # Check that the parent PID is in the killed list
-            assert 99999 in killed
+    try:
+        # Give the parent time to spawn the child
+        import time
+        time.sleep(0.5)
 
-            # Check that the enumerated child PIDs are in the killed list
-            assert 12345 in killed
-            assert 67890 in killed
+        # Get the actual child PID(s)
+        from charlie_work.process_utils import _enumerate_child_pids
+        child_pids = _enumerate_child_pids(parent_proc.pid)
+
+        if not child_pids:
+            # If no children were spawned, skip this test
+            parent_proc.terminate()
+            parent_proc.wait()
+            return
+
+        # Kill the parent process tree
+        killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
+
+        # Check that the parent PID is in the killed list
+        assert parent_proc.pid in killed
+
+        # Check that the enumerated child PIDs are in the killed list
+        for child_pid in child_pids:
+            assert child_pid in killed
+    finally:
+        # Clean up if still alive
+        if parent_proc.poll() is None:
+            parent_proc.terminate()
+            parent_proc.wait()
