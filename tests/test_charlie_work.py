@@ -983,6 +983,7 @@ class FakeGitHub:
         self.deleted_branches: list[str] = []
         self.delete_branch_ok = True
         self.update_branch_ok = True
+        self.pr_head_shas: dict[int, str] = {}
 
     def issue_list(self, ready_label: str):
         # Honor the label filter: return only issues with the ready label
@@ -1006,7 +1007,11 @@ class FakeGitHub:
         # Return the PR matching the requested number
         for pr in self.prs:
             if pr["number"] == number:
-                return pr
+                # Return a copy with the current head SHA (if overridden)
+                pr_copy = dict(pr)
+                if number in self.pr_head_shas:
+                    pr_copy["headRefOid"] = self.pr_head_shas[number]
+                return pr_copy
         raise ValueError(f"PR {number} not found")
 
     def pr_checks(self, number: int):
@@ -2363,18 +2368,19 @@ def test_intake_isolates_per_issue_github_error(tmp_path: Path) -> None:
 
 
 def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None:
-    """A GitHubError during the review_started label transition must still
-    leave the review packet persisted in state and report label_error."""
-    from charlie_work.github import GitHubError as _GitHubError
+    """Issue #135: A PARTIAL_FAILURE during review_started label transition must
+    leave the review packet persisted in state and report structured label_error."""
+    from charlie_work.labels import TransitionOutcome
 
     config = OrchestratorConfig()
     reviewing_label = config.labels.reviewing
 
     class LabelFailReviewGitHub(FakeGitHub):
-        def add_issue_label(self, number: int, label: str) -> None:
+        def add_issue_label(self, number: int, label: str) -> bool:
             if label == reviewing_label:
-                raise _GitHubError("label transition failed")
-            super().add_issue_label(number, label)
+                # Return False to simulate add failure (error-as-value)
+                return False
+            return super().add_issue_label(number, label)
 
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = LabelFailReviewGitHub()
@@ -2383,10 +2389,15 @@ def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None
     result = app.review(456)
 
     assert result.ok is True
-    assert result.data["label_error"] == "label transition failed"
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "review_started"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    # PR #456 is linked to issue #123 in FakeGitHub
+    assert (123, reviewing_label) in label_error["add_failures"]
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "reviewing"
-    assert state["prs"]["456"]["label_error"] == "label transition failed"
+    assert state["prs"]["456"]["label_error"]["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
     assert Path(state["prs"]["456"]["decision_path"]).exists()
 
 
@@ -3124,6 +3135,115 @@ def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
 
 
+def test_record_review_transition_failure_recorded(tmp_path: Path) -> None:
+    """Issue #135: PARTIAL_FAILURE during record_review transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig()
+
+    class LabelFailGitHub(FakeGitHub):
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate remove failure (error-as-value)
+            return False
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "approved", summary="lgtm")
+
+    assert result.ok is True
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "review_approved"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    assert len(label_error["remove_failures"]) > 0
+
+
+def test_record_review_request_changes_transition_failure_recorded(tmp_path: Path) -> None:
+    """Issue #135: PARTIAL_FAILURE during record_review request_changes transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig()
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "request_changes", summary="fix it")
+
+    assert result.ok is True
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "rework_requested"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    assert len(label_error["add_failures"]) > 0
+
+
+def test_record_review_blocked_transition_failure_recorded(tmp_path: Path) -> None:
+    """Issue #135: PARTIAL_FAILURE during record_review blocked transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig()
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(456, "blocked", summary="security issue")
+
+    assert result.ok is True
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "blocked"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    assert len(label_error["add_failures"]) > 0
+
+
+def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> None:
+    """Issue #135: PARTIAL_FAILURE during merge_ready head-moved transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig()
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First approve the PR to set reviewed_head_sha
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Then simulate head moved by updating the PR head SHA
+    fake_gh.pr_head_shas[456] = "sha-different"
+
+    # Now merge_ready should trigger head-moved re-review path
+    result = app.merge_ready(456)
+
+    # Head-moved returns ok=False (cannot merge), but label_error is still recorded
+    assert result.ok is False
+    assert result.data["head_moved"] is True
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "review_started"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    assert len(label_error["add_failures"]) > 0
+
+
 def test_review_started_clears_needs_rework() -> None:
     # Re-review after a rework must not stack reviewing on top of needs-rework.
     from charlie_work.labels import transition, TransitionOutcome
@@ -3251,6 +3371,64 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
     assert (123, "agent:needs-rework") in fake_gh.labels_removed
 
 
+def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
+    """Issue #135: PARTIAL_FAILURE during rework_dispatched transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkLabelFailGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
+
+    # Initialize state with the issue in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkLabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert 123 in result.data["label_errors"]
+    state = load_state(paths.state_file)
+    label_error = state["issues"]["123"]["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "rework_dispatched"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+
+
 def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> None:
     """When all candidates lack rework-prompt.md, dispatch_pending claims must be released."""
     config = OrchestratorConfig(
@@ -3314,11 +3492,13 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
 
 
 def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Path) -> None:
-    from charlie_work.github import GitHubError as _GitHubError
+    """Issue #135: PARTIAL_FAILURE during merged transition must be recorded."""
+    from charlie_work.labels import TransitionOutcome
 
     class LabelFailGitHub(FakeGitHub):
-        def add_issue_label(self, number: int, label: str) -> None:
-            raise _GitHubError("rate limited")
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
 
     config = OrchestratorConfig(auto_merge=_approved_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -3336,7 +3516,10 @@ def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Pa
     result = app.merge_ready(456, merge=True)
 
     assert result.data["merged"] is True
-    assert result.data["label_error"] == "rate limited"
+    label_error = result.data["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "merged"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
 
 
@@ -3543,8 +3726,9 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
 
 
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
+    """Issue #135: PARTIAL_FAILURE during dispatch label transition must be recorded."""
     from charlie_work import devin_shell
-    from charlie_work.github import GitHubError as _GitHubError
+    from charlie_work.labels import TransitionOutcome
     from charlie_work.worktree import WorktreeInfo
 
     wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
@@ -3556,8 +3740,9 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
 
     class LabelFailGitHub(FakeGitHub):
-        def add_issue_label(self, number: int, label: str) -> None:
-            raise _GitHubError("edit failed")
+        def add_issue_label(self, number: int, label: str) -> bool:
+            # Return False to simulate add failure (error-as-value)
+            return False
 
     config = OrchestratorConfig(
         devin=DevinConfig(
@@ -3575,7 +3760,10 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
     assert 123 in result.data["label_errors"]
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "dispatched"
-    assert "label_error" in state["issues"]["123"]
+    label_error = state["issues"]["123"]["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "dispatched"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
 
 
 def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:
@@ -4363,6 +4551,7 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
 
     app.record_review(456, "approved", summary="lgtm")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+    fake_gh.pr_head_shas[456] = "sha-new-head"
 
     result = app.merge_ready(456, merge=True)
 
@@ -4535,6 +4724,7 @@ def test_loop_re_reviews_when_head_moved_after_approval(tmp_path: Path) -> None:
     )
     # New commit pushed after approval.
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+    fake_gh.pr_head_shas[456] = "sha-new-head"
 
     result = app.loop(limit=0)
 
@@ -6626,6 +6816,7 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
 
     # Advance the PR head
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
 
     # Call review again with the advanced head
     result = app.review(456)
