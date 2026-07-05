@@ -523,8 +523,17 @@ class OrchestratorApp:
                 by_number = {int(issue["number"]): issue for issue in candidates}
                 selected = [by_number[number] for number in wanted if number in by_number]
                 skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+                # Apply concurrency governor cap to explicit issue selection
+                if len(selected) > dispatch_limit:
+                    deferred_by_concurrency = [
+                        int(issue["number"]) for issue in selected[dispatch_limit:]
+                    ]
+                    selected = selected[:dispatch_limit]
+                else:
+                    deferred_by_concurrency = []
             else:
                 selected = candidates[:dispatch_limit]
+                deferred_by_concurrency = []
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
@@ -559,6 +568,7 @@ class OrchestratorApp:
                 "attempted_count": len(session_requests),
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
+                "deferred_by_concurrency": deferred_by_concurrency,
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
@@ -657,8 +667,17 @@ class OrchestratorApp:
                 by_number = {int(issue["number"]): issue for issue in candidates}
                 selected = [by_number[number] for number in wanted if number in by_number]
                 skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+                # Apply concurrency governor cap to explicit issue selection
+                if len(selected) > dispatch_limit:
+                    deferred_by_concurrency = [
+                        int(issue["number"]) for issue in selected[dispatch_limit:]
+                    ]
+                    selected = selected[:dispatch_limit]
+                else:
+                    deferred_by_concurrency = []
             else:
                 selected = candidates[:dispatch_limit]
+                deferred_by_concurrency = []
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Capture previous entries for recovery detection BEFORE overwriting status
             # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
@@ -769,6 +788,7 @@ class OrchestratorApp:
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
+                    "deferred_by_concurrency": deferred_by_concurrency,
                 },
             )
             save_state(self.paths.state_file, state)
@@ -785,6 +805,7 @@ class OrchestratorApp:
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
+            "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -1727,11 +1748,24 @@ class OrchestratorApp:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
             selected = [by_number[number] for number in wanted if number in by_number]
+            # Apply concurrency governor cap to explicit issue selection
+            if len(selected) > rework_limit:
+                deferred_by_concurrency = [
+                    int(issue["number"]) for issue in selected[rework_limit:]
+                ]
+                selected = selected[:rework_limit]
+            else:
+                deferred_by_concurrency = []
         else:
             selected = candidates[:rework_limit]
+            deferred_by_concurrency = []
 
         if not selected:
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -1778,7 +1812,11 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         if not selected_issue_numbers:
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -1839,11 +1877,16 @@ class OrchestratorApp:
                         "issue_numbers": [],
                         "failed_issue_numbers": [],
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
+                        "deferred_by_concurrency": deferred_by_concurrency,
                         "label_errors": [],
                     },
                 )
                 save_state(self.paths.state_file, state)
-            data = {"adapter": self.config.devin.adapter, "selected_count": 0}
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": 0,
+                "deferred_by_concurrency": deferred_by_concurrency,
+            }
             if gov.clamped:
                 data.update(gov.report_fields())
             return CommandResult(
@@ -1924,6 +1967,7 @@ class OrchestratorApp:
                     "issue_numbers": sorted(successful_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
+                    "deferred_by_concurrency": deferred_by_concurrency,
                     "label_errors": sorted(label_errors),
                 },
             )
@@ -1939,6 +1983,7 @@ class OrchestratorApp:
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
