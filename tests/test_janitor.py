@@ -217,6 +217,8 @@ def test_non_conventional_title_warns() -> None:
 
     assert verdict.ok is True
     assert any("conventional-commit" in w.lower() for w in verdict.warnings)
+    # Verify the warning references the template (single source of truth)
+    assert any("prompts/worker.md" in w for w in verdict.warnings)
 
 
 def test_conventional_title_variants_do_not_warn() -> None:
@@ -225,6 +227,23 @@ def test_conventional_title_variants_do_not_warn() -> None:
             _green_pr(title=title), _green_checks(), _config(), repo_root=Path.cwd()
         )
         assert not any("conventional-commit" in w.lower() for w in verdict.warnings), title
+
+
+def test_worker_template_title_format_passes_janitor() -> None:
+    """Assert that the worker template's mandated PR title format passes janitor checks.
+
+    This test prevents drift between prompts/worker.md PR requirements and janitor.py's
+    title validation. The template mandates conventional-commit format (type(scope): description),
+    which should never trigger the janitor's conventional-commit warning.
+    """
+    # Example title following the updated worker template format
+    title = "fix(janitor): align worker template with conventional-commit requirements"
+    verdict = run_janitor(
+        _green_pr(title=title), _green_checks(), _config(), repo_root=Path.cwd()
+    )
+    assert not any("conventional-commit" in w.lower() for w in verdict.warnings), (
+        f"Worker template title format '{title}' should not trigger janitor warning"
+    )
 
 
 def test_oversized_diff_warns() -> None:

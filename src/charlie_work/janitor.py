@@ -175,7 +175,9 @@ def _check_title_conventional(pr: dict[str, Any], warnings: list[str]) -> None:
         return
     title = str(pr.get("title") or "")
     if title and not _CONVENTIONAL_COMMIT_RE.match(title):
-        warnings.append("PR title is not conventional-commit shaped")
+        warnings.append(
+            "PR title is not conventional-commit shaped (see prompts/worker.md PR requirements)"
+        )
 
 
 def _check_diff_size(pr: dict[str, Any], warnings: list[str]) -> None:

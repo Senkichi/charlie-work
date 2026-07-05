@@ -58,7 +58,10 @@ The following skills are available to help you complete this task:
 
 ## PR requirements
 
-- Title format: `Fix #$issue_number: <short title>`.
+- Title format: Conventional-Commits format (`type(scope): description`).
+  - Use `fix` for bug fixes, `feat` for new features, `chore` for maintenance, etc.
+  - The issue link goes in the body only (see below), not the title.
+  - If the issue title has a conventional-commit prefix, mirror it in the PR title.
 - Body must include `Closes #$issue_number`.
 - Fill out `.github/pull_request_template.md`.
 - Include exact commands run and results.
