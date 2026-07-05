@@ -351,6 +351,111 @@ def test_launch_devin_session_passes_rework_flag(
     assert rework_calls == [False, True]
 
 
+def test_launch_devin_session_fetch_failure_yields_error_record_not_exception(
+    tmp_path: Path,
+) -> None:
+    """End-to-end test: real fetch failure inside create_worktree must return error record.
+
+    This test forces a real git fetch failure by creating a repo with a broken origin URL,
+    then calling launch_devin_session with base_ref that triggers a fetch. The adapter must
+    catch the RuntimeError from create_worktree and return an error record, not raise.
+
+    This is a mutation gate: if RuntimeError is removed from the except tuple in
+    launch_devin_session, this test will fail with an uncaught exception.
+    """
+    # Create a real git repo with an origin remote
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    (remote_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Clone the remote repo to create a local repo with origin configured
+    repo_root = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(repo_root)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+
+    # Break the origin remote to simulate a fetch failure
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "file:///nonexistent/path"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Call launch_devin_session with base_ref that triggers a fetch
+    # Empty string resolves to origin/main, which will trigger the fetch in create_worktree
+    record = launch_devin_session(
+        142,
+        "agent/issue-142-fetch-failure",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        base_ref="",  # Triggers fetch of origin/main
+    )
+
+    # The adapter must catch the RuntimeError and return an error record
+    assert record.pid is None
+    assert record.error is not None
+    assert "worktree creation failed" in record.error
+    assert record.worktree_path == ""
+
+    # Verify the sidecar was written with the error
+    sidecar_path = sessions_dir / "issue-142.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["pid"] is None
+    assert payload["error"] is not None
+    assert "worktree creation failed" in payload["error"]
+
+
 def test_read_session_records_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
