@@ -16,7 +16,14 @@ from .cross_family import (
     report_body_is_valid,
     run_cross_family_review,
 )
-from .github import GitHub, GitHubError, label_names, linked_issue_number
+from .github import (
+    GitHub,
+    GitHubError,
+    get_github_issue_dependencies,
+    label_names,
+    linked_issue_number,
+    parse_blockers,
+)
 from .janitor import check_operator_containment, run_janitor
 from .labels import transition
 from .paths import RuntimePaths
@@ -269,6 +276,20 @@ class OrchestratorApp:
             issue for issue in issues if label_names(issue) & self.config.labels.active
         ]
         available_issues = [issue for issue in issues if self._is_dispatchable(issue)]
+
+        # Check for blocked issues (dependency gate)
+        blocked_issues: dict[int, list[int]] = {}
+        for issue in available_issues:
+            issue_number = int(issue["number"])
+            declared_blockers, open_blockers = self._get_open_blockers(issue)
+            if open_blockers:
+                blocked_issues[issue_number] = declared_blockers
+
+        # Filter blocked issues from available count
+        truly_available = [
+            issue for issue in available_issues if int(issue["number"]) not in blocked_issues
+        ]
+
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -281,7 +302,7 @@ class OrchestratorApp:
         ]
         data = {
             "ready_issue_count": len(issues),
-            "available_issue_count": len(available_issues),
+            "available_issue_count": len(truly_available),
             "active_issue_count": len(active_issues),
             "open_linked_pr_count": len(linked_prs),
             "state_file": str(self.paths.state_file),
@@ -289,6 +310,10 @@ class OrchestratorApp:
             "issues": [self._summarize_issue(issue) for issue in issues],
             "prs": linked_prs,
             "last_generated_at": state.get("generated_at"),
+            "blocked": [
+                {"issue": issue_number, "blockers": blockers}
+                for issue_number, blockers in sorted(blocked_issues.items())
+            ],
         }
         return CommandResult(True, "status complete", data)
 
@@ -435,29 +460,29 @@ class OrchestratorApp:
         if self.dry_run:
             selected_issue_numbers: list[int] = []
             skipped_issue_numbers: list[int] = []
+            # Gather network results outside the lock (matching intake pattern)
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_worker_issues = _issues_with_live_workers(sessions_dir)
+            prs = self.gh.pr_list()
+            pr_by_issue = {}
+            for pr in prs:
+                issue_number = linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=self.config.dispatch.branch_prefix,
+                )
+                if issue_number is not None:
+                    # If multiple PRs link to the same issue, keep the lowest PR number
+                    if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                        pr_by_issue[issue_number]["number"]
+                    ):
+                        pr_by_issue[issue_number] = pr
+
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 # Same dispatchability logic as the real dispatch, but read-only
                 # Issue #5: also check worker liveness for "dispatched" status
-                sessions_dir = self._resolve(self.config.devin.sessions_dir)
                 live_dispatched = set()
-                # Build open PR → issue map for the recovery condition
-                prs = self.gh.pr_list()
-                pr_by_issue = {}
-                for pr in prs:
-                    issue_number = linked_issue_number(
-                        pr,
-                        is_cross_repository=pr.get("isCrossRepository"),
-                        branch_prefix=self.config.dispatch.branch_prefix,
-                    )
-                    if issue_number is not None:
-                        # If multiple PRs link to the same issue, keep the lowest PR number
-                        if issue_number not in pr_by_issue or int(pr["number"]) < int(
-                            pr_by_issue[issue_number]["number"]
-                        ):
-                            pr_by_issue[issue_number] = pr
-
-                live_worker_issues = _issues_with_live_workers(sessions_dir)
                 for number, entry in state.get("issues", {}).items():
                     if not isinstance(entry, dict):
                         continue
@@ -478,14 +503,29 @@ class OrchestratorApp:
                     for issue in issues
                     if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
                 ]
-                if only_issues:
-                    wanted = parse_issue_numbers(only_issues)
-                    by_number = {int(issue["number"]): issue for issue in candidates}
-                    selected = [by_number[number] for number in wanted if number in by_number]
-                    skipped_issue_numbers = sorted(set(wanted) - set(by_number))
-                else:
-                    selected = candidates[:dispatch_limit]
-                selected_issue_numbers = [int(issue["number"]) for issue in selected]
+
+            # Apply dependency gate: skip issues with open blockers (dry-run)
+            # Done outside the lock to avoid holding it during GitHub API calls
+            blocked_issues: dict[int, list[int]] = {}
+            for issue in candidates:
+                issue_number = int(issue["number"])
+                declared_blockers, open_blockers = self._get_open_blockers(issue)
+                if open_blockers:
+                    blocked_issues[issue_number] = declared_blockers
+
+            # Filter out blocked issues from candidates
+            candidates = [
+                issue for issue in candidates if int(issue["number"]) not in blocked_issues
+            ]
+
+            if only_issues:
+                wanted = parse_issue_numbers(only_issues)
+                by_number = {int(issue["number"]): issue for issue in candidates}
+                selected = [by_number[number] for number in wanted if number in by_number]
+                skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+            else:
+                selected = candidates[:dispatch_limit]
+            selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
             session_requests: list[SessionRequest] = []
@@ -535,6 +575,24 @@ class OrchestratorApp:
         # First lock: claim issues by marking them as dispatch_pending
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
+        # Gather network results outside the lock (matching intake pattern)
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        live_worker_issues = _issues_with_live_workers(sessions_dir)
+        prs = self.gh.pr_list()
+        pr_by_issue = {}
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None:
+                # If multiple PRs link to the same issue, keep the lowest PR number
+                if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                    pr_by_issue[issue_number]["number"]
+                ):
+                    pr_by_issue[issue_number] = pr
+
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Defence-in-depth against double-dispatch: an issue whose state records
@@ -546,25 +604,7 @@ class OrchestratorApp:
             # Stale claims (crashed phase-2) are excluded to allow re-dispatch.
             # Issue #5: also check worker liveness for "dispatched" status to recover
             # from crashed workers before PR opens.
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
             live_dispatched = set()
-            # Build open PR → issue map for the recovery condition
-            prs = self.gh.pr_list()
-            pr_by_issue = {}
-            for pr in prs:
-                issue_number = linked_issue_number(
-                    pr,
-                    is_cross_repository=pr.get("isCrossRepository"),
-                    branch_prefix=self.config.dispatch.branch_prefix,
-                )
-                if issue_number is not None:
-                    # If multiple PRs link to the same issue, keep the lowest PR number
-                    if issue_number not in pr_by_issue or int(pr["number"]) < int(
-                        pr_by_issue[issue_number]["number"]
-                    ):
-                        pr_by_issue[issue_number] = pr
-
-            live_worker_issues = _issues_with_live_workers(sessions_dir)
             for number, entry in state.get("issues", {}).items():
                 if not isinstance(entry, dict):
                     continue
@@ -585,6 +625,33 @@ class OrchestratorApp:
                 for issue in issues
                 if self._is_dispatchable(issue) and int(issue["number"]) not in live_dispatched
             ]
+
+        # Apply dependency gate: skip issues with open blockers
+        # Done outside the lock to avoid holding it during GitHub API calls
+        blocked_issues: dict[int, list[int]] = {}
+        for issue in candidates:
+            issue_number = int(issue["number"])
+            declared_blockers, open_blockers = self._get_open_blockers(issue)
+            if open_blockers:
+                blocked_issues[issue_number] = declared_blockers
+
+        # Filter out blocked issues from candidates
+        candidates = [issue for issue in candidates if int(issue["number"]) not in blocked_issues]
+
+        # Re-enter lock to log events and claim issues
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+
+            # Log dispatch_skip_blocked events for blocked issues
+            if blocked_issues:
+                for issue_number, blockers in blocked_issues.items():
+                    state = append_event(
+                        state,
+                        "dispatch_skip_blocked",
+                        {"issue": issue_number, "blockers": blockers},
+                    )
+                save_state(self.paths.state_file, state)
+
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in candidates}
@@ -1896,6 +1963,51 @@ class OrchestratorApp:
         if names & self.config.labels.terminal:
             return False
         return not names & self.config.labels.active
+
+    def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
+        """Check if an issue has any open blocker issues.
+
+        Parses the issue body for blocker declarations and checks GitHub's
+        native issue dependencies. Returns both declared blockers and open blockers.
+
+        Args:
+            issue: The issue dict from GitHub API
+
+        Returns:
+            Tuple of (declared_blockers, open_blockers). Both are lists of issue numbers.
+            declared_blockers includes all blockers mentioned in the issue body or
+            GitHub dependencies. open_blockers is the subset that are currently open.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        issue_number = int(issue["number"])
+        body = issue.get("body", "")
+
+        # Parse blockers from issue body
+        body_blockers = parse_blockers(body)
+
+        # Get GitHub native dependencies
+        gh_blockers = get_github_issue_dependencies(self.gh, issue_number)
+
+        # Combine and deduplicate
+        all_blockers = sorted(set(body_blockers + gh_blockers))
+
+        if not all_blockers:
+            return [], []
+
+        # Check which blockers are still open
+        open_blockers = self.gh.are_issues_open(all_blockers)
+
+        # Filter out self-references (malformed markers like "Blocked by #123" on issue #123)
+        if issue_number in open_blockers:
+            logger.warning(
+                f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
+            )
+            open_blockers.discard(issue_number)
+            all_blockers.remove(issue_number)
+
+        return sorted(all_blockers), sorted(open_blockers)
 
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
