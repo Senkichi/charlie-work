@@ -15,13 +15,14 @@ failure is captured as a stub report and a not-ok result instead.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from .env_sanitize import sanitize_env
 
 # Signature-compatible with subprocess.run for the happy path; tests inject a fake.
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -106,33 +107,6 @@ class CrossFamilyResult:
     reused: bool = False
 
 
-def _sanitize_env(repo_root: Path) -> dict[str, str]:
-    """Return a sanitized environment for cross-family review subprocesses.
-
-    Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
-    to prevent the orchestrator's venv from leaking into worker sessions. If the
-    repo_root contains a .venv directory, VIRTUAL_ENV is set to that path instead
-    of being dropped.
-
-    This is a defense-in-depth measure: cross-family reviews should resolve their
-    own environment, not inherit the orchestrator's.
-    """
-    env = dict(os.environ)
-    repo_venv = repo_root / ".venv"
-
-    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
-    env.pop("UV_PROJECT_ENVIRONMENT", None)
-
-    if repo_venv.is_dir():
-        # Repo has its own venv — use it
-        env["VIRTUAL_ENV"] = str(repo_venv)
-    else:
-        # No repo venv — drop VIRTUAL_ENV to prevent leaks
-        env.pop("VIRTUAL_ENV", None)
-
-    return env
-
-
 def render_command(command: Sequence[str] | str, values: dict[str, str]) -> list[str] | str:
     """Render the configured command template with ``{name}`` placeholders.
 
@@ -182,7 +156,7 @@ def run_cross_family_review(
 
     rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
-    env = _sanitize_env(repo_root)
+    env = sanitize_env(repo_root)
     stdout = ""
     for attempt in range(2):
         try:
@@ -275,5 +249,4 @@ __all__ = [
     "run_cross_family_review",
     "extract_report_body",
     "report_body_is_valid",
-    "_sanitize_env",
 ]
