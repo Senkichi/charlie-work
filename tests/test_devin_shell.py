@@ -61,6 +61,7 @@ def _install_fake_create_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -70,6 +71,8 @@ def _install_fake_create_worktree(
                     "repo_root": repo_root,
                     "branch": branch,
                     "worktrees_dir": worktrees_dir,
+                    "venv_source": venv_source,
+                    "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
                 }
@@ -1487,3 +1490,113 @@ def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for venv_source and worker_env parity with claude-code
+# ---------------------------------------------------------------------------
+
+
+def test_launch_devin_session_passes_venv_source_to_create_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """venv_source should be passed through to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
+        123,
+        "agent/issue-123-venv",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        venv_source=venv_source,
+        command_template=(sys.executable, "-c", "pass"),
+    )
+
+    assert len(worktree_calls) == 1
+    assert worktree_calls[0]["venv_source"] == venv_source
+
+
+def test_launch_devin_session_injects_worker_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker_env should be merged into the process environment."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Script that writes an env var to a file
+    env_script = tmp_path / "env_probe.py"
+    env_script.write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "Path('env-probe.txt').write_text(\n"
+        "    os.environ.get('TEST_VAR', '<unset>')\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    record = launch_devin_session(
+        99,
+        "agent/issue-99-env",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+        worker_env={"TEST_VAR": "test-value"},
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    # Wait for the subprocess to complete
+    deadline = time.time() + 10
+    probe_path = Path(record.worktree_path) / "env-probe.txt"
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    assert probe_path.read_text(encoding="utf-8") == "test-value"
+
+
+def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """materialize_dirs should be passed through to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
+        456,
+        "agent/issue-456-materialize",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        materialize_dirs=(".devin", ".config"),
+        command_template=(sys.executable, "-c", "pass"),
+    )
+
+    assert len(worktree_calls) == 1
+    assert worktree_calls[0]["materialize_dirs"] == (".devin", ".config")

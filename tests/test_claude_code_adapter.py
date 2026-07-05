@@ -39,6 +39,7 @@ def _install_fake_create_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -50,6 +51,7 @@ def _install_fake_create_worktree(
                     "base_ref": base_ref,
                     "worktrees_dir": worktrees_dir,
                     "venv_source": venv_source,
+                    "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
                 }
@@ -295,6 +297,7 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -964,6 +967,7 @@ def test_launch_claude_worker_with_venv_source_junction(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -974,6 +978,7 @@ def test_launch_claude_worker_with_venv_source_junction(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -1016,6 +1021,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -1026,6 +1032,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -1066,6 +1073,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -1076,6 +1084,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -1122,6 +1131,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -1132,6 +1142,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }

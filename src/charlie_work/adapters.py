@@ -36,12 +36,16 @@ class AdapterSettings:
     claude_command: tuple[str, ...] = ()
     worktrees_dir: Path | None = None
     venv_source: Path | None = None
-    # Extra env merged over the orchestrator's env in each claude-code worker
-    # process (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound local test
-    # parallelism). Empty means no overrides.
+    # Extra env merged over the orchestrator's env in each worker process
+    # (claude-code and devin-shell). Primary use: PYTEST_XDIST_AUTO_NUM_WORKERS
+    # to bound local test parallelism. Empty means no overrides.
     worker_env: dict[str, str] = field(default_factory=dict)
     # devin-shell worker model; empty string means CLI default.
     worker_model: str = ""
+    # Repo-root-relative paths copied into each worktree after creation
+    # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
+    # skip-if-tracked (tracked paths are already present).
+    materialize_dirs: tuple[str, ...] = ()
     # dry_run: if True, adapters return synthetic results without launching
     # real worker processes or mutating worktrees.
     dry_run: bool = False
@@ -214,6 +218,9 @@ def _run_devin_shell_adapter(
             worktrees_dir=settings.worktrees_dir,
             command_template=settings.shell_command or DEFAULT_COMMAND_TEMPLATE,
             worker_model=settings.worker_model,
+            venv_source=settings.venv_source,
+            worker_env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
             rework=request.rework,
             recovery=request.recovery,
             base_ref=settings.base_ref,
@@ -264,6 +271,7 @@ def _run_claude_code_adapter(
         worktrees_dir=settings.worktrees_dir,
         venv_source=settings.venv_source,
         env=settings.worker_env,
+        materialize_dirs=settings.materialize_dirs,
         rework=request.rework,
         recovery=request.recovery,
         base_ref=settings.base_ref,
