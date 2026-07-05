@@ -18,7 +18,9 @@ REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 def _init_repo(repo_root: Path) -> None:
     """Initialize a git repo with a single commit."""
     repo_root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"], cwd=repo_root, check=True, capture_output=True
+    )
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"],
         cwd=repo_root,
@@ -50,6 +52,7 @@ def _green_pr(**overrides) -> dict:
         "url": "https://example.test/pull/456",
         "headRefName": "agent/issue-123-fix-search",
         "headRefOid": "abc123",
+        "baseRefName": "main",
         "body": "Closes #123.\n\nTests: added unit tests for the search path.",
         "isDraft": False,
         "mergeable": "MERGEABLE",
@@ -688,7 +691,7 @@ def test_no_op_rework_skips_when_no_current_sha() -> None:
 
 
 def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) -> None:
-    """Merge commits that bring in non-merge commits clear the no-op gate (real git path)."""
+    """Merge commits that bring in non-merge commits PLUS real worker commits clear the no-op gate (real git path)."""
     # Set up a local "remote" repo
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -775,6 +778,135 @@ def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) ->
         check=True,
         capture_output=True,
     )
+
+    # Add a REAL worker commit (non-merge) on the agent branch
+    (local_repo / "worker-change.txt").write_text("real worker change")
+    subprocess.run(["git", "add", "."], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "real worker commit"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    final_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Push the merge commit and the worker commit
+    subprocess.run(
+        ["git", "push", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Test with a PR that has advanced by a merge commit AND a real worker commit
+    pr = _green_pr(headRefOid=final_sha, headRefName="agent/issue-123-test")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": initial_sha,
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
+
+    # Should PASS (the merge brings in a non-merge commit, AND there's a real worker commit)
+    assert verdict.ok is True
+    # Should NOT have a degradation warning (git succeeded, real path exercised)
+    assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_merge_only_fails_gate(tmp_path: Path) -> None:
+    """Merge-only advances (no real worker commits) fail the no-op gate (real git path)."""
+    # Set up a local "remote" repo
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    # Create initial commit on main
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    initial_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Clone the remote repo to create a local repo
+    local_repo = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create agent branch and push it at the reviewed head
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Advance the branch with ONLY a merge commit (no real worker commits)
+    # Create a commit on main in the remote
+    subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
+    (remote_repo / "main-change.txt").write_text("main branch change")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "main branch change"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # In the local repo, fetch and merge main into agent branch (NO worker commit)
+    subprocess.run(
+        ["git", "checkout", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "fetch", "origin"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "origin/main"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
     merge_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=local_repo,
@@ -783,7 +915,7 @@ def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) ->
         text=True,
     ).stdout.strip()
 
-    # Push the merge commit
+    # Push the merge commit (no worker commit)
     subprocess.run(
         ["git", "push", "origin", "agent/issue-123-test"],
         cwd=local_repo,
@@ -791,7 +923,7 @@ def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) ->
         capture_output=True,
     )
 
-    # Test with a PR that has advanced by a merge commit
+    # Test with a PR that has advanced ONLY by a merge commit
     pr = _green_pr(headRefOid=merge_sha, headRefName="agent/issue-123-test")
     pr_state = {
         "decision": "request_changes",
@@ -800,13 +932,12 @@ def test_no_op_rework_merge_with_non_merge_commit_clears_gate(tmp_path: Path) ->
 
     verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
 
-    # Should PASS (the merge brings in a non-merge commit, so it's real work)
-    assert verdict.ok is True
+    # Should FAIL (merge-only advance is a no-op rework)
+    assert verdict.ok is False
+    # Should have the merge-only failure message
+    assert any("only by merge commits" in f for f in verdict.failures)
     # Should NOT have a degradation warning (git succeeded, real path exercised)
     assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
-
-
-
 
 
 def test_no_op_rework_real_commit_clears_gate(tmp_path: Path) -> None:

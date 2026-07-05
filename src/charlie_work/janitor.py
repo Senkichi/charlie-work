@@ -50,7 +50,8 @@ JANITOR_PR_KEYS = frozenset(
         "state",  # _check_state
         "mergeable",  # _check_mergeable
         "isCrossRepository",  # _check_linked_issue, _check_base_movement
-        "headRefName",  # _check_linked_issue, _check_base_movement
+        "headRefName",  # _check_linked_issue, _check_base_movement, _check_no_op_rework
+        "baseRefName",  # _check_no_op_rework
         "body",  # _check_body
         "title",  # _check_title_conventional
         "additions",  # _check_diff_size
@@ -269,23 +270,38 @@ def _check_no_op_rework(
     # Criterion 2: detect merge-only advances (e.g., from ship-it's update_open_prs)
     # Fetch the PR head ref and check if any non-merge commits exist since the verdict
     head_ref = pr.get("headRefName")
+    base_ref = pr.get("baseRefName")
     if not head_ref:
         # Can't check merge-only case without ref name; fall back to SHA equality check
         # (which already passed above, so no failure here)
         return
 
     try:
-        # Fetch the PR head ref from origin
+        # Fetch both the PR head ref and base ref from origin
+        # We need the base ref to exclude base-reachable commits from the count
+        fetch_refs = [head_ref]
+        if base_ref:
+            fetch_refs.append(base_ref)
         subprocess.run(
-            ["git", "fetch", "origin", head_ref],
+            ["git", "fetch", "origin"] + fetch_refs,
             cwd=repo_root,
             capture_output=True,
             check=True,
             text=True,
         )
-        # Count non-merge commits since the reviewed head
+        # Count non-merge commits since the reviewed head, excluding base-reachable commits
+        # The ^ syntax excludes commits reachable from the given refs
+        # This counts commits that are:
+        # - Not merge commits (--no-merges)
+        # - Not in reviewed_head_sha (^reviewed_head_sha)
+        # - Not in origin/baseRefName (^origin/baseRefName if base_ref exists)
+        # - Reachable from current_head_sha (implicit in the range syntax)
+        rev_list_args = ["git", "rev-list", "--no-merges", "--count", current_head_sha]
+        rev_list_args.append(f"^{reviewed_head_sha}")
+        if base_ref:
+            rev_list_args.append(f"^origin/{base_ref}")
         result = subprocess.run(
-            ["git", "rev-list", "--no-merges", "--count", f"{reviewed_head_sha}..FETCH_HEAD"],
+            rev_list_args,
             cwd=repo_root,
             capture_output=True,
             check=True,
