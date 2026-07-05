@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -286,7 +287,12 @@ def launch_claude_worker(
     # worker's local `pytest -n auto` so a fleet of them doesn't oversubscribe
     # the shared host (see docs/RUNBOOK.md "Local host saturation ceiling
     # (claude-code adapter)"). `env` is a validated mapping (see config.py).
-    worker_env = {**os.environ, **{str(k): str(v) for k, v in (env or {}).items()}}
+    # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
+    # leaks from the orchestrator, then merge user-provided overrides on top.
+    worker_env = {
+        **sanitize_env(worktree.path),
+        **{str(k): str(v) for k, v in (env or {}).items()},
+    }
 
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
