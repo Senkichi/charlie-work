@@ -623,6 +623,10 @@ class OrchestratorApp:
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
+                "blocked": [
+                    {"issue": issue_number, "blockers": blockers}
+                    for issue_number, blockers in sorted(blocked_issues.items())
+                ],
             }
             if gov.clamped:
                 data.update(gov.report_fields())

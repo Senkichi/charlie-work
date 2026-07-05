@@ -3758,6 +3758,12 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
     dispatched_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
     assert 100 not in dispatched_issue_numbers
 
+    # Verify the blocked section contains issue 100 with its declared blockers
+    assert "blocked" in result.data
+    blocked_entries = {entry["issue"]: entry["blockers"] for entry in result.data["blocked"]}
+    assert 100 in blocked_entries
+    assert blocked_entries[100] == [200]
+
 
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
     from charlie_work.github import GitHubError as _GitHubError
