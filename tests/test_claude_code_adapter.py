@@ -1935,3 +1935,41 @@ def test_launch_sanitizes_environment_with_prompt_path(
     assert received == "<unset>|<unset>", (
         f"VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped, got: {received}"
     )
+
+
+def test_launch_claude_worker_includes_start_new_session_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """launch_claude_worker should include start_new_session=True on POSIX systems."""
+    from unittest.mock import patch
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Capture the kwargs passed to subprocess.Popen
+    popen_kwargs: dict = {}
+    original_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        popen_kwargs.update(kwargs)
+        # Return a fake process that exits immediately
+        return original_popen([sys.executable, "-c", "pass"], **kwargs)
+
+    with patch("subprocess.Popen", side_effect=capture_popen):
+        launch_claude_worker(
+            999,
+            "agent/issue-999-start-new-session",
+            "prompt",
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=(sys.executable, "-c", "pass"),
+        )
+
+    # On POSIX, start_new_session should be True
+    if os.name != "nt":
+        assert popen_kwargs.get("start_new_session") is True
+    else:
+        # On Windows, start_new_session should be False (passed explicitly)
+        assert popen_kwargs.get("start_new_session") is False
