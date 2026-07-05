@@ -1471,6 +1471,26 @@ def test_config_rejects_orchestrator_managed_merge_flags(tmp_path: Path) -> None
             assert flag in message
 
 
+def test_config_rejects_orchestrator_managed_merge_flags_equals_form(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    # Test that --flag=value forms are also rejected (normalization splits on '=')
+    # --delete-branch=true is the critical case: it bypasses exact match but is valid gh syntax
+    for flag in ["--delete-branch=true", "--squash=true"]:
+        path = tmp_path / "c.yaml"
+        path.write_text(f'auto_merge:\n  merge_flags: ["{flag}"]\n', encoding="utf-8")
+
+        try:
+            load_config(path)
+            raise AssertionError(f"expected ConfigError for {flag}")
+        except ConfigError as exc:
+            message = str(exc)
+            assert "merge_flags" in message
+            assert "auto_merge" in message
+            assert "managed by the orchestrator" in message
+            assert flag in message
+
+
 def test_config_rejects_merge_flags_scalar(tmp_path: Path) -> None:
     from charlie_work.config import ConfigError
 

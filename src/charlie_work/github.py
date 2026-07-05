@@ -29,6 +29,14 @@ RECONCILE_PR_FIELDS = (
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
 
+# Flags managed by the orchestrator's merge_pr function.
+# These are either appended by merge_pr itself (strategy flags: --merge, --rebase, --squash)
+# or deliberately excluded (--delete-branch is handled separately via delete_branch).
+# This is the single source of truth for config validation — config.py imports this.
+ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
+    {"--merge", "--rebase", "--squash", "--delete-branch"}
+)
+
 
 class GitHubError(RuntimeError):
     pass
@@ -193,6 +201,7 @@ class GitHub:
             args.extend(merge_flags)
         elif admin:
             args.append("--admin")
+        # Strategy flags are managed here — see ORCHESTRATOR_MANAGED_MERGE_FLAGS
         if strategy == "merge":
             args.append("--merge")
         elif strategy == "rebase":
@@ -217,6 +226,9 @@ class GitHub:
         Uses the git-refs API so local checkouts and worktrees are never
         touched. Returns False instead of raising — a deletion failure must
         never abort the merge/label sequence.
+
+        Note: --delete-branch is in ORCHESTRATOR_MANAGED_MERGE_FLAGS because
+        it's deliberately excluded from merge_pr to avoid worktree failures.
         """
         try:
             self.run(["api", "-X", "DELETE", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"])

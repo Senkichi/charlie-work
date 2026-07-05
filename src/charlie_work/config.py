@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
+
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 
@@ -287,14 +289,10 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         # Reject flags that conflict with orchestrator-managed behavior
         # These are either appended by merge_pr itself (strategy flags) or
         # deliberately excluded (branch deletion is handled separately)
-        orchestrator_managed = {
-            "--merge",
-            "--rebase",
-            "--squash",
-            "--delete-branch",
-        }
+        # Normalize by splitting on '=' to catch --flag=value forms
         for flag in merge_flags:
-            if str(flag) in orchestrator_managed:
+            flag_name = str(flag).split("=", 1)[0]
+            if flag_name in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
                 raise ConfigError(
                     f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
                     f"is managed by the orchestrator and cannot be specified in merge_flags"
