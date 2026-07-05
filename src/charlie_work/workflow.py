@@ -40,6 +40,35 @@ class CommandResult:
     data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ConcurrencyGovernorResult:
+    """Result of applying concurrency governor to a dispatch limit.
+
+    This encapsulates the concurrency limiting logic and ensures all related
+    fields are bound together, eliminating Pyright's reportPossiblyUnbound
+    warnings for live_count.
+    """
+
+    clamped: bool
+    max_concurrent: int
+    live_count: int
+    available_slots: int
+    dispatch_limit: int
+
+    @property
+    def enabled(self) -> bool:
+        """Return True if the governor is enabled (max_concurrent > 0)."""
+        return self.max_concurrent > 0
+
+    def report_fields(self) -> dict[str, int]:
+        """Return the fields to include in CommandResult.data when clamped."""
+        return {
+            "concurrency_limit": self.max_concurrent,
+            "live_session_count": self.live_count,
+            "available_slots": self.available_slots,
+        }
+
+
 def _janitor_section(warnings: tuple[str, ...]) -> str:
     if not warnings:
         return ""
@@ -203,6 +232,35 @@ class OrchestratorApp:
             dry_run=self.dry_run,
         )
 
+    def _apply_concurrency_governor(self, dispatch_limit: int) -> ConcurrencyGovernorResult:
+        """Apply global concurrency governor cap to a dispatch limit.
+
+        Returns a ConcurrencyGovernorResult with the potentially-clamped limit
+        and all related fields. This eliminates Pyright's reportPossiblyUnbound
+        warnings by ensuring live_count is always bound together with the
+        clamped flag.
+        """
+        max_concurrent = self.config.dispatch.max_concurrent_sessions
+        live_count = 0
+        available_slots = dispatch_limit
+        clamped = False
+
+        if max_concurrent > 0:
+            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            live_count = _count_live_sessions(sessions_dir)
+            available_slots = max(0, max_concurrent - live_count)
+            if available_slots < dispatch_limit:
+                dispatch_limit = available_slots
+                clamped = True
+
+        return ConcurrencyGovernorResult(
+            clamped=clamped,
+            max_concurrent=max_concurrent,
+            live_count=live_count,
+            available_slots=available_slots,
+            dispatch_limit=dispatch_limit,
+        )
+
     def status(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
@@ -344,16 +402,8 @@ class OrchestratorApp:
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        concurrency_clamped = False
-        available_slots = dispatch_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < dispatch_limit:
-                dispatch_limit = available_slots
-                concurrency_clamped = True
+        gov = self._apply_concurrency_governor(dispatch_limit)
+        dispatch_limit = gov.dispatch_limit
 
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
@@ -372,10 +422,8 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if concurrency_clamped:
-                    data["concurrency_limit"] = max_concurrent
-                    data["live_session_count"] = live_count
-                    data["available_slots"] = available_slots
+                if gov.clamped:
+                    data.update(gov.report_fields())
                 return CommandResult(
                     False,
                     f"dispatch deferred: provider throttled until {throttled_until}",
@@ -475,10 +523,8 @@ class OrchestratorApp:
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
             }
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 f"dry-run: would dispatch {len(session_requests)} issue(s)",
@@ -678,10 +724,8 @@ class OrchestratorApp:
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
         }
-        if concurrency_clamped:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        if gov.clamped:
+            data.update(gov.report_fields())
         return CommandResult(
             not failed_issue_numbers,
             message,
@@ -834,14 +878,34 @@ class OrchestratorApp:
         # packet above is the authority; a label failure is reported, not fatal.
         label_error: str | None = None
         if issue_number is not None:
-            try:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
-            except GitHubError as exc:
-                label_error = str(exc)
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state["prs"][str(pr_number)]["label_error"] = label_error
-                    save_state(self.paths.state_file, state)
+            # Optimization: skip review_started transition if the PR has an unaddressed
+            # request_changes decision and the head SHA hasn't changed (nothing new to review).
+            # This avoids pointless packet churn and prevents the transition from stripping
+            # the needs_rework label from budget-deferred rework candidates.
+            should_skip_transition = False
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                pr_state = state["prs"].get(str(pr_number), {})
+                existing_decision = pr_state.get("decision")
+                reviewed_head_sha = pr_state.get("reviewed_head_sha")
+                live_head_sha = pr.get("headRefOid")
+                if (
+                    existing_decision == "request_changes"
+                    and reviewed_head_sha is not None
+                    and live_head_sha is not None
+                    and live_head_sha == reviewed_head_sha
+                ):
+                    should_skip_transition = True
+
+            if not should_skip_transition:
+                try:
+                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                except GitHubError as exc:
+                    label_error = str(exc)
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)]["label_error"] = label_error
+                        save_state(self.paths.state_file, state)
         message = "review packet generated"
         if label_error:
             message += f" (label update failed: {label_error})"
@@ -936,23 +1000,36 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
-            # Update the linked issue's status when request_changes is recorded:
-            # the previous worker session is definitionally finished, so clear the
-            # dispatched claim to make the issue selectable for rework dispatch.
-            # Escalated requests must NOT mark the issue selectable.
-            if decision == "request_changes" and issue_number is not None:
-                if not escalated:
+            # Update the linked issue's status to reconcile out of rework_requested:
+            # the previous worker session is definitionally finished, so the issue
+            # status must reflect the actual decision. This prevents state-driven
+            # dispatch_rework from selecting approved/blocked PRs for duplicate work.
+            if issue_number is not None:
+                if decision == "request_changes":
+                    if not escalated:
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "rework_requested",
+                        }
+                    else:
+                        # Clear rework_requested status when escalated to prevent selection
+                        state["issues"][str(issue_number)] = {
+                            **state["issues"].get(str(issue_number), {}),
+                            "number": issue_number,
+                            "status": "escalated",
+                        }
+                elif decision == "approved":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "rework_requested",
+                        "status": "approved",
                     }
-                else:
-                    # Clear rework_requested status when escalated to prevent selection
+                elif decision == "blocked":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "escalated",
+                        "status": "blocked",
                     }
             state = append_event(
                 state,
@@ -1114,7 +1191,9 @@ class OrchestratorApp:
             # merged while state.json still shows "reviewing" — which made
             # reconcile false-positive on every clean auto-merge and lost the
             # merged fact entirely on a crash between merge and save.
-            merge_output = self.gh.merge_pr(pr_number, self.config.auto_merge.strategy)
+            merge_output = self.gh.merge_pr(
+                pr_number, self.config.auto_merge.strategy, admin=self.config.auto_merge.admin
+            )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
@@ -1338,6 +1417,7 @@ class OrchestratorApp:
         - Are same-repo (not forks)
         - Have the configured branch prefix
         - Are not the just-merged PR
+        - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
 
         Per-PR failures (conflicts, network errors) are reported as values and
         never abort the batch operation.
@@ -1360,6 +1440,25 @@ class OrchestratorApp:
             if not head.startswith(branch_prefix):
                 continue
 
+            # Skip approved-pending-ship PRs to avoid invalidating their approvals
+            # These will get base-updated when they themselves are merged (GitHub merges
+            # handle base freshness) or by a later pass after they merge.
+            decision = self._review_decision(pr_number)
+            if decision.get("decision") == "approved":
+                reviewed_head_sha = decision.get("reviewed_head_sha")
+                live_head_sha = pr.get("headRefOid")
+                if reviewed_head_sha is not None and live_head_sha == reviewed_head_sha:
+                    # PR is approved and head hasn't moved since approval — skip update
+                    results.append(
+                        {
+                            "pr_number": pr_number,
+                            "head_ref": head,
+                            "updated": False,
+                            "skipped_reason": "approved-pending-ship",
+                        }
+                    )
+                    continue
+
             # Attempt to update the branch
             success = self.gh.pr_update_branch(pr_number)
             results.append(
@@ -1372,7 +1471,11 @@ class OrchestratorApp:
 
         return results
 
-    def loop(self, limit: int | None = None) -> CommandResult:
+    def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
+        # merge=False runs the full pass (intake, dispatch, reviews, readiness
+        # evaluation + labels) but skips the actual `gh pr merge` — for
+        # operators sequencing same-surface PR cascades by hand, where the
+        # pr_list (newest-first) merge order would land PRs in the wrong order.
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
@@ -1380,15 +1483,8 @@ class OrchestratorApp:
         effective_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap to the total wave budget
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        live_count = 0
-        available_slots = effective_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < effective_limit:
-                effective_limit = available_slots
+        gov = self._apply_concurrency_governor(effective_limit)
+        effective_limit = gov.dispatch_limit
 
         # Classify dead sessions and update throttle state (production loop path)
         # This detects provider throttling from worker deaths and sets cooldown
@@ -1434,19 +1530,19 @@ class OrchestratorApp:
                         and live_head_sha == reviewed_head_sha
                     )
                     if head_matches:
-                        merges.append(self.merge_ready(pr_number).data)
+                        merges.append(self.merge_ready(pr_number, merge=merge).data)
                     else:
                         review = self.review(pr_number)
                         reviews.append(review.data)
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved":
-                            merges.append(self.merge_ready(pr_number).data)
+                            merges.append(self.merge_ready(pr_number, merge=merge).data)
                 else:
                     review = self.review(pr_number)
                     reviews.append(review.data)
                     decision = self._review_decision(pr_number)
                     if decision.get("decision") == "approved":
-                        merges.append(self.merge_ready(pr_number).data)
+                        merges.append(self.merge_ready(pr_number, merge=merge).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors
@@ -1467,11 +1563,9 @@ class OrchestratorApp:
             "merges": merges,
             "errors": errors,
         }
-        # Propagate concurrency clamp info from dispatch results
-        if max_concurrent > 0:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        # Propagate concurrency info from dispatch results
+        if gov.enabled:
+            data.update(gov.report_fields())
         return CommandResult(
             ok,
             message,
@@ -1485,6 +1579,10 @@ class OrchestratorApp:
 
         This is only for non-manual adapters. The manual adapter's human-paste
         path remains intact.
+
+        Candidate selection is STATE-DRIVEN: an issue is a rework candidate iff
+        state["issues"][n]["status"] == "rework_requested" and it has an open PR.
+        The label is used for display only and never for selection.
         """
         if self.config.devin.adapter == "manual":
             return CommandResult(
@@ -1493,21 +1591,30 @@ class OrchestratorApp:
                 {"adapter": "manual", "selected_count": 0},
             )
 
-        # Find issues with needs-rework label
-        issues = self.gh.issue_list(self.config.labels.needs_rework)
+        # Load state to find rework_requested issues (state-driven selection)
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+
+        # Find issues with rework_requested status
+        rework_issues = []
+        for number, entry in state.get("issues", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "rework_requested":
+                # Fetch the full issue from GitHub to get labels and other metadata
+                try:
+                    issue_number = int(number)
+                    full_issue = self.gh.issue_view(issue_number)
+                    rework_issues.append(full_issue)
+                except GitHubError:
+                    # Skip issues that can't be fetched (deleted, etc.)
+                    continue
+
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
         # Apply global concurrency governor cap
-        max_concurrent = self.config.dispatch.max_concurrent_sessions
-        concurrency_clamped = False
-        available_slots = rework_limit
-        if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            live_count = _count_live_sessions(sessions_dir)
-            available_slots = max(0, max_concurrent - live_count)
-            if available_slots < rework_limit:
-                rework_limit = available_slots
-                concurrency_clamped = True
+        gov = self._apply_concurrency_governor(rework_limit)
+        rework_limit = gov.dispatch_limit
 
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
@@ -1521,10 +1628,8 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if concurrency_clamped:
-                    data["concurrency_limit"] = max_concurrent
-                    data["live_session_count"] = live_count
-                    data["available_slots"] = available_slots
+                if gov.clamped:
+                    data.update(gov.report_fields())
                 return CommandResult(
                     False,
                     f"rework dispatch deferred: provider throttled until {throttled_until}",
@@ -1549,7 +1654,7 @@ class OrchestratorApp:
 
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
-        candidates = [issue for issue in issues if int(issue["number"]) in pr_by_issue]
+        candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
@@ -1560,10 +1665,8 @@ class OrchestratorApp:
 
         if not selected:
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "no rework candidates found",
@@ -1609,10 +1712,8 @@ class OrchestratorApp:
 
         if not selected_issue_numbers:
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "all rework candidates already dispatched",
@@ -1676,10 +1777,8 @@ class OrchestratorApp:
                 )
                 save_state(self.paths.state_file, state)
             data = {"adapter": self.config.devin.adapter, "selected_count": 0}
-            if concurrency_clamped:
-                data["concurrency_limit"] = max_concurrent
-                data["live_session_count"] = live_count
-                data["available_slots"] = available_slots
+            if gov.clamped:
+                data.update(gov.report_fields())
             return CommandResult(
                 True,
                 "no valid rework prompts found",
@@ -1779,10 +1878,8 @@ class OrchestratorApp:
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
         }
-        if concurrency_clamped:
-            data["concurrency_limit"] = max_concurrent
-            data["live_session_count"] = live_count
-            data["available_slots"] = available_slots
+        if gov.clamped:
+            data.update(gov.report_fields())
         return CommandResult(
             not failed_issue_numbers,
             message,

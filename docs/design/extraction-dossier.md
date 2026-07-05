@@ -216,7 +216,7 @@ production in both forks), jc-only `cross_family` block.
 ### `prompts/*.md` (6 templates)
 `orchestrator.md`, `rework.md` byte-identical across forks. `worker.md` diverges sharply: jc
 is Devin-skills-driven (`/create-branch /commit /test /preflight /push /create-pr /complete`,
-PR title `Fix #N: <title>`); emp is raw-shell-driven (`git switch`, `uv run pytest`, `git
+PR title `Fix #N: <title>`); emp is raw-shell-driven (`git switch`, `uv run pytest` [now: `uv run --extra dev pytest -q --tb=short`], `git
 push`, Conventional-Commits PR titles) with empericus-specific invariants inlined (privacy,
 asyncio-single-process, migration-serialization warning). `review.md` differs only by the
 jc-only `$cross_family_section` placeholder. jc-only: `cross_family_review.md` (7 attack axes),
@@ -393,13 +393,13 @@ Claude Code workers, reconstructed entirely from indirect evidence (no code path
 
 - `devin.adapter: manual` in shipped config confirms no programmatic launch.
 - `worker.md` was rewritten from Devin-skills syntax to **raw shell commands** (`git fetch
-  origin && git switch -c $branch_name origin/main`, `uv run pytest -q --tb=short`, `uv run
+  origin && git switch -c $branch_name origin/main`, `uv run --extra dev pytest -q --tb=short`, `uv run
   ruff check .`/`format .`, `git push -u origin $branch_name`) — the portable interface that
   works for any CLI-driven coding agent, which is precisely what let Claude Code substitute
   for Devin with zero orchestrator code changes.
 - Workers operate in `emp-devin-wt/issue-N/` git worktrees (branch names match
   `workflow._branch_name()` = `agent/issue-N-slug` exactly), which **inherit the repo's
-  tracked `.claude/settings.json`** (permissions allowlist for `uv run pytest/ruff/mypy/
+  tracked `.claude/settings.json`** (permissions allowlist for `uv run --extra dev pytest/ruff/mypy/
   pre-commit` and git commands) **and hooks** at ordinary `git worktree add` checkout time —
   no bespoke launcher code required:
   - `.claude/hooks/enforce-branch.sh` (PreToolUse on every Bash call): blocks `git commit`

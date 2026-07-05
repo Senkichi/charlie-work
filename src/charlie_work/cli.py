@@ -104,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     loop = subparsers.add_parser("bash-rats")
     loop.add_argument("--limit", type=int, default=None)
+    loop_merge_group = loop.add_mutually_exclusive_group()
+    loop_merge_group.add_argument("--merge", action="store_true", dest="merge")
+    loop_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
+    loop.set_defaults(merge=None)
 
     return parser
 
@@ -162,7 +166,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "bash-rats":
-        return app.loop(args.limit)
+        return app.loop(args.limit, merge=args.merge)
     return CommandResult(False, f"unknown command: {args.command}", {})
 
 

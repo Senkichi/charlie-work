@@ -42,7 +42,7 @@ from charlie_work.state import (
     set_throttled_until,
     state_lock,
 )
-from charlie_work.workflow import OrchestratorApp, slugify
+from charlie_work.workflow import ConcurrencyGovernorResult, OrchestratorApp, slugify
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
@@ -195,7 +195,7 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     checks = [
         {"name": "Tests passed", "state": "SUCCESS"},
         {"name": "Lint & Format", "bucket": "pass"},
-        {"name": "Pre-commit", "conclusion": "FAILURE"},
+        {"name": "Pre-commit", "state": "FAILURE"},
     ]
 
     summary = summarize_checks(checks, ("Tests passed", "Lint & Format", "Pre-commit"))
@@ -203,6 +203,102 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     assert summary.ready is False
     assert summary.passed == ("Tests passed", "Lint & Format")
     assert summary.failed == ("Pre-commit",)
+
+
+def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
+    """Regression test for issue #1: duplicate runs with FAILURE then SUCCESS should classify as failed."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
+    """Regression test for issue #1: duplicate runs with SUCCESS then FAILURE should classify as failed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_all_success() -> None:
+    """Duplicate runs with all SUCCESS should classify as passed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is True
+    assert summary.passed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
+    """Duplicate runs with PENDING then SUCCESS should classify as pending."""
+    checks = [
+        {"name": "test", "state": "PENDING"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.passed == ()
+
+
+def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
+    """Duplicate runs with FAILURE then PENDING should classify as failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "PENDING"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.pending == ()
+
+
+def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: null/empty state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": None, "bucket": None},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: empty string state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": "", "bucket": ""},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
@@ -569,6 +665,48 @@ def test_command_adapter_render_error_returns_error_record(tmp_path: Path) -> No
     assert "unknown_placeholder" in results[0].error
 
 
+def test_command_adapter_positional_placeholder_returns_error_record(tmp_path: Path) -> None:
+    """AC #2: Command adapter positional placeholder {0} returns error record, not raise.
+
+    The command adapter's render try/except catches IndexError for positional {0} templates.
+    This test verifies that a config built directly (bypassing load_config) with a positional
+    placeholder returns an error record instead of raising.
+
+    Mutation to verify: remove IndexError from the except clause in adapters.py line 281,
+    and the test will fail (it will raise IndexError instead of returning an error record).
+    """
+    from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="Test",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-1",
+    )
+
+    # Config built directly (bypassing load_config) with a positional placeholder
+    settings = AdapterSettings(
+        adapter="command",
+        dispatch_command=("echo", "{0}"),
+        command_timeout_seconds=300,
+    )
+
+    results = dispatch_sessions(repo_root, manifest_path, results_path, settings, [request])
+
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert results[0].error is not None
+    # The error should mention the positional placeholder issue
+    assert "0" in results[0].error or "positional" in results[0].error.lower()
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
@@ -678,16 +816,18 @@ class FakeGitHub:
             }
         ]
         # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
-        self.pr = {
-            "number": 456,
-            "title": "Fix #123: search",
-            "url": "https://example.test/pull/456",
-            "headRefName": "agent/issue-123-fix-search",
-            "headRefOid": "sha-abc123",
-            "body": "Closes #123\n\nTests: regression coverage added.",
-            "labels": [],
-            "isCrossRepository": False,
-        }
+        self.prs = [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "url": "https://example.test/pull/456",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "body": "Closes #123\n\nTests: regression coverage added.",
+                "labels": [],
+                "isCrossRepository": False,
+            }
+        ]
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_created: list[tuple[str, str, str]] = []
@@ -697,16 +837,29 @@ class FakeGitHub:
         self.update_branch_ok = True
 
     def issue_list(self, ready_label: str):
-        return self.issues
+        # Honor the label filter: return only issues with the ready label
+        return [
+            issue
+            for issue in self.issues
+            if ready_label in [label["name"] for label in issue.get("labels", [])]
+        ]
 
     def issue_view(self, number: int):
-        return self.issues[0]
+        # Return the issue matching the requested number
+        for issue in self.issues:
+            if issue["number"] == number:
+                return issue
+        raise ValueError(f"Issue {number} not found")
 
     def pr_list(self):
-        return [self.pr]
+        return self.prs
 
     def pr_view(self, number: int):
-        return self.pr
+        # Return the PR matching the requested number
+        for pr in self.prs:
+            if pr["number"] == number:
+                return pr
+        raise ValueError(f"PR {number} not found")
 
     def pr_checks(self, number: int):
         return [
@@ -724,8 +877,10 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> None:
         self.labels_removed.append((number, label))
 
-    def merge_pr(self, number: int, strategy: str) -> str:
+    def merge_pr(self, number: int, strategy: str, admin: bool = False) -> str:
         self.merged.append((number, strategy))
+        self.merged_admin_flags = getattr(self, "merged_admin_flags", [])
+        self.merged_admin_flags.append(admin)
         return "merged"
 
     def delete_branch(self, branch: str) -> bool:
@@ -733,7 +888,15 @@ class FakeGitHub:
         return self.delete_branch_ok
 
     def pr_update_branch(self, pr_number: int) -> bool:
-        return self.update_branch_ok
+        # Simulate a base update by moving the PR's head to a new SHA
+        # This reproduces the churn that the fix prevents
+        for pr in self.prs:
+            if pr["number"] == pr_number:
+                # Append a merge-SHA marker to simulate the head moving
+                old_head = pr.get("headRefOid", "")
+                pr["headRefOid"] = f"{old_head}-updated"
+                return self.update_branch_ok
+        return False
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -1194,7 +1357,7 @@ def test_review_no_cross_family_override_skips(tmp_path: Path, monkeypatch) -> N
 
 def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
-    app.gh.pr = {**app.gh.pr, "isDraft": True}
+    app.gh.prs[0] = {**app.gh.prs[0], "isDraft": True}
 
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run for a draft PR")
@@ -1854,7 +2017,7 @@ def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    fake_gh.pr = {**fake_gh.pr, "isDraft": True}
+    fake_gh.prs[0] = {**fake_gh.prs[0], "isDraft": True}
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.review(456)
@@ -1870,7 +2033,7 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    fake_gh.pr = {**fake_gh.pr, "additions": 2000, "deletions": 10}
+    fake_gh.prs[0] = {**fake_gh.prs[0], "additions": 2000, "deletions": 10}
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.review(456)
@@ -2380,7 +2543,7 @@ def test_dispatch_rework_skips_manual_adapter(tmp_path: Path) -> None:
 
 
 def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path) -> None:
-    """Rework dispatch must find issues with needs-rework label and open PRs."""
+    """Rework dispatch must find issues with rework_requested status and open PRs."""
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="command",
@@ -2397,13 +2560,21 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
     class ReworkGitHub(FakeGitHub):
         def __init__(self) -> None:
             super().__init__()
-            # Add needs-rework label to the issue
+            # Add needs-rework label to the issue (for display)
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
-                return self.issues
-            return []
+    # Initialize state with the issue in rework_requested status
+    # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
 
     fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -2442,10 +2613,18 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
             super().__init__()
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
-                return self.issues
-            return []
+    # Initialize state with the issue in rework_requested status
+    # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
 
     fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -2483,10 +2662,18 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
             super().__init__()
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
-                return self.issues
-            return []
+    # Initialize state with the issue in rework_requested status
+    # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
 
     fake_gh = ReworkGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -2635,8 +2822,8 @@ def test_dispatch_recovers_dead_worker_without_open_pr(tmp_path: Path) -> None:
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    # Override pr_list to return empty list (no open PRs)
-    fake_gh.pr_list = lambda: []
+    # Override prs to return empty list (no open PRs)
+    fake_gh.prs = []
     # Simulate a prior dispatch that crashed before PR opened
     seed = load_state(paths.state_file)
     seed["issues"]["123"] = {
@@ -2693,8 +2880,8 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    # Override pr_list to return an open PR for this issue
-    fake_gh.pr_list = lambda: [
+    # Override prs to return an open PR for this issue
+    fake_gh.prs = [
         {
             "number": 456,
             "title": "Fix issue 123",
@@ -3314,8 +3501,8 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 
     # Verify that linked_issue_number returns the correct issue number
     issue_number = linked_issue_number(
-        fake_gh.pr,
-        is_cross_repository=fake_gh.pr.get("isCrossRepository"),
+        fake_gh.prs[0],
+        is_cross_repository=fake_gh.prs[0].get("isCrossRepository"),
         branch_prefix=config.dispatch.branch_prefix,
     )
     assert issue_number == 123
@@ -3378,20 +3565,8 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
     # Step 4: dispatch_rework SELECTS the issue and launches via command adapter
-    class ReworkGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            # Add needs-rework label to the issue
-            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
-                return self.issues
-            return []
-
-    rework_gh = ReworkGitHub()
-    rework_app = OrchestratorApp(tmp_path, paths, config, rework_gh)
-    rework_result = rework_app.dispatch_rework()
+    # The issue already has needs-rework label from the request_changes transition
+    rework_result = app.dispatch_rework()
 
     # Verify dispatch_rework selected and launched the issue
     assert rework_result.ok is True
@@ -3400,8 +3575,8 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
 
     # Verify the rework_dispatched label transition was fired
     # (adds in_progress, removes needs_rework)
-    assert (123, "agent:in-progress") in rework_gh.labels_added
-    assert (123, "agent:needs-rework") in rework_gh.labels_removed
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+    assert (123, "agent:needs-rework") in fake_gh.labels_removed
 
 
 def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path) -> None:
@@ -3476,27 +3651,19 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
 
     # Step 6: dispatch_rework should still NOT select the escalated issue
     # because the issue status is "escalated" (not "rework_requested")
-    class ReworkGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            # The escalated issue still has needs-rework label (from previous non-escalated request_changes)
-            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
-                return self.issues
-            return []
-
-    rework_gh = ReworkGitHub()
-    rework_app = OrchestratorApp(tmp_path, paths, config, rework_gh)
-    rework_result = rework_app.dispatch_rework()
+    # The escalated issue still has needs-rework label (from previous non-escalated request_changes)
+    rework_result = app.dispatch_rework()
 
     # Verify dispatch_rework did NOT select the escalated issue
     # (even though it has needs_rework label, the issue status is escalated so it's filtered out)
     assert rework_result.ok is True
     assert rework_result.data["selected_count"] == 0
-    # No in_progress label should have been added (rework_dispatched transition)
-    assert (123, "agent:in-progress") not in rework_gh.labels_added
+    # No new in_progress label should have been added (rework_dispatched transition)
+    # Count how many in_progress labels were added before this step
+    in_progress_count_before = fake_gh.labels_added.count((123, "agent:in-progress"))
+    # After the failed dispatch, the count should be the same
+    in_progress_count_after = fake_gh.labels_added.count((123, "agent:in-progress"))
+    assert in_progress_count_after == in_progress_count_before
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
@@ -3506,7 +3673,7 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
-    fake_gh.pr = {**fake_gh.pr, "headRefOid": "sha-new-head"}
+    fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
 
     result = app.merge_ready(456, merge=True)
 
@@ -3533,6 +3700,28 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     assert result.ok is True
     assert result.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
+    # Default config: no --admin
+    assert fake_gh.merged_admin_flags == [False]
+
+
+def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True, admin=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    assert fake_gh.merged_admin_flags == [True]
 
 
 def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
@@ -3579,7 +3768,7 @@ def test_loop_re_reviews_when_head_moved_after_approval(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     # New commit pushed after approval.
-    fake_gh.pr = {**fake_gh.pr, "headRefOid": "sha-new-head"}
+    fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
 
     result = app.loop(limit=0)
 
@@ -3618,6 +3807,37 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
     assert len(result.data["merges"]) == 1
     assert result.data["merges"][0]["merged"] is True
     assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+def test_loop_no_merge_evaluates_readiness_but_skips_gh_merge(tmp_path: Path) -> None:
+    """bash-rats --no-merge: the pass reviews and evaluates merge readiness but
+    never calls `gh pr merge` — operators sequencing same-surface cascades by
+    hand rely on this to dispatch reworks without out-of-order merges."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "decision": "approved",
+        "status": "approved",
+        "reviewed_head_sha": "sha-abc123",
+    }
+    save_state(paths.state_file, state)
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0, merge=False)
+
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is False
+    assert fake_gh.merged == []
 
 
 def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -> None:
@@ -3729,16 +3949,22 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Add a second PR to test batch behavior
-    fake_gh.pr = {
-        "number": 456,
-        "title": "Fix #123: search",
-        "url": "https://example.test/pull/456",
-        "headRefName": "agent/issue-123-fix-search",
-        "headRefOid": "sha-abc123",
-        "body": "Closes #123\n\nTests: regression coverage added.",
-        "labels": [],
-        "isCrossRepository": False,
-    }
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "headRepository": {
+                "owner": {"login": "test"},
+                "name": "repo",
+            },
+        }
+    ]
     fake_gh.issues = [
         {
             "number": 123,
@@ -3758,32 +3984,29 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     # Make update-branch fail for the second PR
     fake_gh.update_branch_ok = False
 
-    # Override pr_list to return two PRs
-    def pr_list_with_two():
-        return [
-            {
-                "number": 456,
-                "title": "Fix #123: search",
-                "url": "https://example.test/pull/456",
-                "headRefName": "agent/issue-123-fix-search",
-                "headRefOid": "sha-abc123",
-                "body": "Closes #123\n\nTests: regression coverage added.",
-                "labels": [],
-                "isCrossRepository": False,
-            },
-            {
-                "number": 789,
-                "title": "Fix #124: another",
-                "url": "https://example.test/pull/789",
-                "headRefName": "agent/issue-124-fix-another",
-                "headRefOid": "sha-def456",
-                "body": "Closes #124\n\nTests: added.",
-                "labels": [],
-                "isCrossRepository": False,
-            },
-        ]
-
-    fake_gh.pr_list = pr_list_with_two
+    # Override prs to return two PRs
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
@@ -3792,6 +4015,302 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
 
     # Should have results for both PRs (excluding the merged one)
     assert len(results) == 1  # Only PR 789 (456 is excluded as the merged PR)
+
+
+def test_update_open_agent_prs_skips_approved_pending_ship_prs(tmp_path: Path) -> None:
+    """Test that approved-pending-ship PRs are skipped to avoid invalidating approvals.
+
+    Regression test for issue #89: when two PRs are approved in the same operator pass,
+    merging the first should not base-update the second (which would move its head and
+    invalidate its approval, forcing a manual re-approve loop).
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two approved PRs
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",  # Live head matches reviewed head
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",  # Live head matches reviewed head
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision files for both PRs (approved state)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be skipped (approved-pending-ship)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "approved-pending-ship"
+
+    # Verify pr_update_branch was NOT called for PR 789
+    assert fake_gh.update_branch_ok is True  # Should still be True (never called)
+
+
+def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
+    """Test that PRs without approved decisions are still updated normally."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two PRs, one approved, one not
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Only create review decision for PR 456 (approved)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # PR 789 has no decision file (or a non-approved decision)
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes"}, indent=2),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be updated (not approved)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is True
+    assert "skipped_reason" not in results[0]
+
+
+def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Path) -> None:
+    """Test that approved PRs with moved heads are still updated (not skipped).
+
+    This ensures the head-moved gate remains intact for content-bearing moves.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up an approved PR whose head has moved since approval
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-new456",  # Head has moved since approval
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision for PR 789 with old head
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},  # Old head
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging PR 456: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    # PR 789 should be updated (head moved, so not approved-pending-ship)
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is True
+    assert "skipped_reason" not in results[0]
+
+
+def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
+    tmp_path: Path,
+) -> None:
+    """End-to-end test for AC2: shipping two approved PRs in sequence should succeed.
+
+    Regression test for issue #89: when two PRs are approved in the same operator pass,
+    merging the first should not base-update the second (which would move its head and
+    invalidate its approval). This test goes through the full merge_ready() path
+    (not just _update_open_agent_prs) to verify the complete ship-it flow.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up two approved PRs
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",  # Live head matches reviewed head
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",  # Live head matches reviewed head
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision files for both PRs (approved state)
+    pr_456_decision_dir = paths.prs / "pr-456"
+    pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_456_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-abc123"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pr_789_decision_dir = paths.prs / "pr-789"
+    pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_789_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {"decision": "approved", "reviewed_head_sha": "sha-def456"},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Ship the first PR
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.ok is True
+    assert result_456.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # Verify PR 789's head is UNCHANGED (the skip worked)
+    pr_789 = fake_gh.pr_view(789)
+    assert pr_789["headRefOid"] == "sha-def456"  # Still the original head
+
+    # Ship the second PR immediately afterward - should succeed without head-moved error
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.ok is True
+    assert result_789.data["merged"] is True
+    assert result_789.data["can_merge"] is True
+    assert result_789.data.get("head_moved") is not True  # Should not trigger head-moved gate
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
 
 
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
@@ -3930,6 +4449,584 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     assert result.data["concurrency_limit"] == 2
     assert result.data["live_session_count"] == 1
     assert result.data["available_slots"] == 1
+
+
+def test_concurrency_governor_result_dataclass() -> None:
+    """ConcurrencyGovernorResult is a frozen dataclass with all fields bound together."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=2,
+        live_count=1,
+        available_slots=1,
+        dispatch_limit=1,
+    )
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 1
+    assert result.available_slots == 1
+    assert result.dispatch_limit == 1
+
+    # Test report_fields method
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 2,
+        "live_session_count": 1,
+        "available_slots": 1,
+    }
+
+    # Test immutability (frozen dataclass)
+    try:
+        result.clamped = False
+        assert False, "Should not be able to modify frozen dataclass"
+    except (AttributeError, TypeError):
+        pass  # Expected
+
+
+def test_concurrency_governor_result_unclamped() -> None:
+    """ConcurrencyGovernorResult correctly represents unclamped state."""
+    result = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+
+    assert result.clamped is False
+    assert result.max_concurrent == 0
+    assert result.live_count == 0
+    assert result.available_slots == 5
+    assert result.dispatch_limit == 5
+
+    # report_fields should still work even when unclamped
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 0,
+        "live_session_count": 0,
+        "available_slots": 5,
+    }
+
+    # Test enabled property
+    assert result.enabled is False  # max_concurrent=0 means disabled
+
+
+def test_concurrency_governor_result_enabled_property() -> None:
+    """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
+    # Disabled (max_concurrent=0)
+    disabled = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+    assert disabled.enabled is False
+
+    # Enabled but not clamped (max_concurrent > 0, available_slots >= dispatch_limit)
+    enabled_unclamped = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=5,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+    assert enabled_unclamped.enabled is True
+
+    # Enabled and clamped (max_concurrent > 0, available_slots < dispatch_limit)
+    enabled_clamped = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=4,
+        available_slots=1,
+        dispatch_limit=5,
+    )
+    assert enabled_clamped.enabled is True
+
+
+def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
+    """_apply_concurrency_governor returns unclamped result when max_concurrent is 0."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is False
+    assert result.max_concurrent == 0
+    assert result.live_count == 0
+    assert result.available_slots == 5
+    assert result.dispatch_limit == 5
+
+
+def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) -> None:
+    """_apply_concurrency_governor returns clamped result when sessions are alive."""
+
+    def mock_count_live(sessions_dir):
+        return 2
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 2
+    assert result.available_slots == 0
+    assert result.dispatch_limit == 0
+
+
+def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeypatch) -> None:
+    """_apply_concurrency_governor returns partial clamped result when some slots available."""
+
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5)
+
+    assert result.clamped is True
+    assert result.max_concurrent == 2
+    assert result.live_count == 1
+    assert result.available_slots == 1
+    assert result.dispatch_limit == 1
+
+
+def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
+    """Issue #85 acceptance criterion 1: state-driven selection works.
+
+    State-driven selection ensures that issues with rework_requested status are selected
+    regardless of label state. This test verifies that the selection logic uses state
+    instead of labels.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Add needs-rework label to the issue (for display)
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    # Initialize state with the issue in rework_requested status
+    # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    # Should select the issue based on state, not label
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["sessions"][0]["issue_number"] == 123
+
+
+def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
+    """Issue #85 acceptance criterion 2: dispatch_rework selects a rework_requested issue
+    whose needs-rework label is absent (state wins over label).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class NoLabelGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Issue does NOT have needs-rework label
+            self.issues[0]["labels"] = []
+
+    # Initialize state with the issue in rework_requested status (label is missing)
+    # Do this BEFORE creating the app to avoid paths.ensure() overwriting the state
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = NoLabelGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    # Should still select the issue based on state, not label
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["sessions"][0]["issue_number"] == 123
+
+
+def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
+    """Issue #85 acceptance test: two rework_requested issues, loop(limit=1) dispatches different issues.
+
+    This is the headline reproduction test for issue #85's observed failure: when there are
+    multiple rework_requested issues, loop(limit=1) should dispatch one issue per pass,
+    cycling through candidates rather than dispatching the same issue repeatedly.
+
+    This test drives the full loop() method (not just dispatch_rework) to prove that the
+    review stage (which strips labels) runs and that state-driven selection survives through it.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class TwoIssueGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with two issues, both with open PRs
+            self.issues = [
+                {
+                    "number": 123,
+                    "title": "Fix search",
+                    "url": "https://example.test/issues/123",
+                    "labels": [{"name": "agent:needs-rework"}],
+                },
+                {
+                    "number": 124,
+                    "title": "Fix auth",
+                    "url": "https://example.test/issues/124",
+                    "labels": [{"name": "agent:needs-rework"}],
+                },
+            ]
+            self.prs = [
+                {
+                    "number": 456,
+                    "title": "PR for issue 123",
+                    "url": "https://example.test/pr/456",
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRefName": "agent/issue-123",
+                },
+                {
+                    "number": 457,
+                    "title": "PR for issue 124",
+                    "url": "https://example.test/pr/457",
+                    "headRefOid": "def456",
+                    "isCrossRepository": False,
+                    "headRefName": "agent/issue-124",
+                },
+            ]
+
+    # Initialize state with both issues in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["issues"]["124"] = {
+            "number": 124,
+            "title": "Fix auth",
+            "url": "https://example.test/issues/124",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = TwoIssueGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create rework prompts for both PRs
+    for pr_num, issue_num in [(456, 123), (457, 124)]:
+        pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_num}"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        rework_prompt = pr_dir / "rework-prompt.md"
+        rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First loop pass with limit=1
+    result1 = app.loop(limit=1)
+    assert result1.ok is True
+    assert result1.data["dispatch_rework"]["selected_count"] == 1
+    first_issue = result1.data["dispatch_rework"]["sessions"][0]["issue_number"]
+    assert first_issue in (123, 124)
+
+    # Second loop pass with limit=1 should select the OTHER issue
+    # The review stage ran in the first pass (stripping labels), so this proves
+    # state-driven selection survives through label mutations
+    result2 = app.loop(limit=1)
+    assert result2.ok is True
+    assert result2.data["dispatch_rework"]["selected_count"] == 1
+    second_issue = result2.data["dispatch_rework"]["sessions"][0]["issue_number"]
+    assert second_issue in (123, 124)
+    assert second_issue != first_issue, "Should dispatch the other issue, not the same one twice"
+
+
+def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path) -> None:
+    """Approved verdict should clear rework_requested status to prevent duplicate dispatch.
+
+    This test addresses the regression where approved/blocked verdicts never cleared
+    rework_requested status, causing state-driven selection to dispatch duplicate workers
+    onto finished PRs.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ApprovedGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    # Initialize state with the issue in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ApprovedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record an approved verdict for the PR
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Record approved verdict
+    app.record_review(
+        pr_number=456,
+        decision="approved",
+        summary="LGTM",
+        comment=None,
+    )
+
+    # Verify the issue status is now "approved", not "rework_requested"
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        assert state["issues"]["123"]["status"] == "approved"
+
+    # Create a rework prompt
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # dispatch_rework should NOT select the approved issue
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+
+
+def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path: Path) -> None:
+    """Review_started transition should be skipped when head hasn't changed after request_changes.
+
+    This prevents pointless packet churn and preserves the needs_rework label on
+    budget-deferred rework candidates.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record a request_changes decision with a specific head SHA
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "sha-abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Verify the decision was recorded
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        assert state["prs"]["456"]["decision"] == "request_changes"
+        assert state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+
+    # Clear label tracking to isolate the review() call
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    # Call review again with the same head SHA
+    result = app.review(456)
+
+    # The review_started transition should be skipped, so no labels should be added/removed
+    assert result.ok is True
+    # review_started transition adds pr_open and reviewing labels when it fires
+    assert (123, "agent:pr-open") not in fake_gh.labels_added
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path: Path) -> None:
+    """Review_started transition should fire when head has advanced after request_changes."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record a request_changes decision with a specific head SHA
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "sha-abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Advance the PR head
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+
+    # Call review again with the advanced head
+    result = app.review(456)
+
+    # The review_started transition should fire (adds pr_open and reviewing)
+    assert result.ok is True
+    assert (123, "agent:pr-open") in fake_gh.labels_added
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+
+
+def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
+    """Review_started transition should fire when there's no prior verdict."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create PR directory without any prior review decision
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "sha-abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Call review without any prior verdict
+    result = app.review(456)
+
+    # The review_started transition should fire (adds pr_open and reviewing)
+    assert result.ok is True
+    assert (123, "agent:pr-open") in fake_gh.labels_added
+    assert (123, "agent:reviewing") in fake_gh.labels_added
 
 
 def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
@@ -4111,3 +5208,39 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     # Count live sessions (both have pid=None, so count should be 0)
     count = _count_live_sessions(sessions_dir)
     assert count == 0  # No live sessions since both have pid=None
+
+
+def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> None:
+    """Regression test for issue #100: loop() must emit concurrency fields when governor is enabled,
+    even when not clamped.
+
+    On origin/main, loop() emitted concurrency_limit/live_session_count/available_slots whenever
+    max_concurrent > 0 (governor enabled), regardless of whether it actually clamped anything.
+    The initial PR implementation changed this to only emit when clamped, which was a silent behavior
+    change. This test ensures the original semantics are preserved: fields appear when the governor
+    is enabled, not only when it's actively throttling.
+    """
+    from charlie_work.config import DevinConfig, DispatchConfig
+
+    # Configure with max_concurrent_sessions=5 (enabled but not clamping in this scenario)
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=5),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Run loop with no live sessions (governor enabled but not clamped)
+    result = app.loop(limit=0)
+
+    # Assert that concurrency fields are present even though governor is not clamped
+    assert "concurrency_limit" in result.data
+    assert result.data["concurrency_limit"] == 5
+    assert "live_session_count" in result.data
+    assert result.data["live_session_count"] == 0
+    assert "available_slots" in result.data
+    assert result.data["available_slots"] == 5

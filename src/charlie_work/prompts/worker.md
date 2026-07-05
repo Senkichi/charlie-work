@@ -28,7 +28,7 @@ The following skills are available to help you complete this task:
 
 - `/create-branch` - Ensure the branch is created and checked out
 - `/commit` - Create a conventional commit with proper formatting
-- `/test` - Run the test suite and verify all tests pass
+- `/test` - Run the test suite and verify all tests pass (only if it wraps the canonical command below)
 - `/preflight` - Match CI (ruff + ruff-format + pre-commit) before pushing
 - `/push` - Push the branch to GitHub
 - `/create-pr` - Create a pull request with proper formatting
@@ -40,7 +40,13 @@ The following skills are available to help you complete this task:
 2. Read `CLAUDE.md`, `CONTRIBUTING.md`, the issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
-5. Use `/test` to run the test suite and verify all tests pass.
+5. Run the full test suite with the canonical command from the worktree root:
+   ```bash
+   uv run --extra dev pytest -q --tb=short
+   ```
+   The `/test` skill is a convenience shortcut but may not run the full suite — always
+   use the explicit command for final verification. Quote the exact command you ran
+   AND the collected/passed count in your completion report (e.g., "300 collected, 300 passed").
 6. Add or update regression tests unless not applicable.
 7. Use `/commit` to commit your changes with conventional format.
 8. Use `/preflight` to match CI (ruff, ruff-format, pre-commit). Commit anything it
@@ -75,5 +81,6 @@ After your final commit:
    gh pr view $branch_name --json headRefOid
    ```
    Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
+3. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the task complete.

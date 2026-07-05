@@ -4,7 +4,13 @@ import subprocess
 from pathlib import Path
 
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
-from charlie_work.janitor import JanitorVerdict, check_operator_containment, run_janitor
+from charlie_work.github import PR_VIEW_FIELDS
+from charlie_work.janitor import (
+    JANITOR_PR_KEYS,
+    JanitorVerdict,
+    check_operator_containment,
+    run_janitor,
+)
 
 REQUIRED_CHECKS = ("Tests passed", "Lint & Format")
 
@@ -46,7 +52,6 @@ def _green_pr(**overrides) -> dict:
         "headRefOid": "abc123",
         "body": "Closes #123.\n\nTests: added unit tests for the search path.",
         "isDraft": False,
-        "state": "OPEN",
         "mergeable": "MERGEABLE",
         "additions": 10,
         "deletions": 5,
@@ -1019,4 +1024,41 @@ def test_no_op_rework_unpushed_commit_enrichment(tmp_path: Path) -> None:
     # Just check that we got SOME failure message about no-op rework
     assert any("no pushed commits" in f or "unpushed commit" in f for f in verdict.failures), (
         f"Expected no-op rework failure, got: {verdict.failures}"
+    )
+
+
+def test_body_word_boundary_matching_prevents_false_positives() -> None:
+    """Word-boundary matching prevents 'test' in 'latest' from passing the gate (regression test for issue #2)."""
+    pr = _green_pr(body="Closes #123. Updated to latest version.")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is False
+    assert any("tests/verification/rationale" in f.lower() for f in verdict.failures)
+
+
+def test_body_word_boundary_matching_allows_legitimate_markers() -> None:
+    """Word-boundary matching still allows legitimate test/rationale markers (regression test for issue #2)."""
+    pr = _green_pr(body="Closes #123. Added tests for the fix.")
+
+    verdict = run_janitor(pr, _green_checks(), _config())
+
+    assert verdict.ok is True
+
+
+def test_janitor_pr_keys_contained_in_pr_view_fields() -> None:
+    """All PR keys read by janitor gates must be present in PR_VIEW_FIELDS (regression test for issue #2).
+
+    This test prevents the regression that issue #2 fixed: if a janitor gate reads a PR key
+    that is not in PR_VIEW_FIELDS, the gate will be silently disabled because gh pr view will
+    not fetch that field. This test FAILS if any janitor-read key is dropped from PR_VIEW_FIELDS.
+    """
+    # Parse PR_VIEW_FIELDS into a set of field names
+    pr_view_field_set = set(PR_VIEW_FIELDS.split(","))
+
+    # Assert every janitor-read key is in PR_VIEW_FIELDS
+    missing_keys = JANITOR_PR_KEYS - pr_view_field_set
+    assert not missing_keys, (
+        f"Janitor reads PR keys not in PR_VIEW_FIELDS: {missing_keys}. "
+        f"Add these keys to PR_VIEW_FIELDS in github.py or the corresponding gates will be silently disabled."
     )
