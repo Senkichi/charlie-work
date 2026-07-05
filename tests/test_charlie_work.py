@@ -3550,6 +3550,45 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
     assert persisted["merged"] is True
 
 
+def test_merge_ready_pr_list_error_during_update_open_prs_is_caught(tmp_path: Path) -> None:
+    """Issue #146: GitHubError from pr_list during post-merge sweep must not propagate."""
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.github import GitHubError
+
+    class PrListFailGitHub(FakeGitHub):
+        def pr_list(self):
+            raise GitHubError("API rate limit exceeded")
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # Enable the feature that calls pr_list
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = PrListFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Write the approved decision directly
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    # The merge should still succeed despite pr_list failing
+    assert result.data["merged"] is True
+    # The error should be recorded in update_open_prs_results
+    assert result.data["update_open_prs_results"] is not None
+    assert len(result.data["update_open_prs_results"]) == 1
+    assert "error" in result.data["update_open_prs_results"][0]
+    assert "pr_list failed" in result.data["update_open_prs_results"][0]["error"]
+    # The merged state should still be recorded
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
+
+
 def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path: Path) -> None:
     """A live dispatched issue is not re-dispatched even if label write failed."""
     from charlie_work.devin_shell import SessionRecord

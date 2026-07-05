@@ -1569,7 +1569,7 @@ class OrchestratorApp:
         merge_output: str | None = None
         branch_deleted: bool | None = None
         label_error: dict[str, Any] | None = None
-        update_results: list[dict[str, Any]] = []
+        update_results: list[dict[str, Any]] | None = None
         if can_merge and should_merge:
             # Merge, then labels, then best-effort branch deletion — in that
             # order. merge_pr is the irreversible step: persist status="merged"
@@ -1606,16 +1606,9 @@ class OrchestratorApp:
                         "add_failures": result.add_failures,
                         "remove_failures": result.remove_failures,
                     }
-            try:
-                if self.config.auto_merge.delete_branch:
-                    head_ref = str(pr.get("headRefName") or "")
-                    branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
-            except GitHubError as exc:
-                # Branch deletion failure is separate from label transition failure
-                if label_error is None:
-                    label_error = {"branch_deletion_error": str(exc)}
-                else:
-                    label_error["branch_deletion_error"] = str(exc)
+            if self.config.auto_merge.delete_branch:
+                head_ref = str(pr.get("headRefName") or "")
+                branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
             # Update remaining open agent PRs after successful merge (if configured)
             if self.config.auto_merge.update_open_prs:
                 update_results = self._update_open_agent_prs(pr_number)
@@ -1822,10 +1815,15 @@ class OrchestratorApp:
         - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
 
         Per-PR failures (conflicts, network errors) are reported as values and
-        never abort the batch operation.
+        never abort the batch operation. A GitHubError from pr_list is also
+        reported as a value and never propagates.
         """
         results: list[dict[str, Any]] = []
-        prs = self.gh.pr_list()
+        try:
+            prs = self.gh.pr_list()
+        except GitHubError as exc:
+            # Report the pr_list failure as a value instead of raising
+            return [{"error": f"pr_list failed: {exc}"}]
         branch_prefix = self.config.dispatch.branch_prefix
 
         for pr in prs:
