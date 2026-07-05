@@ -238,9 +238,7 @@ def test_worker_template_title_format_passes_janitor() -> None:
     """
     # Example title following the updated worker template format
     title = "fix(janitor): align worker template with conventional-commit requirements"
-    verdict = run_janitor(
-        _green_pr(title=title), _green_checks(), _config(), repo_root=Path.cwd()
-    )
+    verdict = run_janitor(_green_pr(title=title), _green_checks(), _config(), repo_root=Path.cwd())
     assert not any("conventional-commit" in w.lower() for w in verdict.warnings), (
         f"Worker template title format '{title}' should not trigger janitor warning"
     )
