@@ -45,6 +45,7 @@ class DriftItem:
     detail: str
     fix_actions: tuple[str, ...]
     remove_labels: tuple[str, ...] = ()
+    add_labels: tuple[str, ...] = ()
 
 
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
@@ -102,6 +103,7 @@ def detect_drift(
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
     open_prs_by_number: dict[int, dict[str, Any]] = {}
+    open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
     for pr in prs:
         pr_number = pr.get("number")
         if pr_number is None:
@@ -117,6 +119,8 @@ def detect_drift(
         )
         if issue_number is not None:
             prs_linking_issue.setdefault(issue_number, []).append(pr)
+            if gh_state == "OPEN":
+                open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
         state_entry = state_prs.get(str(pr_number))
 
@@ -290,7 +294,8 @@ def detect_drift(
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # A dead worker with no open PR is recoverable and should be relabeled
                     # as dispatchable (remove active labels, ensure ready label present)
-                    if record.issue_number not in prs_linking_issue:
+                    # Only count OPEN PRs (not CLOSED/MERGED) for the guard
+                    if record.issue_number not in open_prs_by_issue:
                         issue = issues_by_number.get(record.issue_number)
                         if issue:
                             issue_labels = label_names(issue)
@@ -301,10 +306,12 @@ def detect_drift(
                                     f"remove label '{label}' from issue #{record.issue_number}"
                                     for label in sorted(active_labels)
                                 ]
+                                add_labels: tuple[str, ...] = ()
                                 if labels_cfg.ready not in issue_labels:
                                     fix_actions.append(
                                         f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
                                     )
+                                    add_labels = (labels_cfg.ready,)
 
                                 drift.append(
                                     DriftItem(
@@ -318,6 +325,7 @@ def detect_drift(
                                         ),
                                         fix_actions=tuple(fix_actions),
                                         remove_labels=tuple(sorted(active_labels)),
+                                        add_labels=add_labels,
                                     )
                                 )
 
@@ -348,7 +356,8 @@ def detect_drift(
                         )
 
                     # Issue #118: reconcile labels for dead sessions with no open PR
-                    if record.issue_number not in prs_linking_issue:
+                    # Only count OPEN PRs (not CLOSED/MERGED) for the guard
+                    if record.issue_number not in open_prs_by_number:
                         issue = issues_by_number.get(record.issue_number)
                         if issue:
                             issue_labels = label_names(issue)
@@ -358,10 +367,12 @@ def detect_drift(
                                     f"remove label '{label}' from issue #{record.issue_number}"
                                     for label in sorted(active_labels)
                                 ]
+                                add_labels: tuple[str, ...] = ()
                                 if labels_cfg.ready not in issue_labels:
                                     fix_actions.append(
                                         f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
                                     )
+                                    add_labels = (labels_cfg.ready,)
 
                                 drift.append(
                                     DriftItem(
@@ -375,6 +386,7 @@ def detect_drift(
                                         ),
                                         fix_actions=tuple(fix_actions),
                                         remove_labels=tuple(sorted(active_labels)),
+                                        add_labels=add_labels,
                                     )
                                 )
 
@@ -435,14 +447,9 @@ def apply_fixes(
                 # Remove active labels
                 for label in item.remove_labels:
                     gh.remove_issue_label(item.issue_number, label)
-                # Add ready label if needed (parsed from fix_actions)
-                for action in item.fix_actions:
-                    if action.startswith("add label '") and action.endswith(
-                        f"' to issue #{item.issue_number}"
-                    ):
-                        label = action.split("'")[1]
-                        gh.add_issue_label(item.issue_number, label)
-                        break
+                # Add ready label if needed (structured field)
+                for label in item.add_labels:
+                    gh.add_issue_label(item.issue_number, label)
 
         new_state = append_event(
             new_state,

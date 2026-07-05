@@ -157,7 +157,7 @@ class GitHub:
         return result if isinstance(result, list) else []
 
     def add_issue_label(self, number: int, label: str) -> None:
-        self.run(["issue", "edit", str(number), "--add-label", label])
+        self.run(["issue", "edit", str(number), "--add-label", label], allow_failure=True)
 
     def remove_issue_label(self, number: int, label: str) -> None:
         self.run(["issue", "edit", str(number), "--remove-label", label], allow_failure=True)

@@ -642,7 +642,7 @@ def test_detect_drift_session_failed_relabeled_no_open_pr(tmp_path: Path) -> Non
 
 
 def test_detect_drift_session_failed_with_open_pr_no_relabel(tmp_path: Path) -> None:
-    """Issue #118: dead session with open PR should NOT trigger label reconciliation."""
+    """Issue #118: dead session with OPEN PR should NOT trigger label reconciliation."""
     from charlie_work.devin_shell import SessionRecord
     from datetime import UTC, datetime
 
@@ -695,6 +695,66 @@ def test_detect_drift_session_failed_with_open_pr_no_relabel(tmp_path: Path) -> 
     assert len(relabel_drift) == 0
 
 
+def test_detect_drift_session_failed_with_closed_pr_still_relabeled(tmp_path: Path) -> None:
+    """Issue #118: dead session with CLOSED PR should still trigger label reconciliation.
+
+    The guard only counts OPEN PRs, not CLOSED/MERGED. A prior closed PR should
+    not permanently suppress the relabel.
+    """
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(1, "CLOSED", head_ref="agent/issue-42-x")],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    # Create a sessions directory with a dead session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run detect_drift with repo_root to enable session checking
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Should detect both provider throttle and session_failed_relabeled
+    throttle_drift = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert len(throttle_drift) == 1
+    assert throttle_drift[0].issue_number == 42
+
+    relabel_drift = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert len(relabel_drift) == 1
+    assert relabel_drift[0].issue_number == 42
+    assert config.labels.in_progress in relabel_drift[0].remove_labels
+
+
 def test_apply_fixes_session_failed_relabeled(tmp_path: Path) -> None:
     """Issue #118: apply_fixes should remove active labels and add ready label."""
     config = OrchestratorConfig()
@@ -704,7 +764,7 @@ def test_apply_fixes_session_failed_relabeled(tmp_path: Path) -> None:
     )
     state = empty_state()
 
-    # Create a session_failed_relabeled drift item
+    # Create a session_failed_relabeled drift item with structured add_labels
     drift = [
         DriftItem(
             kind="session_failed_relabeled",
@@ -716,6 +776,7 @@ def test_apply_fixes_session_failed_relabeled(tmp_path: Path) -> None:
                 f"add label '{config.labels.ready}' to issue #42",
             ),
             remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.ready,),
         )
     ]
 
@@ -754,6 +815,7 @@ def test_apply_fixes_session_failed_relabeled_idempotent(tmp_path: Path) -> None
                 f"add label '{config.labels.ready}' to issue #42",
             ),
             remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.ready,),
         )
     ]
 
@@ -819,5 +881,5 @@ def test_detect_drift_session_failed_already_has_ready_label(tmp_path: Path) -> 
     assert len(relabel_drift) == 1
     assert relabel_drift[0].issue_number == 42
     assert config.labels.in_progress in relabel_drift[0].remove_labels
-    # Should not have add ready label action since it's already present
-    assert not any("add label" in action for action in relabel_drift[0].fix_actions)
+    # Should not have add ready label in structured field since it's already present
+    assert relabel_drift[0].add_labels == ()

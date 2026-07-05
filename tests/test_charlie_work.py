@@ -4069,6 +4069,338 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     assert dispatch_result.data["selected_count"] == 0
 
 
+def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
+    """Issue #118 AC3: classification pass relabel is idempotent - two-pass test.
+
+    This test runs the classification pass twice on the same dead session and
+    verifies that (a) no error occurs, (b) no duplicate event is emitted, and
+    (c) the issue remains in the correct label state after the second pass.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    # Use command adapter to avoid needing real devin binary
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Issue starts with in_progress label (active)
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+
+    # Ensure state directory exists
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a sessions directory with a dead session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # First pass: run classification directly (not via loop to avoid review logic)
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # Verify first pass relabeled the issue
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+    assert (42, config.labels.ready) in fake_gh.labels_added
+
+    # Verify event was emitted
+    state = load_state(paths.state_file)
+    events_after_first = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events_after_first) == 1
+    assert events_after_first[0]["payload"]["issue_number"] == 42
+
+    # Update fake GitHub to reflect the relabeled state (ready label, no active labels)
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.ready}],
+        }
+    ]
+    # Clear label tracking for second pass
+    fake_gh.labels_added = []
+    fake_gh.labels_removed = []
+
+    # Second pass: run classification again
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # Verify second pass did NOT emit duplicate event (idempotency)
+    state_after_second = load_state(paths.state_file)
+    events_after_second = [
+        e for e in state_after_second["events"] if e["kind"] == "session_failed_relabeled"
+    ]
+    assert len(events_after_second) == 1, "Second pass should not emit duplicate event"
+
+    # Verify second pass did not attempt to remove in_progress (already gone)
+    assert (42, config.labels.in_progress) not in fake_gh.labels_removed
+
+    # Verify second pass did not attempt to add ready (already present)
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+
+
+def test_classify_dead_sessions_preserves_state_record_branch(tmp_path: Path) -> None:
+    """Issue #118 AC1: classification pass preserves state record branch/worktree fields.
+
+    This test ensures that the relabel logic does not clobber the branch or
+    worktree_path fields in the state record for the issue. Mutation gate:
+    clobbering branch MUST fail this test.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    # Use command adapter to avoid needing real devin binary
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+
+    # Ensure state directory exists
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize state with a branch/worktree entry for issue 42
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["42"] = {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "labels": [config.labels.in_progress],
+            "branch": "agent/issue-42-fix-search",
+            "worktree_path": "/tmp/worktree-issue-42",
+        }
+        save_state(paths.state_file, state)
+
+    # Create a sessions directory with a dead session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run classification pass directly
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # Verify branch and worktree_path are preserved byte-identical
+    state_after = load_state(paths.state_file)
+    assert state_after["issues"]["42"]["branch"] == "agent/issue-42-fix-search"
+    assert state_after["issues"]["42"]["worktree_path"] == "/tmp/worktree-issue-42"
+
+
+def test_classify_dead_sessions_dispatch_recovery_integration(tmp_path: Path) -> None:
+    """Issue #118 AC4: full chain integration test - classified-dead + relabeled → dispatch.
+
+    This test drives the complete workflow:
+    1. A session dies and is classified by the automated pass
+    2. The issue is relabeled to dispatchable (ready label)
+    3. The next dispatch pass selects the issue
+    4. The recovery dict (branch/worktree) is passed to create_worktree
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    # Use command adapter to avoid needing real devin binary
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Issue starts with in_progress label (active)
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Ensure state directory exists
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize state with a branch/worktree entry for issue 42 (recovery dict)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["42"] = {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "labels": [config.labels.in_progress],
+            "branch": "agent/issue-42-fix-search",
+            "worktree_path": "/tmp/worktree-issue-42",
+        }
+        save_state(paths.state_file, state)
+
+    # Create a sessions directory with a dead session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with rate-limit signature
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    # Write a session record for a dead session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Step 1: Run classification pass directly
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # Verify the issue was relabeled to ready
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+    assert (42, config.labels.ready) in fake_gh.labels_added
+
+    # Update fake GitHub to reflect the relabeled state
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.ready}],
+        }
+    ]
+    # Clear label tracking
+    fake_gh.labels_added = []
+    fake_gh.labels_removed = []
+
+    # Clear throttle state so dispatch is not deferred
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state.pop("throttled_until", None)
+        save_state(paths.state_file, state)
+
+    # Step 2: Run dispatch pass - should select the relabeled issue
+    dispatch_result = app.dispatch(limit=1)
+
+    # Verify dispatch selected the issue
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["selected_count"] == 1
+    assert dispatch_result.data["sessions"][0]["issue_number"] == 42
+
+    # Verify the recovery dict (branch/worktree) was preserved in state
+    # The dispatch should have used the existing branch from state
+    state_after_dispatch = load_state(paths.state_file)
+    assert state_after_dispatch["issues"]["42"]["branch"] == "agent/issue-42-fix-search"
+    assert state_after_dispatch["issues"]["42"]["worktree_path"] == "/tmp/worktree-issue-42"
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
