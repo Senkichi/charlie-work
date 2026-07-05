@@ -1533,7 +1533,7 @@ def test_run_cross_family_sanitizes_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """run_cross_family_review must sanitize the environment before spawning the subprocess."""
-    from charlie_work.cross_family import _sanitize_env
+    from charlie_work.env_sanitize import sanitize_env
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -1542,7 +1542,7 @@ def test_run_cross_family_sanitizes_environment(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(repo_root)
+    env = sanitize_env(repo_root)
 
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when repo has no .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (
@@ -1554,7 +1554,7 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When repo has .venv, VIRTUAL_ENV must be set to that path."""
-    from charlie_work.cross_family import _sanitize_env
+    from charlie_work.env_sanitize import sanitize_env
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -1565,7 +1565,7 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(repo_root)
+    env = sanitize_env(repo_root)
 
     assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (

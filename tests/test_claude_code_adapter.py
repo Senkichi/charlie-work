@@ -12,13 +12,13 @@ import pytest
 from charlie_work import claude_code
 from charlie_work.claude_code import (
     ClaudeWorkerRecord,
-    _sanitize_env,
     is_worker_alive,
     launch_claude_worker,
     probe_claude,
     read_worker_records,
     update_worker_record_with_failure_classification,
 )
+from charlie_work.env_sanitize import sanitize_env
 from charlie_work.worktree import WorktreeInfo
 
 
@@ -899,6 +899,285 @@ def test_launch_claude_worker_prompt_write_failure_tears_down_worktree(
 
 
 # ---------------------------------------------------------------------------
+# Real-git integration tests: branch delete/preserve semantics
+# ---------------------------------------------------------------------------
+
+
+def test_launch_failure_then_retry_succeeds(tmp_path: Path) -> None:
+    """Launch failure should clean up branch and worktree, allowing retry to succeed."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Initialize a real git repo for the worktree to use
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-42-retry"
+
+    # First launch fails (binary doesn't exist)
+    record1 = launch_claude_worker(
+        42,
+        branch_name,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+    )
+
+    assert not record1.ok
+    assert "failed to launch claude" in record1.error
+
+    # Verify the branch is deleted after the failure
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name not in result.stdout
+
+    # Second launch should succeed (using fake claude script)
+    record2 = launch_claude_worker(
+        42,
+        branch_name,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert record2.ok
+    assert record2.branch == branch_name
+
+
+def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
+    """Rework-mode launch failure should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Initialize a real git repo
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-43-rework"
+
+    # Create the branch first (simulating a previous PR cycle)
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Rework-mode launch fails (binary doesn't exist)
+    record = launch_claude_worker(
+        43,
+        branch_name,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("this-binary-does-not-exist-xyz",),
+        rework=True,
+    )
+
+    assert not record.ok
+    assert "failed to launch claude" in record.error
+
+    # Verify the branch is preserved (not deleted)
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_rework_prompt_write_failure_preserves_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Rework-mode prompt-write failure should preserve the existing branch."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Initialize a real git repo
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    branch_name = "agent/issue-44-rework-prompt-fail"
+
+    # Create the branch first (simulating a previous PR cycle)
+    subprocess.run(
+        ["git", "branch", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Verify the branch exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Monkeypatch Path.write_text to raise OSError on the prompt file
+    original_write_text = Path.write_text
+
+    def failing_write_text(self, content, encoding=None, errors=None):
+        if self.name == ".orchestrator-prompt.md":
+            raise OSError("Mock prompt write failure")
+        return original_write_text(self, content, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    # Rework-mode launch fails on prompt write
+    record = launch_claude_worker(
+        44,
+        branch_name,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        rework=True,
+    )
+
+    assert not record.ok
+    assert "failed to write prompt file" in record.error
+
+    # Verify the branch is preserved (not deleted)
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression: VIRTUAL_ENV sanitization
 # ---------------------------------------------------------------------------
 
@@ -914,7 +1193,7 @@ def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when worktree has no .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (
@@ -935,7 +1214,7 @@ def test_sanitize_env_sets_worktree_venv_when_present(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
         "VIRTUAL_ENV must be set to worktree .venv"
@@ -956,7 +1235,7 @@ def test_sanitize_env_preserves_other_env_vars(
     monkeypatch.setenv("HOME", "/home/user")
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert env.get("PATH") == "/usr/bin:/bin", "PATH must be preserved"
     assert env.get("HOME") == "/home/user", "HOME must be preserved"
@@ -964,7 +1243,7 @@ def test_sanitize_env_preserves_other_env_vars(
 
 
 def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """launch_claude_worker must sanitize the environment before spawning the worker."""
+    """launch_claude_worker must sanitize the environment before spawning the worker (stdin-fed path)."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
@@ -1007,13 +1286,6 @@ def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.Monkey
     deadline = time.time() + 10
     while not probe_path.exists() and time.time() < deadline:
         time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # Both variables must be absent (worktree has no .venv in this test)
-    assert received == "<unset>|<unset>", (
-        f"Both VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be absent, got: {received}"
-    )
 
 
 def test_launch_sanitizes_with_worktree_venv(
@@ -1084,7 +1356,7 @@ def test_launch_sanitizes_with_worktree_venv(
 def test_launch_preserves_worker_env_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Explicit worker_env VIRTUAL_ENV override must survive sanitization."""
+    """Explicit worker_env VIRTUAL_ENV override must survive sanitization (no worktree .venv)."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
@@ -1136,4 +1408,74 @@ def test_launch_preserves_worker_env_override(
     # User-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped
     assert received == "/custom/.venv|<unset>|custom-value", (
         f"User VIRTUAL_ENV override must win, got: {received}"
+    )
+
+
+def test_launch_override_precedence_with_worktree_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User-provided VIRTUAL_ENV override must win over worktree .venv (merge order test)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+
+    # Create a fake worktree with .venv
+    worktree_path = tmp_path / "worktrees" / "agent-issue-117-override-venv"
+    worktree_path.mkdir(parents=True)
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+
+    def fake_create_worktree(*args, **kwargs):
+        return WorktreeInfo(
+            path=worktree_path, branch="agent/issue-117-override-venv", venv_junction=None
+        )
+
+    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+
+    # Seed parent env with leak variables
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    # Script that writes the actual env it received to a file
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-received.txt").write_text(
+                str(os.environ.get("VIRTUAL_ENV", "<unset>"))
+                + "|"
+                + str(os.environ.get("UV_PROJECT_ENVIRONMENT", "<unset>"))
+                + "|"
+                + str(os.environ.get("CUSTOM_VAR", "<unset>")),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        117,
+        "agent/issue-117-override-venv",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+        env={"VIRTUAL_ENV": "/custom/.venv", "CUSTOM_VAR": "custom-value"},
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-received.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    received = probe_path.read_text(encoding="utf-8")
+    # User-provided VIRTUAL_ENV must win over worktree .venv (merge order: sanitizer first, then user overrides)
+    assert received == "/custom/.venv|<unset>|custom-value", (
+        f"User VIRTUAL_ENV override must win over worktree .venv, got: {received}"
     )

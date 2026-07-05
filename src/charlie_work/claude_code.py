@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -176,33 +177,6 @@ def _error_record(
     )
 
 
-def _sanitize_env(worktree_path: Path) -> dict[str, str]:
-    """Return a sanitized environment for worker subprocesses.
-
-    Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
-    to prevent the orchestrator's venv from leaking into worker sessions. If the
-    worktree contains a .venv directory, VIRTUAL_ENV is set to that path instead
-    of being dropped.
-
-    This is a defense-in-depth measure: workers should resolve their own
-    environment via uv run --active or similar, not inherit the orchestrator's.
-    """
-    env = dict(os.environ)
-    worktree_venv = worktree_path / ".venv"
-
-    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
-    env.pop("UV_PROJECT_ENVIRONMENT", None)
-
-    if worktree_venv.is_dir():
-        # Worktree has its own venv — use it
-        env["VIRTUAL_ENV"] = str(worktree_venv)
-    else:
-        # No worktree venv — drop VIRTUAL_ENV to prevent leaks
-        env.pop("VIRTUAL_ENV", None)
-
-    return env
-
-
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -315,7 +289,7 @@ def launch_claude_worker(
     # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
     # leaks from the orchestrator, then merge user-provided overrides on top.
     worker_env = {
-        **_sanitize_env(worktree.path),
+        **sanitize_env(worktree.path),
         **{str(k): str(v) for k, v in (env or {}).items()},
     }
 
@@ -520,5 +494,4 @@ __all__ = [
     "probe_claude",
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
-    "_sanitize_env",
 ]
