@@ -191,6 +191,60 @@ def test_launch_cwd_is_worktree_not_repo_root(
     )
 
 
+def test_launch_devin_session_worker_env_overrides_sanitize_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker_env overrides sanitize_env: operator-provided VIRTUAL_ENV wins.
+
+    This is a mutation gate for the merge order in launch_devin_session:
+    the current order is {**sanitize_env(...), **worker_env}, so worker_env
+    clobbers sanitized keys. If the order is inverted (worker_env first,
+    sanitize_env clobbering it), this test fails.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Set a VIRTUAL_ENV in the orchestrator's environment (which sanitize_env
+    # would normally strip). Then provide an explicit override via worker_env.
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/venv")
+
+    # Script writes VIRTUAL_ENV to stdout so we can verify it
+    env_probe_script = tmp_path / "env_probe.py"
+    env_probe_script.write_text(
+        "import os, sys\nsys.stdout.write(os.environ.get('VIRTUAL_ENV', '<unset>') + '\\n')\nsys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    record = launch_devin_session(
+        140,
+        "agent/issue-140-env-override",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_probe_script)),
+        worker_env={"VIRTUAL_ENV": "/custom/override/venv"},
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    # Give the subprocess a moment, then verify VIRTUAL_ENV in the log
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text = Path(record.log_path).read_text(encoding="utf-8")
+        if log_text.strip():
+            break
+        time.sleep(0.05)
+    log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
+    # worker_env VIRTUAL_ENV override wins over sanitize_env's stripping
+    assert log_text == "/custom/override/venv"
+
+
 # ---------------------------------------------------------------------------
 # Core launch behaviour
 # ---------------------------------------------------------------------------

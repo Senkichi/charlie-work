@@ -185,6 +185,11 @@ class DevinConfig:
     # WITHOUT editing the suite's pyproject addopts — CI never sees this var,
     # so it keeps full parallelism. A non-mapping value is rejected with
     # ConfigError at load; values -> str.
+    #
+    # Merge order: worker_env is merged AFTER sanitize_env, so operator-provided
+    # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
+    # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
+    # intentional: explicit operator overrides win over sanitization.
     worker_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -208,6 +213,11 @@ class ClaudeCodeConfig:
     # pyproject addopts — CI never sees this var, so it keeps full parallelism.
     # See docs/RUNBOOK.md "Local host saturation ceiling (claude-code adapter)".
     # A non-mapping value is rejected with ConfigError at load; values -> str.
+    #
+    # Merge order: worker_env is merged AFTER sanitize_env, so operator-provided
+    # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
+    # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
+    # intentional: explicit operator overrides win over sanitization.
     worker_env: dict[str, str] = field(default_factory=dict)
 
 
