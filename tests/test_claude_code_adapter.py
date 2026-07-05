@@ -29,8 +29,25 @@ def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
     return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
 
 
+def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
+    """Create a fake worktree with a .venv directory.
+
+    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
+    which makes the merge order testable: if worker_env is merged first,
+    sanitize_env will clobber the override.
+    """
+    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    (worktree_path / ".venv").mkdir()
+    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
+
+
 def _install_fake_create_worktree(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, calls: list[dict] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    calls: list[dict] | None = None,
+    with_venv: bool = False,
 ) -> None:
     def fake_create_worktree(
         repo_root,
@@ -56,6 +73,8 @@ def _install_fake_create_worktree(
                     "recovery": recovery,
                 }
             )
+        if with_venv:
+            return _fake_worktree_with_venv(tmp_path, branch)
         return _fake_worktree(tmp_path, branch)
 
     monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
@@ -205,6 +224,65 @@ def test_launch_claude_worker_injects_worker_env(
     assert probe_path.exists()
     # Injected var present AND orchestrator env inherited (merge, not replace).
     assert probe_path.read_text(encoding="utf-8") == "2|inherited-value"
+
+
+def test_launch_claude_worker_worker_env_overrides_sanitize_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """worker_env overrides sanitize_env: operator-provided VIRTUAL_ENV wins.
+
+    This is a mutation gate for the merge order in launch_claude_worker:
+    the current order is {**sanitize_env(...), **worker_env}, so worker_env
+    clobbers sanitized keys. If the order is inverted (worker_env first,
+    sanitize_env clobbering it), this test fails.
+
+    The fixture uses with_venv=True so sanitize_env actively SETS VIRTUAL_ENV
+    (instead of POP-ing it), making the merge order sensitive.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+
+    # Set a VIRTUAL_ENV in the orchestrator's environment (which sanitize_env
+    # would normally strip). Then provide an explicit override via worker_env.
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/venv")
+
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-probe.txt").write_text(
+                os.environ.get("VIRTUAL_ENV", "<unset>"),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        140,
+        "agent/issue-140-env-override",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+        env={"VIRTUAL_ENV": "/custom/override/venv"},
+    )
+
+    assert record.ok
+    probe_path = Path(record.worktree_path) / "env-probe.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    # worker_env VIRTUAL_ENV override wins over sanitize_env's stripping
+    assert probe_path.read_text(encoding="utf-8") == "/custom/override/venv"
 
 
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
