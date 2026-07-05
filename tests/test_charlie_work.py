@@ -7259,23 +7259,6 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # Mock is_session_alive to return True for our fake PID
-    # This simulates a zombie session where PID is alive but agent is dead
-    import charlie_work.devin_shell as devin_shell_module
-
-    original_is_alive = devin_shell_module.is_session_alive
-
-    def mock_is_alive(record):
-        if record.issue_number == 109:
-            return True  # Pretend PID is alive
-        return original_is_alive(record)
-
-    import charlie_work.workflow as workflow_module
-
-    # We need to patch the function after it's imported in workflow
-    # Since workflow imports is_session_alive locally, we patch at the module level
-    original_workflow_is_alive = None
-
     # For this test, we'll just verify the stalled section exists in the data structure
     # The actual stall detection logic is tested in test_process_utils.py
     result = app.status()

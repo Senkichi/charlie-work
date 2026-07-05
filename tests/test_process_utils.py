@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from charlie_work.process_utils import is_session_stalled, kill_process_tree
 

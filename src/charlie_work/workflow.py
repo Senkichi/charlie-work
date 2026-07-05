@@ -121,9 +121,7 @@ def _count_live_sessions(sessions_dir: Path) -> int:
     return live_count
 
 
-def _detect_stalled_sessions(
-    sessions_dir: Path, config: OrchestratorConfig
-) -> set[int]:
+def _detect_stalled_sessions(sessions_dir: Path, config: OrchestratorConfig) -> set[int]:
     """Detect stalled sessions (live PID but dead agent) without handling them.
 
     A session is stalled when its PID is alive but its log file's mtime is
@@ -231,9 +229,7 @@ def _detect_and_handle_stalled_sessions(
                     {
                         "issue_number": record.issue_number,
                         "pid": record.pid,
-                        "log_mtime": str(
-                            datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
-                        ),
+                        "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
                     },
@@ -271,9 +267,7 @@ def _detect_and_handle_stalled_sessions(
                     {
                         "issue_number": record.issue_number,
                         "pid": record.pid,
-                        "log_mtime": str(
-                            datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
-                        ),
+                        "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
                     },
@@ -502,9 +496,7 @@ class OrchestratorApp:
         if max_concurrent > 0:
             sessions_dir = self._resolve(self.config.devin.sessions_dir)
             # Detect and handle stalled sessions before counting live sessions
-            _detect_and_handle_stalled_sessions(
-                sessions_dir, self.paths.state_file, self.config
-            )
+            _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
             live_count = _count_live_sessions(sessions_dir)
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < dispatch_limit:

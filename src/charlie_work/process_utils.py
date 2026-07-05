@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -49,9 +48,7 @@ def parse_proc_stat_starttime(stat_text: str) -> int | None:
         return None
 
 
-def is_session_stalled(
-    log_path: Path, stall_threshold_minutes: int
-) -> tuple[bool, str | None]:
+def is_session_stalled(log_path: Path, stall_threshold_minutes: int) -> tuple[bool, str | None]:
     """Check if a session is stalled based on log file mtime and terminal error markers.
 
     A session is stalled if:
