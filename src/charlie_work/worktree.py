@@ -30,6 +30,7 @@ class WorktreeInfo:
     path: Path
     branch: str
     venv_junction: Path | None
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
 
 def _slugify(value: str, *, max_length: int = 80) -> str:
@@ -55,6 +56,124 @@ def _has_origin_remote(repo_root: Path) -> bool:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     return result.ok
+
+
+def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
+    """Check if a branch exists on the origin remote.
+
+    Returns True if the branch exists, False if it does not exist, or None if the probe
+    failed (network/auth error). This distinguishes 'remote ref missing' from 'broken remote':
+    - exists: exit 0 AND non-empty stdout
+    - missing: exit 0 AND empty stdout
+    - probe-failed: nonzero exit (e.g., network error, auth failure)
+    """
+    result = run_captured(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        # Probe failed (network error, auth failure, etc.)
+        return None
+    if result.stdout.strip():
+        # Branch exists
+        return True
+    # Branch does not exist (exit 0 with empty stdout)
+    return False
+
+
+def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
+    """Salvage a worktree with uncommitted changes or unpushed commits.
+
+    Commits the current state to a salvage ref, pushes it to origin, and returns
+    the salvage ref name. Returns None if the worktree is clean (nothing to salvage).
+    Raises RuntimeError if the salvage push fails.
+    """
+    from .state import utc_now
+
+    # Check if there's anything to salvage
+    dirty_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+    has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
+
+    # Check for unpushed commits (only if branch exists on origin)
+    has_unpushed = False
+    remote_exists = None
+    if _has_origin_remote(repo_root):
+        remote_exists = _remote_branch_exists(repo_root, branch)
+    if remote_exists is True:
+        unpushed_result = run_captured(
+            ["git", "log", f"origin/{branch}..HEAD", "--oneline"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        has_unpushed = unpushed_result.ok and bool(unpushed_result.stdout.strip())
+    else:
+        # Branch doesn't exist on origin: any commits are considered "unpushed"
+        # (killed before first push scenario)
+        # Check if HEAD has any commits beyond the initial commit
+        merge_base_result = run_captured(
+            ["git", "merge-base", "HEAD", "main"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if merge_base_result.ok:
+            merge_base = merge_base_result.stdout.strip()
+            rev_list_result = run_captured(
+                ["git", "rev-list", "--count", f"{merge_base}..HEAD"],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            has_unpushed = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+        else:
+            # If merge-base fails, assume has commits to be safe
+            has_unpushed = True
+
+    if not has_dirty and not has_unpushed:
+        return None
+
+    # Create salvage ref name
+    timestamp = utc_now().replace(":", "-").replace("+00:00", "Z")
+    salvage_ref = f"salvage/{branch.replace('/', '-')}-{timestamp}"
+
+    # Commit dirty changes if any
+    if has_dirty:
+        run_captured(
+            ["git", "add", "-A"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        run_captured(
+            ["git", "commit", "-m", f"Salvage before worktree cleanup: {timestamp}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+
+    # Create the salvage ref
+    run_captured(
+        ["git", "update-ref", f"refs/{salvage_ref}", "HEAD"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    # Push the salvage ref if origin exists
+    if _has_origin_remote(repo_root):
+        push_result = run_captured(
+            ["git", "push", "origin", f"refs/{salvage_ref}:refs/{salvage_ref}"],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not push_result.ok:
+            raise RuntimeError(
+                f"Failed to push salvage ref {salvage_ref!r} to origin: "
+                f"{push_result.error or push_result.stderr}"
+            )
+
+    return salvage_ref
 
 
 def is_junction(path: Path) -> bool:
@@ -128,6 +247,7 @@ def create_worktree(
     worktree_path = target_dir / _slugify(branch)
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
+    reclaimed: str | None = None
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
         recovery_branch = recovery.get("branch_name")
@@ -137,67 +257,50 @@ def create_worktree(
                 f"requested branch {branch!r}"
             )
 
-        # Check if a worktree exists at the expected path (by slug)
-        existing_worktrees = list_worktrees(repo_root)
-        existing_wt = next(
-            (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
-            None,
-        )
-
-        if existing_wt:
-            # AC #3: Fail loudly if the worktree at the expected path is on a FOREIGN branch
-            # (i.e., a worktree whose branch does not match our recovery record).
-            # This protects against clobbering work that is not ours.
-            wt_branch = existing_wt.get("branch", "")
-            # Normalize branch names for comparison (strip refs/heads/ prefix)
-            normalized_wt_branch = wt_branch.replace("refs/heads/", "")
-            if normalized_wt_branch != branch and normalized_wt_branch != f"refs/heads/{branch}":
+        # Issue #110: Check if the branch exists on origin before attempting fetch
+        # If the branch doesn't exist on origin (killed before first push), fall through
+        # to fresh dispatch instead of failing with fetch error 128
+        # If the probe fails (network/auth error), abort dispatch to avoid data loss
+        remote_exists = None
+        if _has_origin_remote(repo_root):
+            remote_exists = _remote_branch_exists(repo_root, branch)
+            if remote_exists is None:
+                # Probe failed: abort dispatch to avoid triggering fallback on transient error
                 raise RuntimeError(
-                    f"Recovery mode found leftover worktree at {worktree_path} on foreign branch {normalized_wt_branch!r}, "
-                    f"but recovery record specifies branch {branch!r}. "
-                    f"This is not our crashed worker — refusing to clobber foreign work."
+                    f"Failed to probe remote branch {branch!r} for recovery: "
+                    f"transient network or auth error. Aborting dispatch to avoid data loss."
                 )
-
-            # Worktree exists on the correct branch: check if it has commits beyond the merge-base
-            wt_path = Path(existing_wt["worktree"])
-            # Check for dirty working tree
-            dirty_result = run_captured(
-                ["git", "status", "--porcelain"],
-                cwd=wt_path,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        if remote_exists is False:
+            # Branch doesn't exist on origin - this is a killed-before-push session
+            # Fall through to fresh dispatch (rework=False) after cleaning up local state
+            reclaimed = "fetch-fallback"
+            # Clean up any local worktree/branch that might exist
+            existing_worktrees = list_worktrees(repo_root)
+            existing_wt = next(
+                (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
+                None,
             )
-            has_dirty = dirty_result.ok and bool(dirty_result.stdout.strip())
-
-            # Check for commits beyond merge-base with base_ref
-            merge_base_result = run_captured(
-                ["git", "merge-base", base_ref, branch],
+            if existing_wt:
+                wt_path = Path(existing_wt["worktree"])
+                # Check if it's on the correct branch (should be, since it's our recovery record)
+                wt_branch = existing_wt.get("branch", "")
+                normalized_wt_branch = wt_branch.replace("refs/heads/", "")
+                if (
+                    normalized_wt_branch == branch
+                    or normalized_wt_branch == f"refs/heads/{branch}"
+                ):
+                    # It's our worktree - remove it
+                    if not remove_worktree(repo_root, wt_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to remove leftover worktree {wt_path} for recovery"
+                        )
+            # Delete the local branch if it exists
+            branch_result = run_captured(
+                ["git", "branch", "--list", branch],
                 cwd=repo_root,
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
-            if merge_base_result.ok:
-                merge_base = merge_base_result.stdout.strip()
-                # Count commits from merge-base to branch tip
-                rev_list_result = run_captured(
-                    ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
-                    cwd=repo_root,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-                )
-                has_commits = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
-            else:
-                # If merge-base fails, assume has commits to be safe
-                has_commits = True
-
-            if has_commits or has_dirty:
-                # Has work: reuse via rework-style attach
-                # Fall through to rework logic below by setting rework=True
-                rework = True
-            else:
-                # Clean: remove worktree and branch, then create fresh
-                if not remove_worktree(repo_root, wt_path, force=True):
-                    raise RuntimeError(
-                        f"Failed to remove leftover worktree {wt_path} for recovery"
-                    )
-                # Delete the branch and check the result
+            if branch_result.ok and branch_result.stdout.strip():
                 branch_delete_result = run_captured(
                     ["git", "branch", "-D", branch],
                     cwd=repo_root,
@@ -208,17 +311,45 @@ def create_worktree(
                         f"Failed to delete branch {branch!r} for recovery: "
                         f"{branch_delete_result.error or branch_delete_result.stderr}"
                     )
-                # Fall through to fresh dispatch below (rework=False)
+            # Fall through to fresh dispatch below (rework=False)
         else:
-            # No worktree exists, but branch might exist
-            # Check if branch exists
-            branch_result = run_captured(
-                ["git", "branch", "--list", branch],
-                cwd=repo_root,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            # Branch exists on origin or no origin - proceed with normal recovery logic
+            # Check if a worktree exists at the expected path (by slug)
+            existing_worktrees = list_worktrees(repo_root)
+            existing_wt = next(
+                (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
+                None,
             )
-            if branch_result.ok and branch_result.stdout.strip():
-                # Branch exists without worktree: check commits and reuse or delete
+
+            if existing_wt:
+                # AC #3: Fail loudly if the worktree at the expected path is on a FOREIGN branch
+                # (i.e., a worktree whose branch does not match our recovery record).
+                # This protects against clobbering work that is not ours.
+                wt_branch = existing_wt.get("branch", "")
+                # Normalize branch names for comparison (strip refs/heads/ prefix)
+                normalized_wt_branch = wt_branch.replace("refs/heads/", "")
+                if (
+                    normalized_wt_branch != branch
+                    and normalized_wt_branch != f"refs/heads/{branch}"
+                ):
+                    raise RuntimeError(
+                        f"Recovery mode found leftover worktree at {worktree_path} on foreign branch {normalized_wt_branch!r}, "
+                        f"but recovery record specifies branch {branch!r}. "
+                        f"This is not our crashed worker — refusing to clobber foreign work."
+                    )
+
+                # Worktree exists on the correct branch: check if it has commits beyond the merge-base
+                wt_path = Path(existing_wt["worktree"])
+                # Check for dirty working tree
+                dirty_result = run_captured(
+                    ["git", "status", "--porcelain"],
+                    cwd=wt_path,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
+
+                # Check for commits beyond merge-base with base_ref
                 merge_base_result = run_captured(
                     ["git", "merge-base", base_ref, branch],
                     cwd=repo_root,
@@ -226,6 +357,7 @@ def create_worktree(
                 )
                 if merge_base_result.ok:
                     merge_base = merge_base_result.stdout.strip()
+                    # Count commits from merge-base to branch tip
                     rev_list_result = run_captured(
                         ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
                         cwd=repo_root,
@@ -233,13 +365,20 @@ def create_worktree(
                     )
                     has_commits = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
                 else:
+                    # If merge-base fails, assume has commits to be safe
                     has_commits = True
 
-                if has_commits:
-                    # Has commits: reuse via rework-style attach
+                if has_commits or has_dirty:
+                    # Has work: reuse via rework-style attach
+                    # Fall through to rework logic below by setting rework=True
                     rework = True
                 else:
-                    # Clean: delete branch and create fresh
+                    # Clean: remove worktree and branch, then create fresh
+                    if not remove_worktree(repo_root, wt_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to remove leftover worktree {wt_path} for recovery"
+                        )
+                    # Delete the branch and check the result
                     branch_delete_result = run_captured(
                         ["git", "branch", "-D", branch],
                         cwd=repo_root,
@@ -250,7 +389,53 @@ def create_worktree(
                             f"Failed to delete branch {branch!r} for recovery: "
                             f"{branch_delete_result.error or branch_delete_result.stderr}"
                         )
+                    reclaimed = "pruned"
                     # Fall through to fresh dispatch below (rework=False)
+            else:
+                # No worktree exists, but branch might exist
+                # Check if branch exists
+                branch_result = run_captured(
+                    ["git", "branch", "--list", branch],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                if branch_result.ok and branch_result.stdout.strip():
+                    # Branch exists without worktree: check commits and reuse or delete
+                    merge_base_result = run_captured(
+                        ["git", "merge-base", base_ref, branch],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                    if merge_base_result.ok:
+                        merge_base = merge_base_result.stdout.strip()
+                        rev_list_result = run_captured(
+                            ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
+                            cwd=repo_root,
+                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                        )
+                        has_commits = (
+                            rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+                        )
+                    else:
+                        has_commits = True
+
+                    if has_commits:
+                        # Has commits: reuse via rework-style attach
+                        rework = True
+                    else:
+                        # Clean: delete branch and create fresh
+                        branch_delete_result = run_captured(
+                            ["git", "branch", "-D", branch],
+                            cwd=repo_root,
+                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                        )
+                        if not branch_delete_result.ok:
+                            raise RuntimeError(
+                                f"Failed to delete branch {branch!r} for recovery: "
+                                f"{branch_delete_result.error or branch_delete_result.stderr}"
+                            )
+                        reclaimed = "pruned"
+                        # Fall through to fresh dispatch below (rework=False)
 
     if rework:
         # Rework mode: branch already exists, reuse or attach to it
@@ -309,7 +494,9 @@ def create_worktree(
                         # Clean up the orphan worktree (but not the branch, which already exists in rework mode)
                         remove_worktree(repo_root, worktree_path, force=True, branch=None)
                         raise
-            return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
+            return WorktreeInfo(
+                path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+            )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
             # Fetch first to ensure we materialize at the origin tip, but only if origin exists
@@ -336,6 +523,73 @@ def create_worktree(
                 )
     else:
         # Fresh dispatch: create new branch off base_ref
+        # Issue #110: Stale worktree reclamation before git worktree add
+        existing_worktrees = list_worktrees(repo_root)
+        existing_wt = next(
+            (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
+            None,
+        )
+        if existing_wt:
+            wt_path = Path(existing_wt["worktree"])
+            if not wt_path.exists():
+                # Directory missing but worktree still registered: prune it
+                run_captured(
+                    ["git", "worktree", "prune"],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                reclaimed = "pruned"
+            elif wt_path.exists():
+                # Directory exists: check if it's clean at the recorded base
+                dirty_result = run_captured(
+                    ["git", "status", "--porcelain"],
+                    cwd=wt_path,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
+                if has_dirty:
+                    # Dirty tree: salvage it
+                    try:
+                        salvage_ref = _salvage_worktree(repo_root, wt_path, branch)
+                        if salvage_ref:
+                            reclaimed = "salvaged"
+                    except RuntimeError as salvage_error:
+                        # Salvage push failed: surface the error and leave worktree intact
+                        raise RuntimeError(
+                            f"Failed to salvage stale worktree {wt_path} for fresh dispatch: {salvage_error}"
+                        ) from salvage_error
+                    # Remove the worktree (junction-safe)
+                    if not remove_worktree(repo_root, wt_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to remove stale worktree {wt_path} for fresh dispatch"
+                        )
+                else:
+                    # Clean at base: junction-safe remove and recreate
+                    if not remove_worktree(repo_root, wt_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to remove stale worktree {wt_path} for fresh dispatch"
+                        )
+                    reclaimed = "pruned"
+
+        # Delete the branch if it exists (it might be leftover from a killed session)
+        branch_result = run_captured(
+            ["git", "branch", "--list", branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if branch_result.ok and branch_result.stdout.strip():
+            branch_delete_result = run_captured(
+                ["git", "branch", "-D", branch],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not branch_delete_result.ok:
+                raise RuntimeError(
+                    f"Failed to delete branch {branch!r} for fresh dispatch: "
+                    f"{branch_delete_result.error or branch_delete_result.stderr}"
+                )
+
         result = run_captured(
             ["git", "worktree", "add", "-b", branch, str(worktree_path), base_ref],
             cwd=repo_root,
@@ -360,7 +614,9 @@ def create_worktree(
             remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
             raise
 
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction)
+    return WorktreeInfo(
+        path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+    )
 
 
 def remove_worktree(
