@@ -26,7 +26,7 @@ from .github import (
     parse_blockers,
 )
 from .janitor import check_operator_containment, run_janitor
-from .labels import transition
+from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
@@ -1022,15 +1022,20 @@ class OrchestratorApp:
                 # rest of the batch (orphaning already-launched workers).
                 save_state(self.paths.state_file, state)
                 if ok:
-                    try:
-                        transition(
-                            self.gh,
-                            self.config.labels,
-                            request.issue_number,
-                            "queued" if manual else "dispatched",
-                        )
-                    except GitHubError as exc:
-                        entry["label_error"] = str(exc)
+                    target = "queued" if manual else "dispatched"
+                    result = transition(
+                        self.gh,
+                        self.config.labels,
+                        request.issue_number,
+                        target,
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        entry["label_error"] = {
+                            "edge": target,
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
                         label_errors.append(request.issue_number)
                         save_state(self.paths.state_file, state)
             state = append_event(
@@ -1222,7 +1227,7 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # packet above is the authority; a label failure is reported, not fatal.
-        label_error: str | None = None
+        label_error: dict[str, Any] | None = None
         if issue_number is not None:
             # Optimization: skip review_started transition if the PR has an unaddressed
             # request_changes decision and the head SHA hasn't changed (nothing new to review).
@@ -1244,17 +1249,21 @@ class OrchestratorApp:
                     should_skip_transition = True
 
             if not should_skip_transition:
-                try:
-                    transition(self.gh, self.config.labels, issue_number, "review_started")
-                except GitHubError as exc:
-                    label_error = str(exc)
+                result = transition(self.gh, self.config.labels, issue_number, "review_started")
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "review_started",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
                         state["prs"][str(pr_number)]["label_error"] = label_error
                         save_state(self.paths.state_file, state)
         message = "review packet generated"
         if label_error:
-            message += f" (label update failed: {label_error})"
+            message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(
             True,
             message,
@@ -1385,24 +1394,50 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # decision above is the authority; a label failure is reported, not fatal.
-        label_error: str | None = None
-        try:
-            if issue_number is not None:
-                if decision == "request_changes":
-                    transition(
-                        self.gh,
-                        self.config.labels,
-                        issue_number,
-                        "escalated" if escalated else "rework_requested",
-                    )
-                elif decision == "blocked":
-                    transition(self.gh, self.config.labels, issue_number, "blocked")
-                elif decision == "approved":
-                    transition(self.gh, self.config.labels, issue_number, "review_approved")
-            if decision == "request_changes" and comment and summary_text:
+        label_error: dict[str, Any] | None = None
+        if issue_number is not None:
+            if decision == "request_changes":
+                target = "escalated" if escalated else "rework_requested"
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    target,
+                )
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": target,
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+            elif decision == "blocked":
+                result = transition(self.gh, self.config.labels, issue_number, "blocked")
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "blocked",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+            elif decision == "approved":
+                result = transition(self.gh, self.config.labels, issue_number, "review_approved")
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "review_approved",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+        if decision == "request_changes" and comment and summary_text:
+            try:
                 self._comment_pr(pr_number, summary_text)
-        except GitHubError as exc:
-            label_error = str(exc)
+            except GitHubError as exc:
+                # Comment failure is separate from label transition failure
+                if label_error is None:
+                    label_error = {"comment_error": str(exc)}
+                else:
+                    label_error["comment_error"] = str(exc)
         message = (
             f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
             "escalated to human"
@@ -1410,7 +1445,7 @@ class OrchestratorApp:
             else "review recorded"
         )
         if label_error:
-            message += f" (label update failed: {label_error})"
+            message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(
             True,
             message,
@@ -1460,12 +1495,18 @@ class OrchestratorApp:
             live_head_sha = pr.get("headRefOid")
             if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
                 message = "PR head moved since approval — re-review required"
-                label_error: str | None = None
-                try:
-                    if issue_number is not None:
-                        transition(self.gh, self.config.labels, issue_number, "review_started")
-                except GitHubError as exc:
-                    label_error = str(exc)
+                label_error: dict[str, Any] | None = None
+                if issue_number is not None:
+                    result = transition(
+                        self.gh, self.config.labels, issue_number, "review_started"
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        label_error = {
+                            "edge": "review_started",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
                 with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
                     state["prs"][str(pr_number)] = {
@@ -1527,7 +1568,7 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
-        label_error: str | None = None
+        label_error: dict[str, Any] | None = None
         update_results: list[dict[str, Any]] = []
         if can_merge and should_merge:
             # Merge, then labels, then best-effort branch deletion — in that
@@ -1556,14 +1597,25 @@ class OrchestratorApp:
             # Label + branch cleanup are best-effort; the merged fact is already
             # durable. A branch-deletion failure (head branch checked out in a
             # worktree) or label failure must never un-record the merge.
+            if issue_number is not None:
+                result = transition(self.gh, self.config.labels, issue_number, "merged")
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "merged",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
             try:
-                if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "merged")
                 if self.config.auto_merge.delete_branch:
                     head_ref = str(pr.get("headRefName") or "")
                     branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
             except GitHubError as exc:
-                label_error = str(exc)
+                # Branch deletion failure is separate from label transition failure
+                if label_error is None:
+                    label_error = {"branch_deletion_error": str(exc)}
+                else:
+                    label_error["branch_deletion_error"] = str(exc)
             # Update remaining open agent PRs after successful merge (if configured)
             if self.config.auto_merge.update_open_prs:
                 update_results = self._update_open_agent_prs(pr_number)
@@ -1719,9 +1771,10 @@ class OrchestratorApp:
             if fix and drift:
                 new_state = apply_drift_fixes(self.gh, state, drift, self.config)
                 save_state(self.paths.state_file, new_state)
-                # The label removals above use allow_failure=True, so a failed
-                # removal is silently swallowed. Re-detect against the new state to
-                # verify the repairs actually landed before reporting success.
+                # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
+                # for failed adds/removes, and apply_fixes records the outcome in the
+                # reconcile event. Re-detect against the new state to verify the repairs
+                # actually landed before reporting success.
                 post_fix_drift = detect_drift(
                     self.gh, new_state, self.config, repo_root=self.repo_root
                 )
@@ -2213,15 +2266,19 @@ class OrchestratorApp:
                 state["issues"][str(request.issue_number)] = entry
                 save_state(self.paths.state_file, state)
                 if ok:
-                    try:
-                        transition(
-                            self.gh,
-                            self.config.labels,
-                            request.issue_number,
-                            "rework_dispatched",
-                        )
-                    except GitHubError as exc:
-                        entry["label_error"] = str(exc)
+                    result = transition(
+                        self.gh,
+                        self.config.labels,
+                        request.issue_number,
+                        "rework_dispatched",
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        entry["label_error"] = {
+                            "edge": "rework_dispatched",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
                         label_errors.append(request.issue_number)
                         save_state(self.paths.state_file, state)
             state = append_event(
