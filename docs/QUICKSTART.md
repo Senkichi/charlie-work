@@ -76,6 +76,8 @@ for the full dataclass list and defaults):
 | `dispatch.default_limit` / `branch_prefix` / `worker_template` | Wave size, branch-name prefix, which prompt template renders per-issue worker prompts (`worker.md` for Devin, `worker_claude_code.md` for Claude Code). |
 | `review.max_rework_cycles` | `request_changes` cycles allowed before escalating to `agent:human-needed` instead of dispatching another rework round. |
 | `auto_merge.required_checks` | CI check-run names that must be green before `ship-it` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
+| `auto_merge.merge_flags` | Extra flags appended to `gh pr merge` (e.g., `["--admin"]` for protected-base merges, `["--auto"]` for merge-queue flows). Takes precedence over the legacy `admin` field. Flags must start with `--` and cannot be strategy flags (`--merge`/`--rebase`/`--squash`) or `--delete-branch` (branch deletion is handled separately). |
+| `auto_merge.admin` | Legacy field for `gh pr merge --admin` (required when the base branch is protected and your gh auth has admin on the repo). Superseded by `merge_flags` but preserved for backward compatibility. |
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
 | `devin.adapter` | `manual` (write a session manifest for a human to paste into a Devin session) or `command` (subprocess-launch via `devin.dispatch_command`). |
 | `cross_family.*` | Enables the non-Claude adversarial pass (`enabled: false` by default; both example profiles show how to turn it on/off). |
