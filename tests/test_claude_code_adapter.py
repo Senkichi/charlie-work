@@ -39,6 +39,7 @@ def _install_fake_create_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -50,6 +51,7 @@ def _install_fake_create_worktree(
                     "base_ref": base_ref,
                     "worktrees_dir": worktrees_dir,
                     "venv_source": venv_source,
+                    "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
                 }
@@ -295,6 +297,7 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -318,6 +321,109 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
 
     sidecar_path = sessions_dir / "issue-13.claude.json"
     assert sidecar_path.exists()
+
+
+def test_launch_claude_worker_fetch_failure_yields_error_record_not_exception(
+    tmp_path: Path,
+) -> None:
+    """End-to-end test: real fetch failure inside create_worktree must return error record.
+
+    This test forces a real git fetch failure by creating a repo with a broken origin URL,
+    then calling launch_claude_worker with base_ref that triggers a fetch. The adapter must
+    catch the RuntimeError from create_worktree and return an error record, not raise.
+
+    This is a mutation gate: if RuntimeError is removed from the except tuple in
+    launch_claude_worker, this test will fail with an uncaught exception.
+    """
+    # Create a real git repo with an origin remote
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    (remote_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Clone the remote repo to create a local repo with origin configured
+    repo_root = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(repo_root)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    sessions_dir = tmp_path / "sessions"
+
+    # Break the origin remote to simulate a fetch failure
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "file:///nonexistent/path"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Call launch_claude_worker with base_ref that triggers a fetch
+    # Empty string resolves to origin/main, which will trigger the fetch in create_worktree
+    record = launch_claude_worker(
+        142,
+        "agent/issue-142-fetch-failure",
+        "do the thing",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        base_ref="",  # Triggers fetch of origin/main
+    )
+
+    # The adapter must catch the RuntimeError and return an error record
+    assert not record.ok
+    assert record.error is not None
+    assert "worktree creation failed" in record.error
+    assert record.worktree_path == ""
+    assert record.pid is None
+
+    # Verify the sidecar was written with the error
+    sidecar_path = sessions_dir / "issue-142.claude.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["error"] is not None
+    assert "worktree creation failed" in payload["error"]
 
 
 def test_launch_claude_worker_remove_worktree_called_on_launch_failure(
@@ -861,6 +967,7 @@ def test_launch_claude_worker_with_venv_source_junction(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -871,6 +978,7 @@ def test_launch_claude_worker_with_venv_source_junction(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -913,6 +1021,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -923,6 +1032,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -963,6 +1073,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -973,6 +1084,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }
@@ -1019,6 +1131,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -1029,6 +1142,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
                 "base_ref": base_ref,
                 "worktrees_dir": worktrees_dir,
                 "venv_source": venv_source,
+                "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
             }

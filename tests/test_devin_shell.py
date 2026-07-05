@@ -61,6 +61,7 @@ def _install_fake_create_worktree(
         base_ref="HEAD",
         worktrees_dir=None,
         venv_source=None,
+        materialize_dirs=(),
         rework=False,
         recovery=None,
     ):
@@ -70,6 +71,8 @@ def _install_fake_create_worktree(
                     "repo_root": repo_root,
                     "branch": branch,
                     "worktrees_dir": worktrees_dir,
+                    "venv_source": venv_source,
+                    "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
                 }
@@ -349,6 +352,111 @@ def test_launch_devin_session_passes_rework_flag(
     )
 
     assert rework_calls == [False, True]
+
+
+def test_launch_devin_session_fetch_failure_yields_error_record_not_exception(
+    tmp_path: Path,
+) -> None:
+    """End-to-end test: real fetch failure inside create_worktree must return error record.
+
+    This test forces a real git fetch failure by creating a repo with a broken origin URL,
+    then calling launch_devin_session with base_ref that triggers a fetch. The adapter must
+    catch the RuntimeError from create_worktree and return an error record, not raise.
+
+    This is a mutation gate: if RuntimeError is removed from the except tuple in
+    launch_devin_session, this test will fail with an uncaught exception.
+    """
+    # Create a real git repo with an origin remote
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir()
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    (remote_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Clone the remote repo to create a local repo with origin configured
+    repo_root = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(repo_root)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+
+    # Break the origin remote to simulate a fetch failure
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "file:///nonexistent/path"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Call launch_devin_session with base_ref that triggers a fetch
+    # Empty string resolves to origin/main, which will trigger the fetch in create_worktree
+    record = launch_devin_session(
+        142,
+        "agent/issue-142-fetch-failure",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        base_ref="",  # Triggers fetch of origin/main
+    )
+
+    # The adapter must catch the RuntimeError and return an error record
+    assert record.pid is None
+    assert record.error is not None
+    assert "worktree creation failed" in record.error
+    assert record.worktree_path == ""
+
+    # Verify the sidecar was written with the error
+    sidecar_path = sessions_dir / "issue-142.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["pid"] is None
+    assert payload["error"] is not None
+    assert "worktree creation failed" in payload["error"]
 
 
 def test_read_session_records_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1382,3 +1490,113 @@ def test_rework_launch_failure_preserves_branch(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for venv_source and worker_env parity with claude-code
+# ---------------------------------------------------------------------------
+
+
+def test_launch_devin_session_passes_venv_source_to_create_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """venv_source should be passed through to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
+        123,
+        "agent/issue-123-venv",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        venv_source=venv_source,
+        command_template=(sys.executable, "-c", "pass"),
+    )
+
+    assert len(worktree_calls) == 1
+    assert worktree_calls[0]["venv_source"] == venv_source
+
+
+def test_launch_devin_session_injects_worker_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker_env should be merged into the process environment."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Script that writes an env var to a file
+    env_script = tmp_path / "env_probe.py"
+    env_script.write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "Path('env-probe.txt').write_text(\n"
+        "    os.environ.get('TEST_VAR', '<unset>')\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    record = launch_devin_session(
+        99,
+        "agent/issue-99-env",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+        worker_env={"TEST_VAR": "test-value"},
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    # Wait for the subprocess to complete
+    deadline = time.time() + 10
+    probe_path = Path(record.worktree_path) / "env-probe.txt"
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    assert probe_path.read_text(encoding="utf-8") == "test-value"
+
+
+def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """materialize_dirs should be passed through to create_worktree."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    worktree_calls: list[dict] = []
+    _install_fake_create_worktree(monkeypatch, tmp_path, calls=worktree_calls)
+
+    # Hermetic: use sys.executable instead of real devin binary
+    launch_devin_session(
+        456,
+        "agent/issue-456-materialize",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        materialize_dirs=(".devin", ".config"),
+        command_template=(sys.executable, "-c", "pass"),
+    )
+
+    assert len(worktree_calls) == 1
+    assert worktree_calls[0]["materialize_dirs"] == (".devin", ".config")
