@@ -3686,6 +3686,86 @@ def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
     assert final_state["events"] == [], "No dispatch events should be recorded"
 
 
+def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
+    """Issue #127: dry-run dispatch dependency-gate filter must exclude blocked issues.
+
+    When a blocked issue is ordered ahead of an eligible candidate with
+    dispatch_limit=1, the dry-run report should list the eligible issue as
+    dispatchable and the blocked issue should be excluded from sessions.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with blocked issue first, then eligible issue
+    class FakeGitHubWithDryRunDependencyGate(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with test issues: blocked first, then eligible
+            self.issues = [
+                {
+                    "number": 100,
+                    "title": "Blocked issue (first in order)",
+                    "url": "https://example.test/issues/100",
+                    "body": "Blocked by #200",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 101,
+                    "title": "Eligible issue (second in order)",
+                    "url": "https://example.test/issues/101",
+                    "body": "No blockers",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 200,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Foundation work",
+                    "labels": [],
+                    "state": "open",  # Still open, blocks #100
+                },
+            ]
+
+        def issue_list(self, ready_label: str):
+            # Return both ready issues in order
+            return [
+                issue
+                for issue in self.issues
+                if ready_label in [label["name"] for label in issue.get("labels", [])]
+            ]
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {200}
+
+    fake_gh = FakeGitHubWithDryRunDependencyGate()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    result = app.dispatch(limit=1)
+
+    # Only the eligible issue should be selected (blocked issue doesn't consume slot)
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+
+    # Verify the selected issue is exactly 101 (the eligible one), not 100 (blocked)
+    assert len(result.data["sessions"]) == 1
+    assert result.data["sessions"][0]["issue_number"] == 101
+
+    # Verify issue 100 is absent from sessions
+    dispatched_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 100 not in dispatched_issue_numbers
+
+    # Verify the blocked section contains issue 100 with its declared blockers
+    assert "blocked" in result.data
+    blocked_entries = {entry["issue"]: entry["blockers"] for entry in result.data["blocked"]}
+    assert 100 in blocked_entries
+    assert blocked_entries[100] == [200]
+
+
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
     from charlie_work.github import GitHubError as _GitHubError
 
