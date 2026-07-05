@@ -286,7 +286,7 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                             )
                         )
-                    
+
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # A dead worker with no open PR is recoverable and should be relabeled
                     # as dispatchable (remove active labels, ensure ready label present)
@@ -302,8 +302,10 @@ def detect_drift(
                                     for label in sorted(active_labels)
                                 ]
                                 if labels_cfg.ready not in issue_labels:
-                                    fix_actions.append(f"add label '{labels_cfg.ready}' to issue #{record.issue_number}")
-                                
+                                    fix_actions.append(
+                                        f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
+                                    )
+
                                 drift.append(
                                     DriftItem(
                                         kind="session_failed_relabeled",
@@ -344,7 +346,7 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                             )
                         )
-                    
+
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     if record.issue_number not in prs_linking_issue:
                         issue = issues_by_number.get(record.issue_number)
@@ -357,8 +359,10 @@ def detect_drift(
                                     for label in sorted(active_labels)
                                 ]
                                 if labels_cfg.ready not in issue_labels:
-                                    fix_actions.append(f"add label '{labels_cfg.ready}' to issue #{record.issue_number}")
-                                
+                                    fix_actions.append(
+                                        f"add label '{labels_cfg.ready}' to issue #{record.issue_number}"
+                                    )
+
                                 drift.append(
                                     DriftItem(
                                         kind="session_failed_relabeled",
@@ -433,7 +437,9 @@ def apply_fixes(
                     gh.remove_issue_label(item.issue_number, label)
                 # Add ready label if needed (parsed from fix_actions)
                 for action in item.fix_actions:
-                    if action.startswith("add label '") and action.endswith(f"' to issue #{item.issue_number}"):
+                    if action.startswith("add label '") and action.endswith(
+                        f"' to issue #{item.issue_number}"
+                    ):
                         label = action.split("'")[1]
                         gh.add_issue_label(item.issue_number, label)
                         break

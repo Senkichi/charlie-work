@@ -636,7 +636,9 @@ def test_detect_drift_session_failed_relabeled_no_open_pr(tmp_path: Path) -> Non
     assert len(relabel_drift) == 1
     assert relabel_drift[0].issue_number == 42
     assert config.labels.in_progress in relabel_drift[0].remove_labels
-    assert any(f"add label '{config.labels.ready}'" in action for action in relabel_drift[0].fix_actions)
+    assert any(
+        f"add label '{config.labels.ready}'" in action for action in relabel_drift[0].fix_actions
+    )
 
 
 def test_detect_drift_session_failed_with_open_pr_no_relabel(tmp_path: Path) -> None:
