@@ -573,9 +573,5 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
-<<<<<<< HEAD
-    "_sanitize_env",
     "_get_process_start_time",
-=======
->>>>>>> origin/main
 ]
