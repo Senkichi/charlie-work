@@ -1038,8 +1038,8 @@ def test_detect_drift_session_failed_no_pr_mutually_exclusive_with_issue_active_
 
     # Should detect session_failed_relabeled but NOT issue_active_label_no_open_pr
     relabel_drift = [d for d in drift if d.kind == "session_failed_relabeled"]
-    assert len(relabel_drift) >= 1, (
-        f"Expected at least 1 session_failed_relabeled, got {len(relabel_drift)}"
+    assert len(relabel_drift) == 1, (
+        f"Expected exactly 1 session_failed_relabeled, got {len(relabel_drift)}"
     )
     assert all(d.issue_number == 42 for d in relabel_drift)
 
@@ -1055,9 +1055,13 @@ def test_detect_drift_session_failed_no_pr_mutually_exclusive_with_issue_active_
     )
     new_state = apply_fixes(gh, state, drift, config)
 
-    # Should have exactly one remove call for in_progress per session type
-    # (may be multiple if both devin-shell and claude-code sessions exist)
-    assert gh.labels_removed.count((42, config.labels.in_progress)) >= 1
-    # Should have at least one reconcile event (may have multiple from different session types)
-    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
-    assert len(reconcile_events) >= 1
+    # Should have exactly one remove call for in_progress
+    assert gh.labels_removed.count((42, config.labels.in_progress)) == 1
+    # Should have exactly one reconcile event for session_failed_relabeled
+    # (provider_throttle_detected also emits an event, so filter by kind)
+    session_relabel_events = [
+        e
+        for e in new_state["events"]
+        if e["kind"] == "reconcile" and e["payload"]["kind"] == "session_failed_relabeled"
+    ]
+    assert len(session_relabel_events) == 1

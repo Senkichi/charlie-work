@@ -1128,6 +1128,34 @@ def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path)
     assert github_module.GitHub(tmp_path).delete_branch("agent/issue-1-x") is False
 
 
+def test_github_add_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
+    """C5 boundary test: add_issue_label with allow_failure=True returns error value, does not raise."""
+
+    def fake_run(*args, check=False, **kwargs):
+        # Simulate subprocess.run returning a failed result when check=False
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="gh: not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    # Should not raise despite subprocess failure (allow_failure=True in add_issue_label)
+    gh.add_issue_label(123, "agent:in-progress")
+
+
+def test_github_remove_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
+    """C5 boundary test: remove_issue_label with allow_failure=True returns error value, does not raise."""
+
+    def fake_run(*args, check=False, **kwargs):
+        # Simulate subprocess.run returning a failed result when check=False
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="gh: not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    # Should not raise despite subprocess failure (allow_failure=True in remove_issue_label)
+    gh.remove_issue_label(123, "agent:in-progress")
+
+
 # --- Cross-family adversarial review ------------------------------------------
 
 
