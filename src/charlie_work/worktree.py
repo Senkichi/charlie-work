@@ -58,18 +58,28 @@ def _has_origin_remote(repo_root: Path) -> bool:
     return result.ok
 
 
-def _remote_branch_exists(repo_root: Path, branch: str) -> bool:
+def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     """Check if a branch exists on the origin remote.
 
-    Returns True if 'git ls-remote origin refs/heads/<branch>' succeeds with output,
-    False otherwise. This distinguishes 'remote ref missing' from network/auth failures.
+    Returns True if the branch exists, False if it does not exist, or None if the probe
+    failed (network/auth error). This distinguishes 'remote ref missing' from 'broken remote':
+    - exists: exit 0 AND non-empty stdout
+    - missing: exit 0 AND empty stdout
+    - probe-failed: nonzero exit (e.g., network error, auth failure)
     """
     result = run_captured(
         ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
         cwd=repo_root,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    return result.ok and bool(result.stdout.strip())
+    if not result.ok:
+        # Probe failed (network error, auth failure, etc.)
+        return None
+    if result.stdout.strip():
+        # Branch exists
+        return True
+    # Branch does not exist (exit 0 with empty stdout)
+    return False
 
 
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
@@ -77,6 +87,7 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
 
     Commits the current state to a salvage ref, pushes it to origin, and returns
     the salvage ref name. Returns None if the worktree is clean (nothing to salvage).
+    Raises RuntimeError if the salvage push fails.
     """
     from .state import utc_now
 
@@ -86,11 +97,15 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    has_dirty = dirty_result.ok and bool(dirty_result.stdout.strip())
+    # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+    has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
 
     # Check for unpushed commits (only if branch exists on origin)
     has_unpushed = False
-    if _has_origin_remote(repo_root) and _remote_branch_exists(repo_root, branch):
+    remote_exists = None
+    if _has_origin_remote(repo_root):
+        remote_exists = _remote_branch_exists(repo_root, branch)
+    if remote_exists is True:
         unpushed_result = run_captured(
             ["git", "log", f"origin/{branch}..HEAD", "--oneline"],
             cwd=worktree_path,
@@ -147,11 +162,16 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
 
     # Push the salvage ref if origin exists
     if _has_origin_remote(repo_root):
-        run_captured(
+        push_result = run_captured(
             ["git", "push", "origin", f"{salvage_ref}:{salvage_ref}"],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
+        if not push_result.ok:
+            raise RuntimeError(
+                f"Failed to push salvage ref {salvage_ref!r} to origin: "
+                f"{push_result.error or push_result.stderr}"
+            )
 
     return salvage_ref
 
@@ -240,7 +260,17 @@ def create_worktree(
         # Issue #110: Check if the branch exists on origin before attempting fetch
         # If the branch doesn't exist on origin (killed before first push), fall through
         # to fresh dispatch instead of failing with fetch error 128
-        if _has_origin_remote(repo_root) and not _remote_branch_exists(repo_root, branch):
+        # If the probe fails (network/auth error), abort dispatch to avoid data loss
+        remote_exists = None
+        if _has_origin_remote(repo_root):
+            remote_exists = _remote_branch_exists(repo_root, branch)
+            if remote_exists is None:
+                # Probe failed: abort dispatch to avoid triggering fallback on transient error
+                raise RuntimeError(
+                    f"Failed to probe remote branch {branch!r} for recovery: "
+                    f"transient network or auth error. Aborting dispatch to avoid data loss."
+                )
+        if remote_exists is False:
             # Branch doesn't exist on origin - this is a killed-before-push session
             # Fall through to fresh dispatch (rework=False) after cleaning up local state
             reclaimed = "fetch-fallback"
@@ -316,7 +346,8 @@ def create_worktree(
                     cwd=wt_path,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
-                has_dirty = dirty_result.ok and bool(dirty_result.stdout.strip())
+                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
 
                 # Check for commits beyond merge-base with base_ref
                 merge_base_result = run_captured(
@@ -515,12 +546,19 @@ def create_worktree(
                     cwd=wt_path,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
-                has_dirty = dirty_result.ok and bool(dirty_result.stdout.strip())
+                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
                 if has_dirty:
                     # Dirty tree: salvage it
-                    salvage_ref = _salvage_worktree(repo_root, wt_path, branch)
-                    if salvage_ref:
-                        reclaimed = "salvaged"
+                    try:
+                        salvage_ref = _salvage_worktree(repo_root, wt_path, branch)
+                        if salvage_ref:
+                            reclaimed = "salvaged"
+                    except RuntimeError as salvage_error:
+                        # Salvage push failed: surface the error and leave worktree intact
+                        raise RuntimeError(
+                            f"Failed to salvage stale worktree {wt_path} for fresh dispatch: {salvage_error}"
+                        ) from salvage_error
                     # Remove the worktree (junction-safe)
                     if not remove_worktree(repo_root, wt_path, force=True):
                         raise RuntimeError(
