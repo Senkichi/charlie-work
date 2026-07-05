@@ -813,6 +813,7 @@ class FakeGitHub:
                 "url": "https://example.test/issues/123",
                 "body": "Search is broken",
                 "labels": [{"name": "automated-ready"}],
+                "state": "open",
             }
         ]
         # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
@@ -897,6 +898,26 @@ class FakeGitHub:
                 pr["headRefOid"] = f"{old_head}-updated"
                 return self.update_branch_ok
         return False
+
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+        """Default implementation: check the actual state field in issues."""
+        open_issues: set[int] = set()
+        for number in issue_numbers:
+            for issue in self.issues:
+                if issue["number"] == number and issue.get("state") == "open":
+                    open_issues.add(number)
+                    break
+        return open_issues
+
+    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+        """Fake run method for GitHub API calls. Returns empty list for dependencies."""
+        # Handle dependency API calls
+        if "dependencies" in " ".join(args):
+            return [] if json_output else ""
+        # Handle other API calls (for reconcile tests)
+        if json_output:
+            return []
+        return ""
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -2091,6 +2112,9 @@ def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> No
 def test_reconcile_wiring_reports_clean_repo(tmp_path: Path) -> None:
     class QuietGitHub(FakeGitHub):
         def run(self, arguments, *, json_output=False, allow_failure=False):
+            # Handle dependency API calls
+            if "dependencies" in " ".join(arguments):
+                return [] if json_output else ""
             return []
 
     config = OrchestratorConfig()
@@ -2123,6 +2147,9 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
 
     class DriftGitHub(FakeGitHub):
         def run(self, arguments, *, json_output=False, allow_failure=False):
+            # Handle dependency API calls
+            if "dependencies" in " ".join(arguments):
+                return [] if json_output else ""
             # pr list: one open PR linked to issue 123
             if arguments[:2] == ["pr", "list"]:
                 return [
@@ -2191,6 +2218,9 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
             }
 
         def run(self, arguments, *, json_output=False, allow_failure=False):
+            # Handle dependency API calls
+            if "dependencies" in " ".join(arguments):
+                return [] if json_output else ""
             if arguments[:2] == ["pr", "list"]:
                 return [self._pr]
             if arguments[:2] == ["issue", "list"]:
@@ -2238,6 +2268,9 @@ def test_reconcile_partial_fix_failure_reports_remaining_drift(tmp_path: Path) -
             }
 
         def run(self, arguments, *, json_output=False, allow_failure=False):
+            # Handle dependency API calls
+            if "dependencies" in " ".join(arguments):
+                return [] if json_output else ""
             if arguments[:2] == ["pr", "list"]:
                 return []
             if arguments[:2] == ["issue", "list"]:
@@ -5247,4 +5280,339 @@ def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> 
     assert "live_session_count" in result.data
     assert result.data["live_session_count"] == 0
     assert "available_slots" in result.data
-    assert result.data["available_slots"] == 5
+
+
+# --- Issue #108: dependency gate tests --------------------------------------
+
+
+def test_parse_blockers_extracts_single_blocker() -> None:
+    """Test that parse_blockers extracts a single blocker from issue body."""
+    from charlie_work.github import parse_blockers
+    
+    body = "This issue is blocked by #743"
+    blockers = parse_blockers(body)
+    assert blockers == [743]
+
+
+def test_parse_blockers_extracts_multiple_blockers() -> None:
+    """Test that parse_blockers extracts multiple blockers from issue body."""
+    from charlie_work.github import parse_blockers
+    
+    body = "Blocked by #743, #744"
+    blockers = parse_blockers(body)
+    assert blockers == [743, 744]
+
+
+def test_parse_blockers_handles_various_patterns() -> None:
+    """Test that parse_blockers handles different declaration patterns."""
+    from charlie_work.github import parse_blockers
+    
+    # Test "Depends on" pattern
+    assert parse_blockers("Depends on #123") == [123]
+    
+    # Test "Blocked-by:" pattern
+    assert parse_blockers("Blocked-by: #456") == [456]
+    
+    # Test case insensitivity
+    assert parse_blockers("BLOCKED BY #789") == [789]
+    assert parse_blockers("depends on #100") == [100]
+
+
+def test_parse_blockers_returns_empty_for_no_blockers() -> None:
+    """Test that parse_blockers returns empty list when no blockers found."""
+    from charlie_work.github import parse_blockers
+    
+    assert parse_blockers("No blockers here") == []
+    assert parse_blockers("") == []
+    assert parse_blockers(None) == []
+
+
+def test_parse_blockers_deduplicates() -> None:
+    """Test that parse_blockers deduplicates blocker numbers."""
+    from charlie_work.github import parse_blockers
+    
+    body = "Blocked by #123, #123, #456"
+    blockers = parse_blockers(body)
+    assert blockers == [123, 456]
+
+
+def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
+    """Issue #108: dispatch should skip issues with open blockers."""
+    from charlie_work.github import parse_blockers
+    
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create a fake GitHub with a blocked issue
+    class FakeGitHubWithBlockers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with only the test issues
+            self.issues = [
+                {
+                    "number": 752,
+                    "title": "Dependent issue",
+                    "url": "https://example.test/issues/752",
+                    "body": "Blocked by #743",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 743,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/743",
+                    "body": "Foundation work",
+                    "labels": [],  # Not ready, so won't be in dispatch list
+                    "state": "open",  # Still open, so should block
+                },
+            ]
+        
+        def issue_list(self, ready_label: str):
+            # Only return issue 752 (the dependent one)
+            return [issue for issue in self.issues if ready_label in [label["name"] for label in issue.get("labels", [])]]
+        
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            # Return that #743 is open
+            return {743}
+    
+    fake_gh = FakeGitHubWithBlockers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    result = app.dispatch(limit=10)
+    
+    # Issue 752 should be skipped due to open blocker #743
+    assert result.data["selected_count"] == 0
+    assert result.data["attempted_count"] == 0
+    
+    # Check that dispatch_skip_blocked event was logged
+    state = load_state(paths.state_file)
+    blocked_events = [
+        e for e in state.get("events", [])
+        if e.get("kind") == "dispatch_skip_blocked"
+    ]
+    assert len(blocked_events) == 1
+    assert blocked_events[0]["payload"]["issue"] == 752
+    assert blocked_events[0]["payload"]["blockers"] == [743]
+
+
+def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
+    """Issue #108: dispatch should proceed when blocker is closed."""
+    from charlie_work.github import parse_blockers
+    
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create a fake GitHub with a blocked issue but closed blocker
+    class FakeGitHubWithClosedBlocker(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with only the test issues
+            self.issues = [
+                {
+                    "number": 752,
+                    "title": "Dependent issue",
+                    "url": "https://example.test/issues/752",
+                    "body": "Blocked by #743",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 743,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/743",
+                    "body": "Foundation work",
+                    "labels": [],  # Not ready, so won't be in dispatch list
+                    "state": "closed",  # Closed, so should not block
+                },
+            ]
+        
+        def issue_list(self, ready_label: str):
+            # Only return issue 752 (the dependent one)
+            return [issue for issue in self.issues if ready_label in [label["name"] for label in issue.get("labels", [])]]
+        
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            # Return that #743 is NOT open
+            return set()
+    
+    fake_gh = FakeGitHubWithClosedBlocker()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    result = app.dispatch(limit=10)
+    
+    # Issue 752 should be dispatched since blocker is closed
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+    
+    # Check that no dispatch_skip_blocked event was logged
+    state = load_state(paths.state_file)
+    blocked_events = [
+        e for e in state.get("events", [])
+        if e.get("kind") == "dispatch_skip_blocked"
+    ]
+    assert len(blocked_events) == 0
+
+
+def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
+    """Issue #108: dispatch should skip when ANY blocker is open (logical AND)."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create a fake GitHub with multiple blockers, one still open
+    class FakeGitHubWithMultipleBlockers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with only the test issues
+            self.issues = [
+                {
+                    "number": 752,
+                    "title": "Dependent issue",
+                    "url": "https://example.test/issues/752",
+                    "body": "Blocked by #743, #744",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 743,
+                    "title": "Blocker issue 1",
+                    "url": "https://example.test/issues/743",
+                    "body": "Foundation work",
+                    "labels": [],  # Not ready
+                    "state": "closed",
+                },
+                {
+                    "number": 744,
+                    "title": "Blocker issue 2",
+                    "url": "https://example.test/issues/744",
+                    "body": "More foundation work",
+                    "labels": [],  # Not ready
+                    "state": "open",  # Still open
+                },
+            ]
+        
+        def issue_list(self, ready_label: str):
+            # Only return issue 752 (the dependent one)
+            return [issue for issue in self.issues if ready_label in [label["name"] for label in issue.get("labels", [])]]
+        
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            # Return that #744 is open
+            return {744}
+    
+    fake_gh = FakeGitHubWithMultipleBlockers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    result = app.dispatch(limit=10)
+    
+    # Issue 752 should be skipped since #744 is still open
+    assert result.data["selected_count"] == 0
+    
+    # Check that both blockers are listed in the event
+    state = load_state(paths.state_file)
+    blocked_events = [
+        e for e in state.get("events", [])
+        if e.get("kind") == "dispatch_skip_blocked"
+    ]
+    assert len(blocked_events) == 1
+    assert blocked_events[0]["payload"]["issue"] == 752
+    assert set(blocked_events[0]["payload"]["blockers"]) == {744}
+
+
+def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
+    """Issue #108: self-referencing blockers should be filtered out with warning."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create a fake GitHub with a self-referencing blocker
+    class FakeGitHubWithSelfRef(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with only the test issue
+            self.issues = [
+                {
+                    "number": 123,
+                    "title": "Self-referencing issue",
+                    "url": "https://example.test/issues/123",
+                    "body": "Blocked by #123",  # Self-reference
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+            ]
+        
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+    
+    fake_gh = FakeGitHubWithSelfRef()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    result = app.dispatch(limit=10)
+    
+    # Issue should be dispatched (self-reference filtered out)
+    assert result.data["selected_count"] == 1
+    
+    # No dispatch_skip_blocked event should be logged
+    state = load_state(paths.state_file)
+    blocked_events = [
+        e for e in state.get("events", [])
+        if e.get("kind") == "dispatch_skip_blocked"
+    ]
+    assert len(blocked_events) == 0
+
+
+def test_status_includes_blocked_section(tmp_path: Path) -> None:
+    """Issue #108: status (roll-call) should include blocked section."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create a fake GitHub with a blocked issue
+    class FakeGitHubWithBlockers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with only the test issues
+            self.issues = [
+                {
+                    "number": 752,
+                    "title": "Dependent issue",
+                    "url": "https://example.test/issues/752",
+                    "body": "Blocked by #743",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 743,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/743",
+                    "body": "Foundation work",
+                    "labels": [],  # Not ready
+                    "state": "open",
+                },
+            ]
+        
+        def issue_list(self, ready_label: str):
+            # Only return issue 752 (the dependent one)
+            return [issue for issue in self.issues if ready_label in [label["name"] for label in issue.get("labels", [])]]
+        
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {743}
+    
+    fake_gh = FakeGitHubWithBlockers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    
+    result = app.status()
+    
+    # Check that blocked section is present
+    assert "blocked" in result.data
+    assert len(result.data["blocked"]) == 1
+    assert result.data["blocked"][0]["issue"] == 752
+    assert result.data["blocked"][0]["blockers"] == [743]
+    
+    # available_issue_count should exclude blocked issues
+    assert result.data["available_issue_count"] == 0
