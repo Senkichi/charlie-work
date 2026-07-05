@@ -82,6 +82,31 @@ class GitHub:
         except json.JSONDecodeError as exc:
             raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
 
+    def _run_bool(self, args: list[str]) -> bool:
+        """Run a gh command and return True iff returncode == 0.
+
+        This is a private helper for label operations that need boolean success
+        semantics without inferring from stdout/stderr string shape. Never raises
+        — failures are returned as False (allow_failure semantics). Dry-run mode
+        returns True (the operation would succeed if not for dry-run).
+        """
+        command = ["gh", *args]
+        if self.dry_run and _is_mutating(args):
+            return True
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.repo_root,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return False
+        return result.returncode == 0
+
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
         result = self.run(args, json_output=True)
         items = result if isinstance(result, list) else []
@@ -168,14 +193,10 @@ class GitHub:
         return result if isinstance(result, list) else []
 
     def add_issue_label(self, number: int, label: str) -> bool:
-        result = self.run(["issue", "edit", str(number), "--add-label", label], allow_failure=True)
-        return result is not None
+        return self._run_bool(["issue", "edit", str(number), "--add-label", label])
 
     def remove_issue_label(self, number: int, label: str) -> bool:
-        result = self.run(
-            ["issue", "edit", str(number), "--remove-label", label], allow_failure=True
-        )
-        return result is not None
+        return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
 
     def issue_comment(self, number: int, body_file: Path) -> None:
         self.run(["issue", "comment", str(number), "--body-file", str(body_file)])

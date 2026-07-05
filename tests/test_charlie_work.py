@@ -1310,6 +1310,58 @@ def test_github_remove_issue_label_failure_does_not_raise(monkeypatch, tmp_path:
     gh.remove_issue_label(123, "agent:in-progress")
 
 
+def test_github_add_issue_label_returns_false_on_failure(monkeypatch, tmp_path: Path) -> None:
+    """Boolean-truthfulness test: add_issue_label returns False on subprocess failure (returncode=1)."""
+
+    def fake_run(cmd, *args, check=False, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.add_issue_label(123, "agent:in-progress")
+    assert result is False, "add_issue_label must return False on failure"
+
+
+def test_github_add_issue_label_returns_true_on_success(monkeypatch, tmp_path: Path) -> None:
+    """Boolean-truthfulness test: add_issue_label returns True on subprocess success (returncode=0)."""
+
+    def fake_run(cmd, *args, check=False, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.add_issue_label(123, "agent:in-progress")
+    assert result is True, "add_issue_label must return True on success"
+
+
+def test_github_remove_issue_label_returns_false_on_failure(monkeypatch, tmp_path: Path) -> None:
+    """Boolean-truthfulness test: remove_issue_label returns False on subprocess failure (returncode=1)."""
+
+    def fake_run(cmd, *args, check=False, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.remove_issue_label(123, "agent:in-progress")
+    assert result is False, "remove_issue_label must return False on failure"
+
+
+def test_github_remove_issue_label_returns_true_on_success(monkeypatch, tmp_path: Path) -> None:
+    """Boolean-truthfulness test: remove_issue_label returns True on subprocess success (returncode=0)."""
+
+    def fake_run(cmd, *args, check=False, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.remove_issue_label(123, "agent:in-progress")
+    assert result is True, "remove_issue_label must return True on success"
+
+
 # --- Cross-family adversarial review ------------------------------------------
 
 
