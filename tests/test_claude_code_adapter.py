@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -478,6 +479,112 @@ def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
         log_path="log2.txt",
     )
     assert is_worker_alive(none_record) is False
+
+
+def test_is_worker_alive_rejects_pid_recycling_mismatched_start_time(tmp_path: Path) -> None:
+    """A record with an alive PID but mismatched start time is treated as dead.
+
+    This prevents false positives from PID recycling: if the OS has reused the PID
+    for a different process, the start time will not match.
+    """
+    from charlie_work.claude_code import _get_process_start_time
+
+    # Spawn a short-lived process to get a valid PID
+    script = tmp_path / "sleep.py"
+    script.write_text("import time; time.sleep(2)", encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        # Get the actual start time of this process
+        actual_start_time = _get_process_start_time(process.pid)
+        assert actual_start_time is not None
+
+        # Create a record with a deliberately wrong start time (10 minutes ago)
+        # This simulates a recycled PID
+        wrong_start_time = actual_start_time - 600  # 10 minutes in the past
+
+        record = ClaudeWorkerRecord(
+            issue_number=1,
+            branch="agent/issue-1",
+            worktree_path="/tmp/wt/issue-1",
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+            process_start_time=wrong_start_time,
+        )
+
+        # Should return False because start time doesn't match
+        assert is_worker_alive(record) is False
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_is_worker_alive_accepts_matching_start_time(tmp_path: Path) -> None:
+    """A record with matching start time is counted as live."""
+    from charlie_work.claude_code import _get_process_start_time
+
+    # Spawn a short-lived process
+    script = tmp_path / "sleep.py"
+    script.write_text("import time; time.sleep(2)", encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        # Get the actual start time of this process
+        actual_start_time = _get_process_start_time(process.pid)
+        assert actual_start_time is not None
+
+        record = ClaudeWorkerRecord(
+            issue_number=1,
+            branch="agent/issue-1",
+            worktree_path="/tmp/wt/issue-1",
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+            process_start_time=actual_start_time,
+        )
+
+        # Should return True because start time matches
+        assert is_worker_alive(record) is True
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_is_worker_alive_legacy_record_fallback() -> None:
+    """Legacy records without process_start_time fall back to pid-only liveness.
+
+    This preserves backward compatibility for old sidecar files.
+    """
+    # Use the test process's own PID (guaranteed to be alive)
+    record = ClaudeWorkerRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/wt/issue-1",
+        prompt_path="p.md",
+        command=("x",),
+        pid=os.getpid(),
+        started_at="2026-01-01T00:00:00Z",
+        log_path="log.txt",
+        process_start_time=None,  # Legacy record
+    )
+
+    # Should return True using pid-only fallback
+    assert is_worker_alive(record) is True
 
 
 # ---------------------------------------------------------------------------
