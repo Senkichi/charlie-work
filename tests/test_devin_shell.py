@@ -643,7 +643,9 @@ def test_command_template_omits_model_when_worker_model_empty(
 # ---------------------------------------------------------------------------
 
 
-def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When worktree has no .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
@@ -655,10 +657,14 @@ def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(tmp_path: Path, mo
     env = _sanitize_env(worktree_path)
 
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when worktree has no .venv"
-    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when worktree has no .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when worktree has no .venv"
+    )
 
 
-def test_sanitize_env_sets_worktree_venv_when_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sanitize_env_sets_worktree_venv_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When worktree has .venv, VIRTUAL_ENV must be set to that path."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
@@ -670,11 +676,17 @@ def test_sanitize_env_sets_worktree_venv_when_present(tmp_path: Path, monkeypatc
 
     env = _sanitize_env(worktree_path)
 
-    assert env.get("VIRTUAL_ENV") == str(worktree_venv), "VIRTUAL_ENV must be set to worktree .venv"
-    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when worktree has .venv"
+    assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
+        "VIRTUAL_ENV must be set to worktree .venv"
+    )
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when worktree has .venv"
+    )
 
 
-def test_sanitize_env_preserves_other_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sanitize_env_preserves_other_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Other environment variables must be preserved."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
