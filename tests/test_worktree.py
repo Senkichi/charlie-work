@@ -1325,7 +1325,11 @@ def test_list_worktrees_porcelain_parser_handles_flag_lines(tmp_path: Path) -> N
 
 
 def test_list_worktrees_porcelain_parser_handles_malformed_worktree_line(tmp_path: Path) -> None:
-    """Porcelain parser should skip malformed worktree lines without crashing."""
+    """Porcelain parser should drop malformed worktree entries entirely.
+
+    When a worktree line is malformed (bare "worktree" with no path), the entire
+    entry is dropped from the result. Sibling valid entries are unaffected.
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -1363,14 +1367,152 @@ branch refs/heads/feature
         # The parser should not crash on malformed input
         worktrees = list_worktrees(repo_root)
 
-        # Should parse both entries, but the malformed one lacks a "worktree" key
-        assert len(worktrees) == 2
-        # First entry is malformed (no worktree key)
-        assert "worktree" not in worktrees[0]
-        assert worktrees[0]["bare"] is True
-        assert worktrees[0]["branch"] == "refs/heads/main"
-        # Second entry is valid
-        assert worktrees[1]["worktree"] == Path("/path/to/valid")
-        assert worktrees[1]["branch"] == "refs/heads/feature"
+        # Should parse only the valid entry; the malformed one is dropped entirely
+        assert len(worktrees) == 1
+        # The valid entry should be present
+        assert worktrees[0]["worktree"] == Path("/path/to/valid")
+        assert worktrees[0]["branch"] == "refs/heads/feature"
     finally:
         charlie_work.worktree.run_captured = original_run_captured
+
+
+def test_list_worktrees_porcelain_parser_drops_unknown_flag_keys(tmp_path: Path) -> None:
+    """Porcelain parser should drop entries with unknown space-less keys.
+
+    Unknown flag keys (not in KNOWN_FLAG_KEYS) mark the entire entry as malformed
+    and cause it to be dropped. Known flag lines (bare, detached) parse as True.
+    Valued forms (prunable <reason>, locked <reason>) parse as str.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Monkeypatch run_captured to return porcelain output with unknown keys
+    import charlie_work.worktree
+
+    original_run_captured = charlie_work.worktree.run_captured
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        # If this is a git worktree list --porcelain call, return output with unknown keys
+        if isinstance(args[0], list) and "worktree" in args[0] and "list" in args[0]:
+            from charlie_work.subprocess_runner import RunResult
+
+            # Output with unknown flag key "garbage" and valued forms
+            malformed_output = """worktree /path/to/valid1
+HEAD abc123
+branch refs/heads/feature1
+bare
+
+worktree /path/to/valid2
+HEAD def456
+branch refs/heads/feature2
+garbage
+
+worktree /path/to/valid3
+HEAD ghi789
+branch refs/heads/feature3
+prunable some reason
+
+worktree /path/to/valid4
+HEAD jkl012
+branch refs/heads/feature4
+locked another reason
+"""
+            return RunResult(
+                returncode=0,
+                stdout=malformed_output,
+                stderr="",
+                error=None,
+            )
+        return original_run_captured(*args, **kwargs)
+
+    charlie_work.worktree.run_captured = mock_run_captured
+
+    try:
+        worktrees = list_worktrees(repo_root)
+
+        # Should parse only entries 1, 3, 4; entry 2 with unknown "garbage" key is dropped
+        assert len(worktrees) == 3
+        # Entry 1: valid with known flag "bare"
+        assert worktrees[0]["worktree"] == Path("/path/to/valid1")
+        assert worktrees[0]["bare"] is True
+        # Entry 3: valid with valued "prunable" (not in KNOWN_FLAG_KEYS, but has a value)
+        assert worktrees[1]["worktree"] == Path("/path/to/valid3")
+        assert worktrees[1]["prunable"] == "some reason"
+        # Entry 4: valid with valued "locked" (not in KNOWN_FLAG_KEYS, but has a value)
+        assert worktrees[2]["worktree"] == Path("/path/to/valid4")
+        assert worktrees[2]["locked"] == "another reason"
+    finally:
+        charlie_work.worktree.run_captured = original_run_captured
+
+
+def test_list_worktrees_consumer_path_safe_with_malformed_entries(tmp_path: Path) -> None:
+    """Consumer-path test: fresh-dispatch lookup with malformed porcelain output.
+
+    Drives the real fresh-dispatch/existing-worktree lookup code (around L529 in
+    worktree.py) with porcelain output containing one malformed entry and one valid
+    entry. Verifies no KeyError occurs and the valid entry is triaged correctly.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a worktree to establish a valid path
+    branch_name = "agent/issue-131-consumer"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Monkeypatch run_captured to return porcelain output with a malformed entry
+    import charlie_work.worktree
+
+    original_run_captured = charlie_work.worktree.run_captured
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        # If this is a git worktree list --porcelain call, return output with malformed entry
+        if isinstance(args[0], list) and "worktree" in args[0] and "list" in args[0]:
+            from charlie_work.subprocess_runner import RunResult
+
+            # Output with a malformed entry (bare "worktree") and the real valid entry
+            # We need to include the actual worktree path from info1
+            malformed_output = f"""worktree
+bare
+HEAD abc123
+branch refs/heads/malformed
+
+worktree {info1.path}
+HEAD def456
+branch refs/heads/{branch_name}
+"""
+            return RunResult(
+                returncode=0,
+                stdout=malformed_output,
+                stderr="",
+                error=None,
+            )
+        return original_run_captured(*args, **kwargs)
+
+    charlie_work.worktree.run_captured = mock_run_captured
+
+    try:
+        # Call list_worktrees (the consumer path)
+        worktrees = list_worktrees(repo_root)
+
+        # Should parse only the valid entry; the malformed one is dropped
+        assert len(worktrees) == 1
+        assert worktrees[0]["worktree"] == info1.path
+        assert worktrees[0]["branch"] == f"refs/heads/{branch_name}"
+
+        # Now drive the actual consumer code: fresh-dispatch stale worktree lookup
+        # This is the code around L529 that does wt["worktree"] subscript reads
+        existing_wt = next(
+            (wt for wt in worktrees if Path(wt["worktree"]) == info1.path),
+            None,
+        )
+
+        # Should find the valid worktree without KeyError
+        assert existing_wt is not None
+        assert existing_wt["worktree"] == info1.path
+        assert existing_wt["branch"] == f"refs/heads/{branch_name}"
+
+        # Verify the subscript access is safe (this would raise KeyError on malformed entry)
+        _ = existing_wt["worktree"]
+    finally:
+        charlie_work.worktree.run_captured = original_run_captured
+        remove_worktree(repo_root, info1.path)
