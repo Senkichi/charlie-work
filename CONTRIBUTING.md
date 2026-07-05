@@ -34,8 +34,9 @@ Examples:
 ## Pull request rules
 
 - **One issue per PR.** Each PR must link exactly one GitHub issue.
-- **PR title format:** `Fix #<N>: <short title>` (the janitor gate checks for a
-  linked issue number in the branch name, title, or body).
+- **PR title format:** Conventional-Commits format (`type(scope): description`).
+  Valid types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`.
+  The janitor gate enforces this format and warns on non-conventional titles.
 - **PR body must include** `Closes #<N>` so GitHub closes the issue on merge.
 - **Tests or rationale required.** The janitor gate checks the PR body for test
   evidence (`test`, `verified`, `verification`, …) or an explicit rationale for
