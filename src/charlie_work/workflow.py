@@ -306,17 +306,30 @@ class OrchestratorApp:
 
     def _adapter_settings(self) -> AdapterSettings:
         claude = self.config.claude_code
+        devin = self.config.devin
+        adapter = devin.adapter
+        # Use adapter-specific venv_source and worker_env
+        if adapter == "devin-shell":
+            venv_source = self._resolve(devin.venv_source) if devin.venv_source else None
+            worker_env = devin.worker_env
+        elif adapter == "claude-code":
+            venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
+            worker_env = claude.worker_env
+        else:
+            venv_source = None
+            worker_env = {}
         return AdapterSettings(
-            adapter=self.config.devin.adapter,
-            dispatch_command=self.config.devin.dispatch_command,
-            command_timeout_seconds=self.config.devin.command_timeout_seconds,
-            sessions_dir=self._resolve(self.config.devin.sessions_dir),
-            shell_command=self.config.devin.shell_command,
+            adapter=adapter,
+            dispatch_command=devin.dispatch_command,
+            command_timeout_seconds=devin.command_timeout_seconds,
+            sessions_dir=self._resolve(devin.sessions_dir),
+            shell_command=devin.shell_command,
             claude_command=claude.command,
             worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
-            venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
-            worker_env=claude.worker_env,
-            worker_model=self.config.devin.worker_model,
+            venv_source=venv_source,
+            worker_env=worker_env,
+            worker_model=devin.worker_model,
+            materialize_dirs=self.config.dispatch.materialize_dirs,
             dry_run=self.dry_run,
             base_ref=self.config.dispatch.base_ref,
         )
