@@ -5820,6 +5820,17 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
     assert result.data["selected_count"] == 1
     assert result.data["attempted_count"] == 1
 
+    # Verify the dispatched issue is exactly 101 (the eligible one), not 100 (blocked)
+    assert len(result.data["sessions"]) == 1
+    assert result.data["sessions"][0]["issue_number"] == 101
+    assert len(result.data["dispatch_results"]) == 1
+    assert result.data["dispatch_results"][0]["issue_number"] == 101
+
+    # Verify issue 100 is absent from dispatch results and sessions
+    dispatched_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 100 not in dispatched_issue_numbers
+    assert 100 not in {result["issue_number"] for result in result.data["dispatch_results"]}
+
     # Check that the blocked issue was skipped
     state = load_state(paths.state_file)
     blocked_events = [
