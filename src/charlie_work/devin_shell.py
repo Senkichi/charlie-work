@@ -29,6 +29,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from charlie_work.process_utils import parse_proc_stat_starttime
+
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -445,19 +447,10 @@ def _get_process_start_time(pid: int) -> float | None:
         try:
             with open(f"/proc/{pid}/stat", "r") as f:
                 stat = f.read()
-            # Field 20 (index 19) is starttime in clock ticks since boot
-            fields = stat.split(")")
-            # After the comm field (which may contain spaces), we have the remaining fields
-            # The format is: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime vsize rss rsslim startcode endcode startstack kstkesp kstkeip signal blocked sigignore sigcatch wchan ...
-            # We need to parse carefully because comm can contain spaces
-            after_comm = fields[1].strip().split()
-            # starttime is at index 19 (0-indexed)
-            if len(after_comm) < 20:
+            starttime_ticks = parse_proc_stat_starttime(stat)
+            if starttime_ticks is None:
                 return None
-            starttime_ticks = int(after_comm[19])
             # Convert to seconds: need system clock tick frequency
-            import os
-
             tick_hz = os.sysconf("SC_CLK_TCK")
             if tick_hz <= 0:
                 tick_hz = 100  # Default fallback

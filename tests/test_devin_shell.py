@@ -640,35 +640,42 @@ def test_posix_stat_parse_with_spaces_in_comm(
 ) -> None:
     """Unit test for /proc/<pid>/stat parsing with comm containing spaces and closing paren.
 
-    This test pins the parsing logic without needing Linux CI by testing the core
-    parsing logic directly. The comm field MUST contain spaces and a closing paren
+    This test exercises the real parse_proc_stat_starttime function (used by both adapters)
+    by monkeypatching the /proc read. The comm field MUST contain spaces and a closing paren
     (e.g., '(tmux: server)') to prove the last-')' splitting logic works correctly.
     """
-    # Simulate the parsing logic from _get_process_start_time
+    from charlie_work.process_utils import parse_proc_stat_starttime
+
     # Format: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime vsize rss ...
     # starttime is at index 19 (0-indexed) after splitting on ')'
     # This example has comm="(tmux: server)" which contains spaces
     stat_line = "1234 (tmux: server) S 1 1234 1234 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 100 200 300 400 500 600 700 800 900 1000 1100 1200 1300 1400 1500 1600 1700 1800 1900 2000 21000 22000 23000 24000 25000 26000 27000 28000 29000 30000 31000 32000 33000 34000 35000 36000 37000 38000 39000 40000 41000 42000 43000 44000 45000 46000 47000 48000 49000 50000 51000 52000"
 
-    # Replicate the parsing logic
-    fields = stat_line.split(")")
-    assert len(fields) == 2, "Stat line should split into two parts on ')'"
-
-    after_comm = fields[1].strip().split()
-    assert len(after_comm) >= 20, "Should have at least 20 fields after comm"
-
-    # starttime is at index 19 (0-indexed)
-    starttime_ticks = int(after_comm[19])
+    # Call the real parser function
+    starttime_ticks = parse_proc_stat_starttime(stat_line)
     assert starttime_ticks == 100, f"Expected starttime to be 100, got {starttime_ticks}"
 
-    # RSS is at index 21 (0-indexed) - this should NOT be used for starttime
-    rss = int(after_comm[21])
-    assert rss == 300, f"Expected RSS to be 300, got {rss}"
 
-    # Verify that changing RSS doesn't affect the extracted starttime
-    after_comm_modified = after_comm.copy()
-    after_comm_modified[21] = "99999"  # Change RSS to a different value
-    assert int(after_comm_modified[19]) == 100, "Changing RSS should not affect starttime"
+def test_posix_stat_parse_with_embedded_paren_in_comm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit test for /proc/<pid>/stat parsing with comm containing embedded ')'.
+
+    This test proves that rpartition (last-')' split) is required: a comm like
+    '(tmux: (0) server)' contains an embedded ')', which would break split(')')
+    by shifting all field offsets. The parser must split on the LAST ')' to correctly
+    extract the starttime field.
+    """
+    from charlie_work.process_utils import parse_proc_stat_starttime
+
+    # Comm contains embedded ')': (tmux: (0) server)
+    # Using split(')') would split on the first ')', giving wrong field offsets
+    # Using rpartition(')') splits on the last ')', giving correct field offsets
+    stat_line = "1234 (tmux: (0) server) S 1 1234 1234 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 100 200 300 400 500 600 700 800 900 1000 1100 1200 1300 1400 1500 1600 1700 1800 1900 2000 21000 22000 23000 24000 25000 26000 27000 28000 29000 30000 31000 32000 33000 34000 35000 36000 37000 38000 39000 40000 41000 42000 43000 44000 45000 46000 47000 48000 49000 50000 51000 52000"
+
+    # Call the real parser function
+    starttime_ticks = parse_proc_stat_starttime(stat_line)
+    assert starttime_ticks == 100, f"Expected starttime to be 100, got {starttime_ticks}"
 
 
 def test_is_session_alive_probe_none_with_start_time_returns_dead(
