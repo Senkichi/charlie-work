@@ -222,6 +222,7 @@ def launch_devin_session(
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
+    base_ref: str = "",
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -259,6 +260,7 @@ def launch_devin_session(
             materialize_dirs=materialize_dirs,
             rework=rework,
             recovery=recovery,
+            base_ref=base_ref,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = SessionRecord(

@@ -49,6 +49,10 @@ class AdapterSettings:
     # dry_run: if True, adapters return synthetic results without launching
     # real worker processes or mutating worktrees.
     dry_run: bool = False
+    # Base ref for fresh worktree creation. Empty string means auto-resolve to
+    # origin/<default-branch>. Passed to create_worktree for both devin-shell
+    # and claude-code adapters.
+    base_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -219,6 +223,7 @@ def _run_devin_shell_adapter(
             materialize_dirs=settings.materialize_dirs,
             rework=request.rework,
             recovery=request.recovery,
+            base_ref=settings.base_ref,
         )
         # Non-blocking launch: there is no returncode/stdout to report — liveness
         # and output live in the sidecar JSON and per-session log.
@@ -269,6 +274,7 @@ def _run_claude_code_adapter(
         materialize_dirs=settings.materialize_dirs,
         rework=request.rework,
         recovery=request.recovery,
+        base_ref=settings.base_ref,
         **kwargs,
     )
     ok = record.error is None and record.pid is not None

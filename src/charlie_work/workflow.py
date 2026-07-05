@@ -331,6 +331,7 @@ class OrchestratorApp:
             worker_model=devin.worker_model,
             materialize_dirs=self.config.dispatch.materialize_dirs,
             dry_run=self.dry_run,
+            base_ref=self.config.dispatch.base_ref,
         )
 
     def _apply_concurrency_governor(self, dispatch_limit: int) -> ConcurrencyGovernorResult:

@@ -212,6 +212,7 @@ def launch_claude_worker(
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
+    base_ref: str = "",
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -240,6 +241,7 @@ def launch_claude_worker(
             materialize_dirs=materialize_dirs,
             rework=rework,
             recovery=recovery,
+            base_ref=base_ref,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(

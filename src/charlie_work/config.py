@@ -103,6 +103,12 @@ class DispatchConfig:
     # skip-if-tracked (tracked paths are already present). Errors surface as
     # values in SessionRecord.error.
     materialize_dirs: tuple[str, ...] = ()
+    # Base ref for fresh worktree creation. Empty string (default) means auto-resolve
+    # to origin/<default-branch>. If set, must be a valid git ref (e.g., "origin/main",
+    # "HEAD", or a commit SHA). When the resolved base ref is a remote-tracking ref
+    # (origin/<branch>), git fetch is run before worktree creation to ensure the
+    # worktree bases off the latest remote tip instead of a stale local HEAD.
+    base_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -289,6 +295,12 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"directory paths, got {type(materialize_dirs).__name__}"
             )
         dispatch_data["materialize_dirs"] = tuple(str(item) for item in materialize_dirs)
+    base_ref = dispatch_data.get("base_ref")
+    if base_ref is not None and not isinstance(base_ref, str):
+        raise ConfigError(
+            "config section 'dispatch' key 'base_ref' must be a string, "
+            f"got {type(base_ref).__name__}"
+        )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     auto_merge_data = _section(data, "auto_merge")
