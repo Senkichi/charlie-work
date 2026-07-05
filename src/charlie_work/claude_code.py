@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import parse_proc_stat_starttime
-
+from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -77,6 +77,7 @@ class ClaudeWorkerRecord:
     error: str | None = None
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     @property
     def ok(self) -> bool:
@@ -289,7 +290,12 @@ def launch_claude_worker(
     # worker's local `pytest -n auto` so a fleet of them doesn't oversubscribe
     # the shared host (see docs/RUNBOOK.md "Local host saturation ceiling
     # (claude-code adapter)"). `env` is a validated mapping (see config.py).
-    worker_env = {**os.environ, **{str(k): str(v) for k, v in (env or {}).items()}}
+    # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
+    # leaks from the orchestrator, then merge user-provided overrides on top.
+    worker_env = {
+        **sanitize_env(worktree.path),
+        **{str(k): str(v) for k, v in (env or {}).items()},
+    }
 
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
@@ -341,6 +347,7 @@ def launch_claude_worker(
         log_path=str(log_path),
         error=None,
         process_start_time=process_start_time,
+        reclaimed=worktree.reclaimed,
     )
     return _write_record(sessions_dir, record)
 
@@ -376,6 +383,7 @@ def read_worker_records(sessions_dir: Path) -> list[ClaudeWorkerRecord]:
                     error=data.get("error"),
                     failure_kind=data.get("failure_kind"),
                     process_start_time=data.get("process_start_time"),
+                    reclaimed=data.get("reclaimed"),
                 )
             )
         except (KeyError, TypeError, ValueError):

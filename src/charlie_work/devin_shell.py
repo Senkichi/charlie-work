@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import parse_proc_stat_starttime
-
+from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -87,6 +87,7 @@ class SessionRecord:
     error: str | None = None
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -108,6 +109,7 @@ class SessionRecord:
             error=payload.get("error"),
             failure_kind=payload.get("failure_kind"),
             process_start_time=payload.get("process_start_time"),
+            reclaimed=payload.get("reclaimed"),
         )
 
 
@@ -173,33 +175,6 @@ def _write_json(path: Path, value: Any) -> None:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
     tmp_path.replace(path)
-
-
-def _sanitize_env(worktree_path: Path) -> dict[str, str]:
-    """Return a sanitized environment for worker subprocesses.
-
-    Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
-    to prevent the orchestrator's venv from leaking into worker sessions. If the
-    worktree contains a .venv directory, VIRTUAL_ENV is set to that path instead
-    of being dropped.
-
-    This is a defense-in-depth measure: workers should resolve their own
-    environment via uv run --active or similar, not inherit the orchestrator's.
-    """
-    env = dict(os.environ)
-    worktree_venv = worktree_path / ".venv"
-
-    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
-    env.pop("UV_PROJECT_ENVIRONMENT", None)
-
-    if worktree_venv.is_dir():
-        # Worktree has its own venv — use it
-        env["VIRTUAL_ENV"] = str(worktree_venv)
-    else:
-        # No worktree venv — drop VIRTUAL_ENV to prevent leaks
-        env.pop("VIRTUAL_ENV", None)
-
-    return env
 
 
 def _render_command(
@@ -325,7 +300,7 @@ def launch_devin_session(
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
-    kwargs["env"] = _sanitize_env(worktree.path)
+    kwargs["env"] = sanitize_env(worktree.path)
 
     pid: int | None = None
     error: str | None = None
@@ -358,6 +333,7 @@ def launch_devin_session(
         log_path=str(log_path),
         error=error,
         process_start_time=process_start_time,
+        reclaimed=worktree.reclaimed,
     )
     _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
     return record
@@ -597,6 +573,9 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
+<<<<<<< HEAD
     "_sanitize_env",
     "_get_process_start_time",
+=======
+>>>>>>> origin/main
 ]

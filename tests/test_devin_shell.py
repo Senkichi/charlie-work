@@ -18,8 +18,8 @@ from charlie_work.devin_shell import (
     probe_devin,
     read_session_records,
     update_session_record_with_failure_classification,
-    _sanitize_env,
 )
+from charlie_work.env_sanitize import sanitize_env
 from charlie_work.worktree import WorktreeInfo
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
@@ -879,7 +879,7 @@ def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when worktree has no .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (
@@ -900,7 +900,7 @@ def test_sanitize_env_sets_worktree_venv_when_present(
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
         "VIRTUAL_ENV must be set to worktree .venv"
@@ -921,7 +921,7 @@ def test_sanitize_env_preserves_other_env_vars(
     monkeypatch.setenv("HOME", "/home/user")
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
 
-    env = _sanitize_env(worktree_path)
+    env = sanitize_env(worktree_path)
 
     assert env.get("PATH") == "/usr/bin:/bin", "PATH must be preserved"
     assert env.get("HOME") == "/home/user", "HOME must be preserved"
