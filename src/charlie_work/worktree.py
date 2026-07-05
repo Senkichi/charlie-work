@@ -715,7 +715,12 @@ def list_worktrees(repo_root: Path) -> list[dict]:
         else:
             key, value = line, True
         if key == "worktree":
-            current[key] = Path(value)
+            # Guard against malformed input: worktree lines must have a path (str)
+            # Flag-style lines (bare, detached, prunable) assign value=True, but
+            # a well-formed porcelain output always has a path after "worktree".
+            # If we encounter a bare "worktree" line, skip it to avoid Path(True) crash.
+            if isinstance(value, str):
+                current[key] = Path(value)
         else:
             current[key] = value
     if current:
