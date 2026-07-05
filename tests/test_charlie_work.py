@@ -1015,11 +1015,13 @@ class FakeGitHub:
     def pr_diff(self, number: int):
         return "diff --git a/file b/file"
 
-    def add_issue_label(self, number: int, label: str) -> None:
+    def add_issue_label(self, number: int, label: str) -> bool:
         self.labels_added.append((number, label))
+        return True
 
-    def remove_issue_label(self, number: int, label: str) -> None:
+    def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
+        return True
 
     def merge_pr(
         self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
@@ -2918,11 +2920,12 @@ def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
 
 def test_review_started_clears_needs_rework() -> None:
     # Re-review after a rework must not stack reviewing on top of needs-rework.
-    from charlie_work.labels import transition
+    from charlie_work.labels import transition, TransitionOutcome
 
     fake_gh = FakeGitHub()
-    transition(fake_gh, OrchestratorConfig().labels, 123, "review_started")
+    result = transition(fake_gh, OrchestratorConfig().labels, 123, "review_started")
 
+    assert result.outcome == TransitionOutcome.APPLIED
     assert (123, "agent:pr-open") in fake_gh.labels_added
     assert (123, "agent:reviewing") in fake_gh.labels_added
     assert (123, "agent:needs-rework") in fake_gh.labels_removed

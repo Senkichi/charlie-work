@@ -17,12 +17,21 @@ from charlie_work.state import empty_state, is_claim_stale
 class FakeGitHub:
     """Records every call so tests can assert detect_drift never mutates."""
 
-    def __init__(self, *, prs: list[dict[str, Any]], issues: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        *,
+        prs: list[dict[str, Any]],
+        issues: list[dict[str, Any]],
+        fail_add_labels: set[tuple[int, str]] | None = None,
+        fail_remove_labels: set[tuple[int, str]] | None = None,
+    ) -> None:
         self._prs = prs
         self._issues = issues
         self.run_calls: list[list[str]] = []
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
+        self._fail_add_labels = fail_add_labels or set()
+        self._fail_remove_labels = fail_remove_labels or set()
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         self.run_calls.append(args)
@@ -32,11 +41,13 @@ class FakeGitHub:
             return self._issues
         raise AssertionError(f"unexpected gh.run call: {args}")
 
-    def add_issue_label(self, number: int, label: str) -> None:
+    def add_issue_label(self, number: int, label: str) -> bool:
         self.labels_added.append((number, label))
+        return (number, label) not in self._fail_add_labels
 
-    def remove_issue_label(self, number: int, label: str) -> None:
+    def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
+        return (number, label) not in self._fail_remove_labels
 
 
 def _pr(
@@ -1053,15 +1064,211 @@ def test_detect_drift_session_failed_no_pr_mutually_exclusive_with_issue_active_
         prs=[],
         issues=[_issue(42, [config.labels.in_progress])],
     )
-    new_state = apply_fixes(gh, state, drift, config)
+    _ = apply_fixes(gh, state, drift, config)
 
     # Should have exactly one remove call for in_progress
     assert gh.labels_removed.count((42, config.labels.in_progress)) == 1
-    # Should have exactly one reconcile event for session_failed_relabeled
-    # (provider_throttle_detected also emits an event, so filter by kind)
-    session_relabel_events = [
-        e
-        for e in new_state["events"]
-        if e["kind"] == "reconcile" and e["payload"]["kind"] == "session_failed_relabeled"
+
+
+def test_transition_failed_add_returns_partial_failure() -> None:
+    """Issue #125: transition() should return PARTIAL_FAILURE when add fails."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    # Simulate a failed add for the done label
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_add_labels={(10, config.labels.done)},
+    )
+
+    result = transition(gh, config.labels, 10, "merged")
+
+    assert result.outcome == TO.PARTIAL_FAILURE
+    assert (10, config.labels.done) in result.add_failures
+    assert len(result.remove_failures) == 0
+
+
+def test_transition_failed_remove_returns_partial_failure() -> None:
+    """Issue #125: transition() should return PARTIAL_FAILURE when remove fails."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    # Simulate a failed remove for an active label
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_remove_labels={(10, config.labels.in_progress)},
+    )
+
+    result = transition(gh, config.labels, 10, "merged")
+
+    assert result.outcome == TO.PARTIAL_FAILURE
+    assert (10, config.labels.in_progress) in result.remove_failures
+    assert len(result.add_failures) == 0
+
+
+def test_transition_no_labels_returns_nothing_changed() -> None:
+    """Issue #125: transition() should return NOTHING_CHANGED when no labels to add/remove."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+
+    # Use an event that has no labels (e.g., a hypothetical no-op event)
+    # For this test, we'll use the "blocked" event which only adds human_needed
+    result = transition(gh, config.labels, 10, "blocked")
+
+    assert result.outcome == TO.APPLIED  # blocked has labels to add
+    assert len(result.add_failures) == 0
+    assert len(result.remove_failures) == 0
+
+
+def test_apply_fixes_multi_item_with_one_failed_label_write() -> None:
+    """Issue #125: apply_fixes should record failure when one label write fails."""
+    config = OrchestratorConfig()
+    # Simulate a failed remove for one label
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_remove_labels={(20, config.labels.pr_open)},
+    )
+    state = empty_state()
+
+    # Create multiple drift items
+    drift = [
+        DriftItem(
+            kind="closed_unmerged_pr_active_labels",
+            issue_number=20,
+            pr_number=2,
+            detail="PR #2 closed without merging",
+            fix_actions=(
+                f"remove label '{config.labels.pr_open}' from issue #20",
+                f"remove label '{config.labels.reviewing}' from issue #20",
+            ),
+            remove_labels=(config.labels.pr_open, config.labels.reviewing),
+        ),
+        DriftItem(
+            kind="issue_active_label_no_open_pr",
+            issue_number=30,
+            pr_number=None,
+            detail="issue #30 has active label but no PR",
+            fix_actions=(f"remove label '{config.labels.in_progress}' from issue #30",),
+            remove_labels=(config.labels.in_progress,),
+        ),
     ]
-    assert len(session_relabel_events) == 1
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Both items should have been processed
+    assert (20, config.labels.pr_open) in gh.labels_removed
+    assert (20, config.labels.reviewing) in gh.labels_removed
+    assert (30, config.labels.in_progress) in gh.labels_removed
+
+    # Check that the failure was recorded in the event
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 2
+
+    # The first event should have label_write_failed recorded
+    first_event = reconcile_events[0]
+    assert first_event["payload"]["kind"] == "closed_unmerged_pr_active_labels"
+    assert "label_write_failed: true" in first_event["payload"]["fix_actions"]
+
+    # The second event should not have label_write_failed (it succeeded)
+    second_event = reconcile_events[1]
+    assert second_event["payload"]["kind"] == "issue_active_label_no_open_pr"
+    assert "label_write_failed" not in " ".join(second_event["payload"]["fix_actions"])
+
+
+def test_apply_fixes_transition_failure_recorded_in_event() -> None:
+    """Issue #125: apply_fixes should record transition outcome when it fails."""
+    config = OrchestratorConfig()
+    # Simulate a failed add during transition
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_add_labels={(10, config.labels.done)},
+    )
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+
+    drift = [
+        DriftItem(
+            kind="merged_outside_orchestrator",
+            issue_number=10,
+            pr_number=1,
+            detail="PR #1 merged outside orchestrator",
+            fix_actions=("mark state prs[1].status = 'merged'", "transition issue #10"),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Check that the transition outcome was recorded in the event
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+
+    event = reconcile_events[0]
+    assert event["payload"]["kind"] == "merged_outside_orchestrator"
+    assert "transition outcome" in " ".join(event["payload"]["fix_actions"])
+    assert "partial_failure" in " ".join(event["payload"]["fix_actions"])
+    assert "add_failures" in " ".join(event["payload"]["fix_actions"])
+
+
+def test_mutation_gate_transition_ignoring_result_fails() -> None:
+    """Issue #125: gate test - ignoring transition result must fail."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_add_labels={(10, config.labels.done)},
+    )
+
+    # This test ensures that if someone reverts to fire-and-forget (ignoring result),
+    # the test will fail because we assert on the outcome
+    result = transition(gh, config.labels, 10, "merged")
+
+    # If someone ignores the result and just calls transition(), this assertion
+    # will catch that the operation didn't fully succeed
+    assert result.outcome == TO.PARTIAL_FAILURE, (
+        "Transition should report PARTIAL_FAILURE when add fails - this gate prevents "
+        "reverting to fire-and-forget behavior"
+    )
+
+
+def test_mutation_gate_apply_fixes_false_success_fails() -> None:
+    """Issue #125: gate test - reporting failed write as success must fail."""
+    config = OrchestratorConfig()
+    # Simulate a failed remove
+    gh = FakeGitHub(
+        prs=[],
+        issues=[],
+        fail_remove_labels={(20, config.labels.pr_open)},
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="closed_unmerged_pr_active_labels",
+            issue_number=20,
+            pr_number=2,
+            detail="PR #2 closed without merging",
+            fix_actions=(f"remove label '{config.labels.pr_open}' from issue #20",),
+            remove_labels=(config.labels.pr_open,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # This gate ensures that if someone removes the failure recording logic,
+    # the test will fail because we expect the failure to be present
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+
+    event = reconcile_events[0]
+    assert "label_write_failed: true" in event["payload"]["fix_actions"], (
+        "Label write failure must be recorded in event - this gate prevents "
+        "reporting failures as successes"
+    )

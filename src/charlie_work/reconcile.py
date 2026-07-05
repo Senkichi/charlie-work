@@ -33,7 +33,7 @@ from .github import (
     label_names,
     linked_issue_number,
 )
-from .labels import transition
+from .labels import TransitionOutcome, transition
 from .state import append_event, is_claim_stale, set_throttled_until
 
 
@@ -426,12 +426,46 @@ def apply_fixes(
                 pr_key = str(item.pr_number)
                 new_prs[pr_key] = {**new_prs.get(pr_key, {}), "status": "merged"}
             if item.issue_number is not None:
-                transition(gh, config.labels, item.issue_number, "merged")
+                result = transition(gh, config.labels, item.issue_number, "merged")
+                # Record transition outcome in the event
+                fix_actions = list(item.fix_actions)
+                if result.outcome != TransitionOutcome.APPLIED:
+                    fix_actions.append(
+                        f"transition outcome: {result.outcome.value}, "
+                        f"add_failures: {result.add_failures}, "
+                        f"remove_failures: {result.remove_failures}"
+                    )
+                    # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         elif item.kind == "closed_unmerged_pr_active_labels":
             if item.issue_number is not None:
+                label_ok = True
                 for label in item.remove_labels:
-                    gh.remove_issue_label(item.issue_number, label)
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                # Record label-write failures in the event
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                    # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         elif item.kind == "state_pr_missing_on_github":
             if item.pr_number is not None:
@@ -439,8 +473,24 @@ def apply_fixes(
 
         elif item.kind in ("issue_active_label_no_open_pr", "done_label_with_active_labels"):
             if item.issue_number is not None:
+                label_ok = True
                 for label in item.remove_labels:
-                    gh.remove_issue_label(item.issue_number, label)
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                # Record label-write failures in the event
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                    # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         elif item.kind == "stale_dispatch_pending_claim":
             if item.issue_number is not None:
@@ -459,12 +509,29 @@ def apply_fixes(
         elif item.kind == "session_failed_relabeled":
             # Issue #118: reconcile labels for dead sessions with no open PR
             if item.issue_number is not None:
+                label_ok = True
                 # Remove active labels
                 for label in item.remove_labels:
-                    gh.remove_issue_label(item.issue_number, label)
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
                 # Add ready label if needed (structured field)
                 for label in item.add_labels:
-                    gh.add_issue_label(item.issue_number, label)
+                    if not gh.add_issue_label(item.issue_number, label):
+                        label_ok = False
+                # Record label-write failures in the event
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                    # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         new_state = append_event(
             new_state,
