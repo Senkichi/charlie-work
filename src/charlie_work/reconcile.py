@@ -286,6 +286,38 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                             )
                         )
+                    
+                    # Issue #118: reconcile labels for dead sessions with no open PR
+                    # A dead worker with no open PR is recoverable and should be relabeled
+                    # as dispatchable (remove active labels, ensure ready label present)
+                    if record.issue_number not in prs_linking_issue:
+                        issue = issues_by_number.get(record.issue_number)
+                        if issue:
+                            issue_labels = label_names(issue)
+                            active_labels = issue_labels & labels_cfg.active
+                            if active_labels:
+                                # Remove all active labels and ensure ready label is present
+                                fix_actions = [
+                                    f"remove label '{label}' from issue #{record.issue_number}"
+                                    for label in sorted(active_labels)
+                                ]
+                                if labels_cfg.ready not in issue_labels:
+                                    fix_actions.append(f"add label '{labels_cfg.ready}' to issue #{record.issue_number}")
+                                
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_failed_relabeled",
+                                        issue_number=record.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{record.issue_number} session died with "
+                                            f"{failure_kind or 'unknown failure'}, no open PR, "
+                                            f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                        ),
+                                        fix_actions=tuple(fix_actions),
+                                        remove_labels=tuple(sorted(active_labels)),
+                                    )
+                                )
 
             # Check claude-code sessions
             for record in read_worker_records(sessions_dir):
@@ -312,6 +344,35 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                             )
                         )
+                    
+                    # Issue #118: reconcile labels for dead sessions with no open PR
+                    if record.issue_number not in prs_linking_issue:
+                        issue = issues_by_number.get(record.issue_number)
+                        if issue:
+                            issue_labels = label_names(issue)
+                            active_labels = issue_labels & labels_cfg.active
+                            if active_labels:
+                                fix_actions = [
+                                    f"remove label '{label}' from issue #{record.issue_number}"
+                                    for label in sorted(active_labels)
+                                ]
+                                if labels_cfg.ready not in issue_labels:
+                                    fix_actions.append(f"add label '{labels_cfg.ready}' to issue #{record.issue_number}")
+                                
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_failed_relabeled",
+                                        issue_number=record.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{record.issue_number} session died with "
+                                            f"{failure_kind or 'unknown failure'}, no open PR, "
+                                            f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                        ),
+                                        fix_actions=tuple(fix_actions),
+                                        remove_labels=tuple(sorted(active_labels)),
+                                    )
+                                )
 
     return drift
 
@@ -363,6 +424,19 @@ def apply_fixes(
                     throttled_until = action.split("=", 1)[1]
                     new_state = set_throttled_until(new_state, throttled_until)
                     break
+
+        elif item.kind == "session_failed_relabeled":
+            # Issue #118: reconcile labels for dead sessions with no open PR
+            if item.issue_number is not None:
+                # Remove active labels
+                for label in item.remove_labels:
+                    gh.remove_issue_label(item.issue_number, label)
+                # Add ready label if needed (parsed from fix_actions)
+                for action in item.fix_actions:
+                    if action.startswith("add label '") and action.endswith(f"' to issue #{item.issue_number}"):
+                        label = action.split("'")[1]
+                        gh.add_issue_label(item.issue_number, label)
+                        break
 
         new_state = append_event(
             new_state,
