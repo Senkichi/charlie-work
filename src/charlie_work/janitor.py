@@ -50,7 +50,8 @@ JANITOR_PR_KEYS = frozenset(
         "state",  # _check_state
         "mergeable",  # _check_mergeable
         "isCrossRepository",  # _check_linked_issue, _check_base_movement
-        "headRefName",  # _check_linked_issue, _check_base_movement
+        "headRefName",  # _check_linked_issue, _check_base_movement, _check_no_op_rework
+        "baseRefName",  # _check_no_op_rework
         "body",  # _check_body
         "title",  # _check_title_conventional
         "additions",  # _check_diff_size
@@ -68,7 +69,12 @@ class JanitorVerdict:
 
 
 def run_janitor(
-    pr: dict[str, Any], checks: list[dict[str, Any]], config: OrchestratorConfig
+    pr: dict[str, Any],
+    checks: list[dict[str, Any]],
+    config: OrchestratorConfig,
+    *,
+    pr_state: dict[str, Any] | None = None,
+    repo_root: Path | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -88,6 +94,10 @@ def run_janitor(
     _check_title_conventional(pr, warnings)
     _check_diff_size(pr, warnings)
     _check_base_movement(pr, config, warnings)
+
+    # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
+    if repo_root is not None:
+        _check_no_op_rework(pr, pr_state, failures, warnings, repo_root)
 
     return JanitorVerdict(ok=not failures, failures=tuple(failures), warnings=tuple(warnings))
 
@@ -202,6 +212,183 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def _check_no_op_rework(
+    pr: dict[str, Any],
+    pr_state: dict[str, Any] | None,
+    failures: list[str],
+    warnings: list[str],
+    repo_root: Path,
+) -> None:
+    """Check if the PR head is unchanged since a request_changes verdict.
+
+    When a PR has a request_changes verdict in its state, compare the current
+    headRefOid against the reviewed_head_sha from that verdict. If they match,
+    the rework produced no pushed commits (no-op rework).
+
+    GitHub update-branch merges (base-update commits) are excluded: only non-merge
+    commits since the verdict are considered real work.
+    """
+    if not pr_state:
+        return
+
+    # Check if the most recent verdict was request_changes
+    decision = pr_state.get("decision")
+    if decision != "request_changes":
+        return
+
+    reviewed_head_sha = pr_state.get("reviewed_head_sha")
+    if not reviewed_head_sha:
+        return
+
+    current_head_sha = pr.get("headRefOid")
+    if not current_head_sha:
+        return
+
+    # If heads match exactly, it's a no-op rework
+    if current_head_sha == reviewed_head_sha:
+        failure_msg = (
+            f"PR head unchanged since request_changes verdict ({reviewed_head_sha}) — "
+            f"the rework produced no pushed commits"
+        )
+
+        # Enrich with unpushed-commit count if worktree exists
+        head_ref = pr.get("headRefName")
+        if head_ref:
+            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
+            if unpushed_info:
+                failure_msg += f"; {unpushed_info}"
+            else:
+                failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+        else:
+            failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+
+        failures.append(failure_msg)
+        return
+
+    # Criterion 2: detect merge-only advances (e.g., from ship-it's update_open_prs)
+    # Fetch the PR head ref and check if any non-merge commits exist since the verdict
+    head_ref = pr.get("headRefName")
+    base_ref = pr.get("baseRefName")
+    if not head_ref:
+        # Can't check merge-only case without ref name; fall back to SHA equality check
+        # (which already passed above, so no failure here)
+        return
+
+    try:
+        # Fetch both the PR head ref and base ref from origin
+        # We need the base ref to exclude base-reachable commits from the count
+        fetch_refs = [head_ref]
+        if base_ref:
+            fetch_refs.append(base_ref)
+        subprocess.run(
+            ["git", "fetch", "origin"] + fetch_refs,
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        # Count non-merge commits since the reviewed head, excluding base-reachable commits
+        # The ^ syntax excludes commits reachable from the given refs
+        # This counts commits that are:
+        # - Not merge commits (--no-merges)
+        # - Not in reviewed_head_sha (^reviewed_head_sha)
+        # - Not in origin/baseRefName (^origin/baseRefName if base_ref exists)
+        # - Reachable from current_head_sha (implicit in the range syntax)
+        rev_list_args = ["git", "rev-list", "--no-merges", "--count", current_head_sha]
+        rev_list_args.append(f"^{reviewed_head_sha}")
+        if base_ref:
+            rev_list_args.append(f"^origin/{base_ref}")
+        result = subprocess.run(
+            rev_list_args,
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        non_merge_count = int(result.stdout.strip())
+
+        if non_merge_count == 0:
+            # Head advanced only by merge commits (base-update) — still a no-op
+            failure_msg = (
+                f"PR head advanced only by merge commits since request_changes verdict ({reviewed_head_sha} → {current_head_sha}) — "
+                f"the rework produced no real work (only base-update merges)"
+            )
+
+            # Enrich with unpushed-commit count if worktree exists
+            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
+            if unpushed_info:
+                failure_msg += f"; {unpushed_info}"
+            else:
+                failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+
+            failures.append(failure_msg)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        # Git failed (no network, unknown ref, shallow history, or parse error)
+        # Fall back to SHA equality result and append a warning
+        warnings.append(
+            f"Could not verify whether PR head advance ({reviewed_head_sha} → {current_head_sha}) "
+            f"included non-merge commits; git fetch/rev-list failed. "
+            f"If the advance was only base-update merges, this may be a no-op rework."
+        )
+
+
+def _get_unpushed_commit_info(
+    branch: str,
+    repo_root: Path,
+) -> str | None:
+    """Check if the branch has unpushed commits in its local worktree.
+
+    Returns a message with the unpushed commit count and push remediation if
+    unpushed commits exist, None otherwise.
+    """
+    # Try to find the worktree for this branch
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        # Parse worktree list to find the worktree for this branch
+        worktree_path = None
+        current_worktree = None
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                current_worktree = Path(line[len("worktree ") :].strip())
+            elif line.startswith("branch ") and current_worktree:
+                branch_line = line[len("branch ") :].strip()
+                # Branch names may have refs/heads/ prefix
+                if branch_line.endswith(f"/{branch}") or branch_line == f"refs/heads/{branch}":
+                    worktree_path = current_worktree
+                    break
+
+        if not worktree_path or not worktree_path.exists():
+            return None
+
+        # Check for unpushed commits in the worktree
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        unpushed_count = int(result.stdout.strip())
+        if unpushed_count > 0:
+            return (
+                f"worktree has {unpushed_count} unpushed commit(s); "
+                f"run 'git push origin {branch}' from the worktree to push them"
+            )
+
+        return None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        # Git failed or worktree not found; skip enrichment
+        return None
 
 
 def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
