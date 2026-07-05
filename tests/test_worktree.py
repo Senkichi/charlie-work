@@ -1562,28 +1562,17 @@ branch refs/heads/{branch_name}
     charlie_work.worktree.run_captured = mock_run_captured
 
     try:
-        # Call list_worktrees (the consumer path)
-        worktrees = list_worktrees(repo_root)
+        # Drive the actual consumer code: call create_worktree again (fresh-dispatch path)
+        # This will call list_worktrees internally and do the real lookup around L529
+        # The existing worktree should be found and triaged correctly despite the malformed entry
+        info2 = create_worktree(repo_root, branch_name, base_ref="HEAD")
 
-        # Should parse only the valid entry; the malformed one is dropped
-        assert len(worktrees) == 1
-        assert worktrees[0]["worktree"] == info1.path
-        assert worktrees[0]["branch"] == f"refs/heads/{branch_name}"
-
-        # Now drive the actual consumer code: fresh-dispatch stale worktree lookup
-        # This is the code around L529 that does wt["worktree"] subscript reads
-        existing_wt = next(
-            (wt for wt in worktrees if Path(wt["worktree"]) == info1.path),
-            None,
-        )
-
-        # Should find the valid worktree without KeyError
-        assert existing_wt is not None
-        assert existing_wt["worktree"] == info1.path
-        assert existing_wt["branch"] == f"refs/heads/{branch_name}"
-
-        # Verify the subscript access is safe (this would raise KeyError on malformed entry)
-        _ = existing_wt["worktree"]
+        # Should succeed without KeyError (the malformed entry is dropped by the parser)
+        assert info2 is not None
+        # The worktree path should be the same (existing worktree was found)
+        assert info2.path == info1.path
+        # The worktree should still exist
+        assert info2.path.exists()
     finally:
         charlie_work.worktree.run_captured = original_run_captured
         remove_worktree(repo_root, info1.path)
