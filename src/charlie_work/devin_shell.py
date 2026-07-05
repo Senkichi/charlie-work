@@ -184,13 +184,15 @@ def _sanitize_env(worktree_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     worktree_venv = worktree_path / ".venv"
 
+    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
+    env.pop("UV_PROJECT_ENVIRONMENT", None)
+
     if worktree_venv.is_dir():
         # Worktree has its own venv — use it
         env["VIRTUAL_ENV"] = str(worktree_venv)
     else:
-        # No worktree venv — drop both variables to prevent leaks
+        # No worktree venv — drop VIRTUAL_ENV to prevent leaks
         env.pop("VIRTUAL_ENV", None)
-        env.pop("UV_PROJECT_ENVIRONMENT", None)
 
     return env
 

@@ -671,8 +671,9 @@ def test_sanitize_env_sets_worktree_venv_when_present(
     worktree_venv = worktree_path / ".venv"
     worktree_venv.mkdir()
 
-    # Set parent env variable (simulating orchestrator leak)
+    # Set parent env variables (simulating orchestrator leak)
     monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
 
     env = _sanitize_env(worktree_path)
 

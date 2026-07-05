@@ -120,13 +120,15 @@ def _sanitize_env(repo_root: Path) -> dict[str, str]:
     env = dict(os.environ)
     repo_venv = repo_root / ".venv"
 
+    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
+    env.pop("UV_PROJECT_ENVIRONMENT", None)
+
     if repo_venv.is_dir():
         # Repo has its own venv — use it
         env["VIRTUAL_ENV"] = str(repo_venv)
     else:
-        # No repo venv — drop both variables to prevent leaks
+        # No repo venv — drop VIRTUAL_ENV to prevent leaks
         env.pop("VIRTUAL_ENV", None)
-        env.pop("UV_PROJECT_ENVIRONMENT", None)
 
     return env
 
