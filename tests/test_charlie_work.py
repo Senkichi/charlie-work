@@ -7,6 +7,7 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 from charlie_work import cli
@@ -1526,6 +1527,101 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
 
     assert calls["n"] == 1
     assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
+
+
+def test_run_cross_family_sanitizes_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_cross_family_review must sanitize the environment before spawning the subprocess."""
+    from charlie_work.cross_family import _sanitize_env
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(repo_root)
+
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when repo has no .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when repo has no .venv"
+    )
+
+
+def test_run_cross_family_sanitizes_environment_with_repo_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When repo has .venv, VIRTUAL_ENV must be set to that path."""
+    from charlie_work.cross_family import _sanitize_env
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    repo_venv = repo_root / ".venv"
+    repo_venv.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(repo_root)
+
+    assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped when repo has .venv"
+    )
+
+
+def test_run_cross_family_sanitizes_environment_at_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_cross_family_review must pass sanitized env to the actual subprocess runner."""
+    import subprocess
+    from charlie_work.cross_family import run_cross_family_review
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report_path = tmp_path / "report.md"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("test prompt", encoding="utf-8")
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    captured_env: dict[str, str] | None = None
+
+    def _fake_runner(command, **kwargs):
+        nonlocal captured_env
+        captured_env = kwargs.get("env")
+        # Return a valid report
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="**MINOR**\nissue\n\nVerdict: safe",
+            stderr="",
+        )
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("echo", "test"),
+        repo_root=repo_root,
+        prompt_text="test prompt",
+        prompt_path=prompt_path,
+        report_path=report_path,
+        timeout_seconds=30,
+        runner=_fake_runner,
+    )
+
+    assert result.ok is True
+    assert captured_env is not None, "Runner should have received env kwarg"
+    assert "VIRTUAL_ENV" not in captured_env, (
+        "VIRTUAL_ENV must be sanitized in the actual subprocess env"
+    )
+    assert "UV_PROJECT_ENVIRONMENT" not in captured_env, (
+        "UV_PROJECT_ENVIRONMENT must be sanitized in the actual subprocess env"
+    )
 
 
 def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, monkeypatch) -> None:
@@ -4909,10 +5005,11 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
 
 
 def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path: Path) -> None:
-    """Review_started transition should be skipped when head hasn't changed after request_changes.
+    """Janitor blocks review when head hasn't changed after request_changes (no-op rework).
 
     This prevents pointless packet churn and preserves the needs_rework label on
-    budget-deferred rework candidates.
+    budget-deferred rework candidates. The janitor now blocks before review_started
+    can fire.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -4931,6 +5028,7 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
                 "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
+                "baseRefName": "main",
             }
         ),
         encoding="utf-8",
@@ -4951,9 +5049,10 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
     # Call review again with the same head SHA
     result = app.review(456)
 
-    # The review_started transition should be skipped, so no labels should be added/removed
-    assert result.ok is True
-    # review_started transition adds pr_open and reviewing labels when it fires
+    # The janitor should block the PR because the head is unchanged (no-op rework)
+    assert result.ok is False
+    assert "PR head unchanged since request_changes verdict" in result.message
+    # review_started transition should not fire (janitor blocks before it)
     assert (123, "agent:pr-open") not in fake_gh.labels_added
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
@@ -4977,6 +5076,7 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
                 "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
+                "baseRefName": "main",
             }
         ),
         encoding="utf-8",

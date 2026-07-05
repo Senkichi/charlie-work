@@ -743,11 +743,21 @@ class OrchestratorApp:
         )
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
+
+        # Load PR state for no-op rework detection (only if PR has verdict history)
+        pr_state = None
+        # Cheap existence check before acquiring lock
+        state = load_state(self.paths.state_file)
+        if str(pr_number) in state.get("prs", {}):
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                pr_state = state["prs"].get(str(pr_number), {})
+
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
         # must cost zero review tokens. Failures don't move labels — they are
         # the worker's/CI's to fix, not a review decision.
-        verdict = run_janitor(pr, checks, self.config)
+        verdict = run_janitor(pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root)
         if not verdict.ok:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
