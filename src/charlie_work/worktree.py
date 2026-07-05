@@ -163,7 +163,7 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
     # Push the salvage ref if origin exists
     if _has_origin_remote(repo_root):
         push_result = run_captured(
-            ["git", "push", "origin", f"{salvage_ref}:{salvage_ref}"],
+            ["git", "push", "origin", f"refs/{salvage_ref}:refs/{salvage_ref}"],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )

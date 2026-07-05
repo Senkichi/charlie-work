@@ -16,17 +16,69 @@ from charlie_work.worktree import (
 )
 
 
-def _init_repo(repo_root: Path) -> None:
+def _init_repo(repo_root: Path, bare: bool = False) -> None:
     repo_root.mkdir(parents=True, exist_ok=True)
     run = lambda args: subprocess.run(  # noqa: E731
         args, cwd=repo_root, check=True, capture_output=True, text=True
     )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
+    if bare:
+        # Create a temporary non-bare repo, initialize it, then convert to bare
+        temp_repo = repo_root.parent / f"{repo_root.name}-temp"
+        temp_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.test"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (temp_repo / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Convert to bare by cloning with --bare
+        subprocess.run(
+            ["git", "clone", "--bare", str(temp_repo), str(repo_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Clean up temp repo (ignore errors on Windows due to file locks)
+        import shutil
+
+        shutil.rmtree(temp_repo, ignore_errors=True)
+    else:
+        run(["git", "init", "--initial-branch=main"])
+        run(["git", "config", "user.email", "test@example.test"])
+        run(["git", "config", "user.name", "Test User"])
+        (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+        run(["git", "add", "README.md"])
+        run(["git", "commit", "-m", "initial commit"])
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -911,8 +963,10 @@ def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
     When a stale worktree exists with dirty changes (not in recovery mode),
     fresh dispatch should salvage the work, remove the worktree, and create fresh.
     """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
     repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
+    _clone_repo(remote_repo, repo_root)
 
     # Create a worktree with dirty changes (simulating a killed session)
     branch_name = "agent/issue-110-dirty-fresh"
@@ -951,6 +1005,17 @@ def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
     assert salvage_refs.returncode == 0
     # The salvage ref should be in the output (it's under refs/salvage/)
     assert "salvage/" in salvage_refs.stdout or "refs/salvage/" in salvage_refs.stdout
+
+    # Verify salvage ref was pushed to origin
+    remote_refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=remote_repo,
+        capture_output=True,
+        text=True,
+    )
+    assert remote_refs.returncode == 0
+    # The salvage ref should be in the output (it's under refs/salvage/)
+    assert "salvage/" in remote_refs.stdout or "refs/salvage/" in remote_refs.stdout
 
     # Clean up
     remove_worktree(repo_root, info2.path)
