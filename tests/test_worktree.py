@@ -9,6 +9,7 @@ import pytest
 from charlie_work.worktree import (
     WorktreeInfo,
     _default_worktrees_dir,
+    _has_origin_remote,
     _resolve_default_branch_ref,
     create_worktree,
     is_junction,
@@ -1529,3 +1530,141 @@ def test_fresh_dispatch_fetch_failure_raises_error(tmp_path: Path) -> None:
 
     # Clean up
     _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
+
+
+def test_salvage_worktree_with_non_main_default_branch(tmp_path: Path) -> None:
+    """Issue #141: _salvage_worktree should use _resolve_default_branch_ref, not hardcoded 'main'.
+
+    This test drives the REAL _salvage_worktree path against a repo whose default branch
+    is NOT 'main' (uses 'master' instead) and asserts the salvage decision is correct.
+
+    Mutation gate: reverting the ref back to a hardcoded "main" literal MUST fail this test.
+    """
+    from charlie_work.worktree import _salvage_worktree
+
+    # Create a repo with 'master' as the default branch (not 'main')
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=master"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    # Create a worktree with commits (simulating a killed-before-push session)
+    branch_name = "agent/issue-141-salvage"
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    worktree_path = worktrees_dir / branch_name.replace("/", "-")
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_path), "master"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    # Add a commit to the worktree (so it has unpushed commits)
+    (worktree_path / "file1.txt").write_text("partial work\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "file1.txt"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "partial work"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    # Verify the branch does NOT exist on origin (killed-before-push scenario)
+    # This forces the salvage path that uses merge-base with the default branch
+    assert not _has_origin_remote(repo_root)
+
+    # Verify the worktree has commits beyond the default branch
+    # This is what the salvage logic should detect
+    merge_base_result = subprocess.run(
+        ["git", "merge-base", "HEAD", "master"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    merge_base = merge_base_result.stdout.strip()
+    rev_list_result = subprocess.run(
+        ["git", "rev-list", "--count", f"{merge_base}..HEAD"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit_count = int(rev_list_result.stdout.strip())
+    assert commit_count > 0, f"Expected commits beyond merge-base, got {commit_count}"
+
+    # Verify that merge-base with "main" (the hardcoded bug) would FAIL
+    # This is the mutation gate: if the code uses "main" instead of "master",
+    # merge-base will fail and the test should catch it
+    merge_base_main_result = subprocess.run(
+        ["git", "merge-base", "HEAD", "main"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_base_main_result.returncode != 0, (
+        "merge-base with 'main' should fail in a 'master' repo"
+    )
+
+    # Call _salvage_worktree directly (the real path, not a mock)
+    salvage_ref = _salvage_worktree(repo_root, worktree_path, branch_name)
+
+    # Should return a salvage ref (not None) because there are unpushed commits
+    assert salvage_ref is not None
+    assert salvage_ref.startswith("salvage/")
+
+    # Verify the salvage ref was created locally
+    salvage_refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert salvage_refs.returncode == 0
+    assert "salvage/" in salvage_refs.stdout or "refs/salvage/" in salvage_refs.stdout
+
+    # Clean up
+    remove_worktree(repo_root, worktree_path, force=True, branch=branch_name)

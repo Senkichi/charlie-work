@@ -140,8 +140,29 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
         # Branch doesn't exist on origin: any commits are considered "unpushed"
         # (killed before first push scenario)
         # Check if HEAD has any commits beyond the initial commit
+        default_ref = _resolve_default_branch_ref(repo_root)
+        # Convert remote-tracking ref to local ref for merge-base if needed
+        # (e.g., "origin/main" -> "main")
+        # If there's no origin (default_ref is "HEAD"), fall back to the repo's
+        # initial branch name from the main worktree (not the current worktree)
+        if default_ref == "HEAD":
+            # Get the actual default branch name from the repo's main worktree
+            # We need to check the main worktree's HEAD, not the current worktree's HEAD
+            # Use git branch --show-current in the repo_root to get the default branch
+            symbolic_ref_result = run_captured(
+                ["git", "symbolic-ref", "--short", "HEAD"],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            local_default_ref = (
+                symbolic_ref_result.stdout.strip()
+                if symbolic_ref_result.ok
+                else "main"  # fallback to "main" if we can't determine it
+            )
+        else:
+            local_default_ref = default_ref.split("/")[-1] if "/" in default_ref else default_ref
         merge_base_result = run_captured(
-            ["git", "merge-base", "HEAD", "main"],
+            ["git", "merge-base", "HEAD", local_default_ref],
             cwd=worktree_path,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
