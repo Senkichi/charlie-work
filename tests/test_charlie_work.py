@@ -3420,7 +3420,7 @@ def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
 
 def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
     """Issue #127: dry-run dispatch dependency-gate filter must exclude blocked issues.
-    
+
     When a blocked issue is ordered ahead of an eligible candidate with
     dispatch_limit=1, the dry-run report should list the eligible issue as
     dispatchable and the blocked issue should be excluded from sessions.
