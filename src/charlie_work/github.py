@@ -15,9 +15,11 @@ _LIST_LIMIT = 500
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
 # All call sites must use these constants — no inline field-list literals.
-ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt"
-ISSUE_VIEW_FIELDS = "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt"
-PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus"
+ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt,state"
+ISSUE_VIEW_FIELDS = (
+    "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
+)
+PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_CHECKS_FIELDS = "name,state,bucket,link"
 LABEL_LIST_FIELDS = "name"
@@ -230,6 +232,36 @@ class GitHub:
         except GitHubError:
             return False
 
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+        """Check which of the given issue numbers are currently open.
+
+        Returns a set of issue numbers that are open. Issues that don't exist
+        or are closed are not included in the result. This is used for the
+        dependency gate to check if blocker issues are still open.
+
+        Args:
+            issue_numbers: List of issue numbers to check
+
+        Returns:
+            Set of issue numbers that are currently open
+        """
+        if not issue_numbers:
+            return set()
+
+        open_issues: set[int] = set()
+        for number in issue_numbers:
+            try:
+                issue = self.issue_view(number)
+                # GitHub API returns issues regardless of state; we need to check
+                # the state field. If the issue doesn't exist, issue_view raises.
+                if issue.get("state") == "open":
+                    open_issues.add(number)
+            except (GitHubError, ValueError, TypeError):
+                # Issue doesn't exist or API error — treat as not blocking
+                continue
+
+        return open_issues
+
 
 def label_names(item: dict[str, Any]) -> set[str]:
     labels = item.get("labels") or []
@@ -309,3 +341,89 @@ def _is_mutating(args: list[str]) -> bool:
         "auth status",
     )
     return not any(text.startswith(prefix) for prefix in readonly_prefixes)
+
+
+# Blocker declaration patterns for dependency gate
+# Case-insensitive patterns: "Blocked by #N", "Depends on #N", "Blocked-by: #N"
+# Handles comma-separated lists like "Blocked by #743, #744"
+_BLOCKER_PATTERNS = [
+    re.compile(r"blocked\s+by\s+#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
+    re.compile(r"depends\s+on\s+#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
+    re.compile(r"blocked-by:\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
+]
+
+
+def parse_blockers(text: str) -> list[int]:
+    """Parse blocker issue numbers from issue body text.
+
+    Returns a list of issue numbers declared as blockers using patterns like:
+    - "Blocked by #N"
+    - "Depends on #N"
+    - "Blocked-by: #N"
+
+    Handles comma-separated lists (e.g., "Blocked by #743, #744").
+    Returns an empty list if no blockers are found.
+    """
+    if not text:
+        return []
+
+    blockers: set[int] = set()
+    # Check if they appear in blocker context
+    for pattern in _BLOCKER_PATTERNS:
+        for match in pattern.finditer(text):
+            # Extract the full match and find all #N references within it
+            match_text = match.group(0)
+            numbers_in_match = re.findall(r"#(\d+)", match_text)
+            for num_str in numbers_in_match:
+                try:
+                    blockers.add(int(num_str))
+                except (ValueError, TypeError):
+                    # Skip malformed numbers
+                    continue
+
+    return sorted(blockers)
+
+
+def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
+    """Fetch GitHub's native issue dependencies (blocked_by relationships).
+
+    Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
+    for repos that don't have the feature enabled. Returns an empty list on any
+    error (fail-open for compatibility).
+
+    Args:
+        gh: GitHub client instance
+        issue_number: The issue number to check dependencies for
+
+    Returns:
+        List of issue numbers that block this issue via GitHub's native API
+    """
+    result = gh.run(
+        [
+            "api",
+            f"repos/{{owner}}/{{repo}}/issues/{issue_number}/dependencies/blocked_by",
+        ],
+        json_output=True,
+        allow_failure=True,
+    )
+
+    # Handle different return types from allow_failure=True
+    if result is None:
+        # Transient error or gh not available — fail open with warning
+        logger.warning(
+            f"GitHub dependencies API returned None for issue #{issue_number} - treating as no dependencies"
+        )
+        return []
+    elif isinstance(result, dict):
+        # 404/410 error response — feature not available on this repo
+        # This is expected for repos without dependencies enabled
+        return []
+    elif isinstance(result, list):
+        # Extract issue numbers from the dependency list
+        return [int(dep.get("number", 0)) for dep in result if dep.get("number")]
+    else:
+        # Unexpected type — fail open with warning
+        logger.warning(
+            f"GitHub dependencies API returned unexpected type {type(result)} for issue #{issue_number} - treating as no dependencies"
+        )
+        return []
