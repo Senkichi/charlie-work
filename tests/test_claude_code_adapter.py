@@ -1479,3 +1479,68 @@ def test_launch_override_precedence_with_worktree_venv(
     assert received == "/custom/.venv|<unset>|custom-value", (
         f"User VIRTUAL_ENV override must win over worktree .venv, got: {received}"
     )
+
+
+def test_launch_sanitizes_environment_with_prompt_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """launch_claude_worker must sanitize the environment before spawning the worker (argv path with {prompt_path})."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Seed parent env with leak variables
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    # Script that reads prompt from argv and writes the actual env it received to a file
+    script_path = tmp_path / "env_probe_argv.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            import os
+            from pathlib import Path
+
+            # Read prompt from argv (the {prompt_path} placeholder)
+            prompt_path = Path(sys.argv[1])
+            prompt_content = prompt_path.read_text(encoding="utf-8")
+
+            # Write the env we received
+            Path("env-received.txt").write_text(
+                str(os.environ.get("VIRTUAL_ENV", "<unset>"))
+                + "|"
+                + str(os.environ.get("UV_PROJECT_ENVIRONMENT", "<unset>")),
+                encoding="utf-8",
+            )
+            print("ok")
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        117,
+        "agent/issue-117-sanitize-argv",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path), "{prompt_path}"),
+    )
+
+    assert record.ok
+    assert record.command[-1] == record.prompt_path
+
+    worktree_path = Path(record.worktree_path)
+    probe_path = worktree_path / "env-received.txt"
+    deadline = time.time() + 10
+    while not probe_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert probe_path.exists()
+    received = probe_path.read_text(encoding="utf-8")
+    # VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped (no worktree .venv)
+    assert received == "<unset>|<unset>", (
+        f"VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped, got: {received}"
+    )
