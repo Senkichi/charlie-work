@@ -1600,3 +1600,44 @@ def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(
 
     assert len(worktree_calls) == 1
     assert worktree_calls[0]["materialize_dirs"] == (".devin", ".config")
+
+
+def test_launch_devin_session_includes_start_new_session_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """launch_devin_session should include start_new_session=True on POSIX systems."""
+    from unittest.mock import patch
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Capture the kwargs passed to subprocess.Popen
+    popen_kwargs: dict = {}
+    original_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        popen_kwargs.update(kwargs)
+        # Return a fake process that exits immediately
+        return original_popen([sys.executable, "-c", "pass"], **kwargs)
+
+    with patch("subprocess.Popen", side_effect=capture_popen):
+        launch_devin_session(
+            789,
+            "agent/issue-789-start-new-session",
+            prompt_path,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=(sys.executable, "-c", "pass"),
+        )
+
+    # On POSIX, start_new_session should be True
+    if os.name != "nt":
+        assert popen_kwargs.get("start_new_session") is True
+    else:
+        # On Windows, start_new_session should not be in kwargs
+        assert "start_new_session" not in popen_kwargs
