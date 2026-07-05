@@ -1131,9 +1131,10 @@ def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path)
 def test_github_add_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
     """C5 boundary test: add_issue_label with allow_failure=True returns error value, does not raise."""
 
-    def fake_run(*args, check=False, **kwargs):
-        # Simulate subprocess.run returning a failed result when check=False
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="gh: not found")
+    def fake_run(cmd, *args, check=False, **kwargs):
+        if check:
+            raise subprocess.CalledProcessError(1, cmd, output="", stderr="simulated failure")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
@@ -1142,18 +1143,20 @@ def test_github_add_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Pa
     gh.add_issue_label(123, "agent:in-progress")
 
 
-def test_github_remove_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
-    """C5 boundary test: remove_issue_label with allow_failure=True returns error value, does not raise."""
+def test_github_remove_issue_label_failure_does_raise(monkeypatch, tmp_path: Path) -> None:
+    """C5 boundary test: remove_issue_label without allow_failure=True raises on subprocess failure."""
 
-    def fake_run(*args, check=False, **kwargs):
-        # Simulate subprocess.run returning a failed result when check=False
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="gh: not found")
+    def fake_run(cmd, *args, check=False, **kwargs):
+        if check:
+            raise subprocess.CalledProcessError(1, cmd, output="", stderr="simulated failure")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
     gh = github_module.GitHub(tmp_path)
-    # Should not raise despite subprocess failure (allow_failure=True in remove_issue_label)
-    gh.remove_issue_label(123, "agent:in-progress")
+    # Should raise because remove_issue_label does NOT have allow_failure=True
+    with pytest.raises(github_module.GitHubError, match="simulated failure"):
+        gh.remove_issue_label(123, "agent:in-progress")
 
 
 # --- Cross-family adversarial review ------------------------------------------
