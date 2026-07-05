@@ -559,7 +559,7 @@ def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) ->
 
 
 def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
-    """Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
+    """Issue #110: Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -579,33 +579,7 @@ def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
     assert info2.path == info1.path
     assert info2.path.exists()
     assert (info2.path / "README.md").exists()
-
-    # Clean up
-    remove_worktree(repo_root, info2.path)
-
-
-def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
-    """Recovery mode with leftover worktree containing commits: reuse via rework-style attach."""
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
-
-    # Simulate a previous dispatch that created a worktree and committed work
-    branch_name = "agent/issue-2-recovery-commits"
-    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
-    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
-
-    # Add a commit to simulate partial work
-    (info1.path / "file1.txt").write_text("partial work\n", encoding="utf-8")
-    _git(info1.path, "add", "file1.txt")
-    _git(info1.path, "commit", "-m", "partial work")
-
-    # Recovery dispatch should reuse the worktree with commits
-    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
-
-    # Should reuse the same worktree
-    assert info2.path == info1.path
-    # The partial work should still be there
-    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "partial work\n"
+    assert info2.reclaimed == "pruned"
 
     # Clean up
     remove_worktree(repo_root, info2.path)
@@ -886,36 +860,6 @@ def test_recovery_stale_worktree_pruned_on_missing_directory(tmp_path: Path) -> 
     remove_worktree(repo_root, info2.path)
 
 
-def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
-    """Issue #110: Stale clean worktree should be removed and recreated.
-
-    When a worktree exists with no commits beyond base and no dirty changes,
-    it should be junction-safely removed and recreated.
-    """
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
-
-    # Create a worktree with no commits beyond base
-    branch_name = "agent/issue-110-clean"
-    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
-    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
-
-    # Verify worktree exists
-    assert info1.path.exists()
-    assert (info1.path / "README.md").exists()
-
-    # Recovery dispatch should remove clean worktree and recreate
-    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
-
-    # Should be a fresh worktree (same path, but recreated)
-    assert info2.path == info1.path
-    assert info2.path.exists()
-    assert info2.reclaimed == "pruned"
-
-    # Clean up
-    remove_worktree(repo_root, info2.path)
-
-
 def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
     """Issue #110: Recovery mode with dirty changes reuses worktree (existing behavior).
 
@@ -961,7 +905,61 @@ def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_recovery_with_commits_salvaged(tmp_path: Path) -> None:
+def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
+    """Issue #110: Fresh dispatch with dirty stale worktree should salvage and recreate.
+
+    When a stale worktree exists with dirty changes (not in recovery mode),
+    fresh dispatch should salvage the work, remove the worktree, and create fresh.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with dirty changes (simulating a killed session)
+    branch_name = "agent/issue-110-dirty-fresh"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Add uncommitted changes
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Verify dirty state
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status_result.stdout.strip()
+
+    # Fresh dispatch should salvage and recreate
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Should be a fresh worktree (same path, but recreated)
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    assert info2.reclaimed == "salvaged"
+    # The dirty file should NOT be there (it was salvaged)
+    assert not (info2.path / "dirty.txt").exists()
+
+    # Verify salvage ref was created (check locally, not on remote)
+    # The salvage ref is created with git update-ref, so check for it
+    salvage_refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert salvage_refs.returncode == 0
+    # The salvage ref should be in the output (it's under refs/salvage/)
+    assert "salvage/" in salvage_refs.stdout or "refs/salvage/" in salvage_refs.stdout
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
     """Issue #110: Recovery mode with commits reuses worktree (existing behavior).
 
     In recovery mode, worktrees with commits are reused via rework-style attach.
@@ -1058,7 +1056,9 @@ def test_recovery_junction_safety_preserves_shared_venv(tmp_path: Path) -> None:
     (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
 
     # Recovery dispatch should reuse via rework (junction-safe)
-    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, venv_source=venv_source)
+    info2 = create_worktree(
+        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, venv_source=venv_source
+    )
 
     # Should reuse the same worktree
     assert info2.path == info1.path

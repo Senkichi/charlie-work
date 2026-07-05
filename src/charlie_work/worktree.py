@@ -72,9 +72,7 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool:
     return result.ok and bool(result.stdout.strip())
 
 
-def _salvage_worktree(
-    repo_root: Path, worktree_path: Path, branch: str
-) -> str | None:
+def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
     """Salvage a worktree with uncommitted changes or unpushed commits.
 
     Commits the current state to a salvage ref, pushes it to origin, and returns
@@ -257,7 +255,10 @@ def create_worktree(
                 # Check if it's on the correct branch (should be, since it's our recovery record)
                 wt_branch = existing_wt.get("branch", "")
                 normalized_wt_branch = wt_branch.replace("refs/heads/", "")
-                if normalized_wt_branch == branch or normalized_wt_branch == f"refs/heads/{branch}":
+                if (
+                    normalized_wt_branch == branch
+                    or normalized_wt_branch == f"refs/heads/{branch}"
+                ):
                     # It's our worktree - remove it
                     if not remove_worktree(repo_root, wt_path, force=True):
                         raise RuntimeError(
@@ -297,7 +298,10 @@ def create_worktree(
                 wt_branch = existing_wt.get("branch", "")
                 # Normalize branch names for comparison (strip refs/heads/ prefix)
                 normalized_wt_branch = wt_branch.replace("refs/heads/", "")
-                if normalized_wt_branch != branch and normalized_wt_branch != f"refs/heads/{branch}":
+                if (
+                    normalized_wt_branch != branch
+                    and normalized_wt_branch != f"refs/heads/{branch}"
+                ):
                     raise RuntimeError(
                         f"Recovery mode found leftover worktree at {worktree_path} on foreign branch {normalized_wt_branch!r}, "
                         f"but recovery record specifies branch {branch!r}. "
@@ -378,7 +382,9 @@ def create_worktree(
                             cwd=repo_root,
                             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                         )
-                        has_commits = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+                        has_commits = (
+                            rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+                        )
                     else:
                         has_commits = True
 
@@ -457,7 +463,9 @@ def create_worktree(
                         # Clean up the orphan worktree (but not the branch, which already exists in rework mode)
                         remove_worktree(repo_root, worktree_path, force=True, branch=None)
                         raise
-            return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed)
+            return WorktreeInfo(
+                path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+            )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
             # Fetch first to ensure we materialize at the origin tip, but only if origin exists
@@ -568,7 +576,9 @@ def create_worktree(
             remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
             raise
 
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed)
+    return WorktreeInfo(
+        path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+    )
 
 
 def remove_worktree(
