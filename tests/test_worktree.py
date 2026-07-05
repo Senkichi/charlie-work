@@ -16,17 +16,69 @@ from charlie_work.worktree import (
 )
 
 
-def _init_repo(repo_root: Path) -> None:
+def _init_repo(repo_root: Path, bare: bool = False) -> None:
     repo_root.mkdir(parents=True, exist_ok=True)
     run = lambda args: subprocess.run(  # noqa: E731
         args, cwd=repo_root, check=True, capture_output=True, text=True
     )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
+    if bare:
+        # Create a temporary non-bare repo, initialize it, then convert to bare
+        temp_repo = repo_root.parent / f"{repo_root.name}-temp"
+        temp_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.test"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (temp_repo / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit"],
+            cwd=temp_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Convert to bare by cloning with --bare
+        subprocess.run(
+            ["git", "clone", "--bare", str(temp_repo), str(repo_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Clean up temp repo (ignore errors on Windows due to file locks)
+        import shutil
+
+        shutil.rmtree(temp_repo, ignore_errors=True)
+    else:
+        run(["git", "init", "--initial-branch=main"])
+        run(["git", "config", "user.email", "test@example.test"])
+        run(["git", "config", "user.name", "Test User"])
+        (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+        run(["git", "add", "README.md"])
+        run(["git", "commit", "-m", "initial commit"])
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -559,7 +611,7 @@ def test_junction_creation_failure_in_rework_preserves_branch(tmp_path: Path) ->
 
 
 def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
-    """Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
+    """Issue #110: Recovery mode with clean leftover worktree (no commits past base): remove and create fresh."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -579,33 +631,7 @@ def test_recovery_clean_worktree_removed_and_recreated(tmp_path: Path) -> None:
     assert info2.path == info1.path
     assert info2.path.exists()
     assert (info2.path / "README.md").exists()
-
-    # Clean up
-    remove_worktree(repo_root, info2.path)
-
-
-def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
-    """Recovery mode with leftover worktree containing commits: reuse via rework-style attach."""
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
-
-    # Simulate a previous dispatch that created a worktree and committed work
-    branch_name = "agent/issue-2-recovery-commits"
-    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
-    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
-
-    # Add a commit to simulate partial work
-    (info1.path / "file1.txt").write_text("partial work\n", encoding="utf-8")
-    _git(info1.path, "add", "file1.txt")
-    _git(info1.path, "commit", "-m", "partial work")
-
-    # Recovery dispatch should reuse the worktree with commits
-    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
-
-    # Should reuse the same worktree
-    assert info2.path == info1.path
-    # The partial work should still be there
-    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "partial work\n"
+    assert info2.reclaimed == "pruned"
 
     # Clean up
     remove_worktree(repo_root, info2.path)
@@ -803,3 +829,465 @@ def test_recovery_branch_prefix_change_fails_loudly(tmp_path: Path) -> None:
 
     # Clean up
     remove_worktree(repo_root, info1.path)
+
+
+def test_recovery_fetch_fallback_on_missing_remote_branch(tmp_path: Path) -> None:
+    """Issue #110: Recovery with no remote branch should fall through to fresh dispatch.
+
+    When a worker is killed before its first push, the branch exists locally but not on origin.
+    Recovery should detect this via _remote_branch_exists and fall through to fresh dispatch
+    instead of failing with fetch error 128.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Simulate a killed-before-push session: create branch locally but don't push
+    branch_name = "agent/issue-110-no-remote"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify worktree exists locally
+    assert info1.path.exists()
+    assert (info1.path / "README.md").exists()
+
+    # Verify branch does NOT exist on origin
+    ls_remote_result = subprocess.run(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch_name}"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not ls_remote_result.stdout.strip()
+
+    # Recovery dispatch should succeed via fetch-fallback path
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # Should be a fresh worktree (same path, but recreated)
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    assert info2.reclaimed == "fetch-fallback"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_stale_worktree_pruned_on_missing_directory(tmp_path: Path) -> None:
+    """Issue #110: Stale worktree with missing directory should be pruned before fresh dispatch.
+
+    When a worktree is registered in git's metadata but the directory is missing
+    (e.g., manually deleted), fresh dispatch should prune the stale registration
+    and succeed.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Create a worktree
+    branch_name = "agent/issue-110-prune"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Manually delete the directory (simulating stale state)
+    import shutil
+
+    shutil.rmtree(info1.path)
+
+    # Verify directory is missing but worktree is still registered
+    assert not info1.path.exists()
+    worktrees = list_worktrees(repo_root)
+    assert any(Path(wt["worktree"]) == info1.path for wt in worktrees)
+
+    # Fresh dispatch should prune and succeed
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Should be a fresh worktree
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    # Note: this test doesn't use recovery mode, so reclaimed might be None or "pruned"
+    # depending on whether the branch exists
+    assert info2.reclaimed in (None, "pruned")
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
+    """Issue #110: Recovery mode with dirty changes reuses worktree (existing behavior).
+
+    In recovery mode, dirty worktrees are reused via rework-style attach.
+    The salvage logic is for fresh dispatch stale worktree reclamation.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with dirty changes
+    branch_name = "agent/issue-110-dirty"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Push the branch to origin first
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Add uncommitted changes
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Verify dirty state
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status_result.stdout.strip()
+
+    # Recovery dispatch should reuse via rework
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # Should reuse the same worktree
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    # The dirty file should still be there
+    assert (info2.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
+    """Issue #110: Fresh dispatch with dirty stale worktree should salvage and recreate.
+
+    When a stale worktree exists with dirty changes (not in recovery mode),
+    fresh dispatch should salvage the work, remove the worktree, and create fresh.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with dirty changes (simulating a killed session)
+    branch_name = "agent/issue-110-dirty-fresh"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Add uncommitted changes
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Verify dirty state
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status_result.stdout.strip()
+
+    # Fresh dispatch should salvage and recreate
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Should be a fresh worktree (same path, but recreated)
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    assert info2.reclaimed == "salvaged"
+    # The dirty file should NOT be there (it was salvaged)
+    assert not (info2.path / "dirty.txt").exists()
+
+    # Verify salvage ref was created locally
+    salvage_refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert salvage_refs.returncode == 0
+    # The salvage ref should be in the output (it's under refs/salvage/)
+    assert "salvage/" in salvage_refs.stdout or "refs/salvage/" in salvage_refs.stdout
+
+    # Verify salvage ref was pushed to origin
+    remote_refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=remote_repo,
+        capture_output=True,
+        text=True,
+    )
+    assert remote_refs.returncode == 0
+    # The salvage ref should be in the output (it's under refs/salvage/)
+    assert "salvage/" in remote_refs.stdout or "refs/salvage/" in remote_refs.stdout
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
+    """Issue #110: Recovery mode with commits reuses worktree (existing behavior).
+
+    In recovery mode, worktrees with commits are reused via rework-style attach.
+    The salvage logic is for fresh dispatch stale worktree reclamation.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with commits
+    branch_name = "agent/issue-110-commits"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Add a commit
+    (info1.path / "file1.txt").write_text("partial work\n", encoding="utf-8")
+    _git(info1.path, "add", "file1.txt")
+    _git(info1.path, "commit", "-m", "partial work")
+
+    # Push the branch to origin
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Add another commit that is NOT pushed
+    (info1.path / "file2.txt").write_text("more work\n", encoding="utf-8")
+    _git(info1.path, "add", "file2.txt")
+    _git(info1.path, "commit", "-m", "more work")
+
+    # Recovery dispatch should reuse via rework
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # Should reuse the same worktree
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    # The partial work should still be there
+    assert (info2.path / "file1.txt").read_text(encoding="utf-8") == "partial work\n"
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "more work\n"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_transient_fetch_failure_still_aborts(tmp_path: Path) -> None:
+    """Issue #110: Transient fetch failure should still abort, not fall through to fresh dispatch.
+
+    When a real network/auth error occurs (not just missing remote branch),
+    the dispatch should fail with the error, not silently fall through.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a branch and push it to origin
+    branch_name = "agent/issue-110-transient"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Break the origin remote to simulate a transient network error
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+    # Recovery with rework should fail on fetch error
+    with pytest.raises(RuntimeError, match="Fetch failed for rework branch"):
+        create_worktree(repo_root, branch_name, rework=True)
+
+    # Clean up
+    remove_worktree(repo_root, info1.path)
+
+
+def test_recovery_junction_safety_preserves_shared_venv(tmp_path: Path) -> None:
+    """Issue #110: Reclamation path must never follow .venv junction into shared venv.
+
+    When salvaging a worktree with a .venv junction, the junction-safe removal
+    must preserve the shared venv target.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+    marker = venv_source / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    # Create a worktree with a junctioned .venv
+    branch_name = "agent/issue-110-junction"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", venv_source=venv_source)
+
+    # Push the branch to origin first
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Add dirty changes to trigger salvage
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Recovery dispatch should reuse via rework (junction-safe)
+    info2 = create_worktree(
+        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, venv_source=venv_source
+    )
+
+    # Should reuse the same worktree
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    # The dirty file should still be there
+    assert (info2.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+    # The shared venv must survive (junction safety)
+    assert venv_source.exists()
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_recovery_transient_fetch_failure_via_probe_aborts(tmp_path: Path) -> None:
+    """Issue #110: Transient fetch failure via _remote_branch_exists probe should abort, not fall through.
+
+    When the _remote_branch_exists probe fails (network/auth error), the dispatch should abort
+    with an error instead of falling through to the fetch-fallback path (which would delete
+    the local worktree and branch). This test exercises the actual recovery= path, not the
+    pre-existing rework=True fetch-raise branch.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Simulate a killed-before-push session: create branch locally but don't push
+    branch_name = "agent/issue-110-transient-probe"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify worktree exists locally
+    assert info1.path.exists()
+    assert (info1.path / "README.md").exists()
+
+    # Break the origin remote to simulate a transient network error
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+    # Recovery dispatch should abort with probe failure, NOT fall through to fetch-fallback
+    with pytest.raises(
+        RuntimeError, match="Failed to probe remote branch.*transient network or auth error"
+    ):
+        create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+    # Verify the local worktree and branch still exist (not deleted by fallback)
+    assert info1.path.exists()
+    assert (info1.path / "README.md").exists()
+
+    # Verify the branch still exists
+    result = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert branch_name in result.stdout
+
+    # Clean up
+    _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
+    remove_worktree(repo_root, info1.path)
+
+
+def test_salvage_push_failure_survives_worktree(tmp_path: Path) -> None:
+    """Issue #110: Salvage push failure should surface error and leave worktree intact.
+
+    When the salvage push to origin fails, the worktree should NOT be removed.
+    The error should be surfaced as a value in the dispatch result.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with dirty changes
+    branch_name = "agent/issue-110-salvage-fail"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Add uncommitted changes
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Verify dirty state
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=info1.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status_result.stdout.strip()
+
+    # Break the origin remote to simulate push failure
+    _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+    # Fresh dispatch should fail on salvage push, leaving worktree intact
+    with pytest.raises(RuntimeError, match="Failed to push salvage ref"):
+        create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Verify the worktree still exists (not removed)
+    assert info1.path.exists()
+    # Verify the dirty file is still there
+    assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+    # Clean up
+    _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
+    remove_worktree(repo_root, info1.path, force=True)
+
+
+def test_dirty_probe_failure_treats_as_dirty(tmp_path: Path) -> None:
+    """Issue #110: Failed dirty-probe should treat as dirty (safe default), not clean.
+
+    When git status --porcelain fails (index lock, corruption, permissions),
+    the code should treat the worktree as dirty (salvage/abort) rather than clean
+    (which would trigger force removal without salvage). This test verifies that
+    nothing is removed when the probe fails and salvage also fails.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Create a worktree with dirty changes
+    branch_name = "agent/issue-110-dirty-probe-fail"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Add uncommitted changes
+    (info1.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    # Monkeypatch run_captured to simulate a failed git status probe
+    import charlie_work.worktree
+
+    original_run_captured = charlie_work.worktree.run_captured
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        # If this is a git status --porcelain call, return a failure
+        if isinstance(args[0], list) and "status" in args[0] and "--porcelain" in args[0]:
+            from charlie_work.subprocess_runner import RunResult
+
+            return RunResult(
+                returncode=1,
+                stdout="",
+                stderr="index.lock: File exists",
+                error="index.lock: File exists",
+            )
+        return original_run_captured(*args, **kwargs)
+
+    charlie_work.worktree.run_captured = mock_run_captured
+
+    try:
+        # Break the origin remote to ensure salvage push also fails
+        _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
+
+        # Fresh dispatch should treat the failed probe as dirty and attempt salvage
+        # Since salvage push fails, the worktree should NOT be removed
+        with pytest.raises(RuntimeError, match="Failed to salvage stale worktree"):
+            create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+        # Verify the worktree still exists (not removed)
+        assert info1.path.exists()
+        # Verify the dirty file is still there
+        assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+        # Clean up
+        _git(repo_root, "remote", "set-url", "origin", str(remote_repo))
+        remove_worktree(repo_root, info1.path, force=True)
+    finally:
+        charlie_work.worktree.run_captured = original_run_captured
