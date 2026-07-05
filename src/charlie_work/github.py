@@ -398,19 +398,32 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     Returns:
         List of issue numbers that block this issue via GitHub's native API
     """
-    try:
-        result = gh.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/issues/{issue_number}/dependencies/blocked_by",
-            ],
-            json_output=True,
-            allow_failure=True,
+    result = gh.run(
+        [
+            "api",
+            f"repos/{{owner}}/{{repo}}/issues/{issue_number}/dependencies/blocked_by",
+        ],
+        json_output=True,
+        allow_failure=True,
+    )
+
+    # Handle different return types from allow_failure=True
+    if result is None:
+        # Transient error or gh not available — fail open with warning
+        logger.warning(
+            f"GitHub dependencies API returned None for issue #{issue_number} - treating as no dependencies"
         )
-        if isinstance(result, list):
-            # Extract issue numbers from the dependency list
-            return [int(dep.get("number", 0)) for dep in result if dep.get("number")]
         return []
-    except (GitHubError, ValueError, TypeError):
-        # API not available or malformed response — fail open
+    elif isinstance(result, dict):
+        # 404/410 error response — feature not available on this repo
+        # This is expected for repos without dependencies enabled
+        return []
+    elif isinstance(result, list):
+        # Extract issue numbers from the dependency list
+        return [int(dep.get("number", 0)) for dep in result if dep.get("number")]
+    else:
+        # Unexpected type — fail open with warning
+        logger.warning(
+            f"GitHub dependencies API returned unexpected type {type(result)} for issue #{issue_number} - treating as no dependencies"
+        )
         return []

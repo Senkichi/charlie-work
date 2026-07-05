@@ -911,9 +911,13 @@ class FakeGitHub:
         return open_issues
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        """Fake run method for GitHub API calls. Returns empty list for dependencies."""
+        """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
         # Handle dependency API calls
         if "dependencies" in " ".join(args):
+            # Default: return empty list (feature not available)
+            # Tests can override this by setting dependencies_response
+            if hasattr(self, "dependencies_response"):
+                return self.dependencies_response
             return [] if json_output else ""
         # Handle other API calls (for reconcile tests)
         if json_output:
@@ -5613,18 +5617,20 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
     # Issue 752 should be skipped since #744 is still open
     assert result.data["selected_count"] == 0
 
-    # Check that both blockers are listed in the event
+    # Check that both declared blockers are listed in the event (AC3)
     state = load_state(paths.state_file)
     blocked_events = [
         e for e in state.get("events", []) if e.get("kind") == "dispatch_skip_blocked"
     ]
     assert len(blocked_events) == 1
     assert blocked_events[0]["payload"]["issue"] == 752
-    assert set(blocked_events[0]["payload"]["blockers"]) == {744}
+    assert set(blocked_events[0]["payload"]["blockers"]) == {743, 744}
 
 
 def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
     """Issue #108: self-referencing blockers should be filtered out with warning."""
+    from unittest.mock import patch
+
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="manual"),
     )
@@ -5647,15 +5653,23 @@ def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
             ]
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
-            return set()
+            # Return that the self-reference is "open" (it exists)
+            return {123}
 
     fake_gh = FakeGitHubWithSelfRef()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.dispatch(limit=10)
+    # Capture warning logs
+    with patch("logging.Logger.warning") as mock_warning:
+        result = app.dispatch(limit=10)
 
-    # Issue should be dispatched (self-reference filtered out)
-    assert result.data["selected_count"] == 1
+        # Issue should be dispatched (self-reference filtered out)
+        assert result.data["selected_count"] == 1
+
+        # Warning should have been logged for self-reference
+        assert any(
+            "self-referencing" in str(call.args[0]).lower() for call in mock_warning.call_args_list
+        ), "Expected warning about self-referencing blocker"
 
     # No dispatch_skip_blocked event should be logged
     state = load_state(paths.state_file)
@@ -5663,6 +5677,157 @@ def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
         e for e in state.get("events", []) if e.get("kind") == "dispatch_skip_blocked"
     ]
     assert len(blocked_events) == 0
+
+
+def test_github_dependencies_404_tolerance(tmp_path: Path) -> None:
+    """Test that 404 errors from dependencies API are handled gracefully (feature not available)."""
+    from charlie_work.github import get_github_issue_dependencies
+
+    class FakeGitHubWith404(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Simulate 404 response (feature not available)
+            self.dependencies_response = {"message": "Not Found", "status": 404}
+
+    fake_gh = FakeGitHubWith404()
+    result = get_github_issue_dependencies(fake_gh, 123)
+    assert result == []
+
+
+def test_github_dependencies_transient_error_fail_open(tmp_path: Path) -> None:
+    """Test that transient errors from dependencies API fail open with warning."""
+    from charlie_work.github import get_github_issue_dependencies
+    from unittest.mock import patch
+
+    class FakeGitHubWithTransientError(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Simulate transient error (None return)
+            self.dependencies_response = None
+
+    fake_gh = FakeGitHubWithTransientError()
+
+    with patch("charlie_work.github.logger") as mock_logger:
+        result = get_github_issue_dependencies(fake_gh, 123)
+        assert result == []
+        # Should have logged a warning about the transient error
+        assert any(
+            "returned None" in str(call.args[0]) for call in mock_logger.warning.call_args_list
+        )
+
+
+def test_github_dependencies_successful_parse(tmp_path: Path) -> None:
+    """Test that successful dependencies API responses are parsed correctly."""
+    from charlie_work.github import get_github_issue_dependencies
+
+    class FakeGitHubWithDependencies(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Simulate successful response with dependencies
+            self.dependencies_response = [
+                {"number": 100, "url": "https://example.test/issues/100"},
+                {"number": 200, "url": "https://example.test/issues/200"},
+            ]
+
+    fake_gh = FakeGitHubWithDependencies()
+    result = get_github_issue_dependencies(fake_gh, 123)
+    assert result == [100, 200]
+
+
+def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:
+    """Test that unexpected return types from dependencies API fail open with warning."""
+    from charlie_work.github import get_github_issue_dependencies
+    from unittest.mock import patch
+
+    class FakeGitHubWithUnexpectedType(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Simulate unexpected return type
+            self.dependencies_response = "unexpected string"
+
+    fake_gh = FakeGitHubWithUnexpectedType()
+
+    with patch("charlie_work.github.logger") as mock_logger:
+        result = get_github_issue_dependencies(fake_gh, 123)
+        assert result == []
+        # Should have logged a warning about the unexpected type
+        assert any(
+            "unexpected type" in str(call.args[0]) for call in mock_logger.warning.call_args_list
+        )
+
+
+def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
+    """Test that blocked issues don't consume dispatch slots (slot invariant).
+
+    When a blocked issue is ordered ahead of an eligible candidate with
+    dispatch_limit=1, the eligible one should dispatch and the blocked one
+    should be in the skip event.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with blocked issue first, then eligible issue
+    class FakeGitHubWithSlotTest(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Override with test issues: blocked first, then eligible
+            self.issues = [
+                {
+                    "number": 100,
+                    "title": "Blocked issue (first in order)",
+                    "url": "https://example.test/issues/100",
+                    "body": "Blocked by #200",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 101,
+                    "title": "Eligible issue (second in order)",
+                    "url": "https://example.test/issues/101",
+                    "body": "No blockers",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "open",
+                },
+                {
+                    "number": 200,
+                    "title": "Blocker issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Foundation work",
+                    "labels": [],
+                    "state": "open",  # Still open, blocks #100
+                },
+            ]
+
+        def issue_list(self, ready_label: str):
+            # Return both ready issues in order
+            return [
+                issue
+                for issue in self.issues
+                if ready_label in [label["name"] for label in issue.get("labels", [])]
+            ]
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {200}
+
+    fake_gh = FakeGitHubWithSlotTest()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    # Only the eligible issue should dispatch (blocked issue doesn't consume slot)
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+
+    # Check that the blocked issue was skipped
+    state = load_state(paths.state_file)
+    blocked_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_skip_blocked"
+    ]
+    assert len(blocked_events) == 1
+    assert blocked_events[0]["payload"]["issue"] == 100
+    assert blocked_events[0]["payload"]["blockers"] == [200]
 
 
 def test_status_includes_blocked_section(tmp_path: Path) -> None:
