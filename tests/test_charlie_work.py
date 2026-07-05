@@ -4953,10 +4953,11 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
 
 
 def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path: Path) -> None:
-    """Review_started transition should be skipped when head hasn't changed after request_changes.
+    """Janitor blocks review when head hasn't changed after request_changes (no-op rework).
 
     This prevents pointless packet churn and preserves the needs_rework label on
-    budget-deferred rework candidates.
+    budget-deferred rework candidates. The janitor now blocks before review_started
+    can fire.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -4975,6 +4976,7 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
                 "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
+                "baseRefName": "main",
             }
         ),
         encoding="utf-8",
@@ -4995,9 +4997,10 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
     # Call review again with the same head SHA
     result = app.review(456)
 
-    # The review_started transition should be skipped, so no labels should be added/removed
-    assert result.ok is True
-    # review_started transition adds pr_open and reviewing labels when it fires
+    # The janitor should block the PR because the head is unchanged (no-op rework)
+    assert result.ok is False
+    assert "PR head unchanged since request_changes verdict" in result.message
+    # review_started transition should not fire (janitor blocks before it)
     assert (123, "agent:pr-open") not in fake_gh.labels_added
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
@@ -5021,6 +5024,7 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
                 "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
+                "baseRefName": "main",
             }
         ),
         encoding="utf-8",
