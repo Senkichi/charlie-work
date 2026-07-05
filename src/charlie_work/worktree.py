@@ -143,23 +143,35 @@ def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str 
     else:
         # Branch doesn't exist on origin: any commits are considered "unpushed"
         # (killed before first push scenario)
-        # Check if HEAD has any commits beyond the initial commit
-        merge_base_result = run_captured(
-            ["git", "merge-base", "HEAD", "main"],
-            cwd=worktree_path,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if merge_base_result.ok:
-            merge_base = merge_base_result.stdout.strip()
-            rev_list_result = run_captured(
-                ["git", "rev-list", "--count", f"{merge_base}..HEAD"],
+        # Check if HEAD has any commits beyond the default branch tip
+        default_ref = _resolve_default_branch_ref(repo_root)
+        if default_ref == "HEAD":
+            # No origin remote: there is no authoritative default-branch tip to compare against.
+            # Conservatively assume there are unpushed commits to preserve work.
+            # This replaces the previous accidental behavior (failed merge-base → same default)
+            # with an intentional, documented trade-off.
+            has_unpushed = True
+        else:
+            # Origin exists: compare against the remote-tracking tip directly.
+            # Using the remote-tracking ref (e.g., "origin/master") is the correct salvage
+            # semantic — we want to know if there are commits beyond what is actually on
+            # the shared default branch. No local-name conversion is needed.
+            merge_base_result = run_captured(
+                ["git", "merge-base", "HEAD", default_ref],
                 cwd=worktree_path,
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
-            has_unpushed = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
-        else:
-            # If merge-base fails, assume has commits to be safe
-            has_unpushed = True
+            if merge_base_result.ok:
+                merge_base = merge_base_result.stdout.strip()
+                rev_list_result = run_captured(
+                    ["git", "rev-list", "--count", f"{merge_base}..HEAD"],
+                    cwd=worktree_path,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                has_unpushed = rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+            else:
+                # If merge-base fails, assume has commits to be safe
+                has_unpushed = True
 
     if not has_dirty and not has_unpushed:
         return None
