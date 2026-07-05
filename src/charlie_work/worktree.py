@@ -24,6 +24,10 @@ from .subprocess_runner import run_captured
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 
+# Known porcelain flag keys that may appear as space-less lines (value=True)
+# These are the only keys that map to True in git worktree --porcelain output
+KNOWN_FLAG_KEYS = frozenset({"bare", "detached", "locked", "prunable"})
+
 
 @dataclass(frozen=True)
 class WorktreeInfo:
@@ -796,7 +800,12 @@ def remove_worktree(
 
 
 def list_worktrees(repo_root: Path) -> list[dict]:
-    """Parse ``git worktree list --porcelain`` into one dict per worktree."""
+    """Parse ``git worktree list --porcelain`` into one dict per worktree.
+
+    Invalid entries (missing required 'worktree' key or unknown flag keys) are
+    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
+    with a Path value. This makes all downstream consumers safe by construction.
+    """
     result = run_captured(
         ["git", "worktree", "list", "--porcelain"],
         cwd=repo_root,
@@ -807,20 +816,39 @@ def list_worktrees(repo_root: Path) -> list[dict]:
 
     worktrees: list[dict] = []
     current: dict = {}
+    entry_malformed = False
+
     for line in result.stdout.splitlines():
         if not line.strip():
-            if current:
+            # Entry boundary: flush current entry if valid
+            if current and not entry_malformed and "worktree" in current:
                 worktrees.append(current)
-                current = {}
+            current = {}
+            entry_malformed = False
             continue
+
         if " " in line:
             key, _, value = line.partition(" ")
         else:
+            # Space-less line: must be a known flag key
             key, value = line, True
+            if key not in KNOWN_FLAG_KEYS:
+                # Unknown flag key marks this entry as malformed
+                entry_malformed = True
+
         if key == "worktree":
-            current[key] = Path(value)
-        else:
+            # Worktree lines must have a path (str), not True
+            if isinstance(value, str):
+                current[key] = Path(value)
+            else:
+                # Malformed worktree line (bare "worktree" with no path)
+                entry_malformed = True
+        elif not entry_malformed:
+            # Only add other keys if entry is not already malformed
             current[key] = value
-    if current:
+
+    # Flush final entry if valid
+    if current and not entry_malformed and "worktree" in current:
         worktrees.append(current)
+
     return worktrees
