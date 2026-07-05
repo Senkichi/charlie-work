@@ -268,6 +268,11 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if isinstance(required_checks, list):
         auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
     merge_flags = auto_merge_data.get("merge_flags")
+    if merge_flags is not None and not isinstance(merge_flags, list):
+        raise ConfigError(
+            "config section 'auto_merge' key 'merge_flags' must be a list of flags, "
+            f"got {type(merge_flags).__name__}"
+        )
     if isinstance(merge_flags, list):
         auto_merge_data["merge_flags"] = tuple(str(item) for item in merge_flags)
     # Validate merge_flags: each flag must start with "--"
@@ -278,6 +283,21 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 raise ConfigError(
                     f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
                     f"must start with '--'"
+                )
+        # Reject flags that conflict with orchestrator-managed behavior
+        # These are either appended by merge_pr itself (strategy flags) or
+        # deliberately excluded (branch deletion is handled separately)
+        orchestrator_managed = {
+            "--merge",
+            "--rebase",
+            "--squash",
+            "--delete-branch",
+        }
+        for flag in merge_flags:
+            if str(flag) in orchestrator_managed:
+                raise ConfigError(
+                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
+                    f"is managed by the orchestrator and cannot be specified in merge_flags"
                 )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))

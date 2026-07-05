@@ -751,6 +751,97 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
     assert result == [{"name": "Tests passed", "state": "FAILURE"}]
 
 
+def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
+    """Test that merge_flags are correctly passed to gh pr merge."""
+    captured_args = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_args.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    gh.merge_pr(123, "squash", admin=False, merge_flags=("--admin", "--auto"))
+
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    # Expected: ["gh", "pr", "merge", "123", "--admin", "--auto", "--squash"]
+    assert args[0] == "gh"
+    assert args[1:4] == ["pr", "merge", "123"]
+    assert "--admin" in args
+    assert "--auto" in args
+    assert "--squash" in args
+    # Verify merge_flags come before strategy flag
+    admin_idx = args.index("--admin")
+    auto_idx = args.index("--auto")
+    squash_idx = args.index("--squash")
+    assert admin_idx < squash_idx
+    assert auto_idx < squash_idx
+
+
+def test_github_merge_pr_argv_with_admin_flag(monkeypatch, tmp_path: Path) -> None:
+    """Test that legacy admin flag is passed when merge_flags is empty."""
+    captured_args = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_args.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    gh.merge_pr(123, "squash", admin=True, merge_flags=())
+
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    # Expected: ["gh", "pr", "merge", "123", "--admin", "--squash"]
+    assert args[0] == "gh"
+    assert args[1:4] == ["pr", "merge", "123"]
+    assert "--admin" in args
+    assert "--squash" in args
+
+
+def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path) -> None:
+    """Test that merge_flags takes precedence over admin flag."""
+    captured_args = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_args.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    # Both admin=True and merge_flags set; merge_flags should win
+    gh.merge_pr(123, "squash", admin=True, merge_flags=("--admin",))
+
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    # Should have exactly one --admin (from merge_flags, not from admin)
+    admin_count = args.count("--admin")
+    assert admin_count == 1
+    # Verify --admin comes from merge_flags path (before strategy)
+    admin_idx = args.index("--admin")
+    squash_idx = args.index("--squash")
+    assert admin_idx < squash_idx
+
+
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
 
 
@@ -1359,6 +1450,44 @@ def test_config_accepts_valid_merge_flags(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.auto_merge.merge_flags == ("--admin", "--auto")
+
+
+def test_config_rejects_orchestrator_managed_merge_flags(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    # Test each orchestrator-managed flag
+    for flag in ["--merge", "--rebase", "--squash", "--delete-branch"]:
+        path = tmp_path / "c.yaml"
+        path.write_text(f'auto_merge:\n  merge_flags: ["{flag}"]\n', encoding="utf-8")
+
+        try:
+            load_config(path)
+            raise AssertionError(f"expected ConfigError for {flag}")
+        except ConfigError as exc:
+            message = str(exc)
+            assert "merge_flags" in message
+            assert "auto_merge" in message
+            assert "managed by the orchestrator" in message
+            assert flag in message
+
+
+def test_config_rejects_merge_flags_scalar(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    # YAML scalar instead of list - this would iterate per-character
+    path.write_text('auto_merge:\n  merge_flags: "--admin"\n', encoding="utf-8")
+
+    try:
+        load_config(path)
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError")
+
+    assert "merge_flags" in message
+    assert "auto_merge" in message
+    assert "must be a list" in message
 
 
 def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
