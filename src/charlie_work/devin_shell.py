@@ -219,6 +219,7 @@ def launch_devin_session(
     worker_model: str = "",
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
+    base_ref: str = "",
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -254,6 +255,7 @@ def launch_devin_session(
             worktrees_dir=worktrees_dir,
             rework=rework,
             recovery=recovery,
+            base_ref=base_ref,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = SessionRecord(
