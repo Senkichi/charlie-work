@@ -170,6 +170,31 @@ def _write_json(path: Path, value: Any) -> None:
     tmp_path.replace(path)
 
 
+def _sanitize_env(worktree_path: Path) -> dict[str, str]:
+    """Return a sanitized environment for worker subprocesses.
+
+    Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
+    to prevent the orchestrator's venv from leaking into worker sessions. If the
+    worktree contains a .venv directory, VIRTUAL_ENV is set to that path instead
+    of being dropped.
+
+    This is a defense-in-depth measure: workers should resolve their own
+    environment via uv run --active or similar, not inherit the orchestrator's.
+    """
+    env = dict(os.environ)
+    worktree_venv = worktree_path / ".venv"
+
+    if worktree_venv.is_dir():
+        # Worktree has its own venv — use it
+        env["VIRTUAL_ENV"] = str(worktree_venv)
+    else:
+        # No worktree venv — drop both variables to prevent leaks
+        env.pop("VIRTUAL_ENV", None)
+        env.pop("UV_PROJECT_ENVIRONMENT", None)
+
+    return env
+
+
 def _render_command(
     command_template: tuple[str, ...],
     *,
@@ -291,6 +316,9 @@ def launch_devin_session(
     kwargs: dict[str, Any] = {}
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
+    kwargs["env"] = _sanitize_env(worktree.path)
 
     pid: int | None = None
     error: str | None = None
@@ -466,4 +494,5 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
+    "_sanitize_env",
 ]

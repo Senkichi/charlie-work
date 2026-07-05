@@ -15,6 +15,7 @@ failure is captured as a stub report and a not-ok result instead.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -105,6 +106,31 @@ class CrossFamilyResult:
     reused: bool = False
 
 
+def _sanitize_env(repo_root: Path) -> dict[str, str]:
+    """Return a sanitized environment for cross-family review subprocesses.
+
+    Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
+    to prevent the orchestrator's venv from leaking into worker sessions. If the
+    repo_root contains a .venv directory, VIRTUAL_ENV is set to that path instead
+    of being dropped.
+
+    This is a defense-in-depth measure: cross-family reviews should resolve their
+    own environment, not inherit the orchestrator's.
+    """
+    env = dict(os.environ)
+    repo_venv = repo_root / ".venv"
+
+    if repo_venv.is_dir():
+        # Repo has its own venv — use it
+        env["VIRTUAL_ENV"] = str(repo_venv)
+    else:
+        # No repo venv — drop both variables to prevent leaks
+        env.pop("VIRTUAL_ENV", None)
+        env.pop("UV_PROJECT_ENVIRONMENT", None)
+
+    return env
+
+
 def render_command(command: Sequence[str] | str, values: dict[str, str]) -> list[str] | str:
     """Render the configured command template with ``{name}`` placeholders.
 
@@ -153,6 +179,8 @@ def run_cross_family_review(
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
     rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
+    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
+    env = _sanitize_env(repo_root)
     for attempt in range(2):
         try:
             completed = runner(
@@ -165,6 +193,7 @@ def run_cross_family_review(
                 timeout=timeout_seconds,
                 shell=isinstance(rendered, str),
                 check=False,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             partial = (
@@ -235,3 +264,13 @@ def _fail(
     return CrossFamilyResult(
         ok=False, report_path=str(report_path), model=model, returncode=returncode, error=reason
     )
+
+
+__all__ = [
+    "CrossFamilyResult",
+    "render_command",
+    "run_cross_family_review",
+    "extract_report_body",
+    "report_body_is_valid",
+    "_sanitize_env",
+]

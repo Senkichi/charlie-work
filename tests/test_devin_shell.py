@@ -17,6 +17,7 @@ from charlie_work.devin_shell import (
     probe_devin,
     read_session_records,
     update_session_record_with_failure_classification,
+    _sanitize_env,
 )
 from charlie_work.worktree import WorktreeInfo
 
@@ -635,6 +636,104 @@ def test_command_template_omits_model_when_worker_model_empty(
     assert str(script) in record.command
     # Regression guard: empty strings should not appear in the rendered command
     assert "" not in record.command
+
+
+# ---------------------------------------------------------------------------
+# Regression: VIRTUAL_ENV sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When worktree has no .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when worktree has no .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when worktree has no .venv"
+
+
+def test_sanitize_env_sets_worktree_venv_when_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When worktree has .venv, VIRTUAL_ENV must be set to that path."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+
+    # Set parent env variable (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert env.get("VIRTUAL_ENV") == str(worktree_venv), "VIRTUAL_ENV must be set to worktree .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when worktree has .venv"
+
+
+def test_sanitize_env_preserves_other_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Other environment variables must be preserved."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+
+    env = _sanitize_env(worktree_path)
+
+    assert env.get("PATH") == "/usr/bin:/bin", "PATH must be preserved"
+    assert env.get("HOME") == "/home/user", "HOME must be preserved"
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped"
+
+
+def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """launch_devin_session must sanitize the environment before spawning the worker."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    # Script that writes VIRTUAL_ENV to stdout so we can verify it's sanitized
+    env_script = tmp_path / "echo_env.py"
+    env_script.write_text(
+        "import os, sys\nsys.stdout.write(os.environ.get('VIRTUAL_ENV', 'UNSET') + '\\n')\nsys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Set parent VIRTUAL_ENV (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+
+    record = launch_devin_session(
+        55,
+        "agent/issue-55-test",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    # Give the subprocess a moment, then verify it didn't inherit VIRTUAL_ENV
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text = Path(record.log_path).read_text(encoding="utf-8")
+        if log_text.strip():
+            break
+        time.sleep(0.05)
+    log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
+
+    assert log_text == "UNSET", (
+        f"Worker inherited VIRTUAL_ENV={log_text!r}, expected UNSET (sanitized)"
+    )
 
 
 # ---------------------------------------------------------------------------

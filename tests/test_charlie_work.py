@@ -7,6 +7,7 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 from charlie_work import cli
@@ -1526,6 +1527,41 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
 
     assert calls["n"] == 1
     assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
+
+
+def test_run_cross_family_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_cross_family_review must sanitize the environment before spawning the subprocess."""
+    from charlie_work.cross_family import _sanitize_env
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    # Set parent env variables (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = _sanitize_env(repo_root)
+
+    assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped when repo has no .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when repo has no .venv"
+
+
+def test_run_cross_family_sanitizes_environment_with_repo_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When repo has .venv, VIRTUAL_ENV must be set to that path."""
+    from charlie_work.cross_family import _sanitize_env
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    repo_venv = repo_root / ".venv"
+    repo_venv.mkdir()
+
+    # Set parent env variable (simulating orchestrator leak)
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+
+    env = _sanitize_env(repo_root)
+
+    assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, "UV_PROJECT_ENVIRONMENT must be dropped when repo has .venv"
 
 
 def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, monkeypatch) -> None:
