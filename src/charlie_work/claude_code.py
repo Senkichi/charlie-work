@@ -73,6 +73,7 @@ class ClaudeWorkerRecord:
     log_path: str
     error: str | None = None
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     @property
     def ok(self) -> bool:
@@ -333,6 +334,7 @@ def launch_claude_worker(
         started_at=utc_now(),
         log_path=str(log_path),
         error=None,
+        reclaimed=worktree.reclaimed,
     )
     return _write_record(sessions_dir, record)
 
@@ -367,6 +369,7 @@ def read_worker_records(sessions_dir: Path) -> list[ClaudeWorkerRecord]:
                     log_path=str(data.get("log_path", "")),
                     error=data.get("error"),
                     failure_kind=data.get("failure_kind"),
+                    reclaimed=data.get("reclaimed"),
                 )
             )
         except (KeyError, TypeError, ValueError):

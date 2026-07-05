@@ -83,6 +83,7 @@ class SessionRecord:
     log_path: str
     error: str | None = None
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
+    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -103,6 +104,7 @@ class SessionRecord:
             log_path=str(payload.get("log_path", "")),
             error=payload.get("error"),
             failure_kind=payload.get("failure_kind"),
+            reclaimed=payload.get("reclaimed"),
         )
 
 
@@ -319,6 +321,7 @@ def launch_devin_session(
         started_at=utc_now(),
         log_path=str(log_path),
         error=error,
+        reclaimed=worktree.reclaimed,
     )
     _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
     return record
