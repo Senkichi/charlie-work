@@ -107,19 +107,9 @@ def _count_live_sessions(sessions_dir: Path) -> int:
     then checks each record's PID liveness using the adapter-specific liveness
     probe. Returns the total count of sessions with alive PIDs.
     """
-    from .devin_shell import is_session_alive, read_session_records
-    from .claude_code import is_worker_alive, read_worker_records
+    from .worker import iter_workers
 
-    live_count = 0
-    # Count devin-shell sessions
-    for record in read_session_records(sessions_dir):
-        if is_session_alive(record):
-            live_count += 1
-    # Count claude-code sessions
-    for record in read_worker_records(sessions_dir):
-        if is_worker_alive(record):
-            live_count += 1
-    return live_count
+    return sum(1 for w in iter_workers(sessions_dir) if w.is_alive())
 
 
 def _detect_stalled_sessions(
@@ -133,8 +123,7 @@ def _detect_stalled_sessions(
 
     Returns a list of {issue, pid} dicts for stalled sessions.
     """
-    from .devin_shell import is_session_alive, read_session_records
-    from .claude_code import is_worker_alive, read_worker_records
+    from .worker import iter_workers
 
     if not config.watchdog.enabled:
         return []
@@ -142,33 +131,18 @@ def _detect_stalled_sessions(
     stalled_entries: list[dict[str, int]] = []
     stall_threshold = config.watchdog.stall_minutes
 
-    # Check devin-shell sessions
-    for record in read_session_records(sessions_dir):
-        if record.pid is None or record.error is not None:
+    for w in iter_workers(sessions_dir):
+        if w.pid is None or w.error is not None:
             continue
 
-        if not is_session_alive(record):
+        if not w.is_alive():
             continue
 
-        log_path = Path(record.log_path)
+        log_path = Path(w.log_path)
         is_stalled, _ = is_session_stalled(log_path, stall_threshold)
 
         if is_stalled:
-            stalled_entries.append({"issue": record.issue_number, "pid": record.pid})
-
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
-        if record.pid is None or record.error is not None:
-            continue
-
-        if not is_worker_alive(record):
-            continue
-
-        log_path = Path(record.log_path)
-        is_stalled, _ = is_session_stalled(log_path, stall_threshold)
-
-        if is_stalled:
-            stalled_entries.append({"issue": record.issue_number, "pid": record.pid})
+            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
     return stalled_entries
 
@@ -186,16 +160,9 @@ def _detect_and_handle_stalled_sessions(
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
     """
-    from .devin_shell import (
-        is_session_alive,
-        read_session_records,
-        update_session_record_with_failure_classification,
-    )
-    from .claude_code import (
-        is_worker_alive,
-        read_worker_records,
-        update_worker_record_with_failure_classification,
-    )
+    from .claude_code import update_worker_record_with_failure_classification
+    from .devin_shell import update_session_record_with_failure_classification
+    from .worker import iter_workers
 
     if not config.watchdog.enabled:
         return []
@@ -203,25 +170,29 @@ def _detect_and_handle_stalled_sessions(
     stalled_entries: list[dict[str, int]] = []
     stall_threshold = config.watchdog.stall_minutes
 
-    # Check devin-shell sessions
-    for record in read_session_records(sessions_dir):
-        if record.pid is None or record.error is not None:
+    for w in iter_workers(sessions_dir):
+        if w.pid is None or w.error is not None:
             continue
 
-        if not is_session_alive(record):
+        if not w.is_alive():
             continue
 
-        log_path = Path(record.log_path)
+        log_path = Path(w.log_path)
         is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
 
         if is_stalled:
             # Kill the process tree (with start-time verification to prevent PID recycling)
-            killed_pids = kill_process_tree(record.pid, record.process_start_time)
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
 
-            # Mark the sidecar with failure_kind: stalled
-            update_session_record_with_failure_classification(
-                sessions_dir, record.issue_number, failure_kind="stalled"
-            )
+            # Mark the sidecar with failure_kind: stalled (adapter-specific dispatch)
+            if w.adapter_kind == "devin":
+                update_session_record_with_failure_classification(
+                    sessions_dir, w.issue_number, failure_kind="stalled"
+                )
+            elif w.adapter_kind == "claude-code":
+                update_worker_record_with_failure_classification(
+                    sessions_dir, w.issue_number, failure_kind="stalled"
+                )
 
             # Log the event
             with state_lock(state_file):
@@ -230,8 +201,8 @@ def _detect_and_handle_stalled_sessions(
                     state,
                     "session_stalled",
                     {
-                        "issue_number": record.issue_number,
-                        "pid": record.pid,
+                        "issue_number": w.issue_number,
+                        "pid": w.pid,
                         "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
@@ -239,45 +210,7 @@ def _detect_and_handle_stalled_sessions(
                 )
                 save_state(state_file, state)
 
-            stalled_entries.append({"issue": record.issue_number, "pid": record.pid})
-
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
-        if record.pid is None or record.error is not None:
-            continue
-
-        if not is_worker_alive(record):
-            continue
-
-        log_path = Path(record.log_path)
-        is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
-
-        if is_stalled:
-            # Kill the process tree (with start-time verification to prevent PID recycling)
-            killed_pids = kill_process_tree(record.pid, record.process_start_time)
-
-            # Mark the sidecar with failure_kind: stalled
-            update_worker_record_with_failure_classification(
-                sessions_dir, record.issue_number, failure_kind="stalled"
-            )
-
-            # Log the event
-            with state_lock(state_file):
-                state = load_state(state_file)
-                state = append_event(
-                    state,
-                    "session_stalled",
-                    {
-                        "issue_number": record.issue_number,
-                        "pid": record.pid,
-                        "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
-                        "last_log_line": last_log_line,
-                        "killed_pids": killed_pids,
-                    },
-                )
-                save_state(state_file, state)
-
-            stalled_entries.append({"issue": record.issue_number, "pid": record.pid})
+            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
     return stalled_entries
 
@@ -294,17 +227,10 @@ def _classify_dead_sessions_and_update_throttle_state(
     a dead worker with no open PR is recoverable and should be relabeled
     as dispatchable (remove active labels, ensure ready label present).
     """
-    from .devin_shell import (
-        is_session_alive,
-        read_session_records,
-        update_session_record_with_failure_classification,
-    )
-    from .claude_code import (
-        is_worker_alive,
-        read_worker_records,
-        update_worker_record_with_failure_classification,
-    )
+    from .claude_code import update_worker_record_with_failure_classification
+    from .devin_shell import update_session_record_with_failure_classification
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
+    from .worker import iter_workers
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -321,13 +247,20 @@ def _classify_dead_sessions_and_update_throttle_state(
         if issue_number is not None:
             open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
-    # Check devin-shell sessions
-    for record in read_session_records(sessions_dir):
-        if record.error is None and not is_session_alive(record):
-            # Session exited without error - classify the failure
-            failure_kind, throttled_until = update_session_record_with_failure_classification(
-                sessions_dir, record.issue_number
-            )
+    for w in iter_workers(sessions_dir):
+        if w.error is None and not w.is_alive():
+            # Session exited without error - classify the failure (adapter-specific dispatch)
+            if w.adapter_kind == "devin":
+                failure_kind, throttled_until = update_session_record_with_failure_classification(
+                    sessions_dir, w.issue_number
+                )
+            elif w.adapter_kind == "claude-code":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir, w.issue_number
+                )
+            else:
+                failure_kind, throttled_until = None, None
+
             if failure_kind and throttled_until:
                 # Update state with throttle window
                 with state_lock(state_file):
@@ -335,10 +268,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
 
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            w.reap_sidecar(sessions_dir)
+
             # Issue #118: reconcile labels for dead sessions with no open PR
-            if record.issue_number not in open_prs_by_issue:
+            if w.issue_number not in open_prs_by_issue:
                 try:
-                    issue = gh.issue_view(record.issue_number)
+                    issue = gh.issue_view(w.issue_number)
                 except Exception:
                     # Issue may have been deleted or we lack access; skip relabel
                     continue
@@ -347,10 +284,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                 if active_labels:
                     # Remove all active labels (error-as-value)
                     for label in sorted(active_labels):
-                        gh.remove_issue_label(record.issue_number, label)
+                        gh.remove_issue_label(w.issue_number, label)
                     # Ensure ready label is present (error-as-value)
                     if config.labels.ready not in issue_labels:
-                        gh.add_issue_label(record.issue_number, config.labels.ready)
+                        gh.add_issue_label(w.issue_number, config.labels.ready)
                     # Record the relabel event
                     with state_lock(state_file):
                         state = load_state(state_file)
@@ -358,52 +295,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             state,
                             "session_failed_relabeled",
                             {
-                                "issue_number": record.issue_number,
-                                "failure_kind": failure_kind,
-                                "removed_labels": sorted(active_labels),
-                                "added_ready": config.labels.ready not in issue_labels,
-                            },
-                        )
-                        save_state(state_file, state)
-
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
-        if record.error is None and not is_worker_alive(record):
-            # Session exited without error - classify the failure
-            failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                sessions_dir, record.issue_number
-            )
-            if failure_kind and throttled_until:
-                # Update state with throttle window
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
-                    save_state(state_file, state)
-
-            # Issue #118: reconcile labels for dead sessions with no open PR
-            if record.issue_number not in open_prs_by_issue:
-                try:
-                    issue = gh.issue_view(record.issue_number)
-                except Exception:
-                    # Issue may have been deleted or we lack access; skip relabel
-                    continue
-                issue_labels = label_names(issue)
-                active_labels = issue_labels & config.labels.active
-                if active_labels:
-                    # Remove all active labels (error-as-value)
-                    for label in sorted(active_labels):
-                        gh.remove_issue_label(record.issue_number, label)
-                    # Ensure ready label is present (error-as-value)
-                    if config.labels.ready not in issue_labels:
-                        gh.add_issue_label(record.issue_number, config.labels.ready)
-                    # Record the relabel event
-                    with state_lock(state_file):
-                        state = load_state(state_file)
-                        state = append_event(
-                            state,
-                            "session_failed_relabeled",
-                            {
-                                "issue_number": record.issue_number,
+                                "issue_number": w.issue_number,
                                 "failure_kind": failure_kind,
                                 "removed_labels": sorted(active_labels),
                                 "added_ready": config.labels.ready not in issue_labels,
@@ -419,19 +311,9 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     then checks each record's PID liveness using the adapter-specific liveness
     probe. Returns the set of issue numbers with alive PIDs.
     """
-    from .devin_shell import is_session_alive, read_session_records
-    from .claude_code import is_worker_alive, read_worker_records
+    from .worker import iter_workers
 
-    live_issues = set()
-    # Check devin-shell sessions
-    for record in read_session_records(sessions_dir):
-        if is_session_alive(record):
-            live_issues.add(record.issue_number)
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
-        if is_worker_alive(record):
-            live_issues.add(record.issue_number)
-    return live_issues
+    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
 
 
 class OrchestratorApp:
@@ -497,24 +379,29 @@ class OrchestratorApp:
             base_ref=self.config.dispatch.base_ref,
         )
 
-    def _apply_concurrency_governor(self, dispatch_limit: int) -> ConcurrencyGovernorResult:
+    def _apply_concurrency_governor(
+        self, dispatch_limit: int, *, live_count: int | None = None
+    ) -> ConcurrencyGovernorResult:
         """Apply global concurrency governor cap to a dispatch limit.
 
         Returns a ConcurrencyGovernorResult with the potentially-clamped limit
         and all related fields. This eliminates Pyright's reportPossiblyUnbound
         warnings by ensuring live_count is always bound together with the
         clamped flag.
+
+        Args:
+            dispatch_limit: The requested dispatch limit
+            live_count: Optional pre-computed live worker count. If None and
+                max_concurrent > 0, this will compute it via _count_live_sessions.
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
-        live_count = 0
         available_slots = dispatch_limit
         clamped = False
 
         if max_concurrent > 0:
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            # Detect and handle stalled sessions before counting live sessions
-            _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
-            live_count = _count_live_sessions(sessions_dir)
+            if live_count is None:
+                sessions_dir = self._resolve(self.config.devin.sessions_dir)
+                live_count = _count_live_sessions(sessions_dir)
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < dispatch_limit:
                 dispatch_limit = available_slots
@@ -523,7 +410,7 @@ class OrchestratorApp:
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
-            live_count=live_count,
+            live_count=live_count or 0,
             available_slots=available_slots,
             dispatch_limit=dispatch_limit,
         )
@@ -681,8 +568,20 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
 
-        # Apply global concurrency governor cap
-        gov = self._apply_concurrency_governor(dispatch_limit)
+        # Gather sessions_dir for stall detection and live worker counting
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+
+        # Detect and handle stalled sessions before applying concurrency governor
+        # This must run once per dispatch() call, not twice (was duplicated in governor)
+        stalled_entries = _detect_and_handle_stalled_sessions(
+            sessions_dir, self.paths.state_file, self.config
+        )
+
+        # Count live workers after stall handling (stalled workers are killed)
+        live_count = _count_live_sessions(sessions_dir)
+
+        # Apply global concurrency governor cap with pre-computed live_count
+        gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
         dispatch_limit = gov.dispatch_limit
 
         # Apply provider throttle cooldown check
@@ -715,8 +614,6 @@ class OrchestratorApp:
         if self.dry_run:
             selected_issue_numbers: list[int] = []
             skipped_issue_numbers: list[int] = []
-            # Gather network results outside the lock (matching intake pattern)
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
             # Detect stalled sessions (read-only for dry-run)
             stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
             stalled_issues = {entry["issue"] for entry in stalled_entries}
@@ -848,12 +745,7 @@ class OrchestratorApp:
         # First lock: claim issues by marking them as dispatch_pending
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
-        # Gather network results outside the lock (matching intake pattern)
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        # Detect and handle stalled sessions before checking live workers
-        stalled_entries = _detect_and_handle_stalled_sessions(
-            sessions_dir, self.paths.state_file, self.config
-        )
+        # Use pre-computed stalled_entries from the stall detection above
         stalled_issues = {entry["issue"] for entry in stalled_entries}
         live_worker_issues = _issues_with_live_workers(sessions_dir)
         prs = self.gh.pr_list()
@@ -2181,8 +2073,8 @@ class OrchestratorApp:
             # Use the rework prompt from the PR directory
             rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
             if not rework_prompt_path.exists():
-                # Skip if rework prompt doesn't exist — record as dispatch_failed
-                # to release the claim and avoid blocking re-dispatch for 30 min
+                # Skip if rework prompt doesn't exist — record as rework_requested
+                # to release the claim and allow retry (issue #116)
                 skipped_issue_numbers.append(issue_number)
                 continue
             session_requests.append(
@@ -2206,7 +2098,8 @@ class OrchestratorApp:
                         "number": issue_number,
                         "title": full_issue.get("title"),
                         "url": full_issue.get("url"),
-                        "status": "dispatch_failed",
+                        # Issue #116: restore to rework_requested for retry (missing prompt may be transient)
+                        "status": "rework_requested",
                         "dispatched_at": None,
                     }
                     entry.pop("dispatch_pending_at", None)
@@ -2258,8 +2151,10 @@ class OrchestratorApp:
         label_errors: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            # Record skipped issues (missing rework prompt) as dispatch_failed
-            # This handles the mixed case where some issues have prompts and some don't
+            # Record skipped issues (missing rework prompt) as rework_requested
+            # This handles the mixed case where some issues have prompts and some don't.
+            # Missing rework-prompt.md may be transient (review agent hasn't written it yet),
+            # so restore to rework_requested for retry (issue #116).
             for issue_number in skipped_issue_numbers:
                 full_issue = full_issues[issue_number]
                 entry = {
@@ -2267,7 +2162,7 @@ class OrchestratorApp:
                     "number": issue_number,
                     "title": full_issue.get("title"),
                     "url": full_issue.get("url"),
-                    "status": "dispatch_failed",
+                    "status": "rework_requested",
                     "dispatched_at": None,
                 }
                 entry.pop("dispatch_pending_at", None)
@@ -2283,7 +2178,9 @@ class OrchestratorApp:
                     "url": full_issue.get("url"),
                     "branch_name": request.branch_name,
                     "prompt_path": str(request.prompt_path),
-                    "status": "dispatched" if ok else "dispatch_failed",
+                    # On failure, restore to rework_requested so the issue can be retried
+                    # in the next pass (issue #116). On success, mark as dispatched.
+                    "status": "dispatched" if ok else "rework_requested",
                     "dispatched_at": utc_now() if ok else None,
                 }
                 entry.pop("dispatch_pending_at", None)

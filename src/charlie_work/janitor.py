@@ -8,15 +8,20 @@ consensus (see docs/design/extraction-dossier.md, "Deterministic, non-LLM
 verification before spending review budget") is to verify cheap, concrete
 signals before ever routing to the adversarial LLM reviewer.
 
-This module is pure: no I/O, no `gh` calls. The caller (``workflow.review``)
-already fetches ``pr`` (``gh pr view`` JSON) and ``checks`` (``gh pr checks``
-JSON) for packet generation, so it feeds that same data in here first.
+The `run_janitor` gate functions themselves are pure: no I/O, no ``gh``
+calls. The caller (``workflow.review``) already fetches ``pr`` (``gh pr
+view`` JSON) and ``checks`` (``gh pr checks`` JSON) for packet generation, so
+it feeds that same data in here first. The module as a whole is not pure,
+however: `_check_no_op_rework`, `_get_unpushed_commit_info`, and
+`check_operator_containment` shell out to `git` via `subprocess.run` to
+compare worktree/branch state against the PR diff.
 """
 
 from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -401,6 +406,44 @@ def _get_unpushed_commit_info(
         return None
 
 
+def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
+    """Split a unified diff into per-file hunk bodies.
+
+    Yields ``(filename, is_new_file, hunk_lines)`` for each file section in
+    ``diff``, where ``hunk_lines`` is every ``@@``-header and hunk-body line
+    for that file (diff-metadata lines starting with ``\\`` are dropped).
+    Sections with no discoverable ``+++ b/`` path are skipped. This performs
+    structural splitting only — it does not tally added/removed lines or
+    inspect hunk content beyond locating file/hunk boundaries; line counting
+    is the caller's responsibility (see ``check_test_adequacy`` in a later
+    module addition).
+    """
+    sections = diff.split("\ndiff --git")
+    for section in sections:
+        if not section.strip():
+            continue
+        if not section.startswith("diff --git"):
+            section = "diff --git" + section
+
+        current_file: str | None = None
+        current_hunks: list[str] = []
+        is_new_file = False
+
+        for line in section.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+            elif line.startswith("new file mode"):
+                is_new_file = True
+            elif line.startswith("@@"):
+                current_hunks.append(line)
+            elif current_hunks:
+                if not line.startswith("\\"):
+                    current_hunks.append(line)
+
+        if current_file is not None:
+            yield current_file, is_new_file, current_hunks
+
+
 def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
     """Check for worker edits leaked into the operator checkout.
 
@@ -506,40 +549,10 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
     pr_file_hunks: dict[str, str] = {}
     pr_new_files: set[str] = set()
 
-    # Split the diff into sections (each file starts with "diff --git")
-    sections = pr_diff.split("\ndiff --git")
-    for section in sections:
-        if not section.strip():
-            continue
-
-        # Re-add the "diff --git" prefix that was stripped by split
-        if not section.startswith("diff --git"):
-            section = "diff --git" + section
-
-        # Extract the file path from the +++ line
-        current_file: str | None = None
-        current_hunks: list[str] = []
-        is_new_file = False
-
-        for line in section.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:]  # Strip "+++ b/" prefix
-            elif line.startswith("new file mode"):
-                is_new_file = True
-            elif line.startswith("@@"):
-                # Start of a hunk - include the hunk header
-                current_hunks.append(line)
-            elif current_hunks:
-                # Include all hunk lines (context, additions, deletions)
-                # Skip diff metadata lines (starting with \)
-                if not line.startswith("\\"):
-                    current_hunks.append(line)
-
-        # Save the file's hunks
-        if current_file is not None:
-            pr_file_hunks[current_file] = "\n".join(current_hunks)
-            if is_new_file:
-                pr_new_files.add(current_file)
+    for filename, is_new_file, hunk_lines in iter_diff_files(pr_diff):
+        pr_file_hunks[filename] = "\n".join(hunk_lines)
+        if is_new_file:
+            pr_new_files.add(filename)
 
     # Check each dirty file against the PR's hunks
     leaked_files: list[str] = []

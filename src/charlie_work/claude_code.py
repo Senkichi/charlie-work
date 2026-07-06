@@ -88,6 +88,24 @@ class ClaudeWorkerRecord:
         payload["command"] = list(self.command)
         return payload
 
+    @staticmethod
+    def from_dict(payload: dict[str, Any]) -> ClaudeWorkerRecord:
+        command = payload.get("command") or []
+        return ClaudeWorkerRecord(
+            issue_number=int(payload["issue_number"]),
+            branch=str(payload.get("branch", "")),
+            worktree_path=str(payload.get("worktree_path", "")),
+            prompt_path=str(payload.get("prompt_path", "")),
+            command=tuple(str(part) for part in command),
+            pid=int(payload["pid"]) if payload.get("pid") is not None else None,
+            started_at=str(payload.get("started_at", "")),
+            log_path=str(payload.get("log_path", "")),
+            error=payload.get("error"),
+            failure_kind=payload.get("failure_kind"),
+            process_start_time=payload.get("process_start_time"),
+            reclaimed=payload.get("reclaimed"),
+        )
+
 
 def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.claude.json"
@@ -376,22 +394,7 @@ def read_worker_records(sessions_dir: Path) -> list[ClaudeWorkerRecord]:
         if not isinstance(data, dict):
             continue
         try:
-            records.append(
-                ClaudeWorkerRecord(
-                    issue_number=int(data["issue_number"]),
-                    branch=str(data["branch"]),
-                    worktree_path=str(data["worktree_path"]),
-                    prompt_path=str(data["prompt_path"]),
-                    command=tuple(data.get("command") or ()),
-                    pid=data.get("pid"),
-                    started_at=str(data.get("started_at", "")),
-                    log_path=str(data.get("log_path", "")),
-                    error=data.get("error"),
-                    failure_kind=data.get("failure_kind"),
-                    process_start_time=data.get("process_start_time"),
-                    reclaimed=data.get("reclaimed"),
-                )
-            )
+            records.append(ClaudeWorkerRecord.from_dict(data))
         except (KeyError, TypeError, ValueError):
             continue
     return records
@@ -612,5 +615,5 @@ __all__ = [
     "probe_claude",
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
-    "_get_process_start_time",
+    "_sidecar_path",
 ]

@@ -261,6 +261,38 @@ class WatchdogConfig:
 
 
 @dataclass(frozen=True)
+class TestAdequacyConfig:
+    """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
+
+    ``enabled`` defaults False so an absent config block is a no-op — mirrors
+    CrossFamilyConfig (config.py:236). Nothing reads this config yet; the
+    structural check and review-routing land in separate issues.
+    """
+
+    __test__ = False  # Prevent pytest from collecting this as a test class
+
+    enabled: bool = False
+    min_product_lines: int = 10
+    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
+    exempt_path_globs: tuple[str, ...] = ("*.md", "docs/**", "*.lock", "*.toml", "*.cfg", "*.ini")
+    assertion_markers: tuple[str, ...] = (
+        "assert ",
+        "pytest.raises",
+        "raises(",
+        "assert_called",
+        "self.assert",
+    )
+    comment_prefixes: tuple[str, ...] = ("#",)
+    require_assertions: bool = False
+    exempt_marker: str = "Test-exempt:"
+    # Tier 3 (reserved, deferred): diff-coverage extension, not read by any
+    # code path yet.
+    coverage_enabled: bool = False
+    coverage_command: tuple[str, ...] = ()
+    min_diff_coverage: float = 0.0
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -271,6 +303,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -439,6 +472,61 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
     watchdog = _build_section(WatchdogConfig, "watchdog", _section(data, "watchdog"))
+    test_adequacy_data = _section(data, "test_adequacy")
+
+    # Five tuple-of-str fields: reject non-list, coerce elements to str.
+    _TEST_ADEQUACY_TUPLE_FIELDS = (
+        "test_path_globs",
+        "exempt_path_globs",
+        "assertion_markers",
+        "comment_prefixes",
+        "coverage_command",
+    )
+    for key in _TEST_ADEQUACY_TUPLE_FIELDS:
+        value = test_adequacy_data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"config section 'test_adequacy' key '{key}' must be a list of "
+                f"strings, got {type(value).__name__}"
+            )
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"config section 'test_adequacy' key '{key}' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        test_adequacy_data[key] = tuple(value)
+
+    # Scalar fields: isinstance rejection, mirroring base_ref (config.py:326-331).
+    min_product_lines = test_adequacy_data.get("min_product_lines")
+    if min_product_lines is not None and not isinstance(min_product_lines, int):
+        raise ConfigError(
+            "config section 'test_adequacy' key 'min_product_lines' must be an "
+            f"int, got {type(min_product_lines).__name__}"
+        )
+    min_diff_coverage = test_adequacy_data.get("min_diff_coverage")
+    if min_diff_coverage is not None and not isinstance(min_diff_coverage, (int, float)):
+        raise ConfigError(
+            "config section 'test_adequacy' key 'min_diff_coverage' must be a "
+            f"float, got {type(min_diff_coverage).__name__}"
+        )
+    exempt_marker = test_adequacy_data.get("exempt_marker")
+    if exempt_marker is not None:
+        if not isinstance(exempt_marker, str) or not exempt_marker:
+            raise ConfigError(
+                "config section 'test_adequacy' key 'exempt_marker' must be a non-empty string"
+            )
+    for bool_key in ("enabled", "coverage_enabled", "require_assertions"):
+        bool_value = test_adequacy_data.get(bool_key)
+        if bool_value is not None and not isinstance(bool_value, bool):
+            raise ConfigError(
+                f"config section 'test_adequacy' key '{bool_key}' must be a bool, "
+                f"got {type(bool_value).__name__}"
+            )
+
+    test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -449,4 +537,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         claude_code=claude_code,
         cross_family=cross_family,
         watchdog=watchdog,
+        test_adequacy=test_adequacy,
     )

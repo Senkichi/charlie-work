@@ -26,6 +26,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     ReviewConfig,
     RuntimeConfig,
+    TestAdequacyConfig,
     WatchdogConfig,
     find_config_path,
     load_config,
@@ -639,6 +640,265 @@ def test_load_config_rejects_invalid_dispatch_order(tmp_path: Path) -> None:
     assert "dispatch" in message
     assert "order" in message
     assert "oldest" in message or "newest" in message
+
+
+def test_default_config_disables_test_adequacy() -> None:
+    """TestAdequacyConfig defaults to disabled with all default values."""
+    config = load_config()
+
+    assert config.test_adequacy == TestAdequacyConfig()
+    assert config.test_adequacy.enabled is False
+
+
+def test_config_test_adequacy_coerces_tuple_fields_to_tuple(tmp_path: Path) -> None:
+    """YAML lists in test_adequacy tuple fields round-trip to tuples."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """test_adequacy:
+  test_path_globs:
+    - "tests/**"
+    - "test_*.py"
+  exempt_path_globs:
+    - "*.md"
+    - "docs/**"
+  assertion_markers:
+    - "assert "
+    - "pytest.raises"
+  comment_prefixes:
+    - "#"
+    - "//"
+  coverage_command:
+    - "pytest"
+    - "--cov"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert isinstance(config.test_adequacy.test_path_globs, tuple)
+    assert config.test_adequacy.test_path_globs == ("tests/**", "test_*.py")
+    assert isinstance(config.test_adequacy.exempt_path_globs, tuple)
+    assert config.test_adequacy.exempt_path_globs == ("*.md", "docs/**")
+    assert isinstance(config.test_adequacy.assertion_markers, tuple)
+    assert config.test_adequacy.assertion_markers == ("assert ", "pytest.raises")
+    assert isinstance(config.test_adequacy.comment_prefixes, tuple)
+    assert config.test_adequacy.comment_prefixes == ("#", "//")
+    assert isinstance(config.test_adequacy.coverage_command, tuple)
+    assert config.test_adequacy.coverage_command == ("pytest", "--cov")
+
+
+def test_config_rejects_non_list_test_adequacy_tuple_field(tmp_path: Path) -> None:
+    """Tuple fields given as scalars raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  test_path_globs: tests/**\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-list tuple field")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-list tuple field")
+
+    assert "test_adequacy" in message
+    assert "test_path_globs" in message
+    assert "must be a list" in message
+
+
+def test_config_rejects_non_str_element_in_test_adequacy_tuple_field(tmp_path: Path) -> None:
+    """Tuple fields with non-str elements raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  test_path_globs:\n    - tests/**\n    - 123\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-str element")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-str element")
+
+    assert "test_adequacy" in message
+    assert "test_path_globs" in message
+    assert "element of type" in message
+
+
+def test_config_rejects_bad_type_min_product_lines(tmp_path: Path) -> None:
+    """min_product_lines as string raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  min_product_lines: ten\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type min_product_lines")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type min_product_lines")
+
+    assert "test_adequacy" in message
+    assert "min_product_lines" in message
+    assert "must be an int" in message
+
+
+def test_config_rejects_bad_type_min_diff_coverage(tmp_path: Path) -> None:
+    """min_diff_coverage as string raises ConfigError; int is accepted."""
+    from charlie_work.config import ConfigError
+
+    # Reject string
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  min_diff_coverage: high\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type min_diff_coverage")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type min_diff_coverage")
+
+    assert "test_adequacy" in message
+    assert "min_diff_coverage" in message
+    assert "must be a float" in message
+
+    # Accept int
+    config_path.write_text(
+        "test_adequacy:\n  min_diff_coverage: 1\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.test_adequacy.min_diff_coverage == 1
+
+
+def test_config_rejects_empty_exempt_marker(tmp_path: Path) -> None:
+    """exempt_marker as empty string raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'test_adequacy:\n  exempt_marker: ""\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for empty exempt_marker")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for empty exempt_marker")
+
+    assert "test_adequacy" in message
+    assert "exempt_marker" in message
+    assert "non-empty string" in message
+
+
+def test_config_rejects_non_bool_test_adequacy_flags(tmp_path: Path) -> None:
+    """Boolean flags as strings raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    for bool_key in ("enabled", "coverage_enabled", "require_assertions"):
+        config_path = tmp_path / "orchestrator.config.yaml"
+        config_path.write_text(
+            f'test_adequacy:\n  {bool_key}: "true"\n',
+            encoding="utf-8",
+        )
+
+        try:
+            load_config(config_path)
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+        except ConfigError as exc:
+            message = str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+
+        assert "test_adequacy" in message
+        assert bool_key in message
+        assert "must be a bool" in message
+
+
+def test_load_config_rejects_unknown_test_adequacy_key(tmp_path: Path) -> None:
+    """Unknown keys under test_adequacy raise ConfigError listing valid keys."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  enabled: true\n  bad_key: value\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for unknown test_adequacy key")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown test_adequacy key")
+
+    assert "section 'test_adequacy'" in message
+    assert "bad_key" in message
+    # Should list valid keys
+    assert "enabled" in message
+
+
+def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
+    """A YAML block overriding every field loads correctly."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """test_adequacy:
+  enabled: true
+  min_product_lines: 20
+  test_path_globs:
+    - "custom_tests/**"
+  exempt_path_globs:
+    - "*.txt"
+  assertion_markers:
+    - "custom_assert"
+  comment_prefixes:
+    - "//"
+  require_assertions: true
+  exempt_marker: "Custom-exempt:"
+  coverage_enabled: true
+  coverage_command:
+    - "custom"
+    - "cov"
+  min_diff_coverage: 0.5
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.test_adequacy.enabled is True
+    assert config.test_adequacy.min_product_lines == 20
+    assert config.test_adequacy.test_path_globs == ("custom_tests/**",)
+    assert config.test_adequacy.exempt_path_globs == ("*.txt",)
+    assert config.test_adequacy.assertion_markers == ("custom_assert",)
+    assert config.test_adequacy.comment_prefixes == ("//",)
+    assert config.test_adequacy.require_assertions is True
+    assert config.test_adequacy.exempt_marker == "Custom-exempt:"
+    assert config.test_adequacy.coverage_enabled is True
+    assert config.test_adequacy.coverage_command == ("custom", "cov")
+    assert config.test_adequacy.min_diff_coverage == 0.5
 
 
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
@@ -1289,7 +1549,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -1768,7 +2028,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -4048,7 +4308,11 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
 
 
 def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> None:
-    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released."""
+    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released.
+
+    Issue #116: Missing rework-prompt.md may be transient (review agent hasn't written it yet),
+    so restore to rework_requested for retry instead of dispatch_failed.
+    """
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="command",
@@ -4088,11 +4352,101 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
 
     assert result.ok is True
     assert result.data["selected_count"] == 0
-    # Verify the claim was released: status should be dispatch_failed, not dispatch_pending
+    # Verify the claim was released: status should be rework_requested (not dispatch_pending)
     state = load_state(paths.state_file)
     issue_state = state["issues"].get("123")
     assert issue_state is not None
-    assert issue_state.get("status") == "dispatch_failed"
+    # Issue #116: restore to rework_requested for retry (missing prompt may be transient)
+    assert issue_state.get("status") == "rework_requested"
+    assert issue_state.get("dispatch_pending_at") is None
+
+
+def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path: Path) -> None:
+    """Issue #116: Failed rework dispatch must restore status to rework_requested for retry.
+
+    When a rework dispatch attempt fails (e.g., git worktree add error), the issue's
+    status must be restored to rework_requested so it can be retried in the next pass.
+    The bug was that failed dispatches left status as dispatch_failed, permanently
+    excluding the issue from rework selection (state-driven selection).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",  # Simulate dispatch failure
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    # Initialize state with the issue in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First dispatch attempt fails
+    result = app.dispatch_rework()
+
+    # result.ok is False when there are dispatch failures
+    assert result.ok is False
+    assert result.data["selected_count"] == 0
+    assert result.data["failed_count"] == 1
+
+    # Verify status is restored to rework_requested (not dispatch_failed)
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "rework_requested"
+
+    # Second dispatch attempt should select the issue again
+    # Fix the command to succeed
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["failed_count"] == 0
+
+    # Verify the issue is now dispatched
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "dispatched"
     assert issue_state.get("dispatch_pending_at") is None
 
 
@@ -8464,7 +8818,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     )
 
     # Mock is_session_alive to return True for PID 99999 so detection runs
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.status()
 
     # Check that stalled section contains the issue number and pid
@@ -8552,7 +8906,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     # Mock is_session_alive to return True and kill_process_tree to return killed PIDs
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True),
+        patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
@@ -8646,7 +9000,7 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
 
     # Mock is_session_alive and kill_process_tree to track calls
     with (
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True) as mock_alive,
+        patch("charlie_work.worker.is_session_alive", return_value=True) as mock_alive,
         patch("charlie_work.process_utils.kill_process_tree", return_value=[]) as mock_kill,
     ):
         # Run the stall detection and handling
@@ -8988,3 +9342,42 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
     entry = registry["repos"]["owner/repo"]
     assert entry["repo_root"] == str(repo_root)
     assert entry["name_with_owner"] == "owner/repo"
+
+
+def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monkeypatch) -> None:
+    """Regression test for issue #158: _detect_and_handle_stalled_sessions should be called exactly once per dispatch() call, not twice (was duplicated in _apply_concurrency_governor)."""
+    # Mock _detect_and_handle_stalled_sessions to track call count
+    stall_detection_calls = []
+
+    def mock_stall_detection(sessions_dir, state_file, config):
+        stall_detection_calls.append(1)
+        return []  # No stalled sessions
+
+    monkeypatch.setattr(
+        "charlie_work.workflow._detect_and_handle_stalled_sessions", mock_stall_detection
+    )
+
+    # Mock _count_live_sessions to return 0 (no live sessions)
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Call dispatch() with max_concurrent_sessions > 0
+    result = app.dispatch()
+
+    # Verify stall detection was called exactly once
+    assert len(stall_detection_calls) == 1, (
+        f"_detect_and_handle_stalled_sessions was called {len(stall_detection_calls)} times, expected 1"
+    )
+
+    # Verify dispatch succeeded
+    assert result.ok is True

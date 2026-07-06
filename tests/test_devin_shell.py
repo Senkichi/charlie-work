@@ -18,6 +18,7 @@ from charlie_work.devin_shell import (
     probe_devin,
     read_session_records,
     update_session_record_with_failure_classification,
+    _sidecar_path,
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.worktree import WorktreeInfo
@@ -817,6 +818,15 @@ def test_is_session_alive_legacy_record_fallback() -> None:
 
     # Should return True using pid-only fallback
     assert is_session_alive(record) is True
+
+
+def test_sidecar_path_returns_correct_path(tmp_path: Path) -> None:
+    """_sidecar_path returns the expected path for a given issue number."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _sidecar_path(sessions_dir, 123)
+    assert path == sessions_dir / "issue-123.json"
 
 
 def test_posix_stat_parse_with_spaces_in_comm(
