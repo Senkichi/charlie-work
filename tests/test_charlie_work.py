@@ -4869,7 +4869,7 @@ def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys)
 
 def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
     """Issue #173: Regression test for GitHub.are_issues_open with realistic uppercase state.
-    
+
     This test directly exercises the production GitHub.are_issues_open method with
     realistic uppercase state field values (as returned by the real GitHub API).
     It ensures the .upper() normalization in github.py:326 is tested and cannot
@@ -4887,7 +4887,10 @@ def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> No
             elif number == 300:
                 return {"number": 300, "state": "OPEN"}  # Uppercase as from real API
             elif number == 400:
-                return {"number": 400, "state": "open"}  # Lowercase (should still work due to .upper())
+                return {
+                    "number": 400,
+                    "state": "open",
+                }  # Lowercase (should still work due to .upper())
             else:
                 raise ValueError(f"Unexpected issue number: {number}")
 
