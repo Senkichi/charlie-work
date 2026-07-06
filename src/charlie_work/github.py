@@ -294,7 +294,7 @@ class GitHub:
                 issue = self.issue_view(number)
                 # GitHub API returns issues regardless of state; we need to check
                 # the state field. If the issue doesn't exist, issue_view raises.
-                if issue.get("state") == "open":
+                if str(issue.get("state") or "").upper() == "OPEN":
                     open_issues.add(number)
             except (GitHubError, ValueError, TypeError):
                 # Issue doesn't exist or API error — treat as not blocking
