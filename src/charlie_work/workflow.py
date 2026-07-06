@@ -767,8 +767,13 @@ class OrchestratorApp:
             # Done outside the lock to avoid holding it during GitHub API calls
             candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
-            # Sort candidates by dispatch order (oldest-first by default)
-            candidates = self._sort_by_dispatch_order(candidates)
+            # Sort candidates by dispatch order
+            # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
+            if self.config.dispatch.order == "newest":
+                candidates = self._sort_by_dispatch_order(candidates)
+            else:
+                # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
+                candidates = self._sort_by_dependency_depth(candidates)
 
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
@@ -904,8 +909,13 @@ class OrchestratorApp:
         # Done outside the lock to avoid holding it during GitHub API calls
         candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
-        # Sort candidates by dispatch order (oldest-first by default)
-        candidates = self._sort_by_dispatch_order(candidates)
+        # Sort candidates by dispatch order
+        # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
+        if self.config.dispatch.order == "newest":
+            candidates = self._sort_by_dispatch_order(candidates)
+        else:
+            # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
+            candidates = self._sort_by_dependency_depth(candidates)
 
         # Re-enter lock to log events and claim issues
         with state_lock(self.paths.state_file):
@@ -2404,6 +2414,67 @@ class OrchestratorApp:
         ]
         return filtered_candidates, blocked_issues
 
+    def _sort_by_dependency_depth(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sort unblocked candidates by out-degree (number of blocked dependents).
+
+        Prioritizes issues that block the most downstream issues, so a wave
+        drains the critical path and maximizes unblocking. Issues are sorted
+        descending by their count of currently-blocked dependents, with
+        creation date (oldest first) as a tiebreaker.
+
+        This metric is computed against the full ready-labeled issue set
+        before filtering, not just the unblocked candidates, to capture
+        the true unblocking impact of each issue.
+
+        Args:
+            candidates: List of unblocked candidate issue dicts from GitHub API
+
+        Returns:
+            List of candidates sorted by out-degree (descending), then by creation date.
+        """
+        if not candidates:
+            return []
+
+        # Fetch the full set of ready-labeled issues to compute out-degree
+        # We need issues that are blocked (not just candidates) to count dependents
+        ready_issues = self.gh.issue_list(
+            labels=[self.config.labels.ready],
+            state="OPEN",
+        )
+
+        # Build reverse-adjacency map: blocker_number -> [dependents that are still blocked]
+        blocker_to_dependents: dict[int, list[int]] = {}
+
+        for issue in ready_issues:
+            issue_number = int(issue["number"])
+            declared_blockers, open_blockers = self._get_open_blockers(issue)
+
+            # Only count dependents that are currently blocked (have open blockers)
+            if not open_blockers:
+                continue
+
+            for blocker in declared_blockers:
+                if blocker not in blocker_to_dependents:
+                    blocker_to_dependents[blocker] = []
+                blocker_to_dependents[blocker].append(issue_number)
+
+        # Compute out-degree for each candidate (number of blocked dependents)
+        out_degree: dict[int, int] = {}
+        for issue in candidates:
+            issue_number = int(issue["number"])
+            out_degree[issue_number] = len(blocker_to_dependents.get(issue_number, []))
+
+        # Sort by out-degree (descending), then by creation date (ascending for oldest-first)
+        def sort_key(issue: dict[str, Any]) -> tuple[int, str]:
+            issue_number = int(issue["number"])
+            # Use negative out_degree for descending sort
+            degree = -out_degree.get(issue_number, 0)
+            # Parse creation date; if missing, use high sentinel to sort last
+            created_at = issue.get("createdAt", "9999-12-31T23:59:59Z")
+            return (degree, created_at)
+
+        return sorted(candidates, key=sort_key)
+
     def _sort_by_dispatch_order(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sort candidates by dispatch order (oldest-first or newest-first).
 
@@ -2492,12 +2563,17 @@ class OrchestratorApp:
         self.gh.pr_comment(pr_number, body_path)
 
     def _summarize_issue(self, issue: dict[str, Any]) -> dict[str, Any]:
+        declared_blockers, open_blockers = self._get_open_blockers(issue)
         return {
             "number": issue.get("number"),
             "title": issue.get("title"),
             "url": issue.get("url"),
             "labels": sorted(label_names(issue)),
             "dispatchable": self._is_dispatchable(issue),
+            "dependencies": {
+                "declared": declared_blockers,
+                "open": open_blockers,
+            },
         }
 
     def _summarize_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
