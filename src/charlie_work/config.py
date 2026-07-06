@@ -332,13 +332,11 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     order = dispatch_data.get("order")
     if order is not None and not isinstance(order, str):
         raise ConfigError(
-            "config section 'dispatch' key 'order' must be a string, "
-            f"got {type(order).__name__}"
+            f"config section 'dispatch' key 'order' must be a string, got {type(order).__name__}"
         )
     if order is not None and order not in ("oldest", "newest"):
         raise ConfigError(
-            f"config section 'dispatch' key 'order' must be 'oldest' or 'newest', "
-            f"got '{order}'"
+            f"config section 'dispatch' key 'order' must be 'oldest' or 'newest', got '{order}'"
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))

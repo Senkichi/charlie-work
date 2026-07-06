@@ -1288,7 +1288,7 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
     """Test that dispatch selects oldest issues first by default (issue #151)."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    
+
     # Create fake GitHub with issues created out of order
     fake_gh = FakeGitHub()
     # Override issue_list to return issues with different creation dates
@@ -1330,12 +1330,12 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
             "state": "open",
         },
     ]
-    
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    
+
     # Dispatch 2 issues - should select oldest first (792, then 793)
     result = app.dispatch(limit=2)
-    
+
     assert result.ok is True
     assert result.data["selected_count"] == 2
     # Should select oldest issues: 792 (oldest), 793 (middle)
@@ -1347,7 +1347,7 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
     """Test that dispatch selects newest issues first when configured (issue #151)."""
     config = OrchestratorConfig(dispatch=DispatchConfig(order="newest"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    
+
     # Create fake GitHub with issues created out of order
     fake_gh = FakeGitHub()
     fake_gh.issues = [
@@ -1388,12 +1388,12 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
             "state": "open",
         },
     ]
-    
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    
+
     # Dispatch 2 issues - should select newest first (808, then 793)
     result = app.dispatch(limit=2)
-    
+
     assert result.ok is True
     assert result.data["selected_count"] == 2
     # Should select newest issues: 808 (newest), 793 (middle)
