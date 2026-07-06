@@ -450,6 +450,7 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     # Write a session record for a dead session (non-existent PID)
     issue_number = 123
     from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
     sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
     record = SessionRecord(
         issue_number=issue_number,
@@ -510,9 +511,7 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
 
     # Run the production function that should reap the sidecar
-    _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, state_file, fake_gh, config
-    )
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
 
     # Verify the sidecar was deleted as a side effect
     assert not sidecar_path.exists(), "Sidecar should be reaped after dead session classification"
