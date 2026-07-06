@@ -1268,6 +1268,7 @@ class FakeGitHub:
         self.delete_branch_ok = True
         self.update_branch_ok = True
         self.pr_head_shas: dict[int, str] = {}
+        self.diffs: dict[int, str] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -1319,6 +1320,9 @@ class FakeGitHub:
         ]
 
     def pr_diff(self, number: int):
+        # Return custom diff if set, otherwise default
+        if number in self.diffs:
+            return self.diffs[number]
         return "diff --git a/file b/file"
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -3529,6 +3533,125 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["janitor_ok"] is True
     assert state["prs"]["456"]["janitor_warnings"]
+
+
+def test_render_test_adequacy_section_unit() -> None:
+    """Unit test for render_test_adequacy_section (issue #180)."""
+    from charlie_work.janitor import TestAdequacyFacts
+    from charlie_work.workflow import render_test_adequacy_section
+
+    # Test with None (gate disabled)
+    assert render_test_adequacy_section(None, ()) == ""
+
+    # Test with populated facts
+    facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=("src/foo.py", "src/bar.py"),
+        exempt=False,
+        exempt_reason="",
+    )
+    warnings = ("Zero recognized assertions in added test lines",)
+
+    section = render_test_adequacy_section(facts, warnings)
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in section
+    assert "Added product LOC: 100" in section
+    assert "Added test LOC: 50" in section
+    assert "Assertion-bearing added test lines: 10" in section
+    assert "Test files changed: 2" in section
+    assert "Untested product files: src/foo.py, src/bar.py" in section
+    assert "Zero recognized assertions in added test lines" in section
+
+    # Test with empty warnings
+    section_no_warnings = render_test_adequacy_section(facts, ())
+    assert "Zero recognized assertions" not in section_no_warnings
+
+    # Test with exempt claim
+    facts_exempt = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=0,
+        assertion_count=0,
+        test_files_changed=0,
+        untested_product_files=(),
+        exempt=True,
+        exempt_reason="n/a - pure refactoring",
+    )
+    section_exempt = render_test_adequacy_section(facts_exempt, ())
+    assert (
+        'Test-exempt claim: "n/a - pure refactoring" (verify against the diff)' in section_exempt
+    )
+
+
+def test_test_adequacy_section_in_review_packet_when_enabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section appears in review packet when gate is enabled and passes (issue #180)."""
+    from unittest.mock import patch
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=True,
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Mock check_test_adequacy to return a passing verdict with facts
+    mock_facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=(),
+        exempt=False,
+        exempt_reason="",
+    )
+    mock_verdict = TestAdequacyVerdict(
+        ok=True,
+        failures=(),
+        warnings=(),
+        facts=mock_facts,
+    )
+
+    with patch("charlie_work.workflow.check_test_adequacy", return_value=mock_verdict):
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section appears in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
+
+
+def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section does not appear in review packet when gate is disabled (issue #180)."""
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=False,  # Gate disabled
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section does NOT appear in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" not in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
 
 
 def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> None:
