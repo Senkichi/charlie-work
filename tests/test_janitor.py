@@ -4,13 +4,19 @@ import re
 import subprocess
 from pathlib import Path
 
-from charlie_work.config import AutoMergeConfig, OrchestratorConfig, ReviewConfig
+from charlie_work.config import (
+    AutoMergeConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    TestAdequacyConfig,
+)
 from charlie_work.github import PR_VIEW_FIELDS
 from charlie_work.janitor import (
     CONVENTIONAL_COMMIT_TYPES,
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
+    check_test_adequacy,
     iter_diff_files,
     run_janitor,
 )
@@ -1447,5 +1453,449 @@ def test_janitor_pr_keys_contained_in_pr_view_fields() -> None:
     missing_keys = JANITOR_PR_KEYS - pr_view_field_set
     assert not missing_keys, (
         f"Janitor reads PR keys not in PR_VIEW_FIELDS: {missing_keys}. "
-        f"Add these keys to PR_VIEW_FIELDS in github.py or the corresponding gates will be silently disabled."
+        f"Add them to github.PR_VIEW_FIELDS or update the gate to not read them."
     )
+
+
+# Test-adequacy gate tests (issue #178)
+
+
+def _test_adequacy_config(**overrides) -> TestAdequacyConfig:
+    """Build a TestAdequacyConfig with overrides for testing."""
+    return TestAdequacyConfig(**overrides)
+
+
+def _test_pr(**overrides) -> dict:
+    """Build a minimal PR dict for test-adequacy testing."""
+    base = {
+        "number": 123,
+        "body": "Closes #123.",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_check_test_adequacy_feature_with_tests_passes() -> None:
+    """Feature diff + test file with real recognized assertions → ok=True, no warnings."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,5 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,5 @@
+ def test_feature():
+-    pass
++    assert new_feature() is not None
++    assert new_feature() == "expected"
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 2
+    assert verdict.facts.added_test_loc == 2
+    assert verdict.facts.assertion_count == 2
+    assert verdict.facts.test_files_changed == 1
+
+
+def test_check_test_adequacy_pure_skip_hard_fails() -> None:
+    """Feature diff, zero test files changed (pure skip), added_product_loc >= min_product_lines → ok=False."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,10 @@
+ def feature():
+     pass
++def new_feature():
++    pass
++def another():
++    pass
++def third():
++    pass
++def fourth():
++    pass
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config(min_product_lines=5)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is False
+    assert len(verdict.failures) == 1
+    assert "Product code changed" in verdict.failures[0]
+    assert "no test files changed" in verdict.failures[0]
+    assert "src/feature.py" in verdict.failures[0]
+    assert verdict.facts.added_product_loc == 8
+    assert verdict.facts.test_files_changed == 0
+
+
+def test_check_test_adequacy_zero_assertions_warns_by_default() -> None:
+    """Feature diff + test file present but zero recognized assertion markers → default config: ok=True with warning."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,10 @@
+ def feature():
+     pass
++def new_feature():
++    pass
++def another():
++    pass
++def third():
++    pass
++def fourth():
++    pass
+diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,5 @@
+ def test_feature():
+-    pass
++def test_new_feature():
++    pass
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config(min_product_lines=5)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert len(verdict.warnings) == 1
+    assert "zero recognized assertions" in verdict.warnings[0]
+    assert verdict.facts.assertion_count == 0
+
+
+def test_check_test_adequacy_zero_assertions_hard_fails_when_required() -> None:
+    """Feature diff + test file present but zero recognized assertion markers → require_assertions=True: ok=False."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,10 @@
+ def feature():
+     pass
++def new_feature():
++    pass
++def another():
++    pass
++def third():
++    pass
++def fourth():
++    pass
+diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,5 @@
+ def test_feature():
+-    pass
++def test_new_feature():
++    pass
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config(min_product_lines=5, require_assertions=True)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is False
+    assert len(verdict.failures) == 1
+    assert "zero recognized assertions" in verdict.failures[0]
+
+
+def test_check_test_adequacy_docs_only_passes() -> None:
+    """Docs-only / config-only diff (all files match exempt_path_globs) → ok=True, facts.added_product_loc == 0."""
+    diff = """diff --git a/README.md b/README.md
+index 123..456 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
+ # README
+-Old text
++New text
+diff --git a/pyproject.toml b/pyproject.toml
+index 123..456 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,3 +1,5 @@
+ [tool.pytest]
+- old_setting = "value"
++ new_setting = "value"
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.added_test_loc == 0
+
+
+def test_check_test_adequacy_rename_only_passes() -> None:
+    """Rename-only diff (100% similarity, no hunk body) → ok=True, facts.added_product_loc == 0."""
+    diff = """diff --git a/old_name.py b/new_name.py
+similarity index 100%
+rename from old_name.py
+rename to new_name.py
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+
+
+def test_check_test_adequacy_rename_with_modify_counts_added_lines() -> None:
+    """Rename+modify diff (small number of added lines on the renamed file) → counts added lines."""
+    diff = """diff --git a/old_name.py b/new_name.py
+similarity index 95%
+rename from old_name.py
+rename to new_name.py
+index 123..456 100644
+--- a/old_name.py
++++ b/new_name.py
+@@ -1,3 +1,5 @@
+ def old_func():
+     pass
++def new_func():
++    pass
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.facts.added_product_loc == 2
+    assert verdict.facts.test_files_changed == 0
+
+
+def test_check_test_adequacy_binary_diff_warns() -> None:
+    """Binary-file diff → ok=True with a warning, never raises."""
+    diff = """Binary files a/image.png and b/image.png differ
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert len(verdict.warnings) == 1
+    assert "diff unparseable" in verdict.warnings[0]
+
+
+def test_check_test_adequacy_malformed_diff_warns() -> None:
+    """Malformed/garbage diff string → ok=True, never raises."""
+    diff = """this is not a valid diff
+at all
+just random text
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert len(verdict.warnings) == 1
+    assert "diff unparseable" in verdict.warnings[0]
+
+
+def test_check_test_adequacy_valid_exemption_passes() -> None:
+    """Valid Test-exempt: <reason> in PR body → ok=True, facts.exempt is True, facts.exempt_reason == "<reason>"."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,5 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+"""
+    pr = _test_pr(body="Closes #123.\n\nTest-exempt: this is a documentation-only change")
+    config = _test_adequacy_config(min_product_lines=5)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.exempt is True
+    assert verdict.facts.exempt_reason == "this is a documentation-only change"
+
+
+def test_check_test_adequacy_exemption_without_reason_not_exempt() -> None:
+    """Test-exempt: with no trailing reason text → NOT exempt (regex requires non-empty reason)."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,10 @@
+ def feature():
+     pass
++def new_feature():
++    pass
++def another():
++    pass
++def third():
++    pass
++def fourth():
++    pass
+"""
+    pr = _test_pr(body="Closes #123.\n\nTest-exempt:")
+    config = _test_adequacy_config(min_product_lines=5)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is False
+    assert verdict.facts.exempt is False
+    assert verdict.facts.exempt_reason == ""
+
+
+def test_check_test_adequacy_custom_exempt_marker_honored() -> None:
+    """Custom exempt_marker config override is honored; the default Test-exempt: does NOT match when overridden."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,5 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+"""
+    pr = _test_pr(body="Closes #123.\n\nNo-Test-Needed: this is a config-only change")
+    config = _test_adequacy_config(min_product_lines=5, exempt_marker="No-Test-Needed:")
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.facts.exempt is True
+    assert verdict.facts.exempt_reason == "this is a config-only change"
+
+
+def test_check_test_adequacy_below_min_product_lines_passes() -> None:
+    """Product diff below min_product_lines → ok=True regardless of test presence."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,4 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config(min_product_lines=10)
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+
+
+def test_check_test_adequacy_test_only_diff_passes() -> None:
+    """Test-only diff (no product files changed) → ok=True."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,5 @@
+ def test_feature():
+-    pass
++    assert new_feature() is not None
++    assert new_feature() == "expected"
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.added_test_loc == 2
+    assert verdict.facts.test_files_changed == 1
+
+
+def test_check_test_adequacy_bugfix_test_only_passes() -> None:
+    """Bugfix diff that only modifies existing test files (with assertions present) and touches no product files → ok=True."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,5 @@
+ def test_feature():
+-    assert old_behavior() == "old"
++    assert new_behavior() == "new"
++    assert edge_case() is not None
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.assertion_count == 2
+
+
+def test_check_test_adequacy_conftest_limitation_accepted() -> None:
+    """conftest.py carrying non-trivial added logic, classified as test via default glob → those added lines do NOT count toward added_product_loc (locks in the documented accepted evasion)."""
+    diff = """diff --git a/conftest.py b/conftest.py
+index 123..456 100644
+--- a/conftest.py
++++ b/conftest.py
+@@ -1,3 +1,10 @@
+ import pytest
+-
++def new_fixture():
++    return "value"
++
++@pytest.fixture
++def custom_config():
++    return {"key": "value"}
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    # conftest.py is classified as test (matches default test_path_globs)
+    # so its added lines count toward added_test_loc, not added_product_loc
+    # Note: blank lines (like the one with just "-") are not counted as added lines
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.added_test_loc == 5
+    assert verdict.facts.test_files_changed == 1
