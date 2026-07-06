@@ -338,6 +338,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
             from .devin_shell import _sidecar_path
+
             sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
             try:
                 sidecar_path.unlink(missing_ok=True)
@@ -393,6 +394,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
             from .claude_code import _sidecar_path
+
             sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
             try:
                 sidecar_path.unlink(missing_ok=True)
