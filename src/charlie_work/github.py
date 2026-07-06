@@ -120,22 +120,51 @@ class GitHub:
             )
         return items
 
-    def issue_list(self, ready_label: str) -> list[dict[str, Any]]:
+    def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
+        # Support both old signature (ready_label: str) and new (labels=None, state=None)
+        if isinstance(labels, str):
+            ready_label = labels
+            return self._list_json(
+                [
+                    "issue",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    ready_label,
+                    "--limit",
+                    str(_LIST_LIMIT),
+                    "--json",
+                    ISSUE_LIST_FIELDS,
+                ],
+                limit=_LIST_LIMIT,
+                kind=f"ready-labeled open issues (label={ready_label})",
+            )
+
+        # New signature: labels as list, state as string
+        args = [
+            "issue",
+            "list",
+            "--limit",
+            str(_LIST_LIMIT),
+            "--json",
+            ISSUE_LIST_FIELDS,
+        ]
+
+        if state:
+            args.extend(["--state", state])
+        else:
+            args.extend(["--state", "open"])
+
+        if labels:
+            for label in labels:
+                args.extend(["--label", label])
+
+        label_str = ", ".join(labels) if labels else "all"
         return self._list_json(
-            [
-                "issue",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                ready_label,
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                ISSUE_LIST_FIELDS,
-            ],
+            args,
             limit=_LIST_LIMIT,
-            kind=f"ready-labeled open issues (label={ready_label})",
+            kind=f"issues (labels={label_str}, state={state or 'open'})",
         )
 
     def issue_view(self, number: int) -> dict[str, Any]:

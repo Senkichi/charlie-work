@@ -2407,66 +2407,63 @@ class OrchestratorApp:
         return filtered_candidates, blocked_issues
 
     def _sort_by_dependency_depth(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Sort unblocked candidates by dependency depth (topological order).
+        """Sort unblocked candidates by out-degree (number of blocked dependents).
 
-        Issues with no blockers (foundational nodes) come first, followed by
-        issues that depend only on those, and so on. Within the same depth,
-        issues are sorted by creation date (oldest first) as a tiebreaker.
+        Prioritizes issues that block the most downstream issues, so a wave
+        drains the critical path and maximizes unblocking. Issues are sorted
+        descending by their count of currently-blocked dependents, with
+        creation date (oldest first) as a tiebreaker.
 
-        This maximizes unblocking per wave by dispatching foundational nodes
-        before their dependents.
+        This metric is computed against the full ready-labeled issue set
+        before filtering, not just the unblocked candidates, to capture
+        the true unblocking impact of each issue.
 
         Args:
             candidates: List of unblocked candidate issue dicts from GitHub API
 
         Returns:
-            List of candidates sorted by dependency depth, then by creation date.
+            List of candidates sorted by out-degree (descending), then by creation date.
         """
         if not candidates:
             return []
 
-        # Build dependency graph: map issue number to its declared blockers
-        # (both body markers and GitHub native dependencies)
-        dependency_graph: dict[int, list[int]] = {}
+        # Fetch the full set of ready-labeled issues to compute out-degree
+        # We need issues that are blocked (not just candidates) to count dependents
+        ready_issues = self.gh.issue_list(
+            labels=[self.config.labels.ready],
+            state="OPEN",
+        )
+
+        # Build reverse-adjacency map: blocker_number -> [dependents that are still blocked]
+        blocker_to_dependents: dict[int, list[int]] = {}
+
+        for issue in ready_issues:
+            issue_number = int(issue["number"])
+            declared_blockers, open_blockers = self._get_open_blockers(issue)
+
+            # Only count dependents that are currently blocked (have open blockers)
+            if not open_blockers:
+                continue
+
+            for blocker in declared_blockers:
+                if blocker not in blocker_to_dependents:
+                    blocker_to_dependents[blocker] = []
+                blocker_to_dependents[blocker].append(issue_number)
+
+        # Compute out-degree for each candidate (number of blocked dependents)
+        out_degree: dict[int, int] = {}
         for issue in candidates:
             issue_number = int(issue["number"])
-            declared_blockers, _ = self._get_open_blockers(issue)
-            # Only include blockers that are also in the candidate set
-            # (blockers outside the ready set are already closed or irrelevant)
-            candidate_numbers = {int(c["number"]) for c in candidates}
-            dependency_graph[issue_number] = [
-                b for b in declared_blockers if b in candidate_numbers
-            ]
+            out_degree[issue_number] = len(blocker_to_dependents.get(issue_number, []))
 
-        # Compute dependency depth for each issue using DFS
-        # Depth = length of longest chain of dependencies
-        depth_cache: dict[int, int] = {}
-
-        def compute_depth(issue_number: int) -> int:
-            """Recursively compute dependency depth for an issue."""
-            if issue_number in depth_cache:
-                return depth_cache[issue_number]
-
-            blockers = dependency_graph.get(issue_number, [])
-            if not blockers:
-                depth = 0
-            else:
-                depth = 1 + max((compute_depth(b) for b in blockers), default=0)
-
-            depth_cache[issue_number] = depth
-            return depth
-
-        # Compute depth for all candidates
-        for issue in candidates:
-            compute_depth(int(issue["number"]))
-
-        # Sort by depth (ascending), then by creation date (ascending for oldest-first)
+        # Sort by out-degree (descending), then by creation date (ascending for oldest-first)
         def sort_key(issue: dict[str, Any]) -> tuple[int, str]:
             issue_number = int(issue["number"])
-            depth = depth_cache.get(issue_number, 0)
-            # Parse creation date; if missing, use empty string to sort last
-            created_at = issue.get("createdAt", "")
-            return (depth, created_at)
+            # Use negative out_degree for descending sort
+            degree = -out_degree.get(issue_number, 0)
+            # Parse creation date; if missing, use high sentinel to sort last
+            created_at = issue.get("createdAt", "9999-12-31T23:59:59Z")
+            return (degree, created_at)
 
         return sorted(candidates, key=sort_key)
 

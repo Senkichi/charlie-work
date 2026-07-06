@@ -1008,13 +1008,26 @@ class FakeGitHub:
         self.update_branch_ok = True
         self.pr_head_shas: dict[int, str] = {}
 
-    def issue_list(self, ready_label: str):
+    def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
-        return [
-            issue
-            for issue in self.issues
-            if ready_label in [label["name"] for label in issue.get("labels", [])]
-        ]
+        # Support both old signature (ready_label: str) and new (labels=None, state=None)
+        if isinstance(labels, str):
+            ready_label = labels
+            return [
+                issue
+                for issue in self.issues
+                if ready_label in [label["name"] for label in issue.get("labels", [])]
+            ]
+        elif labels:
+            return [
+                issue
+                for issue in self.issues
+                if any(
+                    label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                    for label in labels
+                )
+            ]
+        return self.issues
 
     def issue_view(self, number: int):
         # Return the issue matching the requested number
@@ -1399,6 +1412,307 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
     # Should select newest issues: 808 (newest), 793 (middle)
     selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
     assert selected_numbers == [808, 793]
+
+
+def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None:
+    """Test that dispatch sorts by out-degree (number of blocked dependents) per issue #152."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with dependency relationships:
+    # - Issue X (100) has 0 blocked dependents
+    # - Issue Y (200) has 3 blocked dependents (300, 400, 500)
+    # - Issues 300, 400, 500 are blocked by Y (have open blocker Y)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 100,
+            "title": "issue-x",
+            "url": "https://github.com/test/repo/issues/100",
+            "body": "Issue X with no dependents",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 200,
+            "title": "issue-y",
+            "url": "https://github.com/test/repo/issues/200",
+            "body": "Issue Y with 3 dependents",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 300,
+            "title": "dependent-1",
+            "url": "https://github.com/test/repo/issues/300",
+            "body": "Blocked by #200",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-03T00:00:00Z",
+            "updatedAt": "2026-07-03T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 400,
+            "title": "dependent-2",
+            "url": "https://github.com/test/repo/issues/400",
+            "body": "Blocked by #200",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-04T00:00:00Z",
+            "updatedAt": "2026-07-04T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 500,
+            "title": "dependent-3",
+            "url": "https://github.com/test/repo/issues/500",
+            "body": "Blocked by #200",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-05T00:00:00Z",
+            "updatedAt": "2026-07-05T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    # Mock issue_list to return all ready issues for out-degree computation
+    original_issue_list = fake_gh.issue_list
+
+    def mock_issue_list(labels=None, state=None):
+        if labels and "automated-ready" in labels:
+            return fake_gh.issues
+        return original_issue_list(labels=labels, state=state)
+
+    fake_gh.issue_list = mock_issue_list
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Dispatch 2 issues - should select Y (3 dependents) before X (0 dependents)
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    # Y (200) should be selected first due to higher out-degree
+    assert selected_numbers == [200, 100]
+
+
+def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
+    """Test that dispatch handles cyclic dependency declarations without crashing per issue #152."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with cyclic dependency:
+    # - Issue A blocks B, B blocks A (both have open blockers on each other)
+    # - Issue C is independent
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 100,
+            "title": "issue-a",
+            "url": "https://github.com/test/repo/issues/100",
+            "body": "Blocked by #200",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 200,
+            "title": "issue-b",
+            "url": "https://github.com/test/repo/issues/200",
+            "body": "Blocked by #100",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 300,
+            "title": "issue-c",
+            "url": "https://github.com/test/repo/issues/300",
+            "body": "Independent issue",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-03T00:00:00Z",
+            "updatedAt": "2026-07-03T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    # Mock issue_list to return all ready issues for out-degree computation
+    def mock_issue_list(labels=None, state=None):
+        if labels and "automated-ready" in labels:
+            return fake_gh.issues
+        return []
+
+    fake_gh.issue_list = mock_issue_list
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Dispatch should not crash on cyclic dependencies
+    # Since A and B block each other, both should be filtered out
+    # Only C should be dispatchable
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    # Only C should be selected (A and B are mutually blocked)
+    assert result.data["selected_count"] == 1
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [300]
+
+
+def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
+    """Test that dispatch handles missing createdAt field, sorting last per issue #152."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with issues, some missing createdAt
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 100,
+            "title": "old-issue",
+            "url": "https://github.com/test/repo/issues/100",
+            "body": "Old issue",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 200,
+            "title": "new-issue",
+            "url": "https://github.com/test/repo/issues/200",
+            "body": "New issue",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-06T00:00:00Z",
+            "updatedAt": "2026-07-06T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 300,
+            "title": "missing-date",
+            "url": "https://github.com/test/repo/issues/300",
+            "body": "Issue without createdAt",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            # No createdAt field
+            "updatedAt": "2026-07-03T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Dispatch all 3 - missing createdAt should sort last
+    result = app.dispatch(limit=3)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 3
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    # Order: 100 (oldest), 200 (newest), 300 (missing date, last)
+    assert selected_numbers == [100, 200, 300]
+
+
+def test_roll_call_json_dependencies_schema(tmp_path: Path) -> None:
+    """Test that roll-call --json includes dependencies payload with correct schema per issue #152."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with dependency markers
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 100,
+            "title": "issue-with-deps",
+            "url": "https://github.com/test/repo/issues/100",
+            "body": "Blocked by #200, #300",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 200,
+            "title": "blocker-1",
+            "url": "https://github.com/test/repo/issues/200",
+            "body": "Blocker issue",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 300,
+            "title": "blocker-2",
+            "url": "https://github.com/test/repo/issues/300",
+            "body": "Another blocker",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-03T00:00:00Z",
+            "updatedAt": "2026-07-03T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Run roll-call with JSON output
+    result = app.roll_call(json_output=True)
+
+    assert result.ok is True
+    roll_call_data = result.data
+
+    # Verify dependencies payload exists and has correct schema
+    assert "issues" in roll_call_data
+    issues_by_number = {issue["number"]: issue for issue in roll_call_data["issues"]}
+
+    # Check issue 100 has dependencies
+    issue_100 = issues_by_number[100]
+    assert "dependencies" in issue_100
+    deps = issue_100["dependencies"]
+    assert "declared" in deps
+    assert "open" in deps
+    assert isinstance(deps["declared"], list)
+    assert isinstance(deps["open"], list)
+    # Issue 100 declares blockers 200 and 300
+    assert set(deps["declared"]) == {200, 300}
+    # Both blockers are open, so open blockers should match declared
+    assert set(deps["open"]) == {200, 300}
+
+    # Check blocker issues have empty dependencies
+    issue_200 = issues_by_number[200]
+    assert "dependencies" in issue_200
+    assert issue_200["dependencies"]["declared"] == []
+    assert issue_200["dependencies"]["open"] == []
 
 
 def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
