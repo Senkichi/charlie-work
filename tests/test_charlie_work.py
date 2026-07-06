@@ -1316,7 +1316,7 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",  # Oldest
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 808,
@@ -1328,7 +1328,7 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-06T00:00:00Z",  # Newest
             "updatedAt": "2026-07-06T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 793,
@@ -1340,7 +1340,7 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-02T00:00:00Z",  # Middle
             "updatedAt": "2026-07-02T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -1374,7 +1374,7 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",  # Oldest
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 808,
@@ -1386,7 +1386,7 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-06T00:00:00Z",  # Newest
             "updatedAt": "2026-07-06T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 793,
@@ -1398,7 +1398,7 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-02T00:00:00Z",  # Middle
             "updatedAt": "2026-07-02T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -1435,7 +1435,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 200,
@@ -1447,7 +1447,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
             "author": {"login": "test"},
             "createdAt": "2026-07-02T00:00:00Z",
             "updatedAt": "2026-07-02T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 300,
@@ -1459,7 +1459,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
             "author": {"login": "test"},
             "createdAt": "2026-07-03T00:00:00Z",
             "updatedAt": "2026-07-03T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 400,
@@ -1471,7 +1471,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
             "author": {"login": "test"},
             "createdAt": "2026-07-04T00:00:00Z",
             "updatedAt": "2026-07-04T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 500,
@@ -1483,7 +1483,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
             "author": {"login": "test"},
             "createdAt": "2026-07-05T00:00:00Z",
             "updatedAt": "2026-07-05T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -1529,7 +1529,7 @@ def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 200,
@@ -1541,7 +1541,7 @@ def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-02T00:00:00Z",
             "updatedAt": "2026-07-02T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 300,
@@ -1553,7 +1553,7 @@ def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-03T00:00:00Z",
             "updatedAt": "2026-07-03T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -1597,7 +1597,7 @@ def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 200,
@@ -1609,7 +1609,7 @@ def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-06T00:00:00Z",
             "updatedAt": "2026-07-06T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 300,
@@ -1621,7 +1621,7 @@ def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
             "author": {"login": "test"},
             # No createdAt field
             "updatedAt": "2026-07-03T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -1655,7 +1655,7 @@ def test_roll_call_json_dependencies_schema(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-01T00:00:00Z",
             "updatedAt": "2026-07-01T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 200,
@@ -1667,7 +1667,7 @@ def test_roll_call_json_dependencies_schema(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-02T00:00:00Z",
             "updatedAt": "2026-07-02T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
         {
             "number": 300,
@@ -1679,7 +1679,7 @@ def test_roll_call_json_dependencies_schema(tmp_path: Path) -> None:
             "author": {"login": "test"},
             "createdAt": "2026-07-03T00:00:00Z",
             "updatedAt": "2026-07-03T00:00:00Z",
-            "state": "open",
+            "state": "OPEN",
         },
     ]
 
@@ -4865,6 +4865,44 @@ def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys)
 
     assert cli.main(["roll-call"]) == 2
     assert "YAML error: malformed YAML" in capsys.readouterr().err
+
+
+def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
+    """Issue #173: Regression test for GitHub.are_issues_open with realistic uppercase state.
+
+    This test directly exercises the production GitHub.are_issues_open method with
+    realistic uppercase state field values (as returned by the real GitHub API).
+    It ensures the .upper() normalization in github.py:326 is tested and cannot
+    silently regress.
+    """
+    from charlie_work.github import GitHub as RealGitHub
+
+    # Create a subclass that overrides issue_view to return realistic uppercase state values
+    class RealGitHubWithMockedIssueView(RealGitHub):
+        def issue_view(self, number: int) -> dict:
+            if number == 100:
+                return {"number": 100, "state": "OPEN"}  # Uppercase as from real API
+            elif number == 200:
+                return {"number": 200, "state": "CLOSED"}  # Uppercase as from real API
+            elif number == 300:
+                return {"number": 300, "state": "OPEN"}  # Uppercase as from real API
+            elif number == 400:
+                return {
+                    "number": 400,
+                    "state": "open",
+                }  # Lowercase (should still work due to .upper())
+            else:
+                raise ValueError(f"Unexpected issue number: {number}")
+
+    # Create an instance of the subclass
+    real_gh = RealGitHubWithMockedIssueView(repo_root=tmp_path)
+
+    # Call are_issues_open with a mix of open/closed issues
+    result = real_gh.are_issues_open([100, 200, 300, 400])
+
+    # Assert that only the OPEN-state issues (100, 300, and 400) are returned
+    # 200 is CLOSED and should not be in the result
+    assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
 # --- Issue #18: idempotence of ship-it and loop --------------------------------
