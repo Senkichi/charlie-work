@@ -617,6 +617,29 @@ def test_load_config_rejects_positional_placeholder_in_shell_command(tmp_path: P
     assert "unknown placeholder" in message or "malformed placeholder" in message
 
 
+def test_load_config_rejects_invalid_dispatch_order(tmp_path: Path) -> None:
+    """Issue #151: invalid dispatch.order config value is rejected at load."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "dispatch:\n  order: invalid\n",
+        encoding="utf-8",
+    )
+
+    from charlie_work.config import ConfigError, load_config
+
+    try:
+        load_config(config_file)
+        raise AssertionError("expected ConfigError for invalid dispatch.order")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid dispatch.order")
+
+    assert "dispatch" in message
+    assert "order" in message
+    assert "oldest" in message or "newest" in message
+
+
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
     """Issue #4: unknown placeholder in dispatch_command is rejected at load."""
     from charlie_work.config import ConfigError
@@ -958,7 +981,7 @@ class FakeGitHub:
                 "url": "https://example.test/issues/123",
                 "body": "Search is broken",
                 "labels": [{"name": "automated-ready"}],
-                "state": "open",
+                "state": "OPEN",
             }
         ]
         # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
@@ -1064,7 +1087,7 @@ class FakeGitHub:
         open_issues: set[int] = set()
         for number in issue_numbers:
             for issue in self.issues:
-                if issue["number"] == number and issue.get("state") == "open":
+                if issue["number"] == number and str(issue.get("state") or "").upper() == "OPEN":
                     open_issues.add(number)
                     break
         return open_issues
@@ -1259,6 +1282,123 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["selected_count"] == 0
     assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+
+
+def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
+    """Test that dispatch selects oldest issues first by default (issue #151)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with issues created out of order
+    fake_gh = FakeGitHub()
+    # Override issue_list to return issues with different creation dates
+    fake_gh.issues = [
+        {
+            "number": 792,
+            "title": "crash-fix",
+            "url": "https://github.com/test/repo/issues/792",
+            "body": "Fix crash",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",  # Oldest
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 808,
+            "title": "e2e-test",
+            "url": "https://github.com/test/repo/issues/808",
+            "body": "E2E test",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-06T00:00:00Z",  # Newest
+            "updatedAt": "2026-07-06T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 793,
+            "title": "data-model",
+            "url": "https://github.com/test/repo/issues/793",
+            "body": "Data model",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",  # Middle
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Dispatch 2 issues - should select oldest first (792, then 793)
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    # Should select oldest issues: 792 (oldest), 793 (middle)
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [792, 793]
+
+
+def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
+    """Test that dispatch selects newest issues first when configured (issue #151)."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(order="newest"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake GitHub with issues created out of order
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 792,
+            "title": "crash-fix",
+            "url": "https://github.com/test/repo/issues/792",
+            "body": "Fix crash",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",  # Oldest
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 808,
+            "title": "e2e-test",
+            "url": "https://github.com/test/repo/issues/808",
+            "body": "E2E test",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-06T00:00:00Z",  # Newest
+            "updatedAt": "2026-07-06T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 793,
+            "title": "data-model",
+            "url": "https://github.com/test/repo/issues/793",
+            "body": "Data model",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",  # Middle
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Dispatch 2 issues - should select newest first (808, then 793)
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    # Should select newest issues: 808 (newest), 793 (middle)
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [808, 793]
 
 
 def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
@@ -4219,7 +4359,7 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/100",
                     "body": "Blocked by #200",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 101,
@@ -4227,7 +4367,7 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/101",
                     "body": "No blockers",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 200,
@@ -4235,7 +4375,7 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/200",
                     "body": "Foundation work",
                     "labels": [],
-                    "state": "open",  # Still open, blocks #100
+                    "state": "OPEN",  # Still open, blocks #100
                 },
             ]
 
@@ -6107,7 +6247,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
                     "url": "https://example.test/issues/101",
                     "body": "First issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 102,
@@ -6115,7 +6255,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
                     "url": "https://example.test/issues/102",
                     "body": "Second issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 103,
@@ -6123,7 +6263,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
                     "url": "https://example.test/issues/103",
                     "body": "Third issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
@@ -6178,7 +6318,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
                     "url": "https://example.test/issues/101",
                     "body": "First issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 102,
@@ -6186,7 +6326,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
                     "url": "https://example.test/issues/102",
                     "body": "Second issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 103,
@@ -6194,7 +6334,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
                     "url": "https://example.test/issues/103",
                     "body": "Third issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
@@ -6248,7 +6388,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
                     "url": "https://example.test/issues/101",
                     "body": "First issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 102,
@@ -6256,7 +6396,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
                     "url": "https://example.test/issues/102",
                     "body": "Second issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 103,
@@ -6264,7 +6404,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
                     "url": "https://example.test/issues/103",
                     "body": "Third issue",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
@@ -6326,7 +6466,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "url": "https://example.test/issues/101",
                     "body": "First issue",
                     "labels": [{"name": "agent:needs-rework"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 102,
@@ -6334,7 +6474,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "url": "https://example.test/issues/102",
                     "body": "Second issue",
                     "labels": [{"name": "agent:needs-rework"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 103,
@@ -6342,7 +6482,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "url": "https://example.test/issues/103",
                     "body": "Third issue",
                     "labels": [{"name": "agent:needs-rework"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
             # Add corresponding PRs (matching FakeGitHub's default PR 456 pattern)
@@ -7262,7 +7402,7 @@ def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/752",
                     "body": "Blocked by #743",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 743,
@@ -7270,7 +7410,7 @@ def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/743",
                     "body": "Foundation work",
                     "labels": [],  # Not ready, so won't be in dispatch list
-                    "state": "open",  # Still open, so should block
+                    "state": "OPEN",  # Still open, so should block
                 },
             ]
 
@@ -7324,7 +7464,7 @@ def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/752",
                     "body": "Blocked by #743",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 743,
@@ -7332,7 +7472,7 @@ def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/743",
                     "body": "Foundation work",
                     "labels": [],  # Not ready, so won't be in dispatch list
-                    "state": "closed",  # Closed, so should not block
+                    "state": "CLOSED",  # Closed, so should not block
                 },
             ]
 
@@ -7384,7 +7524,7 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/752",
                     "body": "Blocked by #743, #744",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 743,
@@ -7392,7 +7532,7 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/743",
                     "body": "Foundation work",
                     "labels": [],  # Not ready
-                    "state": "closed",
+                    "state": "CLOSED",
                 },
                 {
                     "number": 744,
@@ -7400,7 +7540,7 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/744",
                     "body": "More foundation work",
                     "labels": [],  # Not ready
-                    "state": "open",  # Still open
+                    "state": "OPEN",  # Still open
                 },
             ]
 
@@ -7455,7 +7595,7 @@ def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/123",
                     "body": "Blocked by #123",  # Self-reference
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
@@ -7587,7 +7727,7 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/100",
                     "body": "Blocked by #200",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 101,
@@ -7595,7 +7735,7 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/101",
                     "body": "No blockers",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 200,
@@ -7603,7 +7743,7 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/200",
                     "body": "Foundation work",
                     "labels": [],
-                    "state": "open",  # Still open, blocks #100
+                    "state": "OPEN",  # Still open, blocks #100
                 },
             ]
 
@@ -7667,7 +7807,7 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/752",
                     "body": "Blocked by #743",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
                 {
                     "number": 743,
@@ -7675,7 +7815,7 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/743",
                     "body": "Foundation work",
                     "labels": [],  # Not ready
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
@@ -7728,7 +7868,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
                     "url": "https://example.test/issues/109",
                     "body": "Test body",
                     "labels": [{"name": "automated-ready"}],
-                    "state": "open",
+                    "state": "OPEN",
                 },
             ]
 
