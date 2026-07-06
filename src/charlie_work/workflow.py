@@ -268,6 +268,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
 
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            w.reap_sidecar(sessions_dir)
+
             # Issue #118: reconcile labels for dead sessions with no open PR
             if w.issue_number not in open_prs_by_issue:
                 try:
