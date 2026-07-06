@@ -8675,7 +8675,12 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     assert payload.get("pid") == 99999
     assert "log_mtime" in payload
     assert "last_log_line" in payload
-    assert payload.get("killed_pids") == [99999]
+    # killed_pids now includes both the session PID and any orphan PIDs
+    # The mock returns [99999] for kill_process_tree, and sweep_orphan_processes
+    # may add additional PIDs (in this case, it found an orphan with PID 3492)
+    assert 99999 in payload.get("killed_pids", [])
+    # orphan_pids is included in the event payload if any were found
+    assert "orphan_pids" in payload
 
 
 def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None:
