@@ -69,9 +69,9 @@ just `charlie <command>`:
 charlie doctor              # preflight: env, labels, CI-check names, config
 charlie doctor --adapter-probe   # also probe the worker CLI + surface stale sessions
 charlie bootstrap-labels    # create the agent:* labels once
-charlie roll-call --json    # what is ready / active / linked
-charlie work --limit 3      # newest-first dispatch wave
-charlie work --issues 565,570   # dependency-ordered wave
+charlie roll-call --json    # what is ready / active / linked (with dependency graph)
+charlie work --limit 3      # dependency-ordered dispatch wave (foundational first)
+charlie work --issues 565,570   # explicit issue selection (respects dependency gate)
 charlie why-charlie-hate --pr 123     # janitor gate → adversarial review packet
 charlie verdict --pr 123 --decision approved --summary-file review.md
 charlie ship-it --pr 123
@@ -94,8 +94,9 @@ predictable.
 | Command | What it does |
 |---|---|
 | `charlie roll-call` | show what's ready / active / linked (the `status` view) |
+| `charlie roll-call --json` | show status with dependency graph and issue metadata |
 | `charlie intake` | write worker prompts and state for issues already labeled `automated-ready` |
-| `charlie work` | dispatch a newest-first wave of one-issue worker sessions |
+| `charlie work` | dispatch a dependency-ordered wave of one-issue worker sessions |
 | `charlie why-charlie-hate` | janitor gate + adversarial review packet for a PR |
 | `charlie why-charlie-hate-spec` | cross-family adversarial pass on a design doc |
 | `charlie verdict` | record a review decision (`approved` / `request_changes` / `blocked`) |
@@ -104,6 +105,57 @@ predictable.
 | `charlie mop-up` | detect (and with `--fix`, repair) label/state drift |
 | `charlie doctor` | preflight diagnostics (env, labels, CI-check names, config, adapter) |
 | `charlie bootstrap-labels` | create the nine `agent:*` / `automated-ready` labels once |
+
+## Dependencies
+
+The orchestrator supports dependency-aware dispatch through issue body markers
+and GitHub's native issue dependencies. This allows you to declare that an issue
+depends on other issues, ensuring foundational work is completed before dependent
+issues are dispatched.
+
+### Dependency markers
+
+Add any of these patterns to your issue body to declare blockers:
+
+- `Blocked by #N` — case-insensitive, supports comma-separated lists
+- `Depends on #N` — case-insensitive, supports comma-separated lists
+- `Blocked-by: #N` — case-insensitive, supports comma-separated lists
+
+Examples:
+```
+Blocked by #123, #124
+Depends on #150
+Blocked-by: #200, #201, #202
+```
+
+### GitHub native dependencies
+
+The orchestrator also respects GitHub's native issue dependency feature
+(`blocked_by` relationships). If your repo has GitHub dependencies enabled,
+those relationships are automatically included in the dependency graph.
+
+### How it works
+
+1. **Dependency gate**: Issues with open blockers are never dispatched, even if
+   they have the `automated-ready` label. They appear in `roll-call --json` under
+   the `blocked` field with their blocker list.
+
+2. **Dependency-aware ordering**: Unblocked issues are dispatched in
+   topological order by dependency depth (foundational nodes first, then their
+   dependents). Within the same depth, oldest-first is the tiebreaker. This
+   maximizes unblocking per wave by dispatching critical-path issues first.
+
+3. **Visibility**: `roll-call --json` includes a `dependencies` field for each
+   issue with `declared` (all blockers mentioned in body/GitHub) and `open`
+   (subset that are currently open) arrays.
+
+### Example workflow
+
+For a dependency-ordered epic:
+1. File all issues with `Blocked by #N` markers declaring the dependency chain
+2. Label all issues as `automated-ready`
+3. Run `charlie work --limit 3` — the orchestrator dispatches foundational
+   issues first, then their dependents as blockers close
 
 ## Configuration
 

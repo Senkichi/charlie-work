@@ -767,6 +767,10 @@ class OrchestratorApp:
             # Done outside the lock to avoid holding it during GitHub API calls
             candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
+            # Sort unblocked candidates by dependency depth (topological order)
+            # This maximizes unblocking per wave by dispatching foundational nodes first
+            candidates = self._sort_by_dependency_depth(candidates)
+
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in candidates}
@@ -900,6 +904,10 @@ class OrchestratorApp:
         # Apply dependency gate: skip issues with open blockers
         # Done outside the lock to avoid holding it during GitHub API calls
         candidates, blocked_issues = self._filter_blocked_issues(candidates)
+
+        # Sort unblocked candidates by dependency depth (topological order)
+        # This maximizes unblocking per wave by dispatching foundational nodes first
+        candidates = self._sort_by_dependency_depth(candidates)
 
         # Re-enter lock to log events and claim issues
         with state_lock(self.paths.state_file):
@@ -2398,6 +2406,70 @@ class OrchestratorApp:
         ]
         return filtered_candidates, blocked_issues
 
+    def _sort_by_dependency_depth(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sort unblocked candidates by dependency depth (topological order).
+
+        Issues with no blockers (foundational nodes) come first, followed by
+        issues that depend only on those, and so on. Within the same depth,
+        issues are sorted by creation date (oldest first) as a tiebreaker.
+
+        This maximizes unblocking per wave by dispatching foundational nodes
+        before their dependents.
+
+        Args:
+            candidates: List of unblocked candidate issue dicts from GitHub API
+
+        Returns:
+            List of candidates sorted by dependency depth, then by creation date.
+        """
+        if not candidates:
+            return []
+
+        # Build dependency graph: map issue number to its declared blockers
+        # (both body markers and GitHub native dependencies)
+        dependency_graph: dict[int, list[int]] = {}
+        for issue in candidates:
+            issue_number = int(issue["number"])
+            declared_blockers, _ = self._get_open_blockers(issue)
+            # Only include blockers that are also in the candidate set
+            # (blockers outside the ready set are already closed or irrelevant)
+            candidate_numbers = {int(c["number"]) for c in candidates}
+            dependency_graph[issue_number] = [
+                b for b in declared_blockers if b in candidate_numbers
+            ]
+
+        # Compute dependency depth for each issue using DFS
+        # Depth = length of longest chain of dependencies
+        depth_cache: dict[int, int] = {}
+
+        def compute_depth(issue_number: int) -> int:
+            """Recursively compute dependency depth for an issue."""
+            if issue_number in depth_cache:
+                return depth_cache[issue_number]
+
+            blockers = dependency_graph.get(issue_number, [])
+            if not blockers:
+                depth = 0
+            else:
+                depth = 1 + max((compute_depth(b) for b in blockers), default=0)
+
+            depth_cache[issue_number] = depth
+            return depth
+
+        # Compute depth for all candidates
+        for issue in candidates:
+            compute_depth(int(issue["number"]))
+
+        # Sort by depth (ascending), then by creation date (ascending for oldest-first)
+        def sort_key(issue: dict[str, Any]) -> tuple[int, str]:
+            issue_number = int(issue["number"])
+            depth = depth_cache.get(issue_number, 0)
+            # Parse creation date; if missing, use empty string to sort last
+            created_at = issue.get("createdAt", "")
+            return (depth, created_at)
+
+        return sorted(candidates, key=sort_key)
+
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
@@ -2458,12 +2530,17 @@ class OrchestratorApp:
         self.gh.pr_comment(pr_number, body_path)
 
     def _summarize_issue(self, issue: dict[str, Any]) -> dict[str, Any]:
+        declared_blockers, open_blockers = self._get_open_blockers(issue)
         return {
             "number": issue.get("number"),
             "title": issue.get("title"),
             "url": issue.get("url"),
             "labels": sorted(label_names(issue)),
             "dispatchable": self._is_dispatchable(issue),
+            "dependencies": {
+                "declared": declared_blockers,
+                "open": open_blockers,
+            },
         }
 
     def _summarize_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
