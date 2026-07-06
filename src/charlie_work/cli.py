@@ -11,6 +11,8 @@ import yaml
 from . import CLI_NAME
 from .config import ConfigError, find_config_path, load_config
 from .doctor import run_doctor
+from .fleet_registry import touch_repo
+from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .workflow import CommandResult, OrchestratorApp
@@ -114,18 +116,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_config(find_config_path(repo_root, args.config))
+    config = load_layered_config(repo_root, args.config)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    touch_repo(None, repo_root, paths, gh)
     return OrchestratorApp(repo_root, paths, config, gh, dry_run=args.dry_run)
 
 
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config_path = find_config_path(repo_root, args.config)
-    config = load_config(config_path)
+    config = load_layered_config(repo_root, args.config)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    touch_repo(None, repo_root, paths, gh)
     ok, checks = run_doctor(
         repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe, live=args.live
     )
