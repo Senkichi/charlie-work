@@ -421,6 +421,19 @@ _BLOCKER_PATTERNS = [
     re.compile(r"blocked-by:\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
 ]
 
+_CLAUSE_BOUNDARY_CHARS = ".!?\n"
+_ISSUE_REF = re.compile(r"#\d+")
+
+
+def _clause_preceding(text: str, match_start: int) -> str:
+    """Return the text of the sentence/line leading up to a match.
+
+    Bounded by the closest preceding sentence terminator (".", "!", "?") or
+    line break, so each bullet/sentence is judged independently.
+    """
+    boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
+    return text[boundary + 1 : match_start]
+
 
 def parse_blockers(text: str) -> list[int]:
     """Parse blocker issue numbers from issue body text.
@@ -431,6 +444,13 @@ def parse_blockers(text: str) -> list[int]:
     - "Blocked-by: #N"
 
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
+
+    A match is only treated as the CURRENT issue declaring its own blocker
+    if no other issue reference appears earlier in the same sentence/line.
+    This excludes prose like "#168, #169, and #170 all build on this and are
+    blocked by #159" — which describes those OTHER issues as blocked, not
+    a self-declaration by whichever issue contains that text.
+
     Returns an empty list if no blockers are found.
     """
     if not text:
@@ -440,6 +460,9 @@ def parse_blockers(text: str) -> list[int]:
     # Check if they appear in blocker context
     for pattern in _BLOCKER_PATTERNS:
         for match in pattern.finditer(text):
+            if _ISSUE_REF.search(_clause_preceding(text, match.start())):
+                continue
+
             # Extract the full match and find all #N references within it
             match_text = match.group(0)
             numbers_in_match = re.findall(r"#(\d+)", match_text)

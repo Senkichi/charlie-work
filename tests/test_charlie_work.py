@@ -7848,6 +7848,27 @@ def test_parse_blockers_deduplicates() -> None:
     assert blockers == [123, 456]
 
 
+def test_parse_blockers_ignores_downstream_reference_to_self() -> None:
+    """Issue #159 regression: prose describing OTHER issues as blocked by
+    THIS issue must not be misread as a self-referencing blocker declaration.
+
+    Real trip case from issue #159's "## Dependencies" section: the sentence
+    describes #168/#169/#170 as blocked by #159, not #159 declaring its own
+    blocker. Naively matching "blocked by #N" anywhere in the text extracted
+    159 and treated it as #159 self-declaring a blocker on itself.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Dependencies\n\n"
+        "None — greenfield, no blockers. Downstream: #168 (fleet status), "
+        "#169 (global concurrency budget), and #170 (fleet dispatch) all "
+        "build on this registry and are blocked by #159.\n\n"
+        "_Filed from the fleet-management & worker-supervision design._\n"
+    )
+    assert parse_blockers(body) == []
+
+
 def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
     """Issue #108: dispatch should skip issues with open blockers."""
     config = OrchestratorConfig(
