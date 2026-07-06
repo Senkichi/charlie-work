@@ -109,6 +109,9 @@ class DispatchConfig:
     # (origin/<branch>), git fetch is run before worktree creation to ensure the
     # worktree bases off the latest remote tip instead of a stale local HEAD.
     base_ref: str = ""
+    # Dispatch order: "oldest" (default) selects issues by creation date ascending,
+    # "newest" selects by creation date descending (previous behavior).
+    order: str = "oldest"
 
 
 @dataclass(frozen=True)
@@ -325,6 +328,15 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'dispatch' key 'base_ref' must be a string, "
             f"got {type(base_ref).__name__}"
+        )
+    order = dispatch_data.get("order")
+    if order is not None and not isinstance(order, str):
+        raise ConfigError(
+            f"config section 'dispatch' key 'order' must be a string, got {type(order).__name__}"
+        )
+    if order is not None and order not in ("oldest", "newest"):
+        raise ConfigError(
+            f"config section 'dispatch' key 'order' must be 'oldest' or 'newest', got '{order}'"
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
