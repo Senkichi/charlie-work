@@ -18,6 +18,7 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     update_worker_record_with_failure_classification,
+    _sidecar_path,
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.worktree import WorktreeInfo
@@ -853,6 +854,15 @@ def test_is_worker_alive_probe_none_with_start_time_returns_dead(
     finally:
         process.kill()
         process.wait(timeout=5)
+
+
+def test_sidecar_path_returns_correct_path(tmp_path: Path) -> None:
+    """_sidecar_path returns the expected path for a given issue number."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _sidecar_path(sessions_dir, 123)
+    assert path == sessions_dir / "issue-123.claude.json"
 
 
 def test_launch_captures_process_start_time(

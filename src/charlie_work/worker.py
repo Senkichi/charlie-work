@@ -9,8 +9,18 @@ from dataclasses import dataclass
 from os import stat_result
 from pathlib import Path
 
-from .claude_code import ClaudeWorkerRecord, is_worker_alive, read_worker_records
-from .devin_shell import SessionRecord, is_session_alive, read_session_records
+from .claude_code import (
+    ClaudeWorkerRecord,
+    _sidecar_path as claude_sidecar_path,
+    is_worker_alive,
+    read_worker_records,
+)
+from .devin_shell import (
+    SessionRecord,
+    _sidecar_path as devin_sidecar_path,
+    is_session_alive,
+    read_session_records,
+)
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,31 @@ class WorkerView:
             return Path(self.log_path).stat()
         except OSError:
             return None
+
+    def reap_sidecar(self, sessions_dir: Path) -> None:
+        """Delete the sidecar file for this worker to prevent phantom sessions.
+
+        Dispatches to the adapter-specific sidecar path function based on adapter_kind.
+        Best-effort cleanup: OSError is swallowed to avoid failing the entire dead-session
+        classification loop if a single unlink fails (the sidecar will be reaped on the
+        next cycle).
+
+        This is called after a session is detected as dead and classified to prevent
+        phantom sessions from PID recycling (issue #113).
+        """
+        if self.adapter_kind == "devin":
+            sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
+        elif self.adapter_kind == "claude-code":
+            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number)
+        else:
+            # Unknown adapter kind - nothing to reap
+            return
+
+        try:
+            sidecar_path.unlink(missing_ok=True)
+        except OSError:
+            # Best-effort cleanup - don't fail if unlink fails
+            pass
 
 
 def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:

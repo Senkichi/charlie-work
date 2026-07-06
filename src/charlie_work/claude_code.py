@@ -615,4 +615,5 @@ __all__ = [
     "probe_claude",
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
+    "_sidecar_path",
 ]
