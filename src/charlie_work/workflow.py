@@ -26,7 +26,12 @@ from .github import (
     linked_issue_number,
     parse_blockers,
 )
-from .janitor import check_operator_containment, run_janitor
+from .janitor import (
+    check_operator_containment,
+    check_test_adequacy,
+    run_janitor,
+    TestAdequacyVerdict,
+)
 from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
@@ -87,6 +92,37 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
         "\n## Janitor warnings (non-blocking)\n\n"
         f"{lines}\n\n"
         "These deterministic pre-checks passed the gate but deserve reviewer attention.\n"
+    )
+
+
+def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: str) -> str:
+    """Render a test-adequacy hard-fail verdict as actionable reviewer feedback.
+
+    This summary is passed to record_review as the review summary, which is
+    rendered into rework.md. It must read as actionable feedback, not a raw
+    dataclass dump.
+
+    Args:
+        verdict: The hard-fail TestAdequacyVerdict (ok=False).
+        exempt_marker: The exempt marker string from config (e.g., "Test-exempt:").
+
+    Returns:
+        A non-empty templated string with untested product files and exemption
+        instruction.
+    """
+    facts = verdict.facts
+    untested_files = facts.untested_product_files
+    added_loc = facts.added_product_loc
+
+    # Build file list with LOC counts
+    file_list = "\n".join(f"  - {file}" for file in untested_files)
+
+    return (
+        f"Test adequacy check failed: {added_loc} lines of product code added "
+        f"but no test files changed.\n\n"
+        f"Untested product files:\n{file_list}\n\n"
+        f"To exempt this PR from the test-adequacy gate, add "
+        f"'{exempt_marker} <reason>' to the PR body with a clear justification."
     )
 
 
@@ -993,6 +1029,22 @@ class OrchestratorApp:
         )
 
     def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
+        """Generate a review packet for a PR.
+
+        When config.test_adequacy.enabled, this method may itself issue a
+        request_changes verdict and advance/terminate the rework loop (previously
+        only record_review/verdict did this). When disabled (default), the method
+        never mutates decision state and always returns a packet.
+
+        Args:
+            pr_number: The PR number to review.
+            cross_family: Whether to enable cross-family review (optional).
+
+        Returns:
+            CommandResult with ok=True if a packet was generated, or ok=False if
+            the review was blocked (janitor gate, test-adequacy gate) or the PR
+            was not found.
+        """
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
@@ -1053,6 +1105,24 @@ class OrchestratorApp:
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
+
+        # Tier 1 test-adequacy hard gate (issue #179)
+        if self.config.test_adequacy.enabled:
+            verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
+            if not verdict.ok:
+                # Same terminal label set as an LLM request_changes:
+                # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
+                #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
+                if issue_number is not None:
+                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                summary = render_test_adequacy_summary(
+                    verdict, self.config.test_adequacy.exempt_marker
+                )
+                return self.record_review(pr_number, "request_changes", summary=summary)
+            # Gate passed while enabled: #180 later adds the Tier-2 packet section here,
+            #   test_adequacy_section = render_test_adequacy_section(verdict.facts, verdict.warnings)
+            # reusing this `verdict`. This issue does NOT touch the packet render or $test_adequacy_section.
+
         # Run containment check for worker edits leaked into operator checkout
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         # Merge containment warnings with janitor warnings
