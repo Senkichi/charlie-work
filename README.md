@@ -175,7 +175,8 @@ escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
 `devin.adapter` (`manual` | `command` | `devin-shell` | `claude-code`),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
-`cross_family.*` (non-Claude adversarial pass).
+`cross_family.*` (non-Claude adversarial pass), `test_adequacy.*` (opt-in
+test-adequacy gate).
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
