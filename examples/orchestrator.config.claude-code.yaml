@@ -16,6 +16,8 @@ dispatch:
   worker_model_tier: capable
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
+  # Dispatch order: "oldest" (default) or "newest" (previous behavior)
+  # order: oldest
 
 review:
   # Escalates to agent:human-needed past this many request_changes cycles.

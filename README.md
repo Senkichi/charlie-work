@@ -140,10 +140,10 @@ those relationships are automatically included in the dependency graph.
    they have the `automated-ready` label. They appear in `roll-call --json` under
    the `blocked` field with their blocker list.
 
-2. **Dependency-aware ordering**: Unblocked issues are dispatched in
-   topological order by dependency depth (foundational nodes first, then their
-   dependents). Within the same depth, oldest-first is the tiebreaker. This
-   maximizes unblocking per wave by dispatching critical-path issues first.
+2. **Dependency-aware ordering**: Unblocked issues are dispatched
+   most-unblocking-first (issues that block the most currently-blocked dependents),
+   with oldest-first as the tiebreaker. This maximizes unblocking per wave by
+   dispatching critical-path issues first.
 
 3. **Visibility**: `roll-call --json` includes a `dependencies` field for each
    issue with `declared` (all blockers mentioned in body/GitHub) and `open`
@@ -169,12 +169,13 @@ the two shipped profiles:
 | `orchestrator.config.claude-code.yaml` | Claude Code | direct-shell worker loop, Claude-only review |
 
 Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
-`branch_prefix` / `worker_template`, `review.max_rework_cycles` (past this many
-`request_changes` cycles a PR escalates to `agent:human-needed`),
-`auto_merge.required_checks` (verify with `doctor`), `runtime.prompts_dir`
-(repo-local template overrides), `devin.adapter` (`manual` | `command` |
-`devin-shell` | `claude-code`), `claude_code.*` (worktree/venv settings for the
-claude-code adapter), `cross_family.*` (non-Claude adversarial pass).
+`branch_prefix` / `worker_template` / `order` (`oldest` | `newest`),
+`review.max_rework_cycles` (past this many `request_changes` cycles a PR
+escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
+`doctor`), `runtime.prompts_dir` (repo-local template overrides),
+`devin.adapter` (`manual` | `command` | `devin-shell` | `claude-code`),
+`claude_code.*` (worktree/venv settings for the claude-code adapter),
+`cross_family.*` (non-Claude adversarial pass).
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
