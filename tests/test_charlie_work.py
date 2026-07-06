@@ -1288,7 +1288,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -1767,7 +1767,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -4047,7 +4047,11 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
 
 
 def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> None:
-    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released."""
+    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released.
+
+    Issue #116: Missing rework-prompt.md may be transient (review agent hasn't written it yet),
+    so restore to rework_requested for retry instead of dispatch_failed.
+    """
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="command",
@@ -4087,11 +4091,101 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
 
     assert result.ok is True
     assert result.data["selected_count"] == 0
-    # Verify the claim was released: status should be dispatch_failed, not dispatch_pending
+    # Verify the claim was released: status should be rework_requested (not dispatch_pending)
     state = load_state(paths.state_file)
     issue_state = state["issues"].get("123")
     assert issue_state is not None
-    assert issue_state.get("status") == "dispatch_failed"
+    # Issue #116: restore to rework_requested for retry (missing prompt may be transient)
+    assert issue_state.get("status") == "rework_requested"
+    assert issue_state.get("dispatch_pending_at") is None
+
+
+def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path: Path) -> None:
+    """Issue #116: Failed rework dispatch must restore status to rework_requested for retry.
+
+    When a rework dispatch attempt fails (e.g., git worktree add error), the issue's
+    status must be restored to rework_requested so it can be retried in the next pass.
+    The bug was that failed dispatches left status as dispatch_failed, permanently
+    excluding the issue from rework selection (state-driven selection).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",  # Simulate dispatch failure
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    # Initialize state with the issue in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First dispatch attempt fails
+    result = app.dispatch_rework()
+
+    # result.ok is False when there are dispatch failures
+    assert result.ok is False
+    assert result.data["selected_count"] == 0
+    assert result.data["failed_count"] == 1
+
+    # Verify status is restored to rework_requested (not dispatch_failed)
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "rework_requested"
+
+    # Second dispatch attempt should select the issue again
+    # Fix the command to succeed
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["failed_count"] == 0
+
+    # Verify the issue is now dispatched
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "dispatched"
     assert issue_state.get("dispatch_pending_at") is None
 
 
@@ -8463,7 +8557,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     )
 
     # Mock is_session_alive to return True for PID 99999 so detection runs
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.status()
 
     # Check that stalled section contains the issue number and pid
@@ -8551,7 +8645,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     # Mock is_session_alive to return True and kill_process_tree to return killed PIDs
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True),
+        patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
@@ -8645,7 +8739,7 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
 
     # Mock is_session_alive and kill_process_tree to track calls
     with (
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True) as mock_alive,
+        patch("charlie_work.worker.is_session_alive", return_value=True) as mock_alive,
         patch("charlie_work.process_utils.kill_process_tree", return_value=[]) as mock_kill,
     ):
         # Run the stall detection and handling
@@ -8666,3 +8760,42 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     # Find the session_stalled event
     stalled_events = [e for e in events if e.get("type") == "session_stalled"]
     assert len(stalled_events) == 0  # No event emitted
+
+
+def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monkeypatch) -> None:
+    """Regression test for issue #158: _detect_and_handle_stalled_sessions should be called exactly once per dispatch() call, not twice (was duplicated in _apply_concurrency_governor)."""
+    # Mock _detect_and_handle_stalled_sessions to track call count
+    stall_detection_calls = []
+
+    def mock_stall_detection(sessions_dir, state_file, config):
+        stall_detection_calls.append(1)
+        return []  # No stalled sessions
+
+    monkeypatch.setattr(
+        "charlie_work.workflow._detect_and_handle_stalled_sessions", mock_stall_detection
+    )
+
+    # Mock _count_live_sessions to return 0 (no live sessions)
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Call dispatch() with max_concurrent_sessions > 0
+    result = app.dispatch()
+
+    # Verify stall detection was called exactly once
+    assert len(stall_detection_calls) == 1, (
+        f"_detect_and_handle_stalled_sessions was called {len(stall_detection_calls)} times, expected 1"
+    )
+
+    # Verify dispatch succeeded
+    assert result.ok is True
