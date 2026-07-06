@@ -8709,7 +8709,9 @@ def test_fleet_dir_platform_defaults() -> None:
         if sys.platform == "win32":
             expected_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         else:
-            expected_base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+            expected_base = Path(
+                os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+            )
 
         assert result == expected_base / "charlie-work"
     finally:
@@ -8893,9 +8895,7 @@ def test_global_config_global_only(tmp_path: Path) -> None:
 
     # Create global config with a custom value
     global_config_path = fleet_dir_path / "config.yaml"
-    global_config_path.write_text(
-        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
-    )
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
 
     config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
 
@@ -8913,15 +8913,11 @@ def test_global_config_per_repo_wins(tmp_path: Path) -> None:
 
     # Create global config
     global_config_path = fleet_dir_path / "config.yaml"
-    global_config_path.write_text(
-        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
-    )
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
 
     # Create per-repo config with different value
     repo_config_path = repo_root / "orchestrator.config.yaml"
-    repo_config_path.write_text(
-        "dispatch:\n  max_concurrent_sessions: 10\n", encoding="utf-8"
-    )
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 10\n", encoding="utf-8")
 
     config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
 
