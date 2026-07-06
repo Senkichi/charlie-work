@@ -617,6 +617,29 @@ def test_load_config_rejects_positional_placeholder_in_shell_command(tmp_path: P
     assert "unknown placeholder" in message or "malformed placeholder" in message
 
 
+def test_load_config_rejects_invalid_dispatch_order(tmp_path: Path) -> None:
+    """Issue #151: invalid dispatch.order config value is rejected at load."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "dispatch:\n  order: invalid\n",
+        encoding="utf-8",
+    )
+
+    from charlie_work.config import ConfigError, load_config
+
+    try:
+        load_config(config_file)
+        raise AssertionError("expected ConfigError for invalid dispatch.order")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid dispatch.order")
+
+    assert "dispatch" in message
+    assert "order" in message
+    assert "oldest" in message or "newest" in message
+
+
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
     """Issue #4: unknown placeholder in dispatch_command is rejected at load."""
     from charlie_work.config import ConfigError
@@ -1259,6 +1282,123 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["selected_count"] == 0
     assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+
+
+def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
+    """Test that dispatch selects oldest issues first by default (issue #151)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create fake GitHub with issues created out of order
+    fake_gh = FakeGitHub()
+    # Override issue_list to return issues with different creation dates
+    fake_gh.issues = [
+        {
+            "number": 792,
+            "title": "crash-fix",
+            "url": "https://github.com/test/repo/issues/792",
+            "body": "Fix crash",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",  # Oldest
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 808,
+            "title": "e2e-test",
+            "url": "https://github.com/test/repo/issues/808",
+            "body": "E2E test",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-06T00:00:00Z",  # Newest
+            "updatedAt": "2026-07-06T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 793,
+            "title": "data-model",
+            "url": "https://github.com/test/repo/issues/793",
+            "body": "Data model",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",  # Middle
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+    ]
+    
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    
+    # Dispatch 2 issues - should select oldest first (792, then 793)
+    result = app.dispatch(limit=2)
+    
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    # Should select oldest issues: 792 (oldest), 793 (middle)
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [792, 793]
+
+
+def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
+    """Test that dispatch selects newest issues first when configured (issue #151)."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(order="newest"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    
+    # Create fake GitHub with issues created out of order
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 792,
+            "title": "crash-fix",
+            "url": "https://github.com/test/repo/issues/792",
+            "body": "Fix crash",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-01T00:00:00Z",  # Oldest
+            "updatedAt": "2026-07-01T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 808,
+            "title": "e2e-test",
+            "url": "https://github.com/test/repo/issues/808",
+            "body": "E2E test",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-06T00:00:00Z",  # Newest
+            "updatedAt": "2026-07-06T00:00:00Z",
+            "state": "open",
+        },
+        {
+            "number": 793,
+            "title": "data-model",
+            "url": "https://github.com/test/repo/issues/793",
+            "body": "Data model",
+            "labels": [{"name": "automated-ready"}],
+            "assignees": [],
+            "author": {"login": "test"},
+            "createdAt": "2026-07-02T00:00:00Z",  # Middle
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "state": "open",
+        },
+    ]
+    
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    
+    # Dispatch 2 issues - should select newest first (808, then 793)
+    result = app.dispatch(limit=2)
+    
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    # Should select newest issues: 808 (newest), 793 (middle)
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [808, 793]
 
 
 def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:

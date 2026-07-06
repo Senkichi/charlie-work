@@ -767,6 +767,9 @@ class OrchestratorApp:
             # Done outside the lock to avoid holding it during GitHub API calls
             candidates, blocked_issues = self._filter_blocked_issues(candidates)
 
+            # Sort candidates by dispatch order (oldest-first by default)
+            candidates = self._sort_by_dispatch_order(candidates)
+
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in candidates}
@@ -900,6 +903,9 @@ class OrchestratorApp:
         # Apply dependency gate: skip issues with open blockers
         # Done outside the lock to avoid holding it during GitHub API calls
         candidates, blocked_issues = self._filter_blocked_issues(candidates)
+
+        # Sort candidates by dispatch order (oldest-first by default)
+        candidates = self._sort_by_dispatch_order(candidates)
 
         # Re-enter lock to log events and claim issues
         with state_lock(self.paths.state_file):
@@ -2397,6 +2403,34 @@ class OrchestratorApp:
             issue for issue in candidates if int(issue["number"]) not in blocked_issues
         ]
         return filtered_candidates, blocked_issues
+
+    def _sort_by_dispatch_order(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sort candidates by dispatch order (oldest-first or newest-first).
+
+        Uses the createdAt field from GitHub API to sort by creation date.
+        Default is oldest-first (ascending), but can be configured to newest-first
+        (descending) via dispatch.order config.
+
+        Args:
+            candidates: List of candidate issue dicts from GitHub API
+
+        Returns:
+            Sorted list of candidates by creation date according to dispatch.order
+        """
+        if self.config.dispatch.order == "newest":
+            # Sort by createdAt descending (newest first)
+            return sorted(
+                candidates,
+                key=lambda issue: issue.get("createdAt", ""),
+                reverse=True,
+            )
+        else:
+            # Sort by createdAt ascending (oldest first, default)
+            return sorted(
+                candidates,
+                key=lambda issue: issue.get("createdAt", ""),
+                reverse=False,
+            )
 
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
