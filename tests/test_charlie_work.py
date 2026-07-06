@@ -1685,8 +1685,8 @@ def test_roll_call_json_dependencies_schema(tmp_path: Path) -> None:
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Run roll-call with JSON output
-    result = app.roll_call(json_output=True)
+    # Run status with JSON output
+    result = app.status()
 
     assert result.ok is True
     roll_call_data = result.data
@@ -4693,13 +4693,25 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Return both ready issues in order
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             return {200}
@@ -6441,8 +6453,14 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
             # Add needs-rework label to the issue
             self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
 
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                if ready_label == "agent:needs-rework":
+                    return self.issues
+                return []
+            elif labels and "agent:needs-rework" in labels:
                 return self.issues
             return []
 
@@ -6833,8 +6851,14 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            if ready_label == "agent:needs-rework":
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                if ready_label == "agent:needs-rework":
+                    return self.issues
+                return []
+            elif labels and "agent:needs-rework" in labels:
                 return self.issues
             return []
 
@@ -7728,13 +7752,26 @@ def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Only return issue 752 (the dependent one)
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                # Only return issue 752 (the dependent one)
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             # Return that #743 is open
@@ -7790,13 +7827,26 @@ def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Only return issue 752 (the dependent one)
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                # Only return issue 752 (the dependent one)
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             # Return that #743 is NOT open
@@ -7858,13 +7908,26 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Only return issue 752 (the dependent one)
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                # Only return issue 752 (the dependent one)
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             # Return that #744 is open
@@ -8061,13 +8124,25 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Return both ready issues in order
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             return {200}
@@ -8133,13 +8208,26 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
-            # Only return issue 752 (the dependent one)
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
+            if isinstance(labels, str):
+                ready_label = labels
+                # Only return issue 752 (the dependent one)
+                return [
+                    issue
+                    for issue in self.issues
+                    if ready_label in [label["name"] for label in issue.get("labels", [])]
+                ]
+            elif labels:
+                return [
+                    issue
+                    for issue in self.issues
+                    if any(
+                        label in [label_obj["name"] for label_obj in issue.get("labels", [])]
+                        for label in labels
+                    )
+                ]
+            return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
             return {743}
@@ -8186,7 +8274,8 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
                 },
             ]
 
-        def issue_list(self, ready_label: str):
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
             return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
@@ -8254,7 +8343,8 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
             super().__init__()
             self.issues = []
 
-        def issue_list(self, ready_label: str):
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
             return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
@@ -8364,7 +8454,8 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
             super().__init__()
             self.issues = []
 
-        def issue_list(self, ready_label: str):
+        def issue_list(self, labels=None, state=None):
+            # Support both old and new signature
             return self.issues
 
         def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
