@@ -1288,7 +1288,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -1767,7 +1767,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -8463,7 +8463,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     )
 
     # Mock is_session_alive to return True for PID 99999 so detection runs
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.status()
 
     # Check that stalled section contains the issue number and pid
@@ -8551,7 +8551,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     # Mock is_session_alive to return True and kill_process_tree to return killed PIDs
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True),
+        patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
@@ -8645,7 +8645,7 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
 
     # Mock is_session_alive and kill_process_tree to track calls
     with (
-        patch("charlie_work.devin_shell.is_session_alive", return_value=True) as mock_alive,
+        patch("charlie_work.worker.is_session_alive", return_value=True) as mock_alive,
         patch("charlie_work.process_utils.kill_process_tree", return_value=[]) as mock_kill,
     ):
         # Run the stall detection and handling
@@ -8666,3 +8666,42 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     # Find the session_stalled event
     stalled_events = [e for e in events if e.get("type") == "session_stalled"]
     assert len(stalled_events) == 0  # No event emitted
+
+
+def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monkeypatch) -> None:
+    """Regression test for issue #158: _detect_and_handle_stalled_sessions should be called exactly once per dispatch() call, not twice (was duplicated in _apply_concurrency_governor)."""
+    # Mock _detect_and_handle_stalled_sessions to track call count
+    stall_detection_calls = []
+
+    def mock_stall_detection(sessions_dir, state_file, config):
+        stall_detection_calls.append(1)
+        return []  # No stalled sessions
+
+    monkeypatch.setattr(
+        "charlie_work.workflow._detect_and_handle_stalled_sessions", mock_stall_detection
+    )
+
+    # Mock _count_live_sessions to return 0 (no live sessions)
+    def mock_count_live(sessions_dir):
+        return 0
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Call dispatch() with max_concurrent_sessions > 0
+    result = app.dispatch()
+
+    # Verify stall detection was called exactly once
+    assert len(stall_detection_calls) == 1, (
+        f"_detect_and_handle_stalled_sessions was called {len(stall_detection_calls)} times, expected 1"
+    )
+
+    # Verify dispatch succeeded
+    assert result.ok is True
