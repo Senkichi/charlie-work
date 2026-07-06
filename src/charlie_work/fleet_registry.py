@@ -92,7 +92,6 @@ def touch_repo(
         repos = data.setdefault("repos", {})
 
         entry = repos.get(name_with_owner, {})
-        existing_repo_root = entry.get("repo_root")
 
         # Build/update the entry
         now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")

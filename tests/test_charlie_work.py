@@ -9328,7 +9328,7 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
     args = argparse.Namespace(repo=repo_root, config=None, dry_run=False)
 
     # Call build_app
-    app = build_app(args)
+    build_app(args)
 
     # Verify fleet.json was created
     fleet_json_path = tmp_path / "fleet" / "fleet.json"

@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
-from .config import ConfigError, find_config_path, load_config
+from .config import ConfigError, find_config_path
 from .doctor import run_doctor
 from .fleet_registry import touch_repo
 from .global_config import load_layered_config

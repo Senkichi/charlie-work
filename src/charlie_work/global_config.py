@@ -6,10 +6,7 @@ from typing import Any
 import yaml
 
 from .config import (
-    ConfigError,
     OrchestratorConfig,
-    _build_section,
-    _section,
     find_config_path,
     load_config,
 )
