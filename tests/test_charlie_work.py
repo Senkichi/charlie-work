@@ -2358,7 +2358,7 @@ def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch)
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}
     VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-    
+
     # Set a consistent head SHA for the PR
     app.gh.pr_head_shas[456] = "sha-abc123"
 
@@ -2825,7 +2825,7 @@ def test_cross_family_report_invalidated_on_head_sha_change(tmp_path: Path, monk
     app = _cross_family_app(tmp_path, enabled=True)
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True)
-    
+
     # Create a report with an old head SHA
     old_head_sha = "abc123def456"
     report_content = (
@@ -2836,23 +2836,23 @@ def test_cross_family_report_invalidated_on_head_sha_change(tmp_path: Path, monk
         f"**MAJOR**\nfile:line: old bug\n\nVerdict: needs work\n"
     )
     (pr_dir / "cross-family-review.md").write_text(report_content, encoding="utf-8")
-    
+
     calls = {"n": 0}
-    
+
     def _fake_run(**kwargs):
         calls["n"] += 1
         # Verify that the new head SHA is passed to run_cross_family_review
         assert kwargs.get("head_ref_oid") == "newheadsha789"
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-    
+
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
-    
+
     # Update the PR to have a new head SHA
     app.gh.pr_head_shas[456] = "newheadsha789"
-    
+
     result = app.review(456)
-    
+
     # The old report should NOT be reused because the head SHA changed
     assert calls["n"] == 1
     assert result.data["cross_family_ok"] is True
@@ -2864,7 +2864,7 @@ def test_cross_family_report_reused_when_head_sha_unchanged(tmp_path: Path, monk
     app = _cross_family_app(tmp_path, enabled=True)
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True)
-    
+
     # Create a report with a head SHA
     head_sha = "abc123def456"
     report_content = (
@@ -2875,21 +2875,21 @@ def test_cross_family_report_reused_when_head_sha_unchanged(tmp_path: Path, monk
         f"**MAJOR**\nfile:line: bug\n\nVerdict: needs work\n"
     )
     (pr_dir / "cross-family-review.md").write_text(report_content, encoding="utf-8")
-    
+
     calls = {"n": 0}
-    
+
     def _fake_run(**kwargs):
         calls["n"] += 1
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-    
+
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
-    
+
     # The PR still has the same head SHA
     app.gh.pr_head_shas[456] = head_sha
-    
+
     result = app.review(456)
-    
+
     # The report should be reused because the head SHA has not changed
     assert calls["n"] == 0
     assert result.data["cross_family_ok"] is True
