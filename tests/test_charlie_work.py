@@ -4047,7 +4047,11 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
 
 
 def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> None:
-    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released."""
+    """When all candidates lack rework-prompt.md, dispatch_pending claims must be released.
+
+    Issue #116: Missing rework-prompt.md may be transient (review agent hasn't written it yet),
+    so restore to rework_requested for retry instead of dispatch_failed.
+    """
     config = OrchestratorConfig(
         devin=DevinConfig(
             adapter="command",
@@ -4087,11 +4091,101 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
 
     assert result.ok is True
     assert result.data["selected_count"] == 0
-    # Verify the claim was released: status should be dispatch_failed, not dispatch_pending
+    # Verify the claim was released: status should be rework_requested (not dispatch_pending)
     state = load_state(paths.state_file)
     issue_state = state["issues"].get("123")
     assert issue_state is not None
-    assert issue_state.get("status") == "dispatch_failed"
+    # Issue #116: restore to rework_requested for retry (missing prompt may be transient)
+    assert issue_state.get("status") == "rework_requested"
+    assert issue_state.get("dispatch_pending_at") is None
+
+
+def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path: Path) -> None:
+    """Issue #116: Failed rework dispatch must restore status to rework_requested for retry.
+
+    When a rework dispatch attempt fails (e.g., git worktree add error), the issue's
+    status must be restored to rework_requested so it can be retried in the next pass.
+    The bug was that failed dispatches left status as dispatch_failed, permanently
+    excluding the issue from rework selection (state-driven selection).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",  # Simulate dispatch failure
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    # Initialize state with the issue in rework_requested status
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First dispatch attempt fails
+    result = app.dispatch_rework()
+
+    # result.ok is False when there are dispatch failures
+    assert result.ok is False
+    assert result.data["selected_count"] == 0
+    assert result.data["failed_count"] == 1
+
+    # Verify status is restored to rework_requested (not dispatch_failed)
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "rework_requested"
+
+    # Second dispatch attempt should select the issue again
+    # Fix the command to succeed
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["failed_count"] == 0
+
+    # Verify the issue is now dispatched
+    state = load_state(paths.state_file)
+    issue_state = state["issues"].get("123")
+    assert issue_state is not None
+    assert issue_state.get("status") == "dispatched"
     assert issue_state.get("dispatch_pending_at") is None
 
 
