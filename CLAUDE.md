@@ -14,7 +14,7 @@ uv run ruff format .             # format
 ### Config / value objects are frozen dataclasses
 All config and value-object types (`LabelConfig`, `DispatchConfig`, `ReviewConfig`,
 `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `ClaudeCodeConfig`,
-`OrchestratorConfig`, `SessionRecord`, `JanitorVerdict`, …) use
+`TestAdequacyConfig`, `OrchestratorConfig`, `SessionRecord`, `JanitorVerdict`, …) use
 `@dataclass(frozen=True)`. Never convert them to mutable classes or dicts.
 
 ### All JSON state writes are atomic
