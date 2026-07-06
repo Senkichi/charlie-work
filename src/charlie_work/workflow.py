@@ -2181,8 +2181,8 @@ class OrchestratorApp:
             # Use the rework prompt from the PR directory
             rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
             if not rework_prompt_path.exists():
-                # Skip if rework prompt doesn't exist — record as dispatch_failed
-                # to release the claim and avoid blocking re-dispatch for 30 min
+                # Skip if rework prompt doesn't exist — record as rework_requested
+                # to release the claim and allow retry (issue #116)
                 skipped_issue_numbers.append(issue_number)
                 continue
             session_requests.append(
@@ -2206,7 +2206,8 @@ class OrchestratorApp:
                         "number": issue_number,
                         "title": full_issue.get("title"),
                         "url": full_issue.get("url"),
-                        "status": "dispatch_failed",
+                        # Issue #116: restore to rework_requested for retry (missing prompt may be transient)
+                        "status": "rework_requested",
                         "dispatched_at": None,
                     }
                     entry.pop("dispatch_pending_at", None)
@@ -2258,8 +2259,10 @@ class OrchestratorApp:
         label_errors: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            # Record skipped issues (missing rework prompt) as dispatch_failed
-            # This handles the mixed case where some issues have prompts and some don't
+            # Record skipped issues (missing rework prompt) as rework_requested
+            # This handles the mixed case where some issues have prompts and some don't.
+            # Missing rework-prompt.md may be transient (review agent hasn't written it yet),
+            # so restore to rework_requested for retry (issue #116).
             for issue_number in skipped_issue_numbers:
                 full_issue = full_issues[issue_number]
                 entry = {
@@ -2267,7 +2270,7 @@ class OrchestratorApp:
                     "number": issue_number,
                     "title": full_issue.get("title"),
                     "url": full_issue.get("url"),
-                    "status": "dispatch_failed",
+                    "status": "rework_requested",
                     "dispatched_at": None,
                 }
                 entry.pop("dispatch_pending_at", None)
@@ -2283,7 +2286,9 @@ class OrchestratorApp:
                     "url": full_issue.get("url"),
                     "branch_name": request.branch_name,
                     "prompt_path": str(request.prompt_path),
-                    "status": "dispatched" if ok else "dispatch_failed",
+                    # On failure, restore to rework_requested so the issue can be retried
+                    # in the next pass (issue #116). On success, mark as dispatched.
+                    "status": "dispatched" if ok else "rework_requested",
                     "dispatched_at": utc_now() if ok else None,
                 }
                 entry.pop("dispatch_pending_at", None)
