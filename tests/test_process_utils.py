@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.process_utils import is_session_stalled, kill_process_tree, sweep_orphan_processes
+from charlie_work.process_utils import (
+    is_session_stalled,
+    kill_process_tree,
+    sweep_orphan_processes,
+)
 
 
 def test_is_session_stalled_with_old_mtime(tmp_path: Path) -> None:

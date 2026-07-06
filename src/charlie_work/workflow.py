@@ -191,6 +191,7 @@ def _detect_and_handle_stalled_sessions(
             if orphan_pids:
                 # Kill detected orphans to prevent them from running rejected code
                 import subprocess
+
                 for orphan_pid in orphan_pids:
                     try:
                         subprocess.run(
@@ -280,6 +281,7 @@ def _sweep_orphan_processes_for_dead_sessions(
         if orphan_pids:
             # Kill detected orphans
             import subprocess
+
             killed_orphans = []
             for orphan_pid in orphan_pids:
                 try:
@@ -1904,9 +1906,7 @@ class OrchestratorApp:
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
-        _sweep_orphan_processes_for_dead_sessions(
-            sessions_dir, self.paths.state_file, self.config
-        )
+        _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
 
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
