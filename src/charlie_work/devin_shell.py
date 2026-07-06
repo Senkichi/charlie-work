@@ -598,4 +598,5 @@ __all__ = [
     "is_session_alive",
     "update_session_record_with_failure_classification",
     "_get_process_start_time",
+    "_sidecar_path",
 ]

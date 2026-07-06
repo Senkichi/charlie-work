@@ -613,4 +613,5 @@ __all__ = [
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
     "_get_process_start_time",
+    "_sidecar_path",
 ]

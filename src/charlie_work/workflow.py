@@ -335,6 +335,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
 
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            from .devin_shell import _sidecar_path
+            sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
+            try:
+                sidecar_path.unlink(missing_ok=True)
+            except OSError:
+                # Best-effort cleanup - don't fail if unlink fails
+                pass
+
             # Issue #118: reconcile labels for dead sessions with no open PR
             if record.issue_number not in open_prs_by_issue:
                 try:
@@ -379,6 +389,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
+
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            from .claude_code import _sidecar_path
+            sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
+            try:
+                sidecar_path.unlink(missing_ok=True)
+            except OSError:
+                # Best-effort cleanup - don't fail if unlink fails
+                pass
 
             # Issue #118: reconcile labels for dead sessions with no open PR
             if record.issue_number not in open_prs_by_issue:

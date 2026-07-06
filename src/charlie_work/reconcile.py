@@ -228,6 +228,16 @@ def detect_drift(
                             )
                         )
 
+                    # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+                    # Delete the sidecar file after the session is detected as dead and classified
+                    from .devin_shell import _sidecar_path
+                    sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
+                    try:
+                        sidecar_path.unlink(missing_ok=True)
+                    except OSError:
+                        # Best-effort cleanup - don't fail if unlink fails
+                        pass
+
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # A dead worker with no open PR is recoverable and should be relabeled
                     # as dispatchable (remove active labels, ensure ready label present)
@@ -294,6 +304,16 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                             )
                         )
+
+                    # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+                    # Delete the sidecar file after the session is detected as dead and classified
+                    from .claude_code import _sidecar_path
+                    sidecar_path = _sidecar_path(sessions_dir, record.issue_number)
+                    try:
+                        sidecar_path.unlink(missing_ok=True)
+                    except OSError:
+                        # Best-effort cleanup - don't fail if unlink fails
+                        pass
 
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # Only count OPEN PRs (not CLOSED/MERGED) for the guard
