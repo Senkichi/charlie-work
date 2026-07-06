@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.claude_code import ClaudeWorkerRecord, read_worker_records
-from charlie_work.devin_shell import SessionRecord, read_session_records
+from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.worker import WorkerView, iter_workers
 
 

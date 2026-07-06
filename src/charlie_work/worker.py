@@ -8,7 +8,6 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 from dataclasses import dataclass
 from os import stat_result
 from pathlib import Path
-from typing import Any
 
 from .claude_code import ClaudeWorkerRecord, is_worker_alive, read_worker_records
 from .devin_shell import SessionRecord, is_session_alive, read_session_records
@@ -25,7 +24,9 @@ class WorkerView:
 
     adapter_kind: str  # "devin" | "claude-code"
     issue_number: int
-    repo_key: str  # required — cross-repo disambiguation (fleet work); "" for single-repo callers today
+    repo_key: (
+        str  # required — cross-repo disambiguation (fleet work); "" for single-repo callers today
+    )
     pid: int | None
     started_at: str
     process_start_time: float | None
