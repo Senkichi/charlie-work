@@ -331,6 +331,23 @@ class GitHub:
 
         return open_issues
 
+    def name_with_owner(self) -> str:
+        """Return the repository's nameWithOwner (e.g., "owner/repo").
+
+        Uses `gh repo view --json nameWithOwner`. Raises GitHubError on failure
+        (offline, not a GitHub repo, gh missing, etc.).
+
+        Returns:
+            The repository's nameWithOwner string.
+        """
+        result = self.run(["repo", "view", "--json", "nameWithOwner"], json_output=True)
+        if not isinstance(result, dict):
+            raise GitHubError("Expected dict from gh repo view")
+        name_with_owner = result.get("nameWithOwner")
+        if not isinstance(name_with_owner, str):
+            raise GitHubError("Expected nameWithOwner string in gh repo view output")
+        return name_with_owner
+
 
 def label_names(item: dict[str, Any]) -> set[str]:
     labels = item.get("labels") or []

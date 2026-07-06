@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -9020,6 +9021,327 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     # Find the session_stalled event
     stalled_events = [e for e in events if e.get("type") == "session_stalled"]
     assert len(stalled_events) == 0  # No event emitted
+
+
+# Fleet registry and global config tests
+
+
+def test_fleet_dir_override() -> None:
+    """Test that fleet_dir respects the override parameter."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    result = fleet_dir(override="/custom/path")
+    assert result == Path("/custom/path")
+
+
+def test_fleet_dir_env_var() -> None:
+    """Test that fleet_dir respects CHARLIE_WORK_FLEET_DIR env var."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
+    try:
+        os.environ["CHARLIE_WORK_FLEET_DIR"] = "/env/path"
+        result = fleet_dir()
+        assert result == Path("/env/path")
+    finally:
+        if original is None:
+            os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
+        else:
+            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+
+
+def test_fleet_dir_platform_defaults() -> None:
+    """Test that fleet_dir uses platform-specific defaults."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    # Clear env var to test platform defaults
+    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
+    try:
+        os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
+        result = fleet_dir()
+
+        if sys.platform == "win32":
+            expected_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        else:
+            expected_base = Path(
+                os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+            )
+
+        assert result == expected_base / "charlie-work"
+    finally:
+        if original is not None:
+            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+
+
+def test_fleet_registry_touch_repo_first_call(tmp_path: Path) -> None:
+    """Test that touch_repo sets first_seen and last_seen on first registration."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    # Mock GitHub that returns a nameWithOwner
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Touch repo with isolated fleet dir
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+
+    assert "repos" in registry
+    assert "owner/repo" in registry["repos"]
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root)
+    assert entry["name_with_owner"] == "owner/repo"
+    assert entry["config_path"] == str(repo_root / "orchestrator.config.yaml")
+    assert entry["state_dir"] == str(paths.root)
+    assert entry["first_seen"] == entry["last_seen"]  # First call: both equal
+
+
+def test_fleet_registry_touch_repo_second_call(tmp_path: Path) -> None:
+    """Test that touch_repo preserves first_seen and bumps last_seen on subsequent calls."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # First call
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+    first_last_seen = registry["repos"]["owner/repo"]["last_seen"]
+
+    # Small delay to ensure timestamp difference (need >1s due to second resolution)
+    time.sleep(2.0)
+
+    # Second call
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    second_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+    second_last_seen = registry["repos"]["owner/repo"]["last_seen"]
+
+    assert second_first_seen == first_first_seen  # first_seen preserved
+    assert second_last_seen != first_last_seen  # last_seen bumped
+    assert second_last_seen > first_last_seen  # last_seen increased
+
+
+def test_fleet_registry_touch_repo_moved_repo(tmp_path: Path) -> None:
+    """Test that touch_repo updates repo_root when repo is moved."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root_old = tmp_path / "repo_old"
+    repo_root_old.mkdir(parents=True, exist_ok=True)
+    paths_old = runtime_paths(repo_root_old, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh_old = FakeGitHub(repo_root=repo_root_old)
+
+    # First registration
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root_old, paths_old, gh_old)
+    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+
+    # Move repo
+    repo_root_new = tmp_path / "repo_new"
+    repo_root_new.mkdir(parents=True, exist_ok=True)
+    paths_new = runtime_paths(repo_root_new, ".var/charlie-work")
+    gh_new = FakeGitHub(repo_root=repo_root_new)
+
+    # Re-register with new path
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root_new, paths_new, gh_new)
+
+    # Should update repo_root but preserve first_seen (same nameWithOwner)
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root_new)
+    assert entry["first_seen"] == first_first_seen  # Preserved on move
+
+
+def test_fleet_registry_touch_repo_gh_error(tmp_path: Path) -> None:
+    """Test that touch_repo silently skips registration on gh error."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub, GitHubError
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            raise GitHubError("gh not available")
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Should not raise, should return empty registry
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    assert registry == {"version": 1, "repos": {}}
+
+
+def test_fleet_registry_uses_state_lock(tmp_path: Path) -> None:
+    """Test that fleet_registry writes go through state.save_state."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Spy on save_state
+    from charlie_work.state import save_state
+
+    original_save_state = save_state
+    calls = []
+
+    def spy_save_state(path: Path, data: dict) -> dict:
+        calls.append(path)
+        return original_save_state(path, data)
+
+    with patch("charlie_work.fleet_registry.save_state", side_effect=spy_save_state):
+        touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+
+    # Verify save_state was called with fleet.json path
+    assert len(calls) == 1
+    assert calls[0] == tmp_path / "fleet" / "fleet.json"
+
+
+def test_global_config_no_global_file(tmp_path: Path) -> None:
+    """Test that load_layered_config behaves like load_config when no global file exists."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+
+    # No global config, no repo config
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(tmp_path / "fleet"))
+
+    # Should match default config
+    default_config = load_config(None)
+    assert config.labels.ready == default_config.labels.ready
+    assert config.dispatch.default_limit == default_config.dispatch.default_limit
+
+
+def test_global_config_global_only(tmp_path: Path) -> None:
+    """Test that global config values apply when no per-repo override exists."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config with a custom value
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.dispatch.max_concurrent_sessions == 5
+
+
+def test_global_config_per_repo_wins(tmp_path: Path) -> None:
+    """Test that per-repo config overrides global config."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+
+    # Create per-repo config with different value
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 10\n", encoding="utf-8")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    # Per-repo value should win
+    assert config.dispatch.max_concurrent_sessions == 10
+
+
+def test_global_config_unknown_key_raises(tmp_path: Path) -> None:
+    """Test that unknown keys in global config raise ConfigError."""
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config with unknown top-level section
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+
+def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Integration test: cli.build_app registers repo in fleet.json."""
+    from charlie_work.cli import build_app
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / ".git").mkdir()  # Make it a git repo
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    # Monkeypatch GitHub to use our fake
+    def fake_github(repo_root: Path, dry_run: bool = False) -> GitHub:
+        return FakeGitHub(repo_root=repo_root, dry_run=dry_run)
+
+    monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
+
+    # Mock fleet_dir to use tmp_path
+    def fake_fleet_dir(*, override: str | None = None) -> Path:
+        return tmp_path / "fleet"
+
+    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", fake_fleet_dir)
+
+    # Build args
+    import argparse
+
+    args = argparse.Namespace(repo=repo_root, config=None, dry_run=False)
+
+    # Call build_app
+    build_app(args)
+
+    # Verify fleet.json was created
+    fleet_json_path = tmp_path / "fleet" / "fleet.json"
+    assert fleet_json_path.exists()
+
+    # Verify registry entry
+    import json
+
+    registry = json.loads(fleet_json_path.read_text(encoding="utf-8"))
+    assert "owner/repo" in registry["repos"]
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root)
+    assert entry["name_with_owner"] == "owner/repo"
 
 
 def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monkeypatch) -> None:

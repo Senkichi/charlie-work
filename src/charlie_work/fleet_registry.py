@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+import json
+import logging
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from .fleet_paths import fleet_dir
+from .github import GitHub, GitHubError
+from .paths import RuntimePaths
+from .state import save_state, state_lock
+
+logger = logging.getLogger(__name__)
+
+FLEET_REGISTRY_VERSION = 1
+
+
+def _empty_registry() -> dict[str, Any]:
+    """Return an empty fleet registry dict."""
+    return {"version": FLEET_REGISTRY_VERSION, "repos": {}}
+
+
+def _load_registry(fleet_json_path: Path) -> dict[str, Any]:
+    """Load the fleet registry from disk, returning an empty registry if missing.
+
+    This is a local loader for fleet.json specifically — it does not use
+    state.load_state because that assumes the state.json schema.
+    """
+    if not fleet_json_path.exists():
+        return _empty_registry()
+    try:
+        with fleet_json_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        # Corrupt registry — start fresh (best-effort, same as state.py)
+        return _empty_registry()
+    if not isinstance(data, dict):
+        return _empty_registry()
+    data.setdefault("version", FLEET_REGISTRY_VERSION)
+    data.setdefault("repos", {})
+    return data
+
+
+def touch_repo(
+    fleet_dir_override: str | None,
+    repo_root: Path,
+    paths: RuntimePaths,
+    gh: GitHub,
+) -> dict[str, Any]:
+    """Register or update a repo in the fleet registry.
+
+    Resolves nameWithOwner via gh repo view, then creates or updates the
+    registry entry with:
+    - repo_root (updated if moved)
+    - name_with_owner (key)
+    - config_path
+    - state_dir
+    - first_seen (set on create only)
+    - last_seen (always bumped)
+
+    If gh repo view fails (offline, not a GitHub repo, gh missing), the
+    registration is silently skipped — the command proceeds normally and
+    the registry is not updated for that invocation (errors-as-values invariant).
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+        repo_root: The repository root path.
+        paths: The RuntimePaths for this repo.
+        gh: The GitHub client instance.
+
+    Returns:
+        The updated registry dict (or the unchanged registry if registration
+        was skipped due to gh error).
+    """
+    # Resolve nameWithOwner — best-effort, skip on failure
+    try:
+        name_with_owner = gh.name_with_owner()
+    except GitHubError as exc:
+        logger.debug(f"Skipping fleet registration: gh repo view failed: {exc}")
+        # Return the current registry unchanged (or empty if missing)
+        fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+        return _load_registry(fleet_json_path)
+
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+
+    # Ensure fleet directory exists before locking
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with state_lock(fleet_json_path):
+        data = _load_registry(fleet_json_path)
+        repos = data.setdefault("repos", {})
+
+        entry = repos.get(name_with_owner, {})
+
+        # Build/update the entry
+        now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        # Preserve first_seen if this is the same repo (same nameWithOwner), even if repo_root changed
+        # This handles the "moved repo" case from the acceptance criteria
+        updated_entry = {
+            "repo_root": str(repo_root),
+            "name_with_owner": name_with_owner,
+            "config_path": str(repo_root / "orchestrator.config.yaml"),
+            "state_dir": str(paths.root),
+            "first_seen": entry.get("first_seen", now) if entry else now,
+            "last_seen": now,
+        }
+
+        repos[name_with_owner] = updated_entry
+        data["repos"] = repos
+
+        return save_state(fleet_json_path, data)
