@@ -13,6 +13,7 @@ from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .cross_family import (
     CrossFamilyResult,
+    extract_head_ref_oid,
     extract_report_body,
     report_body_is_valid,
     run_cross_family_review,
@@ -1290,6 +1291,7 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
+                "cross_family_reused": cf_result.reused if cf_result else None,
                 "label_error": label_error,
             },
         )
@@ -1732,6 +1734,8 @@ class OrchestratorApp:
         # but empty/blocked reports must NOT satisfy this check — reusing them
         # turned one codex timeout and one blocked refusal into a permanent
         # silent skip on every subsequent pass.
+        # Additionally, reports are invalidated when the PR head SHA changes
+        # to prevent reviewing stale code (issue #156).
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
             first_line = text.splitlines()[0]
@@ -1739,7 +1743,13 @@ class OrchestratorApp:
             # model body only, not the wrapper text that itself contains bold
             # markdown ("**leads, not verdicts**").
             body = extract_report_body(text)
-            if "(UNAVAILABLE)" not in first_line and report_body_is_valid(body):
+            stored_head_sha = extract_head_ref_oid(text)
+            current_head_sha = pr.get("headRefOid")
+            if (
+                "(UNAVAILABLE)" not in first_line
+                and report_body_is_valid(body)
+                and stored_head_sha == current_head_sha
+            ):
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )
@@ -1764,6 +1774,7 @@ class OrchestratorApp:
             report_path=report_path,
             timeout_seconds=cfg.timeout_seconds,
             dry_run=self.dry_run,
+            head_ref_oid=pr.get("headRefOid"),
         )
         return self._cross_family_section(result.report_path), result
 
