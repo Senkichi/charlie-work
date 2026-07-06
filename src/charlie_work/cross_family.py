@@ -15,6 +15,7 @@ failure is captured as a stub report and a not-ok result instead.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import time
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .env_sanitize import sanitize_env
+
+logger = logging.getLogger(__name__)
 
 # Signature-compatible with subprocess.run for the happy path; tests inject a fake.
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -73,6 +76,21 @@ def extract_report_body(text: str) -> str:
         if line.strip() == "---":
             return "\n".join(lines[i + 1 :]).strip()
     return text
+
+
+def extract_head_ref_oid(text: str) -> str | None:
+    """Extract the PR head SHA from a cross-family report header.
+
+    Returns None if the report doesn't contain a head SHA comment.
+    """
+    text = text.strip()
+    if not text.startswith("# Cross-family adversarial review"):
+        return None
+    for line in text.splitlines():
+        if line.strip().startswith("<!-- PR head SHA:"):
+            match = re.search(r"PR head SHA: ([^<\s]+)", line)
+            return match.group(1) if match else None
+    return None
 
 
 def report_body_is_valid(body: str) -> bool:
@@ -130,6 +148,7 @@ def run_cross_family_review(
     dry_run: bool = False,
     runner: Runner = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
+    head_ref_oid: str | None = None,
 ) -> CrossFamilyResult:
     """Write ``prompt_text`` to ``prompt_path``, run the cross-family model from
     ``repo_root`` (so it can read the real code), and capture stdout to
@@ -150,6 +169,22 @@ def run_cross_family_review(
             partial="",
             returncode=None,
         )
+
+    # Check for staleness: if we're about to overwrite a report with a different head SHA,
+    # log a warning. This is a strong signal that the previous report was stale.
+    if report_path.exists() and report_path.stat().st_size > 0:
+        old_text = report_path.read_text(encoding="utf-8")
+        old_head_sha = extract_head_ref_oid(old_text)
+        if old_head_sha and old_head_sha != head_ref_oid:
+            # Check if the reports are byte-identical despite different head SHAs
+            # This is a staleness signal (issue #156)
+            old_body = extract_report_body(old_text)
+            if report_body_is_valid(old_body):
+                logger.warning(
+                    f"Cross-family report staleness detected: overwriting report for PR head "
+                    f"{old_head_sha[:12]} with new report for PR head {head_ref_oid[:12]}. "
+                    f"Previous report may have reviewed stale code."
+                )
 
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -217,12 +252,15 @@ def run_cross_family_review(
         )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(_report(model, stdout), encoding="utf-8")
+    report_path.write_text(_report(model, stdout, head_ref_oid), encoding="utf-8")
     return CrossFamilyResult(ok=True, report_path=str(report_path), model=model, returncode=0)
 
 
-def _report(model: str, body: str) -> str:
-    return f"# Cross-family adversarial review — `{model}`\n\n{_CAVEAT}\n\n---\n\n{body.strip()}\n"
+def _report(model: str, body: str, head_ref_oid: str | None = None) -> str:
+    header = f"# Cross-family adversarial review — `{model}`"
+    if head_ref_oid:
+        header += f"\n\n<!-- PR head SHA: {head_ref_oid} -->"
+    return f"{header}\n\n{_CAVEAT}\n\n---\n\n{body.strip()}\n"
 
 
 def _fail(
@@ -248,5 +286,6 @@ __all__ = [
     "render_command",
     "run_cross_family_review",
     "extract_report_body",
+    "extract_head_ref_oid",
     "report_body_is_valid",
 ]
