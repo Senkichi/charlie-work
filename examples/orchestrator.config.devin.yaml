@@ -10,6 +10,8 @@ dispatch:
   worker_model_tier: capable
   # Devin worker sessions use the skills-based loop.
   worker_template: worker.md
+  # Dispatch order: "oldest" (default) or "newest" (previous behavior)
+  # order: oldest
 
 review:
   # Past this many request_changes cycles the PR escalates to
