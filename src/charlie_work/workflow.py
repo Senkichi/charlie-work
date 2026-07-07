@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
+import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -148,6 +150,27 @@ def _detect_stalled_sessions(
     return stalled_entries
 
 
+def _kill_orphan_pid(pid: int) -> None:
+    """Best-effort kill of a single orphan PID, cross-platform.
+
+    Mirrors the OS branch used by kill_process_tree: taskkill on Windows,
+    os.kill(SIGKILL) on POSIX. Never raises - callers treat this as best-effort
+    and always record the PID as killed regardless of outcome.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        # Best-effort kill - don't fail if the kill attempt fails
+        pass
+
+
 def _detect_and_handle_stalled_sessions(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig
 ) -> list[dict[str, int]]:
@@ -190,19 +213,9 @@ def _detect_and_handle_stalled_sessions(
             orphan_pids = sweep_orphan_processes(w.worktree_path)
             if orphan_pids:
                 # Kill detected orphans to prevent them from running rejected code
-                import subprocess
-
                 for orphan_pid in orphan_pids:
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", str(orphan_pid)],
-                            capture_output=True,
-                            text=True,
-                        )
-                        killed_pids.append(orphan_pid)
-                    except (subprocess.SubprocessError, FileNotFoundError):
-                        # Best-effort kill - don't fail if taskkill fails
-                        pass
+                    _kill_orphan_pid(orphan_pid)
+                    killed_pids.append(orphan_pid)
 
             # Mark the sidecar with failure_kind: stalled (adapter-specific dispatch)
             if w.adapter_kind == "devin":
@@ -280,20 +293,10 @@ def _sweep_orphan_processes_for_dead_sessions(
         orphan_pids = sweep_orphan_processes(worktree_path)
         if orphan_pids:
             # Kill detected orphans
-            import subprocess
-
             killed_orphans = []
             for orphan_pid in orphan_pids:
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(orphan_pid)],
-                        capture_output=True,
-                        text=True,
-                    )
-                    killed_orphans.append(orphan_pid)
-                except (subprocess.SubprocessError, FileNotFoundError):
-                    # Best-effort kill - don't fail if taskkill fails
-                    pass
+                _kill_orphan_pid(orphan_pid)
+                killed_orphans.append(orphan_pid)
 
             # Log the event
             with state_lock(state_file):
