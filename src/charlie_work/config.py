@@ -270,6 +270,12 @@ class WatchdogConfig:
         "Error: A tool was rejected",
         "Error: Agent error:",
     )
+    # Wall-clock deadline (absolute age cap) - applies to both adapters
+    wall_clock_minutes: int = 240
+    wall_clock_kill: bool = False
+    # Loop/no-progress detection (Claude Code only) - window = stall_minutes * multiplier
+    loop_stall_multiplier: int = 2
+    loop_kill: bool = False
 
 
 @dataclass(frozen=True)
