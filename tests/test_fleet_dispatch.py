@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from charlie_work.config import ConfigError
+from charlie_work.fleet_dispatch import _extract_attention_events, _select_repos, fleet_loop
+from charlie_work.github import GitHubError
+from charlie_work.workflow import CommandResult
+
+
+def test_select_repos_all_sorted_by_last_seen() -> None:
+    """_select_repos returns all repos sorted by oldest last_seen first."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": "/path/to/repo1",
+                "last_seen": "2026-07-07T10:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": "/path/to/repo2",
+                "last_seen": "2026-07-07T09:00:00Z",  # Oldest
+            },
+            "owner/repo3": {
+                "repo_root": "/path/to/repo3",
+                "last_seen": "2026-07-07T11:00:00Z",
+            },
+        }
+    }
+
+    selected = _select_repos(registry, None)
+
+    assert len(selected) == 3
+    assert selected[0][0] == "owner/repo2"  # Oldest first
+    assert selected[1][0] == "owner/repo1"
+    assert selected[2][0] == "owner/repo3"
+
+
+def test_select_repos_without_last_seen_goes_last() -> None:
+    """Repos without last_seen are sorted last (treated as newest)."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": "/path/to/repo1",
+                "last_seen": "2026-07-07T10:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": "/path/to/repo2",
+                # No last_seen
+            },
+            "owner/repo3": {
+                "repo_root": "/path/to/repo3",
+                "last_seen": "2026-07-07T09:00:00Z",
+            },
+        }
+    }
+
+    selected = _select_repos(registry, None)
+
+    assert len(selected) == 3
+    assert selected[0][0] == "owner/repo3"  # Oldest with last_seen
+    assert selected[1][0] == "owner/repo1"
+    assert selected[2][0] == "owner/repo2"  # No last_seen, goes last
+
+
+def test_select_repos_explicit_subset() -> None:
+    """_select_repos with explicit repos returns exactly that subset in given order."""
+    registry = {
+        "repos": {
+            "owner/repo1": {"repo_root": "/path/to/repo1", "last_seen": "2026-07-07T10:00:00Z"},
+            "owner/repo2": {"repo_root": "/path/to/repo2", "last_seen": "2026-07-07T09:00:00Z"},
+            "owner/repo3": {"repo_root": "/path/to/repo3", "last_seen": "2026-07-07T11:00:00Z"},
+        }
+    }
+
+    selected = _select_repos(registry, ("owner/repo3", "owner/repo1"))
+
+    assert len(selected) == 2
+    assert selected[0][0] == "owner/repo3"  # Explicit order
+    assert selected[1][0] == "owner/repo1"
+
+
+def test_select_repos_explicit_subset_skips_missing() -> None:
+    """_select_repos skips keys that don't exist in the registry."""
+    registry = {
+        "repos": {
+            "owner/repo1": {"repo_root": "/path/to/repo1", "last_seen": "2026-07-07T10:00:00Z"},
+            "owner/repo2": {"repo_root": "/path/to/repo2", "last_seen": "2026-07-07T09:00:00Z"},
+        }
+    }
+
+    selected = _select_repos(registry, ("owner/repo3", "owner/repo1"))
+
+    assert len(selected) == 1
+    assert selected[0][0] == "owner/repo1"  # owner/repo3 doesn't exist, skipped
+
+
+def test_select_repos_empty_registry() -> None:
+    """_select_repos with empty registry returns empty list."""
+    registry = {"repos": {}}
+
+    selected = _select_repos(registry, None)
+
+    assert selected == []
+
+
+def test_extract_attention_events_stalled() -> None:
+    """_extract_attention_events extracts stalled sessions."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [
+                {"session_id": "sess1", "issue_number": 123, "reason": "timeout"},
+                {"session_id": "sess2", "issue_number": 456, "reason": "crash"},
+            ],
+            "errors": [],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    assert len(events) == 2
+    assert events[0]["repo_key"] == "owner/repo1"
+    assert events[0]["type"] == "stalled"
+    assert events[0]["session_id"] == "sess1"
+    assert events[0]["issue_number"] == 123
+    assert events[0]["reason"] == "timeout"
+    assert events[1]["repo_key"] == "owner/repo1"
+    assert events[1]["type"] == "stalled"
+    assert events[1]["session_id"] == "sess2"
+
+
+def test_extract_attention_events_errors() -> None:
+    """_extract_attention_events extracts PR errors."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [
+                {"pr": 789, "error": "merge conflict"},
+                {"pr": 101, "error": "network error"},
+            ],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo2", result)
+
+    assert len(events) == 2
+    assert events[0]["repo_key"] == "owner/repo2"
+    assert events[0]["type"] == "error"
+    assert events[0]["pr"] == 789
+    assert events[0]["error"] == "merge conflict"
+    assert events[1]["repo_key"] == "owner/repo2"
+    assert events[1]["type"] == "error"
+    assert events[1]["pr"] == 101
+
+
+def test_extract_attention_events_health_transitions() -> None:
+    """_extract_attention_events extracts health transitions."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "health_transitions": [
+                {"session_id": "sess1", "from_state": "running", "to_state": "stalled"},
+                {"session_id": "sess2", "from_state": "stalled", "to_state": "running"},
+            ],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo3", result)
+
+    assert len(events) == 2
+    assert events[0]["repo_key"] == "owner/repo3"
+    assert events[0]["type"] == "health_transition"
+    assert events[0]["session_id"] == "sess1"
+    assert events[0]["from_state"] == "running"
+    assert events[0]["to_state"] == "stalled"
+    assert events[1]["repo_key"] == "owner/repo3"
+    assert events[1]["type"] == "health_transition"
+    assert events[1]["session_id"] == "sess2"
+
+
+def test_extract_attention_events_empty() -> None:
+    """_extract_attention_events returns empty list for result with no events."""
+    result = CommandResult(True, "loop complete", {"stalled": [], "errors": []})
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    assert events == []
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_config")
+@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_calls_loop_per_repo(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_find_config_path: MagicMock,
+    mock_load_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop calls app.loop() exactly once per repo with that repo's config."""
+    # Setup registry
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dirs
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # Mock config and paths
+    mock_config = MagicMock()
+    mock_load_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
+
+    # Mock OrchestratorApp instances
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(True, "repo1 loop complete", {})
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Verify loop() was called exactly once per repo
+    assert mock_app1.loop.call_count == 1
+    assert mock_app2.loop.call_count == 1
+
+    # Verify loop() was called with correct args
+    mock_app1.loop.assert_called_once_with(3, merge=True)
+    mock_app2.loop.assert_called_once_with(3, merge=True)
+
+    # Verify result includes both repos
+    assert "repos" in result.data
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_config")
+@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_work_only_calls_dispatch(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_find_config_path: MagicMock,
+    mock_load_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop with work_only=True calls app.dispatch() instead of loop()."""
+    # Setup registry
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dir
+    (tmp_path / "repo1").mkdir()
+
+    # Mock config and paths
+    mock_config = MagicMock()
+    mock_load_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
+
+    # Mock OrchestratorApp
+    mock_app = MagicMock()
+    mock_app.dispatch.return_value = CommandResult(True, "repo1 dispatch complete", {})
+    mock_app_class.return_value = mock_app
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop with work_only=True
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=None,
+        dry_run=False,
+        work_only=True,
+    )
+
+    # Verify dispatch() was called instead of loop()
+    assert mock_app.dispatch.call_count == 1
+    assert mock_app.loop.call_count == 0
+
+    # Verify dispatch() was called with correct args
+    mock_app.dispatch.assert_called_once_with(3)
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_fleet_loop_missing_repo_root_skipped(
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop skips repos with missing repo_root and records failure."""
+    # Setup registry with one missing repo
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "config_path": "orchestrator.config.yaml",
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Run fleet_loop
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Verify result includes the failed repo
+    assert "repos" in result.data
+    assert "owner/repo1" in result.data["repos"]
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    # The message is in the CommandResult, not in the data dict
+    # We check ok=False which indicates failure
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_config")
+@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_github_error_isolated(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_find_config_path: MagicMock,
+    mock_load_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop isolates GitHubError from one repo and continues to others."""
+    # Setup registry with two repos
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dirs
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # Mock config and paths
+    mock_config = MagicMock()
+    mock_load_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
+
+    # Mock OrchestratorApp instances - first one raises GitHubError
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.side_effect = GitHubError("API rate limit exceeded")
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Verify result includes both repos
+    assert "repos" in result.data
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+
+    # Verify first repo failed but second succeeded
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+
+    # Verify overall result is False (one repo failed)
+    assert result.ok is False
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_config")
+@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_dry_run_propagates(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_find_config_path: MagicMock,
+    mock_load_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop with dry_run=True propagates to every GitHub and OrchestratorApp."""
+    # Setup registry
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dir
+    (tmp_path / "repo1").mkdir()
+
+    # Mock config and paths
+    mock_config = MagicMock()
+    mock_load_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
+
+    # Mock OrchestratorApp
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "repo1 loop complete", {})
+    mock_app_class.return_value = mock_app
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop with dry_run=True
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=True,
+        work_only=False,
+    )
+
+    # Verify GitHub was constructed with dry_run=True
+    mock_gh_class.assert_called_once_with(repo_root=tmp_path / "repo1", dry_run=True)
+
+    # Verify OrchestratorApp was constructed with dry_run=True
+    mock_app_class.assert_called_once()
+    call_kwargs = mock_app_class.call_args[1]
+    assert call_kwargs["dry_run"] is True
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_config")
+@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_digest_aggregation(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_find_config_path: MagicMock,
+    mock_load_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop aggregates attention events from all repos into one digest."""
+    # Setup registry
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dirs
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # Mock config and paths
+    mock_config = MagicMock()
+    mock_load_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
+
+    # Mock OrchestratorApp instances with attention events
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(
+        True,
+        "repo1 loop complete",
+        {
+            "stalled": [{"session_id": "sess1", "issue_number": 123, "reason": "timeout"}],
+            "errors": [],
+        },
+    )
+    mock_app2.loop.return_value = CommandResult(
+        True,
+        "repo2 loop complete",
+        {
+            "stalled": [],
+            "errors": [{"pr": 456, "error": "merge conflict"}],
+        },
+    )
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Verify digest includes events from both repos
+    assert "digest" in result.data
+    digest = result.data["digest"]
+    assert "events" in digest
+    assert len(digest["events"]) == 2
+
+    # Verify events are from different repos
+    event_repo_keys = {e["repo_key"] for e in digest["events"]}
+    assert event_repo_keys == {"owner/repo1", "owner/repo2"}
+
+    # Verify orphan_sweep_calls metric is present
+    assert "orphan_sweep_calls" in digest
+    assert digest["orphan_sweep_calls"] == 2  # One per repo
