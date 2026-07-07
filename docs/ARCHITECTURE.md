@@ -66,6 +66,10 @@ should not need to be read to reason about it.
 | `janitor.py` | Deterministic, non-LLM pre-review gate: `run_janitor(pr, checks, config)` returns a `JanitorVerdict` (pass/fail + warnings) by checking draft state, PR/mergeable state, required-checks status, linked-issue presence, non-empty body with a tests/rationale mention, conventional-commit-shaped title (warning only), and oversized-diff size (warning only). Pure function — no I/O, no `gh` calls; the caller feeds it data it already fetched. `review()` calls it **before** any packet or cross-family spend and short-circuits a failing PR to `janitor_blocked`. |
 | `reconcile.py` | Drift detection between GitHub's actual state and the orchestrator's recorded state — e.g. a PR merged outside `merge_ready()` whose issue is still labeled `agent:in-progress`. `detect_drift()` is read-only (two `gh` list calls, zero mutations); `apply_fixes()` returns a *new* state and repairs labels via `labels.transition`. Surfaced as `charlie mop-up [--fix]` (read-only without `--fix`). |
 | `prompt_sections.py` | Shared worker-prompt partials: `section_variables(search_dirs)` discovers every `*.md` file under a `worker_sections/` directory (package default `prompts/worker_sections/`, e.g. `scope_contract.md`, `issue_metadata.md`) and exposes each as a `section_<stem>` template value — repo-local `<search_dir>/worker_sections/` wins over the package default per filename, mirroring `prompts.resolve_template`. No section names are hardcoded; the available set is whatever `*.md` files exist on disk. `render_prompt()` folds these in and runs a two-pass substitution so section text carrying its own `$placeholders` resolves. |
+| `worker.py` | Adapter-agnostic worker abstraction: `WorkerView` (frozen dataclass) provides a unified shape for worker records across all adapters (devin-shell, claude-code). `iter_workers()` reads every devin-shell + claude-code sidecar in sessions_dir and returns a unified, adapter-tagged list. `update_worker_log_stat()` refreshes last_activity_at and log_bytes fields from a fresh stat() of the log file. This collapses duplicated adapter-iteration loops in workflow.py into a single abstraction point for fleet supervision. |
+| `fleet_paths.py` | Platform-specific fleet directory resolution: `fleet_dir()` returns the user-level fleet directory (`%LOCALAPPDATA%\charlie-work\` on Windows, `${XDG_STATE_HOME:-~/.local/state}/charlie-work/` on POSIX). Supports override via `CHARLIE_WORK_FLEET_DIR` env var or explicit parameter for test isolation. |
+| `fleet_registry.py` | Fleet registry management: `touch_repo()` registers or updates a repo in fleet.json (resolves nameWithOwner via gh repo view, stores repo_root, config_path, state_dir, first_seen/last_seen). `count_fleet_live_sessions()` counts live worker sessions across all registered repos using the adapter-agnostic `iter_workers()` from worker.py. Tolerates vanished/moved repo dirs by skipping them and returning a list of skipped repo keys. |
+| `global_config.py` | Layered config loading: `load_layered_config()` loads config with a global fleet layer and per-repo override. Global config (if present) at `<fleet_dir>/config.yaml` supplies fleet-wide defaults; the per-repo orchestrator.config.yaml wins on any key present in both. Merge happens at the raw YAML dict level before validation, so unknown keys in the global file raise ConfigError exactly like unknown keys in the per-repo file. |
 
 ## Label state machine
 
@@ -313,6 +317,36 @@ All four are routed by `adapters.dispatch_sessions` from a single
 `AdapterSettings` the workflow resolves. Only adapters that actually launch a
 worker (`command`/`devin-shell`/`claude-code`) promote the issue to
 `agent:in-progress`; a launched worker is recorded in `state.json` **before**
-the label write, so a failed label call can never orphan it into a
-re-dispatchable state. Probe the configured adapter's CLI and surface
-stale/failed sessions with `charlie doctor --adapter-probe`.
+
+## Supervisor and fleet reconciliation
+
+The fleet-management design adds two architectural layers for multi-repo
+coordination and worker health supervision. Neither is a daemon — both are
+invoke-per-pass, matching the hub-and-spoke model.
+
+**Per-repo supervisor sweep**: The supervisor layer (per-worker health
+classification, tripwires, and restart-intensity escalation) runs as a sweep
+nested inside the existing intake→dispatch→review→merge pass. It classifies
+worker health using the adapter-agnostic `WorkerView` abstraction from
+`worker.py`, applies tripwires (liveness, staleness, terminal-marker,
+wall-clock, cost, loop, orphan), and escalates to `agent:human-needed` when
+the restart-intensity cap is exceeded. This generalizes the shipped
+stalled-session watchdog (#109/#136) that already runs unconditionally inside
+`dispatch()`'s real-dispatch branch.
+
+**Fleet layer composition**: The fleet layer composes N per-repo passes under one
+global budget via `fleet.global_max_concurrent_sessions`. The registry
+(`fleet_registry.py`) tracks registered repos by `nameWithOwner`, and the
+global config layer (`global_config.py`) merges fleet-wide defaults with
+per-repo overrides. The governor `_apply_concurrency_governor()` in
+`workflow.py` applies both the per-repo `dispatch.max_concurrent_sessions` cap
+and the fleet-global cap at every dispatch path. Fleet-level commands
+(`charlie fleet status`) aggregate status across all registered repos by
+iterating over the registry and calling `OrchestratorApp.status()` per repo
+with `dry_run=True`.
+
+**Two-reconciler-at-two-scopes**: The architecture maintains two reconcilers at
+two scopes — the per-repo supervisor sweep (nested inside each repo's pass) and
+the fleet layer (composing N per-repo passes under one global budget). Neither
+is a daemon; both are invoke-per-pass, and detection latency equals invocation
+cadence.
