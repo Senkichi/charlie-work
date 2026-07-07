@@ -5,7 +5,6 @@ import os
 import subprocess
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +80,7 @@ def _webhook_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
             if 200 <= response.status < 300:
                 return NotifyResult(ok=True)
             else:
-                return NotifyResult(
-                    ok=False, error=f"webhook returned status {response.status}"
-                )
+                return NotifyResult(ok=False, error=f"webhook returned status {response.status}")
     except urllib.error.URLError as e:
         return NotifyResult(ok=False, error=f"webhook URL error: {e}")
     except (OSError, TimeoutError) as e:
@@ -189,7 +186,7 @@ def _shell_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                         "pid": e.pid,
                     }
                     for e in digest.transitions
-                ]
+                ],
             }
         )
 

@@ -514,7 +514,6 @@ def _build_attention_digest(
                 issue_number: {
                     "adapter_kind": str,
                     "health": str,  # current health (e.g., "STALLED", "RUNAWAY", "DEAD")
-                    "previous_health": str | None,
                     "last_log_line": str | None,
                     "pid": int | None,
                 }
@@ -539,7 +538,6 @@ def _build_attention_digest(
 
         for issue_number, transition in health_transitions.items():
             current_health = transition["health"]
-            previous_health = transition.get("previous_health")
 
             # Read the last persisted health for this issue
             issue_key = str(issue_number)
@@ -1272,7 +1270,6 @@ class OrchestratorApp:
                 health_transitions[entry["issue"]] = {
                     "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
                     "health": "STALLED",
-                    "previous_health": None,
                     "last_log_line": None,
                     "pid": entry.get("pid"),
                 }
@@ -2163,7 +2160,6 @@ class OrchestratorApp:
             health_transitions[entry["issue"]] = {
                 "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
                 "health": "STALLED",
-                "previous_health": None,
                 "last_log_line": None,
                 "pid": entry.get("pid"),
             }
@@ -2611,7 +2607,6 @@ class OrchestratorApp:
                 health_transitions[entry["issue"]] = {
                     "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
                     "health": "STALLED",
-                    "previous_health": None,
                     "last_log_line": None,
                     "pid": entry.get("pid"),
                 }

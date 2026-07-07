@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -91,9 +90,7 @@ def test_emit_digest_webhook_success_and_failure():
 
 def test_emit_digest_shell_sink_nonzero_exit_is_not_ok():
     """Fake subprocess.run returning a non-zero code yields ok=False without raising."""
-    config = NotifyConfig(
-        enabled=True, sink="shell", shell_command=("echo",)
-    )
+    config = NotifyConfig(enabled=True, sink="shell", shell_command=("echo",))
     digest = AttentionDigest(
         generated_at="2026-07-07T00:00:00Z",
         repo="test-repo",
@@ -200,7 +197,9 @@ def test_emit_digest_never_raises_on_any_sink_exception():
     )
 
     # Test file sink with exception (simulate write failure)
-    config = NotifyConfig(enabled=True, sink="file", file_path="C:\\nonexistent\\path\\digest.jsonl")
+    config = NotifyConfig(
+        enabled=True, sink="file", file_path="C:\\nonexistent\\path\\digest.jsonl"
+    )
     result = _file_sink(config, digest)
     # On Windows, this might succeed if the parent directory can be created, so we just check it doesn't raise
     # The key invariant is that it never raises
@@ -279,7 +278,6 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
         1: {
             "adapter_kind": "claude-code",
             "health": "STALLED",
-            "previous_health": None,
             "last_log_line": "error: stuck",
             "pid": 12345,
         }
@@ -310,7 +308,6 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
         1: {
             "adapter_kind": "claude-code",
             "health": "STALLED",
-            "previous_health": None,
             "last_log_line": "error: stuck",
             "pid": 12345,
         }
@@ -330,7 +327,6 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
         1: {
             "adapter_kind": "claude-code",
             "health": "DEAD",
-            "previous_health": "STALLED",
             "last_log_line": "process exited",
             "pid": 12345,
         }
@@ -353,14 +349,9 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
     assert state["issues"]["1"]["health"] == "DEAD"
 
 
-def test_loop_completes_when_notify_sink_fails(tmp_path):
+def test_loop_completes_when_notify_sink_fails():
     """Integration-style: stub a failing sink into a loop() call with a synthetic stalled session,
     assert the CommandResult still reflects the dispatch/review/merge outcome (notify failure isolated)."""
-    from charlie_work.config import OrchestratorConfig
-    from charlie_work.github import GitHub
-    from charlie_work.paths import RuntimePaths
-    from charlie_work.workflow import OrchestratorApp
-
     # This is a minimal integration test - we'll mock the notify emit to fail
     # and verify loop still completes. Full integration would require setting up
     # a full repo with issues, PRs, etc., which is beyond the scope of this test.
