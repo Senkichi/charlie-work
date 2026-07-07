@@ -7,6 +7,7 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
@@ -17,12 +18,37 @@ from .claude_code import (
     is_worker_alive,
     read_worker_records,
 )
+from .config import OrchestratorConfig
 from .devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
     is_session_alive,
     read_session_records,
 )
+
+
+class WorkerHealth(Enum):
+    """Health status of a worker session.
+
+    This enum provides a closed set of health states that the supervisor can use
+    to classify worker sessions. It unifies liveness, staleness, and terminal-marker
+    signals into a single classification point.
+
+    Signal → verdict, first-to-fire-wins order:
+    1. liveness → DEAD
+    2. terminal marker → DEAD
+    3. progress staleness → STALLED
+    4. (none of the above) → HEALTHY
+
+    SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
+    """
+
+    HEALTHY = "healthy"
+    SLOW = "slow"  # Reserved for #162 (wall-clock/loop tripwires)
+    STALLED = "stalled"
+    RUNAWAY = "runaway"  # Reserved for #162/#163 (cost/token tripwires)
+    DEAD = "dead"
+    ORPHANED = "orphaned"  # Reserved for B6a (sidecar dead/non-live but process still references worktree)
 
 
 @dataclass(frozen=True)
@@ -133,6 +159,70 @@ class WorkerView:
         except OSError:
             # Best-effort cleanup - don't fail if unlink fails
             pass
+
+
+def classify_worker_health(
+    view: WorkerView, config: OrchestratorConfig, now: datetime
+) -> WorkerHealth:
+    """Classify a worker's health based on liveness, staleness, and terminal markers.
+
+    This is a pure function that takes a pre-fetched WorkerView and config and returns
+    a WorkerHealth enum. It performs no I/O beyond what WorkerView.log_stat() already
+    captured this pass, and has no side effects.
+
+    Signal → verdict, first-to-fire-wins order:
+    1. liveness → DEAD
+    2. terminal marker → DEAD
+    3. progress staleness → STALLED
+    4. (none of the above) → HEALTHY
+
+    Args:
+        view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
+        config: OrchestratorConfig containing watchdog settings
+        now: Current datetime for staleness calculation
+
+    Returns:
+        WorkerHealth enum member indicating the worker's health status
+    """
+    from datetime import UTC, timedelta
+
+    # Signal 1: liveness
+    if not view.is_alive():
+        return WorkerHealth.DEAD
+
+    # Signal 2: terminal marker
+    log_path = Path(view.log_path)
+    terminal_error_markers = config.watchdog.terminal_error_markers
+
+    # Check for terminal error markers in the log
+    has_terminal_error = False
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        lines = log_text.splitlines()
+        if lines:
+            last_log_line = lines[-1].strip()
+            for pattern in terminal_error_markers:
+                if pattern in last_log_line:
+                    has_terminal_error = True
+                    break
+    except OSError:
+        pass
+
+    if has_terminal_error:
+        return WorkerHealth.DEAD
+
+    # Signal 3: progress staleness
+    log_stat = view.log_stat()
+    if log_stat is not None:
+        log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+        age = now - log_mtime
+        is_stalled_by_mtime = age > timedelta(minutes=config.watchdog.stall_minutes)
+
+        if is_stalled_by_mtime:
+            return WorkerHealth.STALLED
+
+    # Signal 4: (none of the above)
+    return WorkerHealth.HEALTHY
 
 
 def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
@@ -258,7 +348,9 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
 
 
 __all__ = [
+    "WorkerHealth",
     "WorkerView",
+    "classify_worker_health",
     "iter_workers",
     "update_worker_log_stat",
 ]
