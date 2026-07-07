@@ -756,7 +756,9 @@ class OrchestratorApp:
 
         worker_views = list(iter_workers(sessions_dir))
         workers = [
-            self._summarize_worker(view, classify_worker_health(view, self.config, datetime.now(UTC)))
+            self._summarize_worker(
+                view, classify_worker_health(view, self.config, datetime.now(UTC))
+            )
             for view in worker_views
             if view.is_alive()
         ]
