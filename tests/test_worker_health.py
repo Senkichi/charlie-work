@@ -487,9 +487,7 @@ def test_classify_worker_health_no_events_file_devin(tmp_path: Path) -> None:
     )
 
     with patch("charlie_work.worker.is_session_alive", return_value=True):
-        config = OrchestratorConfig(
-            watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10)
-        )
+        config = OrchestratorConfig(watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         # Should be HEALTHY because the tripwire doesn't fire for devin
@@ -519,9 +517,7 @@ def test_classify_worker_health_no_events_file_claude(tmp_path: Path) -> None:
     )
 
     with patch("charlie_work.worker.is_worker_alive", return_value=True):
-        config = OrchestratorConfig(
-            watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10)
-        )
+        config = OrchestratorConfig(watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         # Should be HEALTHY because the tripwire doesn't fire when events file is missing
