@@ -198,7 +198,7 @@ def _detect_and_handle_stalled_sessions(
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
-    from .worker import iter_workers
+    from .worker import iter_workers, update_worker_log_stat
 
     if not config.watchdog.enabled:
         return []
@@ -212,6 +212,9 @@ def _detect_and_handle_stalled_sessions(
 
         if not w.is_alive():
             continue
+
+        # Update log stat fields for progress tracking
+        update_worker_log_stat(sessions_dir, w)
 
         log_path = Path(w.log_path)
         is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
@@ -266,7 +269,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
-    from .worker import iter_workers
+    from .worker import iter_workers, update_worker_log_stat
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -285,6 +288,9 @@ def _classify_dead_sessions_and_update_throttle_state(
 
     for w in iter_workers(sessions_dir):
         if w.error is None and not w.is_alive():
+            # Update log stat fields for progress tracking (final update before classification)
+            update_worker_log_stat(sessions_dir, w)
+
             # Session exited without error - classify the failure (adapter-specific dispatch)
             if w.adapter_kind == "devin":
                 failure_kind, throttled_until = update_session_record_with_failure_classification(
@@ -413,6 +419,7 @@ class OrchestratorApp:
             materialize_dirs=self.config.dispatch.materialize_dirs,
             dry_run=self.dry_run,
             base_ref=self.config.dispatch.base_ref,
+            tee_stream_json=claude.tee_stream_json,
         )
 
     def _apply_concurrency_governor(

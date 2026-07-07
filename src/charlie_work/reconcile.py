@@ -198,12 +198,15 @@ def detect_drift(
     if repo_root is not None:
         from .claude_code import update_worker_record_with_failure_classification
         from .devin_shell import update_session_record_with_failure_classification
-        from .worker import iter_workers
+        from .worker import iter_workers, update_worker_log_stat
 
         sessions_dir = repo_root / config.devin.sessions_dir
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
                 if w.error is None and not w.is_alive():
+                    # Update log stat fields for progress tracking (final update before classification)
+                    update_worker_log_stat(sessions_dir, w)
+
                     # Session exited without error - classify the failure (adapter-specific dispatch)
                     if w.adapter_kind == "devin":
                         failure_kind, throttled_until = (
