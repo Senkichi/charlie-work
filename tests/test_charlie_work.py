@@ -1669,6 +1669,9 @@ class FakeGitHub:
         self.labels_removed.append((number, label))
         return True
 
+    def name_with_owner(self) -> str:
+        return "test-owner/test-repo"
+
     def merge_pr(
         self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
     ) -> str:
@@ -9555,6 +9558,179 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     assert isinstance(result.data["stalled"], list)
     assert any(entry["issue"] == 109 for entry in result.data["stalled"])
     assert any(entry["pid"] == 99999 for entry in result.data["stalled"])
+
+
+def test_status_includes_workers_section(tmp_path: Path) -> None:
+    """Issue #167: status (roll-call) should include workers section with health classification."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub
+    class FakeGitHubWithWorkers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubWithWorkers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a fake live session sidecar
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a log file with recent mtime (not stalled)
+    log_file = sessions_dir / "issue-167.log"
+    log_file.write_text("working on issue\n", encoding="utf-8")
+
+    # Create a sidecar with a fake PID
+    sidecar = sessions_dir / "issue-167.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 167,
+                "branch": "agent/issue-167",
+                "worktree_path": "/fake/path",
+                "prompt_path": "/fake/prompt",
+                "command": ["devin", "--print"],
+                "pid": 12345,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_file),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Mock is_session_alive to return True for PID 12345
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        result = app.status()
+
+    # Check that workers section is present
+    assert "workers" in result.data
+    assert isinstance(result.data["workers"], list)
+    assert len(result.data["workers"]) == 1
+
+    # Check worker entry has required fields
+    worker = result.data["workers"][0]
+    assert worker["issue"] == 167
+    assert worker["adapter"] == "devin"
+    assert worker["repo"] == "test-owner/test-repo"
+    assert "health" in worker
+    assert "runtime_seconds" in worker
+    assert "last_activity_at" in worker
+    assert worker["tool_calls"] is None  # Devin has no structured stream
+    assert worker["tokens"] is None
+    assert worker["cost_usd"] is None
+
+
+def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
+    """Issue #167: workers section should be empty list when no live sessions exist."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.status()
+
+    # Check that workers section is present but empty
+    assert "workers" in result.data
+    assert isinstance(result.data["workers"], list)
+    assert len(result.data["workers"]) == 0
+
+
+def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
+    """Issue #167: stalled section should remain byte-for-byte identical to pre-change output."""
+    from datetime import UTC, datetime, timedelta
+    import os
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub with a ready issue
+    class FakeGitHubWithStalled(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 109,
+                    "title": "Test issue",
+                    "url": "https://example.test/issues/109",
+                    "body": "Test body",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "OPEN",
+                },
+            ]
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubWithStalled()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a fake stalled session sidecar
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a log file with old mtime (stalled by time)
+    log_file = sessions_dir / "issue-109.log"
+    log_file.write_text("working on issue\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    os.utime(log_file, (timestamp, timestamp))
+
+    # Create a sidecar with a fake PID
+    sidecar = sessions_dir / "issue-109.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 109,
+                "branch": "agent/issue-109",
+                "worktree_path": "/fake/path",
+                "prompt_path": "/fake/prompt",
+                "command": ["devin", "--print"],
+                "pid": 99999,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_file),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Mock is_session_alive to return True for PID 99999 so detection runs
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        result = app.status()
+
+    # Check that stalled section is unchanged (byte-for-byte identical shape)
+    assert "stalled" in result.data
+    assert isinstance(result.data["stalled"], list)
+    assert any(entry["issue"] == 109 for entry in result.data["stalled"])
+    assert any(entry["pid"] == 99999 for entry in result.data["stalled"])
+    # Ensure no extra fields were added to stalled entries
+    for entry in result.data["stalled"]:
+        assert set(entry.keys()) == {"issue", "pid"}
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:

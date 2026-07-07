@@ -233,6 +233,23 @@ class WorkerView:
             # Best-effort cleanup - don't fail if unlink fails
             pass
 
+    def runtime_seconds(self) -> float:
+        """Calculate runtime in seconds from started_at to now.
+
+        Returns the elapsed time since the worker started. If started_at is invalid
+        or cannot be parsed, returns 0.0.
+        """
+        from datetime import UTC
+
+        try:
+            started_at = datetime.fromisoformat(self.started_at)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            now = datetime.now(UTC)
+            return (now - started_at).total_seconds()
+        except (ValueError, TypeError):
+            return 0.0
+
 
 def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
     """Extract the timestamp of the last tool_call event from an events.jsonl file.

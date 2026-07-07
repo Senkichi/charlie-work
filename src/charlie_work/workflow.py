@@ -751,6 +751,16 @@ class OrchestratorApp:
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
 
+        # Build workers list with health classification
+        from .worker import classify_worker_health, iter_workers
+
+        worker_views = list(iter_workers(sessions_dir))
+        workers = [
+            self._summarize_worker(view, classify_worker_health(view, self.config, datetime.now(UTC)))
+            for view in worker_views
+            if view.is_alive()
+        ]
+
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -776,6 +786,7 @@ class OrchestratorApp:
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
             "stalled": stalled_entries,
+            "workers": workers,
         }
         return CommandResult(True, "status complete", data)
 
@@ -2973,6 +2984,64 @@ class OrchestratorApp:
             "head": pr.get("headRefName"),
             "is_draft": pr.get("isDraft"),
             "reviewDecision": pr.get("reviewDecision"),
+        }
+
+    def _summarize_worker(self, view, health) -> dict[str, Any]:
+        """Summarize a worker's state for the status() workers list.
+
+        Args:
+            view: WorkerView with worker state
+            health: WorkerHealth enum value from classify_worker_health
+
+        Returns:
+            Dict with worker summary fields for status() JSON output
+        """
+        from .claude_code import _events_path, parse_claude_events
+
+        # Resolve repo_key: use view.repo_key if present, otherwise fall back to gh.name_with_owner()
+        # This handles both fleet mode (repo_key populated by iter_workers) and single-repo mode
+        repo = view.repo_key
+        if not repo:
+            try:
+                repo = self.gh.name_with_owner()
+            except GitHubError:
+                # If gh fails, use a fallback to avoid breaking status()
+                repo = "unknown"
+
+        # Parse tool calls and usage for Claude Code sessions
+        tool_calls = None
+        tokens = None
+        cost_usd = None
+
+        if view.adapter_kind == "claude-code":
+            # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
+            sessions_dir = Path(view.log_path).parent
+            events_path = _events_path(sessions_dir, view.issue_number)
+            progress = parse_claude_events(events_path)
+            if progress is not None:
+                tool_calls = progress.tool_call_count
+                tokens = progress.tokens
+                cost_usd = progress.cost_usd
+        # For devin sessions, these fields remain None (no structured stream)
+
+        # Calculate budget remaining (if configured)
+        budget_remaining = None
+        if tokens is not None and self.config.watchdog.token_budget is not None:
+            budget_remaining = max(0, self.config.watchdog.token_budget - tokens)
+        elif cost_usd is not None and self.config.watchdog.cost_budget_usd is not None:
+            budget_remaining = max(0, self.config.watchdog.cost_budget_usd - cost_usd)
+
+        return {
+            "repo": repo,
+            "issue": view.issue_number,
+            "adapter": view.adapter_kind,
+            "health": health.value,
+            "runtime_seconds": view.runtime_seconds(),
+            "last_activity_at": view.last_activity_at,
+            "tool_calls": tool_calls,
+            "tokens": tokens,
+            "cost_usd": cost_usd,
+            "budget_remaining": budget_remaining,
         }
 
     @staticmethod
