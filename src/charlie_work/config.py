@@ -264,10 +264,18 @@ class WatchdogConfig:
 
     enabled: bool = True
     stall_minutes: int = 20
+    redispatch_window_minutes: int = 240
+    max_auto_redispatch: int = 3
     terminal_error_markers: tuple[str, ...] = (
         "Error: A tool was rejected",
         "Error: Agent error:",
     )
+    # Wall-clock deadline (absolute age cap) - applies to both adapters
+    wall_clock_minutes: int = 240
+    wall_clock_kill: bool = False
+    # Loop/no-progress detection (Claude Code only) - window = stall_minutes * multiplier
+    loop_stall_multiplier: int = 2
+    loop_kill: bool = False
     # Cost/token budget tripwire (issue #163). None/0 = disabled.
     # When enabled, checks cumulative usage from Claude Code's tee'd events.jsonl.
     cost_budget_usd: float | None = None
