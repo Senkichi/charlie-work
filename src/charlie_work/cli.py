@@ -9,9 +9,10 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
-from .config import ConfigError, find_config_path
+from .config import ConfigError, find_config_path, load_config
 from .doctor import run_doctor
-from .fleet_registry import touch_repo
+from .fleet_paths import fleet_dir
+from .fleet_registry import _load_registry, touch_repo
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
@@ -114,6 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
     loop_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
     loop.set_defaults(merge=None)
 
+    fleet = subparsers.add_parser("fleet")
+    fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
+    fleet_sub.add_parser("status")
+
     return parser
 
 
@@ -147,6 +152,45 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
         else f"doctor: {len(failed)} finding(s), at least one blocking"
     )
     return CommandResult(ok, message, {"checks": [check.to_dict() for check in checks]})
+
+
+def run_fleet_status(args: argparse.Namespace) -> CommandResult:
+    """Run fleet status aggregation across all registered repos.
+
+    This is a read-only command that:
+    - Loads the fleet registry from fleet.json
+    - For each registered repo, calls OrchestratorApp.status() with dry_run=True
+    - Aggregates results keyed by repo_key (nameWithOwner)
+    - Isolates per-repo errors (missing/broken repos) without aborting the whole aggregation
+
+    Note: This command does not include per-worker health fields yet. That will be added
+    in a follow-up issue (#167) once the worker health abstraction lands.
+    """
+    fleet_json_path = fleet_dir() / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    per_repo: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+
+    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+        try:
+            repo_root = Path(entry.get("repo_root"))
+            if not repo_root.exists():
+                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+
+            config = load_config(find_config_path(repo_root, None))
+            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            gh = GitHub(repo_root=repo_root, dry_run=True)
+            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
+            result = app.status()
+            per_repo[repo_key] = result.data
+        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
+            errors.append({"repo_key": repo_key, "error": str(exc)})
+
+    return CommandResult(
+        ok=not errors,
+        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        data={"repos": per_repo, "errors": errors},
+    )
 
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
@@ -198,6 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             result = run_doctor_command(args)
+        elif args.command == "fleet":
+            if args.fleet_command == "status":
+                result = run_fleet_status(args)
+            else:
+                result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -216,5 +265,25 @@ def main(argv: list[str] | None = None) -> int:
     except yaml.YAMLError as exc:
         print(f"YAML error: {exc}", file=sys.stderr)
         return 2
-    print_result(result, json_output=args.json_output)
+
+    # Custom human-readable rendering for fleet status
+    if args.command == "fleet" and args.fleet_command == "status" and not json_output:
+        print(result.message)
+        repos = result.data.get("repos", {})
+        for repo_key, repo_data in sorted(repos.items()):
+            ready = repo_data.get("ready_issue_count", 0)
+            active = repo_data.get("active_issue_count", 0)
+            blocked = len(repo_data.get("blocked", []))
+            stalled = len(repo_data.get("stalled", []))
+            print(
+                f"  {repo_key}: {ready} ready, {active} active, {blocked} blocked, {stalled} stalled"
+            )
+        errors = result.data.get("errors", [])
+        if errors:
+            print("Errors:")
+            for error in errors:
+                print(f"  {error['repo_key']}: {error['error']}")
+    else:
+        print_result(result, json_output=args.json_output)
+
     return 0 if result.ok else 1

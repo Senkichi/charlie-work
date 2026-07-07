@@ -78,6 +78,8 @@ class ClaudeWorkerRecord:
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
+    last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
+    log_bytes: int | None = None  # log_path.stat().st_size
 
     @property
     def ok(self) -> bool:
@@ -104,6 +106,8 @@ class ClaudeWorkerRecord:
             failure_kind=payload.get("failure_kind"),
             process_start_time=payload.get("process_start_time"),
             reclaimed=payload.get("reclaimed"),
+            last_activity_at=payload.get("last_activity_at"),
+            log_bytes=payload.get("log_bytes"),
         )
 
 
@@ -114,6 +118,103 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
 def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
     suffix = "-rework.claude.log" if rework else ".claude.log"
     return sessions_dir / f"issue-{issue_number}{suffix}"
+
+
+def _events_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+    """Path to the structured events.jsonl file for Claude Code stream-json output.
+
+    This file is created only when tee_stream_json is enabled. It contains
+    structured JSONL events from Claude Code's --output-format stream-json mode,
+    enabling downstream parsing of tool_call_count, turn_count, tokens, and cost_usd.
+    """
+    suffix = "-rework.events.jsonl" if rework else ".events.jsonl"
+    return sessions_dir / f"issue-{issue_number}{suffix}"
+
+
+@dataclass(frozen=True)
+class ClaudeProgress:
+    """Progress metrics parsed from Claude Code's stream-json events.
+
+    This dataclass holds cumulative counts and usage metrics extracted from
+    the events.jsonl file produced when tee_stream_json is enabled.
+    """
+
+    tool_call_count: int = 0
+    turn_count: int = 0
+    tokens: int | None = None
+    cost_usd: float | None = None
+
+
+def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
+    """Parse Claude Code's stream-json events file and extract progress metrics.
+
+    Reads the events.jsonl file line-by-line, accumulating tool_call_count and
+    turn_count, and taking the last-seen cumulative usage fields (tokens, cost_usd).
+
+    Tolerates partial/incomplete final lines (file is being appended to live).
+    Malformed/unparseable lines are skipped, not raised.
+
+    Returns None if the file doesn't exist (devin workers, or claude workers
+    launched without the tee_stream_json flag) — absence is a valid, non-error state.
+
+    Args:
+        events_path: Path to the events.jsonl file
+
+    Returns:
+        ClaudeProgress with accumulated metrics, or None if file doesn't exist
+    """
+    if not events_path.exists():
+        return None
+
+    tool_call_count = 0
+    turn_count = 0
+    tokens = None
+    cost_usd = None
+
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines
+                    continue
+
+                if not isinstance(event, dict):
+                    continue
+
+                # Count tool calls
+                if event.get("type") == "tool_call":
+                    tool_call_count += 1
+
+                # Count turns (user/assistant exchanges)
+                if event.get("type") in ("user_message", "assistant_message"):
+                    turn_count += 1
+
+                # Extract cumulative usage fields (take last-seen value)
+                if "tokens" in event and isinstance(event["tokens"], int):
+                    tokens = event["tokens"]
+                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+                    cost_usd = float(event["cost_usd"])
+
+    except OSError:
+        # File read error - treat as no progress data
+        return None
+
+    # If we parsed no valid events, return None
+    if tool_call_count == 0 and turn_count == 0 and tokens is None and cost_usd is None:
+        return None
+
+    return ClaudeProgress(
+        tool_call_count=tool_call_count,
+        turn_count=turn_count,
+        tokens=tokens,
+        cost_usd=cost_usd,
+    )
 
 
 def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
@@ -231,6 +332,7 @@ def launch_claude_worker(
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
+    tee_stream_json: bool = False,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -306,6 +408,13 @@ def launch_claude_worker(
         )
         return _write_record(sessions_dir, record)
 
+    # If tee_stream_json is enabled, extend the command with --output-format stream-json
+    # and set up a tee to write to both plaintext log and events file
+    events_path = None
+    if tee_stream_json:
+        command = command + ("--output-format", "stream-json")
+        events_path = _events_path(sessions_dir, issue_number, rework=rework)
+
     feed_stdin = "{prompt_path}" not in "".join(command_template)
     # Workers inherit the orchestrator's environment, with config-provided
     # overrides merged on top — e.g. PYTEST_XDIST_AUTO_NUM_WORKERS to bound a
@@ -320,30 +429,94 @@ def launch_claude_worker(
     }
 
     try:
-        with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+        # If tee_stream_json is enabled, we need to tee stdout to both log and events file
+        # Use subprocess.PIPE and a thread to write to both files
+        if tee_stream_json and events_path:
+            # Open handles without 'with' blocks - the thread will manage their lifecycle
+            # This is necessary because the thread runs as a daemon and must keep handles
+            # open for the entire worker lifetime, not just during launch
+            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
+            events_handle = events_path.open("w", encoding="utf-8", errors="replace")
+
             if feed_stdin:
-                with prompt_path.open("r", encoding="utf-8") as prompt_handle:
+                prompt_handle = prompt_path.open("r", encoding="utf-8")
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(worktree.path),
+                    stdin=prompt_handle,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=worker_env,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                    text=True,  # Ensure text mode for line-by-line processing
+                )
+                prompt_handle.close()
+            else:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(worktree.path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=worker_env,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                    text=True,  # Ensure text mode for line-by-line processing
+                )
+
+            # Start a thread to tee output to both files
+            def _tee_output():
+                try:
+                    for line in process.stdout:
+                        log_handle.write(line)
+                        log_handle.flush()
+                        events_handle.write(line)
+                        events_handle.flush()
+                except Exception:
+                    # Thread dies if process terminates or pipe breaks
+                    pass
+                finally:
+                    # Close handles when thread exits
+                    try:
+                        log_handle.close()
+                    except Exception:
+                        pass
+                    try:
+                        events_handle.close()
+                    except Exception:
+                        pass
+
+            import threading
+
+            tee_thread = threading.Thread(target=_tee_output, daemon=True)
+            tee_thread.start()
+        else:
+            # Original behavior: direct stdout to log file
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
+                if feed_stdin:
+                    with prompt_path.open("r", encoding="utf-8") as prompt_handle:
+                        process = subprocess.Popen(
+                            command,
+                            cwd=str(worktree.path),
+                            stdin=prompt_handle,
+                            stdout=log_handle,
+                            stderr=subprocess.STDOUT,
+                            env=worker_env,
+                            creationflags=_CREATE_NEW_PROCESS_GROUP,
+                            start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                        )
+                else:
                     process = subprocess.Popen(
                         command,
                         cwd=str(worktree.path),
-                        stdin=prompt_handle,
+                        stdin=subprocess.DEVNULL,
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
                         creationflags=_CREATE_NEW_PROCESS_GROUP,
                         start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
-            else:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(worktree.path),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    env=worker_env,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP,
-                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
-                )
     except OSError as exc:
         remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         record = _error_record(
@@ -616,4 +789,7 @@ __all__ = [
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
     "_sidecar_path",
+    "ClaudeProgress",
+    "parse_claude_events",
+    "_events_path",
 ]

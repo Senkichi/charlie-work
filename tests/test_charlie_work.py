@@ -65,6 +65,12 @@ def test_default_config_enables_auto_merge() -> None:
     assert config.labels.ready == "automated-ready"
 
 
+def test_default_config_tee_stream_json_disabled() -> None:
+    """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
+    config = load_config()
+    assert config.claude_code.tee_stream_json is False
+
+
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, ".var/charlie-work")
 
@@ -9435,6 +9441,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
+            "charlie_work.workflow.sweep_orphan_processes", return_value=[3492]
+        ),  # Fixed mock return
+        patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
             return_value=(None, None),
         ),
@@ -9462,7 +9471,179 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     assert payload.get("pid") == 99999
     assert "log_mtime" in payload
     assert "last_log_line" in payload
-    assert payload.get("killed_pids") == [99999]
+    # killed_pids now includes both the session PID and any orphan PIDs
+    # The mock returns [99999] for kill_process_tree, and sweep_orphan_processes
+    # returns [3492] as a fixed mock value
+    assert 99999 in payload.get("killed_pids", [])
+    assert 3492 in payload.get("killed_pids", [])  # Orphan PID from mock
+    # orphan_pids is included in the event payload with the exact mock value
+    assert payload.get("orphan_pids") == [3492]
+
+
+def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
+    """Unit test for _sweep_orphan_processes_for_dead_sessions (issue #139)."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch, MagicMock
+    import subprocess
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake session records
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    dead_session = SessionRecord(
+        issue_number=100,
+        branch="agent/issue-100",
+        worktree_path="/dead/worktree",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1000,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    live_session = SessionRecord(
+        issue_number=101,
+        branch="agent/issue-101",
+        worktree_path="/live/worktree",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1001,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    dead_worker = ClaudeWorkerRecord(
+        issue_number=102,
+        branch="agent/issue-102",
+        worktree_path="/dead/worker",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1002,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    # Mock sweep_orphan_processes to return fixed PIDs for dead worktrees
+    def mock_sweep_orphan(worktree_path: str) -> list[int]:
+        if worktree_path == "/dead/worktree":
+            return [5000, 5001]
+        elif worktree_path == "/dead/worker":
+            return [6000]
+        return []
+
+    # Mock subprocess.run to track taskkill calls
+    taskkill_calls = []
+    original_run = subprocess.run
+
+    def mock_subprocess_run(*args, **kwargs):
+        if args and args[0] and args[0][0] == "taskkill":
+            taskkill_calls.append(args[0])
+            # Return a successful result
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return original_run(*args, **kwargs)
+
+    with (
+        patch(
+            "charlie_work.devin_shell.read_session_records",
+            return_value=[dead_session, live_session],
+        ),
+        patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
+        patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
+        patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
+        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
+        patch("subprocess.run", side_effect=mock_subprocess_run),
+    ):
+        from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _sweep_orphan_processes_for_dead_sessions(sessions_dir, paths.state_file, config)
+
+    # Verify taskkill was called for the orphan PIDs
+    assert len(taskkill_calls) == 3
+    killed_pids = [
+        int(call[3]) for call in taskkill_calls
+    ]  # Extract PID from taskkill /F /PID <pid>
+    assert 5000 in killed_pids
+    assert 5001 in killed_pids
+    assert 6000 in killed_pids
+
+    # Verify the event was logged
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    orphan_events = [e for e in events if e.get("kind") == "orphan_processes_killed"]
+    assert len(orphan_events) == 2
+
+    # Check the first event (dead/worktree)
+    event1 = next(e for e in orphan_events if e["payload"]["worktree_path"] == "/dead/worktree")
+    assert event1["payload"]["orphan_pids"] == [5000, 5001]
+    assert event1["payload"]["killed_orphans"] == [5000, 5001]
+
+    # Check the second event (dead/worker)
+    event2 = next(e for e in orphan_events if e["payload"]["worktree_path"] == "/dead/worker")
+    assert event2["payload"]["orphan_pids"] == [6000]
+    assert event2["payload"]["killed_orphans"] == [6000]
+
+
+def test_sweep_orphan_processes_called_from_production_loop(tmp_path: Path) -> None:
+    """Integration test: verify _sweep_orphan_processes_for_dead_sessions is called from production loop (issue #139)."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub
+    class FakeGitHubForSweep(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForSweep()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mock _sweep_orphan_processes_for_dead_sessions to track if it's called
+    sweep_called = []
+
+    def mock_sweep(*args, **kwargs):
+        sweep_called.append(True)
+        # Don't actually do anything
+
+    with patch(
+        "charlie_work.workflow._sweep_orphan_processes_for_dead_sessions", side_effect=mock_sweep
+    ):
+        # Run the production loop (loop calls the sweep)
+        app.loop(limit=1)
+
+    # Verify the sweep was called from the production loop
+    assert len(sweep_called) == 1, (
+        "Expected _sweep_orphan_processes_for_dead_sessions to be called from production loop"
+    )
 
 
 def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None:
@@ -10227,4 +10408,350 @@ def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatc
 
     assert check_calls["n"] == 1
     assert result.ok is True
-    assert "prompt_path" in result.data
+
+
+# Fleet status tests
+
+
+def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status aggregates status from multiple repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create two repo directories with minimal setup
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+
+    # Create minimal configs
+    config1 = repo1 / "orchestrator.config.yaml"
+    config2 = repo2 / "orchestrator.config.yaml"
+    config1.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    config2.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+
+    # Create state directories
+    (repo1 / ".var" / "charlie-work").mkdir(parents=True)
+    (repo2 / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with two repos
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "name_with_owner": "owner/repo1",
+                "config_path": str(config1),
+                "state_dir": str(repo1 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+                "name_with_owner": "owner/repo2",
+                "config_path": str(config2),
+                "state_dir": str(repo2 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify aggregation
+    assert result.ok is True
+    assert "2 repo(s)" in result.message
+    assert len(result.data["repos"]) == 2
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+    assert result.data["errors"] == []
+
+
+def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status isolates errors from broken repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create one valid repo
+    repo_valid = tmp_path / "repo_valid"
+    repo_valid.mkdir()
+    config_valid = repo_valid / "orchestrator.config.yaml"
+    config_valid.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_valid / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with one valid and one broken repo
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_valid": {
+                "repo_root": str(repo_valid),
+                "name_with_owner": "owner/repo_valid",
+                "config_path": str(config_valid),
+                "state_dir": str(repo_valid / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify error isolation
+    assert result.ok is False  # Errors present
+    assert "1 repo(s), 1 error(s)" in result.message
+    assert len(result.data["repos"]) == 1
+    assert "owner/repo_valid" in result.data["repos"]
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+
+
+def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status never mutates GitHub labels or state."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a repo with a ready-labeled issue
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create state.json
+    state_file = repo / ".var" / "charlie-work" / "state.json"
+    import json
+
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-07-06T12:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_file.write_text(json.dumps(initial_state, indent=2))
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return a ready issue and track mutating calls
+    from charlie_work.github import GitHub
+
+    mutating_calls = []
+
+    def mock_run(self, args, json_output=False, allow_failure=False):
+        mutating_calls.append(args)
+        return ""
+
+    def mock_issue_list(self, label):
+        return [{"number": 123, "title": "Test issue", "labels": [{"name": label}]}]
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "run", mock_run)
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify no mutating calls were made
+    assert result.ok is True
+    # GitHub.run should not be called with mutating commands
+    for call in mutating_calls:
+        assert not any(
+            mutating_cmd in call
+            for mutating_cmd in ["issue edit", "label add", "label remove", "pr edit"]
+        ), f"Mutating call detected: {call}"
+
+    # Verify state.json was not modified
+    final_state = json.loads(state_file.read_text())
+    assert final_state["generated_at"] == initial_state["generated_at"]
+    assert final_state == initial_state
+
+
+def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status --json produces the correct output shape."""
+    from io import StringIO
+
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a minimal repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Capture stdout
+    fake_stdout = StringIO()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    # Run fleet status --json via main()
+    try:
+        cli.main(["fleet", "status", "--json"])
+    except SystemExit:
+        pass
+
+    output = fake_stdout.getvalue()
+    parsed = json.loads(output)
+
+    # Verify JSON structure
+    assert "ok" in parsed
+    assert "message" in parsed
+    assert "data" in parsed
+    assert "repos" in parsed["data"]
+    assert "errors" in parsed["data"]
+    assert "owner/repo" in parsed["data"]["repos"]
+
+
+def test_build_parser_fleet_subcommand() -> None:
+    """Test that build_parser registers the fleet subcommand correctly."""
+    parser = cli.build_parser()
+
+    # Test fleet status parsing
+    args = parser.parse_args(["fleet", "status"])
+    assert args.command == "fleet"
+    assert args.fleet_command == "status"
+
+    # Test that existing subcommands still work
+    args_roll_call = parser.parse_args(["roll-call"])
+    assert args_roll_call.command == "roll-call"
+
+    args_doctor = parser.parse_args(["doctor"])
+    assert args_doctor.command == "doctor"

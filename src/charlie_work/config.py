@@ -222,6 +222,12 @@ class ClaudeCodeConfig:
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
     worker_env: dict[str, str] = field(default_factory=dict)
+    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
+    # When enabled, the worker launch command is extended with --output-format stream-json
+    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
+    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
+    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
+    tee_stream_json: bool = False
 
 
 @dataclass(frozen=True)

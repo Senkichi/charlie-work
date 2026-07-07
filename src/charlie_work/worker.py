@@ -6,8 +6,9 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
+from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
 
@@ -68,9 +69,12 @@ class WorkerView:
     started_at: str
     process_start_time: float | None
     log_path: str
+    worktree_path: str
     error: str | None
     failure_kind: str | None
     reclaimed: str | None
+    last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
+    log_bytes: int | None = None  # log_path.stat().st_size
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -83,7 +87,7 @@ class WorkerView:
             record = SessionRecord(
                 issue_number=self.issue_number,
                 branch="",  # Not used by is_session_alive
-                worktree_path="",  # Not used by is_session_alive
+                worktree_path=self.worktree_path,
                 prompt_path="",  # Not used by is_session_alive
                 command=(),  # Not used by is_session_alive
                 pid=self.pid,
@@ -93,6 +97,8 @@ class WorkerView:
                 failure_kind=self.failure_kind,
                 process_start_time=self.process_start_time,
                 reclaimed=self.reclaimed,
+                last_activity_at=self.last_activity_at,
+                log_bytes=self.log_bytes,
             )
             return is_session_alive(record)
         elif self.adapter_kind == "claude-code":
@@ -100,7 +106,7 @@ class WorkerView:
             record = ClaudeWorkerRecord(
                 issue_number=self.issue_number,
                 branch="",  # Not used by is_worker_alive
-                worktree_path="",  # Not used by is_worker_alive
+                worktree_path=self.worktree_path,
                 prompt_path="",  # Not used by is_worker_alive
                 command=(),  # Not used by is_worker_alive
                 pid=self.pid,
@@ -110,6 +116,8 @@ class WorkerView:
                 failure_kind=self.failure_kind,
                 process_start_time=self.process_start_time,
                 reclaimed=self.reclaimed,
+                last_activity_at=self.last_activity_at,
+                log_bytes=self.log_bytes,
             )
             return is_worker_alive(record)
         else:
@@ -227,9 +235,12 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         started_at=record.started_at,
         process_start_time=record.process_start_time,
         log_path=record.log_path,
+        worktree_path=record.worktree_path,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,
+        last_activity_at=record.last_activity_at,
+        log_bytes=record.log_bytes,
     )
 
 
@@ -243,9 +254,12 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         started_at=record.started_at,
         process_start_time=record.process_start_time,
         log_path=record.log_path,
+        worktree_path=record.worktree_path,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,
+        last_activity_at=record.last_activity_at,
+        log_bytes=record.log_bytes,
     )
 
 
@@ -276,9 +290,67 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
     return workers
 
 
+def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
+    """Update last_activity_at and log_bytes fields on a worker's sidecar.
+
+    This reads the current sidecar, updates the log stat fields from a fresh
+    stat() of the log file, and writes back atomically. This is called during
+    passes over live workers to keep progress signals fresh.
+
+    Args:
+        sessions_dir: Directory containing session sidecar files
+        worker: WorkerView to update (must have valid log_path)
+    """
+    import json
+
+    if worker.adapter_kind == "devin":
+        sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
+    elif worker.adapter_kind == "claude-code":
+        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number)
+    else:
+        # Unknown adapter kind - nothing to update
+        return
+
+    if not sidecar_path.exists():
+        return
+
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, JSONDecodeError):
+        return
+
+    if not isinstance(payload, dict):
+        return
+
+    # Stat the log file
+    log_stat_result = worker.log_stat()
+    if log_stat_result is None:
+        # Log file doesn't exist or is inaccessible - clear the fields
+        payload["last_activity_at"] = None
+        payload["log_bytes"] = None
+    else:
+        # Update with fresh stat data
+        payload["last_activity_at"] = datetime.fromtimestamp(
+            log_stat_result.st_mtime, tz=timezone.utc
+        ).isoformat()
+        payload["log_bytes"] = log_stat_result.st_size
+
+    # Write back atomically using the adapter-specific helper
+    if worker.adapter_kind == "devin":
+        from .devin_shell import _write_json
+
+        _write_json(sidecar_path, payload)
+    elif worker.adapter_kind == "claude-code":
+        from .claude_code import _write_json_atomic
+
+        _write_json_atomic(sidecar_path, payload)
+
+
 __all__ = [
     "WorkerHealth",
     "WorkerView",
     "classify_worker_health",
     "iter_workers",
+    "update_worker_log_stat",
 ]
