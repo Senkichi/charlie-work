@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 from charlie_work.config import OrchestratorConfig, WatchdogConfig
 from charlie_work.worker import (
-    UsageSnapshot,
     WorkerHealth,
     WorkerView,
     classify_worker_health,
