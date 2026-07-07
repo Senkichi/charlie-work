@@ -275,11 +275,7 @@ def classify_worker_health(
             started_at = started_at.replace(tzinfo=UTC)
         wall_clock_age = now - started_at
         if wall_clock_age > timedelta(minutes=config.watchdog.wall_clock_minutes):
-            return (
-                WorkerHealth.RUNAWAY
-                if config.watchdog.wall_clock_kill
-                else WorkerHealth.SLOW
-            )
+            return WorkerHealth.RUNAWAY if config.watchdog.wall_clock_kill else WorkerHealth.SLOW
     except (ValueError, TypeError):
         # Invalid started_at format - skip this signal
         pass
@@ -302,14 +298,9 @@ def classify_worker_health(
 
                 # Trip if log is advancing but no tool calls for 2 * stall_minutes
                 if log_still_advancing and no_new_tool_call_for > timedelta(
-                    minutes=config.watchdog.loop_stall_multiplier
-                    * config.watchdog.stall_minutes
+                    minutes=config.watchdog.loop_stall_multiplier * config.watchdog.stall_minutes
                 ):
-                    return (
-                        WorkerHealth.RUNAWAY
-                        if config.watchdog.loop_kill
-                        else WorkerHealth.SLOW
-                    )
+                    return WorkerHealth.RUNAWAY if config.watchdog.loop_kill else WorkerHealth.SLOW
     elif view.adapter_kind == "devin":
         # Devin has no structured event stream - this tripwire caps at SLOW
         # regardless of config, to avoid killing chatty-but-healthy patterns
