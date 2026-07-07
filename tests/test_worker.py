@@ -262,6 +262,8 @@ def test_claude_worker_record_from_dict_roundtrip() -> None:
         failure_kind=None,
         process_start_time=1710000000.0,
         reclaimed=None,
+        last_activity_at="2026-07-06T01:00:00Z",
+        log_bytes=1024,
     )
 
     payload = original.to_dict()
@@ -270,7 +272,7 @@ def test_claude_worker_record_from_dict_roundtrip() -> None:
 
 
 def test_claude_worker_record_from_dict_missing_optional_fields() -> None:
-    """A payload missing optional fields (reclaimed, process_start_time) still constructs with the documented defaults."""
+    """A payload missing optional fields (reclaimed, process_start_time, last_activity_at, log_bytes) still constructs with the documented defaults."""
     payload = {
         "issue_number": 1,
         "branch": "agent/issue-1",
@@ -280,7 +282,7 @@ def test_claude_worker_record_from_dict_missing_optional_fields() -> None:
         "pid": 12345,
         "started_at": "2026-07-06T00:00:00Z",
         "log_path": "/tmp/issue-1.claude.log",
-        # error, failure_kind, process_start_time, reclaimed omitted
+        # error, failure_kind, process_start_time, reclaimed, last_activity_at, log_bytes omitted
     }
 
     record = ClaudeWorkerRecord.from_dict(payload)
@@ -289,6 +291,38 @@ def test_claude_worker_record_from_dict_missing_optional_fields() -> None:
     assert record.failure_kind is None
     assert record.process_start_time is None
     assert record.reclaimed is None
+    assert record.last_activity_at is None
+    assert record.log_bytes is None
+
+
+def test_claude_worker_record_log_stat_fields_roundtrip() -> None:
+    """ClaudeWorkerRecord with last_activity_at and log_bytes fields round-trips through to_dict/from_dict."""
+    original = ClaudeWorkerRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/worktree-1",
+        prompt_path="/tmp/prompt-1.md",
+        command=("claude", "prompt.md"),
+        pid=12345,
+        started_at="2026-07-06T00:00:00Z",
+        log_path="/tmp/issue-1.claude.log",
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at="2026-07-06T01:30:45Z",
+        log_bytes=2048,
+    )
+
+    payload = original.to_dict()
+    assert "last_activity_at" in payload
+    assert "log_bytes" in payload
+    assert payload["last_activity_at"] == "2026-07-06T01:30:45Z"
+    assert payload["log_bytes"] == 2048
+
+    reconstructed = ClaudeWorkerRecord.from_dict(payload)
+    assert reconstructed.last_activity_at == "2026-07-06T01:30:45Z"
+    assert reconstructed.log_bytes == 2048
 
 
 def test_worker_view_reap_sidecar_devin(tmp_path: Path) -> None:
@@ -342,6 +376,53 @@ def test_worker_view_reap_sidecar_devin(tmp_path: Path) -> None:
 
     # Verify the sidecar was deleted
     assert not sidecar_path.exists()
+
+
+def test_devin_sidecars_never_populate_claude_progress_fields(tmp_path: Path) -> None:
+    """Devin SessionRecord instances never have ClaudeProgress fields (issue #160).
+
+    ClaudeProgress is specific to Claude Code workers (from events.jsonl).
+    Devin sidecars should never populate these fields, and downstream code
+    should treat their absence as "no signal," not "unhealthy."
+    """
+    from charlie_work.devin_shell import SessionRecord
+
+    # Create a devin SessionRecord with all fields populated
+    devin_record = SessionRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/worktree-1",
+        prompt_path="/tmp/prompt-1.md",
+        command=("devin", "prompt.md"),
+        pid=12345,
+        started_at="2026-07-06T00:00:00Z",
+        log_path="/tmp/issue-1.log",
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at="2026-07-06T01:30:45Z",
+        log_bytes=2048,
+    )
+
+    # Verify SessionRecord has no ClaudeProgress-related fields
+    assert not hasattr(devin_record, "tool_call_count")
+    assert not hasattr(devin_record, "turn_count")
+    assert not hasattr(devin_record, "tokens")
+    assert not hasattr(devin_record, "cost_usd")
+
+    # Verify the same when round-tripping through to_dict/from_dict
+    payload = devin_record.to_dict()
+    assert "tool_call_count" not in payload
+    assert "turn_count" not in payload
+    assert "tokens" not in payload
+    assert "cost_usd" not in payload
+
+    reconstructed = SessionRecord.from_dict(payload)
+    assert not hasattr(reconstructed, "tool_call_count")
+    assert not hasattr(reconstructed, "turn_count")
+    assert not hasattr(reconstructed, "tokens")
+    assert not hasattr(reconstructed, "cost_usd")
 
 
 def test_worker_view_reap_sidecar_claude(tmp_path: Path) -> None:

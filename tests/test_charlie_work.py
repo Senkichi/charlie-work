@@ -65,6 +65,12 @@ def test_default_config_enables_auto_merge() -> None:
     assert config.labels.ready == "automated-ready"
 
 
+def test_default_config_tee_stream_json_disabled() -> None:
+    """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
+    config = load_config()
+    assert config.claude_code.tee_stream_json is False
+
+
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, ".var/charlie-work")
 

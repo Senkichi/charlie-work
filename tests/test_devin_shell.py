@@ -19,6 +19,7 @@ from charlie_work.devin_shell import (
     read_session_records,
     update_session_record_with_failure_classification,
     _sidecar_path,
+    _write_json,
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.worktree import WorktreeInfo
@@ -1727,3 +1728,93 @@ def test_launch_devin_session_includes_start_new_session_on_posix(
     else:
         # On Windows, start_new_session should not be in kwargs
         assert "start_new_session" not in popen_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Tests for log-stat enrichment fields (issue #160)
+# ---------------------------------------------------------------------------
+
+
+def test_session_record_log_stat_fields_roundtrip(tmp_path: Path) -> None:
+    """SessionRecord with last_activity_at and log_bytes fields round-trips through to_dict/from_dict."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    original = SessionRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/worktree-1",
+        prompt_path="/tmp/prompt-1.md",
+        command=("devin", "prompt.md"),
+        pid=12345,
+        started_at="2026-07-06T00:00:00Z",
+        log_path="/tmp/issue-1.log",
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at="2026-07-06T01:30:45Z",
+        log_bytes=2048,
+    )
+
+    payload = original.to_dict()
+    assert "last_activity_at" in payload
+    assert "log_bytes" in payload
+    assert payload["last_activity_at"] == "2026-07-06T01:30:45Z"
+    assert payload["log_bytes"] == 2048
+
+    reconstructed = SessionRecord.from_dict(payload)
+    assert reconstructed.last_activity_at == "2026-07-06T01:30:45Z"
+    assert reconstructed.log_bytes == 2048
+
+
+def test_session_record_from_dict_missing_log_stat_fields(tmp_path: Path) -> None:
+    """A payload missing last_activity_at and log_bytes still constructs with None defaults."""
+    payload = {
+        "issue_number": 1,
+        "branch": "agent/issue-1",
+        "worktree_path": "/tmp/worktree-1",
+        "prompt_path": "/tmp/prompt-1.md",
+        "command": ["devin", "prompt.md"],
+        "pid": 12345,
+        "started_at": "2026-07-06T00:00:00Z",
+        "log_path": "/tmp/issue-1.log",
+        # error, failure_kind, process_start_time, reclaimed, last_activity_at, log_bytes omitted
+    }
+
+    record = SessionRecord.from_dict(payload)
+    assert record.last_activity_at is None
+    assert record.log_bytes is None
+
+
+def test_session_record_log_stat_fields_persist_to_sidecar(tmp_path: Path) -> None:
+    """SessionRecord with log stat fields can be written to and read from a sidecar file."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42",
+        worktree_path="/tmp/worktree-42",
+        prompt_path="/tmp/prompt-42.md",
+        command=("devin", "prompt.md"),
+        pid=54321,
+        started_at="2026-07-06T00:00:00Z",
+        log_path="/tmp/issue-42.log",
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at="2026-07-06T02:15:30Z",
+        log_bytes=4096,
+    )
+
+    sidecar_path = _sidecar_path(sessions_dir, 42)
+    _write_json(sidecar_path, record.to_dict())
+
+    # Read back through read_session_records
+    records = read_session_records(sessions_dir)
+    assert len(records) == 1
+    restored = records[0]
+    assert restored.last_activity_at == "2026-07-06T02:15:30Z"
+    assert restored.log_bytes == 4096
