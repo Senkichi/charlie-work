@@ -258,6 +258,10 @@ class WatchdogConfig:
 
     enabled: bool = True
     stall_minutes: int = 20
+    terminal_error_markers: tuple[str, ...] = (
+        "Error: A tool was rejected",
+        "Error: Agent error:",
+    )
 
 
 @dataclass(frozen=True)
@@ -485,7 +489,22 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "cross_family.command",
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
-    watchdog = _build_section(WatchdogConfig, "watchdog", _section(data, "watchdog"))
+    watchdog_data = _section(data, "watchdog")
+    terminal_error_markers = watchdog_data.get("terminal_error_markers")
+    if terminal_error_markers is not None:
+        if not isinstance(terminal_error_markers, list):
+            raise ConfigError(
+                "config section 'watchdog' key 'terminal_error_markers' must be a list of "
+                f"strings, got {type(terminal_error_markers).__name__}"
+            )
+        for item in terminal_error_markers:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'watchdog' key 'terminal_error_markers' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        watchdog_data["terminal_error_markers"] = tuple(terminal_error_markers)
+    watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
 
     # Five tuple-of-str fields: reject non-list, coerce elements to str.

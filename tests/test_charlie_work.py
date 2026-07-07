@@ -902,6 +902,132 @@ def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
     assert config.test_adequacy.min_diff_coverage == 0.5
 
 
+def test_config_accepts_watchdog_terminal_error_markers(tmp_path: Path) -> None:
+    """A YAML block with terminal_error_markers loads correctly."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+  terminal_error_markers:
+    - "Error: A tool was rejected"
+    - "Error: Agent error:"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.watchdog.enabled is True
+    assert config.watchdog.stall_minutes == 20
+    assert config.watchdog.terminal_error_markers == (
+        "Error: A tool was rejected",
+        "Error: Agent error:",
+    )
+
+
+def test_config_defaults_watchdog_terminal_error_markers(tmp_path: Path) -> None:
+    """A YAML block without terminal_error_markers uses the default."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.watchdog.enabled is True
+    assert config.watchdog.stall_minutes == 20
+    assert config.watchdog.terminal_error_markers == (
+        "Error: A tool was rejected",
+        "Error: Agent error:",
+    )
+
+
+def test_config_rejects_invalid_watchdog_terminal_error_markers_type(tmp_path: Path) -> None:
+    """terminal_error_markers must be a list of strings."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  terminal_error_markers: "not a list"
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid terminal_error_markers type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid terminal_error_markers type")
+
+    assert "section 'watchdog'" in message
+    assert "terminal_error_markers" in message
+    assert "must be a list" in message
+
+
+def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(tmp_path: Path) -> None:
+    """terminal_error_markers elements must be strings."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  terminal_error_markers:
+    - "valid string"
+    - 123
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid terminal_error_markers element type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid terminal_error_markers element type")
+
+    assert "section 'watchdog'" in message
+    assert "terminal_error_markers" in message
+    assert "must be a list of strings" in message
+
+
+def test_config_rejects_unknown_watchdog_key(tmp_path: Path) -> None:
+    """Unknown keys under watchdog raise ConfigError listing valid keys."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  bad_key: value
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for unknown watchdog key")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown watchdog key")
+
+    assert "section 'watchdog'" in message
+    assert "bad_key" in message
+    # Should list valid keys
+    assert "enabled" in message
+    assert "stall_minutes" in message
+    assert "terminal_error_markers" in message
+
+
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
     """Issue #4: unknown placeholder in dispatch_command is rejected at load."""
     from charlie_work.config import ConfigError
@@ -1554,7 +1680,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -2033,7 +2159,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch

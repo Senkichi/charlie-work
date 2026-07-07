@@ -47,7 +47,8 @@ from .state import (
     state_lock,
     utc_now,
 )
-from .process_utils import is_session_stalled, kill_process_tree
+from .process_utils import kill_process_tree
+from .worker import WorkerHealth
 
 
 @dataclass(frozen=True)
@@ -202,25 +203,23 @@ def _detect_stalled_sessions(
 
     Returns a list of {issue, pid} dicts for stalled sessions.
     """
-    from .worker import iter_workers
+    from datetime import UTC, datetime
+    from .worker import classify_worker_health, iter_workers
 
     if not config.watchdog.enabled:
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    stall_threshold = config.watchdog.stall_minutes
+    now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        if not w.is_alive():
-            continue
+        health = classify_worker_health(w, config, now)
 
-        log_path = Path(w.log_path)
-        is_stalled, _ = is_session_stalled(log_path, stall_threshold)
-
-        if is_stalled:
+        # Both STALLED and DEAD are considered "stalled" for reporting purposes
+        if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
     return stalled_entries
@@ -241,25 +240,22 @@ def _detect_and_handle_stalled_sessions(
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
-    from .worker import iter_workers
+    from .worker import classify_worker_health, iter_workers
 
     if not config.watchdog.enabled:
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    stall_threshold = config.watchdog.stall_minutes
+    now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        if not w.is_alive():
-            continue
+        health = classify_worker_health(w, config, now)
 
-        log_path = Path(w.log_path)
-        is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
-
-        if is_stalled:
+        # Both STALLED and DEAD are considered "stalled" for handling purposes
+        if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
             # Kill the process tree (with start-time verification to prevent PID recycling)
             killed_pids = kill_process_tree(w.pid, w.process_start_time)
 
@@ -274,6 +270,16 @@ def _detect_and_handle_stalled_sessions(
                 )
 
             # Log the event
+            log_path = Path(w.log_path)
+            last_log_line = None
+            try:
+                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                lines = log_text.splitlines()
+                if lines:
+                    last_log_line = lines[-1].strip()
+            except OSError:
+                pass
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
