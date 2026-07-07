@@ -5,16 +5,17 @@ This module provides a unified view of worker sessions across all adapters
 adapter-iteration loops in workflow.py into a single abstraction point.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
-import json
 
 from .claude_code import (
     ClaudeWorkerRecord,
+    _events_path,
     _sidecar_path as claude_sidecar_path,
     is_worker_alive,
     read_worker_records,
@@ -39,17 +40,88 @@ class WorkerHealth(Enum):
     1. liveness → DEAD
     2. terminal marker → DEAD
     3. progress staleness → STALLED
-    4. (none of the above) → HEALTHY
+    4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
+    5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
+    6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    7. (none of the above) → HEALTHY
 
     SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
     """
 
     HEALTHY = "healthy"
-    SLOW = "slow"  # Reserved for #162 (wall-clock/loop tripwires)
+    SLOW = "slow"  # Reserved for #162 (wall-clock/loop tripwires) and #163 (warn mode)
     STALLED = "stalled"
     RUNAWAY = "runaway"  # Reserved for #162/#163 (cost/token tripwires)
     DEAD = "dead"
     ORPHANED = "orphaned"  # Reserved for B6a (sidecar dead/non-live but process still references worktree)
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """Cumulative usage metrics parsed from Claude Code's events.jsonl.
+
+    This frozen dataclass holds the latest cumulative tokens and cost_usd
+    values extracted from the events.jsonl file.
+    """
+
+    tokens: int | None = None
+    cost_usd: float | None = None
+
+
+def parse_cumulative_usage(events_path: Path) -> UsageSnapshot | None:
+    """Read issue-<n>.events.jsonl and return cumulative tokens/cost.
+
+    Returns None if the file doesn't exist (Devin sessions, or a Claude
+    session that hasn't emitted a usage event yet) — absence is NOT an
+    error and must never be treated as unhealthy.
+
+    Malformed or partial trailing JSON lines (a worker killed mid-write)
+    are skipped, not raised — same defensive posture as state.load_state's
+    corrupt-file handling.
+
+    Args:
+        events_path: Path to the events.jsonl file
+
+    Returns:
+        UsageSnapshot with cumulative tokens/cost, or None if file doesn't exist
+    """
+    if not events_path.exists():
+        return None
+
+    tokens = None
+    cost_usd = None
+
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines (including partial trailing lines)
+                    continue
+
+                if not isinstance(event, dict):
+                    continue
+
+                # Extract cumulative usage fields (take last-seen value)
+                if "tokens" in event and isinstance(event["tokens"], int):
+                    tokens = event["tokens"]
+                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+                    cost_usd = float(event["cost_usd"])
+
+    except OSError:
+        # File read error - treat as no usage data
+        return None
+
+    # If we parsed no usage data, return None
+    if tokens is None and cost_usd is None:
+        return None
+
+    return UsageSnapshot(tokens=tokens, cost_usd=cost_usd)
 
 
 @dataclass(frozen=True)
@@ -221,7 +293,8 @@ def classify_worker_health(
     3. progress staleness → STALLED
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
-    6. (none of the above) → HEALTHY
+    6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    7. (none of the above) → HEALTHY
 
     Args:
         view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
@@ -307,7 +380,37 @@ def classify_worker_health(
         # (this is the single-point-of-enforcement for the Devin hard cap)
         pass
 
-    # Signal 6: (none of the above)
+    # Signal 6: cost/token budget tripwire (issue #163)
+    # Only applies to Claude Code workers (has events.jsonl file)
+    # Devin sessions have no structured usage stream, so absence is never unhealthy
+    if view.adapter_kind == "claude-code":
+        # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
+        sessions_dir = Path(view.log_path).parent
+        events_path = _events_path(sessions_dir, view.issue_number)
+        usage = parse_cumulative_usage(events_path)
+
+        if usage is not None:
+            # Check cost budget
+            cost_budget = config.watchdog.cost_budget_usd
+            if cost_budget is not None and cost_budget > 0:
+                if usage.cost_usd is not None and usage.cost_usd > cost_budget:
+                    # Budget exceeded - return SLOW (warn) or RUNAWAY (kill)
+                    if config.watchdog.cost_budget_action == "kill":
+                        return WorkerHealth.RUNAWAY
+                    else:
+                        return WorkerHealth.SLOW
+
+            # Check token budget
+            token_budget = config.watchdog.token_budget
+            if token_budget is not None and token_budget > 0:
+                if usage.tokens is not None and usage.tokens > token_budget:
+                    # Budget exceeded - return SLOW (warn) or RUNAWAY (kill)
+                    if config.watchdog.cost_budget_action == "kill":
+                        return WorkerHealth.RUNAWAY
+                    else:
+                        return WorkerHealth.SLOW
+
+    # Signal 7: (none of the above)
     return WorkerHealth.HEALTHY
 
 
@@ -435,8 +538,10 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
 
 __all__ = [
     "WorkerHealth",
+    "UsageSnapshot",
     "WorkerView",
     "classify_worker_health",
     "iter_workers",
+    "parse_cumulative_usage",
     "update_worker_log_stat",
 ]

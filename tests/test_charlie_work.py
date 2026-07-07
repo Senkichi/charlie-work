@@ -1038,10 +1038,36 @@ def test_config_rejects_unknown_watchdog_key(tmp_path: Path) -> None:
     assert "enabled" in message
     assert "stall_minutes" in message
     assert "terminal_error_markers" in message
+    assert "cost_budget_usd" in message
+    assert "token_budget" in message
+    assert "cost_budget_action" in message
     assert "wall_clock_minutes" in message
     assert "wall_clock_kill" in message
     assert "loop_stall_multiplier" in message
     assert "loop_kill" in message
+
+
+def test_config_accepts_cost_token_budgets(tmp_path: Path) -> None:
+    """A YAML block with cost/token budget fields loads correctly."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+  cost_budget_usd: 10.0
+  token_budget: 100000
+  cost_budget_action: warn
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.watchdog.enabled is True
+    assert config.watchdog.stall_minutes == 20
+    assert config.watchdog.cost_budget_usd == 10.0
+    assert config.watchdog.token_budget == 100000
+    assert config.watchdog.cost_budget_action == "warn"
 
 
 def test_config_watchdog_new_fields_have_defaults(tmp_path: Path) -> None:
@@ -1057,10 +1083,36 @@ def test_config_watchdog_new_fields_have_defaults(tmp_path: Path) -> None:
     )
 
     config = load_config(config_path)
+
+    assert config.watchdog.enabled is True
+    assert config.watchdog.stall_minutes == 20
+    assert config.watchdog.cost_budget_usd is None
+    assert config.watchdog.token_budget is None
+    assert config.watchdog.cost_budget_action == "warn"
     assert config.watchdog.wall_clock_minutes == 240
     assert config.watchdog.wall_clock_kill is False
     assert config.watchdog.loop_stall_multiplier == 2
     assert config.watchdog.loop_kill is False
+
+
+def test_config_defaults_cost_token_budgets(tmp_path: Path) -> None:
+    """A YAML block without cost/token budget fields uses the defaults (None)."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.watchdog.enabled is True
+    assert config.watchdog.stall_minutes == 20
+    assert config.watchdog.cost_budget_usd is None
+    assert config.watchdog.token_budget is None
+    assert config.watchdog.cost_budget_action == "warn"
 
 
 def test_config_watchdog_accepts_new_fields(tmp_path: Path) -> None:
@@ -1083,6 +1135,106 @@ def test_config_watchdog_accepts_new_fields(tmp_path: Path) -> None:
     assert config.watchdog.wall_clock_kill is True
     assert config.watchdog.loop_stall_multiplier == 3
     assert config.watchdog.loop_kill is True
+
+
+def test_config_rejects_invalid_cost_budget_usd_type(tmp_path: Path) -> None:
+    """cost_budget_usd must be a number."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  cost_budget_usd: "not a number"
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid cost_budget_usd type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid cost_budget_usd type")
+
+    assert "section 'watchdog'" in message
+    assert "cost_budget_usd" in message
+    assert "must be a number" in message
+
+
+def test_config_rejects_invalid_token_budget_type(tmp_path: Path) -> None:
+    """token_budget must be an int."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  token_budget: "not an int"
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid token_budget type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid token_budget type")
+
+    assert "section 'watchdog'" in message
+    assert "token_budget" in message
+    assert "must be an int" in message
+
+
+def test_config_rejects_invalid_cost_budget_action_type(tmp_path: Path) -> None:
+    """cost_budget_action must be a string."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  cost_budget_action: 123
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid cost_budget_action type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid cost_budget_action type")
+
+    assert "section 'watchdog'" in message
+    assert "cost_budget_action" in message
+    assert "must be a string" in message
+
+
+def test_config_rejects_invalid_cost_budget_action_value(tmp_path: Path) -> None:
+    """cost_budget_action must be 'warn' or 'kill'."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  cost_budget_action: "invalid"
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for invalid cost_budget_action value")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for invalid cost_budget_action value")
+
+    assert "section 'watchdog'" in message
+    assert "cost_budget_action" in message
+    assert "must be 'warn' or 'kill'" in message
 
 
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
