@@ -268,6 +268,12 @@ class WatchdogConfig:
         "Error: A tool was rejected",
         "Error: Agent error:",
     )
+    # Cost/token budget tripwire (issue #163). None/0 = disabled.
+    # When enabled, checks cumulative usage from Claude Code's tee'd events.jsonl.
+    cost_budget_usd: float | None = None
+    token_budget: int | None = None
+    # Action when budget is exceeded: "warn" (default, no kill) or "kill"
+    cost_budget_action: str = "warn"
 
 
 @dataclass(frozen=True)
@@ -510,6 +516,33 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                     f"strings, got element of type {type(item).__name__}"
                 )
         watchdog_data["terminal_error_markers"] = tuple(terminal_error_markers)
+    # Validate cost_budget_usd
+    cost_budget_usd = watchdog_data.get("cost_budget_usd")
+    if cost_budget_usd is not None and not isinstance(cost_budget_usd, (int, float)):
+        raise ConfigError(
+            "config section 'watchdog' key 'cost_budget_usd' must be a number, "
+            f"got {type(cost_budget_usd).__name__}"
+        )
+    # Validate token_budget
+    token_budget = watchdog_data.get("token_budget")
+    if token_budget is not None and not isinstance(token_budget, int):
+        raise ConfigError(
+            "config section 'watchdog' key 'token_budget' must be an int, "
+            f"got {type(token_budget).__name__}"
+        )
+    # Validate cost_budget_action
+    cost_budget_action = watchdog_data.get("cost_budget_action")
+    if cost_budget_action is not None:
+        if not isinstance(cost_budget_action, str):
+            raise ConfigError(
+                "config section 'watchdog' key 'cost_budget_action' must be a string, "
+                f"got {type(cost_budget_action).__name__}"
+            )
+        if cost_budget_action not in ("warn", "kill"):
+            raise ConfigError(
+                f"config section 'watchdog' key 'cost_budget_action' must be 'warn' or 'kill', "
+                f"got '{cost_budget_action}'"
+            )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
 
