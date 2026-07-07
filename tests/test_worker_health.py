@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
-import tempfile
 
 from charlie_work.config import OrchestratorConfig, WatchdogConfig
 from charlie_work.worker import WorkerHealth, WorkerView, classify_worker_health
@@ -293,9 +292,7 @@ def test_classify_worker_health_wall_clock_runaway_with_kill(tmp_path: Path) -> 
     )
 
     with patch("charlie_work.worker.is_session_alive", return_value=True):
-        config = OrchestratorConfig(
-            watchdog=WatchdogConfig(wall_clock_kill=True)
-        )
+        config = OrchestratorConfig(watchdog=WatchdogConfig(wall_clock_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         assert health == WorkerHealth.RUNAWAY
@@ -347,6 +344,7 @@ def test_classify_worker_health_loop_slow_default(tmp_path: Path) -> None:
     # Set log mtime to 5 minutes ago (fresh, within stall_minutes)
     import os
     import time
+
     recent_log_time = datetime.now(UTC) - timedelta(minutes=5)
     os.utime(log_file, (time.time(), recent_log_time.timestamp()))
 
@@ -387,6 +385,7 @@ def test_classify_worker_health_loop_runaway_with_kill(tmp_path: Path) -> None:
     # Set log mtime to 5 minutes ago (fresh)
     import os
     import time
+
     recent_log_time = datetime.now(UTC) - timedelta(minutes=5)
     os.utime(log_file, (time.time(), recent_log_time.timestamp()))
 
@@ -405,9 +404,7 @@ def test_classify_worker_health_loop_runaway_with_kill(tmp_path: Path) -> None:
     )
 
     with patch("charlie_work.worker.is_worker_alive", return_value=True):
-        config = OrchestratorConfig(
-            watchdog=WatchdogConfig(loop_kill=True)
-        )
+        config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         assert health == WorkerHealth.RUNAWAY
@@ -429,6 +426,7 @@ def test_classify_worker_health_loop_skipped_when_log_stale(tmp_path: Path) -> N
     # Set log mtime to 30 minutes ago (stale, past stall_minutes)
     import os
     import time
+
     stale_log_time = datetime.now(UTC) - timedelta(minutes=30)
     os.utime(log_file, (time.time(), stale_log_time.timestamp()))
 
@@ -462,6 +460,7 @@ def test_classify_worker_health_loop_devin_never_runaway(tmp_path: Path) -> None
     # Set log mtime to 5 minutes ago (fresh)
     import os
     import time
+
     recent_log_time = datetime.now(UTC) - timedelta(minutes=5)
     os.utime(log_file, (time.time(), recent_log_time.timestamp()))
 
@@ -481,9 +480,7 @@ def test_classify_worker_health_loop_devin_never_runaway(tmp_path: Path) -> None
 
     with patch("charlie_work.worker.is_session_alive", return_value=True):
         # Even with loop_kill=True, Devin should never return RUNAWAY from this tripwire
-        config = OrchestratorConfig(
-            watchdog=WatchdogConfig(loop_kill=True)
-        )
+        config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         # Should be HEALTHY (loop tripwire skipped entirely for Devin)
@@ -535,6 +532,7 @@ def test_classify_worker_health_regression_test_suite_pattern(tmp_path: Path) ->
     # Set log mtime to 10 minutes ago (fresh, within stall_minutes)
     import os
     import time
+
     recent_log_time = datetime.now(UTC) - timedelta(minutes=10)
     os.utime(log_file, (time.time(), recent_log_time.timestamp()))
 
