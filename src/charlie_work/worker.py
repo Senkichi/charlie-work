@@ -246,9 +246,11 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
     # Write back atomically using the adapter-specific helper
     if worker.adapter_kind == "devin":
         from .devin_shell import _write_json
+
         _write_json(sidecar_path, payload)
     elif worker.adapter_kind == "claude-code":
         from .claude_code import _write_json_atomic
+
         _write_json_atomic(sidecar_path, payload)
 
 

@@ -2017,7 +2017,7 @@ def test_launch_claude_worker_includes_start_new_session_on_posix(
 def test_parse_claude_events_file_not_exists(tmp_path: Path) -> None:
     """parse_claude_events returns None when the events file doesn't exist."""
     events_path = tmp_path / "issue-1.events.jsonl"
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is None
 
 
@@ -2025,7 +2025,7 @@ def test_parse_claude_events_empty_file(tmp_path: Path) -> None:
     """parse_claude_events returns None when the events file is empty."""
     events_path = tmp_path / "issue-1.events.jsonl"
     events_path.write_text("", encoding="utf-8")
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is None
 
 
@@ -2043,7 +2043,7 @@ def test_parse_claude_events_wellformed(tmp_path: Path) -> None:
     ]
     events_path.write_text("\n".join(events), encoding="utf-8")
 
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is not None
     assert result.tool_call_count == 3
     assert result.turn_count == 4  # 4 user/assistant messages total
@@ -2061,7 +2061,7 @@ def test_parse_claude_events_truncated_final_line(tmp_path: Path) -> None:
     ]
     events_path.write_text("\n".join(events), encoding="utf-8")
 
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is not None
     assert result.tool_call_count == 1
     assert result.turn_count == 1
@@ -2073,15 +2073,15 @@ def test_parse_claude_events_malformed_lines_skipped(tmp_path: Path) -> None:
     events_path = tmp_path / "issue-1.events.jsonl"
     events = [
         '{"type": "user_message"}',
-        'not valid json',
+        "not valid json",
         '{"type": "tool_call"}',
         '{"type": "assistant_message"}',
-        'also not json',
+        "also not json",
         '{"type": "tool_call"}',
     ]
     events_path.write_text("\n".join(events), encoding="utf-8")
 
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is not None
     assert result.tool_call_count == 2
     assert result.turn_count == 2
@@ -2092,7 +2092,7 @@ def test_parse_claude_events_only_malformed_returns_none(tmp_path: Path) -> None
     events_path = tmp_path / "issue-1.events.jsonl"
     events_path.write_text("not json\nalso not json", encoding="utf-8")
 
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is None
 
 
@@ -2108,7 +2108,7 @@ def test_parse_claude_events_non_dict_events_skipped(tmp_path: Path) -> None:
     ]
     events_path.write_text("\n".join(events), encoding="utf-8")
 
-    result = parse_claude_events(events_path)
+    result: ClaudeProgress | None = parse_claude_events(events_path)
     assert result is not None
     assert result.tool_call_count == 1
     assert result.turn_count == 2

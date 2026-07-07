@@ -23,7 +23,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -138,6 +138,7 @@ class ClaudeProgress:
     This dataclass holds cumulative counts and usage metrics extracted from
     the events.jsonl file produced when tee_stream_json is enabled.
     """
+
     tool_call_count: int = 0
     turn_count: int = 0
     tokens: int | None = None
@@ -443,7 +444,9 @@ def launch_claude_worker(
                                 stderr=subprocess.STDOUT,
                                 env=worker_env,
                                 creationflags=_CREATE_NEW_PROCESS_GROUP,
-                                start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                                start_new_session=(
+                                    os.name != "nt"
+                                ),  # POSIX: detach into own session
                                 text=True,  # Ensure text mode for line-by-line processing
                             )
                     else:
@@ -472,6 +475,7 @@ def launch_claude_worker(
                             pass
 
                     import threading
+
                     tee_thread = threading.Thread(target=_tee_output, daemon=True)
                     tee_thread.start()
             else:
