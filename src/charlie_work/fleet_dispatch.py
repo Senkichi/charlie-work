@@ -8,7 +8,9 @@ from .config import ConfigError, find_config_path, load_config
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry
 from .github import GitHub, GitHubError
+from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import runtime_paths
+from .state import utc_now
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,65 @@ def _extract_attention_events(
     return events
 
 
+def _build_fleet_attention_digest(
+    attention_events: list[dict[str, Any]],
+) -> AttentionDigest:
+    """Convert fleet-aggregated event dicts into a single AttentionDigest.
+
+    Fleet events are already-flattened per-repo dicts (stalled / error /
+    health_transition) produced by ``_extract_attention_events``. This maps
+    each one onto the real #166 ``AttentionEntry`` schema so the fleet pass
+    can go through the same ``emit_digest`` sink pipeline as a single-repo
+    pass, rather than re-deriving its own notification format.
+
+    ``issue_number`` is required by ``AttentionEntry``; events that carry no
+    issue number (e.g. PR errors) fall back to ``-1`` as a sentinel so they
+    still surface in the digest instead of being silently dropped.
+    """
+    entries: list[AttentionEntry] = []
+    for event in attention_events:
+        event_type = event["type"]
+        if event_type == "stalled":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or -1,
+                    adapter_kind=event["repo_key"],
+                    health="STALLED",
+                    previous_health=None,
+                    last_log_line=event.get("reason"),
+                    pid=None,
+                )
+            )
+        elif event_type == "error":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("pr") or -1,
+                    adapter_kind=event["repo_key"],
+                    health="ERROR",
+                    previous_health=None,
+                    last_log_line=event.get("error"),
+                    pid=None,
+                )
+            )
+        elif event_type == "health_transition":
+            entries.append(
+                AttentionEntry(
+                    issue_number=-1,
+                    adapter_kind=event["repo_key"],
+                    health=event.get("to_state") or "UNKNOWN",
+                    previous_health=event.get("from_state"),
+                    last_log_line=None,
+                    pid=None,
+                )
+            )
+
+    return AttentionDigest(
+        generated_at=utc_now(),
+        repo="fleet",
+        transitions=tuple(entries),
+    )
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -197,14 +258,21 @@ def fleet_loop(
             per_repo_results[repo_key] = CommandResult(False, f"fleet pass error: {exc}", {})
             logger.error(f"Error processing repo {repo_key}: {exc}")
 
-    # Call the notifier digest sink exactly once per fleet pass
-    from .notify import emit_digest
-
-    # Use global_config.notify if available, otherwise None (stub will handle it)
+    # Call the notifier digest sink exactly once per fleet pass, via the real
+    # #166 notify.py implementation (AttentionDigest + emit_digest).
     notify_config = getattr(global_config, "notify", None) if global_config else None
-    digest = emit_digest(notify_config, attention_events)
-    # Add orphan_sweep_calls metric to digest for B6a follow-up
-    digest["orphan_sweep_calls"] = orphan_sweep_calls
+    digest: dict[str, Any] = {
+        "events": attention_events,
+        "count": len(attention_events),
+        "orphan_sweep_calls": orphan_sweep_calls,
+        "emitted": False,
+    }
+    if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
+        attention_digest = _build_fleet_attention_digest(attention_events)
+        notify_result = emit_digest(notify_config, attention_digest)
+        digest["emitted"] = notify_result.ok
+        if notify_result.error:
+            digest["notify_error"] = notify_result.error
 
     ok = all(r.ok for r in per_repo_results.values())
     message = f"fleet pass complete: {len(per_repo_results)} repo(s) processed"
