@@ -43,6 +43,7 @@ class WorkerView:
     started_at: str
     process_start_time: float | None
     log_path: str
+    worktree_path: str
     error: str | None
     failure_kind: str | None
     reclaimed: str | None
@@ -60,7 +61,7 @@ class WorkerView:
             record = SessionRecord(
                 issue_number=self.issue_number,
                 branch="",  # Not used by is_session_alive
-                worktree_path="",  # Not used by is_session_alive
+                worktree_path=self.worktree_path,
                 prompt_path="",  # Not used by is_session_alive
                 command=(),  # Not used by is_session_alive
                 pid=self.pid,
@@ -79,7 +80,7 @@ class WorkerView:
             record = ClaudeWorkerRecord(
                 issue_number=self.issue_number,
                 branch="",  # Not used by is_worker_alive
-                worktree_path="",  # Not used by is_worker_alive
+                worktree_path=self.worktree_path,
                 prompt_path="",  # Not used by is_worker_alive
                 command=(),  # Not used by is_worker_alive
                 pid=self.pid,
@@ -144,6 +145,7 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         started_at=record.started_at,
         process_start_time=record.process_start_time,
         log_path=record.log_path,
+        worktree_path=record.worktree_path,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,
@@ -162,6 +164,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         started_at=record.started_at,
         process_start_time=record.process_start_time,
         log_path=record.log_path,
+        worktree_path=record.worktree_path,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,

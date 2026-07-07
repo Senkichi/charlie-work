@@ -9309,6 +9309,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
+            "charlie_work.workflow.sweep_orphan_processes", return_value=[3492]
+        ),  # Fixed mock return
+        patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
             return_value=(None, None),
         ),
@@ -9336,7 +9339,179 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     assert payload.get("pid") == 99999
     assert "log_mtime" in payload
     assert "last_log_line" in payload
-    assert payload.get("killed_pids") == [99999]
+    # killed_pids now includes both the session PID and any orphan PIDs
+    # The mock returns [99999] for kill_process_tree, and sweep_orphan_processes
+    # returns [3492] as a fixed mock value
+    assert 99999 in payload.get("killed_pids", [])
+    assert 3492 in payload.get("killed_pids", [])  # Orphan PID from mock
+    # orphan_pids is included in the event payload with the exact mock value
+    assert payload.get("orphan_pids") == [3492]
+
+
+def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
+    """Unit test for _sweep_orphan_processes_for_dead_sessions (issue #139)."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch, MagicMock
+    import subprocess
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create fake session records
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    dead_session = SessionRecord(
+        issue_number=100,
+        branch="agent/issue-100",
+        worktree_path="/dead/worktree",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1000,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    live_session = SessionRecord(
+        issue_number=101,
+        branch="agent/issue-101",
+        worktree_path="/live/worktree",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1001,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    dead_worker = ClaudeWorkerRecord(
+        issue_number=102,
+        branch="agent/issue-102",
+        worktree_path="/dead/worker",
+        prompt_path="/fake/prompt",
+        command=("devin", "--print"),
+        pid=1002,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path="/fake/log",
+        error=None,
+        process_start_time=1234567890.0,
+    )
+
+    # Mock sweep_orphan_processes to return fixed PIDs for dead worktrees
+    def mock_sweep_orphan(worktree_path: str) -> list[int]:
+        if worktree_path == "/dead/worktree":
+            return [5000, 5001]
+        elif worktree_path == "/dead/worker":
+            return [6000]
+        return []
+
+    # Mock subprocess.run to track taskkill calls
+    taskkill_calls = []
+    original_run = subprocess.run
+
+    def mock_subprocess_run(*args, **kwargs):
+        if args and args[0] and args[0][0] == "taskkill":
+            taskkill_calls.append(args[0])
+            # Return a successful result
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return original_run(*args, **kwargs)
+
+    with (
+        patch(
+            "charlie_work.devin_shell.read_session_records",
+            return_value=[dead_session, live_session],
+        ),
+        patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
+        patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
+        patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
+        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
+        patch("subprocess.run", side_effect=mock_subprocess_run),
+    ):
+        from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _sweep_orphan_processes_for_dead_sessions(sessions_dir, paths.state_file, config)
+
+    # Verify taskkill was called for the orphan PIDs
+    assert len(taskkill_calls) == 3
+    killed_pids = [
+        int(call[3]) for call in taskkill_calls
+    ]  # Extract PID from taskkill /F /PID <pid>
+    assert 5000 in killed_pids
+    assert 5001 in killed_pids
+    assert 6000 in killed_pids
+
+    # Verify the event was logged
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    orphan_events = [e for e in events if e.get("kind") == "orphan_processes_killed"]
+    assert len(orphan_events) == 2
+
+    # Check the first event (dead/worktree)
+    event1 = next(e for e in orphan_events if e["payload"]["worktree_path"] == "/dead/worktree")
+    assert event1["payload"]["orphan_pids"] == [5000, 5001]
+    assert event1["payload"]["killed_orphans"] == [5000, 5001]
+
+    # Check the second event (dead/worker)
+    event2 = next(e for e in orphan_events if e["payload"]["worktree_path"] == "/dead/worker")
+    assert event2["payload"]["orphan_pids"] == [6000]
+    assert event2["payload"]["killed_orphans"] == [6000]
+
+
+def test_sweep_orphan_processes_called_from_production_loop(tmp_path: Path) -> None:
+    """Integration test: verify _sweep_orphan_processes_for_dead_sessions is called from production loop (issue #139)."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create a fake GitHub
+    class FakeGitHubForSweep(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForSweep()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mock _sweep_orphan_processes_for_dead_sessions to track if it's called
+    sweep_called = []
+
+    def mock_sweep(*args, **kwargs):
+        sweep_called.append(True)
+        # Don't actually do anything
+
+    with patch(
+        "charlie_work.workflow._sweep_orphan_processes_for_dead_sessions", side_effect=mock_sweep
+    ):
+        # Run the production loop (loop calls the sweep)
+        app.loop(limit=1)
+
+    # Verify the sweep was called from the production loop
+    assert len(sweep_called) == 1, (
+        "Expected _sweep_orphan_processes_for_dead_sessions to be called from production loop"
+    )
 
 
 def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None:

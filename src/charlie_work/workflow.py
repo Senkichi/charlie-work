@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,7 +50,7 @@ from .state import (
     state_lock,
     utc_now,
 )
-from .process_utils import is_session_stalled, kill_process_tree
+from .process_utils import is_session_stalled, kill_process_tree, sweep_orphan_processes
 
 
 @dataclass(frozen=True)
@@ -226,6 +229,27 @@ def _detect_stalled_sessions(
     return stalled_entries
 
 
+def _kill_orphan_pid(pid: int) -> None:
+    """Best-effort kill of a single orphan PID, cross-platform.
+
+    Mirrors the OS branch used by kill_process_tree: taskkill on Windows,
+    os.kill(SIGKILL) on POSIX. Never raises - callers treat this as best-effort
+    and always record the PID as killed regardless of outcome.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        # Best-effort kill - don't fail if the kill attempt fails
+        pass
+
+
 def _detect_and_handle_stalled_sessions(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig
 ) -> list[dict[str, int]]:
@@ -266,6 +290,15 @@ def _detect_and_handle_stalled_sessions(
             # Kill the process tree (with start-time verification to prevent PID recycling)
             killed_pids = kill_process_tree(w.pid, w.process_start_time)
 
+            # Sweep for orphan processes that survived the tree kill (Windows-only)
+            # This catches detached/daemonized processes (e.g., nohup-style background processes)
+            orphan_pids = sweep_orphan_processes(w.worktree_path)
+            if orphan_pids:
+                # Kill detected orphans to prevent them from running rejected code
+                for orphan_pid in orphan_pids:
+                    _kill_orphan_pid(orphan_pid)
+                    killed_pids.append(orphan_pid)
+
             # Mark the sidecar with failure_kind: stalled (adapter-specific dispatch)
             if w.adapter_kind == "devin":
                 update_session_record_with_failure_classification(
@@ -288,6 +321,7 @@ def _detect_and_handle_stalled_sessions(
                         "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
+                        "orphan_pids": orphan_pids if orphan_pids else None,
                     },
                 )
                 save_state(state_file, state)
@@ -295,6 +329,70 @@ def _detect_and_handle_stalled_sessions(
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
     return stalled_entries
+
+
+def _sweep_orphan_processes_for_dead_sessions(
+    sessions_dir: Path, state_file: Path, config: OrchestratorConfig
+) -> None:
+    """Sweep for orphan processes in worktrees of dead sessions.
+
+    This is called from the production loop to detect and clean up orphaned
+    processes that survived session kills (e.g., detached/daemonized processes
+    like nohup-style background processes). This addresses issue #139.
+
+    On Windows: Uses PowerShell Get-CimInstance Win32_Process to find processes
+    whose CommandLine references the worktree path of dead sessions.
+    On POSIX: Not implemented (returns empty list).
+
+    Detected orphans are killed automatically and logged to state.json.
+    """
+    from .devin_shell import is_session_alive, read_session_records
+    from .claude_code import is_worker_alive, read_worker_records
+
+    # Only run on Windows where the issue occurs
+    if os.name != "nt":
+        return
+
+    # Collect worktree paths of dead sessions
+    dead_worktree_paths: set[str] = set()
+
+    # Check devin-shell sessions
+    for record in read_session_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+        if not is_session_alive(record):
+            dead_worktree_paths.add(record.worktree_path)
+
+    # Check claude-code sessions
+    for record in read_worker_records(sessions_dir):
+        if record.pid is None or record.error is not None:
+            continue
+        if not is_worker_alive(record):
+            dead_worktree_paths.add(record.worktree_path)
+
+    # Sweep for orphans in each dead worktree
+    for worktree_path in dead_worktree_paths:
+        orphan_pids = sweep_orphan_processes(worktree_path)
+        if orphan_pids:
+            # Kill detected orphans
+            killed_orphans = []
+            for orphan_pid in orphan_pids:
+                _kill_orphan_pid(orphan_pid)
+                killed_orphans.append(orphan_pid)
+
+            # Log the event
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "orphan_processes_killed",
+                    {
+                        "worktree_path": worktree_path,
+                        "orphan_pids": orphan_pids,
+                        "killed_orphans": killed_orphans,
+                    },
+                )
+                save_state(state_file, state)
 
 
 def _classify_dead_sessions_and_update_throttle_state(
@@ -1952,6 +2050,10 @@ class OrchestratorApp:
         _classify_dead_sessions_and_update_throttle_state(
             sessions_dir, self.paths.state_file, self.gh, self.config
         )
+
+        # Sweep for orphan processes in dead session worktrees (issue #139)
+        # This catches detached/daemonized processes that survived session kills
+        _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
 
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)

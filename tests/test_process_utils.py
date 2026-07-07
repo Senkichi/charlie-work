@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from charlie_work.process_utils import is_session_stalled, kill_process_tree
+from charlie_work.process_utils import (
+    is_session_stalled,
+    kill_process_tree,
+    sweep_orphan_processes,
+)
 
 
 def test_is_session_stalled_with_old_mtime(tmp_path: Path) -> None:
@@ -130,7 +135,6 @@ def test_kill_process_tree_nonexistent_pid() -> None:
 
 def test_kill_process_tree_start_time_verification() -> None:
     """Test that kill_process_tree verifies start time when provided."""
-    import subprocess
     from unittest.mock import patch
 
     # Spawn a real child process
@@ -235,8 +239,6 @@ def test_kill_process_tree_own_group_guard_posix() -> None:
 
 def test_kill_process_tree_enumerates_children() -> None:
     """Test that kill_process_tree enumerates and includes child PIDs."""
-    import subprocess
-
     # Spawn a real parent process that will spawn a child
     # On POSIX, use start_new_session=True to avoid sharing pytest's process group
     parent_proc = subprocess.Popen(
@@ -281,3 +283,58 @@ def test_kill_process_tree_enumerates_children() -> None:
         if parent_proc.poll() is None:
             parent_proc.terminate()
             parent_proc.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
+def test_sweep_orphan_processes_posix_returns_empty() -> None:
+    """Test that sweep_orphan_processes returns empty list on POSIX."""
+    # On POSIX, the function is not implemented and should return empty list
+    orphans = sweep_orphan_processes("/some/worktree/path")
+    assert orphans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_sweep_orphan_processes_windows_no_powershell() -> None:
+    """Test that sweep_orphan_processes handles missing PowerShell gracefully."""
+    from unittest.mock import patch
+
+    # Mock shutil.which to return None (PowerShell not found)
+    with patch("shutil.which", return_value=None):
+        orphans = sweep_orphan_processes("/some/worktree/path")
+        assert orphans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_sweep_orphan_processes_windows_parsing() -> None:
+    """Test that sweep_orphan_processes parses PowerShell output correctly."""
+    from unittest.mock import patch
+
+    # Mock subprocess.run to return sample PowerShell output
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.stdout = "1234\n5678\n"
+        orphans = sweep_orphan_processes("/some/worktree/path")
+        assert orphans == [1234, 5678]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_sweep_orphan_processes_windows_empty_output() -> None:
+    """Test that sweep_orphan_processes handles empty PowerShell output."""
+    from unittest.mock import patch
+
+    # Mock subprocess.run to return empty output
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.stdout = ""
+        orphans = sweep_orphan_processes("/some/worktree/path")
+        assert orphans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_sweep_orphan_processes_windows_subprocess_error() -> None:
+    """Test that sweep_orphan_processes handles subprocess errors gracefully."""
+    from unittest.mock import patch
+
+    # Mock subprocess.run to raise an exception
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
+        orphans = sweep_orphan_processes("/some/worktree/path")
+        assert orphans == []

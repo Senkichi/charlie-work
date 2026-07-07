@@ -310,3 +310,61 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
         pass
 
     return killed_pids
+
+
+def sweep_orphan_processes(worktree_path: str) -> list[int]:
+    """Sweep for orphan processes whose CommandLine references a worktree path.
+
+    On Windows: Uses PowerShell Get-CimInstance Win32_Process to find processes
+    whose CommandLine contains the worktree path. This catches detached/daemonized
+    processes that survived a process tree kill (e.g., nohup-style background processes).
+
+    On POSIX: Not implemented (returns empty list). POSIX process groups handle
+    detachment better via killpg, and /proc enumeration is more complex.
+
+    This is a read-only detection function. Callers should decide whether to kill
+    the returned PIDs based on policy (e.g., janitor warnings vs. automatic cleanup).
+
+    Args:
+        worktree_path: The worktree path to search for in process CommandLines.
+
+    Returns:
+        A list of PIDs whose CommandLine references the worktree path.
+    """
+    orphans = []
+
+    if os.name != "nt":
+        # POSIX: not implemented - process groups handle detachment better
+        return orphans
+
+    try:
+        import subprocess
+        import shutil
+
+        if not shutil.which("powershell"):
+            return orphans
+
+        # Use PowerShell to query Win32_Process for CommandLine matching the worktree path
+        # We use -like with wildcards for partial matching (handles both forward and backslashes)
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{worktree_path}*" }} | Select-Object -ExpandProperty ProcessId',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        # Parse output: extract PIDs (one per line)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and line.isdigit():
+                orphans.append(int(line))
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        # Best-effort sweep - don't fail if PowerShell fails
+        pass
+
+    return orphans
