@@ -471,9 +471,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                         state = load_state(state_file)
                         entry = state["issues"].get(str(w.issue_number), {})
                         now = datetime.now(UTC)
-                        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
+                        window_start = now - timedelta(
+                            minutes=config.watchdog.redispatch_window_minutes
+                        )
                         prior = [
-                            t for t in entry.get("redispatch_at", [])
+                            t
+                            for t in entry.get("redispatch_at", [])
                             if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
                         ]
                         redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
@@ -484,7 +487,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             entry["escalation_reason"] = "redispatch_cap_exceeded"
                             state["issues"][str(w.issue_number)] = entry
                             save_state(state_file, state)
-                            result = transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                            transition(gh, config.labels, w.issue_number, "redispatch_escalated")
                             state = append_event(
                                 state,
                                 "session_failed_escalated",
@@ -2475,9 +2478,12 @@ class OrchestratorApp:
                 if ok:
                     # Track redispatch count for escalation cap (issue #165)
                     now = datetime.now(UTC)
-                    window_start = now - timedelta(minutes=self.config.watchdog.redispatch_window_minutes)
+                    window_start = now - timedelta(
+                        minutes=self.config.watchdog.redispatch_window_minutes
+                    )
                     prior = [
-                        t for t in entry.get("redispatch_at", [])
+                        t
+                        for t in entry.get("redispatch_at", [])
                         if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
                     ]
                     redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]

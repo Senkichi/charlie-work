@@ -10621,7 +10621,7 @@ def test_build_parser_fleet_subcommand() -> None:
     args_roll_call = parser.parse_args(["roll-call"])
     assert args_roll_call.command == "roll-call"
 
-    args_doctor = parser.parse_args(["doctor"])
+    parser.parse_args(["doctor"])
 
 
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
@@ -10691,7 +10691,6 @@ def test_dispatch_rework_reaps_unconditionally_when_max_concurrent_zero(tmp_path
     assert "_detect_and_handle_stalled_sessions" in dispatch_rework_source
     # Verify it's called before the governor (which has the max_concurrent check)
     reaper_call_pos = dispatch_rework_source.find("_detect_and_handle_stalled_sessions")
-    governor_call_pos = dispatch_rework_source.find("_apply_concurrency_governor")
     assert reaper_call_pos > 0, "Reaper call should exist in dispatch_rework"
     # The reaper call should be before the governor call (unconditional vs gated)
     # This ensures it runs even when max_concurrent_sessions=0
@@ -10764,14 +10763,12 @@ def test_redispatch_within_window_does_not_escalate(tmp_path: Path) -> None:
     }
     save_state(paths.state_file, state)
 
-    # Simulate the redispatch counting logic
-    from charlie_work.workflow import OrchestratorApp
-
     # Test the counting logic directly
     entry = state["issues"]["123"]
     window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
     prior = [
-        t for t in entry.get("redispatch_at", [])
+        t
+        for t in entry.get("redispatch_at", [])
         if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
     ]
     redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
@@ -10815,7 +10812,8 @@ def test_redispatch_exceeding_cap_escalates(tmp_path: Path) -> None:
     entry = state["issues"]["123"]
     window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
     prior = [
-        t for t in entry.get("redispatch_at", [])
+        t
+        for t in entry.get("redispatch_at", [])
         if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
     ]
     redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
@@ -10858,7 +10856,8 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
     entry = state["issues"]["123"]
     window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
     prior = [
-        t for t in entry.get("redispatch_at", [])
+        t
+        for t in entry.get("redispatch_at", [])
         if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
     ]
     redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
@@ -10886,4 +10885,6 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # Total of 4 assignments is correct - 2 in each function for the two code paths (normal vs escalation)
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
     # Should be exactly 4: 2 in dispatch_rework (normal + escalation), 2 in _classify_dead_sessions_and_update_throttle_state (normal + escalation)
-    assert redispatch_assignments == 4, f"Expected 4 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 4, (
+        f"Expected 4 redispatch_at assignments, found {redispatch_assignments}"
+    )
