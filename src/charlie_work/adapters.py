@@ -53,6 +53,12 @@ class AdapterSettings:
     # origin/<default-branch>. Passed to create_worktree for both devin-shell
     # and claude-code adapters.
     base_ref: str = ""
+    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
+    # When enabled, the worker launch command is extended with --output-format stream-json
+    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
+    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
+    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
+    tee_stream_json: bool = False
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,8 @@ def _run_claude_code_adapter(
     kwargs: dict[str, Any] = {}
     if settings.claude_command:
         kwargs["command_template"] = settings.claude_command
+    if settings.tee_stream_json:
+        kwargs["tee_stream_json"] = settings.tee_stream_json
     record = launch_claude_worker(
         request.issue_number,
         request.branch_name,

@@ -14,6 +14,7 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
+from .fleet_registry import count_fleet_live_sessions
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -29,7 +30,13 @@ from .github import (
     linked_issue_number,
     parse_blockers,
 )
-from .janitor import check_operator_containment, run_janitor
+from .janitor import (
+    check_operator_containment,
+    check_test_adequacy,
+    run_janitor,
+    TestAdequacyFacts,
+    TestAdequacyVerdict,
+)
 from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
@@ -67,19 +74,30 @@ class ConcurrencyGovernorResult:
     live_count: int
     available_slots: int
     dispatch_limit: int
+    fleet_live_count: int = 0
+    fleet_max: int = 0
 
     @property
     def enabled(self) -> bool:
         """Return True if the governor is enabled (max_concurrent > 0)."""
         return self.max_concurrent > 0
 
+    @property
+    def fleet_enabled(self) -> bool:
+        """Return True if the fleet governor is enabled (fleet_max > 0)."""
+        return self.fleet_max > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
-        return {
+        fields = {
             "concurrency_limit": self.max_concurrent,
             "live_session_count": self.live_count,
             "available_slots": self.available_slots,
         }
+        if self.fleet_enabled:
+            fields["fleet_concurrency_limit"] = self.fleet_max
+            fields["fleet_live_session_count"] = self.fleet_live_count
+        return fields
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -90,6 +108,67 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
         "\n## Janitor warnings (non-blocking)\n\n"
         f"{lines}\n\n"
         "These deterministic pre-checks passed the gate but deserve reviewer attention.\n"
+    )
+
+
+def render_test_adequacy_section(
+    facts: TestAdequacyFacts | None, warnings: tuple[str, ...]
+) -> str:
+    """Render the $test_adequacy_section packet block from Tier-1 facts.
+
+    Returns "" when facts is None (gate disabled — caller in review() passes
+    None in that case) or when there is nothing to report. Mirrors the
+    _janitor_section pattern: plain function, no I/O, safe to call every pass.
+    """
+    if facts is None:
+        return ""
+    lines = [
+        "## Test-adequacy facts (Tier 1, deterministic)",
+        "",
+        f"- Added product LOC: {facts.added_product_loc}",
+        f"- Added test LOC: {facts.added_test_loc}",
+        f"- Assertion-bearing added test lines: {facts.assertion_count}",
+        f"- Test files changed: {facts.test_files_changed}",
+    ]
+    if facts.untested_product_files:
+        lines.append("- Untested product files: " + ", ".join(facts.untested_product_files))
+    if facts.exempt:
+        lines.append(f'- Test-exempt claim: "{facts.exempt_reason}" (verify against the diff)')
+    if warnings:
+        lines.append("")
+        lines.extend(f"- {warning}" for warning in warnings)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: str) -> str:
+    """Render a test-adequacy hard-fail verdict as actionable reviewer feedback.
+
+    This summary is passed to record_review as the review summary, which is
+    rendered into rework.md. It must read as actionable feedback, not a raw
+    dataclass dump.
+
+    Args:
+        verdict: The hard-fail TestAdequacyVerdict (ok=False).
+        exempt_marker: The exempt marker string from config (e.g., "Test-exempt:").
+
+    Returns:
+        A non-empty templated string with untested product files and exemption
+        instruction.
+    """
+    facts = verdict.facts
+    untested_files = facts.untested_product_files
+    added_loc = facts.added_product_loc
+
+    # Build file list with LOC counts
+    file_list = "\n".join(f"  - {file}" for file in untested_files)
+
+    return (
+        f"Test adequacy check failed: {added_loc} lines of product code added "
+        f"but no test files changed.\n\n"
+        f"Untested product files:\n{file_list}\n\n"
+        f"To exempt this PR from the test-adequacy gate, add "
+        f"'{exempt_marker} <reason>' to the PR body with a clear justification."
     )
 
 
@@ -186,7 +265,7 @@ def _detect_and_handle_stalled_sessions(
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
-    from .worker import iter_workers
+    from .worker import iter_workers, update_worker_log_stat
 
     if not config.watchdog.enabled:
         return []
@@ -200,6 +279,9 @@ def _detect_and_handle_stalled_sessions(
 
         if not w.is_alive():
             continue
+
+        # Update log stat fields for progress tracking
+        update_worker_log_stat(sessions_dir, w)
 
         log_path = Path(w.log_path)
         is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
@@ -328,7 +410,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
-    from .worker import iter_workers
+    from .worker import iter_workers, update_worker_log_stat
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -347,6 +429,9 @@ def _classify_dead_sessions_and_update_throttle_state(
 
     for w in iter_workers(sessions_dir):
         if w.error is None and not w.is_alive():
+            # Update log stat fields for progress tracking (final update before classification)
+            update_worker_log_stat(sessions_dir, w)
+
             # Session exited without error - classify the failure (adapter-specific dispatch)
             if w.adapter_kind == "devin":
                 failure_kind, throttled_until = update_session_record_with_failure_classification(
@@ -365,6 +450,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
+
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            w.reap_sidecar(sessions_dir)
 
             # Issue #118: reconcile labels for dead sessions with no open PR
             if w.issue_number not in open_prs_by_issue:
@@ -419,12 +508,14 @@ class OrchestratorApp:
         gh: GitHub,
         *,
         dry_run: bool = False,
+        fleet_dir_override: str | None = None,
     ):
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
         self.gh = gh
         self.dry_run = dry_run
+        self.fleet_dir_override = fleet_dir_override
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -471,6 +562,7 @@ class OrchestratorApp:
             materialize_dirs=self.config.dispatch.materialize_dirs,
             dry_run=self.dry_run,
             base_ref=self.config.dispatch.base_ref,
+            tee_stream_json=claude.tee_stream_json,
         )
 
     def _apply_concurrency_governor(
@@ -489,8 +581,10 @@ class OrchestratorApp:
                 max_concurrent > 0, this will compute it via _count_live_sessions.
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
+        fleet_max = self.config.fleet.global_max_concurrent_sessions
         available_slots = dispatch_limit
         clamped = False
+        fleet_live_count = 0
 
         if max_concurrent > 0:
             if live_count is None:
@@ -501,12 +595,21 @@ class OrchestratorApp:
                 dispatch_limit = available_slots
                 clamped = True
 
+        if fleet_max > 0:
+            fleet_live_count, _skipped_repos = count_fleet_live_sessions(self.fleet_dir_override)
+            fleet_available = max(0, fleet_max - fleet_live_count)
+            if fleet_available < dispatch_limit:
+                dispatch_limit = fleet_available
+                clamped = True
+
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
             live_count=live_count or 0,
             available_slots=available_slots,
             dispatch_limit=dispatch_limit,
+            fleet_live_count=fleet_live_count,
+            fleet_max=fleet_max,
         )
 
     def status(self) -> CommandResult:
@@ -1087,6 +1190,22 @@ class OrchestratorApp:
         )
 
     def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
+        """Generate a review packet for a PR.
+
+        When config.test_adequacy.enabled, this method may itself issue a
+        request_changes verdict and advance/terminate the rework loop (previously
+        only record_review/verdict did this). When disabled (default), the method
+        never mutates decision state and always returns a packet.
+
+        Args:
+            pr_number: The PR number to review.
+            cross_family: Whether to enable cross-family review (optional).
+
+        Returns:
+            CommandResult with ok=True if a packet was generated, or ok=False if
+            the review was blocked (janitor gate, test-adequacy gate) or the PR
+            was not found.
+        """
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
@@ -1147,10 +1266,34 @@ class OrchestratorApp:
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
+
+        # Tier 1 test-adequacy hard gate (issue #179)
+        test_adequacy_section = ""
+        test_adequacy_verdict = None
+        if self.config.test_adequacy.enabled:
+            test_adequacy_verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
+            if not test_adequacy_verdict.ok:
+                # Same terminal label set as an LLM request_changes:
+                # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
+                #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
+                if issue_number is not None:
+                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                summary = render_test_adequacy_summary(
+                    test_adequacy_verdict, self.config.test_adequacy.exempt_marker
+                )
+                return self.record_review(pr_number, "request_changes", summary=summary)
+            # Gate passed while enabled: add Tier-2 packet section (issue #180)
+            test_adequacy_section = render_test_adequacy_section(
+                test_adequacy_verdict.facts, test_adequacy_verdict.warnings
+            )
+
         # Run containment check for worker edits leaked into operator checkout
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         # Merge containment warnings with janitor warnings
         merged_warnings = tuple(list(verdict.warnings) + list(containment_warnings))
+        # If test-adequacy gate is enabled and passed, merge its warnings too
+        if test_adequacy_verdict is not None:
+            merged_warnings = tuple(list(merged_warnings) + list(test_adequacy_verdict.warnings))
         cross_family_section, cf_result = self._cross_family_for_pr(
             pr=pr,
             issue=issue,
@@ -1175,6 +1318,7 @@ class OrchestratorApp:
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
+                "test_adequacy_section": test_adequacy_section,
                 "decision_command": f"{CLI_NAME} verdict --pr {pr_number} --decision approved --summary-file <path>",
             },
         )

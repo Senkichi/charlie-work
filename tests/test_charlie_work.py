@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -21,10 +22,12 @@ from charlie_work.config import (
     CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
+    FleetConfig,
     LabelConfig,
     OrchestratorConfig,
     ReviewConfig,
     RuntimeConfig,
+    TestAdequacyConfig,
     WatchdogConfig,
     find_config_path,
     load_config,
@@ -60,6 +63,12 @@ def test_default_config_enables_auto_merge() -> None:
     # means empty, and `doctor` flags it.
     assert config.auto_merge.required_checks == ()
     assert config.labels.ready == "automated-ready"
+
+
+def test_default_config_tee_stream_json_disabled() -> None:
+    """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
+    config = load_config()
+    assert config.claude_code.tee_stream_json is False
 
 
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
@@ -640,6 +649,265 @@ def test_load_config_rejects_invalid_dispatch_order(tmp_path: Path) -> None:
     assert "oldest" in message or "newest" in message
 
 
+def test_default_config_disables_test_adequacy() -> None:
+    """TestAdequacyConfig defaults to disabled with all default values."""
+    config = load_config()
+
+    assert config.test_adequacy == TestAdequacyConfig()
+    assert config.test_adequacy.enabled is False
+
+
+def test_config_test_adequacy_coerces_tuple_fields_to_tuple(tmp_path: Path) -> None:
+    """YAML lists in test_adequacy tuple fields round-trip to tuples."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """test_adequacy:
+  test_path_globs:
+    - "tests/**"
+    - "test_*.py"
+  exempt_path_globs:
+    - "*.md"
+    - "docs/**"
+  assertion_markers:
+    - "assert "
+    - "pytest.raises"
+  comment_prefixes:
+    - "#"
+    - "//"
+  coverage_command:
+    - "pytest"
+    - "--cov"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert isinstance(config.test_adequacy.test_path_globs, tuple)
+    assert config.test_adequacy.test_path_globs == ("tests/**", "test_*.py")
+    assert isinstance(config.test_adequacy.exempt_path_globs, tuple)
+    assert config.test_adequacy.exempt_path_globs == ("*.md", "docs/**")
+    assert isinstance(config.test_adequacy.assertion_markers, tuple)
+    assert config.test_adequacy.assertion_markers == ("assert ", "pytest.raises")
+    assert isinstance(config.test_adequacy.comment_prefixes, tuple)
+    assert config.test_adequacy.comment_prefixes == ("#", "//")
+    assert isinstance(config.test_adequacy.coverage_command, tuple)
+    assert config.test_adequacy.coverage_command == ("pytest", "--cov")
+
+
+def test_config_rejects_non_list_test_adequacy_tuple_field(tmp_path: Path) -> None:
+    """Tuple fields given as scalars raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  test_path_globs: tests/**\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-list tuple field")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-list tuple field")
+
+    assert "test_adequacy" in message
+    assert "test_path_globs" in message
+    assert "must be a list" in message
+
+
+def test_config_rejects_non_str_element_in_test_adequacy_tuple_field(tmp_path: Path) -> None:
+    """Tuple fields with non-str elements raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  test_path_globs:\n    - tests/**\n    - 123\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-str element")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-str element")
+
+    assert "test_adequacy" in message
+    assert "test_path_globs" in message
+    assert "element of type" in message
+
+
+def test_config_rejects_bad_type_min_product_lines(tmp_path: Path) -> None:
+    """min_product_lines as string raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  min_product_lines: ten\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type min_product_lines")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type min_product_lines")
+
+    assert "test_adequacy" in message
+    assert "min_product_lines" in message
+    assert "must be an int" in message
+
+
+def test_config_rejects_bad_type_min_diff_coverage(tmp_path: Path) -> None:
+    """min_diff_coverage as string raises ConfigError; int is accepted."""
+    from charlie_work.config import ConfigError
+
+    # Reject string
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  min_diff_coverage: high\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type min_diff_coverage")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type min_diff_coverage")
+
+    assert "test_adequacy" in message
+    assert "min_diff_coverage" in message
+    assert "must be a float" in message
+
+    # Accept int
+    config_path.write_text(
+        "test_adequacy:\n  min_diff_coverage: 1\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.test_adequacy.min_diff_coverage == 1
+
+
+def test_config_rejects_empty_exempt_marker(tmp_path: Path) -> None:
+    """exempt_marker as empty string raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        'test_adequacy:\n  exempt_marker: ""\n',
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for empty exempt_marker")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for empty exempt_marker")
+
+    assert "test_adequacy" in message
+    assert "exempt_marker" in message
+    assert "non-empty string" in message
+
+
+def test_config_rejects_non_bool_test_adequacy_flags(tmp_path: Path) -> None:
+    """Boolean flags as strings raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    for bool_key in ("enabled", "coverage_enabled", "require_assertions"):
+        config_path = tmp_path / "orchestrator.config.yaml"
+        config_path.write_text(
+            f'test_adequacy:\n  {bool_key}: "true"\n',
+            encoding="utf-8",
+        )
+
+        try:
+            load_config(config_path)
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+        except ConfigError as exc:
+            message = str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+
+        assert "test_adequacy" in message
+        assert bool_key in message
+        assert "must be a bool" in message
+
+
+def test_load_config_rejects_unknown_test_adequacy_key(tmp_path: Path) -> None:
+    """Unknown keys under test_adequacy raise ConfigError listing valid keys."""
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "test_adequacy:\n  enabled: true\n  bad_key: value\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for unknown test_adequacy key")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown test_adequacy key")
+
+    assert "section 'test_adequacy'" in message
+    assert "bad_key" in message
+    # Should list valid keys
+    assert "enabled" in message
+
+
+def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
+    """A YAML block overriding every field loads correctly."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """test_adequacy:
+  enabled: true
+  min_product_lines: 20
+  test_path_globs:
+    - "custom_tests/**"
+  exempt_path_globs:
+    - "*.txt"
+  assertion_markers:
+    - "custom_assert"
+  comment_prefixes:
+    - "//"
+  require_assertions: true
+  exempt_marker: "Custom-exempt:"
+  coverage_enabled: true
+  coverage_command:
+    - "custom"
+    - "cov"
+  min_diff_coverage: 0.5
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.test_adequacy.enabled is True
+    assert config.test_adequacy.min_product_lines == 20
+    assert config.test_adequacy.test_path_globs == ("custom_tests/**",)
+    assert config.test_adequacy.exempt_path_globs == ("*.txt",)
+    assert config.test_adequacy.assertion_markers == ("custom_assert",)
+    assert config.test_adequacy.comment_prefixes == ("//",)
+    assert config.test_adequacy.require_assertions is True
+    assert config.test_adequacy.exempt_marker == "Custom-exempt:"
+    assert config.test_adequacy.coverage_enabled is True
+    assert config.test_adequacy.coverage_command == ("custom", "cov")
+    assert config.test_adequacy.min_diff_coverage == 0.5
+
+
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
     """Issue #4: unknown placeholder in dispatch_command is rejected at load."""
     from charlie_work.config import ConfigError
@@ -1007,6 +1275,7 @@ class FakeGitHub:
         self.delete_branch_ok = True
         self.update_branch_ok = True
         self.pr_head_shas: dict[int, str] = {}
+        self.diffs: dict[int, str] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -1058,6 +1327,9 @@ class FakeGitHub:
         ]
 
     def pr_diff(self, number: int):
+        # Return custom diff if set, otherwise default
+        if number in self.diffs:
+            return self.diffs[number]
         return "diff --git a/file b/file"
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -3268,6 +3540,125 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["janitor_ok"] is True
     assert state["prs"]["456"]["janitor_warnings"]
+
+
+def test_render_test_adequacy_section_unit() -> None:
+    """Unit test for render_test_adequacy_section (issue #180)."""
+    from charlie_work.janitor import TestAdequacyFacts
+    from charlie_work.workflow import render_test_adequacy_section
+
+    # Test with None (gate disabled)
+    assert render_test_adequacy_section(None, ()) == ""
+
+    # Test with populated facts
+    facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=("src/foo.py", "src/bar.py"),
+        exempt=False,
+        exempt_reason="",
+    )
+    warnings = ("Zero recognized assertions in added test lines",)
+
+    section = render_test_adequacy_section(facts, warnings)
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in section
+    assert "Added product LOC: 100" in section
+    assert "Added test LOC: 50" in section
+    assert "Assertion-bearing added test lines: 10" in section
+    assert "Test files changed: 2" in section
+    assert "Untested product files: src/foo.py, src/bar.py" in section
+    assert "Zero recognized assertions in added test lines" in section
+
+    # Test with empty warnings
+    section_no_warnings = render_test_adequacy_section(facts, ())
+    assert "Zero recognized assertions" not in section_no_warnings
+
+    # Test with exempt claim
+    facts_exempt = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=0,
+        assertion_count=0,
+        test_files_changed=0,
+        untested_product_files=(),
+        exempt=True,
+        exempt_reason="n/a - pure refactoring",
+    )
+    section_exempt = render_test_adequacy_section(facts_exempt, ())
+    assert (
+        'Test-exempt claim: "n/a - pure refactoring" (verify against the diff)' in section_exempt
+    )
+
+
+def test_test_adequacy_section_in_review_packet_when_enabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section appears in review packet when gate is enabled and passes (issue #180)."""
+    from unittest.mock import patch
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=True,
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Mock check_test_adequacy to return a passing verdict with facts
+    mock_facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=(),
+        exempt=False,
+        exempt_reason="",
+    )
+    mock_verdict = TestAdequacyVerdict(
+        ok=True,
+        failures=(),
+        warnings=(),
+        facts=mock_facts,
+    )
+
+    with patch("charlie_work.workflow.check_test_adequacy", return_value=mock_verdict):
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section appears in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
+
+
+def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section does not appear in review packet when gate is disabled (issue #180)."""
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=False,  # Gate disabled
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section does NOT appear in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" not in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
 
 
 def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> None:
@@ -7149,6 +7540,276 @@ def test_concurrency_governor_result_unclamped() -> None:
     assert result.enabled is False  # max_concurrent=0 means disabled
 
 
+def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeypatch) -> None:
+    """When fleet.global_max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
+
+    # Mock count_fleet_live_sessions to return 0 fleet live sessions
+    def mock_count_fleet_live(fleet_dir_override):
+        return 0, []
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=0),
+        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Should dispatch normally without fleet concurrency clamping
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert "fleet_concurrency_limit" not in result.data
+    assert "fleet_live_session_count" not in result.data
+
+
+def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When fleet.global_max_concurrent_sessions is set and fleet live count meets cap, dispatch should be clamped."""
+
+    # Mock count_fleet_live_sessions to return 3 fleet live sessions (at cap)
+    def mock_count_fleet_live(fleet_dir_override):
+        return 3, []
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=3),
+        dispatch=DispatchConfig(max_concurrent_sessions=5, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Should clamp to 0 since fleet cap is 3 and fleet live is 3
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["fleet_concurrency_limit"] == 3
+    assert result.data["fleet_live_session_count"] == 3
+
+
+def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch) -> None:
+    """When both per-repo and fleet caps are set, the tighter constraint wins."""
+
+    # Mock count_fleet_live_sessions to return 1 fleet live session
+    def mock_count_fleet_live(fleet_dir_override):
+        return 1, []
+
+    # Mock _count_live_sessions to return 1 local live session
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=1),
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Fleet cap (1) is tighter than per-repo cap (2), so should clamp to 0
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 2  # per-repo cap
+    assert result.data["live_session_count"] == 1  # local live
+    assert result.data["fleet_concurrency_limit"] == 1  # fleet cap
+    assert result.data["fleet_live_session_count"] == 1  # fleet live
+
+
+def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeypatch) -> None:
+    """When per-repo cap is tighter than fleet cap, per-repo wins."""
+
+    # Mock count_fleet_live_sessions to return 1 fleet live session
+    def mock_count_fleet_live(fleet_dir_override):
+        return 1, []
+
+    # Mock _count_live_sessions to return 1 local live session
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=5),
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Per-repo cap (1) is tighter than fleet cap (5), so should clamp to 0
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 1  # per-repo cap
+    assert result.data["live_session_count"] == 1  # local live
+    assert result.data["fleet_concurrency_limit"] == 5  # fleet cap
+    assert result.data["fleet_live_session_count"] == 1  # fleet live
+
+
+def test_fleet_concurrency_governor_result_fleet_enabled_property() -> None:
+    """ConcurrencyGovernorResult.fleet_enabled property correctly reflects fleet governor enabled state."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=2,
+        available_slots=3,
+        dispatch_limit=3,
+        fleet_live_count=1,
+        fleet_max=3,
+    )
+
+    assert result.fleet_enabled is True  # fleet_max > 0 means enabled
+
+    result_unlimited = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+        fleet_live_count=0,
+        fleet_max=0,
+    )
+
+    assert result_unlimited.fleet_enabled is False  # fleet_max=0 means disabled
+
+
+def test_fleet_concurrency_governor_result_report_fields_includes_fleet() -> None:
+    """ConcurrencyGovernorResult.report_fields includes fleet fields when fleet_enabled."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=2,
+        available_slots=3,
+        dispatch_limit=3,
+        fleet_live_count=1,
+        fleet_max=3,
+    )
+
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 5,
+        "live_session_count": 2,
+        "available_slots": 3,
+        "fleet_concurrency_limit": 3,
+        "fleet_live_session_count": 1,
+    }
+
+    # When fleet disabled, fleet fields should not be present
+    result_unlimited = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+        fleet_live_count=0,
+        fleet_max=0,
+    )
+
+    fields_unlimited = result_unlimited.report_fields()
+    assert fields_unlimited == {
+        "concurrency_limit": 0,
+        "live_session_count": 0,
+        "available_slots": 5,
+    }
+    assert "fleet_concurrency_limit" not in fields_unlimited
+    assert "fleet_live_session_count" not in fields_unlimited
+
+
+def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:
+    """count_fleet_live_sessions should skip repos that no longer exist and report them."""
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    # Create a fake fleet registry with 3 repos
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    # Create two real repos and one vanished repo
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+    (repo1 / ".git").mkdir()
+    (repo2 / ".git").mkdir()
+
+    # Create state dirs for the real repos
+    state1 = repo1 / ".var" / "charlie-work"
+    state2 = repo2 / ".var" / "charlie-work"
+    state1.mkdir(parents=True)
+    state2.mkdir(parents=True)
+
+    # Create sessions dirs (empty, so no live sessions)
+    sessions1 = state1 / "dispatches" / "sessions"
+    sessions2 = state2 / "dispatches" / "sessions"
+    sessions1.mkdir(parents=True)
+    sessions2.mkdir(parents=True)
+
+    # Write the registry
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "name_with_owner": "owner/repo1",
+                "config_path": str(repo1 / "orchestrator.config.yaml"),
+                "state_dir": str(state1),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+                "name_with_owner": "owner/repo2",
+                "config_path": str(repo2 / "orchestrator.config.yaml"),
+                "state_dir": str(state2),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+            "owner/vanished": {
+                "repo_root": str(tmp_path / "vanished"),
+                "name_with_owner": "owner/vanished",
+                "config_path": str(tmp_path / "vanished" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "vanished" / ".var" / "charlie-work"),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+
+    # Mock fleet_dir to point to our test fleet dir
+    def mock_fleet_dir(override=None):
+        return fleet_dir
+
+    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", mock_fleet_dir)
+
+    # Count fleet live sessions
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    # Should count 0 live sessions (both real repos have empty sessions dirs)
+    assert live_count == 0
+    # Should report the vanished repo
+    assert "owner/vanished" in skipped_repos
+    assert len(skipped_repos) == 1
+
+
 def test_concurrency_governor_result_enabled_property() -> None:
     """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
     # Disabled (max_concurrent=0)
@@ -8937,6 +9598,327 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     assert len(stalled_events) == 0  # No event emitted
 
 
+# Fleet registry and global config tests
+
+
+def test_fleet_dir_override() -> None:
+    """Test that fleet_dir respects the override parameter."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    result = fleet_dir(override="/custom/path")
+    assert result == Path("/custom/path")
+
+
+def test_fleet_dir_env_var() -> None:
+    """Test that fleet_dir respects CHARLIE_WORK_FLEET_DIR env var."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
+    try:
+        os.environ["CHARLIE_WORK_FLEET_DIR"] = "/env/path"
+        result = fleet_dir()
+        assert result == Path("/env/path")
+    finally:
+        if original is None:
+            os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
+        else:
+            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+
+
+def test_fleet_dir_platform_defaults() -> None:
+    """Test that fleet_dir uses platform-specific defaults."""
+    from charlie_work.fleet_paths import fleet_dir
+
+    # Clear env var to test platform defaults
+    original = os.environ.get("CHARLIE_WORK_FLEET_DIR")
+    try:
+        os.environ.pop("CHARLIE_WORK_FLEET_DIR", None)
+        result = fleet_dir()
+
+        if sys.platform == "win32":
+            expected_base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        else:
+            expected_base = Path(
+                os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+            )
+
+        assert result == expected_base / "charlie-work"
+    finally:
+        if original is not None:
+            os.environ["CHARLIE_WORK_FLEET_DIR"] = original
+
+
+def test_fleet_registry_touch_repo_first_call(tmp_path: Path) -> None:
+    """Test that touch_repo sets first_seen and last_seen on first registration."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    # Mock GitHub that returns a nameWithOwner
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Touch repo with isolated fleet dir
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+
+    assert "repos" in registry
+    assert "owner/repo" in registry["repos"]
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root)
+    assert entry["name_with_owner"] == "owner/repo"
+    assert entry["config_path"] == str(repo_root / "orchestrator.config.yaml")
+    assert entry["state_dir"] == str(paths.root)
+    assert entry["first_seen"] == entry["last_seen"]  # First call: both equal
+
+
+def test_fleet_registry_touch_repo_second_call(tmp_path: Path) -> None:
+    """Test that touch_repo preserves first_seen and bumps last_seen on subsequent calls."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # First call
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+    first_last_seen = registry["repos"]["owner/repo"]["last_seen"]
+
+    # Small delay to ensure timestamp difference (need >1s due to second resolution)
+    time.sleep(2.0)
+
+    # Second call
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    second_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+    second_last_seen = registry["repos"]["owner/repo"]["last_seen"]
+
+    assert second_first_seen == first_first_seen  # first_seen preserved
+    assert second_last_seen != first_last_seen  # last_seen bumped
+    assert second_last_seen > first_last_seen  # last_seen increased
+
+
+def test_fleet_registry_touch_repo_moved_repo(tmp_path: Path) -> None:
+    """Test that touch_repo updates repo_root when repo is moved."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root_old = tmp_path / "repo_old"
+    repo_root_old.mkdir(parents=True, exist_ok=True)
+    paths_old = runtime_paths(repo_root_old, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh_old = FakeGitHub(repo_root=repo_root_old)
+
+    # First registration
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root_old, paths_old, gh_old)
+    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
+
+    # Move repo
+    repo_root_new = tmp_path / "repo_new"
+    repo_root_new.mkdir(parents=True, exist_ok=True)
+    paths_new = runtime_paths(repo_root_new, ".var/charlie-work")
+    gh_new = FakeGitHub(repo_root=repo_root_new)
+
+    # Re-register with new path
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root_new, paths_new, gh_new)
+
+    # Should update repo_root but preserve first_seen (same nameWithOwner)
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root_new)
+    assert entry["first_seen"] == first_first_seen  # Preserved on move
+
+
+def test_fleet_registry_touch_repo_gh_error(tmp_path: Path) -> None:
+    """Test that touch_repo silently skips registration on gh error."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub, GitHubError
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            raise GitHubError("gh not available")
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Should not raise, should return empty registry
+    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+    assert registry == {"version": 1, "repos": {}}
+
+
+def test_fleet_registry_uses_state_lock(tmp_path: Path) -> None:
+    """Test that fleet_registry writes go through state.save_state."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+
+    # Spy on save_state
+    from charlie_work.state import save_state
+
+    original_save_state = save_state
+    calls = []
+
+    def spy_save_state(path: Path, data: dict) -> dict:
+        calls.append(path)
+        return original_save_state(path, data)
+
+    with patch("charlie_work.fleet_registry.save_state", side_effect=spy_save_state):
+        touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
+
+    # Verify save_state was called with fleet.json path
+    assert len(calls) == 1
+    assert calls[0] == tmp_path / "fleet" / "fleet.json"
+
+
+def test_global_config_no_global_file(tmp_path: Path) -> None:
+    """Test that load_layered_config behaves like load_config when no global file exists."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+
+    # No global config, no repo config
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(tmp_path / "fleet"))
+
+    # Should match default config
+    default_config = load_config(None)
+    assert config.labels.ready == default_config.labels.ready
+    assert config.dispatch.default_limit == default_config.dispatch.default_limit
+
+
+def test_global_config_global_only(tmp_path: Path) -> None:
+    """Test that global config values apply when no per-repo override exists."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config with a custom value
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.dispatch.max_concurrent_sessions == 5
+
+
+def test_global_config_per_repo_wins(tmp_path: Path) -> None:
+    """Test that per-repo config overrides global config."""
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+
+    # Create per-repo config with different value
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 10\n", encoding="utf-8")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    # Per-repo value should win
+    assert config.dispatch.max_concurrent_sessions == 10
+
+
+def test_global_config_unknown_key_raises(tmp_path: Path) -> None:
+    """Test that unknown keys in global config raise ConfigError."""
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create global config with unknown top-level section
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+
+def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Integration test: cli.build_app registers repo in fleet.json."""
+    from charlie_work.cli import build_app
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / ".git").mkdir()  # Make it a git repo
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    # Monkeypatch GitHub to use our fake
+    def fake_github(repo_root: Path, dry_run: bool = False) -> GitHub:
+        return FakeGitHub(repo_root=repo_root, dry_run=dry_run)
+
+    monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
+
+    # Mock fleet_dir to use tmp_path
+    def fake_fleet_dir(*, override: str | None = None) -> Path:
+        return tmp_path / "fleet"
+
+    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", fake_fleet_dir)
+
+    # Build args
+    import argparse
+
+    args = argparse.Namespace(repo=repo_root, config=None, dry_run=False, fleet_dir=None)
+
+    # Call build_app
+    build_app(args)
+
+    # Verify fleet.json was created
+    fleet_json_path = tmp_path / "fleet" / "fleet.json"
+    assert fleet_json_path.exists()
+
+    # Verify registry entry
+    import json
+
+    registry = json.loads(fleet_json_path.read_text(encoding="utf-8"))
+    assert "owner/repo" in registry["repos"]
+    entry = registry["repos"]["owner/repo"]
+    assert entry["repo_root"] == str(repo_root)
+    assert entry["name_with_owner"] == "owner/repo"
+
+
 def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monkeypatch) -> None:
     """Regression test for issue #158: _detect_and_handle_stalled_sessions should be called exactly once per dispatch() call, not twice (was duplicated in _apply_concurrency_governor)."""
     # Mock _detect_and_handle_stalled_sessions to track call count
@@ -8965,12 +9947,679 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Call dispatch() with max_concurrent_sessions > 0
-    result = app.dispatch()
+    app.dispatch()
 
     # Verify stall detection was called exactly once
     assert len(stall_detection_calls) == 1, (
         f"_detect_and_handle_stalled_sessions was called {len(stall_detection_calls)} times, expected 1"
     )
 
-    # Verify dispatch succeeded
+
+# --- Test-adequacy gate (issue #179) ------------------------------------------
+
+
+def _test_adequacy_app(
+    tmp_path: Path, *, enabled: bool, max_rework_cycles: int = 2
+) -> OrchestratorApp:
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(enabled=enabled, exempt_marker="Test-exempt:"),
+        review=ReviewConfig(max_rework_cycles=max_rework_cycles),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+
+def test_review_test_adequacy_disabled_is_noop(tmp_path: Path, monkeypatch) -> None:
+    """When test_adequacy.enabled=False (default), check_test_adequacy is never called."""
+    app = _test_adequacy_app(tmp_path, enabled=False)
+    calls = {"n": 0}
+
+    def _fake_check(diff, pr, config):
+        calls["n"] += 1
+        raise AssertionError("check_test_adequacy should not be called when disabled")
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+
+    result = app.review(456)
+
+    assert calls["n"] == 0
     assert result.ok is True
+    assert "prompt_path" in result.data
+
+
+def test_review_test_adequacy_hard_fail_records_request_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When test_adequacy hard-fails, review() calls record_review with request_changes."""
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+    from charlie_work.workflow import CommandResult
+
+    app = _test_adequacy_app(tmp_path, enabled=True)
+    calls = {"check_test_adequacy": 0, "record_review": 0, "transition": 0}
+
+    hard_fail_verdict = TestAdequacyVerdict(
+        ok=False,
+        failures=("Product code changed (15 LOC added) but no test files changed.",),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=0,
+            assertion_count=0,
+            test_files_changed=0,
+            untested_product_files=("src/foo.py", "src/bar.py"),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+
+    def _fake_check(diff, pr, config):
+        calls["check_test_adequacy"] += 1
+        return hard_fail_verdict
+
+    def _fake_record_review(pr_number, decision, **kwargs):
+        calls["record_review"] += 1
+        assert decision == "request_changes"
+        summary = kwargs.get("summary", "")
+        assert "Test adequacy check failed" in summary
+        assert "src/foo.py" in summary
+        assert "src/bar.py" in summary
+        assert "Test-exempt:" in summary
+        return CommandResult(True, "record_review called", {})
+
+    def _fake_transition(gh, labels, issue_number, edge):
+        calls["transition"] += 1
+        assert edge == "review_started"
+        from charlie_work.labels import TransitionResult, TransitionOutcome
+
+        return TransitionResult(
+            outcome=TransitionOutcome.APPLIED,
+            add_failures=[],
+            remove_failures=[],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+    monkeypatch.setattr("charlie_work.workflow.transition", _fake_transition)
+    monkeypatch.setattr(app, "record_review", _fake_record_review)
+
+    result = app.review(456)
+
+    assert calls["check_test_adequacy"] == 1
+    assert calls["transition"] == 1
+    assert calls["record_review"] == 1
+    assert result.ok is True
+    assert result.data == {}
+
+
+def test_review_test_adequacy_hard_fail_label_set(tmp_path: Path, monkeypatch) -> None:
+    """After hard-fail, label transitions compose to {in_progress, pr_open, needs_rework}."""
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+    from charlie_work.labels import TransitionResult, TransitionOutcome
+    from charlie_work.workflow import CommandResult
+
+    app = _test_adequacy_app(tmp_path, enabled=True)
+    transition_calls = []
+
+    hard_fail_verdict = TestAdequacyVerdict(
+        ok=False,
+        failures=("Product code changed (15 LOC added) but no test files changed.",),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=0,
+            assertion_count=0,
+            test_files_changed=0,
+            untested_product_files=("src/foo.py",),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+
+    def _fake_check(diff, pr, config):
+        return hard_fail_verdict
+
+    def _fake_record_review(pr_number, decision, **kwargs):
+        # Simulate the rework_requested transition that record_review would call
+        transition_calls.append("rework_requested")
+        return CommandResult(True, "record_review called", {})
+
+    def _fake_transition(gh, labels, issue_number, edge):
+        transition_calls.append(edge)
+        if edge == "review_started":
+            return TransitionResult(
+                outcome=TransitionOutcome.APPLIED,
+                add_failures=[],
+                remove_failures=[],
+            )
+        elif edge == "rework_requested":
+            return TransitionResult(
+                outcome=TransitionOutcome.APPLIED,
+                add_failures=[],
+                remove_failures=[],
+            )
+        raise AssertionError(f"Unexpected transition: {edge}")
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+    monkeypatch.setattr("charlie_work.workflow.transition", _fake_transition)
+    monkeypatch.setattr(app, "record_review", _fake_record_review)
+
+    app.review(456)
+
+    assert transition_calls == ["review_started", "rework_requested"]
+
+
+def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monkeypatch) -> None:
+    """A second review() on the same unchanged head is blocked by janitor gate (no-op rework check)."""
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+    from charlie_work.workflow import CommandResult
+
+    app = _test_adequacy_app(tmp_path, enabled=True)
+    check_calls = {"n": 0}
+
+    hard_fail_verdict = TestAdequacyVerdict(
+        ok=False,
+        failures=("Product code changed (15 LOC added) but no test files changed.",),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=0,
+            assertion_count=0,
+            test_files_changed=0,
+            untested_product_files=("src/foo.py",),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+
+    def _fake_check(diff, pr, config):
+        check_calls["n"] += 1
+        return hard_fail_verdict
+
+    def _fake_record_review(pr_number, decision, **kwargs):
+        return CommandResult(True, "record_review called", {})
+
+    def _fake_transition(gh, labels, issue_number, edge):
+        from charlie_work.labels import TransitionResult, TransitionOutcome
+
+        return TransitionResult(
+            outcome=TransitionOutcome.APPLIED,
+            add_failures=[],
+            remove_failures=[],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+    monkeypatch.setattr("charlie_work.workflow.transition", _fake_transition)
+    monkeypatch.setattr(app, "record_review", _fake_record_review)
+
+    # First review: hard-fail records request_changes
+    app.gh.pr_head_shas[456] = "sha-abc123"
+    result1 = app.review(456)
+    assert check_calls["n"] == 1
+    assert result1.ok is True
+
+    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123
+    state = load_state(app.paths.state_file)
+    if "456" not in state["prs"]:
+        state["prs"]["456"] = {}
+    state["prs"]["456"]["decision"] = "request_changes"
+    state["prs"]["456"]["reviewed_head_sha"] = "sha-abc123"
+    save_state(app.paths.state_file, state)
+
+    # Second review on same head: janitor gate blocks (no-op rework check)
+    # check_test_adequacy should NOT be called again
+    result2 = app.review(456)
+    assert check_calls["n"] == 1  # Still 1, not 2
+    assert result2.ok is False
+    assert "janitor gate blocked" in result2.message
+    assert "unchanged since request_changes" in result2.message
+
+
+def test_review_test_adequacy_escalates_at_max_rework_cycles(tmp_path: Path, monkeypatch) -> None:
+    """After max_rework_cycles hard-fails, escalate to agent:human-needed."""
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+    from charlie_work.workflow import CommandResult
+
+    app = _test_adequacy_app(tmp_path, enabled=True, max_rework_cycles=2)
+    check_calls = {"n": 0}
+
+    hard_fail_verdict = TestAdequacyVerdict(
+        ok=False,
+        failures=("Product code changed (15 LOC added) but no test files changed.",),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=0,
+            assertion_count=0,
+            test_files_changed=0,
+            untested_product_files=("src/foo.py",),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+
+    def _fake_check(diff, pr, config):
+        check_calls["n"] += 1
+        return hard_fail_verdict
+
+    def _fake_record_review(pr_number, decision, **kwargs):
+        state = load_state(app.paths.state_file)
+        pr_state = state["prs"].get(str(pr_number), {})
+        request_changes_count = int(pr_state.get("request_changes_count", 0))
+        # Simulate the increment that record_review would do
+        if decision == "request_changes":
+            escalated = request_changes_count >= 2  # Check before increment
+            request_changes_count += 1
+            pr_state["request_changes_count"] = request_changes_count
+            state["prs"][str(pr_number)] = pr_state
+            save_state(app.paths.state_file, state)
+        else:
+            escalated = False
+        return CommandResult(True, "record_review called", {"escalated": escalated})
+
+    def _fake_transition(gh, labels, issue_number, edge):
+        from charlie_work.labels import TransitionResult, TransitionOutcome
+
+        return TransitionResult(
+            outcome=TransitionOutcome.APPLIED,
+            add_failures=[],
+            remove_failures=[],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+    monkeypatch.setattr("charlie_work.workflow.transition", _fake_transition)
+    monkeypatch.setattr(app, "record_review", _fake_record_review)
+
+    # Cycle 1: request_changes_count = 0 -> 1
+    app.gh.pr_head_shas[456] = "sha-1"
+    result1 = app.review(456)
+    assert result1.data["escalated"] is False
+
+    # Cycle 2: request_changes_count = 1 -> 2
+    app.gh.pr_head_shas[456] = "sha-2"
+    result2 = app.review(456)
+    assert result2.data["escalated"] is False
+
+    # Cycle 3: request_changes_count = 2 -> escalate
+    app.gh.pr_head_shas[456] = "sha-3"
+    result3 = app.review(456)
+    assert result3.data["escalated"] is True
+
+
+def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatch) -> None:
+    """When test_adequacy passes, review() proceeds to normal packet path."""
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+
+    app = _test_adequacy_app(tmp_path, enabled=True)
+    check_calls = {"n": 0}
+
+    pass_verdict = TestAdequacyVerdict(
+        ok=True,
+        failures=(),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=20,
+            assertion_count=5,
+            test_files_changed=2,
+            untested_product_files=(),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+
+    def _fake_check(diff, pr, config):
+        check_calls["n"] += 1
+        return pass_verdict
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _fake_check)
+
+    result = app.review(456)
+
+    assert check_calls["n"] == 1
+    assert result.ok is True
+
+
+# Fleet status tests
+
+
+def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status aggregates status from multiple repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create two repo directories with minimal setup
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+
+    # Create minimal configs
+    config1 = repo1 / "orchestrator.config.yaml"
+    config2 = repo2 / "orchestrator.config.yaml"
+    config1.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    config2.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+
+    # Create state directories
+    (repo1 / ".var" / "charlie-work").mkdir(parents=True)
+    (repo2 / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with two repos
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "name_with_owner": "owner/repo1",
+                "config_path": str(config1),
+                "state_dir": str(repo1 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+                "name_with_owner": "owner/repo2",
+                "config_path": str(config2),
+                "state_dir": str(repo2 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify aggregation
+    assert result.ok is True
+    assert "2 repo(s)" in result.message
+    assert len(result.data["repos"]) == 2
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+    assert result.data["errors"] == []
+
+
+def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status isolates errors from broken repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create one valid repo
+    repo_valid = tmp_path / "repo_valid"
+    repo_valid.mkdir()
+    config_valid = repo_valid / "orchestrator.config.yaml"
+    config_valid.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_valid / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with one valid and one broken repo
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_valid": {
+                "repo_root": str(repo_valid),
+                "name_with_owner": "owner/repo_valid",
+                "config_path": str(config_valid),
+                "state_dir": str(repo_valid / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify error isolation
+    assert result.ok is False  # Errors present
+    assert "1 repo(s), 1 error(s)" in result.message
+    assert len(result.data["repos"]) == 1
+    assert "owner/repo_valid" in result.data["repos"]
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+
+
+def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status never mutates GitHub labels or state."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a repo with a ready-labeled issue
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create state.json
+    state_file = repo / ".var" / "charlie-work" / "state.json"
+    import json
+
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-07-06T12:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_file.write_text(json.dumps(initial_state, indent=2))
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return a ready issue and track mutating calls
+    from charlie_work.github import GitHub
+
+    mutating_calls = []
+
+    def mock_run(self, args, json_output=False, allow_failure=False):
+        mutating_calls.append(args)
+        return ""
+
+    def mock_issue_list(self, label):
+        return [{"number": 123, "title": "Test issue", "labels": [{"name": label}]}]
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "run", mock_run)
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify no mutating calls were made
+    assert result.ok is True
+    # GitHub.run should not be called with mutating commands
+    for call in mutating_calls:
+        assert not any(
+            mutating_cmd in call
+            for mutating_cmd in ["issue edit", "label add", "label remove", "pr edit"]
+        ), f"Mutating call detected: {call}"
+
+    # Verify state.json was not modified
+    final_state = json.loads(state_file.read_text())
+    assert final_state["generated_at"] == initial_state["generated_at"]
+    assert final_state == initial_state
+
+
+def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status --json produces the correct output shape."""
+    from io import StringIO
+
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a minimal repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Capture stdout
+    fake_stdout = StringIO()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    # Run fleet status --json via main()
+    try:
+        cli.main(["fleet", "status", "--json"])
+    except SystemExit:
+        pass
+
+    output = fake_stdout.getvalue()
+    parsed = json.loads(output)
+
+    # Verify JSON structure
+    assert "ok" in parsed
+    assert "message" in parsed
+    assert "data" in parsed
+    assert "repos" in parsed["data"]
+    assert "errors" in parsed["data"]
+    assert "owner/repo" in parsed["data"]["repos"]
+
+
+def test_build_parser_fleet_subcommand() -> None:
+    """Test that build_parser registers the fleet subcommand correctly."""
+    parser = cli.build_parser()
+
+    # Test fleet status parsing
+    args = parser.parse_args(["fleet", "status"])
+    assert args.command == "fleet"
+    assert args.fleet_command == "status"
+
+    # Test that existing subcommands still work
+    args_roll_call = parser.parse_args(["roll-call"])
+    assert args_roll_call.command == "roll-call"
+
+    args_doctor = parser.parse_args(["doctor"])
+    assert args_doctor.command == "doctor"

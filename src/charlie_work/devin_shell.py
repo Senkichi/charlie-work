@@ -88,6 +88,8 @@ class SessionRecord:
     failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
+    last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
+    log_bytes: int | None = None  # log_path.stat().st_size
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -110,6 +112,8 @@ class SessionRecord:
             failure_kind=payload.get("failure_kind"),
             process_start_time=payload.get("process_start_time"),
             reclaimed=payload.get("reclaimed"),
+            last_activity_at=payload.get("last_activity_at"),
+            log_bytes=payload.get("log_bytes"),
         )
 
 
@@ -598,4 +602,5 @@ __all__ = [
     "is_session_alive",
     "update_session_record_with_failure_classification",
     "_get_process_start_time",
+    "_sidecar_path",
 ]

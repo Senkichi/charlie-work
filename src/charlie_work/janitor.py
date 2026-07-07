@@ -8,15 +8,21 @@ consensus (see docs/design/extraction-dossier.md, "Deterministic, non-LLM
 verification before spending review budget") is to verify cheap, concrete
 signals before ever routing to the adversarial LLM reviewer.
 
-This module is pure: no I/O, no `gh` calls. The caller (``workflow.review``)
-already fetches ``pr`` (``gh pr view`` JSON) and ``checks`` (``gh pr checks``
-JSON) for packet generation, so it feeds that same data in here first.
+The `run_janitor` gate functions themselves are pure: no I/O, no ``gh``
+calls. The caller (``workflow.review``) already fetches ``pr`` (``gh pr
+view`` JSON) and ``checks`` (``gh pr checks`` JSON) for packet generation, so
+it feeds that same data in here first. The module as a whole is not pure,
+however: `_check_no_op_rework`, `_get_unpushed_commit_info`, and
+`check_operator_containment` shell out to `git` via `subprocess.run` to
+compare worktree/branch state against the PR diff.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,7 +31,7 @@ from charlie_work.checks import summarize_checks
 from charlie_work.github import linked_issue_number
 
 if TYPE_CHECKING:
-    from charlie_work.config import OrchestratorConfig
+    from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
 
 
 # Case-insensitive word-boundary regex for tests/rationale markers.
@@ -74,6 +80,29 @@ class JanitorVerdict:
     ok: bool
     failures: tuple[str, ...]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TestAdequacyFacts:
+    __test__ = False  # Prevent pytest from collecting this as a test class
+
+    added_product_loc: int
+    added_test_loc: int
+    assertion_count: int
+    test_files_changed: int
+    untested_product_files: tuple[str, ...]
+    exempt: bool
+    exempt_reason: str
+
+
+@dataclass(frozen=True)
+class TestAdequacyVerdict:
+    __test__ = False  # Prevent pytest from collecting this as a test class
+
+    ok: bool
+    failures: tuple[str, ...]
+    warnings: tuple[str, ...]
+    facts: TestAdequacyFacts
 
 
 def run_janitor(
@@ -401,6 +430,206 @@ def _get_unpushed_commit_info(
         return None
 
 
+def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
+    """Split a unified diff into per-file hunk bodies.
+
+    Yields ``(filename, is_new_file, hunk_lines)`` for each file section in
+    ``diff``, where ``hunk_lines`` is every ``@@``-header and hunk-body line
+    for that file (diff-metadata lines starting with ``\\`` are dropped).
+    Sections with no discoverable ``+++ b/`` path are skipped. This performs
+    structural splitting only — it does not tally added/removed lines or
+    inspect hunk content beyond locating file/hunk boundaries; line counting
+    is the caller's responsibility (see ``check_test_adequacy`` in a later
+    module addition).
+    """
+    sections = diff.split("\ndiff --git")
+    for section in sections:
+        if not section.strip():
+            continue
+        if not section.startswith("diff --git"):
+            section = "diff --git" + section
+
+        current_file: str | None = None
+        current_hunks: list[str] = []
+        is_new_file = False
+
+        for line in section.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+            elif line.startswith("new file mode"):
+                is_new_file = True
+            elif line.startswith("@@"):
+                current_hunks.append(line)
+            elif current_hunks:
+                if not line.startswith("\\"):
+                    current_hunks.append(line)
+
+        if current_file is not None:
+            yield current_file, is_new_file, current_hunks
+
+
+def check_test_adequacy(
+    diff: str, pr: dict[str, Any], config: TestAdequacyConfig
+) -> TestAdequacyVerdict:
+    """Check test adequacy of a PR diff.
+
+    Pure function: no I/O, no ``gh`` calls, no subprocess. Never raises —
+    any exception returns an ``ok=True`` verdict with a warning.
+
+    Detects the "pure skip" failure mode (product code changed, zero test files
+    touched) deterministically, and routes the fuzzier "tests present but zero
+    recognized assertions" case to a warning for Tier 2 to judge.
+    """
+    # Default facts (all zero/empty) for exemption or parse failure
+    default_facts = TestAdequacyFacts(
+        added_product_loc=0,
+        added_test_loc=0,
+        assertion_count=0,
+        test_files_changed=0,
+        untested_product_files=(),
+        exempt=False,
+        exempt_reason="",
+    )
+
+    try:
+        # Step 1: Parse the diff using the shared hunk parser
+        added_product_loc = 0
+        added_test_loc = 0
+        assertion_count = 0
+        test_files_changed = 0
+        untested_product_files: list[str] = []
+
+        files_parsed = False
+        for filename, is_new_file, hunk_lines in iter_diff_files(diff):
+            files_parsed = True
+            # Step 2: Partition file into test/product/exempt
+            # test_path_globs wins over exempt_path_globs on overlap
+            is_test = any(fnmatch.fnmatch(filename, glob) for glob in config.test_path_globs)
+            is_exempt = any(fnmatch.fnmatch(filename, glob) for glob in config.exempt_path_globs)
+
+            if is_test:
+                test_files_changed += 1
+            elif is_exempt:
+                continue  # Skip exempt files entirely
+            else:
+                # Product file
+                pass
+
+            # Step 3: Count added lines
+            file_added_loc = 0
+            for line in hunk_lines:
+                # Added line: starts with '+' and not '+++'
+                if line.startswith("+") and not line.startswith("+++"):
+                    # Check if blank/comment
+                    stripped = line[1:].strip()  # Remove the '+' prefix
+                    if stripped and not any(
+                        stripped.startswith(prefix) for prefix in config.comment_prefixes
+                    ):
+                        file_added_loc += 1
+                        # Step 4: Count assertions in test files
+                        if is_test:
+                            if any(marker in line for marker in config.assertion_markers):
+                                assertion_count += 1
+
+            if is_test:
+                added_test_loc += file_added_loc
+            else:
+                added_product_loc += file_added_loc
+                if file_added_loc > 0:
+                    untested_product_files.append(filename)
+
+        # If no files were parsed, the diff is malformed or binary
+        # Exception: non-empty diff with no files parsed could be a rename-only diff
+        # (100% similarity, no hunk body), which should pass with 0 added lines
+        if not files_parsed:
+            if diff.strip() and "diff --git" in diff:
+                # Valid diff format but no hunks (e.g., rename-only)
+                return TestAdequacyVerdict(ok=True, failures=(), warnings=(), facts=default_facts)
+            else:
+                # Malformed or binary diff
+                return TestAdequacyVerdict(
+                    ok=True,
+                    failures=(),
+                    warnings=("diff unparseable — test-adequacy skipped",),
+                    facts=default_facts,
+                )
+
+        # Step 5: Exemption check
+        exempt = False
+        exempt_reason = ""
+        body = pr.get("body") or ""
+        exempt_re = re.compile(rf"^{re.escape(config.exempt_marker)}\s*(?P<reason>.+)$", re.M)
+        match = exempt_re.search(body)
+        if match:
+            reason = match.group("reason").strip()
+            if reason:  # Non-empty reason required
+                exempt = True
+                exempt_reason = reason
+
+        facts = TestAdequacyFacts(
+            added_product_loc=added_product_loc,
+            added_test_loc=added_test_loc,
+            assertion_count=assertion_count,
+            test_files_changed=test_files_changed,
+            untested_product_files=tuple(untested_product_files),
+            exempt=exempt,
+            exempt_reason=exempt_reason,
+        )
+
+        # Step 6: Verdict
+        if exempt:
+            return TestAdequacyVerdict(ok=True, failures=(), warnings=(), facts=facts)
+
+        failures: list[str] = []
+        warnings: list[str] = []
+
+        if added_product_loc >= config.min_product_lines and test_files_changed == 0:
+            # Hard fail: pure skip
+            failures.append(
+                f"Product code changed ({added_product_loc} LOC added) but no test files changed. "
+                f"Untested product files: {', '.join(untested_product_files)}. "
+                f"Add tests or use '{config.exempt_marker} <reason>' in the PR body to exempt."
+            )
+            return TestAdequacyVerdict(
+                ok=False, failures=tuple(failures), warnings=(), facts=facts
+            )
+
+        if (
+            added_product_loc >= config.min_product_lines
+            and test_files_changed > 0
+            and assertion_count == 0
+        ):
+            if config.require_assertions:
+                # Hard fail: zero assertions when required
+                failures.append(
+                    f"Test files changed ({test_files_changed}) but zero recognized assertions found. "
+                    f"Configure assertion_markers for your assertion style or use '{config.exempt_marker} <reason>' to exempt."
+                )
+                return TestAdequacyVerdict(
+                    ok=False, failures=tuple(failures), warnings=(), facts=facts
+                )
+            else:
+                # Warn: possibly hollow tests
+                warnings.append(
+                    f"Test files changed ({test_files_changed}) but zero recognized assertions found. "
+                    f"Tests may be hollow (over-mocked, tautological, or using custom assertion helpers). "
+                    f"Configure assertion_markers or set require_assertions=True to hard-fail this case."
+                )
+
+        return TestAdequacyVerdict(
+            ok=True, failures=tuple(failures), warnings=tuple(warnings), facts=facts
+        )
+
+    except Exception:
+        # Never raise — return a safe default on any error
+        return TestAdequacyVerdict(
+            ok=True,
+            failures=(),
+            warnings=("diff unparseable — test-adequacy skipped",),
+            facts=default_facts,
+        )
+
+
 def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:
     """Check for worker edits leaked into the operator checkout.
 
@@ -506,40 +735,10 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
     pr_file_hunks: dict[str, str] = {}
     pr_new_files: set[str] = set()
 
-    # Split the diff into sections (each file starts with "diff --git")
-    sections = pr_diff.split("\ndiff --git")
-    for section in sections:
-        if not section.strip():
-            continue
-
-        # Re-add the "diff --git" prefix that was stripped by split
-        if not section.startswith("diff --git"):
-            section = "diff --git" + section
-
-        # Extract the file path from the +++ line
-        current_file: str | None = None
-        current_hunks: list[str] = []
-        is_new_file = False
-
-        for line in section.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:]  # Strip "+++ b/" prefix
-            elif line.startswith("new file mode"):
-                is_new_file = True
-            elif line.startswith("@@"):
-                # Start of a hunk - include the hunk header
-                current_hunks.append(line)
-            elif current_hunks:
-                # Include all hunk lines (context, additions, deletions)
-                # Skip diff metadata lines (starting with \)
-                if not line.startswith("\\"):
-                    current_hunks.append(line)
-
-        # Save the file's hunks
-        if current_file is not None:
-            pr_file_hunks[current_file] = "\n".join(current_hunks)
-            if is_new_file:
-                pr_new_files.add(current_file)
+    for filename, is_new_file, hunk_lines in iter_diff_files(pr_diff):
+        pr_file_hunks[filename] = "\n".join(hunk_lines)
+        if is_new_file:
+            pr_new_files.add(filename)
 
     # Check each dirty file against the PR's hunks
     leaked_files: list[str] = []
