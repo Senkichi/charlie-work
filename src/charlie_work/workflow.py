@@ -6,7 +6,7 @@ import re
 import signal
 import subprocess
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -465,6 +465,42 @@ def _classify_dead_sessions_and_update_throttle_state(
                 issue_labels = label_names(issue)
                 active_labels = issue_labels & config.labels.active
                 if active_labels:
+                    # Track redispatch count for escalation cap (issue #165)
+                    # This relabel-to-ready path is a redispatch event
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        entry = state["issues"].get(str(w.issue_number), {})
+                        now = datetime.now(UTC)
+                        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
+                        prior = [
+                            t for t in entry.get("redispatch_at", [])
+                            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                        ]
+                        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                        if len(redispatch_at) > config.watchdog.max_auto_redispatch:
+                            # Escalate to human review instead of relabeling to ready
+                            entry["status"] = "escalated"
+                            entry["redispatch_at"] = redispatch_at
+                            entry["escalation_reason"] = "redispatch_cap_exceeded"
+                            state["issues"][str(w.issue_number)] = entry
+                            save_state(state_file, state)
+                            result = transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                            state = append_event(
+                                state,
+                                "session_failed_escalated",
+                                {
+                                    "issue_number": w.issue_number,
+                                    "failure_kind": failure_kind,
+                                    "removed_labels": sorted(active_labels),
+                                    "redispatch_count": len(redispatch_at),
+                                },
+                            )
+                            save_state(state_file, state)
+                            continue
+                        else:
+                            entry["redispatch_at"] = redispatch_at
+                            state["issues"][str(w.issue_number)] = entry
+                            save_state(state_file, state)
                     # Remove all active labels (error-as-value)
                     for label in sorted(active_labels):
                         gh.remove_issue_label(w.issue_number, label)
@@ -2033,6 +2069,10 @@ class OrchestratorApp:
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
         # pr_list (newest-first) merge order would land PRs in the wrong order.
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Unconditional sweep: reap stalled/orphaned sessions even when this pass
+        # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
+        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
@@ -2154,6 +2194,11 @@ class OrchestratorApp:
                 "rework dispatch skipped for manual adapter",
                 {"adapter": "manual", "selected_count": 0},
             )
+
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Unconditional reaper call, matching dispatch()'s :773-775 — previously
+        # this only ran when max_concurrent_sessions > 0 via the governor at :2189.
+        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -2427,24 +2472,60 @@ class OrchestratorApp:
                 }
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
-                state["issues"][str(request.issue_number)] = entry
-                save_state(self.paths.state_file, state)
                 if ok:
-                    result = transition(
-                        self.gh,
-                        self.config.labels,
-                        request.issue_number,
-                        "rework_dispatched",
-                    )
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        entry["label_error"] = {
-                            "edge": "rework_dispatched",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                        label_errors.append(request.issue_number)
+                    # Track redispatch count for escalation cap (issue #165)
+                    now = datetime.now(UTC)
+                    window_start = now - timedelta(minutes=self.config.watchdog.redispatch_window_minutes)
+                    prior = [
+                        t for t in entry.get("redispatch_at", [])
+                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                    ]
+                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
+                        # Escalate to human review
+                        entry["status"] = "escalated"
+                        entry["redispatch_at"] = redispatch_at
+                        entry["escalation_reason"] = "redispatch_cap_exceeded"
+                        state["issues"][str(request.issue_number)] = entry
                         save_state(self.paths.state_file, state)
+                        result = transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "redispatch_escalated",
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            entry["label_error"] = {
+                                "edge": "redispatch_escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                            label_errors.append(request.issue_number)
+                            save_state(self.paths.state_file, state)
+                        continue
+                    else:
+                        entry["redispatch_at"] = redispatch_at
+                        state["issues"][str(request.issue_number)] = entry
+                        save_state(self.paths.state_file, state)
+                        result = transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "rework_dispatched",
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            entry["label_error"] = {
+                                "edge": "rework_dispatched",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                            label_errors.append(request.issue_number)
+                            save_state(self.paths.state_file, state)
+                else:
+                    state["issues"][str(request.issue_number)] = entry
+                    save_state(self.paths.state_file, state)
             state = append_event(
                 state,
                 "dispatch_rework",

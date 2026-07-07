@@ -264,6 +264,8 @@ class WatchdogConfig:
 
     enabled: bool = True
     stall_minutes: int = 20
+    redispatch_window_minutes: int = 240
+    max_auto_redispatch: int = 3
 
 
 @dataclass(frozen=True)
