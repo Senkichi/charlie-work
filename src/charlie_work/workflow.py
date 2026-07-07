@@ -11,6 +11,7 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
+from .fleet_registry import count_fleet_live_sessions
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -70,19 +71,30 @@ class ConcurrencyGovernorResult:
     live_count: int
     available_slots: int
     dispatch_limit: int
+    fleet_live_count: int = 0
+    fleet_max: int = 0
 
     @property
     def enabled(self) -> bool:
         """Return True if the governor is enabled (max_concurrent > 0)."""
         return self.max_concurrent > 0
 
+    @property
+    def fleet_enabled(self) -> bool:
+        """Return True if the fleet governor is enabled (fleet_max > 0)."""
+        return self.fleet_max > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
-        return {
+        fields = {
             "concurrency_limit": self.max_concurrent,
             "live_session_count": self.live_count,
             "available_slots": self.available_slots,
         }
+        if self.fleet_enabled:
+            fields["fleet_concurrency_limit"] = self.fleet_max
+            fields["fleet_live_session_count"] = self.fleet_live_count
+        return fields
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -392,12 +404,14 @@ class OrchestratorApp:
         gh: GitHub,
         *,
         dry_run: bool = False,
+        fleet_dir_override: str | None = None,
     ):
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
         self.gh = gh
         self.dry_run = dry_run
+        self.fleet_dir_override = fleet_dir_override
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -462,8 +476,10 @@ class OrchestratorApp:
                 max_concurrent > 0, this will compute it via _count_live_sessions.
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
+        fleet_max = self.config.fleet.global_max_concurrent_sessions
         available_slots = dispatch_limit
         clamped = False
+        fleet_live_count = 0
 
         if max_concurrent > 0:
             if live_count is None:
@@ -474,12 +490,21 @@ class OrchestratorApp:
                 dispatch_limit = available_slots
                 clamped = True
 
+        if fleet_max > 0:
+            fleet_live_count, _skipped_repos = count_fleet_live_sessions(self.fleet_dir_override)
+            fleet_available = max(0, fleet_max - fleet_live_count)
+            if fleet_available < dispatch_limit:
+                dispatch_limit = fleet_available
+                clamped = True
+
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
             live_count=live_count or 0,
             available_slots=available_slots,
             dispatch_limit=dispatch_limit,
+            fleet_live_count=fleet_live_count,
+            fleet_max=fleet_max,
         )
 
     def status(self) -> CommandResult:
