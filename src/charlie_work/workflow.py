@@ -15,6 +15,7 @@ from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions
+from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -497,6 +498,85 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     from .worker import iter_workers
 
     return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+
+
+def _build_attention_digest(
+    state_file: Path,
+    health_transitions: dict[int, dict[str, Any]],
+    repo: str,
+) -> AttentionDigest | None:
+    """Build an AttentionDigest from health transitions observed in a pass.
+
+    Args:
+        state_file: Path to state.json for reading/writing per-issue health baseline
+        health_transitions: Dict mapping issue_number to transition data:
+            {
+                issue_number: {
+                    "adapter_kind": str,
+                    "health": str,  # current health (e.g., "STALLED", "RUNAWAY", "DEAD")
+                    "previous_health": str | None,
+                    "last_log_line": str | None,
+                    "pid": int | None,
+                }
+            }
+        repo: Repository name for the digest
+
+    Returns:
+        AttentionDigest if there are transitions, None otherwise. Updates per-issue
+        health field in state.json to the current health for transition comparison
+        on the next pass.
+    """
+    if not health_transitions:
+        return None
+
+    from .state import load_state, save_state, state_lock
+    from .state import utc_now
+
+    entries: list[AttentionEntry] = []
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+
+        for issue_number, transition in health_transitions.items():
+            current_health = transition["health"]
+            previous_health = transition.get("previous_health")
+
+            # Read the last persisted health for this issue
+            issue_key = str(issue_number)
+            issue_entry = state.get("issues", {}).get(issue_key, {})
+            last_health = issue_entry.get("health")
+
+            # Only include if health changed (or no previous health persisted)
+            if last_health != current_health:
+                entries.append(
+                    AttentionEntry(
+                        issue_number=issue_number,
+                        adapter_kind=transition["adapter_kind"],
+                        health=current_health,
+                        previous_health=last_health,
+                        last_log_line=transition.get("last_log_line"),
+                        pid=transition.get("pid"),
+                    )
+                )
+
+                # Update the persisted health for this issue
+                state["issues"][issue_key] = {
+                    **issue_entry,
+                    "health": current_health,
+                }
+
+        # Save the updated health baselines
+        if entries:
+            save_state(state_file, state)
+
+    if not entries:
+        return None
+
+    return AttentionDigest(
+        generated_at=utc_now(),
+        repo=repo,
+        transitions=tuple(entries),
+    )
 
 
 class OrchestratorApp:
@@ -1183,6 +1263,27 @@ class OrchestratorApp:
         }
         if gov.clamped:
             data.update(gov.report_fields())
+
+        # Emit notification digest if there are health transitions (stalled sessions)
+        # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
+        if stalled_entries and self.config.notify.enabled:
+            health_transitions: dict[int, dict[str, Any]] = {}
+            for entry in stalled_entries:
+                health_transitions[entry["issue"]] = {
+                    "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                    "health": "STALLED",
+                    "previous_health": None,
+                    "last_log_line": None,
+                    "pid": entry.get("pid"),
+                }
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         return CommandResult(
             not failed_issue_numbers,
             message,
@@ -2055,6 +2156,28 @@ class OrchestratorApp:
         # This catches detached/daemonized processes that survived session kills
         _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
 
+        # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
+        stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
+        health_transitions: dict[int, dict[str, Any]] = {}
+        for entry in stalled_entries:
+            health_transitions[entry["issue"]] = {
+                "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                "health": "STALLED",
+                "previous_health": None,
+                "last_log_line": None,
+                "pid": entry.get("pid"),
+            }
+
+        # Emit notification digest if there are health transitions
+        if health_transitions and self.config.notify.enabled:
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
         fresh_limit = max(0, effective_limit - rework_count)
@@ -2477,6 +2600,29 @@ class OrchestratorApp:
         }
         if gov.clamped:
             data.update(gov.report_fields())
+
+        # Emit notification digest if there are health transitions (stalled sessions)
+        # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
+        if stalled_entries and self.config.notify.enabled:
+            health_transitions: dict[int, dict[str, Any]] = {}
+            for entry in stalled_entries:
+                health_transitions[entry["issue"]] = {
+                    "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                    "health": "STALLED",
+                    "previous_health": None,
+                    "last_log_line": None,
+                    "pid": entry.get("pid"),
+                }
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         return CommandResult(
             not failed_issue_numbers,
             message,
