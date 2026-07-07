@@ -51,6 +51,8 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         "escalated": ((labels.human_needed,), (labels.reviewing,)),
         "blocked": ((labels.human_needed,), ()),
         "merged": ((labels.done,), tuple(sorted(labels.active))),
+        # redispatch cap exhausted — a human decision is needed
+        "redispatch_escalated": ((labels.human_needed,), tuple(sorted(labels.active))),
     }
 
 
