@@ -10,6 +10,7 @@ from .fleet_paths import fleet_dir
 from .github import GitHub, GitHubError
 from .paths import RuntimePaths
 from .state import save_state, state_lock
+from .worker import iter_workers
 
 logger = logging.getLogger(__name__)
 
@@ -110,3 +111,74 @@ def touch_repo(
         data["repos"] = repos
 
         return save_state(fleet_json_path, data)
+
+
+def count_fleet_live_sessions(
+    fleet_dir_override: str | None,
+) -> tuple[int, list[str]]:
+    """Count live worker sessions across all registered repos in the fleet.
+
+    Reads the fleet registry, iterates over each registered repo, resolves its
+    sessions_dir, and counts live workers using the adapter-agnostic iter_workers
+    from worker.py. Tolerates vanished/moved repo dirs by skipping them and
+    returning a list of skipped repo keys for operator visibility.
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+
+    Returns:
+        A tuple of (total_live_count, skipped_repos) where skipped_repos is a
+        list of name_with_owner keys whose repo_root no longer exists or is not
+        a git worktree.
+    """
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    data = _load_registry(fleet_json_path)
+    repos = data.get("repos", {})
+
+    total_live_count = 0
+    skipped_repos: list[str] = []
+
+    for name_with_owner, entry in repos.items():
+        repo_root_str = entry.get("repo_root")
+        if not repo_root_str:
+            continue
+
+        repo_root = Path(repo_root_str)
+
+        # Skip if repo_root no longer exists
+        if not repo_root.exists():
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: repo_root {repo_root} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        # Skip if not a git worktree (basic sanity check)
+        if not (repo_root / ".git").exists():
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: repo_root {repo_root} is not a git worktree"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        # Resolve sessions_dir from the registry entry's state_dir
+        # The state_dir is the .var/charlie-work root for that repo
+        state_dir = Path(entry.get("state_dir", ""))
+        if not state_dir.exists():
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: state_dir {state_dir} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        sessions_dir = state_dir / "dispatches" / "sessions"
+        if not sessions_dir.exists():
+            # No sessions dir means no live sessions for this repo
+            continue
+
+        # Count live workers using adapter-agnostic iter_workers
+        workers = iter_workers(sessions_dir, repo_key=name_with_owner)
+        live_count = sum(1 for worker in workers if worker.is_alive())
+        total_live_count += live_count
+
+    return total_live_count, skipped_repos

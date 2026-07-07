@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument("--fleet-dir", type=str, default=None, help="Override fleet directory path")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("roll-call")
@@ -116,20 +117,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
-    touch_repo(None, repo_root, paths, gh)
-    return OrchestratorApp(repo_root, paths, config, gh, dry_run=args.dry_run)
+    touch_repo(args.fleet_dir, repo_root, paths, gh)
+    return OrchestratorApp(repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir)
 
 
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config_path = find_config_path(repo_root, args.config)
-    config = load_layered_config(repo_root, args.config)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
-    touch_repo(None, repo_root, paths, gh)
+    touch_repo(args.fleet_dir, repo_root, paths, gh)
     ok, checks = run_doctor(
         repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe, live=args.live
     )

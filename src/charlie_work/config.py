@@ -293,6 +293,19 @@ class TestAdequacyConfig:
 
 
 @dataclass(frozen=True)
+class FleetConfig:
+    """Fleet-wide configuration for multi-repo coordination.
+
+    ``global_max_concurrent_sessions`` caps total live worker sessions across
+    all registered repos. Default 0 (unlimited) preserves current per-repo-only
+    behavior. This addresses worker-count oversubscription only; CPU/RAM
+    oversubscription via xdist requires operator discipline (see RUNBOOK.md).
+    """
+
+    global_max_concurrent_sessions: int = 0
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -304,6 +317,7 @@ class OrchestratorConfig:
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
+    fleet: FleetConfig = field(default_factory=FleetConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -527,6 +541,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             )
 
     test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
+    fleet_data = _section(data, "fleet")
+    global_max = fleet_data.get("global_max_concurrent_sessions")
+    if global_max is not None and not isinstance(global_max, int):
+        raise ConfigError(
+            "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
+            f"int, got {type(global_max).__name__}"
+        )
+    fleet = _build_section(FleetConfig, "fleet", fleet_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -538,4 +560,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         cross_family=cross_family,
         watchdog=watchdog,
         test_adequacy=test_adequacy,
+        fleet=fleet,
     )
