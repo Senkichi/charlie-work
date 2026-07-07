@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -48,7 +49,11 @@ def parse_proc_stat_starttime(stat_text: str) -> int | None:
         return None
 
 
-def is_session_stalled(log_path: Path, stall_threshold_minutes: int) -> tuple[bool, str | None]:
+def is_session_stalled(
+    log_path: Path,
+    stall_threshold_minutes: int,
+    terminal_error_markers: Sequence[str] | None = None,
+) -> tuple[bool, str | None]:
     """Check if a session is stalled based on log file mtime and terminal error markers.
 
     A session is stalled if:
@@ -56,6 +61,12 @@ def is_session_stalled(log_path: Path, stall_threshold_minutes: int) -> tuple[bo
     2. The log ends with a terminal error marker (e.g., "Error: A tool was rejected")
 
     Returns a tuple of (is_stalled, last_log_line).
+
+    Args:
+        log_path: Path to the log file
+        stall_threshold_minutes: Minutes of log inactivity to consider stalled
+        terminal_error_markers: List of terminal error marker strings. If None, uses
+            the default hardcoded list for backward compatibility.
     """
     if not log_path.exists():
         return False, None
@@ -77,10 +88,14 @@ def is_session_stalled(log_path: Path, stall_threshold_minutes: int) -> tuple[bo
 
         # Terminal error markers that indicate a dead agent regardless of mtime
         # Anchored to known-fatal shapes to avoid false positives from retry messages
-        terminal_error_patterns = [
-            "Error: A tool was rejected",
-            "Error: Agent error:",  # Devin fatal prefix
-        ]
+        if terminal_error_markers is None:
+            # Default hardcoded list for backward compatibility
+            terminal_error_patterns = [
+                "Error: A tool was rejected",
+                "Error: Agent error:",  # Devin fatal prefix
+            ]
+        else:
+            terminal_error_patterns = terminal_error_markers
 
         has_terminal_error = False
         if last_log_line:

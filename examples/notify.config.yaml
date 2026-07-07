@@ -1,0 +1,31 @@
+# charlie-work notify config — pluggable needs-attention notification sinks.
+# Copy to your repo root as `orchestrator.config.yaml` and add this section.
+# This section is additive and disabled by default — omit it or set enabled: false
+# for zero behavior change.
+
+notify:
+  # Enable the notification layer. Default false (no notifications).
+  enabled: false
+
+  # Sink type: "webhook" | "desktop" | "shell" | "file"
+  sink: file
+
+  # Webhook sink: POST digest JSON to this URL (timeout 10s).
+  # Non-2xx responses or errors return ok=False and never fail the pass.
+  # webhook_url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+
+  # Desktop sink: OS-native toast notification.
+  # Windows: PowerShell toast (Windows.UI.Notifications) or msg.exe fallback.
+  # POSIX: notify-send if present, else ok=False.
+  # No additional config needed for desktop sink.
+
+  # Shell sink: Run this command with digest JSON as the final argument.
+  # Command is a tuple (no shell string injection surface). Timeout 30s.
+  # Non-zero exit returns ok=False and never fails the pass.
+  # Example: ["jq", ".transitions[].issue_number"]
+  # shell_command: []
+
+  # File sink: Append digest as JSONL to this path (default shown).
+  # Append-mode writes are safe for single-writer JSONL (no read-modify-write).
+  # Each line is independently json.loads-able.
+  file_path: .var/charlie-work/notify/digest.jsonl

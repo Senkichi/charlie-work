@@ -6,7 +6,7 @@ import re
 import signal
 import subprocess
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions
+from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -50,7 +51,8 @@ from .state import (
     state_lock,
     utc_now,
 )
-from .process_utils import is_session_stalled, kill_process_tree, sweep_orphan_processes
+from .process_utils import kill_process_tree, sweep_orphan_processes
+from .worker import WorkerHealth
 
 
 @dataclass(frozen=True)
@@ -205,25 +207,23 @@ def _detect_stalled_sessions(
 
     Returns a list of {issue, pid} dicts for stalled sessions.
     """
-    from .worker import iter_workers
+    from datetime import UTC, datetime
+    from .worker import classify_worker_health, iter_workers
 
     if not config.watchdog.enabled:
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    stall_threshold = config.watchdog.stall_minutes
+    now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        if not w.is_alive():
-            continue
+        health = classify_worker_health(w, config, now)
 
-        log_path = Path(w.log_path)
-        is_stalled, _ = is_session_stalled(log_path, stall_threshold)
-
-        if is_stalled:
+        # Both STALLED and DEAD are considered "stalled" for reporting purposes
+        if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
     return stalled_entries
@@ -265,28 +265,25 @@ def _detect_and_handle_stalled_sessions(
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
-    from .worker import iter_workers, update_worker_log_stat
+    from .worker import classify_worker_health, iter_workers, update_worker_log_stat
 
     if not config.watchdog.enabled:
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    stall_threshold = config.watchdog.stall_minutes
+    now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        if not w.is_alive():
-            continue
-
         # Update log stat fields for progress tracking
         update_worker_log_stat(sessions_dir, w)
 
-        log_path = Path(w.log_path)
-        is_stalled, last_log_line = is_session_stalled(log_path, stall_threshold)
+        health = classify_worker_health(w, config, now)
 
-        if is_stalled:
+        # Both STALLED and DEAD are considered "stalled" for handling purposes
+        if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
             # Kill the process tree (with start-time verification to prevent PID recycling)
             killed_pids = kill_process_tree(w.pid, w.process_start_time)
 
@@ -310,6 +307,16 @@ def _detect_and_handle_stalled_sessions(
                 )
 
             # Log the event
+            log_path = Path(w.log_path)
+            last_log_line = None
+            try:
+                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                lines = log_text.splitlines()
+                if lines:
+                    last_log_line = lines[-1].strip()
+            except OSError:
+                pass
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
@@ -465,6 +472,45 @@ def _classify_dead_sessions_and_update_throttle_state(
                 issue_labels = label_names(issue)
                 active_labels = issue_labels & config.labels.active
                 if active_labels:
+                    # Track redispatch count for escalation cap (issue #165)
+                    # This relabel-to-ready path is a redispatch event
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        entry = state["issues"].get(str(w.issue_number), {})
+                        now = datetime.now(UTC)
+                        window_start = now - timedelta(
+                            minutes=config.watchdog.redispatch_window_minutes
+                        )
+                        prior = [
+                            t
+                            for t in entry.get("redispatch_at", [])
+                            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                        ]
+                        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                        if len(redispatch_at) > config.watchdog.max_auto_redispatch:
+                            # Escalate to human review instead of relabeling to ready
+                            entry["status"] = "escalated"
+                            entry["redispatch_at"] = redispatch_at
+                            entry["escalation_reason"] = "redispatch_cap_exceeded"
+                            state["issues"][str(w.issue_number)] = entry
+                            save_state(state_file, state)
+                            transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                            state = append_event(
+                                state,
+                                "session_failed_escalated",
+                                {
+                                    "issue_number": w.issue_number,
+                                    "failure_kind": failure_kind,
+                                    "removed_labels": sorted(active_labels),
+                                    "redispatch_count": len(redispatch_at),
+                                },
+                            )
+                            save_state(state_file, state)
+                            continue
+                        else:
+                            entry["redispatch_at"] = redispatch_at
+                            state["issues"][str(w.issue_number)] = entry
+                            save_state(state_file, state)
                     # Remove all active labels (error-as-value)
                     for label in sorted(active_labels):
                         gh.remove_issue_label(w.issue_number, label)
@@ -497,6 +543,83 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     from .worker import iter_workers
 
     return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+
+
+def _build_attention_digest(
+    state_file: Path,
+    health_transitions: dict[int, dict[str, Any]],
+    repo: str,
+) -> AttentionDigest | None:
+    """Build an AttentionDigest from health transitions observed in a pass.
+
+    Args:
+        state_file: Path to state.json for reading/writing per-issue health baseline
+        health_transitions: Dict mapping issue_number to transition data:
+            {
+                issue_number: {
+                    "adapter_kind": str,
+                    "health": str,  # current health (e.g., "STALLED", "RUNAWAY", "DEAD")
+                    "last_log_line": str | None,
+                    "pid": int | None,
+                }
+            }
+        repo: Repository name for the digest
+
+    Returns:
+        AttentionDigest if there are transitions, None otherwise. Updates per-issue
+        health field in state.json to the current health for transition comparison
+        on the next pass.
+    """
+    if not health_transitions:
+        return None
+
+    from .state import load_state, save_state, state_lock
+    from .state import utc_now
+
+    entries: list[AttentionEntry] = []
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+
+        for issue_number, transition in health_transitions.items():
+            current_health = transition["health"]
+
+            # Read the last persisted health for this issue
+            issue_key = str(issue_number)
+            issue_entry = state.get("issues", {}).get(issue_key, {})
+            last_health = issue_entry.get("health")
+
+            # Only include if health changed (or no previous health persisted)
+            if last_health != current_health:
+                entries.append(
+                    AttentionEntry(
+                        issue_number=issue_number,
+                        adapter_kind=transition["adapter_kind"],
+                        health=current_health,
+                        previous_health=last_health,
+                        last_log_line=transition.get("last_log_line"),
+                        pid=transition.get("pid"),
+                    )
+                )
+
+                # Update the persisted health for this issue
+                state["issues"][issue_key] = {
+                    **issue_entry,
+                    "health": current_health,
+                }
+
+        # Save the updated health baselines
+        if entries:
+            save_state(state_file, state)
+
+    if not entries:
+        return None
+
+    return AttentionDigest(
+        generated_at=utc_now(),
+        repo=repo,
+        transitions=tuple(entries),
+    )
 
 
 class OrchestratorApp:
@@ -1183,6 +1306,26 @@ class OrchestratorApp:
         }
         if gov.clamped:
             data.update(gov.report_fields())
+
+        # Emit notification digest if there are health transitions (stalled sessions)
+        # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
+        if stalled_entries and self.config.notify.enabled:
+            health_transitions: dict[int, dict[str, Any]] = {}
+            for entry in stalled_entries:
+                health_transitions[entry["issue"]] = {
+                    "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                    "health": "STALLED",
+                    "last_log_line": None,
+                    "pid": entry.get("pid"),
+                }
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         return CommandResult(
             not failed_issue_numbers,
             message,
@@ -2033,6 +2176,10 @@ class OrchestratorApp:
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
         # pr_list (newest-first) merge order would land PRs in the wrong order.
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Unconditional sweep: reap stalled/orphaned sessions even when this pass
+        # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
+        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
@@ -2054,6 +2201,27 @@ class OrchestratorApp:
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
         _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
+
+        # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
+        stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
+        health_transitions: dict[int, dict[str, Any]] = {}
+        for entry in stalled_entries:
+            health_transitions[entry["issue"]] = {
+                "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                "health": "STALLED",
+                "last_log_line": None,
+                "pid": entry.get("pid"),
+            }
+
+        # Emit notification digest if there are health transitions
+        if health_transitions and self.config.notify.enabled:
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
 
         dispatch_rework = self.dispatch_rework(effective_limit)
         rework_count = dispatch_rework.data.get("selected_count", 0)
@@ -2154,6 +2322,11 @@ class OrchestratorApp:
                 "rework dispatch skipped for manual adapter",
                 {"adapter": "manual", "selected_count": 0},
             )
+
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Unconditional reaper call, matching dispatch()'s :773-775 — previously
+        # this only ran when max_concurrent_sessions > 0 via the governor at :2189.
+        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -2427,24 +2600,63 @@ class OrchestratorApp:
                 }
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
-                state["issues"][str(request.issue_number)] = entry
-                save_state(self.paths.state_file, state)
                 if ok:
-                    result = transition(
-                        self.gh,
-                        self.config.labels,
-                        request.issue_number,
-                        "rework_dispatched",
+                    # Track redispatch count for escalation cap (issue #165)
+                    now = datetime.now(UTC)
+                    window_start = now - timedelta(
+                        minutes=self.config.watchdog.redispatch_window_minutes
                     )
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        entry["label_error"] = {
-                            "edge": "rework_dispatched",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                        label_errors.append(request.issue_number)
+                    prior = [
+                        t
+                        for t in entry.get("redispatch_at", [])
+                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                    ]
+                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
+                        # Escalate to human review
+                        entry["status"] = "escalated"
+                        entry["redispatch_at"] = redispatch_at
+                        entry["escalation_reason"] = "redispatch_cap_exceeded"
+                        state["issues"][str(request.issue_number)] = entry
                         save_state(self.paths.state_file, state)
+                        result = transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "redispatch_escalated",
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            entry["label_error"] = {
+                                "edge": "redispatch_escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                            label_errors.append(request.issue_number)
+                            save_state(self.paths.state_file, state)
+                        continue
+                    else:
+                        entry["redispatch_at"] = redispatch_at
+                        state["issues"][str(request.issue_number)] = entry
+                        save_state(self.paths.state_file, state)
+                        result = transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "rework_dispatched",
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            entry["label_error"] = {
+                                "edge": "rework_dispatched",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                            label_errors.append(request.issue_number)
+                            save_state(self.paths.state_file, state)
+                else:
+                    state["issues"][str(request.issue_number)] = entry
+                    save_state(self.paths.state_file, state)
             state = append_event(
                 state,
                 "dispatch_rework",
@@ -2477,6 +2689,28 @@ class OrchestratorApp:
         }
         if gov.clamped:
             data.update(gov.report_fields())
+
+        # Emit notification digest if there are health transitions (stalled sessions)
+        # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
+        if stalled_entries and self.config.notify.enabled:
+            health_transitions: dict[int, dict[str, Any]] = {}
+            for entry in stalled_entries:
+                health_transitions[entry["issue"]] = {
+                    "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
+                    "health": "STALLED",
+                    "last_log_line": None,
+                    "pid": entry.get("pid"),
+                }
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                health_transitions,
+                repo=self.repo_root.name,
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         return CommandResult(
             not failed_issue_numbers,
             message,

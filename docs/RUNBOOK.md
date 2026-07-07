@@ -303,3 +303,14 @@ concurrency cap exists in code:
 - `doctor`'s `probe_devin()` / `probe_claude()` helpers are cheap
   `--version` checks — use them to confirm the CLI is reachable at all
   before burning a dispatch wave on a broken PATH.
+
+## Needs-attention notification and detection latency
+
+charlie-work has no daemon — detection is strictly invocation-cadence-bound. A stalled session found on pass N is invisible until pass N+1 runs, and nothing runs it automatically unless you schedule it. The pluggable `notify` layer (configured under `notify:` in `orchestrator.config.yaml`) turns health transitions (STALLED / RUNAWAY / DEAD / escalated-to-human) into outbound signals an operator actually sees — webhook, desktop toast, shell command, or file.
+
+**Detection latency = invocation cadence.** There is no background daemon; this design does not add one. If you run `charlie bash-rats` (or `charlie fleet bash-rats` for multi-repo) manually every hour, a stalled session can go undetected for up to an hour. For timely detection, schedule periodic invocation:
+
+- **cron (Linux/macOS)**: See `examples/schedule/charlie-fleet.cron` for a commented crontab entry. Adjust the interval (e.g., `*/5 * * * *` for every 5 minutes) based on how quickly you need to detect issues.
+- **Windows Task Scheduler**: See `examples/schedule/charlie-fleet-task.xml` for an XML template. Import with `schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"` and adjust the `<Interval>` (e.g., `PT5M` for 5 minutes).
+
+The `notify` layer is disabled by default (`notify.enabled: false`). To enable it, add a `notify:` section to your `orchestrator.config.yaml` — see `examples/notify.config.yaml` for sink options (webhook, desktop, shell, file). The layer emits a digest once per pass if any issue's health state changed since the last pass, comparing against a dedicated per-issue `health` field in `state.json` (not the capped `events` log). Sink failures never fail the pass — errors are returned as values and logged.

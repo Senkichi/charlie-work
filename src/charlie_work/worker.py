@@ -5,24 +5,123 @@ This module provides a unified view of worker sessions across all adapters
 adapter-iteration loops in workflow.py into a single abstraction point.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
 
 from .claude_code import (
     ClaudeWorkerRecord,
+    _events_path,
     _sidecar_path as claude_sidecar_path,
     is_worker_alive,
     read_worker_records,
 )
+from .config import OrchestratorConfig
 from .devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
     is_session_alive,
     read_session_records,
 )
+
+
+class WorkerHealth(Enum):
+    """Health status of a worker session.
+
+    This enum provides a closed set of health states that the supervisor can use
+    to classify worker sessions. It unifies liveness, staleness, and terminal-marker
+    signals into a single classification point.
+
+    Signal → verdict, first-to-fire-wins order:
+    1. liveness → DEAD
+    2. terminal marker → DEAD
+    3. progress staleness → STALLED
+    4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
+    5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
+    6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    7. (none of the above) → HEALTHY
+
+    SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
+    """
+
+    HEALTHY = "healthy"
+    SLOW = "slow"  # Reserved for #162 (wall-clock/loop tripwires) and #163 (warn mode)
+    STALLED = "stalled"
+    RUNAWAY = "runaway"  # Reserved for #162/#163 (cost/token tripwires)
+    DEAD = "dead"
+    ORPHANED = "orphaned"  # Reserved for B6a (sidecar dead/non-live but process still references worktree)
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """Cumulative usage metrics parsed from Claude Code's events.jsonl.
+
+    This frozen dataclass holds the latest cumulative tokens and cost_usd
+    values extracted from the events.jsonl file.
+    """
+
+    tokens: int | None = None
+    cost_usd: float | None = None
+
+
+def parse_cumulative_usage(events_path: Path) -> UsageSnapshot | None:
+    """Read issue-<n>.events.jsonl and return cumulative tokens/cost.
+
+    Returns None if the file doesn't exist (Devin sessions, or a Claude
+    session that hasn't emitted a usage event yet) — absence is NOT an
+    error and must never be treated as unhealthy.
+
+    Malformed or partial trailing JSON lines (a worker killed mid-write)
+    are skipped, not raised — same defensive posture as state.load_state's
+    corrupt-file handling.
+
+    Args:
+        events_path: Path to the events.jsonl file
+
+    Returns:
+        UsageSnapshot with cumulative tokens/cost, or None if file doesn't exist
+    """
+    if not events_path.exists():
+        return None
+
+    tokens = None
+    cost_usd = None
+
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines (including partial trailing lines)
+                    continue
+
+                if not isinstance(event, dict):
+                    continue
+
+                # Extract cumulative usage fields (take last-seen value)
+                if "tokens" in event and isinstance(event["tokens"], int):
+                    tokens = event["tokens"]
+                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+                    cost_usd = float(event["cost_usd"])
+
+    except OSError:
+        # File read error - treat as no usage data
+        return None
+
+    # If we parsed no usage data, return None
+    if tokens is None and cost_usd is None:
+        return None
+
+    return UsageSnapshot(tokens=tokens, cost_usd=cost_usd)
 
 
 @dataclass(frozen=True)
@@ -133,6 +232,186 @@ class WorkerView:
         except OSError:
             # Best-effort cleanup - don't fail if unlink fails
             pass
+
+
+def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
+    """Extract the timestamp of the last tool_call event from an events.jsonl file.
+
+    Reads the events.jsonl file line by line and returns the timestamp of the most
+    recent event with type="tool_call". Returns None if the file doesn't exist,
+    can't be read, or contains no tool_call events.
+
+    Args:
+        events_path: Path to the events.jsonl file
+
+    Returns:
+        datetime of the last tool_call event, or None if not found
+    """
+    from datetime import UTC
+
+    if not events_path.exists():
+        return None
+
+    try:
+        last_tool_call_at: datetime | None = None
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict) and event.get("type") == "tool_call":
+                        timestamp_str = event.get("timestamp")
+                        if timestamp_str:
+                            try:
+                                timestamp = datetime.fromisoformat(timestamp_str)
+                                if timestamp.tzinfo is None:
+                                    timestamp = timestamp.replace(tzinfo=UTC)
+                                last_tool_call_at = timestamp
+                            except (ValueError, TypeError):
+                                continue
+                except (JSONDecodeError, TypeError):
+                    continue
+        return last_tool_call_at
+    except OSError:
+        return None
+
+
+def classify_worker_health(
+    view: WorkerView, config: OrchestratorConfig, now: datetime
+) -> WorkerHealth:
+    """Classify a worker's health based on liveness, staleness, and terminal markers.
+
+    This is a pure function that takes a pre-fetched WorkerView and config and returns
+    a WorkerHealth enum. It performs no I/O beyond what WorkerView.log_stat() already
+    captured this pass, and has no side effects.
+
+    Signal → verdict, first-to-fire-wins order:
+    1. liveness → DEAD
+    2. terminal marker → DEAD
+    3. progress staleness → STALLED
+    4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
+    5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
+    6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    7. (none of the above) → HEALTHY
+
+    Args:
+        view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
+        config: OrchestratorConfig containing watchdog settings
+        now: Current datetime for staleness calculation
+
+    Returns:
+        WorkerHealth enum member indicating the worker's health status
+    """
+    from datetime import UTC, timedelta
+
+    # Signal 1: liveness
+    if not view.is_alive():
+        return WorkerHealth.DEAD
+
+    # Signal 2: terminal marker
+    log_path = Path(view.log_path)
+    terminal_error_markers = config.watchdog.terminal_error_markers
+
+    # Check for terminal error markers in the log
+    has_terminal_error = False
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        lines = log_text.splitlines()
+        if lines:
+            last_log_line = lines[-1].strip()
+            for pattern in terminal_error_markers:
+                if pattern in last_log_line:
+                    has_terminal_error = True
+                    break
+    except OSError:
+        pass
+
+    if has_terminal_error:
+        return WorkerHealth.DEAD
+
+    # Signal 3: progress staleness
+    log_stat = view.log_stat()
+    if log_stat is not None:
+        log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+        age = now - log_mtime
+        is_stalled_by_mtime = age > timedelta(minutes=config.watchdog.stall_minutes)
+
+        if is_stalled_by_mtime:
+            return WorkerHealth.STALLED
+
+    # Signal 4: wall-clock deadline (both adapters)
+    try:
+        started_at = datetime.fromisoformat(view.started_at)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        wall_clock_age = now - started_at
+        if wall_clock_age > timedelta(minutes=config.watchdog.wall_clock_minutes):
+            return WorkerHealth.RUNAWAY if config.watchdog.wall_clock_kill else WorkerHealth.SLOW
+    except (ValueError, TypeError):
+        # Invalid started_at format - skip this signal
+        pass
+
+    # Signal 5: loop/no-progress detection (Claude Code only)
+    if view.adapter_kind == "claude-code":
+        # Check for events.jsonl file (sibling to log_path)
+        events_path = log_path.with_suffix(".events.jsonl")
+        if events_path.exists():
+            last_tool_call_at = _tail_last_tool_call_timestamp(events_path)
+            log_stat = view.log_stat()
+            if log_stat is not None:
+                log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+                log_still_advancing = (now - log_mtime) < timedelta(
+                    minutes=config.watchdog.stall_minutes
+                )
+
+                # Calculate time since last tool call (or since start if never seen)
+                no_new_tool_call_for = now - (last_tool_call_at or started_at)
+
+                # Trip if log is advancing but no tool calls for 2 * stall_minutes
+                if log_still_advancing and no_new_tool_call_for > timedelta(
+                    minutes=config.watchdog.loop_stall_multiplier * config.watchdog.stall_minutes
+                ):
+                    return WorkerHealth.RUNAWAY if config.watchdog.loop_kill else WorkerHealth.SLOW
+    elif view.adapter_kind == "devin":
+        # Devin has no structured event stream - this tripwire caps at SLOW
+        # regardless of config, to avoid killing chatty-but-healthy patterns
+        # (this is the single-point-of-enforcement for the Devin hard cap)
+        pass
+
+    # Signal 6: cost/token budget tripwire (issue #163)
+    # Only applies to Claude Code workers (has events.jsonl file)
+    # Devin sessions have no structured usage stream, so absence is never unhealthy
+    if view.adapter_kind == "claude-code":
+        # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
+        sessions_dir = Path(view.log_path).parent
+        events_path = _events_path(sessions_dir, view.issue_number)
+        usage = parse_cumulative_usage(events_path)
+
+        if usage is not None:
+            # Check cost budget
+            cost_budget = config.watchdog.cost_budget_usd
+            if cost_budget is not None and cost_budget > 0:
+                if usage.cost_usd is not None and usage.cost_usd > cost_budget:
+                    # Budget exceeded - return SLOW (warn) or RUNAWAY (kill)
+                    if config.watchdog.cost_budget_action == "kill":
+                        return WorkerHealth.RUNAWAY
+                    else:
+                        return WorkerHealth.SLOW
+
+            # Check token budget
+            token_budget = config.watchdog.token_budget
+            if token_budget is not None and token_budget > 0:
+                if usage.tokens is not None and usage.tokens > token_budget:
+                    # Budget exceeded - return SLOW (warn) or RUNAWAY (kill)
+                    if config.watchdog.cost_budget_action == "kill":
+                        return WorkerHealth.RUNAWAY
+                    else:
+                        return WorkerHealth.SLOW
+
+    # Signal 7: (none of the above)
+    return WorkerHealth.HEALTHY
 
 
 def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
@@ -258,7 +537,11 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
 
 
 __all__ = [
+    "WorkerHealth",
+    "UsageSnapshot",
     "WorkerView",
+    "classify_worker_health",
     "iter_workers",
+    "parse_cumulative_usage",
     "update_worker_log_stat",
 ]
