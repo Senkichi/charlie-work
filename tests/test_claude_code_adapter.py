@@ -2214,3 +2214,51 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     failure_kind, throttled_until = _classify_session_failure(log_path)
     assert failure_kind is None, "Successful run should not be classified as a failure"
     assert throttled_until is None
+
+
+def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test: in the tee_stream_json branch, log_handle/events_handle
+    are opened without a `with` block so the background tee thread can own their
+    lifecycle (closing them itself once the process exits). But if
+    subprocess.Popen raises before the thread ever starts, nobody closes them.
+    Popen failure must close both handles before the OSError propagates.
+    """
+    from unittest.mock import patch
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    opened_handles: list = []
+    original_open = Path.open
+
+    def tracking_open(self, *args, **kwargs):
+        handle = original_open(self, *args, **kwargs)
+        if self.name.endswith((".claude.log", ".events.jsonl")):
+            opened_handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    with patch("subprocess.Popen", side_effect=OSError("mock spawn failure")):
+        record = launch_claude_worker(
+            161,
+            "agent/issue-161-tee-popen-failure",
+            "prompt text",
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=("claude",),
+            tee_stream_json=True,
+        )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to launch claude" in record.error
+
+    assert len(opened_handles) == 2, "expected exactly log_handle and events_handle to be opened"
+    assert all(handle.closed for handle in opened_handles), (
+        "log_handle/events_handle must be closed when Popen fails, not leaked"
+    )

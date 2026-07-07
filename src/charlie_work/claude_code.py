@@ -438,32 +438,43 @@ def launch_claude_worker(
             log_handle = log_path.open("w", encoding="utf-8", errors="replace")
             events_handle = events_path.open("w", encoding="utf-8", errors="replace")
 
-            if feed_stdin:
-                prompt_handle = prompt_path.open("r", encoding="utf-8")
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(worktree.path),
-                    stdin=prompt_handle,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    env=worker_env,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP,
-                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
-                    text=True,  # Ensure text mode for line-by-line processing
-                )
-                prompt_handle.close()
-            else:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(worktree.path),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    env=worker_env,
-                    creationflags=_CREATE_NEW_PROCESS_GROUP,
-                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
-                    text=True,  # Ensure text mode for line-by-line processing
-                )
+            try:
+                if feed_stdin:
+                    prompt_handle = prompt_path.open("r", encoding="utf-8")
+                    try:
+                        process = subprocess.Popen(
+                            command,
+                            cwd=str(worktree.path),
+                            stdin=prompt_handle,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            env=worker_env,
+                            creationflags=_CREATE_NEW_PROCESS_GROUP,
+                            start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                            text=True,  # Ensure text mode for line-by-line processing
+                        )
+                    finally:
+                        prompt_handle.close()
+                else:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=str(worktree.path),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        env=worker_env,
+                        creationflags=_CREATE_NEW_PROCESS_GROUP,
+                        start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                        text=True,  # Ensure text mode for line-by-line processing
+                    )
+            except OSError:
+                # Popen failed before the tee thread could start — nobody else
+                # will ever close these, so close them here. The outer
+                # `except OSError` below still handles worktree cleanup and
+                # the error record.
+                log_handle.close()
+                events_handle.close()
+                raise
 
             # Start a thread to tee output to both files
             def _tee_output():
