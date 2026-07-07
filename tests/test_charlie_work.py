@@ -972,7 +972,9 @@ def test_config_rejects_invalid_watchdog_terminal_error_markers_type(tmp_path: P
     assert "must be a list" in message
 
 
-def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(tmp_path: Path) -> None:
+def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(
+    tmp_path: Path,
+) -> None:
     """terminal_error_markers elements must be strings."""
     from charlie_work.config import ConfigError
 
@@ -988,11 +990,15 @@ def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(tmp
 
     try:
         load_config(config_path)
-        raise AssertionError("expected ConfigError for invalid terminal_error_markers element type")
+        raise AssertionError(
+            "expected ConfigError for invalid terminal_error_markers element type"
+        )
     except ConfigError as exc:
         message = str(exc)
     else:  # pragma: no cover
-        raise AssertionError("expected ConfigError for invalid terminal_error_markers element type")
+        raise AssertionError(
+            "expected ConfigError for invalid terminal_error_markers element type"
+        )
 
     assert "section 'watchdog'" in message
     assert "terminal_error_markers" in message

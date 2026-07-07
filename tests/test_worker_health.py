@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from charlie_work.config import OrchestratorConfig, WatchdogConfig
 from charlie_work.worker import WorkerHealth, WorkerView, classify_worker_health
@@ -180,9 +178,7 @@ def test_classify_worker_health_custom_terminal_marker(tmp_path: Path) -> None:
     with patch("charlie_work.worker.is_session_alive", return_value=True):
         # Custom config with a custom terminal marker
         config = OrchestratorConfig(
-            watchdog=WatchdogConfig(
-                terminal_error_markers=("Custom fatal error",)
-            )
+            watchdog=WatchdogConfig(terminal_error_markers=("Custom fatal error",))
         )
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
