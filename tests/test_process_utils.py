@@ -285,6 +285,50 @@ def test_kill_process_tree_enumerates_children() -> None:
             parent_proc.wait()
 
 
+def test_is_session_stalled_custom_terminal_markers(tmp_path: Path) -> None:
+    """Test that is_session_stalled uses custom terminal_error_markers when provided."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("some log content\nCustom fatal error\n", encoding="utf-8")
+
+    # Default markers should not trigger stall
+    is_stalled, last_line = is_session_stalled(
+        log_file, stall_threshold_minutes=20, terminal_error_markers=None
+    )
+    assert is_stalled is False
+    assert last_line == "Custom fatal error"
+
+    # Custom marker should trigger stall
+    is_stalled, last_line = is_session_stalled(
+        log_file,
+        stall_threshold_minutes=20,
+        terminal_error_markers=("Custom fatal error",),
+    )
+    assert is_stalled is True
+    assert last_line == "Custom fatal error"
+
+
+def test_is_session_stalled_default_markers_backward_compat(tmp_path: Path) -> None:
+    """Test that is_session_stalled with None markers uses the default hardcoded list for backward compatibility."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("some log content\nError: A tool was rejected\n", encoding="utf-8")
+
+    # None should use default markers
+    is_stalled, last_line = is_session_stalled(
+        log_file, stall_threshold_minutes=20, terminal_error_markers=None
+    )
+    assert is_stalled is True
+    assert last_line == "Error: A tool was rejected"
+
+    # Explicit default markers should behave the same
+    is_stalled, last_line = is_session_stalled(
+        log_file,
+        stall_threshold_minutes=20,
+        terminal_error_markers=("Error: A tool was rejected", "Error: Agent error:"),
+    )
+    assert is_stalled is True
+    assert last_line == "Error: A tool was rejected"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
 def test_sweep_orphan_processes_posix_returns_empty() -> None:
     """Test that sweep_orphan_processes returns empty list on POSIX."""
