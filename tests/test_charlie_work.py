@@ -1038,6 +1038,51 @@ def test_config_rejects_unknown_watchdog_key(tmp_path: Path) -> None:
     assert "enabled" in message
     assert "stall_minutes" in message
     assert "terminal_error_markers" in message
+    assert "wall_clock_minutes" in message
+    assert "wall_clock_kill" in message
+    assert "loop_stall_multiplier" in message
+    assert "loop_kill" in message
+
+
+def test_config_watchdog_new_fields_have_defaults(tmp_path: Path) -> None:
+    """New watchdog fields (wall_clock_minutes, wall_clock_kill, loop_stall_multiplier, loop_kill) have defaults."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    # Config without the new fields (pre-#162 style)
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config.watchdog.wall_clock_minutes == 240
+    assert config.watchdog.wall_clock_kill is False
+    assert config.watchdog.loop_stall_multiplier == 2
+    assert config.watchdog.loop_kill is False
+
+
+def test_config_watchdog_accepts_new_fields(tmp_path: Path) -> None:
+    """New watchdog fields can be set explicitly in YAML."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """watchdog:
+  enabled: true
+  stall_minutes: 20
+  wall_clock_minutes: 300
+  wall_clock_kill: true
+  loop_stall_multiplier: 3
+  loop_kill: true
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config.watchdog.wall_clock_minutes == 300
+    assert config.watchdog.wall_clock_kill is True
+    assert config.watchdog.loop_stall_multiplier == 3
+    assert config.watchdog.loop_kill is True
 
 
 def test_load_config_rejects_unknown_placeholder_in_dispatch_command(tmp_path: Path) -> None:
