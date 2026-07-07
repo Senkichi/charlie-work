@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  charlie-work fleet scheduler — Windows Task Scheduler XML template.
+  Import this task with: schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"
+  
+  Detection latency equals invocation cadence: a stalled session found on pass N
+  is invisible until pass N+1 runs. There is no daemon — this design does not add one.
+  Choose your interval based on how quickly you need to detect stalled/runaway/dead workers.
+  
+  PLACEHOLDERS TO ADJUST:
+  - Replace C:\path\to\your\repo with your actual repository path
+  - Adjust the <Interval> in <Triggers> to set the recurrence interval (PT5M = 5 minutes)
+  - For single-repo (non-fleet) usage, replace "charlie fleet bash-rats" with "charlie bash-rats"
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-07-07T00:00:00.000000</Date>
+    <Author>System Operator</Author>
+    <Description>Run charlie-work fleet supervisor periodically to detect stalled/runaway/dead workers</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-07-07T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+      <!-- Adjust PT5M to your desired interval (PT5M = 5 minutes, PT15M = 15 minutes, PT1H = 1 hour) -->
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <LogonType>Password</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <!-- Replace C:\path\to\your\repo with your actual repository path -->
+      <!-- For single-repo usage, replace "charlie fleet bash-rats" with "charlie bash-rats" -->
+      <Command>cmd.exe</Command>
+      <Arguments>/c "cd /d C:\path\to\your\repo &amp;&amp; charlie fleet bash-rats"</Arguments>
+      <!-- Optional: redirect output to a log file -->
+      <!-- <Arguments>/c "cd /d C:\path\to\your\repo &amp;&amp; charlie fleet bash-rats &gt;&gt; C:\path\to\charlie-work.log 2&gt;&amp;1"</Arguments> -->
+    </Exec>
+  </Actions>
+</Task>

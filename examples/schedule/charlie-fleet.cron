@@ -1,0 +1,12 @@
+# charlie-work fleet scheduler — crontab entry for periodic invocation.
+# Add this line to your crontab (crontab -e) to run charlie fleet bash-rats
+# at the specified interval. Detection latency equals invocation cadence:
+# a stalled session found on pass N is invisible until pass N+1 runs.
+# There is no daemon — this design does not add one. Choose your interval
+# based on how quickly you need to detect stalled/runaway/dead workers.
+#
+# Example: Run every 5 minutes (adjust the interval as needed)
+# */5 * * * * cd /path/to/your/repo && charlie fleet bash-rats >> /var/log/charlie-work.log 2>&1
+#
+# For single-repo (non-fleet) usage, replace `charlie fleet bash-rats` with
+# `charlie bash-rats` and adjust the repo path accordingly.

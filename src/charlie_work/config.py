@@ -264,6 +264,24 @@ class WatchdogConfig:
 
     enabled: bool = True
     stall_minutes: int = 20
+    redispatch_window_minutes: int = 240
+    max_auto_redispatch: int = 3
+    terminal_error_markers: tuple[str, ...] = (
+        "Error: A tool was rejected",
+        "Error: Agent error:",
+    )
+    # Wall-clock deadline (absolute age cap) - applies to both adapters
+    wall_clock_minutes: int = 240
+    wall_clock_kill: bool = False
+    # Loop/no-progress detection (Claude Code only) - window = stall_minutes * multiplier
+    loop_stall_multiplier: int = 2
+    loop_kill: bool = False
+    # Cost/token budget tripwire (issue #163). None/0 = disabled.
+    # When enabled, checks cumulative usage from Claude Code's tee'd events.jsonl.
+    cost_budget_usd: float | None = None
+    token_budget: int | None = None
+    # Action when budget is exceeded: "warn" (default, no kill) or "kill"
+    cost_budget_action: str = "warn"
 
 
 @dataclass(frozen=True)
@@ -312,6 +330,23 @@ class FleetConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    """Pluggable needs-attention notification sink.
+
+    Detect (supervisor) and escalate (label policy) are separate concerns — this
+    section only decides where a digest goes once a needs-attention transition
+    has already fired. ``enabled`` defaults False so an absent config block is
+    a no-op — mirrors CrossFamilyConfig (config.py:236).
+    """
+
+    enabled: bool = False
+    sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
+    webhook_url: str = ""
+    shell_command: tuple[str, ...] = ()
+    file_path: str = ".var/charlie-work/notify/digest.jsonl"
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -324,6 +359,7 @@ class OrchestratorConfig:
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -491,7 +527,49 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "cross_family.command",
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
-    watchdog = _build_section(WatchdogConfig, "watchdog", _section(data, "watchdog"))
+    watchdog_data = _section(data, "watchdog")
+    terminal_error_markers = watchdog_data.get("terminal_error_markers")
+    if terminal_error_markers is not None:
+        if not isinstance(terminal_error_markers, list):
+            raise ConfigError(
+                "config section 'watchdog' key 'terminal_error_markers' must be a list of "
+                f"strings, got {type(terminal_error_markers).__name__}"
+            )
+        for item in terminal_error_markers:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'watchdog' key 'terminal_error_markers' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        watchdog_data["terminal_error_markers"] = tuple(terminal_error_markers)
+    # Validate cost_budget_usd
+    cost_budget_usd = watchdog_data.get("cost_budget_usd")
+    if cost_budget_usd is not None and not isinstance(cost_budget_usd, (int, float)):
+        raise ConfigError(
+            "config section 'watchdog' key 'cost_budget_usd' must be a number, "
+            f"got {type(cost_budget_usd).__name__}"
+        )
+    # Validate token_budget
+    token_budget = watchdog_data.get("token_budget")
+    if token_budget is not None and not isinstance(token_budget, int):
+        raise ConfigError(
+            "config section 'watchdog' key 'token_budget' must be an int, "
+            f"got {type(token_budget).__name__}"
+        )
+    # Validate cost_budget_action
+    cost_budget_action = watchdog_data.get("cost_budget_action")
+    if cost_budget_action is not None:
+        if not isinstance(cost_budget_action, str):
+            raise ConfigError(
+                "config section 'watchdog' key 'cost_budget_action' must be a string, "
+                f"got {type(cost_budget_action).__name__}"
+            )
+        if cost_budget_action not in ("warn", "kill"):
+            raise ConfigError(
+                f"config section 'watchdog' key 'cost_budget_action' must be 'warn' or 'kill', "
+                f"got '{cost_budget_action}'"
+            )
+    watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
 
     # Five tuple-of-str fields: reject non-list, coerce elements to str.
@@ -555,6 +633,11 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"int, got {type(global_max).__name__}"
         )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
+    notify_data = _section(data, "notify")
+    shell_command = notify_data.get("shell_command")
+    if isinstance(shell_command, list):
+        notify_data["shell_command"] = tuple(str(item) for item in shell_command)
+    notify = _build_section(NotifyConfig, "notify", notify_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -567,4 +650,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         watchdog=watchdog,
         test_adequacy=test_adequacy,
         fleet=fleet,
+        notify=notify,
     )
