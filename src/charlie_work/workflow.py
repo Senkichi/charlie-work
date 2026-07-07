@@ -11,6 +11,7 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
+from .fleet_registry import count_fleet_live_sessions
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -30,6 +31,7 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     run_janitor,
+    TestAdequacyFacts,
     TestAdequacyVerdict,
 )
 from .labels import TransitionOutcome, transition
@@ -69,19 +71,30 @@ class ConcurrencyGovernorResult:
     live_count: int
     available_slots: int
     dispatch_limit: int
+    fleet_live_count: int = 0
+    fleet_max: int = 0
 
     @property
     def enabled(self) -> bool:
         """Return True if the governor is enabled (max_concurrent > 0)."""
         return self.max_concurrent > 0
 
+    @property
+    def fleet_enabled(self) -> bool:
+        """Return True if the fleet governor is enabled (fleet_max > 0)."""
+        return self.fleet_max > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
-        return {
+        fields = {
             "concurrency_limit": self.max_concurrent,
             "live_session_count": self.live_count,
             "available_slots": self.available_slots,
         }
+        if self.fleet_enabled:
+            fields["fleet_concurrency_limit"] = self.fleet_max
+            fields["fleet_live_session_count"] = self.fleet_live_count
+        return fields
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -93,6 +106,36 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
         f"{lines}\n\n"
         "These deterministic pre-checks passed the gate but deserve reviewer attention.\n"
     )
+
+
+def render_test_adequacy_section(
+    facts: TestAdequacyFacts | None, warnings: tuple[str, ...]
+) -> str:
+    """Render the $test_adequacy_section packet block from Tier-1 facts.
+
+    Returns "" when facts is None (gate disabled — caller in review() passes
+    None in that case) or when there is nothing to report. Mirrors the
+    _janitor_section pattern: plain function, no I/O, safe to call every pass.
+    """
+    if facts is None:
+        return ""
+    lines = [
+        "## Test-adequacy facts (Tier 1, deterministic)",
+        "",
+        f"- Added product LOC: {facts.added_product_loc}",
+        f"- Added test LOC: {facts.added_test_loc}",
+        f"- Assertion-bearing added test lines: {facts.assertion_count}",
+        f"- Test files changed: {facts.test_files_changed}",
+    ]
+    if facts.untested_product_files:
+        lines.append("- Untested product files: " + ", ".join(facts.untested_product_files))
+    if facts.exempt:
+        lines.append(f'- Test-exempt claim: "{facts.exempt_reason}" (verify against the diff)')
+    if warnings:
+        lines.append("")
+        lines.extend(f"- {warning}" for warning in warnings)
+    lines.append("")
+    return "\n".join(lines)
 
 
 def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: str) -> str:
@@ -367,12 +410,14 @@ class OrchestratorApp:
         gh: GitHub,
         *,
         dry_run: bool = False,
+        fleet_dir_override: str | None = None,
     ):
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
         self.gh = gh
         self.dry_run = dry_run
+        self.fleet_dir_override = fleet_dir_override
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -438,8 +483,10 @@ class OrchestratorApp:
                 max_concurrent > 0, this will compute it via _count_live_sessions.
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
+        fleet_max = self.config.fleet.global_max_concurrent_sessions
         available_slots = dispatch_limit
         clamped = False
+        fleet_live_count = 0
 
         if max_concurrent > 0:
             if live_count is None:
@@ -450,12 +497,21 @@ class OrchestratorApp:
                 dispatch_limit = available_slots
                 clamped = True
 
+        if fleet_max > 0:
+            fleet_live_count, _skipped_repos = count_fleet_live_sessions(self.fleet_dir_override)
+            fleet_available = max(0, fleet_max - fleet_live_count)
+            if fleet_available < dispatch_limit:
+                dispatch_limit = fleet_available
+                clamped = True
+
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
             live_count=live_count or 0,
             available_slots=available_slots,
             dispatch_limit=dispatch_limit,
+            fleet_live_count=fleet_live_count,
+            fleet_max=fleet_max,
         )
 
     def status(self) -> CommandResult:
@@ -1114,26 +1170,32 @@ class OrchestratorApp:
         diff_path.write_text(diff, encoding="utf-8")
 
         # Tier 1 test-adequacy hard gate (issue #179)
+        test_adequacy_section = ""
+        test_adequacy_verdict = None
         if self.config.test_adequacy.enabled:
-            verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
-            if not verdict.ok:
+            test_adequacy_verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
+            if not test_adequacy_verdict.ok:
                 # Same terminal label set as an LLM request_changes:
                 # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
                 #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
                 if issue_number is not None:
                     transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = render_test_adequacy_summary(
-                    verdict, self.config.test_adequacy.exempt_marker
+                    test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
                 return self.record_review(pr_number, "request_changes", summary=summary)
-            # Gate passed while enabled: #180 later adds the Tier-2 packet section here,
-            #   test_adequacy_section = render_test_adequacy_section(verdict.facts, verdict.warnings)
-            # reusing this `verdict`. This issue does NOT touch the packet render or $test_adequacy_section.
+            # Gate passed while enabled: add Tier-2 packet section (issue #180)
+            test_adequacy_section = render_test_adequacy_section(
+                test_adequacy_verdict.facts, test_adequacy_verdict.warnings
+            )
 
         # Run containment check for worker edits leaked into operator checkout
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         # Merge containment warnings with janitor warnings
         merged_warnings = tuple(list(verdict.warnings) + list(containment_warnings))
+        # If test-adequacy gate is enabled and passed, merge its warnings too
+        if test_adequacy_verdict is not None:
+            merged_warnings = tuple(list(merged_warnings) + list(test_adequacy_verdict.warnings))
         cross_family_section, cf_result = self._cross_family_for_pr(
             pr=pr,
             issue=issue,
@@ -1158,6 +1220,7 @@ class OrchestratorApp:
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
+                "test_adequacy_section": test_adequacy_section,
                 "decision_command": f"{CLI_NAME} verdict --pr {pr_number} --decision approved --summary-file <path>",
             },
         )

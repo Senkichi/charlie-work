@@ -166,6 +166,25 @@ unrecoverable), the cycle count resets, because it's keyed by
 `pr_number`. Worker prompts (`rework.md`) explicitly instruct workers to
 update the existing PR rather than open a new one for exactly this reason.
 
+## Test-adequacy gate behavior
+
+Configured via `test_adequacy.enabled` (default `False` in `config.py` and in
+both shipped `examples/*.yaml` profiles — opt-in by default). When enabled, the
+gate runs a deterministic structural check in `OrchestratorApp.review()` before
+packet generation: if the diff adds product code with zero test files touched,
+the gate auto-records a `request_changes` decision (bypassing the LLM reviewer)
+and routes to rework. This Tier-1 hard gate is self-correcting — a "pure skip"
+PR automatically reworks without waiting on an LLM review round. When the gate
+passes (tests present or exempt), the review packet includes a "Test-adequacy
+facts" section with metrics (added product/test LOC, assertion count, untested
+files) and the LLM reviewer receives a stricter written rubric for evaluating
+test quality (behavior-coverage table, hollow-test heuristics, exemption
+scrutiny). Practical implication: **when enabled, the gate is advisory to the
+LLM reviewer (Tier 2) but hard-blocking for pure-skip failures (Tier 1)** — a
+PR with no tests and no exemption claim never reaches the LLM, while a PR with
+tests present gets the facts block and rubric but the LLM still decides
+approval.
+
 ## Worktree cleanup gone wrong (junction hazard)
 
 **The hazard**: worker worktrees created by `worktree.create_worktree()`

@@ -22,6 +22,7 @@ from charlie_work.config import (
     CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
+    FleetConfig,
     LabelConfig,
     OrchestratorConfig,
     ReviewConfig,
@@ -1274,6 +1275,7 @@ class FakeGitHub:
         self.delete_branch_ok = True
         self.update_branch_ok = True
         self.pr_head_shas: dict[int, str] = {}
+        self.diffs: dict[int, str] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -1325,6 +1327,9 @@ class FakeGitHub:
         ]
 
     def pr_diff(self, number: int):
+        # Return custom diff if set, otherwise default
+        if number in self.diffs:
+            return self.diffs[number]
         return "diff --git a/file b/file"
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -3535,6 +3540,125 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["janitor_ok"] is True
     assert state["prs"]["456"]["janitor_warnings"]
+
+
+def test_render_test_adequacy_section_unit() -> None:
+    """Unit test for render_test_adequacy_section (issue #180)."""
+    from charlie_work.janitor import TestAdequacyFacts
+    from charlie_work.workflow import render_test_adequacy_section
+
+    # Test with None (gate disabled)
+    assert render_test_adequacy_section(None, ()) == ""
+
+    # Test with populated facts
+    facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=("src/foo.py", "src/bar.py"),
+        exempt=False,
+        exempt_reason="",
+    )
+    warnings = ("Zero recognized assertions in added test lines",)
+
+    section = render_test_adequacy_section(facts, warnings)
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in section
+    assert "Added product LOC: 100" in section
+    assert "Added test LOC: 50" in section
+    assert "Assertion-bearing added test lines: 10" in section
+    assert "Test files changed: 2" in section
+    assert "Untested product files: src/foo.py, src/bar.py" in section
+    assert "Zero recognized assertions in added test lines" in section
+
+    # Test with empty warnings
+    section_no_warnings = render_test_adequacy_section(facts, ())
+    assert "Zero recognized assertions" not in section_no_warnings
+
+    # Test with exempt claim
+    facts_exempt = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=0,
+        assertion_count=0,
+        test_files_changed=0,
+        untested_product_files=(),
+        exempt=True,
+        exempt_reason="n/a - pure refactoring",
+    )
+    section_exempt = render_test_adequacy_section(facts_exempt, ())
+    assert (
+        'Test-exempt claim: "n/a - pure refactoring" (verify against the diff)' in section_exempt
+    )
+
+
+def test_test_adequacy_section_in_review_packet_when_enabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section appears in review packet when gate is enabled and passes (issue #180)."""
+    from unittest.mock import patch
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=True,
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Mock check_test_adequacy to return a passing verdict with facts
+    mock_facts = TestAdequacyFacts(
+        added_product_loc=100,
+        added_test_loc=50,
+        assertion_count=10,
+        test_files_changed=2,
+        untested_product_files=(),
+        exempt=False,
+        exempt_reason="",
+    )
+    mock_verdict = TestAdequacyVerdict(
+        ok=True,
+        failures=(),
+        warnings=(),
+        facts=mock_facts,
+    )
+
+    with patch("charlie_work.workflow.check_test_adequacy", return_value=mock_verdict):
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section appears in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
+
+
+def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path) -> None:
+    """Integration test: verify test_adequacy_section does not appear in review packet when gate is disabled (issue #180)."""
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(
+            enabled=False,  # Gate disabled
+            exempt_marker="Test-exempt:",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Verify the test-adequacy facts section does NOT appear in the packet
+    assert "## Test-adequacy facts (Tier 1, deterministic)" not in packet_text
+    # Verify no unresolved placeholder
+    assert "$test_adequacy_section" not in packet_text
 
 
 def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> None:
@@ -7416,6 +7540,276 @@ def test_concurrency_governor_result_unclamped() -> None:
     assert result.enabled is False  # max_concurrent=0 means disabled
 
 
+def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeypatch) -> None:
+    """When fleet.global_max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
+
+    # Mock count_fleet_live_sessions to return 0 fleet live sessions
+    def mock_count_fleet_live(fleet_dir_override):
+        return 0, []
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=0),
+        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Should dispatch normally without fleet concurrency clamping
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert "fleet_concurrency_limit" not in result.data
+    assert "fleet_live_session_count" not in result.data
+
+
+def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When fleet.global_max_concurrent_sessions is set and fleet live count meets cap, dispatch should be clamped."""
+
+    # Mock count_fleet_live_sessions to return 3 fleet live sessions (at cap)
+    def mock_count_fleet_live(fleet_dir_override):
+        return 3, []
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=3),
+        dispatch=DispatchConfig(max_concurrent_sessions=5, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Should clamp to 0 since fleet cap is 3 and fleet live is 3
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["fleet_concurrency_limit"] == 3
+    assert result.data["fleet_live_session_count"] == 3
+
+
+def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch) -> None:
+    """When both per-repo and fleet caps are set, the tighter constraint wins."""
+
+    # Mock count_fleet_live_sessions to return 1 fleet live session
+    def mock_count_fleet_live(fleet_dir_override):
+        return 1, []
+
+    # Mock _count_live_sessions to return 1 local live session
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=1),
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Fleet cap (1) is tighter than per-repo cap (2), so should clamp to 0
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 2  # per-repo cap
+    assert result.data["live_session_count"] == 1  # local live
+    assert result.data["fleet_concurrency_limit"] == 1  # fleet cap
+    assert result.data["fleet_live_session_count"] == 1  # fleet live
+
+
+def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeypatch) -> None:
+    """When per-repo cap is tighter than fleet cap, per-repo wins."""
+
+    # Mock count_fleet_live_sessions to return 1 fleet live session
+    def mock_count_fleet_live(fleet_dir_override):
+        return 1, []
+
+    # Mock _count_live_sessions to return 1 local live session
+    def mock_count_live(sessions_dir):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=5),
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # Per-repo cap (1) is tighter than fleet cap (5), so should clamp to 0
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 1  # per-repo cap
+    assert result.data["live_session_count"] == 1  # local live
+    assert result.data["fleet_concurrency_limit"] == 5  # fleet cap
+    assert result.data["fleet_live_session_count"] == 1  # fleet live
+
+
+def test_fleet_concurrency_governor_result_fleet_enabled_property() -> None:
+    """ConcurrencyGovernorResult.fleet_enabled property correctly reflects fleet governor enabled state."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=2,
+        available_slots=3,
+        dispatch_limit=3,
+        fleet_live_count=1,
+        fleet_max=3,
+    )
+
+    assert result.fleet_enabled is True  # fleet_max > 0 means enabled
+
+    result_unlimited = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+        fleet_live_count=0,
+        fleet_max=0,
+    )
+
+    assert result_unlimited.fleet_enabled is False  # fleet_max=0 means disabled
+
+
+def test_fleet_concurrency_governor_result_report_fields_includes_fleet() -> None:
+    """ConcurrencyGovernorResult.report_fields includes fleet fields when fleet_enabled."""
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=5,
+        live_count=2,
+        available_slots=3,
+        dispatch_limit=3,
+        fleet_live_count=1,
+        fleet_max=3,
+    )
+
+    fields = result.report_fields()
+    assert fields == {
+        "concurrency_limit": 5,
+        "live_session_count": 2,
+        "available_slots": 3,
+        "fleet_concurrency_limit": 3,
+        "fleet_live_session_count": 1,
+    }
+
+    # When fleet disabled, fleet fields should not be present
+    result_unlimited = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+        fleet_live_count=0,
+        fleet_max=0,
+    )
+
+    fields_unlimited = result_unlimited.report_fields()
+    assert fields_unlimited == {
+        "concurrency_limit": 0,
+        "live_session_count": 0,
+        "available_slots": 5,
+    }
+    assert "fleet_concurrency_limit" not in fields_unlimited
+    assert "fleet_live_session_count" not in fields_unlimited
+
+
+def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:
+    """count_fleet_live_sessions should skip repos that no longer exist and report them."""
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    # Create a fake fleet registry with 3 repos
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    # Create two real repos and one vanished repo
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+    (repo1 / ".git").mkdir()
+    (repo2 / ".git").mkdir()
+
+    # Create state dirs for the real repos
+    state1 = repo1 / ".var" / "charlie-work"
+    state2 = repo2 / ".var" / "charlie-work"
+    state1.mkdir(parents=True)
+    state2.mkdir(parents=True)
+
+    # Create sessions dirs (empty, so no live sessions)
+    sessions1 = state1 / "dispatches" / "sessions"
+    sessions2 = state2 / "dispatches" / "sessions"
+    sessions1.mkdir(parents=True)
+    sessions2.mkdir(parents=True)
+
+    # Write the registry
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "name_with_owner": "owner/repo1",
+                "config_path": str(repo1 / "orchestrator.config.yaml"),
+                "state_dir": str(state1),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+                "name_with_owner": "owner/repo2",
+                "config_path": str(repo2 / "orchestrator.config.yaml"),
+                "state_dir": str(state2),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+            "owner/vanished": {
+                "repo_root": str(tmp_path / "vanished"),
+                "name_with_owner": "owner/vanished",
+                "config_path": str(tmp_path / "vanished" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "vanished" / ".var" / "charlie-work"),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+
+    # Mock fleet_dir to point to our test fleet dir
+    def mock_fleet_dir(override=None):
+        return fleet_dir
+
+    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", mock_fleet_dir)
+
+    # Count fleet live sessions
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    # Should count 0 live sessions (both real repos have empty sessions dirs)
+    assert live_count == 0
+    # Should report the vanished repo
+    assert "owner/vanished" in skipped_repos
+    assert len(skipped_repos) == 1
+
+
 def test_concurrency_governor_result_enabled_property() -> None:
     """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
     # Disabled (max_concurrent=0)
@@ -9331,7 +9725,7 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
     # Build args
     import argparse
 
-    args = argparse.Namespace(repo=repo_root, config=None, dry_run=False)
+    args = argparse.Namespace(repo=repo_root, config=None, dry_run=False, fleet_dir=None)
 
     # Call build_app
     build_app(args)
