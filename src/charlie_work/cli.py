@@ -196,9 +196,7 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
 
     # Load global config for notifier integration (optional, may be None)
     try:
-        global_config = load_layered_config(
-            Path.cwd(), None, fleet_dir_override=args.fleet_dir
-        )
+        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
     except (ConfigError, RepoNotFoundError):
         global_config = None
 
@@ -226,9 +224,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
 
     # Load global config for notifier integration (optional, may be None)
     try:
-        global_config = load_layered_config(
-            Path.cwd(), None, fleet_dir_override=args.fleet_dir
-        )
+        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
     except (ConfigError, RepoNotFoundError):
         global_config = None
 
@@ -387,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
             digest = result.data.get("digest", {})
             event_count = digest.get("count", 0)
             orphan_sweep_calls = digest.get("orphan_sweep_calls", 0)
-            print(f"  Digest: {event_count} attention event(s), {orphan_sweep_calls} orphan sweep call(s)")
+            print(
+                f"  Digest: {event_count} attention event(s), {orphan_sweep_calls} orphan sweep call(s)"
+            )
     else:
         print_result(result, json_output=args.json_output)
 

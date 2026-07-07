@@ -3,9 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from charlie_work.config import ConfigError
 from charlie_work.fleet_dispatch import _extract_attention_events, _select_repos, fleet_loop
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -321,7 +318,7 @@ def test_fleet_loop_work_only_calls_dispatch(
     mock_gh_class.return_value = mock_gh
 
     # Run fleet_loop with work_only=True
-    result = fleet_loop(
+    fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
         global_config=None,
         repos=None,

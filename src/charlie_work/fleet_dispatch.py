@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +8,7 @@ from .config import ConfigError, find_config_path, load_config
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry
 from .github import GitHub, GitHubError
-from .paths import RepoNotFoundError, runtime_paths
+from .paths import runtime_paths
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -40,6 +39,7 @@ def _select_repos(
     else:
         # All repos: sort by oldest last_seen first
         all_repos = list(repos_map.items())
+
         # Sort by last_seen ascending (oldest first)
         # Repos without last_seen go last (treated as newest)
         def last_seen_key(item: tuple[str, dict[str, Any]]) -> tuple[bool, str]:
@@ -194,9 +194,7 @@ def fleet_loop(
 
         except (GitHubError, ConfigError) as exc:
             # Per-repo isolation: catch at iteration boundary and continue
-            per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {exc}", {}
-            )
+            per_repo_results[repo_key] = CommandResult(False, f"fleet pass error: {exc}", {})
             logger.error(f"Error processing repo {repo_key}: {exc}")
 
     # Call the notifier digest sink exactly once per fleet pass
