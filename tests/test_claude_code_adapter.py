@@ -2112,3 +2112,105 @@ def test_parse_claude_events_non_dict_events_skipped(tmp_path: Path) -> None:
     assert result is not None
     assert result.tool_call_count == 1
     assert result.turn_count == 2
+
+
+# Critical regression test for issue #160: tee thread file handle closure bug
+# ---------------------------------------------------------------------------
+def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test for issue #160: tee thread must write to both log and events files.
+
+    This test verifies that when tee_stream_json=True, the background tee thread
+    successfully writes output to both the plaintext log file and the events.jsonl file.
+    The original bug closed file handles immediately after starting the thread,
+    causing all writes to fail silently and leaving both files empty.
+
+    This test would fail against the buggy code (empty files) and pass after the fix.
+    """
+    from charlie_work.process_utils import is_session_stalled
+    from charlie_work.claude_code import _classify_session_failure
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Create a fake claude script that outputs multiple lines
+    script_path = tmp_path / "fake_claude_tee.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            data = sys.stdin.read()
+            Path("worker-ran.txt").write_text(data, encoding="utf-8")
+            # Output multiple lines to verify tee writes all of them
+            print("line 1")
+            print("line 2")
+            print("line 3")
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    record = launch_claude_worker(
+        160,
+        "agent/issue-160-tee-test",
+        "test prompt for tee",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(script_path)),
+        tee_stream_json=True,  # Enable the tee feature
+    )
+
+    assert record.ok
+    worktree_path = Path(record.worktree_path)
+
+    # Wait for the worker to complete
+    marker_path = worktree_path / "worker-ran.txt"
+    deadline = time.time() + 10
+    while not marker_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert marker_path.exists()
+
+    # Give the tee thread a moment to finish writing
+    time.sleep(0.2)
+
+    # Verify both files exist and have content
+    log_path = Path(record.log_path)
+    events_path = sessions_dir / "issue-160.events.jsonl"
+
+    assert log_path.exists(), "Log file should exist"
+    assert events_path.exists(), "Events file should exist"
+
+    log_content = log_path.read_text(encoding="utf-8")
+    events_content = events_path.read_text(encoding="utf-8")
+
+    # Both files should have content (the bug would leave them empty)
+    assert len(log_content) > 0, "Log file should have content (bug would leave it empty)"
+    assert len(events_content) > 0, "Events file should have content (bug would leave it empty)"
+
+    # Verify the content matches what we expect
+    assert "line 1" in log_content
+    assert "line 2" in log_content
+    assert "line 3" in log_content
+
+    # Events file should have the same content (it's a tee)
+    assert "line 1" in events_content
+    assert "line 2" in events_content
+    assert "line 3" in events_content
+
+    # Verify is_session_stalled works correctly on the tee'd log
+    # The log should not be stalled (it was just written)
+    is_stalled, last_line = is_session_stalled(log_path, stall_threshold_minutes=20)
+    assert is_stalled is False, "Freshly written log should not be stalled"
+    assert last_line is not None, "Should be able to read last line from log"
+
+    # Verify _classify_session_failure works correctly on the tee'd log
+    # Should return None (no failure) for a successful run
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+    assert failure_kind is None, "Successful run should not be classified as a failure"
+    assert throttled_until is None

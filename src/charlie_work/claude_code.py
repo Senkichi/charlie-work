@@ -429,57 +429,71 @@ def launch_claude_worker(
     }
 
     try:
-        with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
-            # If tee_stream_json is enabled, we need to tee stdout to both log and events file
-            # Use subprocess.PIPE and a thread to write to both files
-            if tee_stream_json and events_path:
-                with events_path.open("w", encoding="utf-8", errors="replace") as events_handle:
-                    if feed_stdin:
-                        with prompt_path.open("r", encoding="utf-8") as prompt_handle:
-                            process = subprocess.Popen(
-                                command,
-                                cwd=str(worktree.path),
-                                stdin=prompt_handle,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                env=worker_env,
-                                creationflags=_CREATE_NEW_PROCESS_GROUP,
-                                start_new_session=(
-                                    os.name != "nt"
-                                ),  # POSIX: detach into own session
-                                text=True,  # Ensure text mode for line-by-line processing
-                            )
-                    else:
-                        process = subprocess.Popen(
-                            command,
-                            cwd=str(worktree.path),
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            env=worker_env,
-                            creationflags=_CREATE_NEW_PROCESS_GROUP,
-                            start_new_session=(os.name != "nt"),  # POSIX: detach into own session
-                            text=True,  # Ensure text mode for line-by-line processing
-                        )
+        # If tee_stream_json is enabled, we need to tee stdout to both log and events file
+        # Use subprocess.PIPE and a thread to write to both files
+        if tee_stream_json and events_path:
+            # Open handles without 'with' blocks - the thread will manage their lifecycle
+            # This is necessary because the thread runs as a daemon and must keep handles
+            # open for the entire worker lifetime, not just during launch
+            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
+            events_handle = events_path.open("w", encoding="utf-8", errors="replace")
 
-                    # Start a thread to tee output to both files
-                    def _tee_output():
-                        try:
-                            for line in process.stdout:
-                                log_handle.write(line)
-                                log_handle.flush()
-                                events_handle.write(line)
-                                events_handle.flush()
-                        except Exception:
-                            # Thread dies if process terminates or pipe breaks
-                            pass
-
-                    import threading
-
-                    tee_thread = threading.Thread(target=_tee_output, daemon=True)
-                    tee_thread.start()
+            if feed_stdin:
+                prompt_handle = prompt_path.open("r", encoding="utf-8")
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(worktree.path),
+                    stdin=prompt_handle,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=worker_env,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                    text=True,  # Ensure text mode for line-by-line processing
+                )
+                prompt_handle.close()
             else:
-                # Original behavior: direct stdout to log file
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(worktree.path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=worker_env,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP,
+                    start_new_session=(os.name != "nt"),  # POSIX: detach into own session
+                    text=True,  # Ensure text mode for line-by-line processing
+                )
+
+            # Start a thread to tee output to both files
+            def _tee_output():
+                try:
+                    for line in process.stdout:
+                        log_handle.write(line)
+                        log_handle.flush()
+                        events_handle.write(line)
+                        events_handle.flush()
+                except Exception:
+                    # Thread dies if process terminates or pipe breaks
+                    pass
+                finally:
+                    # Close handles when thread exits
+                    try:
+                        log_handle.close()
+                    except Exception:
+                        pass
+                    try:
+                        events_handle.close()
+                    except Exception:
+                        pass
+
+            import threading
+
+            tee_thread = threading.Thread(target=_tee_output, daemon=True)
+            tee_thread.start()
+        else:
+            # Original behavior: direct stdout to log file
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
                 if feed_stdin:
                     with prompt_path.open("r", encoding="utf-8") as prompt_handle:
                         process = subprocess.Popen(
