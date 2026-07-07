@@ -7413,6 +7413,7 @@ def test_concurrency_governor_result_unclamped() -> None:
 
 def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeypatch) -> None:
     """When fleet.global_max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
+
     # Mock count_fleet_live_sessions to return 0 fleet live sessions
     def mock_count_fleet_live(fleet_dir_override):
         return 0, []
@@ -7441,6 +7442,7 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     tmp_path: Path, monkeypatch
 ) -> None:
     """When fleet.global_max_concurrent_sessions is set and fleet live count meets cap, dispatch should be clamped."""
+
     # Mock count_fleet_live_sessions to return 3 fleet live sessions (at cap)
     def mock_count_fleet_live(fleet_dir_override):
         return 3, []
@@ -7467,6 +7469,7 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
 
 def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch) -> None:
     """When both per-repo and fleet caps are set, the tighter constraint wins."""
+
     # Mock count_fleet_live_sessions to return 1 fleet live session
     def mock_count_fleet_live(fleet_dir_override):
         return 1, []
@@ -7500,6 +7503,7 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
 
 def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeypatch) -> None:
     """When per-repo cap is tighter than fleet cap, per-repo wins."""
+
     # Mock count_fleet_live_sessions to return 1 fleet live session
     def mock_count_fleet_live(fleet_dir_override):
         return 1, []
@@ -7602,7 +7606,7 @@ def test_fleet_concurrency_governor_result_report_fields_includes_fleet() -> Non
 
 def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:
     """count_fleet_live_sessions should skip repos that no longer exist and report them."""
-    from charlie_work.fleet_registry import count_fleet_live_sessions, _load_registry
+    from charlie_work.fleet_registry import count_fleet_live_sessions
 
     # Create a fake fleet registry with 3 repos
     fleet_dir = tmp_path / ".fleet"

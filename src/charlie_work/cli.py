@@ -24,7 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
-    parser.add_argument("--fleet-dir", type=str, default=None, help="Override fleet directory path")
+    parser.add_argument(
+        "--fleet-dir", type=str, default=None, help="Override fleet directory path"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("roll-call")
@@ -121,7 +123,9 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
-    return OrchestratorApp(repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir)
+    return OrchestratorApp(
+        repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir
+    )
 
 
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
