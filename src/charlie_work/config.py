@@ -324,6 +324,23 @@ class FleetConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    """Pluggable needs-attention notification sink.
+
+    Detect (supervisor) and escalate (label policy) are separate concerns — this
+    section only decides where a digest goes once a needs-attention transition
+    has already fired. ``enabled`` defaults False so an absent config block is
+    a no-op — mirrors CrossFamilyConfig (config.py:236).
+    """
+
+    enabled: bool = False
+    sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
+    webhook_url: str = ""
+    shell_command: tuple[str, ...] = ()
+    file_path: str = ".var/charlie-work/notify/digest.jsonl"
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -336,6 +353,7 @@ class OrchestratorConfig:
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -582,6 +600,11 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"int, got {type(global_max).__name__}"
         )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
+    notify_data = _section(data, "notify")
+    shell_command = notify_data.get("shell_command")
+    if isinstance(shell_command, list):
+        notify_data["shell_command"] = tuple(str(item) for item in shell_command)
+    notify = _build_section(NotifyConfig, "notify", notify_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -594,4 +617,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         watchdog=watchdog,
         test_adequacy=test_adequacy,
         fleet=fleet,
+        notify=notify,
     )
