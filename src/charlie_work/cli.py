@@ -11,6 +11,7 @@ import yaml
 from . import CLI_NAME
 from .config import ConfigError, find_config_path, load_config
 from .doctor import run_doctor
+from .fleet_dispatch import fleet_loop
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo
 from .global_config import load_layered_config
@@ -119,6 +120,34 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_sub.add_parser("status")
 
+    fleet_work = fleet_sub.add_parser("work")
+    fleet_work.add_argument("--limit", type=int, default=None)
+    fleet_work.add_argument(
+        "--repos",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated repo keys to process explicitly, e.g. "
+            "'owner/repo1,owner/repo2'. Overrides the oldest-last_seen heuristic."
+        ),
+    )
+
+    fleet_bash_rats = fleet_sub.add_parser("bash-rats")
+    fleet_bash_rats.add_argument("--limit", type=int, default=None)
+    fleet_bash_rats.add_argument(
+        "--repos",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated repo keys to process explicitly, e.g. "
+            "'owner/repo1,owner/repo2'. Overrides the oldest-last_seen heuristic."
+        ),
+    )
+    fleet_bash_rats_merge_group = fleet_bash_rats.add_mutually_exclusive_group()
+    fleet_bash_rats_merge_group.add_argument("--merge", action="store_true", dest="merge")
+    fleet_bash_rats_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
+    fleet_bash_rats.set_defaults(merge=None)
+
     return parser
 
 
@@ -152,6 +181,62 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
         else f"doctor: {len(failed)} finding(s), at least one blocking"
     )
     return CommandResult(ok, message, {"checks": [check.to_dict() for check in checks]})
+
+
+def run_fleet_work(args: argparse.Namespace) -> CommandResult:
+    """Run fleet work (dispatch-only) across all or selected registered repos.
+
+    This is the fleet-wide version of the single-repo 'work' command:
+    - Runs dispatch only (no review/merge stage)
+    - Respects global concurrency budget via per-repo governor
+    - Aggregates results into one consolidated attention digest
+    """
+    # Parse --repos into tuple if provided
+    repos = tuple(args.repos.split(",")) if args.repos else None
+
+    # Load global config for notifier integration (optional, may be None)
+    try:
+        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+    except (ConfigError, RepoNotFoundError):
+        global_config = None
+
+    return fleet_loop(
+        fleet_dir_override=args.fleet_dir,
+        global_config=global_config,
+        repos=repos,
+        limit=args.limit,
+        merge=None,  # work-only doesn't use merge
+        dry_run=args.dry_run,
+        work_only=True,
+    )
+
+
+def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
+    """Run fleet bash-rats (full loop) across all or selected registered repos.
+
+    This is the fleet-wide version of the single-repo 'bash-rats' command:
+    - Runs full loop (intake -> dispatch -> review -> merge)
+    - Respects global concurrency budget via per-repo governor
+    - Aggregates results into one consolidated attention digest
+    """
+    # Parse --repos into tuple if provided
+    repos = tuple(args.repos.split(",")) if args.repos else None
+
+    # Load global config for notifier integration (optional, may be None)
+    try:
+        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+    except (ConfigError, RepoNotFoundError):
+        global_config = None
+
+    return fleet_loop(
+        fleet_dir_override=args.fleet_dir,
+        global_config=global_config,
+        repos=repos,
+        limit=args.limit,
+        merge=args.merge,
+        dry_run=args.dry_run,
+        work_only=False,
+    )
 
 
 def run_fleet_status(args: argparse.Namespace) -> CommandResult:
@@ -245,6 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "fleet":
             if args.fleet_command == "status":
                 result = run_fleet_status(args)
+            elif args.fleet_command == "work":
+                result = run_fleet_work(args)
+            elif args.fleet_command == "bash-rats":
+                result = run_fleet_bash_rats(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         else:
@@ -266,23 +355,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"YAML error: {exc}", file=sys.stderr)
         return 2
 
-    # Custom human-readable rendering for fleet status
-    if args.command == "fleet" and args.fleet_command == "status" and not json_output:
+    # Custom human-readable rendering for fleet commands
+    if args.command == "fleet" and not json_output:
         print(result.message)
-        repos = result.data.get("repos", {})
-        for repo_key, repo_data in sorted(repos.items()):
-            ready = repo_data.get("ready_issue_count", 0)
-            active = repo_data.get("active_issue_count", 0)
-            blocked = len(repo_data.get("blocked", []))
-            stalled = len(repo_data.get("stalled", []))
+        if args.fleet_command == "status":
+            repos = result.data.get("repos", {})
+            for repo_key, repo_data in sorted(repos.items()):
+                ready = repo_data.get("ready_issue_count", 0)
+                active = repo_data.get("active_issue_count", 0)
+                blocked = len(repo_data.get("blocked", []))
+                stalled = len(repo_data.get("stalled", []))
+                print(
+                    f"  {repo_key}: {ready} ready, {active} active, {blocked} blocked, {stalled} stalled"
+                )
+            errors = result.data.get("errors", [])
+            if errors:
+                print("Errors:")
+                for error in errors:
+                    print(f"  {error['repo_key']}: {error['error']}")
+        elif args.fleet_command in ("work", "bash-rats"):
+            repos = result.data.get("repos", {})
+            for repo_key, repo_data in sorted(repos.items()):
+                # repo_data now includes the ok field from fleet_dispatch
+                ok = repo_data.get("ok", True)
+                status = "OK" if ok else "FAILED"
+                print(f"  {repo_key}: {status}")
+            digest = result.data.get("digest", {})
+            event_count = digest.get("count", 0)
+            orphan_sweep_calls = digest.get("orphan_sweep_calls", 0)
             print(
-                f"  {repo_key}: {ready} ready, {active} active, {blocked} blocked, {stalled} stalled"
+                f"  Digest: {event_count} attention event(s), {orphan_sweep_calls} orphan sweep call(s)"
             )
-        errors = result.data.get("errors", [])
-        if errors:
-            print("Errors:")
-            for error in errors:
-                print(f"  {error['repo_key']}: {error['error']}")
     else:
         print_result(result, json_output=args.json_output)
 
