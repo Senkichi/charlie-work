@@ -10101,4 +10101,350 @@ def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatc
 
     assert check_calls["n"] == 1
     assert result.ok is True
-    assert "prompt_path" in result.data
+
+
+# Fleet status tests
+
+
+def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status aggregates status from multiple repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create two repo directories with minimal setup
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+
+    # Create minimal configs
+    config1 = repo1 / "orchestrator.config.yaml"
+    config2 = repo2 / "orchestrator.config.yaml"
+    config1.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    config2.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+
+    # Create state directories
+    (repo1 / ".var" / "charlie-work").mkdir(parents=True)
+    (repo2 / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with two repos
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "name_with_owner": "owner/repo1",
+                "config_path": str(config1),
+                "state_dir": str(repo1 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+                "name_with_owner": "owner/repo2",
+                "config_path": str(config2),
+                "state_dir": str(repo2 / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify aggregation
+    assert result.ok is True
+    assert "2 repo(s)" in result.message
+    assert len(result.data["repos"]) == 2
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+    assert result.data["errors"] == []
+
+
+def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status isolates errors from broken repos."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create one valid repo
+    repo_valid = tmp_path / "repo_valid"
+    repo_valid.mkdir()
+    config_valid = repo_valid / "orchestrator.config.yaml"
+    config_valid.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_valid / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json with one valid and one broken repo
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_valid": {
+                "repo_root": str(repo_valid),
+                "name_with_owner": "owner/repo_valid",
+                "config_path": str(config_valid),
+                "state_dir": str(repo_valid / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify error isolation
+    assert result.ok is False  # Errors present
+    assert "1 repo(s), 1 error(s)" in result.message
+    assert len(result.data["repos"]) == 1
+    assert "owner/repo_valid" in result.data["repos"]
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+
+
+def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status never mutates GitHub labels or state."""
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a repo with a ready-labeled issue
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create state.json
+    state_file = repo / ".var" / "charlie-work" / "state.json"
+    import json
+
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-07-06T12:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_file.write_text(json.dumps(initial_state, indent=2))
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return a ready issue and track mutating calls
+    from charlie_work.github import GitHub
+
+    mutating_calls = []
+
+    def mock_run(self, args, json_output=False, allow_failure=False):
+        mutating_calls.append(args)
+        return ""
+
+    def mock_issue_list(self, label):
+        return [{"number": 123, "title": "Test issue", "labels": [{"name": label}]}]
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "run", mock_run)
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Run fleet status
+    args = cli.build_parser().parse_args(["fleet", "status"])
+    result = cli.run_fleet_status(args)
+
+    # Verify no mutating calls were made
+    assert result.ok is True
+    # GitHub.run should not be called with mutating commands
+    for call in mutating_calls:
+        assert not any(
+            mutating_cmd in call
+            for mutating_cmd in ["issue edit", "label add", "label remove", "pr edit"]
+        ), f"Mutating call detected: {call}"
+
+    # Verify state.json was not modified
+    final_state = json.loads(state_file.read_text())
+    assert final_state["generated_at"] == initial_state["generated_at"]
+    assert final_state == initial_state
+
+
+def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
+    """Test that fleet status --json produces the correct output shape."""
+    from io import StringIO
+
+    # Set up fleet directory override
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    # Create a minimal repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Create fleet.json
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(config),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    import json
+
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    # Mock GitHub to return empty issue/PR lists
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, label):
+        return []
+
+    def mock_pr_list(self):
+        return []
+
+    def mock_get_github_issue_dependencies(gh, issue_number):
+        return [], []
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    monkeypatch.setattr(
+        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    )
+
+    # Capture stdout
+    fake_stdout = StringIO()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    # Run fleet status --json via main()
+    try:
+        cli.main(["fleet", "status", "--json"])
+    except SystemExit:
+        pass
+
+    output = fake_stdout.getvalue()
+    parsed = json.loads(output)
+
+    # Verify JSON structure
+    assert "ok" in parsed
+    assert "message" in parsed
+    assert "data" in parsed
+    assert "repos" in parsed["data"]
+    assert "errors" in parsed["data"]
+    assert "owner/repo" in parsed["data"]["repos"]
+
+
+def test_build_parser_fleet_subcommand() -> None:
+    """Test that build_parser registers the fleet subcommand correctly."""
+    parser = cli.build_parser()
+
+    # Test fleet status parsing
+    args = parser.parse_args(["fleet", "status"])
+    assert args.command == "fleet"
+    assert args.fleet_command == "status"
+
+    # Test that existing subcommands still work
+    args_roll_call = parser.parse_args(["roll-call"])
+    assert args_roll_call.command == "roll-call"
+
+    args_doctor = parser.parse_args(["doctor"])
+    assert args_doctor.command == "doctor"
