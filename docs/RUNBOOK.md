@@ -281,6 +281,82 @@ Mitigations (the fleet is charlie-work's, but the test config is the
   and sync time and does not touch the CPU/RAM ceiling. The shared-venv junction
   (`claude_code.venv_source`) is correct; bound parallelism instead.
 
+## Fleet: cross-repo dispatch
+
+The fleet layer extends the single-repo orchestrator to operate across multiple
+registered repos under a global concurrency budget. This is not a daemon — it
+is invoke-per-pass, matching the hub-and-spoke model in ARCHITECTURE.md.
+
+**Registry location**: The fleet registry lives at a user-level path:
+- Windows: `%LOCALAPPDATA%\charlie-work\fleet.json`
+- POSIX: `${XDG_STATE_HOME:-~/.local/state}/charlie-work/fleet.json`
+
+The registry (`fleet_registry.py`) tracks each registered repo by
+`name_with_owner` (resolved via `gh repo view`) and stores:
+- `repo_root` (absolute path to the worktree)
+- `config_path` (orchestrator.config.yaml location)
+- `state_dir` (.var/charlie-work location)
+- `first_seen` / `last_seen` timestamps
+
+Registration happens automatically on every command that loads config
+(`intake`, `dispatch`, `loop`, etc.) via `touch_repo()`. If `gh repo view`
+fails (offline, not a GitHub repo, gh missing), registration is silently
+skipped for that invocation.
+
+**Global budget**: `fleet.global_max_concurrent_sessions` caps total live worker
+sessions across all registered repos. This is a worker-count budget only — it
+does not bound CPU or RAM. The governor applies this cap at every dispatch
+path alongside the per-repo `dispatch.max_concurrent_sessions` cap
+(`_apply_concurrency_governor()` in `workflow.py`).
+
+**Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
+the fleet across multiple repos on one host, you must still respect the
+cross-repo xdist discipline from the Local host saturation ceiling section
+above:
+
+```
+sum(repo.default_limit) × PYTEST_XDIST_AUTO_NUM_WORKERS ≤ physical cores
+```
+
+Today's per-repo guidance only bounds one repo at a time; the fleet multiplies
+the risk. If you have 3 repos each with `default_limit: 3` and each worker
+runs `pytest -n auto` on a 16-core box, that's 16 × 3 × 3 = 144 test processes
+simultaneously. Set `claude_code.worker_env: {PYTEST_XDIST_AUTO_NUM_WORKERS: "2"}`
+globally (via the fleet config layer) or per-repo to keep the total under
+physical cores.
+
+**Fleet commands**: `charlie fleet status` aggregates status across all
+registered repos (reads the registry, calls `OrchestratorApp.status()` per repo
+with `dry_run=True`, and returns a combined JSON or human-readable report).
+Fleet-level `work` and `bash-rats` equivalents are not yet implemented at the
+time of this writing — the current fleet is a registry + global budget layer
+only.
+
+## Supervisor: worker health & escalation
+
+The supervisor layer (per-worker health classification, tripwires, and
+restart-intensity escalation) is part of the fleet-management design but has not
+landed at the time of this writing. This section will be added once the
+implementing issues (#158-#167) ship and the `WorkerHealth` enum,
+`classify_worker_health` function, and tripwire table are available in the
+codebase. The shipped stalled-session watchdog (#109/#136) is prior art that
+the supervisor generalizes.
+
+## Scheduled invocation
+
+The orchestrator is not a daemon — it is invoke-per-pass. Detection latency equals
+invocation cadence. For continuous operation, schedule periodic invocation via
+your platform's scheduler:
+
+- **cron** (Linux/macOS): Schedule `charlie bash-rats` or `charlie fleet bash-rats`
+  (once fleet-level equivalents ship) at your desired cadence.
+- **Windows Task Scheduler**: Create a task that runs the equivalent command
+  at your desired cadence.
+
+Scheduler artifacts (cron snippets and Windows Task Scheduler templates) are not
+yet provided in the `examples/` directory at the time of this writing. This will
+be added as part of the notification layer and scheduler artifact work (#166).
+
 ## Session-limit / quota discipline
 
 Both non-blocking adapters (`devin_shell.py`'s `launch_devin_session()`,
@@ -289,17 +365,20 @@ immediately; they do not enforce a concurrency limit themselves. The Devin CLI's
 documented (per the extraction dossier) as **single-threaded / SQLite-
 contention-limited** — do not assume parallel local Devin-shell dispatch
 works reliably; serialize dispatch waves or shard across machines/profiles
-if you need real concurrency. Practical discipline until an enforced
-concurrency cap exists in code:
+if you need real concurrency.
+
+The orchestrator enforces a code-level concurrency cap via
+`dispatch.max_concurrent_sessions` (shipped in #63 and #105). The governor
+`_apply_concurrency_governor()` in `workflow.py` counts live sessions at
+every dispatch path (`dispatch()`, `dispatch_rework()`, and the combined
+wave budget in `loop()`/`bash-rats`) and clamps the dispatch limit to the
+available slots. This replaces the need for manual session-count checks
+before dispatch — the governor does this automatically.
+
+Operator discipline:
 
 - Keep `dispatch.default_limit` (default `3`) conservative relative to your
   actual quota/rate-limit budget for whichever worker CLI you're driving.
-- Before dispatching a new wave, check for still-alive sessions:
-  `devin_shell.read_session_records(sessions_dir)` +
-  `devin_shell.is_session_alive(record)` (Windows PID liveness via ctypes
-  `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on
-  Windows; `os.kill(pid, 0)` on POSIX), or the `claude_code` equivalents
-  (`read_worker_records`, checking `record.pid`).
 - `doctor`'s `probe_devin()` / `probe_claude()` helpers are cheap
   `--version` checks — use them to confirm the CLI is reachable at all
   before burning a dispatch wave on a broken PATH.

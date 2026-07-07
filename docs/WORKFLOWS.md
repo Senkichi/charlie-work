@@ -145,7 +145,8 @@ charlie work --limit 3
 # 5. Worker runs inside its own worktree, opens a PR referencing the issue,
 #    the orchestrator's dispatch loop or a periodic status check picks up
 #    completion via the PR appearing on GitHub (there is no session-status
-#    API for claude -p any more than for devin --print)
+#    API for claude -p any more than for devin --print — a roll-call/fleet
+#    workers health section will add per-worker health fields once #167 ships)
 
 # 6-8. Same why-charlie-hate/verdict/ship-it sequence
 charlie why-charlie-hate --pr 123
@@ -190,6 +191,14 @@ A non-empty successful report is **reused** on repeated `review()`/`loop()`
 passes over the same PR (no repeat model spend) — but a failed run's
 `(UNAVAILABLE)` stub is never reused; it retries on the next call
 (see [ARCHITECTURE.md](ARCHITECTURE.md#invariants)).
+
+## Fleet dispatch loop
+
+Fleet-level commands compose the single-repo loops across all registered repos
+under a global budget. At the time of this writing, only `charlie fleet status`
+is implemented (aggregates status across all registered repos). Fleet-level
+`work` and `bash-rats` equivalents are not yet implemented — this section will
+be added once those commands ship (#170).
 
 ## Spec-review flow
 
