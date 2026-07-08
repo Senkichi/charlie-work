@@ -3388,8 +3388,16 @@ def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    # First request_changes (count = 1, head = "sha-1")
+    fake_gh.pr_head_shas[456] = "sha-1"
     first = app.record_review(456, "request_changes", summary="fix A")
+
+    # Second request_changes (count = 2, head = "sha-2")
+    fake_gh.pr_head_shas[456] = "sha-2"
     second = app.record_review(456, "request_changes", summary="fix B")
+
+    # Third request_changes (count stays at 2, escalated, head = "sha-3")
+    fake_gh.pr_head_shas[456] = "sha-3"
     third = app.record_review(456, "request_changes", summary="fix C")
 
     assert first.data["escalated"] is False and first.data["rework_path"]
@@ -4444,8 +4452,14 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    # First request_changes (count = 1, head = "sha-1")
+    fake_gh.pr_head_shas[456] = "sha-1"
     app.record_review(456, "request_changes", summary="a")
+
+    # Second request_changes (count = 2, head = "sha-2")
+    fake_gh.pr_head_shas[456] = "sha-2"
     app.record_review(456, "request_changes", summary="b")
+
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
     for i in range(300):
@@ -4455,6 +4469,8 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
         e.get("kind") == "record_review" for e in load_state(paths.state_file)["events"]
     )
 
+    # Third request_changes (count stays at 2, escalated, head = "sha-3")
+    fake_gh.pr_head_shas[456] = "sha-3"
     third = app.record_review(456, "request_changes", summary="c")
 
     assert third.data["escalated"] is True
@@ -6006,7 +6022,8 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert dispatch_result.ok is True
     assert dispatch_result.data["selected_count"] == 1
 
-    # Step 2: Record first request_changes (count = 1, not escalated)
+    # Step 2: Record first request_changes (count = 1, not escalated, head = "sha-1")
+    fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(456, "request_changes", summary="fix A")
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
@@ -6015,11 +6032,12 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert state["prs"]["456"]["request_changes_count"] == 1
     assert state["issues"]["123"]["status"] == "rework_requested"
 
-    # Step 3: Record second request_changes (count = 2, not escalated yet)
+    # Step 3: Record second request_changes (count = 2, not escalated yet, head = "sha-2")
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     pr_dir.mkdir(parents=True, exist_ok=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
+    fake_gh.pr_head_shas[456] = "sha-2"
 
     review_result_2 = app.record_review(456, "request_changes", summary="fix B")
     assert review_result_2.ok is True
@@ -6029,8 +6047,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert state["prs"]["456"]["request_changes_count"] == 2
     assert state["issues"]["123"]["status"] == "rework_requested"
 
-    # Step 4: Record third request_changes (count stays at 2, escalated because max_rework_cycles = 2)
+    # Step 4: Record third request_changes (count stays at 2, escalated because max_rework_cycles = 2, head = "sha-3")
     # When escalated, the count is NOT incremented (see workflow.py line 731-734)
+    fake_gh.pr_head_shas[456] = "sha-3"
     review_result_3 = app.record_review(456, "request_changes", summary="fix C")
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is True  # Should be escalated
@@ -6064,6 +6083,70 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     # After the failed dispatch, the count should be the same
     in_progress_count_after = fake_gh.labels_added.count((123, "agent:in-progress"))
     assert in_progress_count_after == in_progress_count_before
+
+
+def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Path) -> None:
+    """Issue #208: request_changes_count should only increment when PR head advances.
+
+    When a worker dies orphaned and the PR head never advances, re-issuing
+    request_changes should not consume the escalation budget.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_rework_cycles=2),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Step 1: Fresh dispatch
+    dispatch_result = app.dispatch(limit=1)
+    assert dispatch_result.ok is True
+
+    # Step 2: Record first request_changes (count = 1, head = "sha-1")
+    fake_gh.pr_head_shas[456] = "sha-1"
+    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    assert review_result_1.ok is True
+    assert review_result_1.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-1"
+
+    # Step 3: Record second request_changes with SAME head (count should stay at 1)
+    # This simulates a worker dying orphaned - no rework was actually produced
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    assert review_result_2.ok is True
+    assert review_result_2.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    # Count should NOT increment because head didn't advance
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-1"
+
+    # Step 4: Record third request_changes with NEW head (count should increment to 2)
+    fake_gh.pr_head_shas[456] = "sha-2"
+    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    assert review_result_3.ok is True
+    assert review_result_3.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    # Count should increment because head advanced
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-2"
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
@@ -10712,7 +10795,11 @@ def test_review_test_adequacy_escalates_at_max_rework_cycles(tmp_path: Path, mon
         # Simulate the increment that record_review would do
         if decision == "request_changes":
             escalated = request_changes_count >= 2  # Check before increment
-            request_changes_count += 1
+            # Simulate head_advanced check (issue #208)
+            reviewed_head_sha = app.gh.pr_head_shas.get(pr_number)
+            head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
+            if not escalated and head_advanced:
+                request_changes_count += 1
             pr_state["request_changes_count"] = request_changes_count
             state["prs"][str(pr_number)] = pr_state
             save_state(app.paths.state_file, state)
