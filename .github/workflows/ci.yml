@@ -6,18 +6,26 @@ on:
     branches:
       - main
 
+# SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
+# run on the repo-registered self-hosted runner (cw-9800x3d-1, local Windows
+# box). The hosted ubuntu+windows matrix is suspended — restore it from git
+# history when returning to GitHub-hosted runners. Check names changed from
+# "Tests (ubuntu-latest)"/"Tests (windows-latest)" to "Tests"; the local
+# orchestrator.config.yaml auto_merge.required_checks list must match.
+#
+# enable-cache stays OFF on self-hosted: setup-uv's GitHub-cache mode runs a
+# post-job `uv cache prune --ci` that destroys sibling jobs' in-flight cache
+# extractions when runners share a box (observed 2026-07-08 on job-cannon).
+# The persistent local disk cache is already warm.
 jobs:
   Tests:
     name: Tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
-          enable-cache: true
+          enable-cache: false
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
@@ -25,12 +33,12 @@ jobs:
 
   Lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
-          enable-cache: true
+          enable-cache: false
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Ruff check
