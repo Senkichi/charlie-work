@@ -325,22 +325,60 @@ simultaneously. Set `claude_code.worker_env: {PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
 globally (via the fleet config layer) or per-repo to keep the total under
 physical cores.
 
-**Fleet commands**: `charlie fleet status` aggregates status across all
-registered repos (reads the registry, calls `OrchestratorApp.status()` per repo
-with `dry_run=True`, and returns a combined JSON or human-readable report).
-Fleet-level `work` and `bash-rats` equivalents are not yet implemented at the
-time of this writing — the current fleet is a registry + global budget layer
-only.
+**Fleet commands**:
+
+- `charlie fleet status` aggregates status across all registered repos (reads
+  the registry, calls `OrchestratorApp.status()` per repo with `dry_run=True`,
+  and returns a combined JSON or human-readable report).
+- `charlie fleet work [--limit N] [--repos owner/a,owner/b]` runs a
+  dispatch-only wave across the registry (`fleet_dispatch.fleet_loop`,
+  `work_only=True`).
+- `charlie fleet bash-rats [--limit N] [--repos …] [--merge/--no-merge]` runs
+  the full intake→work→review→merge loop per repo.
+
+`fleet work` / `fleet bash-rats` walk the registry oldest-`last_seen`-first (or
+the explicit `--repos` order), enforce both the per-repo
+`dispatch.max_concurrent_sessions` and the fleet-global cap at every dispatch
+path, isolate per-repo failures (a broken/moved repo never aborts the sweep),
+and emit a consolidated attention digest at the end of the pass
+(`data.digest`: needs-attention event count + orphan-sweep calls).
 
 ## Supervisor: worker health & escalation
 
-The supervisor layer (per-worker health classification, tripwires, and
-restart-intensity escalation) is part of the fleet-management design but has not
-landed at the time of this writing. This section will be added once the
-implementing issues (#158-#167) ship and the `WorkerHealth` enum,
-`classify_worker_health` function, and tripwire table are available in the
-codebase. The shipped stalled-session watchdog (#109/#136) is prior art that
-the supervisor generalizes.
+The supervisor layer runs as a sweep nested inside each pass (it generalizes
+the original stalled-session watchdog #109/#136). It classifies every live
+worker via the adapter-agnostic `WorkerView` abstraction
+(`worker.classify_worker_health`) into a `WorkerHealth` state, applies a table
+of tripwires, and escalates to `agent:human-needed` when the restart-intensity
+cap is exceeded.
+
+**Health states** (`WorkerHealth` enum in `worker.py`): a worker is classified
+from multiple signals — process liveness, log-file staleness (mtime vs.
+`watchdog.stall_minutes`), terminal error markers, absolute age, loop/no-
+progress detection, and cumulative cost/token usage. `charlie roll-call`
+surfaces these under a `workers` section (health per live sidecar) so a
+STALLED / RUNAWAY / DEAD worker is visible on the next pass.
+
+**Tripwires** (all under `watchdog.*` in `orchestrator.config.yaml`, WARN-first
+by default so nothing kills a worker until you opt in):
+
+| Tripwire | Config knob | Default | Kill? |
+|---|---|---|---|
+| Stall (log mtime idle) | `watchdog.stall_minutes` | `20` | redispatch (see cap) |
+| Wall-clock age cap | `watchdog.wall_clock_minutes` / `wall_clock_kill` | `240` / `false` | only if `wall_clock_kill` |
+| Loop / no-progress | `watchdog.loop_stall_multiplier` / `loop_kill` | `2` / `false` | only if `loop_kill` |
+| Cost budget | `watchdog.cost_budget_usd` / `cost_budget_action` | `null` (off) / `warn` | only if action `kill` |
+| Token budget | `watchdog.token_budget` / `cost_budget_action` | `null` (off) / `warn` | only if action `kill` |
+
+The cost/token tripwires read cumulative usage from Claude Code's tee'd
+`events.jsonl` stream (session-status API); they are inert for adapters that
+don't emit usage.
+
+**Restart-intensity escalation**: redispatch is capped by
+`watchdog.max_auto_redispatch` (default `3`) within
+`watchdog.redispatch_window_minutes` (default `240`). Past the cap the
+supervisor stops restarting and escalates the issue to `agent:human-needed`
+rather than thrashing a genuinely-stuck worker indefinitely.
 
 ## Scheduled invocation
 
@@ -348,14 +386,15 @@ The orchestrator is not a daemon — it is invoke-per-pass. Detection latency eq
 invocation cadence. For continuous operation, schedule periodic invocation via
 your platform's scheduler:
 
-- **cron** (Linux/macOS): Schedule `charlie bash-rats` or `charlie fleet bash-rats`
-  (once fleet-level equivalents ship) at your desired cadence.
-- **Windows Task Scheduler**: Create a task that runs the equivalent command
-  at your desired cadence.
+- **cron** (Linux/macOS): Schedule `charlie bash-rats` (single repo) or
+  `charlie fleet bash-rats` (multi-repo) at your desired cadence. A commented
+  crontab entry ships at `examples/schedule/charlie-fleet.cron`.
+- **Windows Task Scheduler**: Import `examples/schedule/charlie-fleet-task.xml`
+  with `schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"`
+  and adjust the `<Interval>` (e.g. `PT5M` for every 5 minutes).
 
-Scheduler artifacts (cron snippets and Windows Task Scheduler templates) are not
-yet provided in the `examples/` directory at the time of this writing. This will
-be added as part of the notification layer and scheduler artifact work (#166).
+Both artifacts are reference templates — adjust the interval, working
+directory, and command to your setup before enabling.
 
 ## Session-limit / quota discipline
 
