@@ -355,8 +355,7 @@ def _detect_and_handle_orphaned_workers(
     - Otherwise, surface as drift for human triage
     - Clear worker_pid from state.json after handling
     """
-    from .devin_shell import is_session_alive, read_session_records, _get_process_start_time
-    from .claude_code import is_worker_alive, read_worker_records
+    from .devin_shell import _get_process_start_time, _win_is_alive, _posix_is_alive
 
     if not config.watchdog.enabled:
         return
@@ -377,10 +376,8 @@ def _detect_and_handle_orphaned_workers(
         # Check if the worker PID is still alive
         pid_alive = False
         if sys.platform == "win32":
-            from .devin_shell import _win_is_alive
             pid_alive = _win_is_alive(worker_pid)
         else:
-            from .devin_shell import _posix_is_alive
             pid_alive = _posix_is_alive(worker_pid)
 
         # Verify process identity via start time if available
@@ -684,7 +681,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                         # Clear worker PID when session fails (worker is dead)
                         if str(w.issue_number) in state.get("issues", {}):
                             state["issues"][str(w.issue_number)].pop("worker_pid", None)
-                            state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
+                            state["issues"][str(w.issue_number)].pop(
+                                "worker_process_start_time", None
+                            )
                         state = append_event(
                             state,
                             "session_failed_relabeled",
@@ -1110,6 +1109,8 @@ class OrchestratorApp:
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
+            from .devin_shell import _win_is_alive, _posix_is_alive, _get_process_start_time
+
             selected_issue_numbers: list[int] = []
             skipped_issue_numbers: list[int] = []
             # Detect stalled sessions (read-only for dry-run)
@@ -1156,9 +1157,11 @@ class OrchestratorApp:
                             # Check PID liveness using state.json record
                             if sys.platform == "win32":
                                 from .devin_shell import _win_is_alive, _get_process_start_time
+
                                 worker_alive = _win_is_alive(worker_pid)
                             else:
                                 from .devin_shell import _posix_is_alive, _get_process_start_time
+
                                 worker_alive = _posix_is_alive(worker_pid)
                             # Verify process identity via start time if available
                             if worker_alive:
@@ -1169,7 +1172,11 @@ class OrchestratorApp:
                                         worker_alive = False
                                     elif abs(current_start_time - process_start_time) > 1.0:
                                         worker_alive = False
-                        if issue_number in live_worker_issues or worker_alive or issue_number in pr_by_issue:
+                        if (
+                            issue_number in live_worker_issues
+                            or worker_alive
+                            or issue_number in pr_by_issue
+                        ):
                             live_dispatched.add(issue_number)
                 candidates = [
                     issue
@@ -1261,6 +1268,8 @@ class OrchestratorApp:
 
         # Real dispatch: claim issues, launch workers, update state and labels
         # First lock: claim issues by marking them as dispatch_pending
+        from .devin_shell import _win_is_alive, _posix_is_alive, _get_process_start_time
+
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
         # Use pre-computed stalled_entries from the stall detection above
@@ -1312,10 +1321,8 @@ class OrchestratorApp:
                     if worker_pid is not None:
                         # Check PID liveness using state.json record
                         if sys.platform == "win32":
-                            from .devin_shell import _win_is_alive, _get_process_start_time
                             worker_alive = _win_is_alive(worker_pid)
                         else:
-                            from .devin_shell import _posix_is_alive, _get_process_start_time
                             worker_alive = _posix_is_alive(worker_pid)
                         # Verify process identity via start time if available
                         if worker_alive:
@@ -1326,7 +1333,11 @@ class OrchestratorApp:
                                     worker_alive = False
                                 elif abs(current_start_time - process_start_time) > 1.0:
                                     worker_alive = False
-                    if issue_number in live_worker_issues or worker_alive or issue_number in pr_by_issue:
+                    if (
+                        issue_number in live_worker_issues
+                        or worker_alive
+                        or issue_number in pr_by_issue
+                    ):
                         live_dispatched.add(issue_number)
             candidates = [
                 issue
@@ -1464,7 +1475,10 @@ class OrchestratorApp:
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
-                    result = next((r for r in dispatch_results if r.issue_number == request.issue_number), None)
+                    result = next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    )
                     if result and result.pid is not None:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
@@ -2435,7 +2449,9 @@ class OrchestratorApp:
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
         # This fallback detects dead workers even when session sidecar files are orphaned
-        _detect_and_handle_orphaned_workers(sessions_dir, self.paths.state_file, self.config, self.gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, self.paths.state_file, self.config, self.gh
+        )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
@@ -2565,7 +2581,9 @@ class OrchestratorApp:
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
         # This fallback detects dead workers even when session sidecar files are orphaned
-        _detect_and_handle_orphaned_workers(sessions_dir, self.paths.state_file, self.config, self.gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, self.paths.state_file, self.config, self.gh
+        )
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -2842,7 +2860,10 @@ class OrchestratorApp:
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
-                    result = next((r for r in dispatch_results if r.issue_number == request.issue_number), None)
+                    result = next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    )
                     if result and result.pid is not None:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
