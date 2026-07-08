@@ -75,6 +75,8 @@ class SessionDispatchResult:
     stderr: str = ""
     error: str | None = None
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
+    pid: int | None = None  # Worker process PID for state-based liveness detection
+    process_start_time: float | None = None  # Process creation time for PID recycling protection
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +92,8 @@ class SessionDispatchResult:
             "stderr": self.stderr,
             "error": self.error,
             "reclaimed": self.reclaimed,
+            "pid": self.pid,
+            "process_start_time": self.process_start_time,
         }
 
 
@@ -241,6 +245,8 @@ def _run_devin_shell_adapter(
             command=list(record.command),
             error=record.error if not ok else None,
             reclaimed=record.reclaimed,
+            pid=record.pid,
+            process_start_time=record.process_start_time,
         )
     except Exception as exc:
         # Catch any unexpected exception and return as a failure result
@@ -293,6 +299,8 @@ def _run_claude_code_adapter(
         command=list(record.command),
         error=record.error if not ok else None,
         reclaimed=record.reclaimed,
+        pid=record.pid,
+        process_start_time=record.process_start_time,
     )
 
 
@@ -369,6 +377,8 @@ def _result(
     stderr: str = "",
     error: str | None = None,
     reclaimed: str | None = None,
+    pid: int | None = None,
+    process_start_time: float | None = None,
 ) -> SessionDispatchResult:
     return SessionDispatchResult(
         issue_number=request.issue_number,
@@ -383,6 +393,8 @@ def _result(
         stderr=stderr,
         error=error,
         reclaimed=reclaimed,
+        pid=pid,
+        process_start_time=process_start_time,
     )
 
 
