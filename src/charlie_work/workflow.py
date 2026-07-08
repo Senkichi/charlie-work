@@ -339,6 +339,48 @@ def _detect_and_handle_stalled_sessions(
     return stalled_entries
 
 
+def _worker_pid_alive(entry: dict[str, Any]) -> bool:
+    """Check if a worker PID from state.json is alive, with start-time verification.
+
+    This helper deduplicates the PID liveness check used across dispatch and
+    orphaned worker detection. It checks both PID liveness and process identity
+    via start time to detect PID recycling.
+
+    Args:
+        entry: A state.json issue entry containing worker_pid and optionally
+               worker_process_start_time.
+
+    Returns:
+        True if the worker PID is alive and the start time matches (if available),
+        False otherwise.
+    """
+    from .devin_shell import _get_process_start_time, _win_is_alive, _posix_is_alive
+
+    worker_pid = entry.get("worker_pid")
+    if worker_pid is None:
+        return False
+
+    # Check if the worker PID is still alive
+    pid_alive = False
+    if sys.platform == "win32":
+        pid_alive = _win_is_alive(worker_pid)
+    else:
+        pid_alive = _posix_is_alive(worker_pid)
+
+    # Verify process identity via start time if available
+    if pid_alive:
+        process_start_time = entry.get("worker_process_start_time")
+        if process_start_time is not None:
+            current_start_time = _get_process_start_time(worker_pid)
+            if current_start_time is None:
+                pid_alive = False
+            elif abs(current_start_time - process_start_time) > 1.0:
+                # Start time mismatch - PID has been recycled
+                pid_alive = False
+
+    return pid_alive
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig, gh: GitHub
 ) -> None:
@@ -355,8 +397,6 @@ def _detect_and_handle_orphaned_workers(
     - Otherwise, surface as drift for human triage
     - Clear worker_pid from state.json after handling
     """
-    from .devin_shell import _get_process_start_time, _win_is_alive, _posix_is_alive
-
     if not config.watchdog.enabled:
         return
 
@@ -369,33 +409,24 @@ def _detect_and_handle_orphaned_workers(
             continue
         if entry.get("status") != "dispatched":
             continue
-        worker_pid = entry.get("worker_pid")
-        if worker_pid is None:
-            continue
 
-        # Check if the worker PID is still alive
-        pid_alive = False
-        if sys.platform == "win32":
-            pid_alive = _win_is_alive(worker_pid)
-        else:
-            pid_alive = _posix_is_alive(worker_pid)
-
-        # Verify process identity via start time if available
-        if pid_alive:
-            process_start_time = entry.get("worker_process_start_time")
-            if process_start_time is not None:
-                current_start_time = _get_process_start_time(worker_pid)
-                if current_start_time is None:
-                    pid_alive = False
-                elif abs(current_start_time - process_start_time) > 1.0:
-                    # Start time mismatch - PID has been recycled
-                    pid_alive = False
-
-        if not pid_alive:
+        if not _worker_pid_alive(entry):
             orphaned_issues.append(int(issue_number_str))
 
     if not orphaned_issues:
         return
+
+    # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
+    prs = gh.pr_list()
+    pr_by_issue: dict[int, dict[str, Any]] = {}
+    for pr in prs:
+        linked = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if linked is not None:
+            pr_by_issue[linked] = pr
 
     # Handle orphaned workers
     with state_lock(state_file):
@@ -405,21 +436,14 @@ def _detect_and_handle_orphaned_workers(
             if not isinstance(entry, dict):
                 continue
 
-            # Check if there's an open PR for this issue
-            pr_number = None
-            pr_data = None
-            for pr in gh.pr_list():
-                linked = linked_issue_number(
-                    pr,
-                    is_cross_repository=pr.get("isCrossRepository"),
-                    branch_prefix=config.dispatch.branch_prefix,
-                )
-                if linked == issue_number:
-                    pr_number = int(pr["number"])
-                    pr_data = pr
-                    break
+            # Re-verify status (state may have changed between lock windows)
+            if entry.get("status") != "dispatched":
+                continue
 
-            if pr_number and pr_data:
+            pr_data = pr_by_issue.get(issue_number)
+
+            if pr_data:
+                pr_number = int(pr_data["number"])
                 # Check the last review decision from state
                 pr_state = state.get("prs", {}).get(str(pr_number), {})
                 last_decision = pr_state.get("decision")
@@ -471,16 +495,14 @@ def _detect_and_handle_orphaned_workers(
                         },
                     )
             else:
-                # No open PR - safe to reset to rework_requested
-                entry["status"] = "rework_requested"
-                entry["dispatched_at"] = None
+                # No open PR - emit drift event, leave recovery to mop-up
+                # Mop-up will handle label transition back to ready (issue #118)
                 state = append_event(
                     state,
-                    "orphaned_worker_recovered",
+                    "orphaned_worker_drift",
                     {
                         "issue_number": issue_number,
                         "previous_status": "dispatched",
-                        "new_status": "rework_requested",
                         "reason": "dead_worker_no_open_pr",
                     },
                 )
@@ -1109,8 +1131,6 @@ class OrchestratorApp:
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
-            from .devin_shell import _win_is_alive, _posix_is_alive, _get_process_start_time
-
             selected_issue_numbers: list[int] = []
             skipped_issue_numbers: list[int] = []
             # Detect stalled sessions (read-only for dry-run)
@@ -1151,27 +1171,7 @@ class OrchestratorApp:
                         # A dead worker with an open PR is mid-review and must not be re-dispatched.
                         # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                         issue_number = int(number)
-                        worker_pid = entry.get("worker_pid")
-                        worker_alive = False
-                        if worker_pid is not None:
-                            # Check PID liveness using state.json record
-                            if sys.platform == "win32":
-                                from .devin_shell import _win_is_alive, _get_process_start_time
-
-                                worker_alive = _win_is_alive(worker_pid)
-                            else:
-                                from .devin_shell import _posix_is_alive, _get_process_start_time
-
-                                worker_alive = _posix_is_alive(worker_pid)
-                            # Verify process identity via start time if available
-                            if worker_alive:
-                                process_start_time = entry.get("worker_process_start_time")
-                                if process_start_time is not None:
-                                    current_start_time = _get_process_start_time(worker_pid)
-                                    if current_start_time is None:
-                                        worker_alive = False
-                                    elif abs(current_start_time - process_start_time) > 1.0:
-                                        worker_alive = False
+                        worker_alive = _worker_pid_alive(entry)
                         if (
                             issue_number in live_worker_issues
                             or worker_alive
@@ -1268,8 +1268,6 @@ class OrchestratorApp:
 
         # Real dispatch: claim issues, launch workers, update state and labels
         # First lock: claim issues by marking them as dispatch_pending
-        from .devin_shell import _win_is_alive, _posix_is_alive, _get_process_start_time
-
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
         # Use pre-computed stalled_entries from the stall detection above
@@ -1316,23 +1314,7 @@ class OrchestratorApp:
                     # A dead worker with an open PR is mid-review and must not be re-dispatched.
                     # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                     issue_number = int(number)
-                    worker_pid = entry.get("worker_pid")
-                    worker_alive = False
-                    if worker_pid is not None:
-                        # Check PID liveness using state.json record
-                        if sys.platform == "win32":
-                            worker_alive = _win_is_alive(worker_pid)
-                        else:
-                            worker_alive = _posix_is_alive(worker_pid)
-                        # Verify process identity via start time if available
-                        if worker_alive:
-                            process_start_time = entry.get("worker_process_start_time")
-                            if process_start_time is not None:
-                                current_start_time = _get_process_start_time(worker_pid)
-                                if current_start_time is None:
-                                    worker_alive = False
-                                elif abs(current_start_time - process_start_time) > 1.0:
-                                    worker_alive = False
+                    worker_alive = _worker_pid_alive(entry)
                     if (
                         issue_number in live_worker_issues
                         or worker_alive
