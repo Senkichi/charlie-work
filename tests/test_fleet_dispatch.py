@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from charlie_work.config import OrchestratorConfig
 from charlie_work.fleet_dispatch import _extract_attention_events, _select_repos, fleet_loop
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -194,8 +195,7 @@ def test_extract_attention_events_empty() -> None:
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_config")
-@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -203,8 +203,7 @@ def test_fleet_loop_calls_loop_per_repo(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_find_config_path: MagicMock,
-    mock_load_config: MagicMock,
+    mock_load_layered_config: MagicMock,
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -229,11 +228,10 @@ def test_fleet_loop_calls_loop_per_repo(
     (tmp_path / "repo2").mkdir()
 
     # Mock config and paths
-    mock_config = MagicMock()
-    mock_load_config.return_value = mock_config
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
     mock_runtime_paths.return_value = mock_paths
-    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
 
     # Mock OrchestratorApp instances
     mock_app1 = MagicMock()
@@ -272,8 +270,7 @@ def test_fleet_loop_calls_loop_per_repo(
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_config")
-@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -281,8 +278,7 @@ def test_fleet_loop_work_only_calls_dispatch(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_find_config_path: MagicMock,
-    mock_load_config: MagicMock,
+    mock_load_layered_config: MagicMock,
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -302,11 +298,10 @@ def test_fleet_loop_work_only_calls_dispatch(
     (tmp_path / "repo1").mkdir()
 
     # Mock config and paths
-    mock_config = MagicMock()
-    mock_load_config.return_value = mock_config
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
     mock_runtime_paths.return_value = mock_paths
-    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
 
     # Mock OrchestratorApp
     mock_app = MagicMock()
@@ -373,8 +368,7 @@ def test_fleet_loop_missing_repo_root_skipped(
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_config")
-@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -382,8 +376,7 @@ def test_fleet_loop_github_error_isolated(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_find_config_path: MagicMock,
-    mock_load_config: MagicMock,
+    mock_load_layered_config: MagicMock,
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -408,11 +401,10 @@ def test_fleet_loop_github_error_isolated(
     (tmp_path / "repo2").mkdir()
 
     # Mock config and paths
-    mock_config = MagicMock()
-    mock_load_config.return_value = mock_config
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
     mock_runtime_paths.return_value = mock_paths
-    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
 
     # Mock OrchestratorApp instances - first one raises GitHubError
     mock_app1 = MagicMock()
@@ -450,8 +442,7 @@ def test_fleet_loop_github_error_isolated(
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_config")
-@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -459,8 +450,7 @@ def test_fleet_loop_dry_run_propagates(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_find_config_path: MagicMock,
-    mock_load_config: MagicMock,
+    mock_load_layered_config: MagicMock,
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -480,11 +470,10 @@ def test_fleet_loop_dry_run_propagates(
     (tmp_path / "repo1").mkdir()
 
     # Mock config and paths
-    mock_config = MagicMock()
-    mock_load_config.return_value = mock_config
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
     mock_runtime_paths.return_value = mock_paths
-    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
 
     # Mock OrchestratorApp
     mock_app = MagicMock()
@@ -516,8 +505,7 @@ def test_fleet_loop_dry_run_propagates(
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_config")
-@patch("charlie_work.fleet_dispatch.find_config_path")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -525,8 +513,7 @@ def test_fleet_loop_digest_aggregation(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_find_config_path: MagicMock,
-    mock_load_config: MagicMock,
+    mock_load_layered_config: MagicMock,
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -551,11 +538,10 @@ def test_fleet_loop_digest_aggregation(
     (tmp_path / "repo2").mkdir()
 
     # Mock config and paths
-    mock_config = MagicMock()
-    mock_load_config.return_value = mock_config
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
     mock_runtime_paths.return_value = mock_paths
-    mock_find_config_path.return_value = tmp_path / "repo1" / "orchestrator.config.yaml"
 
     # Mock OrchestratorApp instances with attention events
     mock_app1 = MagicMock()
