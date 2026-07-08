@@ -289,8 +289,11 @@ class TestAdequacyConfig:
     """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
 
     ``enabled`` defaults False so an absent config block is a no-op — mirrors
-    CrossFamilyConfig (config.py:236). Nothing reads this config yet; the
-    structural check and review-routing land in separate issues.
+    CrossFamilyConfig (config.py:236). When enabled, ``OrchestratorApp.review()``
+    runs the structural check (``janitor.check_test_adequacy``) before packet
+    generation: a Tier-1 "pure skip" failure auto-records a ``request_changes``
+    decision, and a passing PR gets a test-quality rubric folded into the review
+    packet (Tier-2). Tier-3 diff-coverage fields below remain reserved/unread.
     """
 
     __test__ = False  # Prevent pytest from collecting this as a test class

@@ -57,8 +57,9 @@ charlie verdict --pr 123 --decision blocked --summary-file review.md
 charlie ship-it --pr 123
 ```
 
-For explicit dependency-ordered dispatch (foundations before leaves) instead
-of the newest-first heuristic:
+Dispatch is dependency-aware by default (issues with open blockers are held
+back; the rest go most-unblocking-first, `dispatch.order` — default `oldest` —
+breaking ties). To pin an explicit order or subset instead:
 
 ```powershell
 charlie work --issues 565,570,572
@@ -144,9 +145,9 @@ charlie work --limit 3
 
 # 5. Worker runs inside its own worktree, opens a PR referencing the issue,
 #    the orchestrator's dispatch loop or a periodic status check picks up
-#    completion via the PR appearing on GitHub (there is no session-status
-#    API for claude -p any more than for devin --print — a roll-call/fleet
-#    workers health section will add per-worker health fields once #167 ships)
+#    completion via the PR appearing on GitHub. `charlie roll-call` now
+#    includes a `workers` health section (classify_worker_health over each
+#    live sidecar) so you can see STALLED / RUNAWAY / DEAD workers per pass.
 
 # 6-8. Same why-charlie-hate/verdict/ship-it sequence
 charlie why-charlie-hate --pr 123
@@ -194,11 +195,40 @@ passes over the same PR (no repeat model spend) — but a failed run's
 
 ## Fleet dispatch loop
 
-Fleet-level commands compose the single-repo loops across all registered repos
-under a global budget. At the time of this writing, only `charlie fleet status`
-is implemented (aggregates status across all registered repos). Fleet-level
-`work` and `bash-rats` equivalents are not yet implemented — this section will
-be added once those commands ship (#170).
+Fleet-level commands compose the single-repo loops across every repo in the
+user-level registry (`fleet_registry.py`) under one global concurrency budget
+(`fleet.global_max_concurrent_sessions`). A repo joins the registry
+automatically the first time any command loads its config (`touch_repo()`), so
+there is no explicit "register" step — run charlie once against a repo and it is
+enrolled.
+
+```powershell
+# Aggregate roll-call across every registered repo (read-only, dry-run per repo)
+charlie fleet status
+
+# Dispatch-only wave across all registered repos, sharing the global budget
+charlie fleet work --limit 3
+
+# Full intake -> work -> review -> merge pass across all registered repos
+charlie fleet bash-rats --limit 3
+
+# Restrict either command to specific repos (overrides the oldest-last_seen order)
+charlie fleet work --repos owner/repo-a,owner/repo-b
+```
+
+`fleet work` / `fleet bash-rats` walk the registry oldest-`last_seen`-first (or
+the explicit `--repos` order), applying the per-repo
+`dispatch.max_concurrent_sessions` cap and the fleet-global cap at every
+dispatch path. Per-repo errors (a moved/broken repo) are isolated — one repo
+failing never aborts the rest of the sweep. Each pass ends with a consolidated
+**attention digest** (count of needs-attention events + orphan-sweep calls)
+printed in the human-readable output and available under `data.digest` in
+`--json`.
+
+The fleet budget bounds worker *count*, not CPU/RAM — respect the cross-repo
+xdist discipline in
+[RUNBOOK.md](RUNBOOK.md#fleet-cross-repo-dispatch) when running many repos on
+one host.
 
 ## Spec-review flow
 

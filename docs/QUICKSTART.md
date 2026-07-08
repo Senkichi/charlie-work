@@ -79,8 +79,11 @@ for the full dataclass list and defaults):
 | `auto_merge.merge_flags` | Extra flags appended to `gh pr merge` (e.g., `["--admin"]` for protected-base merges, `["--auto"]` for merge-queue flows). Takes precedence over the legacy `admin` field. Flags must start with `--` and cannot be strategy flags (`--merge`/`--rebase`/`--squash`) or `--delete-branch` (branch deletion is handled separately). |
 | `auto_merge.admin` | Legacy field for `gh pr merge --admin` (required when the base branch is protected and your gh auth has admin on the repo). Superseded by `merge_flags` but preserved for backward compatibility. |
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
-| `devin.adapter` | `manual` (write a session manifest for a human to paste into a Devin session) or `command` (subprocess-launch via `devin.dispatch_command`). |
+| `devin.adapter` | How a worker is launched: `manual` (write a session manifest for a human to paste), `command` (blocking subprocess via `devin.dispatch_command`), `devin-shell` (non-blocking headless `devin --print`), or `claude-code` (non-blocking headless `claude -p` in an isolated worktree). See [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary). |
 | `cross_family.*` | Enables the non-Claude adversarial pass (`enabled: false` by default; both example profiles show how to turn it on/off). |
+| `watchdog.*` | Supervisor tripwires (stall, wall-clock, loop/no-progress, cost/token budget) and restart-intensity cap. WARN-first by default — see [RUNBOOK.md](RUNBOOK.md#supervisor-worker-health--escalation). |
+| `fleet.global_max_concurrent_sessions` | Cross-repo worker-count budget for `charlie fleet …` (default `0` = unlimited). |
+| `notify.*` | Opt-in needs-attention sink (webhook \| desktop \| shell \| file); `enabled: false` by default. See `examples/notify.config.yaml`. |
 
 ## 3. Preflight with `doctor`
 
@@ -126,7 +129,8 @@ uv run charlie roll-call --json
 # Write worker-prompt.md + issue.json for every automated-ready issue
 uv run charlie intake
 
-# Select a wave (newest-first, up to dispatch.default_limit) and write the
+# Select a wave (dependency-aware, most-unblocking-first with dispatch.order —
+# default oldest — as tiebreaker, up to dispatch.default_limit) and write the
 # session manifest / launch workers per the configured adapter
 uv run charlie work --limit 3
 
@@ -162,18 +166,18 @@ runtimes:
 
 | Profile | `dispatch.worker_template` | `devin.adapter` | Notes |
 |---|---|---|---|
-| `examples/orchestrator.config.devin.yaml` | `worker.md` | `manual` (default) | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); cross-family review **on**. |
-| `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `manual` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); cross-family review **off** (Claude-only review). |
+| `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); cross-family review **on**. |
+| `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `claude-code` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); cross-family review **off** (Claude-only review). |
 
-`manual` is the operator-confirmed default for both profiles today: the
-orchestrator writes the session manifest and prompt files, and a human opens
-the worker session (Devin app, or a `claude` terminal in a worktree) by
-hand. The `command` adapter (subprocess-launch via
-`devin.dispatch_command`) and the in-flight non-blocking `devin_shell`/
-`claude_code` adapters are alternatives — see
-[ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary) and
-[WORKFLOWS.md](WORKFLOWS.md) for their exact invocation shape and current
-integration status.
+Both shipped profiles use a non-blocking adapter that actually launches a
+worker (`devin-shell` / `claude-code`); each comments `# Fall back to
+adapter: manual` inline if you'd rather have the orchestrator only write the
+session manifest and prompt files and paste them into a worker session (Devin
+app, or a `claude` terminal in a worktree) by hand. The `command` adapter
+(blocking subprocess-launch via `devin.dispatch_command`) is a fourth option —
+see [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary) and
+[WORKFLOWS.md](WORKFLOWS.md) for each adapter's exact invocation shape. Confirm
+the configured adapter's CLI is reachable with `charlie doctor --adapter-probe`.
 
 ## 7. Prompt templates
 

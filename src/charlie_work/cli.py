@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
-from .config import ConfigError, find_config_path, load_config
+from .config import ConfigError, find_config_path
 from .doctor import run_doctor
 from .fleet_dispatch import fleet_loop
 from .fleet_paths import fleet_dir
@@ -262,7 +262,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
             if not repo_root.exists():
                 raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
 
-            config = load_config(find_config_path(repo_root, None))
+            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
             gh = GitHub(repo_root=repo_root, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)

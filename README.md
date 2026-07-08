@@ -43,6 +43,17 @@ union of both forks plus the fixes each learned separately.
 - **Reconcile**: `charlie mop-up` detects drift when humans act outside
   the orchestrator (a PR merged by hand leaving stale labels) — read-only by
   default, `--fix` to repair.
+- **Supervise**: each pass classifies live worker health (`WorkerView` →
+  `classify_worker_health`) and applies tripwires (liveness, staleness,
+  terminal-marker, wall-clock, loop/no-progress, cost/token budget),
+  escalating to `agent:human-needed` when the restart-intensity cap trips.
+  `roll-call` surfaces a `workers` health section; the pluggable `notify`
+  layer turns health transitions into outbound signals.
+- **Fleet**: `charlie fleet …` composes N per-repo passes across a user-level
+  repo registry under one global concurrency budget
+  (`fleet.global_max_concurrent_sessions`). Neither the supervisor nor the
+  fleet is a daemon — both are invoke-per-pass, so detection latency equals
+  invocation cadence.
 
 ## Quickstart
 
@@ -78,6 +89,9 @@ charlie ship-it --pr 123
 charlie bash-rats --limit 3      # intake → dispatch → review → merge in one pass
 charlie why-charlie-hate-spec --file docs/SPEC.md   # cross-family pass on a design doc
 charlie mop-up              # detect label/state drift (--fix to repair)
+charlie fleet status        # aggregate status across every registered repo
+charlie fleet work --limit 3     # dispatch-only wave across all registered repos
+charlie fleet bash-rats --limit 3   # full loop across all registered repos, one global budget
 ```
 
 > **Why not an editable path dependency?** Because it breaks consumer CI: a
@@ -105,6 +119,9 @@ predictable.
 | `charlie mop-up` | detect (and with `--fix`, repair) label/state drift |
 | `charlie doctor` | preflight diagnostics (env, labels, CI-check names, config, adapter) |
 | `charlie bootstrap-labels` | create the nine `agent:*` / `automated-ready` labels once |
+| `charlie fleet status` | aggregate `roll-call` across every registered repo |
+| `charlie fleet work` | dispatch-only wave across all (or `--repos`-selected) registered repos, under one global concurrency budget |
+| `charlie fleet bash-rats` | full intake→work→review→merge pass across all registered repos, under one global budget |
 
 ## Dependencies
 
@@ -176,7 +193,10 @@ escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `devin.adapter` (`manual` | `command` | `devin-shell` | `claude-code`),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
 `cross_family.*` (non-Claude adversarial pass), `test_adequacy.*` (opt-in
-test-adequacy gate).
+test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
+loop/cost-token budgets, WARN-first by default), `fleet.*`
+(`global_max_concurrent_sessions` — cross-repo worker-count budget), and
+`notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file).
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in

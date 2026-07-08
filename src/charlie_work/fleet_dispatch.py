@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, find_config_path, load_config
+from .config import ConfigError
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry
 from .github import GitHub, GitHubError
+from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import runtime_paths
 from .state import utc_now
@@ -227,12 +229,30 @@ def fleet_loop(
             continue
 
         try:
-            # Load per-repo config
-            config = load_config(find_config_path(repo_root, entry.get("config_path")))
+            # Load per-repo config through the global fleet layer so a fleet-wide
+            # default (e.g. fleet.global_max_concurrent_sessions, watchdog knobs)
+            # set once in <fleet_dir>/config.yaml applies here too; the per-repo
+            # orchestrator.config.yaml still wins on any overlapping key.
+            explicit_cfg = entry.get("config_path")
+            config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+            # Fleet mode is the single notification authority: the aggregate
+            # digest below emits once for the whole pass. Silence per-repo
+            # dispatch()/loop() emission so one health transition doesn't fire
+            # both a per-repo and a fleet-level notification.
+            config = replace(config, notify=replace(config.notify, enabled=False))
             paths = runtime_paths(repo_root, config.runtime.state_dir)
             gh = GitHub(repo_root=repo_root, dry_run=dry_run)
             app = OrchestratorApp(
-                repo_root, paths, config, gh, dry_run=dry_run, fleet_dir_override=None
+                repo_root,
+                paths,
+                config,
+                gh,
+                dry_run=dry_run,
+                fleet_dir_override=fleet_dir_override,
             )
 
             # Call the appropriate per-repo method
