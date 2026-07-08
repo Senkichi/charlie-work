@@ -1871,8 +1871,14 @@ class OrchestratorApp:
                 # thrashes (wrong brief or unimplementable criteria) — escalate to
                 # a human instead of dispatching another cycle.
                 escalated = request_changes_count >= self.config.review.max_rework_cycles
-                if not escalated:
+                # Only count a rework cycle when the PR head has actually advanced.
+                # If the head is unchanged, the prior cycle's attempt was never
+                # delivered (e.g., worker died orphaned), so re-issuing request_changes
+                # should not consume the escalation budget. See issue #208.
+                head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
+                if not escalated and head_advanced:
                     request_changes_count += 1
+                if not escalated:
                     rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
             decision_payload["escalated"] = escalated
             state["prs"][str(pr_number)] = {
