@@ -490,7 +490,12 @@ index 1234567..abcdef0 100644
     assert current_patch_id != "old-patch-id"
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(require_issue_link=False), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+        pr,
+        _green_checks(),
+        _config(require_issue_link=False),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=diff,
     )
 
     # Should PASS because patch-id changed (actual content changed)

@@ -1391,7 +1391,9 @@ class OrchestratorApp:
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
         # must cost zero review tokens. Failures don't move labels — they are
         # the worker's/CI's to fix, not a review decision.
-        verdict = run_janitor(pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff)
+        verdict = run_janitor(
+            pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
+        )
         if not verdict.ok:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)

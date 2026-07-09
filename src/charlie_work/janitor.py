@@ -347,7 +347,9 @@ def _check_no_op_rework(
                 if unpushed_info:
                     failure_msg += f"; {unpushed_info}"
                 else:
-                    failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+                    failure_msg += (
+                        "; check the branch worktree for unpushed work before re-reviewing"
+                    )
             else:
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
 

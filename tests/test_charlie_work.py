@@ -8570,7 +8570,9 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
     )
 
     # Set initial diff
-    fake_gh.diffs[456] = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
 
     app.record_review(456, "request_changes", summary="fix A")
 
@@ -8624,14 +8626,18 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
     )
 
     # Set initial diff
-    fake_gh.diffs[456] = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
 
     app.record_review(456, "request_changes", summary="fix A")
 
     # Advance the PR head and change the diff (simulating actual content changes)
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
     fake_gh.pr_head_shas[456] = "sha-new-head"
-    fake_gh.diffs[456] = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+changed"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+changed"
+    )
 
     # Call review again with the advanced head
     result = app.review(456)
