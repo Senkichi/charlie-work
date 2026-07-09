@@ -1141,10 +1141,10 @@ def test_terminal_transition_clears_sibling_workflow_labels() -> None:
     assert result.outcome == TO.APPLIED
     assert len(result.add_failures) == 0
     assert len(result.remove_failures) == 0
-    
+
     # Verify that agent:done was added
     assert (852, config.labels.done) in gh.labels_added
-    
+
     # Verify that all other workflow labels were removed (but not agent:done itself)
     # The remove set should include all workflow labels except agent:done
     assert (852, config.labels.queued) in gh.labels_removed
@@ -1153,7 +1153,7 @@ def test_terminal_transition_clears_sibling_workflow_labels() -> None:
     assert (852, config.labels.reviewing) in gh.labels_removed
     assert (852, config.labels.needs_rework) in gh.labels_removed
     assert (852, config.labels.human_needed) in gh.labels_removed
-    
+
     # Verify agent:done was NOT removed (it's the target state)
     assert (852, config.labels.done) not in gh.labels_removed
 

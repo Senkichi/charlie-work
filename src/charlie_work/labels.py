@@ -48,7 +48,10 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         "dispatched": ((labels.in_progress,), _compute_remove((labels.in_progress,))),
         # Re-review is a fresh cycle: clear needs_rework so repeated loop()
         # passes don't permanently stack reviewing on top of needs_rework.
-        "review_started": ((labels.pr_open, labels.reviewing), _compute_remove((labels.pr_open, labels.reviewing))),
+        "review_started": (
+            (labels.pr_open, labels.reviewing),
+            _compute_remove((labels.pr_open, labels.reviewing)),
+        ),
         "rework_requested": ((labels.needs_rework,), _compute_remove((labels.needs_rework,))),
         # rework worker launched for non-manual adapters
         "rework_dispatched": ((labels.in_progress,), _compute_remove((labels.in_progress,))),
