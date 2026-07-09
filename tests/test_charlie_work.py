@@ -7347,22 +7347,26 @@ def test_update_open_agent_prs_skips_prs_with_pending_required_checks(tmp_path: 
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
             "isCrossRepository": False,
-            "statusCheckRollup": {
-                "contexts": [
-                    {
-                        "name": "Tests passed",
-                        "status": "IN_PROGRESS",  # Required check is in-flight
-                    },
-                    {
-                        "name": "Lint & Format",
-                        "status": "SUCCESS",
-                    },
-                    {
-                        "name": "Pre-commit",
-                        "status": "SUCCESS",
-                    },
-                ]
-            },
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "IN_PROGRESS",  # Required check is in-flight
+                    "conclusion": "",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
         },
         {
             "number": 789,
@@ -7373,22 +7377,26 @@ def test_update_open_agent_prs_skips_prs_with_pending_required_checks(tmp_path: 
             "body": "Closes #124\n\nTests: added.",
             "labels": [],
             "isCrossRepository": False,
-            "statusCheckRollup": {
-                "contexts": [
-                    {
-                        "name": "Tests passed",
-                        "status": "PENDING",  # Required check is pending
-                    },
-                    {
-                        "name": "Lint & Format",
-                        "status": "SUCCESS",
-                    },
-                    {
-                        "name": "Pre-commit",
-                        "status": "SUCCESS",
-                    },
-                ]
-            },
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "QUEUED",  # Required check is pending
+                    "conclusion": "",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
         },
     ]
 
@@ -7434,22 +7442,26 @@ def test_update_open_agent_prs_updates_prs_with_completed_required_checks(tmp_pa
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
             "isCrossRepository": False,
-            "statusCheckRollup": {
-                "contexts": [
-                    {
-                        "name": "Tests passed",
-                        "status": "SUCCESS",
-                    },
-                    {
-                        "name": "Lint & Format",
-                        "status": "SUCCESS",
-                    },
-                    {
-                        "name": "Pre-commit",
-                        "status": "SUCCESS",
-                    },
-                ]
-            },
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
         },
     ]
 

@@ -2399,15 +2399,23 @@ class OrchestratorApp:
             # matrix jobs and aggregate-gate checks permanently fail against the frozen CANCELLED state.
             status_rollup = pr.get("statusCheckRollup")
             if status_rollup and required_checks:
-                # statusCheckRollup is a dict with 'contexts' containing check runs
-                contexts = status_rollup.get("contexts") or []
+                # statusCheckRollup is a flat array of check objects (CheckRun or StatusContext)
+                # CheckRun uses 'status' field, StatusContext uses 'state' field
                 has_pending_required = False
-                for context in contexts:
-                    check_name = context.get("name") or context.get("context")
+                for check in status_rollup:
+                    check_name = check.get("name") or check.get("context")
                     if check_name in required_checks:
                         # Check if this required check is in a pending/in-progress state
-                        status = context.get("status") or context.get("state", "")
-                        if status.upper() in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"}:
+                        # For CheckRuns: status != COMPLETED means in-flight
+                        # For StatusContext: state != SUCCESS/FAILURE/ERROR means in-flight
+                        status = check.get("status") or check.get("state", "")
+                        # Treat any non-terminal status as in-flight (safer than enumerating)
+                        # Terminal states: COMPLETED (CheckRun), SUCCESS/FAILURE/ERROR (StatusContext)
+                        if status.upper() != "COMPLETED" and status.upper() not in {
+                            "SUCCESS",
+                            "FAILURE",
+                            "ERROR",
+                        }:
                             has_pending_required = True
                             break
 
