@@ -174,7 +174,9 @@ def _check_required_checks(
     if summary.failed:
         failures.append(f"Required check(s) failed: {', '.join(summary.failed)}")
     if summary.infra_failed:
-        failures.append(f"CI never ran (infrastructure failure): {', '.join(summary.infra_failed)}")
+        failures.append(
+            f"CI never ran (infrastructure failure): {', '.join(summary.infra_failed)}"
+        )
     if summary.missing:
         failures.append(f"Required check(s) missing: {', '.join(summary.missing)}")
     if summary.pending:
