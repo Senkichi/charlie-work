@@ -1566,7 +1566,7 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
     auto_merge = AutoMergeConfig(
         required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
         enabled=True,  # Ensure auto_merge is enabled for merge tests
-        **kwargs
+        **kwargs,
     )
     return OrchestratorConfig(auto_merge=auto_merge)
 
@@ -2462,6 +2462,7 @@ def test_merge_ready_honors_delete_branch_false(tmp_path: Path) -> None:
     assert ready.data["merged"] is True
     assert fake_gh.deleted_branches == []
     assert ready.data["branch_deleted"] is None
+
 
 def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> None:
     """Issue #149: when update_open_prs is disabled, update_open_prs_results must be None."""
