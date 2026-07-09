@@ -20,6 +20,7 @@ compare worktree/branch state against the PR diff.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 import subprocess
 from collections.abc import Iterator
@@ -82,6 +83,60 @@ class JanitorVerdict:
     warnings: tuple[str, ...]
 
 
+def _calculate_patch_id(diff: str) -> str:
+    """Calculate a stable patch-id from a diff.
+
+    This function computes a SHA256 hash of the normalized diff content,
+    which serves as a stable identifier for the actual changes regardless
+    of base SHA changes (e.g., from base-update merges).
+
+    The normalization strips metadata that varies between runs (hashes,
+    timestamps, line offsets) while preserving the actual code changes.
+    Specifically, it mirrors what ``git patch-id`` does: hunk headers
+    (lines starting with ``@@``) are dropped so that base-update merges
+    that shift line numbers in a PR's files do not change the patch-id
+    even when the content lines are identical.
+
+    Args:
+        diff: The unified diff string (e.g., from `git diff` or `gh pr diff`)
+
+    Returns:
+        A SHA256 hash of the normalized diff content, or empty string for empty/whitespace-only diffs
+    """
+    if not diff or not diff.strip():
+        return ""
+
+    # Normalize the diff by stripping metadata lines that vary
+    lines = diff.splitlines()
+    normalized = []
+    for line in lines:
+        # Skip header lines that vary between runs
+        if (
+            line.startswith("diff --git")
+            or line.startswith("index ")
+            or line.startswith("--- ")
+            or line.startswith("+++ ")
+        ):
+            continue
+        # Skip hunk headers (e.g. "@@ -10,5 +10,6 @@"): line-offset numbers change
+        # on base-update merges even when content is identical. git patch-id ignores
+        # these for the same reason.
+        if line.startswith("@@"):
+            continue
+        # Skip diff metadata lines
+        if line.startswith("\\"):
+            continue
+        normalized.append(line)
+
+    # If after normalization we have no content, return empty string
+    if not normalized or not any(line.strip() for line in normalized):
+        return ""
+
+    # Calculate SHA256 of the normalized diff
+    content = "\n".join(normalized)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class TestAdequacyFacts:
     __test__ = False  # Prevent pytest from collecting this as a test class
@@ -112,6 +167,7 @@ def run_janitor(
     *,
     pr_state: dict[str, Any] | None = None,
     repo_root: Path | None = None,
+    pr_diff: str | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -134,7 +190,7 @@ def run_janitor(
 
     # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
     if repo_root is not None:
-        _check_no_op_rework(pr, pr_state, failures, warnings, repo_root)
+        _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
     return JanitorVerdict(ok=not failures, failures=tuple(failures), warnings=tuple(warnings))
 
@@ -263,15 +319,19 @@ def _check_no_op_rework(
     failures: list[str],
     warnings: list[str],
     repo_root: Path,
+    pr_diff: str | None = None,
 ) -> None:
-    """Check if the PR head is unchanged since a request_changes verdict.
+    """Check if the PR has actual content changes since a request_changes verdict.
 
     When a PR has a request_changes verdict in its state, compare the current
-    headRefOid against the reviewed_head_sha from that verdict. If they match,
-    the rework produced no pushed commits (no-op rework).
+    patch-id against the reviewed_patch_id from that verdict. If they match,
+    the rework produced no actual content changes (no-op rework).
 
-    GitHub update-branch merges (base-update commits) are excluded: only non-merge
-    commits since the verdict are considered real work.
+    This is superior to head SHA comparison because base-update merges can
+    advance the head SHA without changing the actual diff content (issue #222).
+
+    Falls back to head SHA comparison if patch-id is not available (for backwards
+    compatibility with old verdicts).
     """
     if not pr_state:
         return
@@ -280,6 +340,35 @@ def _check_no_op_rework(
     decision = pr_state.get("decision")
     if decision != "request_changes":
         return
+
+    # Primary check: compare patch-ids when both are available
+    reviewed_patch_id = pr_state.get("reviewed_patch_id")
+    if reviewed_patch_id and pr_diff is not None:
+        current_patch_id = _calculate_patch_id(pr_diff)
+        if current_patch_id == reviewed_patch_id:
+            failure_msg = (
+                f"PR diff unchanged since request_changes verdict (patch-id {current_patch_id[:12]}...) — "
+                f"the rework produced no actual content changes"
+            )
+
+            # Enrich with unpushed-commit count if worktree exists
+            head_ref = pr.get("headRefName")
+            if head_ref:
+                unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
+                if unpushed_info:
+                    failure_msg += f"; {unpushed_info}"
+                else:
+                    failure_msg += (
+                        "; check the branch worktree for unpushed work before re-reviewing"
+                    )
+            else:
+                failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+
+            failures.append(failure_msg)
+        # Patch-id check ran (match or not) — skip SHA fallback
+        return
+
+    # Fallback: head SHA comparison (only when patch-id check could not run)
 
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:

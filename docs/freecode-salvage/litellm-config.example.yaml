@@ -1,0 +1,59 @@
+# Example LiteLLM proxy config for cheap-token secondary roles (spec 05).
+# Run: litellm --config litellm-config.example.yaml   (listens on :4000)
+# Point any OpenAI-compatible client at http://localhost:4000/v1.
+#
+# Prices/models verified 2026-07-09 — re-verify before first use; this
+# landscape reshuffles monthly (see freecode docs/evaluation-2026-07/).
+
+model_list:
+  # Primary cheap coding model — DeepSeek-V4-Flash via OpenRouter ($0.09/$0.18 per M)
+  - model_name: cheap-coder
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+      rpm: 60
+      tpm: 200000
+
+  # Fallback 1 — GLM-4.7-FlashX via z.ai ($0.07/$0.40 per M)
+  - model_name: cheap-coder
+    litellm_params:
+      model: openai/glm-4.7-flashx        # z.ai exposes an OpenAI-compatible endpoint
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+      rpm: 30
+      tpm: 100000
+
+  # Fallback 2 — gpt-oss-120b via Groq (free tier, 200K tokens/day — burst reserve only)
+  - model_name: cheap-coder
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      rpm: 20
+      tpm: 30000
+
+  # Distinct alias when a role wants a *different family* on purpose
+  # (cross-family review should not silently share the primary's model).
+  - model_name: cross-family-reviewer
+    litellm_params:
+      model: openai/glm-5.2               # z.ai flagship, $1.40/$4.40 per M
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+      rpm: 10
+      tpm: 60000
+
+litellm_settings:
+  num_retries: 2
+  request_timeout: 300
+  # 429/5xx puts a deployment on cooldown; router hops to the next same-name entry.
+  cooldown_time: 60
+
+router_settings:
+  routing_strategy: simple-shuffle        # deployments above are already priority-ordered
+  allowed_fails: 2
+  # Session affinity (2026 LiteLLM) if a role needs sticky multi-turn routing:
+  # routing_strategy_args: {"session_affinity": true}
+
+general_settings:
+  # Keep the proxy loopback-only; it fronts personal keys.
+  # (Run behind localhost; do not expose. Master key optional for local use.)
+  disable_spend_logs: false

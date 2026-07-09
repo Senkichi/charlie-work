@@ -9040,6 +9040,11 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
         encoding="utf-8",
     )
 
+    # Set initial diff
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+
     app.record_review(456, "request_changes", summary="fix A")
 
     # Verify the decision was recorded
@@ -9047,17 +9052,20 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
         state = load_state(paths.state_file)
         assert state["prs"]["456"]["decision"] == "request_changes"
         assert state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+        # Verify patch-id was calculated
+        assert "reviewed_patch_id" in state["prs"]["456"]
 
     # Clear label tracking to isolate the review() call
     fake_gh.labels_added.clear()
     fake_gh.labels_removed.clear()
 
-    # Call review again with the same head SHA
+    # Call review again with the same head SHA and same diff (no-op rework)
     result = app.review(456)
 
-    # The janitor should block the PR because the head is unchanged (no-op rework)
+    # The janitor should block the PR because the diff is unchanged (no-op rework)
     assert result.ok is False
-    assert "PR head unchanged since request_changes verdict" in result.message
+    # With patch-id comparison, the message should mention patch-id
+    assert "PR diff unchanged since request_changes verdict" in result.message
     # review_started transition should not fire (janitor blocks before it)
     assert (123, "agent:pr-open") not in fake_gh.labels_added
     assert (123, "agent:reviewing") not in fake_gh.labels_added
@@ -9088,11 +9096,19 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
         encoding="utf-8",
     )
 
+    # Set initial diff
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+
     app.record_review(456, "request_changes", summary="fix A")
 
-    # Advance the PR head
+    # Advance the PR head and change the diff (simulating actual content changes)
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
     fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+changed"
+    )
 
     # Call review again with the advanced head
     result = app.review(456)
