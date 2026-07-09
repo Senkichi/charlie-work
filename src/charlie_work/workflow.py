@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -338,6 +339,182 @@ def _detect_and_handle_stalled_sessions(
     return stalled_entries
 
 
+def _worker_pid_alive(entry: dict[str, Any]) -> bool:
+    """Check if a worker PID from state.json is alive, with start-time verification.
+
+    This helper deduplicates the PID liveness check used across dispatch and
+    orphaned worker detection. It checks both PID liveness and process identity
+    via start time to detect PID recycling.
+
+    Args:
+        entry: A state.json issue entry containing worker_pid and optionally
+               worker_process_start_time.
+
+    Returns:
+        True if the worker PID is alive and the start time matches (if available),
+        False otherwise.
+    """
+    from .devin_shell import _get_process_start_time, _win_is_alive, _posix_is_alive
+
+    worker_pid = entry.get("worker_pid")
+    if worker_pid is None:
+        return False
+
+    # Check if the worker PID is still alive
+    pid_alive = False
+    if sys.platform == "win32":
+        pid_alive = _win_is_alive(worker_pid)
+    else:
+        pid_alive = _posix_is_alive(worker_pid)
+
+    # Verify process identity via start time if available
+    if pid_alive:
+        process_start_time = entry.get("worker_process_start_time")
+        if process_start_time is not None:
+            current_start_time = _get_process_start_time(worker_pid)
+            if current_start_time is None:
+                pid_alive = False
+            elif abs(current_start_time - process_start_time) > 1.0:
+                # Start time mismatch - PID has been recycled
+                pid_alive = False
+
+    return pid_alive
+
+
+def _detect_and_handle_orphaned_workers(
+    sessions_dir: Path, state_file: Path, config: OrchestratorConfig, gh: GitHub
+) -> None:
+    """Detect and handle orphaned workers using state.json PID records.
+
+    This is a fallback for issue #207: when session sidecar files are orphaned
+    (e.g., by session-limit reset), the session-file-based stall-reaper cannot
+    detect dead workers. This function reads worker PIDs from state.json and
+    checks liveness directly, allowing recovery even without session files.
+
+    For issues with status "dispatched" and a recorded worker_pid:
+    - If the PID is dead, check the linked PR's last review decision
+    - If last decision was "request_changes" and head unchanged, reset to "rework_requested"
+    - Otherwise, surface as drift for human triage
+    - Clear worker_pid from state.json after handling
+    """
+    if not config.watchdog.enabled:
+        return
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+
+    orphaned_issues: list[int] = []
+    for issue_number_str, entry in state.get("issues", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") != "dispatched":
+            continue
+
+        if not _worker_pid_alive(entry):
+            orphaned_issues.append(int(issue_number_str))
+
+    if not orphaned_issues:
+        return
+
+    # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
+    prs = gh.pr_list()
+    pr_by_issue: dict[int, dict[str, Any]] = {}
+    for pr in prs:
+        linked = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if linked is not None:
+            pr_by_issue[linked] = pr
+
+    # Handle orphaned workers
+    with state_lock(state_file):
+        state = load_state(state_file)
+        for issue_number in orphaned_issues:
+            entry = state["issues"].get(str(issue_number), {})
+            if not isinstance(entry, dict):
+                continue
+
+            # Re-verify status (state may have changed between lock windows)
+            if entry.get("status") != "dispatched":
+                continue
+
+            pr_data = pr_by_issue.get(issue_number)
+
+            if pr_data:
+                pr_number = int(pr_data["number"])
+                # Check the last review decision from state
+                pr_state = state.get("prs", {}).get(str(pr_number), {})
+                last_decision = pr_state.get("decision")
+                reviewed_head_sha = pr_state.get("reviewed_head_sha")
+                live_head_sha = pr_data.get("headRefOid")
+
+                if last_decision == "request_changes" and reviewed_head_sha and live_head_sha:
+                    if reviewed_head_sha == live_head_sha:
+                        # Safe to reset to rework_requested - PR head unchanged since request_changes
+                        entry["status"] = "rework_requested"
+                        entry["dispatched_at"] = None
+                        state = append_event(
+                            state,
+                            "orphaned_worker_recovered",
+                            {
+                                "issue_number": issue_number,
+                                "pr_number": pr_number,
+                                "previous_status": "dispatched",
+                                "new_status": "rework_requested",
+                                "reason": "dead_worker_with_request_changes",
+                            },
+                        )
+                    else:
+                        # PR head has changed - surface as drift for human triage
+                        state = append_event(
+                            state,
+                            "orphaned_worker_drift",
+                            {
+                                "issue_number": issue_number,
+                                "pr_number": pr_number,
+                                "previous_status": "dispatched",
+                                "last_decision": last_decision,
+                                "reviewed_head_sha": reviewed_head_sha,
+                                "live_head_sha": live_head_sha,
+                                "reason": "dead_worker_with_head_change",
+                            },
+                        )
+                else:
+                    # Not a simple request_changes case - surface as drift
+                    state = append_event(
+                        state,
+                        "orphaned_worker_drift",
+                        {
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "previous_status": "dispatched",
+                            "last_decision": last_decision,
+                            "reason": "dead_worker_unsafe_to_auto_reset",
+                        },
+                    )
+            else:
+                # No open PR - emit drift event, leave recovery to mop-up
+                # Mop-up will handle label transition back to ready (issue #118)
+                state = append_event(
+                    state,
+                    "orphaned_worker_drift",
+                    {
+                        "issue_number": issue_number,
+                        "previous_status": "dispatched",
+                        "reason": "dead_worker_no_open_pr",
+                    },
+                )
+
+            # Clear the worker PID from state.json
+            entry.pop("worker_pid", None)
+            entry.pop("worker_process_start_time", None)
+            state["issues"][str(issue_number)] = entry
+
+        save_state(state_file, state)
+
+
 def _sweep_orphan_processes_for_dead_sessions(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig
 ) -> None:
@@ -492,6 +669,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                             entry["status"] = "escalated"
                             entry["redispatch_at"] = redispatch_at
                             entry["escalation_reason"] = "redispatch_cap_exceeded"
+                            # Clear worker PID when session fails (worker is dead)
+                            entry.pop("worker_pid", None)
+                            entry.pop("worker_process_start_time", None)
                             state["issues"][str(w.issue_number)] = entry
                             save_state(state_file, state)
                             transition(gh, config.labels, w.issue_number, "redispatch_escalated")
@@ -520,6 +700,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # Record the relabel event
                     with state_lock(state_file):
                         state = load_state(state_file)
+                        # Clear worker PID when session fails (worker is dead)
+                        if str(w.issue_number) in state.get("issues", {}):
+                            state["issues"][str(w.issue_number)].pop("worker_pid", None)
+                            state["issues"][str(w.issue_number)].pop(
+                                "worker_process_start_time", None
+                            )
                         state = append_event(
                             state,
                             "session_failed_relabeled",
@@ -983,8 +1169,14 @@ class OrchestratorApp:
                         # Issue #5: only exclude if the worker is alive OR there's an open PR.
                         # A dead worker with no open PR is recoverable (crashed before PR opened).
                         # A dead worker with an open PR is mid-review and must not be re-dispatched.
+                        # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                         issue_number = int(number)
-                        if issue_number in live_worker_issues or issue_number in pr_by_issue:
+                        worker_alive = _worker_pid_alive(entry)
+                        if (
+                            issue_number in live_worker_issues
+                            or worker_alive
+                            or issue_number in pr_by_issue
+                        ):
                             live_dispatched.add(issue_number)
                 candidates = [
                     issue
@@ -1120,8 +1312,14 @@ class OrchestratorApp:
                     # Issue #5: only exclude if the worker is alive OR there's an open PR.
                     # A dead worker with no open PR is recoverable (crashed before PR opened).
                     # A dead worker with an open PR is mid-review and must not be re-dispatched.
+                    # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                     issue_number = int(number)
-                    if issue_number in live_worker_issues or issue_number in pr_by_issue:
+                    worker_alive = _worker_pid_alive(entry)
+                    if (
+                        issue_number in live_worker_issues
+                        or worker_alive
+                        or issue_number in pr_by_issue
+                    ):
                         live_dispatched.add(issue_number)
             candidates = [
                 issue
@@ -1256,6 +1454,16 @@ class OrchestratorApp:
                 # Clear the claim timestamp on successful upgrade
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
+                # Store worker PID and process start time for state-based liveness detection
+                # This allows recovery even when session sidecar files are orphaned (issue #207)
+                if ok:
+                    result = next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    )
+                    if result and result.pid is not None:
+                        entry["worker_pid"] = result.pid
+                        entry["worker_process_start_time"] = result.process_start_time
                 state["issues"][str(request.issue_number)] = entry
                 # Persist the launched worker BEFORE touching GitHub labels: a
                 # transient label-write failure (or crash) must never leave a live
@@ -1645,8 +1853,14 @@ class OrchestratorApp:
                 # thrashes (wrong brief or unimplementable criteria) — escalate to
                 # a human instead of dispatching another cycle.
                 escalated = request_changes_count >= self.config.review.max_rework_cycles
-                if not escalated:
+                # Only count a rework cycle when the PR head has actually advanced.
+                # If the head is unchanged, the prior cycle's attempt was never
+                # delivered (e.g., worker died orphaned), so re-issuing request_changes
+                # should not consume the escalation budget. See issue #208.
+                head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
+                if not escalated and head_advanced:
                     request_changes_count += 1
+                if not escalated:
                     rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
             decision_payload["escalated"] = escalated
             state["prs"][str(pr_number)] = {
@@ -1684,12 +1898,18 @@ class OrchestratorApp:
                         "number": issue_number,
                         "status": "approved",
                     }
+                    # Clear worker PID when issue is approved (worker is done)
+                    state["issues"][str(issue_number)].pop("worker_pid", None)
+                    state["issues"][str(issue_number)].pop("worker_process_start_time", None)
                 elif decision == "blocked":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
                         "status": "blocked",
                     }
+                    # Clear worker PID when issue is blocked (worker is done)
+                    state["issues"][str(issue_number)].pop("worker_pid", None)
+                    state["issues"][str(issue_number)].pop("worker_process_start_time", None)
             state = append_event(
                 state,
                 "record_review",
@@ -2126,6 +2346,7 @@ class OrchestratorApp:
         - Have the configured branch prefix
         - Are not the just-merged PR
         - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
+        - Do NOT have required checks in PENDING/IN_PROGRESS state (to avoid cancelling in-flight CI)
 
         Per-PR failures (conflicts, network errors) are reported as values and
         never abort the batch operation. A GitHubError from pr_list is also
@@ -2138,6 +2359,7 @@ class OrchestratorApp:
             # Report the pr_list failure as a value instead of raising
             return [{"error": f"pr_list failed: {exc}"}]
         branch_prefix = self.config.dispatch.branch_prefix
+        required_checks = self.config.auto_merge.required_checks
 
         for pr in prs:
             pr_number = int(pr.get("number", 0))
@@ -2168,6 +2390,42 @@ class OrchestratorApp:
                             "head_ref": head,
                             "updated": False,
                             "skipped_reason": "approved-pending-ship",
+                        }
+                    )
+                    continue
+
+            # Skip PRs with required checks in PENDING/IN_PROGRESS to avoid cancelling in-flight CI
+            # This prevents the wedge described in issue #209 where update-branch cancels
+            # matrix jobs and aggregate-gate checks permanently fail against the frozen CANCELLED state.
+            status_rollup = pr.get("statusCheckRollup")
+            if status_rollup and required_checks:
+                # statusCheckRollup is a flat array of check objects (CheckRun or StatusContext)
+                # CheckRun uses 'status' field, StatusContext uses 'state' field
+                has_pending_required = False
+                for check in status_rollup:
+                    check_name = check.get("name") or check.get("context")
+                    if check_name in required_checks:
+                        # Check if this required check is in a pending/in-progress state
+                        # For CheckRuns: status != COMPLETED means in-flight
+                        # For StatusContext: state != SUCCESS/FAILURE/ERROR means in-flight
+                        status = check.get("status") or check.get("state", "")
+                        # Treat any non-terminal status as in-flight (safer than enumerating)
+                        # Terminal states: COMPLETED (CheckRun), SUCCESS/FAILURE/ERROR (StatusContext)
+                        if status.upper() != "COMPLETED" and status.upper() not in {
+                            "SUCCESS",
+                            "FAILURE",
+                            "ERROR",
+                        }:
+                            has_pending_required = True
+                            break
+
+                if has_pending_required:
+                    results.append(
+                        {
+                            "pr_number": pr_number,
+                            "head_ref": head,
+                            "updated": False,
+                            "skipped_reason": "pending-required-checks",
                         }
                     )
                     continue
@@ -2214,6 +2472,12 @@ class OrchestratorApp:
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
         _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
+
+        # Detect and handle orphaned workers using state.json PID records (issue #207)
+        # This fallback detects dead workers even when session sidecar files are orphaned
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, self.paths.state_file, self.config, self.gh
+        )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
@@ -2340,6 +2604,12 @@ class OrchestratorApp:
         # Unconditional reaper call, matching dispatch()'s :773-775 — previously
         # this only ran when max_concurrent_sessions > 0 via the governor at :2189.
         _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
+
+        # Detect and handle orphaned workers using state.json PID records (issue #207)
+        # This fallback detects dead workers even when session sidecar files are orphaned
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, self.paths.state_file, self.config, self.gh
+        )
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -2613,6 +2883,16 @@ class OrchestratorApp:
                 }
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
+                # Store worker PID and process start time for state-based liveness detection
+                # This allows recovery even when session sidecar files are orphaned (issue #207)
+                if ok:
+                    result = next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
+                    )
+                    if result and result.pid is not None:
+                        entry["worker_pid"] = result.pid
+                        entry["worker_process_start_time"] = result.process_start_time
                 if ok:
                     # Track redispatch count for escalation cap (issue #165)
                     now = datetime.now(UTC)
