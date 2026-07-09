@@ -21,6 +21,7 @@ direct ``remove_issue_label`` calls only for label combinations that
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -198,11 +199,97 @@ def detect_drift(
     if repo_root is not None:
         from .claude_code import update_worker_record_with_failure_classification
         from .devin_shell import update_session_record_with_failure_classification
-        from .worker import iter_workers, update_worker_log_stat
+        from .worker import _log_is_stalled_at_shim, iter_workers, update_worker_log_stat
 
         sessions_dir = repo_root / config.devin.sessions_dir
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
+                # Issue #221: detect launch_stalled sessions (alive but hung at shim marker)
+                # This check runs before the dead session check to catch zombies
+                if w.error is None and w.is_alive():
+                    now = datetime.now(UTC)
+                    log_path = Path(w.log_path)
+                    if _log_is_stalled_at_shim(
+                        log_path, config.watchdog.launch_stall_grace_minutes, now
+                    ):
+                        # Session is alive but stalled at shim marker - classify as launch_stalled
+                        if w.adapter_kind == "devin":
+                            update_session_record_with_failure_classification(
+                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                            )
+                        elif w.adapter_kind == "claude-code":
+                            update_worker_record_with_failure_classification(
+                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                            )
+
+                        # Kill the process tree to free the slot
+                        if w.pid is not None:
+                            try:
+                                import os
+                                import signal
+
+                                if os.name != "nt":
+                                    # POSIX: kill the process group
+                                    try:
+                                        os.killpg(os.getpgid(w.pid), signal.SIGTERM)
+                                    except (OSError, ProcessLookupError):
+                                        pass
+                                else:
+                                    # Windows: terminate the process
+                                    import ctypes
+
+                                    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                                    handle = kernel32.OpenProcess(
+                                        0x0001,  # PROCESS_TERMINATE
+                                        False,
+                                        w.pid,
+                                    )
+                                    if handle:
+                                        kernel32.TerminateProcess(handle, 1)
+                                        kernel32.CloseHandle(handle)
+                            except (OSError, ProcessLookupError):
+                                pass
+
+                        # Reap the sidecar to prevent phantom sessions
+                        w.reap_sidecar(sessions_dir)
+
+                        # Reconcile labels for launch_stalled sessions with no open PR
+                        if w.issue_number not in open_prs_by_issue:
+                            issue = issues_by_number.get(w.issue_number)
+                            if issue:
+                                issue_labels = label_names(issue)
+                                active_labels = issue_labels & labels_cfg.active
+                                if active_labels:
+                                    # Remove all active labels and ensure ready label is present
+                                    fix_actions = [
+                                        f"remove label '{label}' from issue #{w.issue_number}"
+                                        for label in sorted(active_labels)
+                                    ]
+                                    add_labels: tuple[str, ...] = ()
+                                    if labels_cfg.ready not in issue_labels:
+                                        fix_actions.append(
+                                            f"add label '{labels_cfg.ready}' to issue #{w.issue_number}"
+                                        )
+                                        add_labels = (labels_cfg.ready,)
+
+                                    drift.append(
+                                        DriftItem(
+                                            kind="session_failed_relabeled",
+                                            issue_number=w.issue_number,
+                                            pr_number=None,
+                                            detail=(
+                                                f"issue #{w.issue_number} session launch_stalled "
+                                                f"(hung at shim marker), no open PR, "
+                                                f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                            ),
+                                            fix_actions=tuple(fix_actions),
+                                            remove_labels=tuple(sorted(active_labels)),
+                                            add_labels=add_labels,
+                                        )
+                                    )
+                                    # Mark this issue as handled to avoid double-emission
+                                    issues_handled_by_session_relabel.add(w.issue_number)
+
                 if w.error is None and not w.is_alive():
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)

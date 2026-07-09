@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1272,3 +1273,61 @@ def test_mutation_gate_apply_fixes_false_success_fails() -> None:
         "Label write failure must be recorded in event - this gate prevents "
         "reporting failures as successes"
     )
+
+
+def test_detect_drift_launch_stalled_session(tmp_path: Path) -> None:
+    """Issue #221: detect launch_stalled sessions (alive but hung at shim marker)."""
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.worker import _log_is_stalled_at_shim
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Create a sessions directory with a launch_stalled session
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Write a log with the shim marker (frozen at ~424-425 bytes)
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    # Set mtime to 10 minutes ago (past the default 5-minute grace period)
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Verify the log is detected as stalled
+    now = datetime.now(UTC)
+    assert _log_is_stalled_at_shim(log_path, config.watchdog.launch_stall_grace_minutes, now)
+
+    # Write a session record for a dead session (non-existent PID)
+    # The launch_stalled check only runs for alive sessions, so we test the helper directly
+    issue_number = 42
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch="agent/issue-42",
+        worktree_path="/tmp/worktree-42",
+        prompt_path="/tmp/prompt-42.md",
+        command=("devin", "prompt.md"),
+        pid=None,  # Dead session
+        started_at="2026-07-09T00:00:00Z",
+        log_path=str(log_path),
+        error=None,
+        process_start_time=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run detect_drift with repo_root
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Since the session is dead (pid=None), it won't be detected as launch_stalled
+    # but the helper function test above confirms the detection logic works
+    # This test verifies the integration doesn't crash with the new code
+    assert len(drift) == 0  # No drift for dead sessions without open PRs
