@@ -2190,7 +2190,7 @@ class OrchestratorApp:
                         if status.upper() in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"}:
                             has_pending_required = True
                             break
-                
+
                 if has_pending_required:
                     results.append(
                         {
