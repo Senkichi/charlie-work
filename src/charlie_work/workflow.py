@@ -3085,9 +3085,6 @@ class OrchestratorApp:
             return False
         if names & self.config.labels.terminal:
             return False
-        if self.config.labels.prose_only_deps in names:
-            # Issue #225: prose-only dependencies need human attention to convert to structured blockers
-            return False
         return not names & self.config.labels.active
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:

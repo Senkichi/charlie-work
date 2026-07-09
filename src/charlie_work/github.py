@@ -615,8 +615,15 @@ def detect_prose_only_dependencies(text: str) -> bool:
 
     Patterns detected:
     - "do not dispatch before" (case-insensitive)
-    - "depends on P\\d+-T\\d+" (task references like P2-T3)
-    - "wait for" in dependency context
+    - "depends on <...> P\\d+-T\\d+" — task reference in dependency context
+    - "wait for <...> P\\d+-T\\d+ <...> (complete|done|land|merge|ship)" — task
+      reference with completion verb; covers "Wait for P1-T5 to complete first."
+    - "before/until/after <...> P\\d+-T\\d+ <...> (land|merge|complete|done|ship)"
+    - "wait for" before a PR or merge event (non-task dependency prose)
+
+    Pattern 2 is intentionally scoped to dependency context only — bare task
+    marker mentions like "implements P2-T4" or title suffixes "(P2-T4)" are
+    NOT matched, to avoid flagging every plan-generated issue for human review.
 
     Args:
         text: The issue body text to check
@@ -631,13 +638,26 @@ def detect_prose_only_dependencies(text: str) -> bool:
     if re.search(r"do\s+not\s+dispatch\s+before", text, flags=re.IGNORECASE):
         return True
 
-    # Pattern 2: task references like P2-T3, P1-T5, etc.
-    # These indicate plan dependencies that should be structured as "Blocked by #N"
-    if re.search(r"P\d+-T\d+", text):
+    # Pattern 2: task references (P\d+-T\d+) only in dependency context.
+    # "depends on ... P\d+-T\d+" — classic self-declaration
+    if re.search(r"depends\s+on\s+[^.\n]*P\d+-T\d+", text, flags=re.IGNORECASE):
+        return True
+    # "wait for ... P\d+-T\d+ ... <completion verb>" — e.g. "Wait for P1-T5 to complete first."
+    if re.search(
+        r"wait\s+for\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    # "before/until/after ... P\d+-T\d+ ... <completion verb>"
+    if re.search(
+        r"(?:before|until|after)\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
+        text,
+        flags=re.IGNORECASE,
+    ):
         return True
 
-    # Pattern 3: "wait for" in dependency context
-    # More specific than just "wait for" to avoid false positives
+    # Pattern 3: "wait for" before a PR or merge event (non-task dependency prose)
     if re.search(
         r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE
     ):

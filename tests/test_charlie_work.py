@@ -9602,6 +9602,29 @@ def test_detect_prose_only_dependencies_no_match() -> None:
     assert detect_prose_only_dependencies(body) is False
 
 
+def test_detect_prose_only_dependencies_descriptive_task_refs_no_match() -> None:
+    """REQUIRED 1 negative tests: bare/descriptive task-marker mentions must NOT match.
+
+    Plan-generated issue bodies routinely mention task markers descriptively
+    (e.g. 'implements P2-T4', title suffix '(P2-T4)', 'this task is P2-T3 of
+    the plan'). These must not fire the detector — only dependency-context uses
+    should match (REQUIRED 1, PR #230 rework).
+    """
+    from charlie_work.github import detect_prose_only_dependencies
+
+    # "implements P2-T4" — descriptive, not a dependency declaration
+    body = "This implements P2-T4 of the expiry plan."
+    assert detect_prose_only_dependencies(body) is False
+
+    # Commit-style title with inline task marker — descriptive reference in prose
+    body = "fix(expiry): thread careers-match (P2-T4)"
+    assert detect_prose_only_dependencies(body) is False
+
+    # "this task is P2-T3 of the plan" — describes what the issue is, not what it depends on
+    body = "This task is P2-T3 of the plan."
+    assert detect_prose_only_dependencies(body) is False
+
+
 def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
     """Issue #108: dispatch should skip issues with open blockers."""
     config = OrchestratorConfig(
