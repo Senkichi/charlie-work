@@ -87,6 +87,20 @@ class LabelConfig:
             self.prose_only_deps,
         ]
 
+    @property
+    def workflow_labels(self) -> set[str]:
+        """All workflow labels (agent:* states) excluding the ready marker."""
+        return {
+            self.queued,
+            self.in_progress,
+            self.pr_open,
+            self.reviewing,
+            self.needs_rework,
+            self.blocked,
+            self.done,
+            self.human_needed,
+        }
+
 
 @dataclass(frozen=True)
 class DispatchConfig:
