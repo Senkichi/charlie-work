@@ -217,6 +217,7 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     assert summary.ready is False
     assert summary.passed == ("Tests passed", "Lint & Format")
     assert summary.failed == ("Pre-commit",)
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
@@ -231,6 +232,7 @@ def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.passed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
@@ -245,6 +247,7 @@ def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.passed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_all_success() -> None:
@@ -259,6 +262,7 @@ def test_summarize_checks_duplicate_runs_all_success() -> None:
     assert summary.ready is True
     assert summary.passed == ("test",)
     assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
@@ -273,6 +277,8 @@ def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.passed == ()
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
@@ -287,6 +293,7 @@ def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.pending == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
@@ -300,6 +307,7 @@ def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
@@ -313,6 +321,78 @@ def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() 
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.failed == ()
+
+
+def test_summarize_checks_cancelled_classifies_as_infra_failed() -> None:
+    """Regression test for issue #210: CANCELLED state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_cancelled_case_insensitive() -> None:
+    """CANCELLED state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "cancelled"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_mixed_cancelled_and_failure() -> None:
+    """Mixed CANCELLED and FAILURE states should classify each separately."""
+    checks = [
+        {"name": "test1", "state": "CANCELLED"},
+        {"name": "test2", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test1", "test2"))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test1",)
+    assert summary.failed == ("test2",)
+    assert summary.pending == ()
+
+
+def test_summarize_checks_duplicate_runs_cancelled_then_success() -> None:
+    """Duplicate runs with CANCELLED then SUCCESS should classify as infra_failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_cancelled() -> None:
+    """FAILURE should take priority over CANCELLED in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+    assert summary.pending == ()
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
