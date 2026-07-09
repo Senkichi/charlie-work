@@ -32,6 +32,7 @@ from .github import (
     parse_blockers,
 )
 from .janitor import (
+    _calculate_patch_id,
     check_operator_containment,
     check_test_adequacy,
     run_janitor,
@@ -1382,11 +1383,15 @@ class OrchestratorApp:
                 state = load_state(self.paths.state_file)
                 pr_state = state["prs"].get(str(pr_number), {})
 
+        # Fetch diff for patch-id based no-op rework detection (issue #222)
+        # This is needed before the janitor gate to detect actual content changes
+        diff = self.gh.pr_diff(pr_number)
+
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
         # must cost zero review tokens. Failures don't move labels — they are
         # the worker's/CI's to fix, not a review decision.
-        verdict = run_janitor(pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root)
+        verdict = run_janitor(pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff)
         if not verdict.ok:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -1415,7 +1420,6 @@ class OrchestratorApp:
                     "janitor_warnings": list(verdict.warnings),
                 },
             )
-        diff = self.gh.pr_diff(pr_number)
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         self._write_json(pr_dir / "pr.json", pr)
@@ -1616,6 +1620,12 @@ class OrchestratorApp:
                 {},
             )
         reviewed_head_sha = pr.get("headRefOid") if pr else None
+        # Calculate patch-id for the PR diff to detect actual content changes
+        # (issue #222: base-update merges can advance head SHA without changing diff content)
+        reviewed_patch_id = ""
+        if pr and decision in {"request_changes", "approved"}:
+            diff = self.gh.pr_diff(pr_number)
+            reviewed_patch_id = _calculate_patch_id(diff)
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
@@ -1623,6 +1633,7 @@ class OrchestratorApp:
             "summary": summary_text,
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
+            "reviewed_patch_id": reviewed_patch_id,
             "reviewed_at": utc_now(),
         }
         decision_path = pr_dir / "review-decision.json"
@@ -1656,6 +1667,7 @@ class OrchestratorApp:
                 "decision": decision,
                 "decision_path": str(decision_path),
                 "reviewed_head_sha": reviewed_head_sha,
+                "reviewed_patch_id": reviewed_patch_id,
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
             }
