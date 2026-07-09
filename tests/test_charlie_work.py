@@ -17,6 +17,7 @@ import yaml
 from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import summarize_checks
+from charlie_work.github import is_infrastructure_failure
 from charlie_work.config import (
     ClaudeCodeConfig,
     CrossFamilyConfig,
@@ -217,6 +218,7 @@ def test_summarize_checks_requires_all_configured_checks() -> None:
     assert summary.ready is False
     assert summary.passed == ("Tests passed", "Lint & Format")
     assert summary.failed == ("Pre-commit",)
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
@@ -231,6 +233,7 @@ def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.passed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
@@ -245,6 +248,7 @@ def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.passed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_all_success() -> None:
@@ -259,6 +263,7 @@ def test_summarize_checks_duplicate_runs_all_success() -> None:
     assert summary.ready is True
     assert summary.passed == ("test",)
     assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
@@ -273,6 +278,8 @@ def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.passed == ()
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
@@ -287,6 +294,7 @@ def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.pending == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
@@ -300,6 +308,7 @@ def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.failed == ()
+    assert summary.infra_failed == ()
 
 
 def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
@@ -313,6 +322,211 @@ def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() 
     assert summary.ready is False
     assert summary.pending == ("test",)
     assert summary.failed == ()
+
+
+def test_summarize_checks_cancelled_classifies_as_infra_failed() -> None:
+    """Regression test for issue #210: CANCELLED state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_cancelled_case_insensitive() -> None:
+    """CANCELLED state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "cancelled"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_mixed_cancelled_and_failure() -> None:
+    """Mixed CANCELLED and FAILURE states should classify each separately."""
+    checks = [
+        {"name": "test1", "state": "CANCELLED"},
+        {"name": "test2", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test1", "test2"))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test1",)
+    assert summary.failed == ("test2",)
+    assert summary.pending == ()
+
+
+def test_summarize_checks_duplicate_runs_cancelled_then_success() -> None:
+    """Duplicate runs with CANCELLED then SUCCESS should classify as infra_failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_cancelled() -> None:
+    """FAILURE should take priority over CANCELLED in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_marker_classifies_as_infra_failed() -> None:
+    """INFRA_FAILURE marker state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_case_insensitive() -> None:
+    """INFRA_FAILURE state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "infra_failure"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
+    """FAILURE should take priority over INFRA_FAILURE in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+
+
+def test_is_infrastructure_failure_zero_step_job() -> None:
+    """Jobs with zero non-setup steps should be classified as infrastructure failure."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job"},
+            {"name": "Checkout"},
+        ],
+    }
+    annotations = []
+
+    assert is_infrastructure_failure(job, annotations) is True
+
+
+def test_is_infrastructure_failure_with_test_steps() -> None:
+    """Jobs with actual test steps should not be classified as infrastructure failure."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job"},
+            {"name": "Checkout"},
+            {"name": "Run tests"},
+        ],
+    }
+    annotations = []
+
+    assert is_infrastructure_failure(job, annotations) is False
+
+
+def test_is_infrastructure_failure_billing_annotation() -> None:
+    """Jobs with billing annotation should be classified as infrastructure failure."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [{"name": "Run tests"}],
+    }
+    annotations = [
+        {
+            "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+        }
+    ]
+
+    assert is_infrastructure_failure(job, annotations) is True
+
+
+def test_is_infrastructure_failure_mixed_billing_annotation_text() -> None:
+    """Billing annotation detection should be case-insensitive and match partial text."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [{"name": "Run tests"}],
+    }
+    annotations = [{"message": "The job WAS NOT STARTED due to billing issues"}]
+
+    assert is_infrastructure_failure(job, annotations) is True
+
+
+def test_is_infrastructure_failure_no_infrastructure_signals() -> None:
+    """Jobs without infrastructure failure signals should not be classified as such."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job"},
+            {"name": "Checkout"},
+            {"name": "Run tests"},
+        ],
+    }
+    annotations = [{"message": "Test failed: assertion error"}]
+
+    assert is_infrastructure_failure(job, annotations) is False
+
+
+def test_is_infrastructure_failure_empty_steps() -> None:
+    """Job with no steps at all should be classified as infrastructure failure (primary signal)."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [],
+    }
+    annotations = []
+
+    assert is_infrastructure_failure(job, annotations) is True
+
+
+def test_is_infrastructure_failure_non_failed_job() -> None:
+    """Jobs that didn't fail should not trigger infrastructure failure detection."""
+    job = {
+        "conclusion": "SUCCESS",
+        "steps": [],
+    }
+    annotations = []
+
+    assert is_infrastructure_failure(job, annotations) is False
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:

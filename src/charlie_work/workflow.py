@@ -28,6 +28,7 @@ from .github import (
     GitHub,
     GitHubError,
     get_github_issue_dependencies,
+    is_infrastructure_failure,
     label_names,
     linked_issue_number,
     parse_blockers,
@@ -2068,7 +2069,25 @@ class OrchestratorApp:
                     },
                 )
         checks = self.gh.pr_checks(pr_number)
-        summary = summarize_checks(checks, self.config.auto_merge.required_checks)
+        # Enrich check data with infrastructure failure detection for FAILED checks
+        # This implements detection signals 1 (zero-step jobs) and 2 (billing annotations)
+        # from issue #210, keeping summarize_checks pure by enriching at the data boundary
+        enriched_checks = []
+        for check in checks:
+            state = str(check.get("state") or "").upper()
+            if state == "FAILURE":
+                # Check if this failure is due to infrastructure issues
+                check_run_id = check.get("databaseId")
+                if check_run_id and isinstance(check_run_id, int):
+                    # The databaseId from gh pr checks IS the GitHub Actions job id
+                    job = self.gh.actions_job(check_run_id)
+                    annotations = self.gh.check_run_annotations(check_run_id)
+                    if job and is_infrastructure_failure(job, annotations):
+                        # Reclassify as infrastructure failure by setting state to a marker
+                        # that summarize_checks will route to infra_failed
+                        check = {**check, "state": "INFRA_FAILURE"}
+            enriched_checks.append(check)
+        summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
         # Run containment check for worker edits leaked into operator checkout
         diff = self.gh.pr_diff(pr_number)
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)

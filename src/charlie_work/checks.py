@@ -11,10 +11,11 @@ class CheckSummary:
     pending: tuple[str, ...]
     failed: tuple[str, ...]
     missing: tuple[str, ...]
+    infra_failed: tuple[str, ...]
 
     @property
     def ready(self) -> bool:
-        return not self.pending and not self.failed and not self.missing
+        return not self.pending and not self.failed and not self.missing and not self.infra_failed
 
 
 def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) -> CheckSummary:
@@ -30,6 +31,7 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
     pending: list[str] = []
     failed: list[str] = []
     missing: list[str] = []
+    infra_failed: list[str] = []
 
     for name in required:
         runs = by_name.get(name)
@@ -43,6 +45,7 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
         # - passed only if ALL runs passed
         name_failed = False
         name_pending = False
+        name_infra_failed = False
 
         for check in runs:
             state = str(check.get("state") or "").upper()
@@ -56,13 +59,26 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
             elif not state and not bucket:
                 # Null/empty state and bucket means the check-run hasn't populated yet - classify as pending
                 name_pending = True
-            else:
-                # Any failure state (FAILURE, CANCELLED, TIMED_OUT, etc.)
+            elif state == "FAILURE":
+                # FAILURE state indicates code failure - highest priority
                 name_failed = True
-                break  # No need to check further - worst case is already failed
+            elif state == "CANCELLED":
+                # CANCELLED state indicates infrastructure failure (e.g., billing lapse, runner death)
+                # Note: Signal-3's head-unchanged qualifier is omitted here because checks are evaluated
+                # at the current head, so cancellations in scope are genuine infrastructure failures
+                name_infra_failed = True
+            elif state == "INFRA_FAILURE":
+                # INFRA_FAILURE is a marker state set by the GitHub adapter enrichment layer
+                # to indicate jobs with zero steps or billing annotations (signals 1 and 2 from #210)
+                name_infra_failed = True
+            else:
+                # Any other failure state (TIMED_OUT, etc.)
+                name_failed = True
 
         if name_failed:
             failed.append(name)
+        elif name_infra_failed:
+            infra_failed.append(name)
         elif name_pending:
             pending.append(name)
         else:
@@ -74,4 +90,5 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
         pending=tuple(pending),
         failed=tuple(failed),
         missing=tuple(missing),
+        infra_failed=tuple(infra_failed),
     )
