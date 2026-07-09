@@ -1564,7 +1564,9 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
     from charlie_work.config import AutoMergeConfig
 
     auto_merge = AutoMergeConfig(
-        required_checks=("Tests passed", "Lint & Format", "Pre-commit"), **kwargs
+        required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+        enabled=True,  # Ensure auto_merge is enabled for merge tests
+        **kwargs
     )
     return OrchestratorConfig(auto_merge=auto_merge)
 
@@ -1605,6 +1607,7 @@ class FakeGitHub:
         self.update_branch_ok = True
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
+        self.closed_issues: list[int] = []
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -1667,6 +1670,17 @@ class FakeGitHub:
 
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
+        return True
+
+    def close_issue(self, number: int) -> bool:
+        """Track issue closure for testing. Idempotent — returns True even if already closed."""
+        # Track the closure
+        self.closed_issues.append(number)
+        # Update the issue state in the issues list
+        for issue in self.issues:
+            if issue["number"] == number:
+                issue["state"] = "CLOSED"
+                break
         return True
 
     def name_with_owner(self) -> str:
@@ -2397,7 +2411,7 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    ready = app.merge_ready(456)
+    ready = app.merge_ready(456, merge=True)  # Explicitly request merge
 
     assert ready.data["can_merge"] is True
     assert ready.data["merged"] is True
@@ -2424,7 +2438,7 @@ def test_merge_ready_branch_delete_failure_never_blocks_labels(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    ready = app.merge_ready(456)
+    ready = app.merge_ready(456, merge=True)
 
     assert ready.data["merged"] is True
     assert ready.data["branch_deleted"] is False
@@ -2443,12 +2457,11 @@ def test_merge_ready_honors_delete_branch_false(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    ready = app.merge_ready(456)
+    ready = app.merge_ready(456, merge=True)
 
     assert ready.data["merged"] is True
     assert fake_gh.deleted_branches == []
     assert ready.data["branch_deleted"] is None
-
 
 def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> None:
     """Issue #149: when update_open_prs is disabled, update_open_prs_results must be None."""
@@ -2470,7 +2483,7 @@ def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    ready = app.merge_ready(456)
+    ready = app.merge_ready(456, merge=True)
 
     assert ready.data["merged"] is True
     assert ready.data["update_open_prs_results"] is None

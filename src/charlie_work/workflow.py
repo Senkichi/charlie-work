@@ -1910,6 +1910,10 @@ class OrchestratorApp:
                         "add_failures": result.add_failures,
                         "remove_failures": result.remove_failures,
                     }
+                # Close the linked issue explicitly — idempotent if already closed
+                # via GitHub's keyword automation. This ensures the dependency gate
+                # sees the closure immediately, avoiding the agent:done+OPEN state.
+                self.gh.close_issue(issue_number)
             if self.config.auto_merge.delete_branch:
                 head_ref = str(pr.get("headRefName") or "")
                 branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False

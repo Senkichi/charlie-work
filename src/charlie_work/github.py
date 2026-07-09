@@ -227,6 +227,19 @@ class GitHub:
     def remove_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
 
+    def close_issue(self, number: int) -> bool:
+        """Close an issue. Idempotent — returns True even if already closed.
+
+        Uses `gh issue close`. Returns True on success, False on failure.
+        Never raises — per-issue failures are reported as values and must not
+        abort a batch operation.
+        """
+        try:
+            self.run(["issue", "close", str(number)])
+            return True
+        except GitHubError:
+            return False
+
     def issue_comment(self, number: int, body_file: Path) -> None:
         self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
 
