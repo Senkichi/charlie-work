@@ -493,6 +493,44 @@ def parse_blockers(text: str) -> list[int]:
     return sorted(blockers)
 
 
+def detect_prose_only_dependencies(text: str) -> bool:
+    """Detect prose-only dependency declarations in issue body.
+
+    Returns True if the issue body contains dependency-like prose without
+    structured blocker declarations. This catches cases like "Do not dispatch
+    before P2-T2/P2-T3 have landed" that lack corresponding "Blocked by #N" markers.
+
+    Patterns detected:
+    - "do not dispatch before" (case-insensitive)
+    - "depends on P\\d+-T\\d+" (task references like P2-T3)
+    - "wait for" in dependency context
+
+    Args:
+        text: The issue body text to check
+
+    Returns:
+        True if prose-only dependencies are detected, False otherwise
+    """
+    if not text:
+        return False
+
+    # Pattern 1: "do not dispatch before" and variants
+    if re.search(r"do\s+not\s+dispatch\s+before", text, flags=re.IGNORECASE):
+        return True
+
+    # Pattern 2: task references like P2-T3, P1-T5, etc.
+    # These indicate plan dependencies that should be structured as "Blocked by #N"
+    if re.search(r"P\d+-T\d+", text):
+        return True
+
+    # Pattern 3: "wait for" in dependency context
+    # More specific than just "wait for" to avoid false positives
+    if re.search(r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE):
+        return True
+
+    return False
+
+
 def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     """Fetch GitHub's native issue dependencies (blocked_by relationships).
 

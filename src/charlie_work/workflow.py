@@ -26,6 +26,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    detect_prose_only_dependencies,
     get_github_issue_dependencies,
     label_names,
     linked_issue_number,
@@ -803,6 +804,7 @@ class OrchestratorApp:
             self.config.labels.blocked: "Automation is blocked and needs intervention.",
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
+            self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
         }
         for label in self.config.labels.all:
             color = "0E8A16" if label == self.config.labels.ready else "5319E7"
@@ -837,6 +839,7 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         written: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        prose_only_deps_issues: list[int] = []
         # Gather all network results and write files outside the lock
         for issue in issues:
             issue_number = int(issue["number"])
@@ -850,6 +853,21 @@ class OrchestratorApp:
             issue_json = issue_dir / "issue.json"
             self._write_json(issue_json, full_issue)
             prompt_path = self._write_worker_prompt(full_issue)
+
+            # Check for prose-only dependencies (issue #225)
+            body_text = full_issue.get("body", "")
+            has_prose_deps = detect_prose_only_dependencies(body_text)
+            has_structured_blockers = bool(parse_blockers(body_text))
+
+            # If prose-only dependencies exist without structured blockers, label for human attention
+            if has_prose_deps and not has_structured_blockers:
+                prose_only_deps_issues.append(issue_number)
+                try:
+                    self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
+                except Exception:
+                    # Label add failure is non-blocking for intake
+                    pass
+
             written.append(
                 {
                     "issue": issue_number,
@@ -882,6 +900,12 @@ class OrchestratorApp:
                     "intake_failed",
                     {"issue_number": failure["issue"], "error": failure["error"]},
                 )
+            if prose_only_deps_issues:
+                state = append_event(
+                    state,
+                    "intake_prose_only_deps",
+                    {"issue_numbers": sorted(prose_only_deps_issues)},
+                )
             state = append_event(
                 state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
             )
@@ -889,10 +913,16 @@ class OrchestratorApp:
         message = "intake complete"
         if failed:
             message = f"intake completed with {len(failed)} failure(s)"
+        if prose_only_deps_issues:
+            message += f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
         return CommandResult(
             not failed,
             message,
-            {"issues": written, "failed": failed},
+            {
+                "issues": written,
+                "failed": failed,
+                "prose_only_deps_issues": prose_only_deps_issues,
+            },
         )
 
     def dispatch(
@@ -2735,6 +2765,9 @@ class OrchestratorApp:
         if self.config.labels.ready not in names:
             return False
         if names & self.config.labels.terminal:
+            return False
+        if self.config.labels.prose_only_deps in names:
+            # Issue #225: prose-only dependencies need human attention to convert to structured blockers
             return False
         return not names & self.config.labels.active
 
