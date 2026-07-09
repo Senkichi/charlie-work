@@ -290,7 +290,8 @@ def test_apply_fixes_merged_outside_orchestrator_transitions_labels() -> None:
     new_state = apply_fixes(gh, state, drift, config)
 
     assert (10, config.labels.done) in gh.labels_added
-    for label in sorted(config.labels.active):
+    # Issue #215: merged transition removes ALL other workflow labels, not just active
+    for label in sorted(config.labels.workflow_labels - {config.labels.done}):
         assert (10, label) in gh.labels_removed
     assert new_state["prs"]["1"]["status"] == "merged"
 
@@ -1249,6 +1250,39 @@ def test_transition_no_labels_returns_nothing_changed() -> None:
     assert result.outcome == TO.APPLIED  # blocked has labels to add
     assert len(result.add_failures) == 0
     assert len(result.remove_failures) == 0
+
+
+def test_terminal_transition_clears_sibling_workflow_labels() -> None:
+    """Issue #215: terminal transitions (agent:done, agent:blocked, agent:human-needed) must clear sibling agent:* workflow labels."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(852, [config.labels.human_needed])],
+    )
+
+    # Transition to agent:done should remove agent:human-needed and all other workflow labels
+    result = transition(gh, config.labels, 852, "merged")
+
+    assert result.outcome == TO.APPLIED
+    assert len(result.add_failures) == 0
+    assert len(result.remove_failures) == 0
+
+    # Verify that agent:done was added
+    assert (852, config.labels.done) in gh.labels_added
+
+    # Verify that all other workflow labels were removed (but not agent:done itself)
+    # The remove set should include all workflow labels except agent:done
+    assert (852, config.labels.queued) in gh.labels_removed
+    assert (852, config.labels.in_progress) in gh.labels_removed
+    assert (852, config.labels.pr_open) in gh.labels_removed
+    assert (852, config.labels.reviewing) in gh.labels_removed
+    assert (852, config.labels.needs_rework) in gh.labels_removed
+    assert (852, config.labels.human_needed) in gh.labels_removed
+
+    # Verify agent:done was NOT removed (it's the target state)
+    assert (852, config.labels.done) not in gh.labels_removed
 
 
 def test_apply_fixes_multi_item_with_one_failed_label_write() -> None:

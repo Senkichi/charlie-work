@@ -11710,8 +11710,8 @@ def test_redispatch_escalated_edge_clears_full_active_set(tmp_path: Path) -> Non
     # Should add human_needed
     assert config.labels.human_needed in add
 
-    # Should remove ALL active labels
-    assert set(remove) == config.labels.active
+    # Should remove ALL other workflow labels (issue #215: terminal transitions clear siblings)
+    assert set(remove) == config.labels.workflow_labels - {config.labels.human_needed}
 
 
 def test_redispatch_within_window_does_not_escalate(tmp_path: Path) -> None:
