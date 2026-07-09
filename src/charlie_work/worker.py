@@ -7,7 +7,7 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
@@ -27,6 +27,81 @@ from .devin_shell import (
     is_session_alive,
     read_session_records,
 )
+
+
+# Shim marker that indicates successful infra materialization (issue #221)
+# Workers that hang at this line are detected as launch_stalled
+_SHIM_MARKER = "[shim] .devin infra materialized"
+
+
+def _log_has_shim_marker(log_path: Path) -> bool:
+    """Check if a log file contains the shim marker line.
+
+    Returns True if the marker is found in the log, False otherwise.
+    This is used to detect whether a worker has progressed past the
+    initial shim materialization phase (issue #221).
+
+    Args:
+        log_path: Path to the worker's log file
+
+    Returns:
+        True if the shim marker is found, False otherwise
+    """
+    if not log_path.exists():
+        return False
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        return _SHIM_MARKER in log_text
+    except OSError:
+        return False
+
+
+def _log_is_stalled_at_shim(log_path: Path, grace_minutes: int, now: datetime) -> bool:
+    """Check if a log is stalled at the shim marker (issue #221).
+
+    A log is considered stalled at shim if:
+    1. The shim marker is present in the log
+    2. The log file has not been modified within the grace period
+    3. The log is small (<= 1KB) - indicating no real progress
+
+    This detects workers that hang immediately after shim materialization
+    with error:null, alive PID, and frozen logs.
+
+    Args:
+        log_path: Path to the worker's log file
+        grace_minutes: Grace period in minutes to allow for shim materialization
+        now: Current datetime for staleness calculation
+
+    Returns:
+        True if the log is stalled at shim, False otherwise
+    """
+    from datetime import UTC
+
+    if not log_path.exists():
+        return False
+
+    try:
+        log_stat = log_path.stat()
+        log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+        log_size = log_stat.st_size
+
+        # Check if log is small (frozen at shim marker, typically ~424-425 bytes)
+        if log_size > 1024:  # More than 1KB means likely made progress
+            return False
+
+        # Check if log has shim marker
+        if not _log_has_shim_marker(log_path):
+            return False
+
+        # Check if log is stale (no modification within grace period)
+        age = now - log_mtime
+        if age <= timedelta(minutes=grace_minutes):
+            return False
+
+        return True
+    except OSError:
+        return False
 
 
 class WorkerHealth(Enum):
@@ -561,4 +636,5 @@ __all__ = [
     "iter_workers",
     "parse_cumulative_usage",
     "update_worker_log_stat",
+    "_log_is_stalled_at_shim",
 ]

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from charlie_work.claude_code import ClaudeWorkerRecord
-from charlie_work.worker import WorkerView, iter_workers
+from charlie_work.worker import WorkerView, _log_is_stalled_at_shim, iter_workers
 
 
 def test_iter_workers_empty_dir(tmp_path: Path) -> None:
@@ -692,3 +693,73 @@ def test_iter_workers_backward_compatibility(tmp_path: Path) -> None:
     legacy_worker = next(w for w in workers if w.issue_number == 3)
     assert legacy_worker.adapter_kind == "devin"
     assert legacy_worker.reclaimed is None  # Should default to None for missing field
+
+
+def test_log_is_stalled_at_shim_with_marker(tmp_path: Path) -> None:
+    """_log_is_stalled_at_shim returns True when log has shim marker and is stale."""
+    log_path = tmp_path / "issue-1.log"
+    # Write a log with the shim marker (typical frozen log size ~424-425 bytes)
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    # Set mtime to 10 minutes ago (past the default 5-minute grace period)
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    assert _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+def test_log_is_stalled_at_shim_without_marker(tmp_path: Path) -> None:
+    """_log_is_stalled_at_shim returns False when log lacks shim marker."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("Some other log content\n", encoding="utf-8")
+
+    # Set mtime to 10 minutes ago
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+def test_log_is_stalled_at_shim_within_grace_period(tmp_path: Path) -> None:
+    """_log_is_stalled_at_shim returns False when log is within grace period."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    # Set mtime to 2 minutes ago (within the 5-minute grace period)
+    old_time = datetime.now(UTC) - timedelta(minutes=2)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+def test_log_is_stalled_at_shim_large_log(tmp_path: Path) -> None:
+    """_log_is_stalled_at_shim returns False when log is large (>1KB)."""
+    log_path = tmp_path / "issue-1.log"
+    # Write a large log with the shim marker
+    large_content = "[shim] .devin infra materialized\n" + "x" * 2000
+    log_path.write_text(large_content, encoding="utf-8")
+
+    # Set mtime to 10 minutes ago
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+def test_log_is_stalled_at_shim_nonexistent_log(tmp_path: Path) -> None:
+    """_log_is_stalled_at_shim returns False when log file doesn't exist."""
+    log_path = tmp_path / "issue-1.log"
+    now = datetime.now(UTC)
+    assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
