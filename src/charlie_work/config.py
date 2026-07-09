@@ -298,6 +298,10 @@ class WatchdogConfig:
     token_budget: int | None = None
     # Action when budget is exceeded: "warn" (default, no kill) or "kill"
     cost_budget_action: str = "warn"
+    # Launch stall detection (issue #221): grace period for shim materialization.
+    # Sessions whose log has not grown past the shim marker within this window
+    # are classified as launch_stalled and reaped. Default 5 minutes.
+    launch_stall_grace_minutes: int = 5
 
 
 @dataclass(frozen=True)
@@ -588,6 +592,13 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"config section 'watchdog' key 'cost_budget_action' must be 'warn' or 'kill', "
                 f"got '{cost_budget_action}'"
             )
+    # Validate launch_stall_grace_minutes
+    launch_stall_grace_minutes = watchdog_data.get("launch_stall_grace_minutes")
+    if launch_stall_grace_minutes is not None and not isinstance(launch_stall_grace_minutes, int):
+        raise ConfigError(
+            "config section 'watchdog' key 'launch_stall_grace_minutes' must be an int, "
+            f"got {type(launch_stall_grace_minutes).__name__}"
+        )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
 
