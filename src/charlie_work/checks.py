@@ -64,7 +64,12 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
                 name_failed = True
             elif state == "CANCELLED":
                 # CANCELLED state indicates infrastructure failure (e.g., billing lapse, runner death)
-                # unless it's due to a superseding push (which we can't detect from this data alone)
+                # Note: Signal-3's head-unchanged qualifier is omitted here because checks are evaluated
+                # at the current head, so cancellations in scope are genuine infrastructure failures
+                name_infra_failed = True
+            elif state == "INFRA_FAILURE":
+                # INFRA_FAILURE is a marker state set by the GitHub adapter enrichment layer
+                # to indicate jobs with zero steps or billing annotations (signals 1 and 2 from #210)
                 name_infra_failed = True
             else:
                 # Any other failure state (TIMED_OUT, etc.)

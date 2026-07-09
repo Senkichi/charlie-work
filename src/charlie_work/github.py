@@ -21,7 +21,7 @@ ISSUE_VIEW_FIELDS = (
 )
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
-PR_CHECKS_FIELDS = "name,state,bucket,link"
+PR_CHECKS_FIELDS = "name,state,bucket,link,databaseId"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
 RECONCILE_PR_FIELDS = (
@@ -220,6 +220,25 @@ class GitHub:
             allow_failure=True,
         )
         return result if isinstance(result, list) else []
+
+    def check_run_jobs(self, check_run_id: int) -> list[dict[str, Any]]:
+        """Fetch jobs for a specific check run to detect infrastructure failures.
+
+        Returns job data including step counts and annotations. Used to detect
+        billing lapses (zero-step jobs) and runner infrastructure failures.
+        """
+        result = self.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/jobs",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, dict):
+            jobs = result.get("jobs", [])
+            return jobs if isinstance(jobs, list) else []
+        return []
 
     def add_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--add-label", label])
@@ -450,6 +469,65 @@ def _clause_preceding(text: str, match_start: int) -> str:
     """
     boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
     return text[boundary + 1 : match_start]
+
+
+def is_infrastructure_failure(jobs: list[dict[str, Any]]) -> bool:
+    """Detect if failed jobs indicate infrastructure failure vs code failure.
+
+    Returns True if all failed jobs show signs of infrastructure failure:
+    - Zero executed steps (billing lapse, runner never started)
+    - Annotations matching "was not started" patterns (billing/runner issues)
+
+    This is used to reclassify FAILURE-state checks as infra_failed instead of
+    code failures, preventing rework worker dispatch against untested code.
+    """
+    if not jobs:
+        return False
+
+    # Check if every failed job has infrastructure failure indicators
+    for job in jobs:
+        conclusion = str(job.get("conclusion") or "").upper()
+        if conclusion != "FAILURE":
+            # Only check jobs that actually failed
+            continue
+
+        steps = job.get("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+
+        # Signal 1: zero-step job (never started)
+        # Filter out setup steps like "Set up job", "Checkout" to detect
+        # jobs that completed without running any actual test/work steps
+        non_setup_steps = [
+            s
+            for s in steps
+            if isinstance(s, dict)
+            and str(s.get("name") or "").lower()
+            not in {
+                "set up job",
+                "checkout",
+                "initialize",
+                "complete job",
+            }
+        ]
+
+        if len(non_setup_steps) == 0:
+            # Job completed with zero non-setup steps - infrastructure failure
+            return True
+
+        # Signal 2: check for "was not started" annotations
+        # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+        annotations = job.get("annotations", [])
+        if not isinstance(annotations, list):
+            annotations = []
+
+        for annotation in annotations:
+            if isinstance(annotation, dict):
+                message = str(annotation.get("message") or "").lower()
+                if "was not started" in message:
+                    return True
+
+    return False
 
 
 def parse_blockers(text: str) -> list[int]:

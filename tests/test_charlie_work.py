@@ -17,6 +17,7 @@ import yaml
 from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import summarize_checks
+from charlie_work.github import is_infrastructure_failure
 from charlie_work.config import (
     ClaudeCodeConfig,
     CrossFamilyConfig,
@@ -393,6 +394,142 @@ def test_summarize_checks_failure_takes_priority_over_cancelled() -> None:
     assert summary.failed == ("test",)
     assert summary.infra_failed == ()
     assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_marker_classifies_as_infra_failed() -> None:
+    """INFRA_FAILURE marker state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_case_insensitive() -> None:
+    """INFRA_FAILURE state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "infra_failure"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
+    """FAILURE should take priority over INFRA_FAILURE in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+
+
+def test_is_infrastructure_failure_zero_step_job() -> None:
+    """Jobs with zero non-setup steps should be classified as infrastructure failure."""
+    jobs = [
+        {
+            "conclusion": "FAILURE",
+            "steps": [
+                {"name": "Set up job"},
+                {"name": "Checkout"},
+            ],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is True
+
+
+def test_is_infrastructure_failure_with_test_steps() -> None:
+    """Jobs with actual test steps should not be classified as infrastructure failure."""
+    jobs = [
+        {
+            "conclusion": "FAILURE",
+            "steps": [
+                {"name": "Set up job"},
+                {"name": "Checkout"},
+                {"name": "Run tests"},
+            ],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is False
+
+
+def test_is_infrastructure_failure_billing_annotation() -> None:
+    """Jobs with billing annotation should be classified as infrastructure failure."""
+    jobs = [
+        {
+            "conclusion": "FAILURE",
+            "steps": [{"name": "Run tests"}],
+            "annotations": [
+                {
+                    "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+                }
+            ],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is True
+
+
+def test_is_infrastructure_failure_mixed_billing_annotation_text() -> None:
+    """Billing annotation detection should be case-insensitive and match partial text."""
+    jobs = [
+        {
+            "conclusion": "FAILURE",
+            "steps": [{"name": "Run tests"}],
+            "annotations": [{"message": "The job WAS NOT STARTED due to billing issues"}],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is True
+
+
+def test_is_infrastructure_failure_no_infrastructure_signals() -> None:
+    """Jobs without infrastructure failure signals should not be classified as such."""
+    jobs = [
+        {
+            "conclusion": "FAILURE",
+            "steps": [
+                {"name": "Set up job"},
+                {"name": "Checkout"},
+                {"name": "Run tests"},
+            ],
+            "annotations": [{"message": "Test failed: assertion error"}],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is False
+
+
+def test_is_infrastructure_failure_empty_jobs() -> None:
+    """Empty job list should return False (no infrastructure failure detected)."""
+    assert is_infrastructure_failure([]) is False
+
+
+def test_is_infrastructure_failure_non_failed_job() -> None:
+    """Jobs that didn't fail should not trigger infrastructure failure detection."""
+    jobs = [
+        {
+            "conclusion": "SUCCESS",
+            "steps": [],
+        }
+    ]
+
+    assert is_infrastructure_failure(jobs) is False
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
