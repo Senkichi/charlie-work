@@ -35,6 +35,7 @@ from .github import (
     linked_issue_number,
 )
 from .labels import TransitionOutcome, transition
+from .process_utils import kill_process_tree
 from .state import append_event, is_claim_stale, set_throttled_until
 
 
@@ -224,31 +225,7 @@ def detect_drift(
 
                         # Kill the process tree to free the slot
                         if w.pid is not None:
-                            try:
-                                import os
-                                import signal
-
-                                if os.name != "nt":
-                                    # POSIX: kill the process group
-                                    try:
-                                        os.killpg(os.getpgid(w.pid), signal.SIGTERM)
-                                    except (OSError, ProcessLookupError):
-                                        pass
-                                else:
-                                    # Windows: terminate the process
-                                    import ctypes
-
-                                    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-                                    handle = kernel32.OpenProcess(
-                                        0x0001,  # PROCESS_TERMINATE
-                                        False,
-                                        w.pid,
-                                    )
-                                    if handle:
-                                        kernel32.TerminateProcess(handle, 1)
-                                        kernel32.CloseHandle(handle)
-                            except (OSError, ProcessLookupError):
-                                pass
+                            kill_process_tree(w.pid, w.process_start_time)
 
                         # Reap the sidecar to prevent phantom sessions
                         w.reap_sidecar(sessions_dir)

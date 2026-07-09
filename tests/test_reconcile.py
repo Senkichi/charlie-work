@@ -1331,3 +1331,75 @@ def test_detect_drift_launch_stalled_session(tmp_path: Path) -> None:
     # but the helper function test above confirms the detection logic works
     # This test verifies the integration doesn't crash with the new code
     assert len(drift) == 0  # No drift for dead sessions without open PRs
+
+
+def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> None:
+    """Issue #221: launch_stalled path must call kill_process_tree with pid and process_start_time.
+
+    Mutation check: this test FAILS against the old inline-kill code (which calls
+    os.killpg / ctypes.TerminateProcess directly and never touches kill_process_tree)
+    and PASSES against the fix (which calls kill_process_tree from process_utils).
+    """
+    import json
+    import os
+    from unittest.mock import patch
+
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(55, [config.labels.in_progress])])
+    state = empty_state()
+
+    # detect_drift looks in repo_root / config.devin.sessions_dir
+    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a small log with only the shim marker — frozen well past grace period
+    log_path = sessions_dir / "issue-55.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=20)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Use a fake PID that passes is_alive() without actually checking the OS.
+    # We patch is_session_alive so the worker reads as alive.
+    fake_pid = 99999
+    fake_start_time = 1700000000.0
+
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 55)
+    record = SessionRecord(
+        issue_number=55,
+        branch="agent/issue-55",
+        worktree_path="/tmp/worktree-55",
+        prompt_path="/tmp/prompt-55.md",
+        command=("devin", "prompt.md"),
+        pid=fake_pid,
+        started_at="2026-07-09T00:00:00Z",
+        log_path=str(log_path),
+        error=None,
+        process_start_time=fake_start_time,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Ensure no claude-code sidecar interferes
+    (sessions_dir / "issue-55.claude.json").unlink(missing_ok=True)
+
+    kill_calls: list[tuple[int, float | None]] = []
+
+    def fake_kill(pid: int, expected_start_time: float | None = None) -> list[int]:
+        kill_calls.append((pid, expected_start_time))
+        return [pid]
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.reconcile.kill_process_tree", fake_kill),
+    ):
+        detect_drift(gh, state, config, repo_root=tmp_path)
+
+    assert len(kill_calls) == 1, (
+        f"Expected kill_process_tree to be called exactly once, got {kill_calls}"
+    )
+    assert kill_calls[0] == (fake_pid, fake_start_time), (
+        f"Expected kill_process_tree({fake_pid}, {fake_start_time}), got {kill_calls[0]}"
+    )
