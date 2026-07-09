@@ -3824,6 +3824,100 @@ def test_intake_isolates_per_issue_github_error(tmp_path: Path) -> None:
     assert any(e.get("kind") == "intake_failed" for e in state["events"])
 
 
+def test_intake_labels_prose_only_dependencies(tmp_path: Path) -> None:
+    """Issue #225: intake should label issues with prose-only dependencies."""
+
+    class ProseOnlyDepsGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 908,
+                    "title": "Issue with prose-only deps",
+                    "url": "https://example.test/issues/908",
+                    "body": "Do not dispatch before P2-T2/P2-T3 have landed.",
+                    "labels": [{"name": "automated-ready"}],
+                },
+                {
+                    "number": 909,
+                    "title": "Issue with structured blockers",
+                    "url": "https://example.test/issues/909",
+                    "body": "Blocked by #123",
+                    "labels": [{"name": "automated-ready"}],
+                },
+                {
+                    "number": 910,
+                    "title": "Normal issue",
+                    "url": "https://example.test/issues/910",
+                    "body": "Just a normal issue",
+                    "labels": [{"name": "automated-ready"}],
+                },
+            ]
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ProseOnlyDepsGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    # Issue 908 should be labeled with prose-only-deps
+    assert 908 in result.data["prose_only_deps_issues"]
+    # Issues 909 and 910 should not be labeled
+    assert 909 not in result.data["prose_only_deps_issues"]
+    assert 910 not in result.data["prose_only_deps_issues"]
+
+    # Check that the label was added to issue 908
+    assert (908, config.labels.prose_only_deps) in fake_gh.labels_added
+
+    # Check state event was logged
+    state = load_state(paths.state_file)
+    assert any(e.get("kind") == "intake_prose_only_deps" for e in state["events"])
+    prose_event = next(e for e in state["events"] if e.get("kind") == "intake_prose_only_deps")
+    # The event structure uses "payload" key with "issue_numbers" inside
+    assert prose_event.get("payload", {}).get("issue_numbers") == [908]
+
+
+def test_dispatch_skips_prose_only_deps_labeled_issues(tmp_path: Path) -> None:
+    """Issue #225: dispatch should skip issues labeled with prose-only-deps."""
+
+    class ProseOnlyDepsGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 908,
+                    "title": "Issue with prose-only deps",
+                    "url": "https://example.test/issues/908",
+                    "body": "Do not dispatch before P2-T2/P2-T3 have landed.",
+                    "labels": [{"name": "automated-ready"}, {"name": "agent:prose-only-deps"}],
+                },
+                {
+                    "number": 910,
+                    "title": "Normal issue",
+                    "url": "https://example.test/issues/910",
+                    "body": "Just a normal issue",
+                    "labels": [{"name": "automated-ready"}],
+                },
+            ]
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ProseOnlyDepsGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=10)
+
+    # Only issue 910 should be dispatched (908 is labeled with prose-only-deps)
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+    # The dispatched issue should be 910, not 908
+    assert result.data["sessions"][0]["issue_number"] == 910
+
+
 def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None:
     """Issue #135: A PARTIAL_FAILURE during review_started label transition must
     leave the review packet persisted in state and report structured label_error."""
@@ -9441,6 +9535,94 @@ def test_parse_blockers_ignores_downstream_reference_to_self() -> None:
         "_Filed from the fleet-management & worker-supervision design._\n"
     )
     assert parse_blockers(body) == []
+
+
+def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
+    """Test detection of 'do not dispatch before' pattern (issue #225)."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "Do not dispatch before P2-T2/P2-T3 have landed."
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "DO NOT DISPATCH BEFORE #123 merges"
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_task_references() -> None:
+    """Test detection of task references like P2-T3 (issue #225)."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "This depends on P2-T2 and P2-T3."
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "Wait for P1-T5 to complete first."
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_wait_for_pr() -> None:
+    """Test detection of 'wait for PR' pattern (issue #225)."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "Wait for this PR to merge before starting."
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "wait for that PR to land"
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_with_structured_blockers() -> None:
+    """Test that issues with structured blockers are handled correctly (issue #225)."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "Blocked by #123"
+    # Has structured blockers, so prose-only detection returns False
+    # (doesn't match the prose patterns)
+    assert detect_prose_only_dependencies(body) is False
+    assert parse_blockers(body) == [123]
+
+    # Test case with both prose and structured blockers
+    body = "Do not dispatch before P2-T2. Blocked by #123"
+    # Has prose pattern, so detection returns True
+    # But caller will check parse_blockers and see structured blockers exist
+    assert detect_prose_only_dependencies(body) is True
+    assert parse_blockers(body) == [123]
+
+
+def test_detect_prose_only_dependencies_no_match() -> None:
+    """Test that normal issue bodies don't trigger false positives (issue #225)."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "This is a normal issue with no dependencies."
+    assert detect_prose_only_dependencies(body) is False
+
+    body = "Fix the bug in the authentication module."
+    assert detect_prose_only_dependencies(body) is False
+
+    body = ""
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_detect_prose_only_dependencies_descriptive_task_refs_no_match() -> None:
+    """REQUIRED 1 negative tests: bare/descriptive task-marker mentions must NOT match.
+
+    Plan-generated issue bodies routinely mention task markers descriptively
+    (e.g. 'implements P2-T4', title suffix '(P2-T4)', 'this task is P2-T3 of
+    the plan'). These must not fire the detector — only dependency-context uses
+    should match (REQUIRED 1, PR #230 rework).
+    """
+    from charlie_work.github import detect_prose_only_dependencies
+
+    # "implements P2-T4" — descriptive, not a dependency declaration
+    body = "This implements P2-T4 of the expiry plan."
+    assert detect_prose_only_dependencies(body) is False
+
+    # Commit-style title with inline task marker — descriptive reference in prose
+    body = "fix(expiry): thread careers-match (P2-T4)"
+    assert detect_prose_only_dependencies(body) is False
+
+    # "this task is P2-T3 of the plan" — describes what the issue is, not what it depends on
+    body = "This task is P2-T3 of the plan."
+    assert detect_prose_only_dependencies(body) is False
 
 
 def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:

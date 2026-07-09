@@ -606,6 +606,66 @@ def parse_blockers(text: str) -> list[int]:
     return sorted(blockers)
 
 
+def detect_prose_only_dependencies(text: str) -> bool:
+    """Detect prose-only dependency declarations in issue body.
+
+    Returns True if the issue body contains dependency-like prose without
+    structured blocker declarations. This catches cases like "Do not dispatch
+    before P2-T2/P2-T3 have landed" that lack corresponding "Blocked by #N" markers.
+
+    Patterns detected:
+    - "do not dispatch before" (case-insensitive)
+    - "depends on <...> P\\d+-T\\d+" — task reference in dependency context
+    - "wait for <...> P\\d+-T\\d+ <...> (complete|done|land|merge|ship)" — task
+      reference with completion verb; covers "Wait for P1-T5 to complete first."
+    - "before/until/after <...> P\\d+-T\\d+ <...> (land|merge|complete|done|ship)"
+    - "wait for" before a PR or merge event (non-task dependency prose)
+
+    Pattern 2 is intentionally scoped to dependency context only — bare task
+    marker mentions like "implements P2-T4" or title suffixes "(P2-T4)" are
+    NOT matched, to avoid flagging every plan-generated issue for human review.
+
+    Args:
+        text: The issue body text to check
+
+    Returns:
+        True if prose-only dependencies are detected, False otherwise
+    """
+    if not text:
+        return False
+
+    # Pattern 1: "do not dispatch before" and variants
+    if re.search(r"do\s+not\s+dispatch\s+before", text, flags=re.IGNORECASE):
+        return True
+
+    # Pattern 2: task references (P\d+-T\d+) only in dependency context.
+    # "depends on ... P\d+-T\d+" — classic self-declaration
+    if re.search(r"depends\s+on\s+[^.\n]*P\d+-T\d+", text, flags=re.IGNORECASE):
+        return True
+    # "wait for ... P\d+-T\d+ ... <completion verb>" — e.g. "Wait for P1-T5 to complete first."
+    if re.search(
+        r"wait\s+for\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    # "before/until/after ... P\d+-T\d+ ... <completion verb>"
+    if re.search(
+        r"(?:before|until|after)\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # Pattern 3: "wait for" before a PR or merge event (non-task dependency prose)
+    if re.search(
+        r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE
+    ):
+        return True
+
+    return False
+
+
 def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     """Fetch GitHub's native issue dependencies (blocked_by relationships).
 

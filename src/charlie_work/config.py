@@ -62,10 +62,11 @@ class LabelConfig:
     blocked: str = "agent:blocked"
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
+    prose_only_deps: str = "agent:prose-only-deps"
 
     @property
     def terminal(self) -> set[str]:
-        return {self.blocked, self.done, self.human_needed}
+        return {self.blocked, self.done, self.human_needed, self.prose_only_deps}
 
     @property
     def active(self) -> set[str]:
@@ -83,6 +84,7 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
+            self.prose_only_deps,
         ]
 
     @property
