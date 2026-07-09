@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -290,7 +291,8 @@ def test_apply_fixes_merged_outside_orchestrator_transitions_labels() -> None:
     new_state = apply_fixes(gh, state, drift, config)
 
     assert (10, config.labels.done) in gh.labels_added
-    for label in sorted(config.labels.active):
+    # Issue #215: merged transition removes ALL other workflow labels, not just active
+    for label in sorted(config.labels.workflow_labels - {config.labels.done}):
         assert (10, label) in gh.labels_removed
     assert new_state["prs"]["1"]["status"] == "merged"
 
@@ -1070,6 +1072,133 @@ def test_detect_drift_session_failed_no_pr_mutually_exclusive_with_issue_active_
     assert gh.labels_removed.count((42, config.labels.in_progress)) == 1
 
 
+def test_detect_drift_live_session_no_pr_no_issue_active_drift(tmp_path: Path) -> None:
+    """Issue #214: live session with no open PR should NOT trigger issue_active_label_no_open_pr.
+
+    This test ensures that the drift rule checks session liveness before proposing
+    label removal. A worker that is still running (is_alive() returns True) should
+    not have its labels stripped even if it hasn't opened a PR yet.
+    """
+    import os
+    from charlie_work.devin_shell import SessionRecord, _get_process_start_time
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    # Create a sessions directory with a LIVE session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("Worker is running...\n", encoding="utf-8")
+
+    # Write a session record for a LIVE session (with a real PID that we'll mock as alive)
+    # We use the current process's PID to ensure is_alive() returns True
+    current_pid = os.getpid()
+    current_start_time = _get_process_start_time(current_pid)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=current_pid,  # Use current PID to simulate live session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=current_start_time,  # Use actual process start time
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Ensure no claude-code session exists (to avoid double-reading)
+    claude_sidecar = sessions_dir / "issue-42.claude.json"
+    if claude_sidecar.exists():
+        claude_sidecar.unlink()
+
+    # Run detect_drift with repo_root to enable session checking
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Should NOT detect issue_active_label_no_open_pr for live session
+    issue_active_drift = [d for d in drift if d.kind == "issue_active_label_no_open_pr"]
+    assert len(issue_active_drift) == 0, (
+        "Should not emit issue_active_label_no_open_pr when session is still alive"
+    )
+
+    # Should also not emit session_failed_relabeled (session is alive)
+    relabel_drift = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert len(relabel_drift) == 0, "Should not emit session_failed_relabeled for live session"
+
+
+def test_detect_drift_dead_session_no_pr_still_triggers_issue_active_drift(tmp_path: Path) -> None:
+    """Issue #214: dead session with no open PR should still trigger issue_active_label_no_open_pr.
+
+    This test ensures that the drift rule still works correctly for dead sessions.
+    When a session is dead (is_alive() returns False) and has no open PR, the drift
+    rule should still propose label removal.
+    """
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    # Create a sessions directory with a DEAD session
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("Worker died...\n", encoding="utf-8")
+
+    # Write a session record for a DEAD session (pid=None to simulate dead)
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Ensure no claude-code session exists (to avoid double-reading)
+    claude_sidecar = sessions_dir / "issue-42.claude.json"
+    if claude_sidecar.exists():
+        claude_sidecar.unlink()
+
+    # Run detect_drift with repo_root to enable session checking
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Should detect session_failed_relabeled (dead session with no open PR)
+    relabel_drift = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert len(relabel_drift) >= 1, "Should emit session_failed_relabeled for dead session"
+
+    # Should NOT detect issue_active_label_no_open_pr (mutually exclusive with session_failed_relabeled)
+    issue_active_drift = [d for d in drift if d.kind == "issue_active_label_no_open_pr"]
+    assert len(issue_active_drift) == 0, (
+        "Should not emit issue_active_label_no_open_pr when session_failed_relabeled handles it"
+    )
+
+
 def test_transition_failed_add_returns_partial_failure() -> None:
     """Issue #125: transition() should return PARTIAL_FAILURE when add fails."""
     from charlie_work.labels import transition, TransitionOutcome as TO
@@ -1122,6 +1251,39 @@ def test_transition_no_labels_returns_nothing_changed() -> None:
     assert result.outcome == TO.APPLIED  # blocked has labels to add
     assert len(result.add_failures) == 0
     assert len(result.remove_failures) == 0
+
+
+def test_terminal_transition_clears_sibling_workflow_labels() -> None:
+    """Issue #215: terminal transitions (agent:done, agent:blocked, agent:human-needed) must clear sibling agent:* workflow labels."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(852, [config.labels.human_needed])],
+    )
+
+    # Transition to agent:done should remove agent:human-needed and all other workflow labels
+    result = transition(gh, config.labels, 852, "merged")
+
+    assert result.outcome == TO.APPLIED
+    assert len(result.add_failures) == 0
+    assert len(result.remove_failures) == 0
+
+    # Verify that agent:done was added
+    assert (852, config.labels.done) in gh.labels_added
+
+    # Verify that all other workflow labels were removed (but not agent:done itself)
+    # The remove set should include all workflow labels except agent:done
+    assert (852, config.labels.queued) in gh.labels_removed
+    assert (852, config.labels.in_progress) in gh.labels_removed
+    assert (852, config.labels.pr_open) in gh.labels_removed
+    assert (852, config.labels.reviewing) in gh.labels_removed
+    assert (852, config.labels.needs_rework) in gh.labels_removed
+    assert (852, config.labels.human_needed) in gh.labels_removed
+
+    # Verify agent:done was NOT removed (it's the target state)
+    assert (852, config.labels.done) not in gh.labels_removed
 
 
 def test_apply_fixes_multi_item_with_one_failed_label_write() -> None:
@@ -1271,4 +1433,134 @@ def test_mutation_gate_apply_fixes_false_success_fails() -> None:
     assert "label_write_failed: true" in event["payload"]["fix_actions"], (
         "Label write failure must be recorded in event - this gate prevents "
         "reporting failures as successes"
+    )
+
+
+def test_detect_drift_launch_stalled_session(tmp_path: Path) -> None:
+    """Issue #221: detect launch_stalled sessions (alive but hung at shim marker)."""
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.worker import _log_is_stalled_at_shim
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    # Create a sessions directory with a launch_stalled session
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Write a log with the shim marker (frozen at ~424-425 bytes)
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    # Set mtime to 10 minutes ago (past the default 5-minute grace period)
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Verify the log is detected as stalled
+    now = datetime.now(UTC)
+    assert _log_is_stalled_at_shim(log_path, config.watchdog.launch_stall_grace_minutes, now)
+
+    # Write a session record for a dead session (non-existent PID)
+    # The launch_stalled check only runs for alive sessions, so we test the helper directly
+    issue_number = 42
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch="agent/issue-42",
+        worktree_path="/tmp/worktree-42",
+        prompt_path="/tmp/prompt-42.md",
+        command=("devin", "prompt.md"),
+        pid=None,  # Dead session
+        started_at="2026-07-09T00:00:00Z",
+        log_path=str(log_path),
+        error=None,
+        process_start_time=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run detect_drift with repo_root
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Since the session is dead (pid=None), it won't be detected as launch_stalled
+    # but the helper function test above confirms the detection logic works
+    # This test verifies the integration doesn't crash with the new code
+    assert len(drift) == 0  # No drift for dead sessions without open PRs
+
+
+def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> None:
+    """Issue #221: launch_stalled path must call kill_process_tree with pid and process_start_time.
+
+    Mutation check: this test FAILS against the old inline-kill code (which calls
+    os.killpg / ctypes.TerminateProcess directly and never touches kill_process_tree)
+    and PASSES against the fix (which calls kill_process_tree from process_utils).
+    """
+    import json
+    import os
+    from unittest.mock import patch
+
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(55, [config.labels.in_progress])])
+    state = empty_state()
+
+    # detect_drift looks in repo_root / config.devin.sessions_dir
+    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a small log with only the shim marker — frozen well past grace period
+    log_path = sessions_dir / "issue-55.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=20)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Use a fake PID that passes is_alive() without actually checking the OS.
+    # We patch is_session_alive so the worker reads as alive.
+    fake_pid = 99999
+    fake_start_time = 1700000000.0
+
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 55)
+    record = SessionRecord(
+        issue_number=55,
+        branch="agent/issue-55",
+        worktree_path="/tmp/worktree-55",
+        prompt_path="/tmp/prompt-55.md",
+        command=("devin", "prompt.md"),
+        pid=fake_pid,
+        started_at="2026-07-09T00:00:00Z",
+        log_path=str(log_path),
+        error=None,
+        process_start_time=fake_start_time,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Ensure no claude-code sidecar interferes
+    (sessions_dir / "issue-55.claude.json").unlink(missing_ok=True)
+
+    kill_calls: list[tuple[int, float | None]] = []
+
+    def fake_kill(pid: int, expected_start_time: float | None = None) -> list[int]:
+        kill_calls.append((pid, expected_start_time))
+        return [pid]
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.reconcile.kill_process_tree", fake_kill),
+    ):
+        detect_drift(gh, state, config, repo_root=tmp_path)
+
+    assert len(kill_calls) == 1, (
+        f"Expected kill_process_tree to be called exactly once, got {kill_calls}"
+    )
+    assert kill_calls[0] == (fake_pid, fake_start_time), (
+        f"Expected kill_process_tree({fake_pid}, {fake_start_time}), got {kill_calls[0]}"
     )

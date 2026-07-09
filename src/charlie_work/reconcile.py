@@ -21,6 +21,7 @@ direct ``remove_issue_label`` calls only for label combinations that
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from .github import (
     linked_issue_number,
 )
 from .labels import TransitionOutcome, transition
+from .process_utils import kill_process_tree
 from .state import append_event, is_claim_stale, set_throttled_until
 
 
@@ -106,6 +108,9 @@ def detect_drift(
     # Track issues already handled by session relabel to avoid double-emission
     # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
     issues_handled_by_session_relabel: set[int] = set()
+    # Track issues with live sessions to avoid false-positive drift detection
+    # (issue #214: don't strip labels from workers that are still running)
+    live_session_issue_numbers: set[int] = set()
 
     for pr in prs:
         pr_number = pr.get("number")
@@ -198,11 +203,77 @@ def detect_drift(
     if repo_root is not None:
         from .claude_code import update_worker_record_with_failure_classification
         from .devin_shell import update_session_record_with_failure_classification
-        from .worker import iter_workers, update_worker_log_stat
+        from .worker import _log_is_stalled_at_shim, iter_workers, update_worker_log_stat
 
         sessions_dir = repo_root / config.devin.sessions_dir
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
+                # Track live sessions to avoid false-positive drift detection (issue #214)
+                if w.is_alive():
+                    live_session_issue_numbers.add(w.issue_number)
+
+                # Issue #221: detect launch_stalled sessions (alive but hung at shim marker)
+                # This check runs before the dead session check to catch zombies
+                if w.error is None and w.is_alive():
+                    now = datetime.now(UTC)
+                    log_path = Path(w.log_path)
+                    if _log_is_stalled_at_shim(
+                        log_path, config.watchdog.launch_stall_grace_minutes, now
+                    ):
+                        # Session is alive but stalled at shim marker - classify as launch_stalled
+                        if w.adapter_kind == "devin":
+                            update_session_record_with_failure_classification(
+                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                            )
+                        elif w.adapter_kind == "claude-code":
+                            update_worker_record_with_failure_classification(
+                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                            )
+
+                        # Kill the process tree to free the slot
+                        if w.pid is not None:
+                            kill_process_tree(w.pid, w.process_start_time)
+
+                        # Reap the sidecar to prevent phantom sessions
+                        w.reap_sidecar(sessions_dir)
+
+                        # Reconcile labels for launch_stalled sessions with no open PR
+                        if w.issue_number not in open_prs_by_issue:
+                            issue = issues_by_number.get(w.issue_number)
+                            if issue:
+                                issue_labels = label_names(issue)
+                                active_labels = issue_labels & labels_cfg.active
+                                if active_labels:
+                                    # Remove all active labels and ensure ready label is present
+                                    fix_actions = [
+                                        f"remove label '{label}' from issue #{w.issue_number}"
+                                        for label in sorted(active_labels)
+                                    ]
+                                    add_labels: tuple[str, ...] = ()
+                                    if labels_cfg.ready not in issue_labels:
+                                        fix_actions.append(
+                                            f"add label '{labels_cfg.ready}' to issue #{w.issue_number}"
+                                        )
+                                        add_labels = (labels_cfg.ready,)
+
+                                    drift.append(
+                                        DriftItem(
+                                            kind="session_failed_relabeled",
+                                            issue_number=w.issue_number,
+                                            pr_number=None,
+                                            detail=(
+                                                f"issue #{w.issue_number} session launch_stalled "
+                                                f"(hung at shim marker), no open PR, "
+                                                f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                            ),
+                                            fix_actions=tuple(fix_actions),
+                                            remove_labels=tuple(sorted(active_labels)),
+                                            add_labels=add_labels,
+                                        )
+                                    )
+                                    # Mark this issue as handled to avoid double-emission
+                                    issues_handled_by_session_relabel.add(w.issue_number)
+
                 if w.error is None and not w.is_alive():
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)
@@ -291,11 +362,13 @@ def detect_drift(
         terminal_present = issue_labels & labels_cfg.terminal
 
         # Skip issue_active_label_no_open_pr if already handled by session relabel
-        # (both fire for dead-session-with-no-PR-ever scenario)
+        # (both fire for dead-session-with-no-PR-ever scenario) or if the session
+        # is still alive (issue #214: don't strip labels from running workers)
         if (
             active_present
             and not prs_linking_issue.get(issue_number)
             and issue_number not in issues_handled_by_session_relabel
+            and issue_number not in live_session_issue_numbers
         ):
             drift.append(
                 DriftItem(
