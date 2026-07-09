@@ -3590,6 +3590,7 @@ def test_intake_isolates_per_issue_github_error(tmp_path: Path) -> None:
 
 def test_intake_labels_prose_only_dependencies(tmp_path: Path) -> None:
     """Issue #225: intake should label issues with prose-only dependencies."""
+
     class ProseOnlyDepsGitHub(FakeGitHub):
         def __init__(self) -> None:
             super().__init__()
@@ -3644,6 +3645,7 @@ def test_intake_labels_prose_only_dependencies(tmp_path: Path) -> None:
 
 def test_dispatch_skips_prose_only_deps_labeled_issues(tmp_path: Path) -> None:
     """Issue #225: dispatch should skip issues labeled with prose-only-deps."""
+
     class ProseOnlyDepsGitHub(FakeGitHub):
         def __init__(self) -> None:
             super().__init__()

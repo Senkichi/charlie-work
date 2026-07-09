@@ -914,7 +914,9 @@ class OrchestratorApp:
         if failed:
             message = f"intake completed with {len(failed)} failure(s)"
         if prose_only_deps_issues:
-            message += f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
+            message += (
+                f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
+            )
         return CommandResult(
             not failed,
             message,

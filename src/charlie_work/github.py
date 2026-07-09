@@ -525,7 +525,9 @@ def detect_prose_only_dependencies(text: str) -> bool:
 
     # Pattern 3: "wait for" in dependency context
     # More specific than just "wait for" to avoid false positives
-    if re.search(r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE):
+    if re.search(
+        r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE
+    ):
         return True
 
     return False
