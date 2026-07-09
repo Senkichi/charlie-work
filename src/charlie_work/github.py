@@ -21,7 +21,7 @@ ISSUE_VIEW_FIELDS = (
 )
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
-PR_CHECKS_FIELDS = "name,state,bucket,link"
+PR_CHECKS_FIELDS = "name,state,bucket,link,databaseId"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
 RECONCILE_PR_FIELDS = (
@@ -221,11 +221,60 @@ class GitHub:
         )
         return result if isinstance(result, list) else []
 
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        """Fetch a single GitHub Actions job by ID.
+
+        Returns job data including steps[]. Used to detect infrastructure failures
+        via step counts. Returns None on failure (allow_failure=True).
+        """
+        result = self.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, dict):
+            return result
+        return None
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        """Fetch annotations for a specific check run.
+
+        Returns a flat list of annotation objects. Used to detect infrastructure
+        failures via billing/runner messages. Returns empty list on failure.
+        """
+        result = self.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/annotations",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, list):
+            return result
+        return []
+
     def add_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--add-label", label])
 
     def remove_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
+
+    def close_issue(self, number: int) -> bool:
+        """Close an issue. Idempotent — returns True even if already closed.
+
+        Uses `gh issue close`. Returns True on success, False on failure.
+        Never raises — per-issue failures are reported as values and must not
+        abort a batch operation.
+        """
+        try:
+            self.run(["issue", "close", str(number)])
+            return True
+        except GitHubError:
+            return False
 
     def issue_comment(self, number: int, body_file: Path) -> None:
         self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
@@ -450,6 +499,70 @@ def _clause_preceding(text: str, match_start: int) -> str:
     """
     boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
     return text[boundary + 1 : match_start]
+
+
+def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:
+    """Detect if a failed job indicates infrastructure failure vs code failure.
+
+    Returns True if the failed job shows signs of infrastructure failure:
+    - Zero executed steps (billing lapse, runner never started)
+    - Annotations matching "was not started" patterns (billing/runner issues)
+
+    This is used to reclassify FAILURE-state checks as infra_failed instead of
+    code failures, preventing rework worker dispatch against untested code.
+
+    Args:
+        job: A single job object with steps[] from the GitHub Actions API
+        annotations: A flat list of annotation objects from the check-runs API
+
+    Returns:
+        True if any infrastructure failure signal is detected, False otherwise.
+    """
+    conclusion = str(job.get("conclusion") or "").upper()
+    if conclusion != "FAILURE":
+        # Only check jobs that actually failed
+        return False
+
+    steps = job.get("steps", [])
+    if not isinstance(steps, list):
+        steps = []
+
+    # Signal 1: zero-step job (never started)
+    # Primary signal: job with no steps at all (runner never started)
+    if len(steps) == 0:
+        return True
+
+    # Fallback: filter out setup steps to detect jobs that completed
+    # without running any actual test/work steps
+    non_setup_steps = [
+        s
+        for s in steps
+        if isinstance(s, dict)
+        and str(s.get("name") or "").lower()
+        not in {
+            "set up job",
+            "checkout",
+            "initialize",
+            "complete job",
+        }
+    ]
+
+    if len(non_setup_steps) == 0:
+        # Job completed with zero non-setup steps - infrastructure failure
+        return True
+
+    # Signal 2: check for "was not started" annotations
+    # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+    if not isinstance(annotations, list):
+        annotations = []
+
+    for annotation in annotations:
+        if isinstance(annotation, dict):
+            message = str(annotation.get("message") or "").lower()
+            if "was not started" in message:
+                return True
+
+    return False
 
 
 def parse_blockers(text: str) -> list[int]:

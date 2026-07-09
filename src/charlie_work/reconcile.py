@@ -108,6 +108,9 @@ def detect_drift(
     # Track issues already handled by session relabel to avoid double-emission
     # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
     issues_handled_by_session_relabel: set[int] = set()
+    # Track issues with live sessions to avoid false-positive drift detection
+    # (issue #214: don't strip labels from workers that are still running)
+    live_session_issue_numbers: set[int] = set()
 
     for pr in prs:
         pr_number = pr.get("number")
@@ -205,6 +208,10 @@ def detect_drift(
         sessions_dir = repo_root / config.devin.sessions_dir
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
+                # Track live sessions to avoid false-positive drift detection (issue #214)
+                if w.is_alive():
+                    live_session_issue_numbers.add(w.issue_number)
+
                 # Issue #221: detect launch_stalled sessions (alive but hung at shim marker)
                 # This check runs before the dead session check to catch zombies
                 if w.error is None and w.is_alive():
@@ -355,11 +362,13 @@ def detect_drift(
         terminal_present = issue_labels & labels_cfg.terminal
 
         # Skip issue_active_label_no_open_pr if already handled by session relabel
-        # (both fire for dead-session-with-no-PR-ever scenario)
+        # (both fire for dead-session-with-no-PR-ever scenario) or if the session
+        # is still alive (issue #214: don't strip labels from running workers)
         if (
             active_present
             and not prs_linking_issue.get(issue_number)
             and issue_number not in issues_handled_by_session_relabel
+            and issue_number not in live_session_issue_numbers
         ):
             drift.append(
                 DriftItem(
