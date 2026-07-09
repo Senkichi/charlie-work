@@ -2079,8 +2079,10 @@ class OrchestratorApp:
                 # Check if this failure is due to infrastructure issues
                 check_run_id = check.get("databaseId")
                 if check_run_id and isinstance(check_run_id, int):
-                    jobs = self.gh.check_run_jobs(check_run_id)
-                    if is_infrastructure_failure(jobs):
+                    # The databaseId from gh pr checks IS the GitHub Actions job id
+                    job = self.gh.actions_job(check_run_id)
+                    annotations = self.gh.check_run_annotations(check_run_id)
+                    if job and is_infrastructure_failure(job, annotations):
                         # Reclassify as infrastructure failure by setting state to a marker
                         # that summarize_checks will route to infra_failed
                         check = {**check, "state": "INFRA_FAILURE"}

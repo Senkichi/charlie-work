@@ -221,23 +221,40 @@ class GitHub:
         )
         return result if isinstance(result, list) else []
 
-    def check_run_jobs(self, check_run_id: int) -> list[dict[str, Any]]:
-        """Fetch jobs for a specific check run to detect infrastructure failures.
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        """Fetch a single GitHub Actions job by ID.
 
-        Returns job data including step counts and annotations. Used to detect
-        billing lapses (zero-step jobs) and runner infrastructure failures.
+        Returns job data including steps[]. Used to detect infrastructure failures
+        via step counts. Returns None on failure (allow_failure=True).
         """
         result = self.run(
             [
                 "api",
-                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/jobs",
+                f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}",
             ],
             json_output=True,
             allow_failure=True,
         )
         if isinstance(result, dict):
-            jobs = result.get("jobs", [])
-            return jobs if isinstance(jobs, list) else []
+            return result
+        return None
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        """Fetch annotations for a specific check run.
+
+        Returns a flat list of annotation objects. Used to detect infrastructure
+        failures via billing/runner messages. Returns empty list on failure.
+        """
+        result = self.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/annotations",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, list):
+            return result
         return []
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -471,61 +488,66 @@ def _clause_preceding(text: str, match_start: int) -> str:
     return text[boundary + 1 : match_start]
 
 
-def is_infrastructure_failure(jobs: list[dict[str, Any]]) -> bool:
-    """Detect if failed jobs indicate infrastructure failure vs code failure.
+def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:
+    """Detect if a failed job indicates infrastructure failure vs code failure.
 
-    Returns True if all failed jobs show signs of infrastructure failure:
+    Returns True if the failed job shows signs of infrastructure failure:
     - Zero executed steps (billing lapse, runner never started)
     - Annotations matching "was not started" patterns (billing/runner issues)
 
     This is used to reclassify FAILURE-state checks as infra_failed instead of
     code failures, preventing rework worker dispatch against untested code.
+
+    Args:
+        job: A single job object with steps[] from the GitHub Actions API
+        annotations: A flat list of annotation objects from the check-runs API
+
+    Returns:
+        True if any infrastructure failure signal is detected, False otherwise.
     """
-    if not jobs:
+    conclusion = str(job.get("conclusion") or "").upper()
+    if conclusion != "FAILURE":
+        # Only check jobs that actually failed
         return False
 
-    # Check if every failed job has infrastructure failure indicators
-    for job in jobs:
-        conclusion = str(job.get("conclusion") or "").upper()
-        if conclusion != "FAILURE":
-            # Only check jobs that actually failed
-            continue
+    steps = job.get("steps", [])
+    if not isinstance(steps, list):
+        steps = []
 
-        steps = job.get("steps", [])
-        if not isinstance(steps, list):
-            steps = []
+    # Signal 1: zero-step job (never started)
+    # Primary signal: job with no steps at all (runner never started)
+    if len(steps) == 0:
+        return True
 
-        # Signal 1: zero-step job (never started)
-        # Filter out setup steps like "Set up job", "Checkout" to detect
-        # jobs that completed without running any actual test/work steps
-        non_setup_steps = [
-            s
-            for s in steps
-            if isinstance(s, dict)
-            and str(s.get("name") or "").lower()
-            not in {
-                "set up job",
-                "checkout",
-                "initialize",
-                "complete job",
-            }
-        ]
+    # Fallback: filter out setup steps to detect jobs that completed
+    # without running any actual test/work steps
+    non_setup_steps = [
+        s
+        for s in steps
+        if isinstance(s, dict)
+        and str(s.get("name") or "").lower()
+        not in {
+            "set up job",
+            "checkout",
+            "initialize",
+            "complete job",
+        }
+    ]
 
-        if len(non_setup_steps) == 0:
-            # Job completed with zero non-setup steps - infrastructure failure
-            return True
+    if len(non_setup_steps) == 0:
+        # Job completed with zero non-setup steps - infrastructure failure
+        return True
 
-        # Signal 2: check for "was not started" annotations
-        # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
-        annotations = job.get("annotations", [])
-        if not isinstance(annotations, list):
-            annotations = []
+    # Signal 2: check for "was not started" annotations
+    # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+    if not isinstance(annotations, list):
+        annotations = []
 
-        for annotation in annotations:
-            if isinstance(annotation, dict):
-                message = str(annotation.get("message") or "").lower()
-                if "was not started" in message:
-                    return True
+    for annotation in annotations:
+        if isinstance(annotation, dict):
+            message = str(annotation.get("message") or "").lower()
+            if "was not started" in message:
+                return True
 
     return False
 
