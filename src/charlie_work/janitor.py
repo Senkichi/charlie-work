@@ -91,7 +91,11 @@ def _calculate_patch_id(diff: str) -> str:
     of base SHA changes (e.g., from base-update merges).
 
     The normalization strips metadata that varies between runs (hashes,
-    timestamps) while preserving the actual code changes.
+    timestamps, line offsets) while preserving the actual code changes.
+    Specifically, it mirrors what ``git patch-id`` does: hunk headers
+    (lines starting with ``@@``) are dropped so that base-update merges
+    that shift line numbers in a PR's files do not change the patch-id
+    even when the content lines are identical.
 
     Args:
         diff: The unified diff string (e.g., from `git diff` or `gh pr diff`)
@@ -113,6 +117,11 @@ def _calculate_patch_id(diff: str) -> str:
             or line.startswith("--- ")
             or line.startswith("+++ ")
         ):
+            continue
+        # Skip hunk headers (e.g. "@@ -10,5 +10,6 @@"): line-offset numbers change
+        # on base-update merges even when content is identical. git patch-id ignores
+        # these for the same reason.
+        if line.startswith("@@"):
             continue
         # Skip diff metadata lines
         if line.startswith("\\"):
@@ -328,11 +337,9 @@ def _check_no_op_rework(
     if decision != "request_changes":
         return
 
-    # Primary check: compare patch-ids if available
+    # Primary check: compare patch-ids when both are available
     reviewed_patch_id = pr_state.get("reviewed_patch_id")
-    patch_id_check_ran = False
     if reviewed_patch_id and pr_diff is not None:
-        patch_id_check_ran = True
         current_patch_id = _calculate_patch_id(pr_diff)
         if current_patch_id == reviewed_patch_id:
             failure_msg = (
@@ -354,15 +361,10 @@ def _check_no_op_rework(
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
 
             failures.append(failure_msg)
-            return
-        # If patch-ids differ, the rework has actual content changes - pass the check
-        if current_patch_id != reviewed_patch_id:
-            return
-
-    # Fallback: head SHA comparison (only if patch-id check didn't run)
-    if patch_id_check_ran:
-        # Patch-id check ran and didn't fail, so don't run SHA fallback
+        # Patch-id check ran (match or not) — skip SHA fallback
         return
+
+    # Fallback: head SHA comparison (only when patch-id check could not run)
 
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:

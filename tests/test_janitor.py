@@ -437,6 +437,111 @@ def test_calculate_patch_id_empty_diff() -> None:
     assert _calculate_patch_id("   \n  ") == ""
 
 
+def test_calculate_patch_id_offset_immune() -> None:
+    """Patch-id is identical for diffs with the same content but shifted hunk offsets.
+
+    A base-update merge that adds lines to files shared with an open PR shifts
+    hunk-header line numbers (@@ -N,M +N,M @@) without touching content lines.
+    git patch-id strips hunk headers for this reason; _calculate_patch_id must
+    do the same so that offset-only shifts do not change the patch-id.
+
+    MUTATION CHECK: this test MUST FAIL if the @@ skip is removed from
+    _calculate_patch_id (verified during development — see PR #229 rework notes).
+    """
+    # Two diffs with identical content lines but hunk offsets shifted by 4 lines
+    diff_original = """\
+diff --git a/src/foo.py b/src/foo.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -10,5 +10,6 @@
+ context line
+-old line
++new line
+ another context
+"""
+    diff_shifted = """\
+diff --git a/src/foo.py b/src/foo.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -14,5 +14,6 @@
+ context line
+-old line
++new line
+ another context
+"""
+    id_original = _calculate_patch_id(diff_original)
+    id_shifted = _calculate_patch_id(diff_shifted)
+    assert id_original == id_shifted, (
+        f"Hunk-offset shift changed patch-id: {id_original!r} != {id_shifted!r}. "
+        "Did someone remove the @@ skip from _calculate_patch_id?"
+    )
+    assert len(id_original) == 64  # SHA256 hex
+
+
+def test_no_op_rework_offset_shift_still_blocks(tmp_path: Path) -> None:
+    """No-op rework gate blocks when only hunk offsets shifted (base-update scenario).
+
+    This is the integration-level proof of issue #222: the reviewed_patch_id was
+    recorded from the unshifted diff; after a base-update merge shifts line numbers
+    the current diff has different @@ headers but identical content — the janitor
+    must still recognise it as a no-op and block re-review.
+
+    MUTATION CHECK: this test MUST FAIL against the pre-fix implementation (without
+    the @@ skip in _calculate_patch_id), because the shifted hunk header would make
+    _calculate_patch_id return a different hash and the gate would incorrectly pass.
+    """
+    diff_at_review_time = """\
+diff --git a/src/foo.py b/src/foo.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -10,5 +10,6 @@
+ context line
+-old line
++new line
+ another context
+"""
+    # Base-update merge shifted the hunk by 4 lines — same content, different header
+    diff_after_base_update = """\
+diff --git a/src/foo.py b/src/foo.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -14,5 +14,6 @@
+ context line
+-old line
++new line
+ another context
+"""
+    reviewed_patch_id = _calculate_patch_id(diff_at_review_time)
+
+    pr = _green_pr(headRefOid="def456")  # Head SHA changed by base-update merge
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": reviewed_patch_id,
+    }
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff_after_base_update,
+    )
+
+    assert verdict.ok is False, (
+        "Expected no-op block but got ok=True. "
+        "Did the @@ skip get removed from _calculate_patch_id?"
+    )
+    assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures), (
+        f"Expected patch-id no-op failure, got: {verdict.failures}"
+    )
+
+
 def test_no_op_rework_detects_unchanged_patch_id() -> None:
     """Detect no-op rework when PR patch-id is unchanged since request_changes verdict."""
     pr = _green_pr(headRefOid="def456")  # Head SHA changed (e.g., base-update merge)
