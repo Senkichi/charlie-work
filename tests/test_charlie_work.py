@@ -11480,3 +11480,332 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     assert redispatch_assignments == 4, (
         f"Expected 4 redispatch_at assignments, found {redispatch_assignments}"
     )
+
+
+def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_path: Path) -> None:
+    """Regression test for issue #207: dead worker with request_changes and unchanged head should reset to rework_requested."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create initial state with a dispatched issue and dead worker PID
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,  # Dead PID
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    # Mock GitHub to return an open PR for the issue
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    # Mock PID liveness check to return False (dead PID)
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Load state and verify the transition
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Status should be reset to rework_requested
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    # Worker PID should be cleared
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    # Verify the event was logged
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["payload"]["issue_number"] == 207
+    assert recovered_events[0]["payload"]["pr_number"] == 100
+    assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+
+def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
+    """Regression test for issue #207: dead worker with head change should emit drift event, not auto-reset."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create initial state with a dispatched issue and dead worker PID
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,  # Dead PID
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",  # Old head
+    }
+    save_state(paths.state_file, state)
+
+    # Mock GitHub to return an open PR with changed head
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",  # Changed since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    # Mock PID liveness check to return False (dead PID)
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Load state and verify NO auto-reset
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Status should NOT be reset (still dispatched)
+    assert entry.get("status") == "dispatched"
+
+    # Worker PID should be cleared
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    # Verify drift event was logged
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["issue_number"] == 207
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_with_head_change"
+
+
+def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
+    """Regression test for issue #207: live worker with matching start time should be untouched."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create initial state with a dispatched issue and live worker PID
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,  # Live PID
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    # Mock GitHub to return an open PR
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    # Mock PID liveness check to return True (live PID) with matching start time
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Load state and verify NO changes
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Status should remain dispatched
+    assert entry.get("status") == "dispatched"
+
+    # Worker PID should still be present
+    assert entry.get("worker_pid") == 99999
+    assert entry.get("worker_process_start_time") == 1234567890.0
+
+    # Verify NO events were logged
+    events = state.get("events", [])
+    orphaned_events = [
+        e
+        for e in events
+        if e.get("kind") in ("orphaned_worker_recovered", "orphaned_worker_drift")
+    ]
+    assert len(orphaned_events) == 0
+
+
+def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
+    """Regression test for issue #207: PID recycled (start-time mismatch) should be treated as dead."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create initial state with a dispatched issue and recycled PID
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,  # Recycled PID
+        "worker_process_start_time": 1234567890.0,  # Old start time
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    # Mock GitHub to return an open PR
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    # Mock the helper to simulate PID recycling (alive check returns False due to start-time mismatch)
+    def mock_worker_pid_alive(entry):
+        # Simulate start-time mismatch by returning False even though PID is set
+        return False
+
+    with patch("charlie_work.workflow._worker_pid_alive", side_effect=mock_worker_pid_alive):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Load state and verify it was treated as dead
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Status should be reset to rework_requested
+    assert entry.get("status") == "rework_requested"
+
+    # Worker PID should be cleared
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    # Verify recovered event was logged
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+
+
+def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
+    """Regression test for issue #207: dead worker with no open PR should emit drift event (not auto-reset status)."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Create initial state with a dispatched issue and dead worker PID
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,  # Dead PID
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    # Mock GitHub to return NO open PRs
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+
+    # Mock PID liveness check to return False (dead PID)
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Load state and verify NO status auto-reset
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Status should NOT be reset (still dispatched)
+    assert entry.get("status") == "dispatched"
+
+    # Worker PID should be cleared
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    # Verify drift event was logged (not recovered)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["issue_number"] == 207
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+    # Verify NO recovered event
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 0
