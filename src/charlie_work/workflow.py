@@ -2346,6 +2346,7 @@ class OrchestratorApp:
         - Have the configured branch prefix
         - Are not the just-merged PR
         - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
+        - Do NOT have required checks in PENDING/IN_PROGRESS state (to avoid cancelling in-flight CI)
 
         Per-PR failures (conflicts, network errors) are reported as values and
         never abort the batch operation. A GitHubError from pr_list is also
@@ -2358,6 +2359,7 @@ class OrchestratorApp:
             # Report the pr_list failure as a value instead of raising
             return [{"error": f"pr_list failed: {exc}"}]
         branch_prefix = self.config.dispatch.branch_prefix
+        required_checks = self.config.auto_merge.required_checks
 
         for pr in prs:
             pr_number = int(pr.get("number", 0))
@@ -2388,6 +2390,42 @@ class OrchestratorApp:
                             "head_ref": head,
                             "updated": False,
                             "skipped_reason": "approved-pending-ship",
+                        }
+                    )
+                    continue
+
+            # Skip PRs with required checks in PENDING/IN_PROGRESS to avoid cancelling in-flight CI
+            # This prevents the wedge described in issue #209 where update-branch cancels
+            # matrix jobs and aggregate-gate checks permanently fail against the frozen CANCELLED state.
+            status_rollup = pr.get("statusCheckRollup")
+            if status_rollup and required_checks:
+                # statusCheckRollup is a flat array of check objects (CheckRun or StatusContext)
+                # CheckRun uses 'status' field, StatusContext uses 'state' field
+                has_pending_required = False
+                for check in status_rollup:
+                    check_name = check.get("name") or check.get("context")
+                    if check_name in required_checks:
+                        # Check if this required check is in a pending/in-progress state
+                        # For CheckRuns: status != COMPLETED means in-flight
+                        # For StatusContext: state != SUCCESS/FAILURE/ERROR means in-flight
+                        status = check.get("status") or check.get("state", "")
+                        # Treat any non-terminal status as in-flight (safer than enumerating)
+                        # Terminal states: COMPLETED (CheckRun), SUCCESS/FAILURE/ERROR (StatusContext)
+                        if status.upper() != "COMPLETED" and status.upper() not in {
+                            "SUCCESS",
+                            "FAILURE",
+                            "ERROR",
+                        }:
+                            has_pending_required = True
+                            break
+
+                if has_pending_required:
+                    results.append(
+                        {
+                            "pr_number": pr_number,
+                            "head_ref": head,
+                            "updated": False,
+                            "skipped_reason": "pending-required-checks",
                         }
                     )
                     continue

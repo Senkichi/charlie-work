@@ -7317,6 +7317,166 @@ def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Pa
     assert "skipped_reason" not in results[0]
 
 
+def test_update_open_agent_prs_skips_prs_with_pending_required_checks(tmp_path: Path) -> None:
+    """Test that PRs with required checks in PENDING/IN_PROGRESS are skipped to avoid cancelling in-flight CI.
+
+    Regression test for issue #209: when ship-it merges a PR with update_open_prs enabled,
+    update-branch on sibling PRs cancels their in-flight CI, which can permanently wedge
+    aggregate-gate checks. This test verifies the avoidance approach: skip update-branch
+    for PRs whose required checks are in PENDING/IN_PROGRESS state.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up a PR with PENDING required checks
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "IN_PROGRESS",  # Required check is in-flight
+                    "conclusion": "",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "QUEUED",  # Required check is pending
+                    "conclusion": "",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging a different PR: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=999)
+
+    # Both PRs should be skipped due to pending required checks
+    assert len(results) == 2
+    assert results[0]["pr_number"] == 456
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "pending-required-checks"
+    assert results[1]["pr_number"] == 789
+    assert results[1]["updated"] is False
+    assert results[1]["skipped_reason"] == "pending-required-checks"
+
+    # Verify update-branch was NOT called
+    assert fake_gh.update_branch_ok is True  # Never set to False by a call
+
+
+def test_update_open_agent_prs_updates_prs_with_completed_required_checks(tmp_path: Path) -> None:
+    """Test that PRs with all required checks completed are still updated normally."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Set up a PR with all required checks SUCCESS
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "Tests passed",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Lint & Format",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "Pre-commit",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+            ],
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate merging a different PR: update remaining open PRs
+    results = app._update_open_agent_prs(merged_pr_number=999)
+
+    # PR should be updated normally
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 456
+    assert results[0]["updated"] is True
+    assert "skipped_reason" not in results[0]
+
+
 def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     tmp_path: Path,
 ) -> None:
