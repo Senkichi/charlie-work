@@ -37,6 +37,14 @@ class PoolPressure(str, Enum):
     IDLE = "idle"  # Underutilized: no queue, excess capacity
 
 
+class ScaleAction(str, Enum):
+    """Scale action type."""
+
+    NONE = "none"  # No scaling action
+    UP = "up"  # Scale up (add runners)
+    DOWN = "down"  # Scale down (remove runners)
+
+
 @dataclass(frozen=True)
 class RunnerPoolState:
     """Snapshot of runner pool state.
@@ -64,6 +72,29 @@ class RunnerPoolState:
 
     # Timestamp
     timestamp: str  # ISO 8601 timestamp of the snapshot
+
+
+@dataclass(frozen=True)
+class ScaleDecision:
+    """Decision result from the autoscale policy function.
+
+    Frozen value object representing a scaling decision with human-readable reason.
+    """
+
+    action: ScaleAction  # Type of scaling action
+    count: int  # Number of runners to scale (0 for NONE)
+    reason: str  # Human-readable explanation for the decision
+
+
+@dataclass(frozen=True)
+class FleetTotals:
+    """Fleet-wide runner totals across all registered repos.
+
+    Used for cross-repo guardrails to ensure combined resource usage stays within budget.
+    """
+
+    total_runners: int  # Total runners across all fleet repos
+    total_busy_runners: int  # Total busy runners across all fleet repos
 
 
 @dataclass(frozen=True)
@@ -604,6 +635,121 @@ def record_scale_event(state_dir: Path, event_type: str) -> None:
         json.dump(data, f, indent=2)
         f.write("\n")
     tmp_path.replace(scale_event_path)
+
+
+def decide_autoscale(
+    state: RunnerPoolState,
+    config: RunnerScalingConfig,
+    fleet_totals: FleetTotals | None = None,
+    *,
+    in_cooldown: bool = False,
+    is_idle_for_duration: bool = False,
+) -> ScaleDecision:
+    """Pure decision function for runner autoscale policy.
+
+    This is the unit-tested core that turns observations into scale actions.
+    No I/O is performed inside this function.
+
+    Scale-up conditions:
+    - Queue has waiting jobs (queued_jobs > 0)
+    - All managed runners are busy (idle_runners == 0)
+    - Not in cooldown period
+    - Below max_runners limit
+    - Sufficient RAM headroom (fleet-wide if fleet_totals provided)
+    - CPU below threshold
+    - Feature is enabled
+
+    Scale-down conditions:
+    - Pool has been idle for required duration (is_idle_for_duration)
+    - Not in cooldown period
+    - Above min_runners floor
+    - Feature is enabled
+
+    Args:
+        state: Current runner pool state
+        config: Runner scaling configuration
+        fleet_totals: Optional fleet-wide totals for cross-repo guardrails
+        in_cooldown: Whether we are in the cooldown period after a scale event
+        is_idle_for_duration: Whether the pool has been idle for the required duration
+
+    Returns:
+        ScaleDecision with action, count, and human-readable reason
+    """
+    # Guardrail: feature disabled
+    if not config.enabled:
+        return ScaleDecision(
+            action=ScaleAction.NONE,
+            count=0,
+            reason="Runner scaling is disabled in config",
+        )
+
+    # Guardrail: cooldown period
+    if in_cooldown:
+        return ScaleDecision(
+            action=ScaleAction.NONE,
+            count=0,
+            reason=f"In cooldown period ({config.cooldown_minutes} minutes)",
+        )
+
+    # Scale-up logic
+    if state.queued_jobs > 0 and state.idle_runners == 0:
+        # Check max_runners limit (fleet-wide if fleet_totals provided)
+        current_total = fleet_totals.total_runners if fleet_totals else state.total_runners
+        if current_total >= config.max_runners:
+            return ScaleDecision(
+                action=ScaleAction.NONE,
+                count=0,
+                reason=f"At max_runners limit ({config.max_runners})",
+            )
+
+        # Check RAM headroom (fleet-wide if fleet_totals provided)
+        current_busy = fleet_totals.total_busy_runners if fleet_totals else state.busy_runners
+        projected_ram_usage = (current_busy + 1) * config.ram_per_job_gb
+        if state.free_ram_gb - projected_ram_usage < config.min_free_ram_gb:
+            return ScaleDecision(
+                action=ScaleAction.NONE,
+                count=0,
+                reason=f"Insufficient RAM: {state.free_ram_gb:.2f}GB free, need {config.min_free_ram_gb:.2f}GB after provisioning",
+            )
+
+        # Check CPU threshold
+        if state.cpu_percent > config.max_host_cpu_pct:
+            return ScaleDecision(
+                action=ScaleAction.NONE,
+                count=0,
+                reason=f"CPU usage ({state.cpu_percent}%) above threshold ({config.max_host_cpu_pct}%)",
+            )
+
+        # All checks passed, scale up by 1 (conservative)
+        return ScaleDecision(
+            action=ScaleAction.UP,
+            count=1,
+            reason=f"Queue has {state.queued_jobs} waiting job(s) and all runners are busy",
+        )
+
+    # Scale-down logic
+    if is_idle_for_duration:
+        # Check min_runners floor
+        if state.total_runners <= config.min_runners:
+            return ScaleDecision(
+                action=ScaleAction.NONE,
+                count=0,
+                reason=f"At min_runners floor ({config.min_runners})",
+            )
+
+        # Scale down by 1 (conservative)
+        return ScaleDecision(
+            action=ScaleAction.DOWN,
+            count=1,
+            reason=f"Pool has been idle for {config.idle_scale_down_minutes} minutes",
+        )
+
+    # No scaling action needed
+    return ScaleDecision(
+        action=ScaleAction.NONE,
+        count=0,
+        reason="Pool is balanced (no queue, no idle duration)",
+    )
 
 
 def is_in_cooldown(state_dir: Path, cooldown_minutes: int) -> bool:

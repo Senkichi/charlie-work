@@ -12,11 +12,15 @@ from charlie_work.config import RunnerScalingConfig
 from charlie_work.github import GitHub
 from charlie_work.runners import (
     CHARLIE_MANAGED_MARKER,
+    decide_autoscale,
+    FleetTotals,
     PoolPressure,
     PoolSample,
     ProvisioningResult,
     RunnerDir,
     RunnerPoolState,
+    ScaleAction,
+    ScaleDecision,
     _allocate_runner_dir,
     _classify_pressure,
     _cleanup_runner_dir,
@@ -63,6 +67,309 @@ def test_runner_pool_state_is_frozen() -> None:
     )
     with pytest.raises(Exception):  # frozen dataclass raises on assignment
         state.total_runners = 10
+
+
+def test_scale_decision_is_frozen() -> None:
+    """ScaleDecision is a frozen dataclass."""
+    decision = ScaleDecision(
+        action=ScaleAction.UP,
+        count=1,
+        reason="Queue has waiting jobs",
+    )
+    with pytest.raises(Exception):  # frozen dataclass raises on assignment
+        decision.count = 2
+
+
+def test_fleet_totals_is_frozen() -> None:
+    """FleetTotals is a frozen dataclass."""
+    totals = FleetTotals(
+        total_runners=10,
+        total_busy_runners=5,
+    )
+    with pytest.raises(Exception):  # frozen dataclass raises on assignment
+        totals.total_runners = 20
+
+
+def test_decide_autoscale_saturated_queue_up() -> None:
+    """Saturated queue with all runners busy -> scale up."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+        ram_per_job_gb=2.0,
+        min_free_ram_gb=4.0,
+        max_host_cpu_pct=80.0,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=16.0,
+        cpu_percent=50.0,
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.UP
+    assert decision.count == 1
+    assert "Queue has 3 waiting job(s)" in decision.reason
+
+
+def test_decide_autoscale_idle_pool_down() -> None:
+    """Idle pool for required duration -> scale down."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+        idle_scale_down_minutes=15,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=0,
+        idle_runners=5,
+        queued_jobs=0,
+        in_progress_jobs=0,
+        free_ram_gb=16.0,
+        cpu_percent=10.0,
+        pressure=PoolPressure.IDLE,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=True,
+    )
+    assert decision.action == ScaleAction.DOWN
+    assert decision.count == 1
+    assert "idle for 15 minutes" in decision.reason
+
+
+def test_decide_autoscale_cooldown_suppression() -> None:
+    """Cooldown period suppresses all scaling actions."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        cooldown_minutes=5,
+        min_runners=1,
+        max_runners=10,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=16.0,
+        cpu_percent=50.0,
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=True,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "cooldown" in decision.reason.lower()
+
+
+def test_decide_autoscale_ram_ceiling_suppression() -> None:
+    """RAM ceiling suppresses scale-up."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+        ram_per_job_gb=2.0,
+        min_free_ram_gb=4.0,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=2.0,  # Not enough RAM for another job
+        cpu_percent=50.0,
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "Insufficient RAM" in decision.reason
+
+
+def test_decide_autoscale_fleet_wide_ceiling() -> None:
+    """Fleet-wide runner ceiling suppresses scale-up."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+        ram_per_job_gb=2.0,
+        min_free_ram_gb=4.0,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=16.0,
+        cpu_percent=50.0,
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    fleet_totals = FleetTotals(
+        total_runners=10,  # At max
+        total_busy_runners=5,
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        fleet_totals=fleet_totals,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "max_runners" in decision.reason
+
+
+def test_decide_autoscale_disabled() -> None:
+    """Disabled feature returns none."""
+    config = RunnerScalingConfig(enabled=False)
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=16.0,
+        cpu_percent=50.0,
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "disabled" in decision.reason.lower()
+
+
+def test_decide_autoscale_min_runners_floor() -> None:
+    """Min runners floor suppresses scale-down."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=2,
+        max_runners=10,
+        idle_scale_down_minutes=15,
+    )
+    state = RunnerPoolState(
+        total_runners=2,  # At min
+        online_runners=2,
+        busy_runners=0,
+        idle_runners=2,
+        queued_jobs=0,
+        in_progress_jobs=0,
+        free_ram_gb=16.0,
+        cpu_percent=10.0,
+        pressure=PoolPressure.IDLE,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=True,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "min_runners" in decision.reason
+
+
+def test_decide_autoscale_cpu_ceiling_suppression() -> None:
+    """CPU ceiling suppresses scale-up."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+        max_host_cpu_pct=80.0,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=5,
+        idle_runners=0,
+        queued_jobs=3,
+        in_progress_jobs=5,
+        free_ram_gb=16.0,
+        cpu_percent=90.0,  # Above threshold
+        pressure=PoolPressure.SATURATED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "CPU" in decision.reason
+
+
+def test_decide_autoscale_balanced_no_action() -> None:
+    """Balanced pool with no queue and no idle duration -> no action."""
+    config = RunnerScalingConfig(
+        enabled=True,
+        min_runners=1,
+        max_runners=10,
+    )
+    state = RunnerPoolState(
+        total_runners=5,
+        online_runners=5,
+        busy_runners=3,
+        idle_runners=2,
+        queued_jobs=0,
+        in_progress_jobs=3,
+        free_ram_gb=16.0,
+        cpu_percent=50.0,
+        pressure=PoolPressure.BALANCED,
+        timestamp="2026-07-09T00:00:00Z",
+    )
+    decision = decide_autoscale(
+        state,
+        config,
+        in_cooldown=False,
+        is_idle_for_duration=False,
+    )
+    assert decision.action == ScaleAction.NONE
+    assert decision.count == 0
+    assert "balanced" in decision.reason.lower()
 
 
 def test_provisioning_result_is_frozen() -> None:
