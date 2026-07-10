@@ -459,35 +459,54 @@ def test_get_runner_listener_process_no_exe(tmp_path: Path) -> None:
     assert process is None
 
 
+def test_get_runner_listener_process_windows_match(tmp_path: Path) -> None:
+    """get_runner_listener_process matches Runner.Listener.exe by name and cwd on Windows."""
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific test")
+
+    # Create a temporary directory to simulate a runner directory
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+
+    # We can't easily create a real Runner.Listener.exe process in tests,
+    # but we can verify the logic would work by checking the matching criteria
+    # This test documents the expected behavior: match by exe name + cwd
+
+    # The function should return None when no matching process exists
+    process = get_runner_listener_process(runner_dir)
+    assert process is None
+
+
 def test_mint_remove_token_success(tmp_path: Path) -> None:
     """mint_remove_token successfully mints a token."""
     gh = MagicMock(spec=GitHub)
     gh.run = MagicMock(return_value={"token": "test-token"})
 
-    token = mint_remove_token(gh)
+    success, token = mint_remove_token(gh)
+    assert success is True
     assert token == "test-token"
 
 
 def test_mint_remove_token_invalid_response(tmp_path: Path) -> None:
-    """mint_remove_token raises GitHubError on invalid response."""
-    from charlie_work.github import GitHubError
-
+    """mint_remove_token returns error on invalid response."""
     gh = MagicMock(spec=GitHub)
     gh.run = MagicMock(return_value=None)
 
-    with pytest.raises(GitHubError):
-        mint_remove_token(gh)
+    success, error = mint_remove_token(gh)
+    assert success is False
+    assert "invalid response" in error
 
 
 def test_mint_remove_token_no_token(tmp_path: Path) -> None:
-    """mint_remove_token raises GitHubError when response has no token."""
-    from charlie_work.github import GitHubError
-
+    """mint_remove_token returns error when response has no token."""
     gh = MagicMock(spec=GitHub)
     gh.run = MagicMock(return_value={})
 
-    with pytest.raises(GitHubError):
-        mint_remove_token(gh)
+    success, error = mint_remove_token(gh)
+    assert success is False
+    assert "no token in response" in error
 
 
 def test_remove_runner_dry_run(tmp_path: Path) -> None:

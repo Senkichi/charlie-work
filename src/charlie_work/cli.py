@@ -157,8 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
-    runners_sub.add_parser("ensure-started")
-    runners_sub.add_parser("scale-down")
+    ensure_started_parser = runners_sub.add_parser("ensure-started")
+    ensure_started_parser.add_argument("--dry-run", action="store_true")
+    scale_down_parser = runners_sub.add_parser("scale-down")
+    scale_down_parser.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -372,11 +374,14 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
             data={},
         )
 
+    # Use subparser-specific dry_run flag if available, otherwise fall back to global
+    dry_run = getattr(args, "dry_run", False)
+
     started_count, messages = ensure_runners_started(
         managed_root,
         config.runner_scaling.runner_dir_prefix,
         config.runner_scaling,
-        dry_run=args.dry_run,
+        dry_run=dry_run,
     )
 
     return CommandResult(
@@ -424,7 +429,10 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
             data={},
         )
 
-    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    # Use subparser-specific dry_run flag if available, otherwise fall back to global
+    dry_run = getattr(args, "dry_run", False)
+
+    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
 
     removed_count, errors = scale_down_idle_runners(
         managed_root,
@@ -432,7 +440,7 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
         gh,
         config.runner_scaling,
         paths.root,
-        dry_run=args.dry_run,
+        dry_run=dry_run,
     )
 
     return CommandResult(
