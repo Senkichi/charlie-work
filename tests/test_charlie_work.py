@@ -12768,3 +12768,163 @@ def test_supervisor_config_is_frozen() -> None:
     assert dataclasses.is_dataclass(cfg)
     with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
         cfg.poll_interval_seconds = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# loop() additions: open_tracked_prs + same-head packet skip
+# ---------------------------------------------------------------------------
+
+
+def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp, FakeGitHub]:
+    """Build a minimal OrchestratorApp with the given open PRs for loop() tests."""
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=False),
+        auto_merge=_approved_automerge(),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return app, fake_gh
+
+
+def test_loop_open_tracked_prs_counted(tmp_path: Path) -> None:
+    """loop() data includes open_tracked_prs = number of PRs with linked issues."""
+    prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc",
+            "body": "Closes #123",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        # This PR has no linked issue — should NOT count
+        {
+            "number": 999,
+            "title": "Manual PR",
+            "url": "https://example.test/pull/999",
+            "headRefName": "manual-branch",
+            "headRefOid": "sha-xyz",
+            "body": "no issue link",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app, _ = _make_loop_app(tmp_path, prs=prs)
+    result = app.loop(limit=0)
+    assert "open_tracked_prs" in result.data
+    assert result.data["open_tracked_prs"] == 1
+
+
+def test_loop_open_tracked_prs_zero_when_no_prs(tmp_path: Path) -> None:
+    """loop() returns open_tracked_prs=0 when there are no open PRs."""
+    app, _ = _make_loop_app(tmp_path, prs=[])
+    result = app.loop(limit=0)
+    assert result.data["open_tracked_prs"] == 0
+
+
+def test_loop_undecided_same_head_skips_review(tmp_path: Path) -> None:
+    """Undecided PR with a same-head packet does NOT re-invoke review()."""
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-same",
+        "body": "Closes #123",
+        "labels": [],
+        "isCrossRepository": False,
+    }
+    app, fake_gh = _make_loop_app(tmp_path, prs=[pr])
+
+    # Pre-plant a pr.json packet with the same headRefOid as the live PR
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    import json as _json
+
+    (pr_dir / "pr.json").write_text(
+        _json.dumps({"number": 456, "headRefOid": "sha-same"}), encoding="utf-8"
+    )
+    # No review-decision.json → undecided
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    result = app.loop(limit=0)
+
+    assert result.data["skipped_reviews"] == 1
+    assert 456 not in review_calls
+
+
+def test_loop_undecided_head_moved_invokes_review(tmp_path: Path) -> None:
+    """Undecided PR whose head has advanced past the packet re-invokes review()."""
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-new",
+        "body": "Closes #123",
+        "labels": [],
+        "isCrossRepository": False,
+    }
+    app, fake_gh = _make_loop_app(tmp_path, prs=[pr])
+
+    # Packet has OLD sha — head has moved
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    import json as _json
+
+    (pr_dir / "pr.json").write_text(
+        _json.dumps({"number": 456, "headRefOid": "sha-old"}), encoding="utf-8"
+    )
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    result = app.loop(limit=0)
+
+    assert result.data["skipped_reviews"] == 0
+    assert 456 in review_calls
+
+
+def test_loop_undecided_no_packet_invokes_review(tmp_path: Path) -> None:
+    """Undecided PR with no existing packet still invokes review()."""
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-abc",
+        "body": "Closes #123",
+        "labels": [],
+        "isCrossRepository": False,
+    }
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    # No packet at all
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    result = app.loop(limit=0)
+
+    assert result.data["skipped_reviews"] == 0
+    assert 456 in review_calls

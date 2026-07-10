@@ -2608,6 +2608,8 @@ class OrchestratorApp:
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        open_tracked_prs = 0
+        skipped_reviews = 0
         for pr in self.gh.pr_list():
             issue_number = linked_issue_number(
                 pr,
@@ -2616,6 +2618,8 @@ class OrchestratorApp:
             )
             if issue_number is None:
                 continue
+            # Count every PR with a resolvable linked issue (includes skipped ones)
+            open_tracked_prs += 1
             pr_number = int(pr["number"])
             # Per-PR isolation: one PR's merge conflict or gh failure must not
             # abort review/merge of every remaining PR in the batch.
@@ -2648,11 +2652,28 @@ class OrchestratorApp:
                         if decision.get("decision") == "approved":
                             merges.append(self.merge_ready(pr_number, merge=merge).data)
                 else:
-                    review = self.review(pr_number)
-                    reviews.append(review.data)
-                    decision = self._review_decision(pr_number)
-                    if decision.get("decision") == "approved":
-                        merges.append(self.merge_ready(pr_number, merge=merge).data)
+                    # Same-head packet skip: if we already have a review packet
+                    # for this exact head SHA and no decision has been recorded
+                    # yet, skip regenerating the packet. This prevents repeated
+                    # supervised passes from re-firing review_started transitions
+                    # and regenerating packets every poll cycle while the operator
+                    # is still reading. The packet remains current; verdict file
+                    # appearance triggers a delta → the merge lane fires normally.
+                    live_head_sha = pr.get("headRefOid")
+                    packet_head_sha = self._read_packet_head_oid(pr_number)
+                    if (
+                        live_head_sha is not None
+                        and packet_head_sha is not None
+                        and live_head_sha == packet_head_sha
+                    ):
+                        # Packet is current and no approval yet — skip review()
+                        skipped_reviews += 1
+                    else:
+                        review = self.review(pr_number)
+                        reviews.append(review.data)
+                        decision = self._review_decision(pr_number)
+                        if decision.get("decision") == "approved":
+                            merges.append(self.merge_ready(pr_number, merge=merge).data)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors
@@ -2672,6 +2693,8 @@ class OrchestratorApp:
             "reviews": reviews,
             "merges": merges,
             "errors": errors,
+            "open_tracked_prs": open_tracked_prs,
+            "skipped_reviews": skipped_reviews,
         }
         # Propagate concurrency info from dispatch results
         if gov.enabled:
@@ -3333,6 +3356,28 @@ class OrchestratorApp:
         except (OSError, json.JSONDecodeError):
             return {"decision": "invalid"}
         return value if isinstance(value, dict) else {"decision": "invalid"}
+
+    def _read_packet_head_oid(self, pr_number: int) -> str | None:
+        """Return the ``headRefOid`` stored in the existing review packet for
+        ``pr_number``, or ``None`` if no packet exists or it cannot be read.
+
+        Used by ``loop()`` to detect same-head PRs whose review packet is already
+        current, so repeated supervised passes don't regenerate the packet or
+        re-fire ``review_started`` label transitions while the operator is still
+        reading the packet.
+        """
+        pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+        if not pr_json_path.exists():
+            return None
+        try:
+            with pr_json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        value = data.get("headRefOid")
+        return str(value) if value is not None else None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
