@@ -580,7 +580,7 @@ def provision_runner(
 
     # Step 1: Mint registration token
     if dry_run:
-        actions.append(f"Mint registration token via GitHub API")
+        actions.append("Mint registration token via GitHub API")
     else:
         token_data = _mint_registration_token(gh)
         if token_data is None:
@@ -641,7 +641,9 @@ def provision_runner(
     repo_url = repo_data.get("html_url", "") if isinstance(repo_data, dict) else ""
 
     if dry_run:
-        actions.append(f"Configure runner: config.cmd --unattended --url {repo_url} --token *** --name {runner_name} --work _work")
+        actions.append(
+            f"Configure runner: config.cmd --unattended --url {repo_url} --token *** --name {runner_name} --work _work"
+        )
     else:
         config_result = _configure_runner(
             runner_dir,
