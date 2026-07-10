@@ -952,6 +952,18 @@ class OrchestratorApp:
             if view.is_alive()
         ]
 
+        # Observe runner pool if feature is enabled
+        runners_data = None
+        if self.config.runner_scaling.enabled:
+            from .runners import format_runner_pool_state, observe_runner_pool
+
+            try:
+                pool_state = observe_runner_pool(self.gh, self.config.runner_scaling)
+                runners_data = format_runner_pool_state(pool_state)
+            except Exception:
+                # Don't fail status() if runner observation fails
+                runners_data = None
+
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -979,6 +991,11 @@ class OrchestratorApp:
             "stalled": stalled_entries,
             "workers": workers,
         }
+
+        # Add runners section if feature is enabled and observation succeeded
+        if runners_data is not None:
+            data["runners"] = runners_data
+
         return CommandResult(True, "status complete", data)
 
     def bootstrap_labels(self) -> CommandResult:

@@ -72,6 +72,94 @@ def test_default_config_tee_stream_json_disabled() -> None:
     assert config.claude_code.tee_stream_json is False
 
 
+def test_default_config_runner_scaling_disabled() -> None:
+    """RunnerScalingConfig.enabled defaults to False (issue #232)."""
+    config = load_config()
+    assert config.runner_scaling.enabled is False
+
+
+def test_runner_scaling_config_parses_with_enabled_flag(tmp_path: Path) -> None:
+    """RunnerScalingConfig parses with enabled=true and custom values."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runner_scaling:
+  enabled: true
+  managed_root: "C:\\\\actions-runners"
+  runner_dir_prefix: "jc-"
+  runner_name_template: "jc-9800x3d-{n}"
+  package_zip: "C:\\\\packages\\\\runner.zip"
+  min_runners: 2
+  max_runners: 20
+  ram_per_job_gb: 4.0
+  min_free_ram_gb: 8.0
+  max_host_cpu_pct: 90.0
+  idle_scale_down_minutes: 30
+  cooldown_minutes: 10
+"""
+    )
+    config = load_config(config_file)
+    assert config.runner_scaling.enabled is True
+    assert config.runner_scaling.managed_root == "C:\\actions-runners"
+    assert config.runner_scaling.runner_dir_prefix == "jc-"
+    assert config.runner_scaling.runner_name_template == "jc-9800x3d-{n}"
+    assert config.runner_scaling.package_zip == "C:\\packages\\runner.zip"
+    assert config.runner_scaling.min_runners == 2
+    assert config.runner_scaling.max_runners == 20
+    assert config.runner_scaling.ram_per_job_gb == 4.0
+    assert config.runner_scaling.min_free_ram_gb == 8.0
+    assert config.runner_scaling.max_host_cpu_pct == 90.0
+    assert config.runner_scaling.idle_scale_down_minutes == 30
+    assert config.runner_scaling.cooldown_minutes == 10
+
+
+def test_runner_scaling_config_rejects_invalid_numeric_types(tmp_path: Path) -> None:
+    """RunnerScalingConfig rejects non-numeric values for numeric fields."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runner_scaling:
+  enabled: true
+  min_runners: "not-a-number"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_runner_scaling_config_rejects_invalid_string_types(tmp_path: Path) -> None:
+    """RunnerScalingConfig rejects non-string values for string fields."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runner_scaling:
+  enabled: true
+  managed_root: 123
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a string"):
+        load_config(config_file)
+
+
+def test_runner_scaling_config_rejects_invalid_boolean_type(tmp_path: Path) -> None:
+    """RunnerScalingConfig rejects non-boolean values for enabled field."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runner_scaling:
+  enabled: "true"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a bool"):
+        load_config(config_file)
+
+
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, ".var/charlie-work")
 
