@@ -58,8 +58,12 @@ def state_lock(state_path: Path):
     acquired = False
 
     try:
-        # Create lock file if it doesn't exist
-        lock_path.touch(exist_ok=True)
+        # Create lock file if it doesn't exist.
+        # Write 1 byte so msvcrt.locking(... 1) has a byte-range to lock:
+        # msvcrt locks specific byte ranges and raises EACCES on a 0-byte file.
+        # (Same gap as supervisor.lock — both use LK_NBLCK with nbytes=1.)
+        if not lock_path.exists():
+            lock_path.write_bytes(b"\x00")
 
         if sys.platform == "win32":
             import msvcrt
