@@ -10820,6 +10820,246 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     assert payload.get("orphan_pids") == [3492]
 
 
+def _make_stalled_sidecar(
+    sessions_dir: Path, issue_number: int, *, log_text: str
+) -> tuple[Path, Path]:
+    """Write a fake devin-shell sidecar + log with an old mtime (stalled by time).
+
+    Shared setup for issue #246 regression tests: the stall watchdog must
+    classify the log tail (rate-limit/quota signatures) before falling back
+    to failure_kind "stalled".
+    """
+    from datetime import UTC, datetime, timedelta
+    import os as _os
+
+    log_file = sessions_dir / f"issue-{issue_number}.log"
+    log_file.write_text(log_text, encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    timestamp = old_time.timestamp()
+    _os.utime(log_file, (timestamp, timestamp))
+
+    sidecar = sessions_dir / f"issue-{issue_number}.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "branch": f"agent/issue-{issue_number}",
+                "worktree_path": "/fake/path",
+                "prompt_path": "/fake/prompt",
+                "command": ["devin", "--print"],
+                "pid": 99999,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_file),
+                "error": None,
+                "process_start_time": 1234567890.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sidecar, log_file
+
+
+def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path) -> None:
+    """Issue #246: a stall-killed worker whose log tail matches the rate-limit
+    signature must be classified rate_limited (with throttled_until set from
+    the parsed reset-in-N-minutes cooldown), not the hardcoded "stalled"
+    fallback — otherwise the very next dispatch pass relaunches into the same
+    live provider rate limit.
+    """
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar, _log_file = _make_stalled_sidecar(
+        sessions_dir,
+        1034,
+        log_text=(
+            "Error: Agent error: Permission denied: Permission denied: Reached "
+            "overall message rate limit. Please try again later. Your limit "
+            "will reset in 7 minutes.\n"
+        ),
+    )
+
+    before = datetime.now(UTC)
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+    after = datetime.now(UTC)
+
+    assert any(entry["issue"] == 1034 for entry in result)
+
+    # Sidecar must be classified rate_limited, not the hardcoded "stalled"
+    updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
+
+    # throttled_until must be persisted to state.json, roughly now + 7 minutes
+    state = load_state(paths.state_file)
+    throttled_until = state.get("throttled_until")
+    assert throttled_until is not None
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8)
+
+    # session_stalled event must carry the resolved failure_kind
+    events = state.get("events", [])
+    stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["payload"]["failure_kind"] == "rate_limited"
+
+
+def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path: Path) -> None:
+    """Issue #246: quota-exhaustion signature in the log tail must classify as
+    quota_exhausted with the fixed 24-hour cooldown, not "stalled".
+    """
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar, _log_file = _make_stalled_sidecar(
+        sessions_dir,
+        2001,
+        log_text="Error: daily usage quota has been exhausted.\n",
+    )
+
+    before = datetime.now(UTC)
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "quota_exhausted"
+
+    state = load_state(paths.state_file)
+    throttled_until = state.get("throttled_until")
+    assert throttled_until is not None
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+
+    events = state.get("events", [])
+    stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
+    assert stalled_events[0]["payload"]["failure_kind"] == "quota_exhausted"
+
+
+def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: Path) -> None:
+    """Issue #246: a stall-killed worker with a quiet log tail (no rate-limit
+    or quota signature) still falls back to failure_kind "stalled", and
+    throttled_until is left untouched.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar, _log_file = _make_stalled_sidecar(
+        sessions_dir, 3007, log_text="working on the issue, one moment...\n"
+    )
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "stalled"
+
+    state = load_state(paths.state_file)
+    assert state.get("throttled_until") is None
+
+    events = state.get("events", [])
+    stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
+    assert stalled_events[0]["payload"]["failure_kind"] == "stalled"
+
+
+def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -> None:
+    """Issue #246: after the stall watchdog reaps a worker that hit a live
+    provider rate limit, the very next dispatch pass must defer instead of
+    launching a replacement worker into the same throttle window.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    _make_stalled_sidecar(
+        sessions_dir,
+        4055,
+        log_text=(
+            "Error: Reached overall message rate limit. Please try again "
+            "later. Your limit will reset in 9 minutes.\n"
+        ),
+    )
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+        # dispatch() re-runs the stall reaper unconditionally at its top (workflow.py
+        # dispatch():~1180) before checking is_throttled — keep the same mocks active
+        # so this second reap pass over the already-classified sidecar stays cheap
+        # and deterministic instead of shelling out to real process/PowerShell calls.
+        result = app.dispatch()
+
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled"
+    assert result.data["throttled_until"] is not None
+    assert result.data["selected_count"] == 0
+
+
 def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
     """Unit test for _sweep_orphan_processes_for_dead_sessions (issue #139)."""
     from datetime import UTC, datetime

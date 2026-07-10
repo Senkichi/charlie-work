@@ -543,18 +543,27 @@ def is_session_alive(record: SessionRecord) -> bool:
 
 
 def update_session_record_with_failure_classification(
-    sessions_dir: Path, issue_number: int, *, failure_kind: str | None = None
+    sessions_dir: Path, issue_number: int, *, fallback_kind: str | None = None
 ) -> tuple[str | None, str | None]:
     """Update a session record with failure classification after the session exits.
 
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
 
-    If failure_kind is provided directly, it uses that instead of classifying
-    from the log (used by the stall watchdog to mark sessions as "stalled").
+    Log-tail classification (``_classify_session_failure``) always runs first.
+    If it detects a provider throttle signature (``rate_limited`` /
+    ``quota_exhausted``), that classification wins — including its computed
+    ``throttled_until`` cooldown — regardless of ``fallback_kind``. Only when
+    the log shows no throttle signature does ``fallback_kind`` apply (e.g. the
+    stall watchdog's "stalled" default, or the launch-stall watchdog's
+    "launch_stalled" default). This ordering matters: a worker that dies
+    because it hit a provider rate limit must be classified as such even when
+    the caller only knows "this looked stalled" — otherwise ``throttled_until``
+    never gets set and dispatch keeps relaunching workers into the same limit.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
-    update runtime state if needed.
+    update runtime state if needed. ``throttled_until_iso`` is only non-None
+    when log-tail classification actually matched a throttle signature.
     """
     sidecar_path = _sidecar_path(sessions_dir, issue_number)
     if not sidecar_path.exists():
@@ -573,24 +582,19 @@ def update_session_record_with_failure_classification(
     if payload.get("failure_kind") is not None:
         return payload.get("failure_kind"), None
 
-    # If failure_kind is provided directly, use it
-    if failure_kind is not None:
-        payload["failure_kind"] = failure_kind
-        _write_json(sidecar_path, payload)
-        return failure_kind, None
-
+    classified_kind: str | None = None
+    throttled_until: str | None = None
     log_path_str = payload.get("log_path")
-    if not log_path_str:
+    if log_path_str:
+        classified_kind, throttled_until = _classify_session_failure(Path(log_path_str))
+
+    resolved_kind = classified_kind or fallback_kind
+    if resolved_kind is None:
         return None, None
 
-    log_path = Path(log_path_str)
-    classified_kind, throttled_until = _classify_session_failure(log_path)
-
-    if classified_kind:
-        payload["failure_kind"] = classified_kind
-        _write_json(sidecar_path, payload)
-
-    return classified_kind, throttled_until
+    payload["failure_kind"] = resolved_kind
+    _write_json(sidecar_path, payload)
+    return resolved_kind, throttled_until
 
 
 __all__ = [
