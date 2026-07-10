@@ -1,20 +1,29 @@
-"""Tests for runner pool observability (runners.py)."""
+"""Tests for runner pool observability and provisioning (runners.py)."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from charlie_work.config import RunnerScalingConfig
 from charlie_work.github import GitHub
 from charlie_work.runners import (
+    CHARLIE_MANAGED_MARKER,
     PoolPressure,
+    ProvisioningResult,
     RunnerPoolState,
+    _allocate_runner_dir,
     _classify_pressure,
+    _cleanup_runner_dir,
+    _extract_runner_package,
+    _sanitize_env,
+    _verify_runner_online,
+    _write_charlie_managed_marker,
     format_runner_pool_state,
     observe_runner_pool,
+    provision_runner,
 )
 
 
@@ -34,6 +43,17 @@ def test_runner_pool_state_is_frozen() -> None:
     )
     with pytest.raises(Exception):  # frozen dataclass raises on assignment
         state.total_runners = 10
+
+
+def test_provisioning_result_is_frozen() -> None:
+    """ProvisioningResult is a frozen dataclass."""
+    result = ProvisioningResult(
+        ok=True,
+        runner_name="jc-1",
+        runner_dir=Path("/runners/jc-1"),
+    )
+    with pytest.raises(Exception):  # frozen dataclass raises on assignment
+        result.runner_name = "jc-2"
 
 
 def test_classify_pressure_saturated_by_queue() -> None:
@@ -262,3 +282,321 @@ _RUNS_RESPONSE = {
         {"id": 3, "status": "completed"},
     ]
 }
+
+
+# Provisioning engine tests
+
+
+def test_allocate_runner_dir_empty_root(tmp_path: Path) -> None:
+    """When managed_root is empty, allocate index 1."""
+    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-")
+    assert index == 1
+    assert runner_dir == tmp_path / "jc-1"
+    assert runner_dir.exists()  # Directory should be created
+
+
+def test_allocate_runner_dir_existing_runners(tmp_path: Path) -> None:
+    """When runners exist, allocate next index."""
+    (tmp_path / "jc-1").mkdir()
+    (tmp_path / "jc-2").mkdir()
+    (tmp_path / "other-dir").mkdir()  # Not a runner dir
+
+    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-")
+    assert index == 3
+    assert runner_dir == tmp_path / "jc-3"
+    assert runner_dir.exists()  # Directory should be created
+
+
+def test_write_charlie_managed_marker(tmp_path: Path) -> None:
+    """Marker file is written to identify charlie-managed dirs."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+
+    _write_charlie_managed_marker(runner_dir)
+
+    marker_file = runner_dir / CHARLIE_MANAGED_MARKER
+    assert marker_file.exists()
+    assert marker_file.read_text() == "charlie-work managed runner\n"
+
+
+def test_extract_runner_package(tmp_path: Path) -> None:
+    """Package zip is extracted to runner directory."""
+    import zipfile
+
+    # Create a mock package zip
+    package_zip = tmp_path / "package.zip"
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+
+    with zipfile.ZipFile(package_zip, "w") as zf:
+        zf.writestr("config.cmd", "mock config")
+        zf.writestr("run.cmd", "mock run")
+
+    result = _extract_runner_package(package_zip, runner_dir)
+    assert result.ok
+    assert (runner_dir / "config.cmd").exists()
+    assert (runner_dir / "run.cmd").exists()
+
+
+def test_extract_runner_package_invalid_zip(tmp_path: Path) -> None:
+    """Invalid zip returns error result."""
+    package_zip = tmp_path / "invalid.zip"
+    package_zip.write_text("not a zip")
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+
+    result = _extract_runner_package(package_zip, runner_dir)
+    assert not result.ok
+    assert "Failed to extract package" in result.error
+
+
+def test_sanitize_env() -> None:
+    """Environment variables are stripped to prevent contamination."""
+    import os
+
+    # Set some environment variables that should be stripped
+    os.environ["UV_INDEX"] = "test"
+    os.environ["VIRTUAL_ENV"] = "/path/to/venv"
+    os.environ["PYTHONPATH"] = "/path/to/python"
+    os.environ["PIP_INDEX_URL"] = "test"
+    os.environ["CLAUDE_API_KEY"] = "test"
+    os.environ["SAFE_VAR"] = "keep"
+
+    sanitized = _sanitize_env()
+
+    assert "UV_INDEX" not in sanitized
+    assert "VIRTUAL_ENV" not in sanitized
+    assert "PYTHONPATH" not in sanitized
+    assert "PIP_INDEX_URL" not in sanitized
+    assert "CLAUDE_API_KEY" not in sanitized
+    assert "SAFE_VAR" in sanitized
+    assert sanitized["SAFE_VAR"] == "keep"
+
+
+def test_cleanup_runner_dir_with_marker(tmp_path: Path) -> None:
+    """Directory with marker is removed."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    (runner_dir / CHARLIE_MANAGED_MARKER).write_text("managed")
+
+    _cleanup_runner_dir(runner_dir)
+
+    assert not runner_dir.exists()
+
+
+def test_cleanup_runner_dir_without_marker(tmp_path: Path) -> None:
+    """Directory without marker is not removed (safety invariant)."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    (runner_dir / "some-file.txt").write_text("data")
+
+    _cleanup_runner_dir(runner_dir)
+
+    # Directory should still exist
+    assert runner_dir.exists()
+
+
+def test_verify_runner_online_success(tmp_path: Path) -> None:
+    """Verification succeeds when runner reports online."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        return_value={
+            "runners": [
+                {"id": 1, "name": "jc-1", "status": "online"},
+            ]
+        }
+    )
+
+    result = _verify_runner_online(gh, "jc-1", max_retries=1, retry_interval_seconds=0)
+    assert result.ok
+    assert "online" in result.stdout
+
+
+def test_verify_runner_online_not_found(tmp_path: Path) -> None:
+    """Verification fails when runner not found after retries."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(return_value={"runners": []})
+
+    result = _verify_runner_online(gh, "jc-1", max_retries=2, retry_interval_seconds=0)
+    assert not result.ok
+    assert "did not come online" in result.error
+
+
+def test_provision_runner_disabled_config(tmp_path: Path) -> None:
+    """Provisioning fails when feature is disabled."""
+    gh = MagicMock(spec=GitHub)
+    config = RunnerScalingConfig(enabled=False)
+
+    result = provision_runner(gh, config, busy_jobs=0)
+
+    assert not result.ok
+    assert "disabled" in result.error
+
+
+def test_provision_runner_max_runners_reached(tmp_path: Path) -> None:
+    """Provisioning fails when max_runners is reached."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        return_value={
+            "runners": [
+                {"id": 1, "name": "jc-1", "status": "online"},
+                {"id": 2, "name": "jc-2", "status": "online"},
+            ]
+        }
+    )
+    config = RunnerScalingConfig(
+        enabled=True,
+        max_runners=2,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        runner_name_template="jc-{n}",
+        package_zip=str(tmp_path / "package.zip"),
+    )
+
+    result = provision_runner(gh, config, busy_jobs=0)
+
+    assert not result.ok
+    assert "Max runners" in result.error
+
+
+def test_provision_runner_insufficient_ram(tmp_path: Path) -> None:
+    """Provisioning fails when projected RAM would breach min_free_ram_gb."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(return_value={"runners": []})
+
+    # Mock psutil to return low RAM by patching the import inside the function
+    import sys
+
+    # Create a mock psutil module
+    mock_psutil = MagicMock()
+    mock_ram = MagicMock()
+    mock_ram.available = 1 * (1024**3)  # 1 GB
+    mock_psutil.virtual_memory.return_value = mock_ram
+
+    # Patch sys.modules to inject our mock psutil
+    original_psutil = sys.modules.get("psutil")
+    sys.modules["psutil"] = mock_psutil
+
+    try:
+        config = RunnerScalingConfig(
+            enabled=True,
+            max_runners=10,
+            managed_root=str(tmp_path),
+            runner_dir_prefix="jc-",
+            runner_name_template="jc-{n}",
+            package_zip=str(tmp_path / "package.zip"),
+            ram_per_job_gb=2.0,
+            min_free_ram_gb=4.0,
+        )
+
+        result = provision_runner(gh, config, busy_jobs=0)
+
+        assert not result.ok
+        assert "Insufficient RAM" in result.error
+    finally:
+        # Restore original psutil
+        if original_psutil is None:
+            del sys.modules["psutil"]
+        else:
+            sys.modules["psutil"] = original_psutil
+
+
+def test_provision_runner_dry_run(tmp_path: Path) -> None:
+    """Dry-run mode prints planned actions without executing."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        side_effect=lambda args, **kwargs: _mock_github_response_for_provision(args)
+    )
+
+    # Create a mock package zip
+    package_zip = tmp_path / "package.zip"
+    import zipfile
+
+    with zipfile.ZipFile(package_zip, "w") as zf:
+        zf.writestr("config.cmd", "mock config")
+        zf.writestr("run.cmd", "mock run")
+
+    config = RunnerScalingConfig(
+        enabled=True,
+        max_runners=10,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        runner_name_template="jc-{n}",
+        package_zip=str(package_zip),
+    )
+
+    result = provision_runner(gh, config, busy_jobs=0, dry_run=True)
+
+    assert result.ok
+    assert result.dry_run
+    assert result.runner_name == "jc-1"
+    assert len(result.dry_run_actions) > 0
+    assert any("Mint registration token" in action for action in result.dry_run_actions)
+    assert any("Allocate runner directory" in action for action in result.dry_run_actions)
+
+
+def test_provision_runner_config_failure_cleans_orphan_dir(tmp_path: Path) -> None:
+    """Config failure triggers cleanup of the just-created directory."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        side_effect=lambda args, **kwargs: _mock_github_response_for_provision(args, **kwargs)
+    )
+
+    # Create a mock package zip
+    package_zip = tmp_path / "package.zip"
+    import zipfile
+
+    with zipfile.ZipFile(package_zip, "w") as zf:
+        zf.writestr("config.cmd", "mock config")
+        zf.writestr("run.cmd", "mock run")
+
+    config = RunnerScalingConfig(
+        enabled=True,
+        max_runners=10,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        runner_name_template="jc-{n}",
+        package_zip=str(package_zip),
+    )
+
+    # Mock _configure_runner to fail
+    with patch("charlie_work.runners._configure_runner") as mock_configure:
+        from charlie_work.subprocess_runner import RunResult
+
+        mock_configure.return_value = RunResult(
+            returncode=1,
+            stdout="",
+            stderr="config failed",
+            error="Configuration failed",
+        )
+
+        result = provision_runner(gh, config, busy_jobs=0)
+
+        assert not result.ok
+        assert "Failed to configure runner" in result.error
+
+        # Verify the directory was cleaned up
+        runner_dir = tmp_path / "jc-1"
+        assert not runner_dir.exists()
+
+
+def _mock_github_response_for_provision(args: list[str], **kwargs: object) -> dict | object:
+    """Mock GitHub API responses for provisioning tests.
+
+    Returns dict for json_output=True calls, which the GitHub.run method
+    returns directly.
+    """
+    # Find the endpoint in the args (it's the one starting with "repos/")
+    endpoint = ""
+    for arg in args:
+        if arg.startswith("repos/"):
+            endpoint = arg
+            break
+
+    if endpoint == "repos/{owner}/{repo}/actions/runners":
+        return {"runners": []}
+    if endpoint == "repos/{owner}/{repo}":
+        return {"default_branch": "main", "html_url": "https://github.com/test/repo"}
+    if "registration-token" in endpoint:
+        return {"token": "mock-token-12345"}
+    return {}
