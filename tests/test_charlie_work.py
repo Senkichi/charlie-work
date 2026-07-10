@@ -28,6 +28,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     ReviewConfig,
     RuntimeConfig,
+    SupervisorConfig,
     TestAdequacyConfig,
     WatchdogConfig,
     find_config_path,
@@ -12692,3 +12693,78 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     # Verify NO recovered event
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
     assert len(recovered_events) == 0
+
+
+# ---------------------------------------------------------------------------
+# SupervisorConfig tests
+# ---------------------------------------------------------------------------
+
+
+def test_supervisor_config_defaults() -> None:
+    """SupervisorConfig defaults are stable and load_config picks them up."""
+    config = load_config()
+    assert isinstance(config.supervisor, SupervisorConfig)
+    assert config.supervisor.poll_interval_seconds == 20
+    assert config.supervisor.full_pass_interval_seconds == 300
+    assert config.supervisor.active_cooldown_seconds == 30
+    assert config.supervisor.max_runtime_minutes == 0
+
+
+def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
+    """Custom supervisor section values are parsed correctly."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  poll_interval_seconds: 10
+  full_pass_interval_seconds: 120
+  active_cooldown_seconds: 15
+  max_runtime_minutes: 60
+"""
+    )
+    config = load_config(config_file)
+    assert config.supervisor.poll_interval_seconds == 10
+    assert config.supervisor.full_pass_interval_seconds == 120
+    assert config.supervisor.active_cooldown_seconds == 15
+    assert config.supervisor.max_runtime_minutes == 60
+
+
+def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:
+    """Unknown keys in supervisor section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  poll_interval_seconds: 10
+  unknown_key: 99
+"""
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_file)
+
+
+def test_supervisor_config_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong types in supervisor section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  poll_interval_seconds: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_is_frozen() -> None:
+    """SupervisorConfig is a frozen dataclass."""
+    import dataclasses
+
+    cfg = SupervisorConfig()
+    assert dataclasses.is_dataclass(cfg)
+    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
+        cfg.poll_interval_seconds = 99  # type: ignore[misc]
