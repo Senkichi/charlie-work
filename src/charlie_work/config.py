@@ -424,6 +424,25 @@ class RunnerScalingConfig:
 
 
 @dataclass(frozen=True)
+class SupervisorConfig:
+    """Configuration for the supervised infill loop (``charlie bash-rats`` default mode).
+
+    ``poll_interval_seconds``: how often to check for local-signal deltas when
+    no pass is warranted (default 20 s).
+    ``full_pass_interval_seconds``: fallback — run a pass even without a local
+    delta to catch GitHub-side changes (default 300 s / 5 min).
+    ``active_cooldown_seconds``: sleep after a pass that dispatched or merged
+    something (default 30 s — stagger starts, respect rate limits).
+    ``max_runtime_minutes``: hard wall-clock cap; 0 = unlimited (default).
+    """
+
+    poll_interval_seconds: int = 20
+    full_pass_interval_seconds: int = 300
+    active_cooldown_seconds: int = 30
+    max_runtime_minutes: int = 0
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -439,6 +458,7 @@ class OrchestratorConfig:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
+    supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -778,6 +798,20 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {type(enabled).__name__}"
         )
     runner_scaling = _build_section(RunnerScalingConfig, "runner_scaling", runner_scaling_data)
+    supervisor_data = _section(data, "supervisor")
+    for int_key in (
+        "poll_interval_seconds",
+        "full_pass_interval_seconds",
+        "active_cooldown_seconds",
+        "max_runtime_minutes",
+    ):
+        value = supervisor_data.get(int_key)
+        if value is not None and not isinstance(value, int):
+            raise ConfigError(
+                f"config section 'supervisor' key '{int_key}' must be an int, "
+                f"got {type(value).__name__}"
+            )
+    supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -793,4 +827,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         notify=notify,
         runners=runners,
         runner_scaling=runner_scaling,
+        supervisor=supervisor,
     )
