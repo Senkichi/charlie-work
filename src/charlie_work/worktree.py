@@ -47,16 +47,8 @@ def _default_worktrees_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "worktrees"
 
 
-def _resolve_default_branch_ref(repo_root: Path) -> str:
-    """Resolve the repository's default branch as a remote-tracking ref.
-
-    Returns a string like "origin/main" or "origin/master". If the repo has no
-    origin remote or the default branch cannot be determined, returns "HEAD"
-    (fallback to local behavior).
-
-    Uses git symbolic-ref refs/remotes/origin/HEAD which is the standard way
-    to get the default branch without needing the GitHub CLI.
-    """
+def _read_origin_head_symref(repo_root: Path) -> str | None:
+    """Read refs/remotes/origin/HEAD and return "origin/<branch>", or None."""
     result = run_captured(
         ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
         cwd=repo_root,
@@ -67,8 +59,54 @@ def _resolve_default_branch_ref(repo_root: Path) -> str:
         ref = result.stdout.strip()
         if ref.startswith("refs/remotes/"):
             return ref[len("refs/remotes/") :]
-    # Fallback to HEAD if we can't determine the default branch
-    return "HEAD"
+    return None
+
+
+def _resolve_default_branch_ref(repo_root: Path) -> str:
+    """Resolve the repository's default branch as a remote-tracking ref.
+
+    Returns a string like "origin/main" or "origin/master". Only when the repo
+    has no origin remote at all (pure-local repos, e.g. test fixtures) does it
+    return "HEAD".
+
+    Uses git symbolic-ref refs/remotes/origin/HEAD, the standard way to read
+    the default branch without the GitHub CLI. That ref is only written at
+    clone time (or by git remote set-head), so when it is missing, heal it
+    with ``git remote set-head origin --auto`` and retry once.
+
+    Raises:
+        RuntimeError: an origin remote exists but the default branch cannot be
+            determined even after the set-head heal. Falling back to local
+            HEAD here is how a stale/dirty operator checkout leaks into fresh
+            worker branches (issue #239: two agent PRs shipped the operator's
+            unpublished docs commit). The adapter boundary converts this raise
+            into a SessionRecord error value, failing the one dispatch loudly.
+    """
+    if not _has_origin_remote(repo_root):
+        # Pure-local repo: local HEAD is the only meaningful base.
+        return "HEAD"
+
+    resolved = _read_origin_head_symref(repo_root)
+    if resolved is not None:
+        return resolved
+
+    # origin/HEAD is unset on this clone; set-head persists it in-repo so both
+    # future dispatches and operator git usage benefit. Failure surfaces via
+    # the retried symref read below, not an exception (run_captured contract).
+    run_captured(
+        ["git", "remote", "set-head", "origin", "--auto"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    resolved = _read_origin_head_symref(repo_root)
+    if resolved is not None:
+        return resolved
+
+    raise RuntimeError(
+        "Cannot resolve origin's default branch: refs/remotes/origin/HEAD is "
+        "unset and 'git remote set-head origin --auto' did not heal it. "
+        "Refusing to base a fresh worktree on local HEAD (issue #239)."
+    )
 
 
 def _has_origin_remote(repo_root: Path) -> bool:

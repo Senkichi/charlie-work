@@ -1494,6 +1494,85 @@ def test_resolve_default_branch_ref_without_origin(tmp_path: Path) -> None:
     assert default_ref == "HEAD"
 
 
+def test_resolve_default_branch_ref_heals_missing_origin_head(tmp_path: Path) -> None:
+    """A clone whose origin/HEAD symref is unset gets healed via set-head --auto.
+
+    Issue #239: this exact gap made fresh dispatches base on stale local HEAD.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Simulate the incident state: origin remote present, symref absent.
+    subprocess.run(
+        ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    default_ref = _resolve_default_branch_ref(repo_root)
+    assert default_ref == "origin/main"
+
+    # The heal must persist in-repo, not just resolve transiently.
+    symref = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert symref.stdout.strip() == "refs/remotes/origin/main"
+
+
+def test_resolve_default_branch_ref_raises_when_unhealable(tmp_path: Path) -> None:
+    """Origin exists but is unreachable: raise instead of silently using local HEAD."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    _git(repo_root, "remote", "add", "origin", str(tmp_path / "does-not-exist"))
+
+    with pytest.raises(RuntimeError, match="issue #239"):
+        _resolve_default_branch_ref(repo_root)
+
+
+def test_fresh_dispatch_autoresolve_ignores_stale_local_head(tmp_path: Path) -> None:
+    """base_ref='' must base on the fetched origin tip even when origin/HEAD is
+    unset and local HEAD is stale AND carries operator-only work (issue #239)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Incident state 1: origin/HEAD symref absent on the clone.
+    subprocess.run(
+        ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    # Incident state 2: the remote advanced past the local checkout.
+    (remote_repo / "remote-only.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "remote-only.txt")
+    _git(remote_repo, "commit", "-m", "remote advance")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Incident state 3: local main carries an unpublished operator commit.
+    (repo_root / "operator-wip.txt").write_text("unpublished\n", encoding="utf-8")
+    _git(repo_root, "add", "operator-wip.txt")
+    _git(repo_root, "commit", "-m", "operator WIP never pushed")
+
+    info = create_worktree(repo_root, "agent/issue-239-regression", base_ref="")
+
+    worktree_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_tip == remote_tip
+    assert not (info.path / "operator-wip.txt").exists()
+    assert (info.path / "remote-only.txt").exists()
+
+
 def test_fresh_dispatch_with_base_ref_fetches_remote_ref(tmp_path: Path) -> None:
     """Fresh dispatch with base_ref=origin/main should fetch before worktree creation."""
     remote_repo = tmp_path / "remote"
