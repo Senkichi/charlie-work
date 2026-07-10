@@ -255,6 +255,8 @@ def _mint_registration_token(gh: GitHub) -> dict[str, Any] | None:
 def _allocate_runner_dir(
     managed_root: Path,
     runner_dir_prefix: str,
+    *,
+    dry_run: bool = False,
 ) -> tuple[Path, int]:
     """Allocate the next runner directory by scanning for existing instances.
 
@@ -263,33 +265,40 @@ def _allocate_runner_dir(
     Args:
         managed_root: Root directory for runner instances
         runner_dir_prefix: Directory name prefix (e.g., "jc-")
+        dry_run: If True, derive the next index without creating the directory
 
     Returns:
         Tuple of (runner_dir, next_index)
     """
     managed_root = Path(managed_root)
     if not managed_root.exists():
-        managed_root.mkdir(parents=True, exist_ok=True)
+        if dry_run:
+            # In dry-run mode, don't create the managed_root
+            pass
+        else:
+            managed_root.mkdir(parents=True, exist_ok=True)
 
     # Scan for existing runner directories
     existing_indices = []
-    for entry in managed_root.iterdir():
-        if entry.is_dir() and entry.name.startswith(runner_dir_prefix):
-            # Extract index from directory name (e.g., "jc-1" -> 1)
-            suffix = entry.name[len(runner_dir_prefix) :]
-            try:
-                index = int(suffix)
-                existing_indices.append(index)
-            except ValueError:
-                # Not a numbered directory, skip
-                pass
+    if managed_root.exists():
+        for entry in managed_root.iterdir():
+            if entry.is_dir() and entry.name.startswith(runner_dir_prefix):
+                # Extract index from directory name (e.g., "jc-1" -> 1)
+                suffix = entry.name[len(runner_dir_prefix) :]
+                try:
+                    index = int(suffix)
+                    existing_indices.append(index)
+                except ValueError:
+                    # Not a numbered directory, skip
+                    pass
 
     # Allocate next index
     next_index = max(existing_indices) + 1 if existing_indices else 1
     runner_dir = managed_root / f"{runner_dir_prefix}{next_index}"
 
-    # Create the directory
-    runner_dir.mkdir(parents=True, exist_ok=True)
+    # Create the directory only in real mode
+    if not dry_run:
+        runner_dir.mkdir(parents=True, exist_ok=True)
 
     return runner_dir, next_index
 
@@ -600,6 +609,7 @@ def provision_runner(
     runner_dir, next_index = _allocate_runner_dir(
         managed_root,
         config.runner_dir_prefix,
+        dry_run=dry_run,
     )
     runner_name = config.runner_name_template.format(n=next_index)
 
@@ -615,6 +625,12 @@ def provision_runner(
     if not package_zip.exists():
         if dry_run:
             actions.append(f"Extract package: {package_zip} (file not found)")
+            return ProvisioningResult(
+                ok=False,
+                error=f"Package zip not found: {package_zip}",
+                dry_run=True,
+                dry_run_actions=actions,
+            )
         else:
             # Cleanup: remove the just-created dir with marker
             _cleanup_runner_dir(runner_dir)

@@ -289,7 +289,7 @@ _RUNS_RESPONSE = {
 
 def test_allocate_runner_dir_empty_root(tmp_path: Path) -> None:
     """When managed_root is empty, allocate index 1."""
-    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-")
+    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-", dry_run=False)
     assert index == 1
     assert runner_dir == tmp_path / "jc-1"
     assert runner_dir.exists()  # Directory should be created
@@ -301,10 +301,41 @@ def test_allocate_runner_dir_existing_runners(tmp_path: Path) -> None:
     (tmp_path / "jc-2").mkdir()
     (tmp_path / "other-dir").mkdir()  # Not a runner dir
 
-    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-")
+    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-", dry_run=False)
     assert index == 3
     assert runner_dir == tmp_path / "jc-3"
     assert runner_dir.exists()  # Directory should be created
+
+
+def test_allocate_runner_dir_dry_run_no_mkdir(tmp_path: Path) -> None:
+    """Dry-run mode derives the next index without creating directories."""
+    # Create some existing runners
+    (tmp_path / "jc-1").mkdir()
+    (tmp_path / "jc-2").mkdir()
+
+    # Snapshot the directory contents before dry-run
+    before = set(entry.name for entry in tmp_path.iterdir())
+
+    # Run in dry-run mode
+    runner_dir, index = _allocate_runner_dir(tmp_path, "jc-", dry_run=True)
+    assert index == 3
+    assert runner_dir == tmp_path / "jc-3"
+    assert not runner_dir.exists()  # Directory should NOT be created in dry-run
+
+    # Verify managed_root contents are unchanged
+    after = set(entry.name for entry in tmp_path.iterdir())
+    assert before == after, f"Dry-run mutated managed_root: {before} -> {after}"
+
+
+def test_allocate_runner_dir_dry_run_nonexistent_root(tmp_path: Path) -> None:
+    """Dry-run mode with nonexistent managed_root does not create it."""
+    nonexistent_root = tmp_path / "nonexistent"
+
+    # Run in dry-run mode on a nonexistent root
+    runner_dir, index = _allocate_runner_dir(nonexistent_root, "jc-", dry_run=True)
+    assert index == 1
+    assert runner_dir == nonexistent_root / "jc-1"
+    assert not nonexistent_root.exists()  # Root should NOT be created in dry-run
 
 
 def test_write_charlie_managed_marker(tmp_path: Path) -> None:
@@ -533,6 +564,75 @@ def test_provision_runner_dry_run(tmp_path: Path) -> None:
     assert len(result.dry_run_actions) > 0
     assert any("Mint registration token" in action for action in result.dry_run_actions)
     assert any("Allocate runner directory" in action for action in result.dry_run_actions)
+
+
+def test_provision_runner_dry_run_no_mutation(tmp_path: Path) -> None:
+    """Dry-run mode does not mutate managed_root filesystem."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        side_effect=lambda args, **kwargs: _mock_github_response_for_provision(args)
+    )
+
+    # Create a mock package zip
+    package_zip = tmp_path / "package.zip"
+    import zipfile
+
+    with zipfile.ZipFile(package_zip, "w") as zf:
+        zf.writestr("config.cmd", "mock config")
+        zf.writestr("run.cmd", "mock run")
+
+    config = RunnerScalingConfig(
+        enabled=True,
+        max_runners=10,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        runner_name_template="jc-{n}",
+        package_zip=str(package_zip),
+    )
+
+    # Snapshot the directory contents before dry-run
+    before = set(entry.name for entry in tmp_path.iterdir())
+
+    result = provision_runner(gh, config, busy_jobs=0, dry_run=True)
+
+    assert result.ok
+    assert result.dry_run
+
+    # Verify managed_root contents are unchanged
+    after = set(entry.name for entry in tmp_path.iterdir())
+    assert before == after, f"Dry-run mutated managed_root: {before} -> {after}"
+
+
+def test_provision_runner_dry_run_missing_package_no_duplicate_actions(tmp_path: Path) -> None:
+    """Dry-run mode with missing package zip has no duplicate actions."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(
+        side_effect=lambda args, **kwargs: _mock_github_response_for_provision(args)
+    )
+
+    # Use a non-existent package zip
+    missing_package = tmp_path / "nonexistent.zip"
+
+    config = RunnerScalingConfig(
+        enabled=True,
+        max_runners=10,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        runner_name_template="jc-{n}",
+        package_zip=str(missing_package),
+    )
+
+    result = provision_runner(gh, config, busy_jobs=0, dry_run=True)
+
+    assert not result.ok
+    assert result.dry_run
+    assert "Package zip not found" in result.error
+
+    # Verify no duplicate actions for the same step
+    extract_actions = [action for action in result.dry_run_actions if "Extract package" in action]
+    assert len(extract_actions) == 1, (
+        f"Expected 1 extract action, got {len(extract_actions)}: {extract_actions}"
+    )
 
 
 def test_provision_runner_config_failure_cleans_orphan_dir(tmp_path: Path) -> None:
