@@ -122,6 +122,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     loop = subparsers.add_parser("bash-rats")
     loop.add_argument("--limit", type=int, default=None)
+    loop.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Run a single pass and exit (preserves legacy behavior).",
+    )
+    loop.add_argument(
+        "--poll-interval",
+        type=int,
+        default=None,
+        dest="poll_interval",
+        help="Override supervisor poll_interval_seconds from config.",
+    )
+    loop.add_argument(
+        "--max-runtime",
+        type=int,
+        default=None,
+        dest="max_runtime",
+        help="Override supervisor max_runtime_minutes from config (0 = unlimited).",
+    )
     loop_merge_group = loop.add_mutually_exclusive_group()
     loop_merge_group.add_argument("--merge", action="store_true", dest="merge")
     loop_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
@@ -652,7 +672,31 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "bash-rats":
-        return app.loop(args.limit, merge=args.merge)
+        from .supervise import run_supervised, try_acquire_supervisor_lock
+
+        if args.once:
+            # Single-pass mode: check the supervisor lock first to avoid double-
+            # dispatching through the governor read→launch window when a supervised
+            # loop is already running.
+            lock_path = app.paths.root / "supervisor.lock"
+            lock = try_acquire_supervisor_lock(lock_path)
+            if lock is None:
+                return CommandResult(
+                    False,
+                    "supervisor already running (supervisor.lock held)",
+                    {},
+                )
+            try:
+                return app.loop(args.limit, merge=args.merge)
+            finally:
+                lock.release()
+        return run_supervised(
+            app,
+            limit=args.limit,
+            merge=args.merge,
+            poll_interval_override=getattr(args, "poll_interval", None),
+            max_runtime_override=getattr(args, "max_runtime", None),
+        )
     return CommandResult(False, f"unknown command: {args.command}", {})
 
 
