@@ -298,7 +298,9 @@ def test_save_and_load_pool_samples(tmp_path: Path) -> None:
     # Use recent timestamps so they won't be filtered out
     now = datetime.now(UTC)
     sample1 = PoolSample(timestamp=now.isoformat(), busy=False, queued_jobs=0)
-    sample2 = PoolSample(timestamp=(now + timedelta(seconds=1)).isoformat(), busy=True, queued_jobs=1)
+    sample2 = PoolSample(
+        timestamp=(now + timedelta(seconds=1)).isoformat(), busy=True, queued_jobs=1
+    )
 
     save_pool_sample(tmp_path, sample1)
     save_pool_sample(tmp_path, sample2)
@@ -549,7 +551,7 @@ def test_gracefully_remove_runner_not_managed(tmp_path: Path) -> None:
 
 def test_record_and_get_scale_event(tmp_path: Path) -> None:
     """record_scale_event and get_last_scale_event_time round-trip correctly."""
-    from datetime import datetime, timedelta, UTC
+    from datetime import datetime, UTC
 
     before = datetime.now(UTC)
     record_scale_event(tmp_path, "down")
@@ -574,8 +576,6 @@ def test_is_in_cooldown_no_event(tmp_path: Path) -> None:
 
 def test_is_in_cooldown_in_cooldown(tmp_path: Path) -> None:
     """is_in_cooldown returns True when in cooldown period."""
-    from datetime import datetime, timedelta, UTC
-
     # Record a recent event
     record_scale_event(tmp_path, "down")
 
@@ -743,14 +743,10 @@ def test_ensure_runners_started_idempotent(tmp_path: Path) -> None:
     (jc1 / ".charlie-managed").touch()
 
     # First call (dry-run)
-    started_count1, messages1 = ensure_runners_started(
-        tmp_path, "jc-", config, dry_run=True
-    )
+    started_count1, messages1 = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
 
     # Second call (dry-run)
-    started_count2, messages2 = ensure_runners_started(
-        tmp_path, "jc-", config, dry_run=True
-    )
+    started_count2, messages2 = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
 
     # Both should succeed with the same result
     assert started_count1 == started_count2
@@ -761,9 +757,7 @@ def test_ensure_runners_started_no_runners(tmp_path: Path) -> None:
     """ensure_runners_started returns 0 when no managed runners exist."""
     config = RunnerScalingConfig()
 
-    started_count, messages = ensure_runners_started(
-        tmp_path, "jc-", config, dry_run=True
-    )
+    started_count, messages = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
 
     assert started_count == 0
     assert len(messages) == 0

@@ -349,7 +349,6 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
 
     if not config.runner_scaling.enabled:
         return CommandResult(

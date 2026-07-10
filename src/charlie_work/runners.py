@@ -89,7 +89,16 @@ def save_pool_sample(state_dir: Path, sample: PoolSample) -> None:
 
     # Append to file (atomic for single-line appends)
     with samples_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"timestamp": sample.timestamp, "busy": sample.busy, "queued_jobs": sample.queued_jobs}) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "timestamp": sample.timestamp,
+                    "busy": sample.busy,
+                    "queued_jobs": sample.queued_jobs,
+                }
+            )
+            + "\n"
+        )
 
 
 def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSample]:
@@ -156,7 +165,16 @@ def cleanup_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> None:
     tmp_path = samples_path.with_suffix(samples_path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         for sample in recent_samples:
-            f.write(json.dumps({"timestamp": sample.timestamp, "busy": sample.busy, "queued_jobs": sample.queued_jobs}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": sample.timestamp,
+                        "busy": sample.busy,
+                        "queued_jobs": sample.queued_jobs,
+                    }
+                )
+                + "\n"
+            )
     tmp_path.replace(samples_path)
 
 
@@ -175,7 +193,9 @@ def is_pool_idle_for_minutes(state_dir: Path, idle_minutes: int) -> bool:
     Returns:
         True if the pool has been idle for the required duration, False otherwise
     """
-    samples = load_pool_samples(state_dir, max_age_minutes=idle_minutes + 5)  # Load slightly more than needed
+    samples = load_pool_samples(
+        state_dir, max_age_minutes=idle_minutes + 5
+    )  # Load slightly more than needed
 
     if not samples:
         return False  # No samples yet, cannot determine idle state
@@ -236,9 +256,7 @@ def discover_managed_runners(managed_root: Path, runner_dir_prefix: str) -> list
         is_managed = marker_path.exists()
 
         if is_managed:
-            managed_runners.append(
-                RunnerDir(path=entry, name=entry.name, is_managed=True)
-            )
+            managed_runners.append(RunnerDir(path=entry, name=entry.name, is_managed=True))
 
     return managed_runners
 
@@ -350,7 +368,9 @@ def remove_runner(
         return False, f"config.cmd remove failed: {e}"
 
 
-def stop_runner_process(process: subprocess.Popen[bytes] | None, *, dry_run: bool = False) -> tuple[bool, str]:
+def stop_runner_process(
+    process: subprocess.Popen[bytes] | None, *, dry_run: bool = False
+) -> tuple[bool, str]:
     """Stop a runner listener process gracefully.
 
     Args:
