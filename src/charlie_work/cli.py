@@ -26,7 +26,7 @@ from .runners import (
     is_pool_idle_for_minutes,
     observe_runner_pool,
     scale_down_idle_runners,
-    ScaleDecision,
+    ScaleAction,
 )
 from .workflow import CommandResult, OrchestratorApp
 
@@ -551,6 +551,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         if result.ok:
             # Record scale event
             from .runners import record_scale_event
+
             record_scale_event(paths.root, "up")
             return CommandResult(
                 ok=True,
