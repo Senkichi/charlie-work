@@ -9299,6 +9299,10 @@ def test_github_dependencies_successful_parse(tmp_path: Path) -> None:
                 {"number": 200, "url": "https://example.test/issues/200"},
             ]
 
+    fake_gh = FakeGitHubWithDependencies()
+    result = get_github_issue_dependencies(fake_gh, 123)
+    assert result == [100, 200]
+
 
 def test_cancel_superseded_runs_no_workflow_name(tmp_path: Path) -> None:
     """Test that cancel_superseded_runs returns error when workflow_name is empty."""
@@ -9496,24 +9500,6 @@ def test_cancel_superseded_runs_handles_list_error(tmp_path: Path) -> None:
     assert result["cancelled"] == 0
     assert len(result["errors"]) == 1
     assert "GitHub API error" in result["errors"][0]
-
-
-def test_github_dependencies_successful_parse(tmp_path: Path) -> None:
-    """Test that successful dependencies API responses are parsed correctly."""
-    from charlie_work.github import get_github_issue_dependencies
-
-    class FakeGitHubWithDependencies(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            # Simulate successful response with dependencies
-            self.dependencies_response = [
-                {"number": 100, "url": "https://example.test/issues/100"},
-                {"number": 200, "url": "https://example.test/issues/200"},
-            ]
-
-    fake_gh = FakeGitHubWithDependencies()
-    result = get_github_issue_dependencies(fake_gh, 123)
-    assert result == [100, 200]
 
 
 def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:
