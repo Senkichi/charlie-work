@@ -17,6 +17,7 @@ from .fleet_registry import _load_registry, touch_repo
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
+from .runners import format_runner_pool_state, observe_runner_pool
 from .workflow import CommandResult, OrchestratorApp
 
 
@@ -148,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_bash_rats_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
     fleet_bash_rats.set_defaults(merge=None)
 
+    runners = subparsers.add_parser("runners")
+    runners_sub = runners.add_subparsers(dest="runners_command", required=True)
+    runners_sub.add_parser("status")
+
     return parser
 
 
@@ -278,6 +283,50 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     )
 
 
+def run_runners_status(args: argparse.Namespace) -> CommandResult:
+    """Run runner pool status for the current repository.
+
+    This is a read-only command that:
+    - Loads the runner scaling configuration
+    - Observes the runner pool state via GitHub API and host metrics
+    - Returns formatted pool state with pressure classification
+
+    Returns an error if the runner_scaling feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+
+    if not config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+
+    try:
+        pool_state = observe_runner_pool(gh, config.runner_scaling)
+        formatted = format_runner_pool_state(pool_state)
+        return CommandResult(
+            ok=True,
+            message="runners status complete",
+            data=formatted,
+        )
+    except GitHubError as exc:
+        return CommandResult(
+            ok=False,
+            message=f"GitHub API error: {exc}",
+            data={},
+        )
+    except Exception as exc:
+        return CommandResult(
+            ok=False,
+            message=f"runners status failed: {exc}",
+            data={},
+        )
+
+
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
     if args.command == "roll-call":
         return app.status()
@@ -336,6 +385,13 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_bash_rats(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
+        elif args.command == "runners":
+            if args.runners_command == "status":
+                result = run_runners_status(args)
+            else:
+                result = CommandResult(
+                    False, f"unknown runners command: {args.runners_command}", {}
+                )
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -386,6 +442,24 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  Digest: {event_count} attention event(s), {orphan_sweep_calls} orphan sweep call(s)"
             )
+    elif args.command == "runners" and not json_output:
+        print(result.message)
+        if result.ok:
+            pool_size = result.data.get("pool_size", {})
+            queue_depth = result.data.get("queue_depth", {})
+            host_headroom = result.data.get("host_headroom", {})
+            pressure = result.data.get("pressure", "unknown")
+            print(
+                f"  Pool: {pool_size.get('total', 0)} total, {pool_size.get('online', 0)} online, "
+                f"{pool_size.get('busy', 0)} busy, {pool_size.get('idle', 0)} idle"
+            )
+            print(
+                f"  Queue: {queue_depth.get('queued', 0)} queued, {queue_depth.get('in_progress', 0)} in progress"
+            )
+            print(
+                f"  Host: {host_headroom.get('free_ram_gb', 0)} GB free RAM, {host_headroom.get('cpu_percent', 0)}% CPU"
+            )
+            print(f"  Pressure: {pressure}")
     else:
         print_result(result, json_output=args.json_output)
 

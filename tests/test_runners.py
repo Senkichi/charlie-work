@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -174,7 +174,9 @@ def test_observe_runner_pool_handles_oserror_from_psutil(tmp_path: Path) -> None
 def test_observe_runner_pool_with_custom_workflow(tmp_path: Path) -> None:
     """observe_runner_pool filters by workflow filename when provided."""
     gh = MagicMock(spec=GitHub)
-    gh.run = MagicMock(side_effect=lambda args, **kwargs: _mock_github_response(args, workflow_filter=True))
+    gh.run = MagicMock(
+        side_effect=lambda args, **kwargs: _mock_github_response(args, workflow_filter=True)
+    )
 
     config = RunnerScalingConfig()
     state = observe_runner_pool(gh, config, workflow_filename="ci.yml")

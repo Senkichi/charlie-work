@@ -350,6 +350,40 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class RunnerScalingConfig:
+    """Self-hosted GitHub Actions runner pool scaling configuration.
+
+    ``enabled`` defaults False so an absent config block is a no-op — mirrors
+    CrossFamilyConfig (config.py:236). This is the foundation for read-only
+    observability; scaling actions are deferred to future issues.
+    """
+
+    enabled: bool = False
+    # Root directory where runner instances are managed (e.g., "C:\\actions-runners")
+    managed_root: str = ""
+    # Directory name prefix for runner instances (e.g., "jc-" for "jc-1", "jc-2")
+    runner_dir_prefix: str = "jc-"
+    # Template for GitHub runner names (e.g., "jc-9800x3d-{n}" where {n} is the instance number)
+    runner_name_template: str = "jc-{n}"
+    # Path to the runner package zip file for installation
+    package_zip: str = ""
+    # Minimum number of runners to maintain in the pool
+    min_runners: int = 1
+    # Maximum number of runners allowed in the pool
+    max_runners: int = 10
+    # Estimated RAM required per job in GB (empirical: ~2)
+    ram_per_job_gb: float = 2.0
+    # Minimum free RAM required in GB before scaling up
+    min_free_ram_gb: float = 4.0
+    # Maximum host CPU percentage before scaling up
+    max_host_cpu_pct: float = 80.0
+    # Minutes of idle time before scaling down runners
+    idle_scale_down_minutes: int = 15
+    # Cooldown period between scaling actions in minutes
+    cooldown_minutes: int = 5
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -363,6 +397,7 @@ class OrchestratorConfig:
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -641,6 +676,43 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if isinstance(shell_command, list):
         notify_data["shell_command"] = tuple(str(item) for item in shell_command)
     notify = _build_section(NotifyConfig, "notify", notify_data)
+    runner_scaling_data = _section(data, "runner_scaling")
+    # Validate numeric fields
+    for numeric_key in (
+        "min_runners",
+        "max_runners",
+        "idle_scale_down_minutes",
+        "cooldown_minutes",
+    ):
+        value = runner_scaling_data.get(numeric_key)
+        if value is not None and not isinstance(value, int):
+            raise ConfigError(
+                f"config section 'runner_scaling' key '{numeric_key}' must be an int, "
+                f"got {type(value).__name__}"
+            )
+    for float_key in ("ram_per_job_gb", "min_free_ram_gb", "max_host_cpu_pct"):
+        value = runner_scaling_data.get(float_key)
+        if value is not None and not isinstance(value, (int, float)):
+            raise ConfigError(
+                f"config section 'runner_scaling' key '{float_key}' must be a number, "
+                f"got {type(value).__name__}"
+            )
+    # Validate string fields
+    for str_key in ("managed_root", "runner_dir_prefix", "runner_name_template", "package_zip"):
+        value = runner_scaling_data.get(str_key)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(
+                f"config section 'runner_scaling' key '{str_key}' must be a string, "
+                f"got {type(value).__name__}"
+            )
+    # Validate boolean field
+    enabled = runner_scaling_data.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ConfigError(
+            f"config section 'runner_scaling' key 'enabled' must be a bool, "
+            f"got {type(enabled).__name__}"
+        )
+    runner_scaling = _build_section(RunnerScalingConfig, "runner_scaling", runner_scaling_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -654,4 +726,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         test_adequacy=test_adequacy,
         fleet=fleet,
         notify=notify,
+        runner_scaling=runner_scaling,
     )
