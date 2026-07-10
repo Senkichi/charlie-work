@@ -370,7 +370,7 @@ def mint_remove_token(gh: GitHub) -> tuple[bool, str]:
         ["api", "-X", "POST", "repos/{owner}/{repo}/actions/runners/remove-token"],
         json_output=True,
     )
-    if not result or not isinstance(result, dict):
+    if not isinstance(result, dict):
         return False, "Failed to mint remove token: invalid response"
     token = result.get("token")
     if not token or not isinstance(token, str):

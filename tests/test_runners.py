@@ -344,7 +344,8 @@ def test_cleanup_pool_samples(tmp_path: Path) -> None:
     save_pool_sample(tmp_path, old_sample)
     save_pool_sample(tmp_path, recent_sample)
 
-    cleanup_pool_samples(tmp_path, max_age_minutes=60)
+    # Force cleanup by setting max_samples to 1 (below current sample count)
+    cleanup_pool_samples(tmp_path, max_age_minutes=60, max_samples=1)
 
     samples = load_pool_samples(tmp_path, max_age_minutes=120)
     assert len(samples) == 1
