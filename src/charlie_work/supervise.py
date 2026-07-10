@@ -18,6 +18,7 @@ Design notes:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import sys
 import time
@@ -43,7 +44,7 @@ class LocalSnapshot:
 
     live_count: int
     sidecar_mtimes: frozenset[tuple[str, float]]  # sessions/*.json name+mtime
-    verdict_mtimes: frozenset[tuple[str, float]]  # prs/*/review-decision.json name+mtime
+    verdict_mtimes: frozenset[tuple[str, float]]  # prs/*/review-decision.json (pr-dir-name, mtime)
 
 
 def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
@@ -57,12 +58,16 @@ def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
             except OSError:
                 pass
 
-    # Verdict files: prs/pr-N/review-decision.json
+    # Verdict files: prs/pr-N/review-decision.json — key on the PR-unique parent
+    # directory name ("pr-N"), not path.name (always the constant string
+    # "review-decision.json"). Keying on path.name collides across every PR,
+    # so a rewritten verdict for PR A can produce a frozenset identical to one
+    # from PR B and has_delta() would miss the change.
     verdict_mtimes: set[tuple[str, float]] = set()
     if prs_dir.exists():
         for path in prs_dir.glob("*/review-decision.json"):
             try:
-                verdict_mtimes.add((path.name, path.stat().st_mtime))
+                verdict_mtimes.add((path.parent.name, path.stat().st_mtime))
             except OSError:
                 pass
 
@@ -94,13 +99,24 @@ def should_exit(pass_result: CommandResult, live_count: int) -> bool:
     - any workers are live (they may open PRs or complete);
     - any fresh or rework dispatches occurred this pass (slots just filled);
     - any merges occurred (base may have shifted for remaining PRs);
-    - any open tracked PRs await operator verdicts (verdict → merge on next pass).
+    - any open tracked PRs await operator verdicts (verdict → merge on next pass);
+    - dispatch was deferred due to provider throttling — queued issues are still
+      waiting to be dispatched once the cooldown clears, so "nothing happened
+      this pass" must not be read as "drained".
     """
     data = pass_result.data
-    dispatched = data.get("dispatch", {}).get("selected_count", 0)
-    rework = data.get("dispatch_rework", {}).get("selected_count", 0)
+    dispatch_data = data.get("dispatch", {})
+    rework_data = data.get("dispatch_rework", {})
+    dispatched = dispatch_data.get("selected_count", 0)
+    rework = rework_data.get("selected_count", 0)
     merged = len(data.get("merges", []))
     open_prs = data.get("open_tracked_prs", 0)
+    throttled = (
+        dispatch_data.get("deferred_reason") == "provider_throttled"
+        or rework_data.get("deferred_reason") == "provider_throttled"
+    )
+    if throttled:
+        return False
     return live_count == 0 and dispatched == 0 and rework == 0 and merged == 0 and open_prs == 0
 
 
@@ -125,6 +141,10 @@ class _SupervisorLock:
         if self._released:
             return
         self._released = True
+        # Unlock and close are independent failure modes: an msvcrt/fcntl
+        # unlock raising OSError must not skip closing the handle (that would
+        # leak the file descriptor and, on Windows, keep the lock file
+        # undeletable/unlockable by anyone else).
         try:
             if sys.platform == "win32":
                 import msvcrt
@@ -134,6 +154,9 @@ class _SupervisorLock:
                 import fcntl
 
                 fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        try:
             self._handle.close()  # type: ignore[attr-defined]
         except OSError:
             pass
@@ -159,6 +182,15 @@ def try_acquire_supervisor_lock(lock_path: Path) -> _SupervisorLock | None:
         if sys.platform == "win32":
             import msvcrt
 
+            # Guard against a pre-existing 0-byte lock file (e.g. left over
+            # from an older touch()-based implementation, or a race with
+            # another process's creation) — the write above only fires when
+            # the file doesn't exist yet, so a stale empty file would still
+            # make msvcrt.locking raise EACCES.
+            if handle.seek(0, 2) == 0:
+                handle.write(b"\x00")
+                handle.flush()
+            handle.seek(0)
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
@@ -220,13 +252,18 @@ def run_supervised(
             {},
         )
 
-    cfg = app.config.supervisor
-    poll_interval = (
-        poll_interval_override if poll_interval_override is not None else cfg.poll_interval_seconds
-    )
-    max_runtime_minutes = (
-        max_runtime_override if max_runtime_override is not None else cfg.max_runtime_minutes
-    )
+    # Apply CLI overrides on top of the configured supervisor section as a
+    # single ``dataclasses.replace`` — one config object instead of parallel
+    # locals that can drift out of sync with each other or with future fields.
+    overrides: dict[str, int] = {}
+    if poll_interval_override is not None:
+        overrides["poll_interval_seconds"] = poll_interval_override
+    if max_runtime_override is not None:
+        overrides["max_runtime_minutes"] = max_runtime_override
+    cfg = dataclasses.replace(app.config.supervisor, **overrides)
+
+    poll_interval = cfg.poll_interval_seconds
+    max_runtime_minutes = cfg.max_runtime_minutes
     full_pass_interval = cfg.full_pass_interval_seconds
     active_cooldown = cfg.active_cooldown_seconds
 
@@ -247,7 +284,7 @@ def run_supervised(
             now = clock()
 
             # Max-runtime check
-            if max_runtime_minutes and max_runtime_minutes > 0:
+            if max_runtime_minutes is not None and max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
                 if elapsed_minutes >= max_runtime_minutes:
                     break
@@ -264,14 +301,18 @@ def run_supervised(
             if run_pass:
                 pass_number += 1
                 last_full_pass_at = now
-                snapshot = new_snapshot
 
                 pass_result = app.loop(limit, merge=merge)
 
-                # Recount live sessions after the pass
-                live_count = (
-                    sum(1 for _ in sessions_dir.glob("*.json")) if sessions_dir.exists() else 0
-                )
+                # Snapshot AFTER the pass becomes the baseline for the next
+                # iteration's delta check (and supplies live_count). Using the
+                # pre-pass ``new_snapshot`` as the baseline instead would (a)
+                # race the next iteration's own take_snapshot call, and (b)
+                # guarantee a spurious extra pass whenever this pass's own
+                # side effects (e.g. a fresh dispatch writing a new sidecar
+                # file) show up as a "delta" on the very next poll.
+                snapshot = take_snapshot(sessions_dir, prs_dir)
+                live_count = snapshot.live_count
 
                 # Accumulate totals
                 data = pass_result.data
@@ -311,6 +352,23 @@ def run_supervised(
 
     except KeyboardInterrupt:
         pass
+
+    except Exception as exc:
+        # Errors-as-values invariant: a raw exception from app.loop() (or
+        # anything else in the loop body) must not propagate past the
+        # supervisor — callers expect CommandResult(ok=False, ...), not a
+        # traceback. The lock is still released via `finally` below.
+        elapsed_s = clock() - start_time
+        return CommandResult(
+            False,
+            f"supervisor aborted on pass {pass_number}: {exc}",
+            {
+                "passes": pass_number,
+                "total_dispatched": total_dispatched,
+                "total_merged": total_merged,
+                "elapsed_seconds": elapsed_s,
+            },
+        )
 
     finally:
         lock.release()

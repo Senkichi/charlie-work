@@ -2666,8 +2666,18 @@ class OrchestratorApp:
                         and packet_head_sha is not None
                         and live_head_sha == packet_head_sha
                     ):
-                        # Packet is current and no approval yet — skip review()
+                        # Packet is current — skip regenerating it. But an
+                        # operator may have written review-decision.json
+                        # directly without state.json reflecting it yet (the
+                        # already_approved branch above only fires once
+                        # state.json has the decision), so the verdict would
+                        # otherwise stay invisible until the head moves. Check
+                        # the decision file directly and proceed to merge on
+                        # approval, same as the decided path.
                         skipped_reviews += 1
+                        decision = self._review_decision(pr_number)
+                        if decision.get("decision") == "approved":
+                            merges.append(self.merge_ready(pr_number, merge=merge).data)
                     else:
                         review = self.review(pr_number)
                         reviews.append(review.data)

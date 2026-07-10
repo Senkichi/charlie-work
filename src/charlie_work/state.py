@@ -69,6 +69,14 @@ def state_lock(state_path: Path):
             import msvcrt
 
             lock_file = lock_path.open("r+b", encoding=None)
+            # Guard against a pre-existing 0-byte lock file (e.g. left over
+            # from an older touch()-based implementation) — the write above
+            # only fires when the file doesn't exist yet, so a stale empty
+            # file would still make msvcrt.locking raise EACCES.
+            if lock_file.seek(0, 2) == 0:
+                lock_file.write(b"\x00")
+                lock_file.flush()
+            lock_file.seek(0)
             # msvcrt.locking mode: 0 = lock, 1 = unlock
             # LK_NBLCK = non-blocking lock, LK_LOCK = blocking lock
             # We use a retry loop with timeout for bounded waiting
@@ -113,19 +121,30 @@ def state_lock(state_path: Path):
 
         yield
     finally:
-        if lock_file is not None and acquired:
+        # Close whenever the handle was opened, regardless of whether the
+        # lock was acquired — on the 30s timeout path (acquired=False) the
+        # handle was still opened above and must not leak. Unlock only when
+        # acquired=True (nothing to unlock otherwise). The two operations are
+        # independent failure modes: an unlock raising OSError must not skip
+        # the close.
+        if lock_file is not None:
+            if acquired:
+                try:
+                    if sys.platform == "win32":
+                        import msvcrt
+
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    # Best-effort unlock — ignore failures
+                    pass
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                 lock_file.close()
             except OSError:
-                # Best-effort unlock — ignore failures
+                # Best-effort close — ignore failures
                 pass
 
 

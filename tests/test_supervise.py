@@ -172,6 +172,40 @@ def test_should_exit_merged_returns_false() -> None:
     assert should_exit(result, live_count=0) is False
 
 
+def test_should_exit_provider_throttled_dispatch_returns_false() -> None:
+    """Regression for finding #2: dispatch() defers with selected_count=0 and
+    deferred_reason="provider_throttled" while queued issues are still
+    waiting on the throttle cooldown to clear. With zero live workers and no
+    open PRs, the old should_exit() misread this as fully drained.
+    """
+    result = CommandResult(
+        False,
+        "dispatch deferred: provider throttled until 2026-07-10T00:00:00Z",
+        {
+            "dispatch": {"selected_count": 0, "deferred_reason": "provider_throttled"},
+            "dispatch_rework": {"selected_count": 0},
+            "merges": [],
+            "open_tracked_prs": 0,
+        },
+    )
+    assert should_exit(result, live_count=0) is False
+
+
+def test_should_exit_provider_throttled_rework_returns_false() -> None:
+    """Same as above but the throttle hits dispatch_rework instead of dispatch."""
+    result = CommandResult(
+        False,
+        "rework dispatch deferred: provider throttled until 2026-07-10T00:00:00Z",
+        {
+            "dispatch": {"selected_count": 0},
+            "dispatch_rework": {"selected_count": 0, "deferred_reason": "provider_throttled"},
+            "merges": [],
+            "open_tracked_prs": 0,
+        },
+    )
+    assert should_exit(result, live_count=0) is False
+
+
 # ---------------------------------------------------------------------------
 # has_delta / take_snapshot tests
 # ---------------------------------------------------------------------------
@@ -214,6 +248,46 @@ def test_has_delta_sidecar_mtime_change_returns_true(tmp_path: Path) -> None:
     assert has_delta(snap1, snap2) is True
 
 
+def test_take_snapshot_verdict_mtimes_keys_on_pr_parent_not_filename(tmp_path: Path) -> None:
+    """Regression for finding #1: verdict_mtimes must key on the PR-unique
+    parent directory name ("pr-N"), not path.name (always the constant
+    "review-decision.json"). Two PRs whose verdict files happen to share an
+    identical mtime must still produce two distinct snapshot entries --
+    keying on path.name alone would collapse them into a single set element
+    (sets dedup identical tuples), silently erasing one PR's presence from
+    the delta signal and letting a later rewrite go unnoticed.
+    """
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+    pr1_dir = prs / "pr-1"
+    pr1_dir.mkdir()
+    pr2_dir = prs / "pr-2"
+    pr2_dir.mkdir()
+    verdict1 = pr1_dir / "review-decision.json"
+    verdict2 = pr2_dir / "review-decision.json"
+    verdict1.write_text('{"decision": "approved"}', encoding="utf-8")
+    verdict2.write_text('{"decision": "approved"}', encoding="utf-8")
+
+    import os
+
+    shared_mtime = 1_700_000_000.0
+    os.utime(verdict1, (shared_mtime, shared_mtime))
+    os.utime(verdict2, (shared_mtime, shared_mtime))
+
+    snap1 = take_snapshot(sessions, prs)
+    assert len(snap1.verdict_mtimes) == 2, (
+        "two PRs with identical verdict mtimes collapsed into one entry -- "
+        "verdict_mtimes is keyed on path.name instead of the PR parent dir"
+    )
+
+    # Rewrite PR-1's verdict only; PR-2 is left untouched.
+    os.utime(verdict1, (shared_mtime + 5, shared_mtime + 5))
+    snap2 = take_snapshot(sessions, prs)
+    assert has_delta(snap1, snap2) is True
+
+
 def test_has_delta_new_verdict_file_returns_true(tmp_path: Path) -> None:
     sessions = tmp_path / "sessions"
     sessions.mkdir()
@@ -247,20 +321,36 @@ def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:
 
 
 def test_run_supervised_infill_freed_slot_triggers_prompt_pass(tmp_path: Path) -> None:
-    """A sidecar disappearing (worker exited) triggers a delta → prompt pass which dispatches."""
+    """A sidecar disappearing (worker exited) triggers a delta → prompt pass
+    which dispatches.
+
+    Bounded proof (finding #12): ``full_pass_interval_seconds`` is set far out
+    of reach and ``max_passes=2`` caps the run, so pass 2 can ONLY fire because
+    ``has_delta()`` detected the vanished sidecar -- not because the fallback
+    timer eventually fires (the old assertion, ``call_count >= 2``, would have
+    passed even with ``has_delta`` hard-coded to ``False``, since the fallback
+    would eventually force a pass).
+    """
     # Plant a sidecar that will vanish between first poll and first pass
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     sidecar = sessions_dir / "issue-1.json"
     sidecar.write_text("{}", encoding="utf-8")
 
-    # Pass 1: still-live (open_prs=1 keeps loop alive), Pass 2: dispatches 1, Pass 3: drained
+    cfg = SupervisorConfig(
+        poll_interval_seconds=5,
+        full_pass_interval_seconds=100_000,
+        active_cooldown_seconds=9,
+    )
+    # Pass 1: still-live (open_prs=1 keeps loop alive), Pass 2: dispatches 1
+    # (dispatched > 0 keeps the loop alive one more cooldown before
+    # max_passes=2 stops it -- that trailing sleep is expected and doesn't
+    # weaken the bound on how pass 2 itself was triggered).
     results = [
         _active_result(open_prs=1),
         _active_result(dispatched=1),
-        _drained_result(),
     ]
-    app = FakeApp(tmp_path, results)
+    app = FakeApp(tmp_path, results, supervisor_cfg=cfg)
     app._sessions_dir = sessions_dir
 
     fc = FakeClock(auto_advance=1.0)
@@ -270,32 +360,54 @@ def test_run_supervised_infill_freed_slot_triggers_prompt_pass(tmp_path: Path) -
         # After first sleep, remove the sidecar to simulate worker exit
         if len(fc.sleep_calls) == 1 and sidecar.exists():
             sidecar.unlink()
+        assert len(fc.sleep_calls) <= 2, (
+            "pass 2 should have fired after exactly one poll interval via "
+            "has_delta(); the fallback timer is set far out of reach so "
+            "further sleeps mean delta detection did not fire it"
+        )
 
     result = run_supervised(
         app,
         clock=fc.now,
         sleep=sleeping,
-        max_passes=5,
+        max_passes=2,
     )
     assert result.ok is True
-    assert app._call_count >= 2
+    assert app._call_count == 2
+    # Bound the proof: pass 2 fires after exactly ONE poll-interval sleep
+    # (5.0s, not the 100_000s fallback); the trailing active-cooldown sleep
+    # (9.0s) follows pass 2 itself, per should_exit keeping the loop alive
+    # while dispatched > 0.
+    assert fc.sleep_calls == [5.0, 9.0]
 
 
 def test_run_supervised_verdict_file_triggers_pass_while_live_zero(tmp_path: Path) -> None:
-    """A verdict file appearing while live=0 keeps the loop alive and triggers a merge pass."""
+    """A verdict file appearing while live=0 keeps the loop alive and triggers
+    a merge pass.
+
+    Bounded proof (finding #12): ``full_pass_interval_seconds`` is set far out
+    of reach and ``max_passes=2`` caps the run, so pass 2 can ONLY be
+    explained by ``has_delta()`` picking up the new verdict file -- not by the
+    fallback timer (the old assertion, ``call_count >= 2``, would have passed
+    even with ``has_delta`` hard-coded to ``False``).
+    """
     prs_dir = tmp_path / ".var" / "charlie-work" / "prs"
     prs_dir.mkdir(parents=True, exist_ok=True)
     pr_dir = prs_dir / "pr-456"
     pr_dir.mkdir()
 
+    cfg = SupervisorConfig(
+        poll_interval_seconds=5,
+        full_pass_interval_seconds=100_000,
+        active_cooldown_seconds=9,
+    )
     # Pass 1: no workers, no dispatched, but open_prs=1 → stay alive
-    # Pass 2: merges=1 after verdict written, open_prs=0 → drained
+    # Pass 2: merges=1 after verdict written
     results = [
         _active_result(open_prs=1),
         _active_result(merged=1),
-        _drained_result(),
     ]
-    app = FakeApp(tmp_path, results)
+    app = FakeApp(tmp_path, results, supervisor_cfg=cfg)
 
     fc = FakeClock(auto_advance=1.0)
 
@@ -305,6 +417,56 @@ def test_run_supervised_verdict_file_triggers_pass_while_live_zero(tmp_path: Pat
         if len(fc.sleep_calls) == 1:
             verdict = pr_dir / "review-decision.json"
             verdict.write_text('{"decision": "approved"}', encoding="utf-8")
+        assert len(fc.sleep_calls) <= 2, (
+            "pass 2 should have fired after exactly one poll interval via "
+            "has_delta(); the fallback timer is set far out of reach so "
+            "further sleeps mean delta detection did not fire it"
+        )
+
+    result = run_supervised(
+        app,
+        clock=fc.now,
+        sleep=sleeping,
+        max_passes=2,
+    )
+    assert result.ok is True
+    assert app._call_count == 2
+    # Bound the proof: pass 2 fires after exactly ONE poll-interval sleep
+    # (5.0s, not the 100_000s fallback); the trailing active-cooldown sleep
+    # (9.0s) follows pass 2 itself, per should_exit keeping the loop alive
+    # while merged > 0.
+    assert fc.sleep_calls == [5.0, 9.0]
+
+
+def test_run_supervised_fallback_timer_fires_with_no_delta(tmp_path: Path) -> None:
+    """After a pass with no local-signal delta, the fallback timer still
+    forces a subsequent pass once ``full_pass_interval_seconds`` genuinely
+    elapses.
+
+    This is distinct from first-pass priming (finding #12): the OLD test only
+    proved pass 1 fires, which is trivially true on iteration 1 regardless of
+    whether the fallback timer's elapsed-time math works at all (priming sets
+    ``last_full_pass_at`` behind "now" specifically to force iteration 1).
+    Here the clock is advanced PAST the interval only after pass 1 completes,
+    with nothing else changing in sessions/prs, so pass 2 can only be
+    explained by the fallback timer noticing real elapsed time.
+    """
+    cfg = SupervisorConfig(
+        full_pass_interval_seconds=10,
+        poll_interval_seconds=5,
+        active_cooldown_seconds=5,
+    )
+    results = [_active_result(open_prs=1), _drained_result()]
+    app = FakeApp(tmp_path, results, supervisor_cfg=cfg)
+
+    fc = FakeClock(start=0.0, auto_advance=0.0)
+
+    def sleeping(seconds: float) -> None:
+        fc.sleep(seconds)
+        if len(fc.sleep_calls) == 1:
+            # Push the clock past the fallback threshold only AFTER pass 1
+            # has completed with no file changes.
+            fc.advance(cfg.full_pass_interval_seconds)
 
     result = run_supervised(
         app,
@@ -313,30 +475,9 @@ def test_run_supervised_verdict_file_triggers_pass_while_live_zero(tmp_path: Pat
         max_passes=5,
     )
     assert result.ok is True
-    assert app._call_count >= 2
-
-
-def test_run_supervised_fallback_timer_fires_with_no_delta(tmp_path: Path) -> None:
-    """If no delta fires, the fallback timer still triggers a pass."""
-    app = FakeApp(
-        tmp_path,
-        [_drained_result()],
-        supervisor_cfg=SupervisorConfig(
-            full_pass_interval_seconds=10,
-            poll_interval_seconds=5,
-        ),
-    )
-    # Advance clock to force fallback on first iteration
-    fc = FakeClock(start=0.0, auto_advance=0.0)
-    # last_full_pass_at will be -10, so first iteration fallback_due = True
-    result = run_supervised(
-        app,
-        clock=fc.now,
-        sleep=fc.sleep,
-        max_passes=5,
-    )
-    assert result.ok is True
-    assert app._call_count == 1
+    # Pass 1 fires from priming; pass 2 fires from the fallback timer once
+    # real elapsed time (not priming) crosses full_pass_interval_seconds.
+    assert app._call_count == 2
 
 
 def test_run_supervised_active_cooldown_sleep_after_dispatch(tmp_path: Path) -> None:
@@ -441,6 +582,58 @@ def test_run_supervised_keyboard_interrupt_returns_ok(tmp_path: Path) -> None:
     )
     assert result.ok is True
     assert "supervised loop complete" in result.message
+
+
+def test_run_supervised_exception_returns_ok_false_and_releases_lock(tmp_path: Path) -> None:
+    """Regression for finding #3: a raw exception from app.loop() must not
+    propagate past run_supervised (errors-as-values invariant) -- it comes
+    back as CommandResult(ok=False, ...) with the pass number in the
+    message, and the supervisor lock is still released afterward.
+    """
+    call_count = [0]
+
+    class RaisingApp(FakeApp):
+        def loop(self, limit: Any = None, *, merge: Any = None) -> CommandResult:
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise RuntimeError("boom")
+            return _active_result(open_prs=1)
+
+    app = RaisingApp(tmp_path, [])
+    fc = FakeClock(auto_advance=1.0)
+    result = run_supervised(
+        app,
+        clock=fc.now,
+        sleep=fc.sleep,
+        max_passes=10,
+    )
+    assert result.ok is False
+    assert "pass 2" in result.message
+    assert "boom" in result.message
+
+    # Lock must be released even though the loop aborted via exception --
+    # a fresh acquire must succeed.
+    lock_path = app.paths.root / "supervisor.lock"
+    lock = try_acquire_supervisor_lock(lock_path)
+    assert lock is not None, "lock should be released after an aborted pass"
+    lock.release()
+
+
+def test_try_acquire_supervisor_lock_zero_byte_existing_file_succeeds(tmp_path: Path) -> None:
+    """Regression for finding #8: a pre-existing 0-byte lock file (e.g. left
+    over from an older touch()-based implementation) must not permanently
+    block acquisition -- msvcrt.locking raises EACCES on a 0-byte file even
+    for a non-blocking attempt, so the acquire path must top up the file
+    before locking, not just on first creation.
+    """
+    lock_path = tmp_path / "supervisor.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")  # simulate the old touch()-created 0-byte file
+    assert lock_path.stat().st_size == 0
+
+    lock = try_acquire_supervisor_lock(lock_path)
+    assert lock is not None, "0-byte pre-existing lock file should still be acquirable"
+    lock.release()
 
 
 def test_run_supervised_second_instance_lock_returns_false(tmp_path: Path) -> None:

@@ -12901,6 +12901,65 @@ def test_loop_undecided_head_moved_invokes_review(tmp_path: Path) -> None:
     assert 456 in review_calls
 
 
+def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
+    tmp_path: Path,
+) -> None:
+    """Regression for review finding #7: a same-head packet skip must still
+    check review-decision.json directly. An operator can write the decision
+    file without state.json reflecting it yet (the already_approved branch
+    only fires once state.json has caught up), so the approval must not stay
+    invisible until the head moves -- it should proceed straight to
+    merge_ready(), same as the decided path.
+    """
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-abc123",
+        "body": "Closes #123\n\nTests: regression coverage added.",
+        "labels": [],
+        "isCrossRepository": False,
+    }
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [pr]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # State has NO decision recorded yet (undecided from state's perspective).
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    import json as _json
+
+    # Packet head matches the live PR head → same-head skip branch fires.
+    (pr_dir / "pr.json").write_text(
+        _json.dumps({"number": 456, "headRefOid": "sha-abc123"}), encoding="utf-8"
+    )
+    # Operator wrote the decision file directly; state.json wasn't updated.
+    (pr_dir / "review-decision.json").write_text(
+        _json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    result = app.loop(limit=0)
+
+    # Packet regeneration is still skipped (review() never called)...
+    assert result.data["skipped_reviews"] == 1
+    assert 456 not in review_calls
+    # ...but the approval is not left invisible: merge_ready() fires.
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is True
+
+
 def test_loop_undecided_no_packet_invokes_review(tmp_path: Path) -> None:
     """Undecided PR with no existing packet still invokes review()."""
     pr = {

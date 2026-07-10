@@ -694,8 +694,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             app,
             limit=args.limit,
             merge=args.merge,
-            poll_interval_override=getattr(args, "poll_interval", None),
-            max_runtime_override=getattr(args, "max_runtime", None),
+            poll_interval_override=args.poll_interval,
+            max_runtime_override=args.max_runtime,
         )
     return CommandResult(False, f"unknown command: {args.command}", {})
 
