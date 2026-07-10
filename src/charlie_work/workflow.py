@@ -27,6 +27,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    cancel_superseded_runs,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
     is_infrastructure_failure,
@@ -2159,6 +2160,7 @@ class OrchestratorApp:
         branch_deleted: bool | None = None
         label_error: dict[str, Any] | None = None
         update_results: list[dict[str, Any]] | None = None
+        cancel_results: dict[str, Any] | None = None
         if can_merge and should_merge:
             # Merge, then labels, then best-effort branch deletion — in that
             # order. merge_pr is the irreversible step: persist status="merged"
@@ -2205,6 +2207,13 @@ class OrchestratorApp:
             # Update remaining open agent PRs after successful merge (if configured)
             if self.config.auto_merge.update_open_prs:
                 update_results = self._update_open_agent_prs(pr_number)
+            # Cancel superseded queued runs on default branch after successful merge (if configured)
+            if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
+                cancel_results = cancel_superseded_runs(
+                    self.gh,
+                    self.config.runners.default_branch,
+                    self.config.runners.workflow_name,
+                )
         data = {
             "pr": pr_number,
             "issue": issue_number,
@@ -2217,6 +2226,7 @@ class OrchestratorApp:
             "checks": asdict(summary),
             "label_error": label_error,
             "update_open_prs_results": update_results,
+            "cancel_superseded_runs_results": cancel_results,
             "containment_warnings": list(containment_warnings),
         }
         with state_lock(self.paths.state_file):
@@ -2234,7 +2244,12 @@ class OrchestratorApp:
             state = append_event(
                 state,
                 "merge_ready",
-                {"pr_number": pr_number, "can_merge": can_merge, "merged": bool(merge_output)},
+                {
+                    "pr_number": pr_number,
+                    "can_merge": can_merge,
+                    "merged": bool(merge_output),
+                    "cancel_superseded_runs_results": cancel_results,
+                },
             )
             save_state(self.paths.state_file, state)
         message = "merge readiness evaluated"

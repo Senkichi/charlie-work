@@ -709,3 +709,106 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
             f"GitHub dependencies API returned unexpected type {type(result)} for issue #{issue_number} - treating as no dependencies"
         )
         return []
+
+
+def cancel_superseded_runs(
+    gh: GitHub,
+    default_branch: str,
+    workflow_name: str,
+) -> dict[str, Any]:
+    """Cancel superseded queued runs on the default branch for a workflow.
+
+    Lists QUEUED runs for the given workflow on the default branch, keeps the
+    newest (by createdAt, not run ID), and cancels the rest via `gh run cancel`.
+    Never cancels in_progress runs; never touches PR-branch runs.
+
+    Args:
+        gh: GitHub client instance
+        default_branch: The default branch name (e.g., "main")
+        workflow_name: The workflow name to filter runs
+
+    Returns:
+        Dict with cancellation results:
+        {
+            "total_queued": int,
+            "kept": int,
+            "cancelled": int,
+            "cancelled_run_ids": list[int],
+            "errors": list[str],
+        }
+    """
+    result = {
+        "total_queued": 0,
+        "kept": 0,
+        "cancelled": 0,
+        "cancelled_run_ids": [],
+        "errors": [],
+    }
+
+    if not workflow_name:
+        result["errors"].append("workflow_name is empty - cannot cancel runs")
+        return result
+
+    try:
+        # List queued runs for the workflow on the default branch
+        runs = gh.run(
+            [
+                "run",
+                "list",
+                "--workflow",
+                workflow_name,
+                "--branch",
+                default_branch,
+                "--status",
+                "queued",
+                "--limit",
+                "100",
+                "--json",
+                "databaseId,status,createdAt,headBranch",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+
+        if not isinstance(runs, list):
+            result["errors"].append(f"Expected list from gh run list, got {type(runs)}")
+            return result
+
+        queued_runs = [r for r in runs if r.get("status") == "queued"]
+        result["total_queued"] = len(queued_runs)
+
+        if len(queued_runs) <= 1:
+            # 0 or 1 queued runs - nothing to cancel
+            result["kept"] = len(queued_runs)
+            return result
+
+        # Sort by createdAt (newest first) to keep the newest
+        queued_runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
+
+        # Keep the newest, cancel the rest
+        newest_run = queued_runs[0]
+        to_cancel = queued_runs[1:]
+
+        result["kept"] = 1
+
+        for run in to_cancel:
+            run_id = run.get("databaseId")
+            if not isinstance(run_id, int):
+                result["errors"].append(f"Run missing databaseId: {run}")
+                continue
+
+            try:
+                cancel_result = gh.run(["run", "cancel", str(run_id)], allow_failure=True)
+                # With allow_failure=True, gh.run returns None on failure
+                if cancel_result is not None:
+                    result["cancelled_run_ids"].append(run_id)
+                    result["cancelled"] += 1
+                else:
+                    result["errors"].append(f"Failed to cancel run {run_id}")
+            except GitHubError as e:
+                result["errors"].append(f"Failed to cancel run {run_id}: {e}")
+
+    except GitHubError as e:
+        result["errors"].append(f"GitHub API error: {e}")
+
+    return result
