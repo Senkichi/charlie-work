@@ -61,6 +61,7 @@ def observe_runner_pool(
     config: RunnerScalingConfig,
     *,
     workflow_filename: str | None = None,
+    default_branch: str | None = None,
 ) -> RunnerPoolState:
     """Observe runner pool state for a repository.
 
@@ -74,7 +75,10 @@ def observe_runner_pool(
         gh: GitHub client instance
         config: Runner scaling configuration
         workflow_filename: Optional CI workflow filename to filter queue depth.
-            If None, uses a default heuristic (main branch CI).
+            If None, counts runs on the repository's default branch instead.
+        default_branch: Optional default branch name for the queue-depth query.
+            Only consulted when ``workflow_filename`` is None. If also None, the
+            branch is resolved once via the repository metadata endpoint.
 
     Returns:
         RunnerPoolState snapshot
@@ -84,7 +88,9 @@ def observe_runner_pool(
     """
     from datetime import datetime, timezone
 
-    # Query GitHub Actions runners
+    # Query GitHub Actions runners.
+    # Endpoint is passed verbatim to `gh api`; the {owner}/{repo} placeholders
+    # are substituted by gh from the current repo context.
     runners_data = gh.run(["api", "repos/{owner}/{repo}/actions/runners"], json_output=True)
     runners = runners_data.get("runners", []) if runners_data else []
 
@@ -94,25 +100,33 @@ def observe_runner_pool(
     busy_runners = sum(1 for r in runners if r.get("busy") is True)
     idle_runners = online_runners - busy_runners
 
-    # Query workflow run queue depth
-    # Default to main branch CI if no specific workflow provided
+    # Query workflow run queue depth.
+    # NOTE: `gh api` takes query params in the endpoint string (e.g. ?per_page=100),
+    # NOT as gh-run-list-style flags (--branch/--per-page/--workflow); those flags
+    # are silently rejected by `gh api` and would fail at runtime.
     if workflow_filename is None:
-        # Use a simple heuristic: count queued and in_progress runs for main branch
+        # No specific workflow: count runs on the repository's default branch.
+        # Resolve the default branch once if the caller did not supply it.
+        if default_branch is None:
+            repo_data = gh.run(["api", "repos/{owner}/{repo}"], json_output=True)
+            default_branch = repo_data.get("default_branch", "main") if repo_data else "main"
         runs_data = gh.run(
-            ["api", "repos/{owner}/{repo}/actions/runs", "--branch=main", "--per-page=100"],
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/actions/runs?branch={default_branch}&per_page=100",
+            ],
             json_output=True,
         )
         runs = runs_data.get("workflow_runs", []) if runs_data else []
         queued_jobs = sum(1 for r in runs if r.get("status") in ("queued", "pending"))
         in_progress_jobs = sum(1 for r in runs if r.get("status") == "in_progress")
     else:
-        # Filter by specific workflow filename
+        # Filter by specific workflow filename. The REST shape scopes runs under
+        # the workflow resource; there is no `workflow=` query param on /actions/runs.
         runs_data = gh.run(
             [
                 "api",
-                "repos/{owner}/{repo}/actions/runs",
-                f"--workflow={workflow_filename}",
-                "--per-page=100",
+                f"repos/{{owner}}/{{repo}}/actions/workflows/{workflow_filename}/runs?per_page=100",
             ],
             json_output=True,
         )
@@ -131,7 +145,10 @@ def observe_runner_pool(
         # CPU: utilization percentage
         cpu_percent = psutil.cpu_percent(interval=0.1)
     except (ImportError, OSError):
-        # Fallback if psutil unavailable or metrics fail
+        # Fallback if psutil unavailable or metrics fail.
+        # The 0.0 fallbacks are intentional: free_ram_gb=0.0 (< min_free_ram_gb)
+        # forces a SATURATED classification, so unknown host headroom is treated
+        # as no-headroom — fail-conservative for future scale-up decisions.
         free_ram_gb = 0.0
         cpu_percent = 0.0
 
