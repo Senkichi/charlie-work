@@ -7,11 +7,22 @@ from typing import Any
 
 from .config import ConfigError
 from .fleet_paths import fleet_dir
-from .fleet_registry import _load_registry
+from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import runtime_paths
+from .runners import (
+    decide_autoscale,
+    FleetTotals,
+    is_in_cooldown,
+    is_pool_idle_for_minutes,
+    observe_runner_pool,
+    provision_runner,
+    record_scale_event,
+    scale_down_idle_runners,
+    ScaleAction,
+)
 from .state import utc_now
 from .workflow import CommandResult, OrchestratorApp
 
@@ -56,6 +67,179 @@ def _select_repos(
 
         all_repos.sort(key=last_seen_key)
         return all_repos
+
+
+def _run_fleet_autoscale_prologue(
+    fleet_dir_override: str | None,
+    global_config: Any,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    """Run autoscale decision as a prologue to fleet bash-rats.
+
+    This is an opt-in prologue phase that:
+    - Loads fleet-wide runner totals
+    - Runs the autoscale decision function
+    - Executes scale actions if not in dry-run mode
+    - Returns attention events for the digest
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+        global_config: Global fleet configuration.
+        dry_run: If True, print decisions without executing.
+
+    Returns:
+        A list of attention event dicts for aggregation into the fleet digest.
+    """
+    events: list[dict[str, Any]] = []
+
+    # Check if autoscale prologue is enabled
+    runners_config = getattr(global_config, "runners", None)
+    if not runners_config or not getattr(runners_config, "fleet_autoscale_prologue", False):
+        return events
+
+    # Check if runner_scaling is enabled
+    runner_scaling = getattr(global_config, "runner_scaling", None)
+    if not runner_scaling or not runner_scaling.enabled:
+        logger.info("Fleet autoscale prologue: runner_scaling not enabled, skipping")
+        return events
+
+    # Load fleet-wide runner totals
+    total_runners, total_busy_runners, skipped_repos = count_fleet_runners(fleet_dir_override)
+    fleet_totals = FleetTotals(
+        total_runners=total_runners,
+        total_busy_runners=total_busy_runners,
+    )
+
+    # For fleet-wide autoscale, we need to pick a representative repo to observe state
+    # We'll use the first repo in the registry that has runner_scaling enabled
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    repos_map = registry.get("repos", {})
+
+    representative_repo = None
+    for repo_key, entry in repos_map.items():
+        repo_root = Path(entry.get("repo_root"))
+        if not repo_root.exists():
+            continue
+
+        try:
+            # Load per-repo config to check if runner_scaling is enabled
+            explicit_cfg = entry.get("config_path")
+            config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+            if config.runner_scaling.enabled:
+                representative_repo = (repo_key, repo_root, config)
+                break
+        except (ConfigError, GitHubError):
+            continue
+
+    if not representative_repo:
+        logger.info("Fleet autoscale prologue: no repo with runner_scaling enabled found")
+        return events
+
+    repo_key, repo_root, config = representative_repo
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+
+    # Observe current pool state
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+
+    # Check cooldown and idle duration
+    in_cooldown = is_in_cooldown(paths.root, config.runner_scaling.cooldown_minutes)
+    is_idle_for_duration = is_pool_idle_for_minutes(
+        paths.root, config.runner_scaling.idle_scale_down_minutes
+    )
+
+    # Run the pure decision function
+    decision = decide_autoscale(
+        state,
+        config.runner_scaling,
+        fleet_totals=fleet_totals,
+        in_cooldown=in_cooldown,
+        is_idle_for_duration=is_idle_for_duration,
+    )
+
+    logger.info(
+        f"Fleet autoscale prologue: decision={decision.action.value}({decision.count}) reason={decision.reason}"
+    )
+
+    # In dry-run mode, just log the decision
+    if dry_run:
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "autoscale_decision",
+                "action": decision.action.value,
+                "count": decision.count,
+                "reason": decision.reason,
+                "dry_run": True,
+            }
+        )
+        return events
+
+    # Execute the decision
+    if decision.action == ScaleAction.UP:
+        result = provision_runner(
+            gh,
+            config.runner_scaling,
+            state.busy_runners,
+            dry_run=False,
+        )
+        if result.ok:
+            record_scale_event(paths.root, "up")
+            events.append(
+                {
+                    "repo_key": repo_key,
+                    "type": "autoscale_up",
+                    "runner_name": result.runner_name,
+                    "reason": decision.reason,
+                }
+            )
+        else:
+            events.append(
+                {
+                    "repo_key": repo_key,
+                    "type": "autoscale_error",
+                    "action": "up",
+                    "error": result.error,
+                    "reason": decision.reason,
+                }
+            )
+    elif decision.action == ScaleAction.DOWN:
+        managed_root = Path(config.runner_scaling.managed_root)
+        if managed_root.exists():
+            removed_count, errors = scale_down_idle_runners(
+                managed_root,
+                config.runner_scaling.runner_dir_prefix,
+                gh,
+                config.runner_scaling,
+                paths.root,
+                dry_run=False,
+            )
+            events.append(
+                {
+                    "repo_key": repo_key,
+                    "type": "autoscale_down",
+                    "removed_count": removed_count,
+                    "errors": errors,
+                    "reason": decision.reason,
+                }
+            )
+        else:
+            events.append(
+                {
+                    "repo_key": repo_key,
+                    "type": "autoscale_error",
+                    "action": "down",
+                    "error": f"managed_root does not exist: {managed_root}",
+                    "reason": decision.reason,
+                }
+            )
+
+    return events
 
 
 def _extract_attention_events(
@@ -218,6 +402,13 @@ def fleet_loop(
     per_repo_results: dict[str, CommandResult] = {}
     attention_events: list[dict[str, Any]] = []
     orphan_sweep_calls = 0
+
+    # Run autoscale prologue if enabled (only for full loop, not work-only)
+    if not work_only:
+        autoscale_events = _run_fleet_autoscale_prologue(
+            fleet_dir_override, global_config, dry_run
+        )
+        attention_events.extend(autoscale_events)
 
     for repo_key, entry in selected:
         repo_root = Path(entry.get("repo_root"))

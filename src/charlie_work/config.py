@@ -377,12 +377,16 @@ class RunnersConfig:
     a no-op — mirrors CrossFamilyConfig (config.py:236). When enabled, cancels
     queued runs on the default branch for the configured workflow, keeping only
     the newest (its tree contains every earlier merge).
+
+    ``fleet_autoscale_prologue`` defaults False so an absent config block is
+    a no-op. When enabled, runs the autoscale decision before fleet bash-rats.
     """
 
     enabled: bool = False
     cancel_superseded_main_runs: bool = False
     default_branch: str = "main"
     workflow_name: str = ""
+    fleet_autoscale_prologue: bool = False
 
 
 @dataclass(frozen=True)

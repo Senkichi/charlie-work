@@ -182,3 +182,79 @@ def count_fleet_live_sessions(
         total_live_count += live_count
 
     return total_live_count, skipped_repos
+
+
+def count_fleet_runners(
+    fleet_dir_override: str | None,
+) -> tuple[int, int, list[str]]:
+    """Count fleet-wide runners across all registered repos.
+
+    Reads the fleet registry, iterates over each registered repo, and counts
+    total and busy runners using the GitHub API. Tolerates vanished/moved repo dirs
+    by skipping them and returning a list of skipped repo keys for operator visibility.
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+
+    Returns:
+        A tuple of (total_runners, total_busy_runners, skipped_repos) where
+        skipped_repos is a list of name_with_owner keys whose repo_root no longer
+        exists or is not a git worktree.
+    """
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    data = _load_registry(fleet_json_path)
+    repos = data.get("repos", {})
+
+    total_runners = 0
+    total_busy_runners = 0
+    skipped_repos: list[str] = []
+
+    for name_with_owner, entry in repos.items():
+        repo_root_str = entry.get("repo_root")
+        if not repo_root_str:
+            continue
+
+        repo_root = Path(repo_root_str)
+
+        # Skip if repo_root no longer exists
+        if not repo_root.exists():
+            logger.warning(
+                f"Skipping fleet runner-count for {name_with_owner}: repo_root {repo_root} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        # Skip if not a git worktree (basic sanity check)
+        if not (repo_root / ".git").exists():
+            logger.warning(
+                f"Skipping fleet runner-count for {name_with_owner}: repo_root {repo_root} is not a git worktree"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        # Create a GitHub client for this repo
+        try:
+            repo_gh = GitHub(repo_root=repo_root)
+        except GitHubError:
+            logger.warning(
+                f"Skipping fleet runner-count for {name_with_owner}: failed to create GitHub client"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        # Query runners for this repo
+        try:
+            runners_data = repo_gh.run(
+                ["api", "repos/{owner}/{repo}/actions/runners"], json_output=True
+            )
+            runners = runners_data.get("runners", []) if runners_data else []
+            total_runners += len(runners)
+            total_busy_runners += sum(1 for r in runners if r.get("busy") is True)
+        except (GitHubError, Exception) as exc:
+            logger.warning(
+                f"Skipping fleet runner-count for {name_with_owner}: failed to query runners: {exc}"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+    return total_runners, total_busy_runners, skipped_repos

@@ -13,15 +13,20 @@ from .config import ConfigError, find_config_path
 from .doctor import run_doctor
 from .fleet_dispatch import fleet_loop
 from .fleet_paths import fleet_dir
-from .fleet_registry import _load_registry, touch_repo
+from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .runners import (
+    decide_autoscale,
     ensure_runners_started,
     format_runner_pool_state,
+    FleetTotals,
+    is_in_cooldown,
+    is_pool_idle_for_minutes,
     observe_runner_pool,
     scale_down_idle_runners,
+    ScaleDecision,
 )
 from .workflow import CommandResult, OrchestratorApp
 
@@ -161,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
     ensure_started_parser.add_argument("--dry-run", action="store_true")
     scale_down_parser = runners_sub.add_parser("scale-down")
     scale_down_parser.add_argument("--dry-run", action="store_true")
+    autoscale_parser = runners_sub.add_parser("autoscale")
+    autoscale_parser.add_argument("--dry-run", action="store_true")
+    autoscale_parser.add_argument(
+        "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
+    )
 
     return parser
 
@@ -450,6 +460,171 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
     )
 
 
+def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
+    """Run autoscale decision and execute scale actions.
+
+    This command:
+    - Loads the runner scaling configuration
+    - Observes the current runner pool state
+    - Optionally loads fleet-wide runner totals for cross-repo guardrails
+    - Runs the pure decision function to determine scale action
+    - Executes scale actions (provision or scale-down) if not in dry-run mode
+    - Returns the decision and execution result
+
+    Returns an error if the runner_scaling feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    if not config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    # Use subparser-specific dry_run flag if available, otherwise fall back to global
+    dry_run = getattr(args, "dry_run", False)
+    fleet_wide = getattr(args, "fleet_wide", False)
+
+    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+
+    # Observe current pool state
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+
+    # Load fleet-wide totals if requested
+    fleet_totals: FleetTotals | None = None
+    if fleet_wide:
+        total_runners, total_busy_runners, skipped_repos = count_fleet_runners(args.fleet_dir)
+        fleet_totals = FleetTotals(
+            total_runners=total_runners,
+            total_busy_runners=total_busy_runners,
+        )
+
+    # Check cooldown and idle duration
+    in_cooldown = is_in_cooldown(paths.root, config.runner_scaling.cooldown_minutes)
+    is_idle_for_duration = is_pool_idle_for_minutes(
+        paths.root, config.runner_scaling.idle_scale_down_minutes
+    )
+
+    # Run the pure decision function
+    decision = decide_autoscale(
+        state,
+        config.runner_scaling,
+        fleet_totals=fleet_totals,
+        in_cooldown=in_cooldown,
+        is_idle_for_duration=is_idle_for_duration,
+    )
+
+    # In dry-run mode, just return the decision
+    if dry_run:
+        return CommandResult(
+            ok=True,
+            message=f"autoscale decision: {decision.action.value}({decision.count}) - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "state": format_runner_pool_state(state),
+                "fleet_totals": {
+                    "total_runners": fleet_totals.total_runners if fleet_totals else 0,
+                    "total_busy_runners": fleet_totals.total_busy_runners if fleet_totals else 0,
+                }
+                if fleet_totals
+                else None,
+            },
+        )
+
+    # Execute the decision
+    if decision.action == ScaleAction.UP:
+        from .runners import provision_runner
+
+        result = provision_runner(
+            gh,
+            config.runner_scaling,
+            state.busy_runners,
+            dry_run=False,
+        )
+        if result.ok:
+            # Record scale event
+            from .runners import record_scale_event
+            record_scale_event(paths.root, "up")
+            return CommandResult(
+                ok=True,
+                message=f"autoscale: scaled up by {decision.count} - {decision.reason}",
+                data={
+                    "decision": {
+                        "action": decision.action.value,
+                        "count": decision.count,
+                        "reason": decision.reason,
+                    },
+                    "provisioning": {
+                        "runner_name": result.runner_name,
+                        "runner_dir": str(result.runner_dir) if result.runner_dir else None,
+                    },
+                },
+            )
+        else:
+            return CommandResult(
+                ok=False,
+                message=f"autoscale: scale up failed - {result.error}",
+                data={
+                    "decision": {
+                        "action": decision.action.value,
+                        "count": decision.count,
+                        "reason": decision.reason,
+                    },
+                    "error": result.error,
+                },
+            )
+    elif decision.action == ScaleAction.DOWN:
+        managed_root = Path(config.runner_scaling.managed_root)
+        if not managed_root.exists():
+            return CommandResult(
+                ok=False,
+                message=f"managed_root does not exist: {managed_root}",
+                data={},
+            )
+
+        removed_count, errors = scale_down_idle_runners(
+            managed_root,
+            config.runner_scaling.runner_dir_prefix,
+            gh,
+            config.runner_scaling,
+            paths.root,
+            dry_run=False,
+        )
+        return CommandResult(
+            ok=removed_count > 0 or not errors,
+            message=f"autoscale: scaled down by {removed_count} - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "removed_count": removed_count,
+                "errors": errors,
+            },
+        )
+    else:
+        # No action
+        return CommandResult(
+            ok=True,
+            message=f"autoscale: no action - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+            },
+        )
+
+
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
     if args.command == "roll-call":
         return app.status()
@@ -515,6 +690,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_runners_ensure_started(args)
             elif args.runners_command == "scale-down":
                 result = run_runners_scale_down(args)
+            elif args.runners_command == "autoscale":
+                result = run_runners_autoscale(args)
             else:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
@@ -601,6 +778,28 @@ def main(argv: list[str] | None = None) -> int:
                 print("  Errors:")
                 for error in errors:
                     print(f"    {error}")
+        elif args.runners_command == "autoscale":
+            decision = result.data.get("decision", {})
+            action = decision.get("action", "unknown")
+            count = decision.get("count", 0)
+            reason = decision.get("reason", "")
+            print(f"  Decision: {action}({count}) - {reason}")
+            if action == "up" and result.ok:
+                provisioning = result.data.get("provisioning", {})
+                runner_name = provisioning.get("runner_name")
+                runner_dir = provisioning.get("runner_dir")
+                if runner_name:
+                    print(f"  Provisioned: {runner_name}")
+                if runner_dir:
+                    print(f"  Directory: {runner_dir}")
+            elif action == "down":
+                removed_count = result.data.get("removed_count", 0)
+                errors = result.data.get("errors", [])
+                print(f"  Removed: {removed_count} runner(s)")
+                if errors:
+                    print("  Errors:")
+                    for error in errors:
+                        print(f"    {error}")
     else:
         print_result(result, json_output=args.json_output)
 
