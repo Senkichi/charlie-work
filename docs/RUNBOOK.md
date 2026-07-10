@@ -396,6 +396,87 @@ your platform's scheduler:
 Both artifacts are reference templates — adjust the interval, working
 directory, and command to your setup before enabling.
 
+## Continuous infill mode
+
+`charlie bash-rats` now runs a **supervised foreground loop** by default.
+Each iteration polls cheap local signals (session sidecar mtimes, verdict file
+mtimes) and runs a full pass when something actionable changes.  A fallback
+pass fires every `full_pass_interval_seconds` (default 5 min) even with no
+local delta, to catch GitHub-side changes.  The loop exits automatically when
+the system is fully drained (no live workers, no pending dispatches, no open
+tracked PRs awaiting verdicts).
+
+### Default mode (supervised loop)
+
+```powershell
+uv run charlie bash-rats
+```
+
+Press **Ctrl+C** at any time to exit cleanly.  The aggregate summary
+(passes run, dispatched, merged, runtime) is printed on exit.
+
+Each pass emits a compact one-line summary:
+
+```
+[HH:MM:SS] pass N: dispatched F+R, merged M, reviewed V(+S skipped), live ~K, prs-open P, errors E
+```
+
+### Single-pass mode (legacy behavior)
+
+```powershell
+uv run charlie bash-rats --once
+```
+
+Runs exactly one pass and exits, same as the old behavior.  While a
+supervised loop is running, `--once` also refuses with an error (the single
+supervisor lock prevents double-dispatch through the concurrency governor's
+read→launch window).
+
+### CLI knobs
+
+| Flag | Description | Config equivalent |
+|------|-------------|-------------------|
+| `--poll-interval N` | Override poll interval (seconds) | `supervisor.poll_interval_seconds` |
+| `--max-runtime N` | Stop after N minutes (0 = unlimited) | `supervisor.max_runtime_minutes` |
+| `--once` | Single pass, then exit | — |
+
+### Config knobs (`orchestrator.config.yaml`)
+
+```yaml
+supervisor:
+  poll_interval_seconds: 20        # how often to check local signals
+  full_pass_interval_seconds: 300  # fallback pass even with no local delta
+  active_cooldown_seconds: 30      # sleep after a pass that dispatched/merged
+  max_runtime_minutes: 0           # 0 = unlimited
+```
+
+### Detection latency
+
+- **Local events** (worker exits/starts, verdict files written): detected within
+  ~2× `poll_interval_seconds` (20 s default → ≤40 s latency).
+- **GitHub-side events** (e.g. label changes made manually): detected on the
+  next fallback pass (`full_pass_interval_seconds`, 5 min default).
+
+### Lock-file behavior (scheduled invocations)
+
+A non-blocking `supervisor.lock` in `.var/charlie-work/` prevents concurrent
+invocations from double-dispatching.  If Task Scheduler triggers a new run
+while a supervised loop is already running, the new invocation exits
+immediately with:
+
+```
+supervisor already running (supervisor.lock held)
+```
+
+The lock is released on clean exit, KeyboardInterrupt, or process death.
+
+### `fleet bash-rats` is unchanged
+
+`charlie fleet bash-rats` (multi-repo, scheduled-task path) remains a
+one-shot command — it calls `app.loop()` directly per repo and does not enter
+the supervised loop.  The supervisor lock is repo-local, so each repo's
+single-repo `bash-rats` loop is independent.
+
 ## Session-limit / quota discipline
 
 Both non-blocking adapters (`devin_shell.py`'s `launch_devin_session()`,
