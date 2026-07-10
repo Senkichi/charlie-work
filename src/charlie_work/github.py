@@ -21,7 +21,19 @@ ISSUE_VIEW_FIELDS = (
 )
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
-PR_CHECKS_FIELDS = "name,state,bucket,link,databaseId"
+# NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
+# list --json`, which does support it) — installed gh CLIs reject it with
+# 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
+# run(..., allow_failure=True) and treats a non-list result as "no checks", adding
+# it here silently returns [] from every pr_checks() call, which makes
+# summarize_checks() report all required checks "missing" and merge_ready()
+# compute can_merge=False for every PR — the entire auto-merge lane goes
+# silently dead (regression introduced 2026-07-10, fixed same day). The GitHub
+# Actions job id (needed for infrastructure-failure classification, issue #210)
+# is instead derived from "link" by pr_checks() via _job_id_from_link() and
+# injected back into each check dict as "databaseId", so downstream consumers
+# (workflow.py) see an unchanged contract.
+PR_CHECKS_FIELDS = "name,state,bucket,link"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
 RECONCILE_PR_FIELDS = (
@@ -43,6 +55,30 @@ ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
 
 class GitHubError(RuntimeError):
     pass
+
+
+# Matches the job-id segment of a GitHub Actions check link, e.g.
+# https://github.com/OWNER/REPO/actions/runs/RUN_ID/job/JOB_ID (optionally
+# followed by a query string or #fragment, e.g. "?check_suite_focus=true").
+_ACTIONS_JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
+
+
+def _job_id_from_link(link: str | None) -> int | None:
+    """Derive a GitHub Actions job id from a check's ``link`` field.
+
+    ``gh pr checks --json`` has no ``databaseId`` field, so the job id (needed
+    to call ``actions_job``/``check_run_annotations`` for infrastructure-failure
+    classification, issue #210) must be parsed out of the check's link. Only
+    GitHub Actions check links match; external status checks may have
+    arbitrary or empty links. Never raises — returns None for anything that
+    doesn't match.
+    """
+    if not link:
+        return None
+    match = _ACTIONS_JOB_LINK_RE.search(link)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 @dataclass(frozen=True)
@@ -219,7 +255,11 @@ class GitHub:
             json_output=True,
             allow_failure=True,
         )
-        return result if isinstance(result, list) else []
+        checks = result if isinstance(result, list) else []
+        # gh pr checks --json has no databaseId field; derive the GitHub Actions
+        # job id from "link" and inject it so downstream consumers (workflow.py)
+        # keep reading check.get("databaseId") unchanged.
+        return [{**check, "databaseId": _job_id_from_link(check.get("link"))} for check in checks]
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         """Fetch a single GitHub Actions job by ID.
