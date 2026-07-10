@@ -370,6 +370,22 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class RunnersConfig:
+    """GitHub Actions runner management.
+
+    ``cancel_superseded_main_runs`` defaults False so an absent config block is
+    a no-op — mirrors CrossFamilyConfig (config.py:236). When enabled, cancels
+    queued runs on the default branch for the configured workflow, keeping only
+    the newest (its tree contains every earlier merge).
+    """
+
+    enabled: bool = False
+    cancel_superseded_main_runs: bool = False
+    default_branch: str = "main"
+    workflow_name: str = ""
+
+
+@dataclass(frozen=True)
 class RunnerScalingConfig:
     """Self-hosted GitHub Actions runner pool scaling configuration.
 
@@ -417,6 +433,7 @@ class OrchestratorConfig:
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    runners: RunnersConfig = field(default_factory=RunnersConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
 
 
@@ -703,6 +720,23 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if isinstance(shell_command, list):
         notify_data["shell_command"] = tuple(str(item) for item in shell_command)
     notify = _build_section(NotifyConfig, "notify", notify_data)
+    runners_data = _section(data, "runners")
+    # Validate runners config fields
+    for bool_key in ("enabled", "cancel_superseded_main_runs"):
+        bool_value = runners_data.get(bool_key)
+        if bool_value is not None and not isinstance(bool_value, bool):
+            raise ConfigError(
+                f"config section 'runners' key '{bool_key}' must be a bool, "
+                f"got {type(bool_value).__name__}"
+            )
+    for str_key in ("default_branch", "workflow_name"):
+        str_value = runners_data.get(str_key)
+        if str_value is not None and not isinstance(str_value, str):
+            raise ConfigError(
+                f"config section 'runners' key '{str_key}' must be a string, "
+                f"got {type(str_value).__name__}"
+            )
+    runners = _build_section(RunnersConfig, "runners", runners_data)
     runner_scaling_data = _section(data, "runner_scaling")
     # Validate numeric fields
     for numeric_key in (
@@ -753,5 +787,6 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         test_adequacy=test_adequacy,
         fleet=fleet,
         notify=notify,
+        runners=runners,
         runner_scaling=runner_scaling,
     )
