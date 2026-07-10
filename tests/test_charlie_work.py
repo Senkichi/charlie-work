@@ -1678,6 +1678,86 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
     assert result == [{"name": "Tests passed", "state": "FAILURE"}]
 
 
+def test_pr_checks_fields_excludes_database_id() -> None:
+    """Regression guard: gh pr checks --json does not support "databaseId".
+
+    Adding it to PR_CHECKS_FIELDS (unlike gh run list --json, which does
+    support it) makes the installed gh CLI exit non-zero with 'Unknown JSON
+    field: "databaseId"'. Because pr_checks() uses allow_failure=True and
+    treats a non-list result as "no checks", this silently returns [] from
+    EVERY pr_checks() call — summarize_checks() then reports all required
+    checks "missing" and merge_ready() computes can_merge=False for every PR,
+    killing the entire auto-merge lane. This exact string broke the merge lane
+    on 2026-07-10. The job id workflow.py needs is instead derived from "link"
+    by pr_checks() via _job_id_from_link().
+    """
+    fields = github_module.PR_CHECKS_FIELDS.split(",")
+    assert "databaseId" not in fields
+    assert "link" in fields
+
+
+@pytest.mark.parametrize(
+    ("link", "expected"),
+    [
+        (
+            "https://github.com/OWNER/REPO/actions/runs/123456/job/789012",
+            789012,
+        ),
+        (
+            "https://github.com/OWNER/REPO/actions/runs/123456/job/789012/",
+            789012,
+        ),
+        (
+            "https://github.com/OWNER/REPO/actions/runs/123456/job/789012?check_suite_focus=true",
+            789012,
+        ),
+        (
+            "https://github.com/OWNER/REPO/actions/runs/123456/job/789012#step:3:1",
+            789012,
+        ),
+        ("https://example.com/some/external/status-check", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_job_id_from_link(link, expected) -> None:
+    assert github_module._job_id_from_link(link) == expected
+
+
+def test_pr_checks_injects_database_id_from_link(monkeypatch, tmp_path: Path) -> None:
+    """pr_checks() derives databaseId from link for Actions checks, None otherwise."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "name": "Tests passed",
+                        "state": "SUCCESS",
+                        "bucket": "pass",
+                        "link": "https://github.com/OWNER/REPO/actions/runs/1/job/42",
+                    },
+                    {
+                        "name": "external-status-check",
+                        "state": "SUCCESS",
+                        "bucket": "pass",
+                        "link": "https://example.com/status",
+                    },
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    checks = github_module.GitHub(tmp_path).pr_checks(123)
+
+    assert checks[0]["databaseId"] == 42
+    assert checks[1]["databaseId"] is None
+
+
 def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
     """Test that merge_flags are correctly passed to gh pr merge."""
     captured_args = []
