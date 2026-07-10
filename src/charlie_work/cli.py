@@ -17,7 +17,12 @@ from .fleet_registry import _load_registry, touch_repo
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
-from .runners import format_runner_pool_state, observe_runner_pool
+from .runners import (
+    ensure_runners_started,
+    format_runner_pool_state,
+    observe_runner_pool,
+    scale_down_idle_runners,
+)
 from .workflow import CommandResult, OrchestratorApp
 
 
@@ -152,6 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
+    ensure_started_parser = runners_sub.add_parser("ensure-started")
+    ensure_started_parser.add_argument("--dry-run", action="store_true")
+    scale_down_parser = runners_sub.add_parser("scale-down")
+    scale_down_parser.add_argument("--dry-run", action="store_true")
 
     return parser
 
@@ -290,11 +299,13 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
     - Loads the runner scaling configuration
     - Observes the runner pool state via GitHub API and host metrics
     - Returns formatted pool state with pressure classification
+    - Saves pool samples for idle detection
 
     Returns an error if the runner_scaling feature is not enabled.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
 
     if not config.runner_scaling.enabled:
         return CommandResult(
@@ -306,7 +317,7 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
 
     try:
-        pool_state = observe_runner_pool(gh, config.runner_scaling)
+        pool_state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
         formatted = format_runner_pool_state(pool_state)
         return CommandResult(
             ok=True,
@@ -325,6 +336,118 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
             message=f"runners status failed: {exc}",
             data={},
         )
+
+
+def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
+    """Ensure all configured managed runners are running.
+
+    This command:
+    - Loads the runner scaling configuration
+    - Discovers managed runners under managed_root
+    - Relaunches any configured-but-not-running managed runner
+    - Returns the number of runners started and status messages
+
+    Returns an error if the runner_scaling feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+
+    if not config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    if not config.runner_scaling.managed_root:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling.managed_root is not configured",
+            data={},
+        )
+
+    managed_root = Path(config.runner_scaling.managed_root)
+    if not managed_root.exists():
+        return CommandResult(
+            ok=False,
+            message=f"managed_root does not exist: {managed_root}",
+            data={},
+        )
+
+    # Use subparser-specific dry_run flag if available, otherwise fall back to global
+    dry_run = getattr(args, "dry_run", False)
+
+    started_count, messages = ensure_runners_started(
+        managed_root,
+        config.runner_scaling.runner_dir_prefix,
+        config.runner_scaling,
+        dry_run=dry_run,
+    )
+
+    return CommandResult(
+        ok=True,
+        message=f"runners ensure-started: {started_count} runner(s) started",
+        data={"started_count": started_count, "messages": messages},
+    )
+
+
+def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
+    """Scale down idle runners by gracefully removing them.
+
+    This command:
+    - Loads the runner scaling configuration
+    - Checks if the pool has been idle for the required duration
+    - Checks if we are in the cooldown period
+    - Gracefully removes one idle runner if conditions are met
+    - Returns the number of runners removed and any error messages
+
+    Returns an error if the runner_scaling feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    if not config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    if not config.runner_scaling.managed_root:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling.managed_root is not configured",
+            data={},
+        )
+
+    managed_root = Path(config.runner_scaling.managed_root)
+    if not managed_root.exists():
+        return CommandResult(
+            ok=False,
+            message=f"managed_root does not exist: {managed_root}",
+            data={},
+        )
+
+    # Use subparser-specific dry_run flag if available, otherwise fall back to global
+    dry_run = getattr(args, "dry_run", False)
+
+    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+
+    removed_count, errors = scale_down_idle_runners(
+        managed_root,
+        config.runner_scaling.runner_dir_prefix,
+        gh,
+        config.runner_scaling,
+        paths.root,
+        dry_run=dry_run,
+    )
+
+    return CommandResult(
+        ok=removed_count > 0 or not errors,
+        message=f"runners scale-down: {removed_count} runner(s) removed",
+        data={"removed_count": removed_count, "errors": errors},
+    )
 
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
@@ -388,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "runners":
             if args.runners_command == "status":
                 result = run_runners_status(args)
+            elif args.runners_command == "ensure-started":
+                result = run_runners_ensure_started(args)
+            elif args.runners_command == "scale-down":
+                result = run_runners_scale_down(args)
             else:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
@@ -444,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     elif args.command == "runners" and not json_output:
         print(result.message)
-        if result.ok:
+        if args.runners_command == "status" and result.ok:
             pool_size = result.data.get("pool_size", {})
             queue_depth = result.data.get("queue_depth", {})
             host_headroom = result.data.get("host_headroom", {})
@@ -460,6 +587,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"  Host: {host_headroom.get('free_ram_gb', 0)} GB free RAM, {host_headroom.get('cpu_percent', 0)}% CPU"
             )
             print(f"  Pressure: {pressure}")
+        elif args.runners_command == "ensure-started" and result.ok:
+            started_count = result.data.get("started_count", 0)
+            messages = result.data.get("messages", [])
+            print(f"  Started: {started_count} runner(s)")
+            for message in messages:
+                print(f"  {message}")
+        elif args.runners_command == "scale-down":
+            removed_count = result.data.get("removed_count", 0)
+            errors = result.data.get("errors", [])
+            print(f"  Removed: {removed_count} runner(s)")
+            if errors:
+                print("  Errors:")
+                for error in errors:
+                    print(f"    {error}")
     else:
         print_result(result, json_output=args.json_output)
 

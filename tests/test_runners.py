@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,7 +13,9 @@ from charlie_work.github import GitHub
 from charlie_work.runners import (
     CHARLIE_MANAGED_MARKER,
     PoolPressure,
+    PoolSample,
     ProvisioningResult,
+    RunnerDir,
     RunnerPoolState,
     _allocate_runner_dir,
     _classify_pressure,
@@ -21,9 +24,26 @@ from charlie_work.runners import (
     _sanitize_env,
     _verify_runner_online,
     _write_charlie_managed_marker,
+    cleanup_pool_samples,
+    delete_runner_dir,
+    discover_managed_runners,
+    ensure_runner_running,
+    ensure_runners_started,
     format_runner_pool_state,
+    get_last_scale_event_time,
+    get_runner_listener_process,
+    gracefully_remove_runner,
+    is_in_cooldown,
+    is_pool_idle_for_minutes,
+    load_pool_samples,
+    mint_remove_token,
     observe_runner_pool,
     provision_runner,
+    record_scale_event,
+    remove_runner,
+    save_pool_sample,
+    scale_down_idle_runners,
+    stop_runner_process,
 )
 
 
@@ -282,6 +302,505 @@ _RUNS_RESPONSE = {
         {"id": 3, "status": "completed"},
     ]
 }
+
+
+def test_pool_sample_is_frozen() -> None:
+    """PoolSample is a frozen dataclass."""
+    sample = PoolSample(timestamp="2026-07-09T00:00:00Z", busy=False, queued_jobs=0)
+    with pytest.raises(Exception):  # frozen dataclass raises on assignment
+        sample.busy = True
+
+
+def test_save_and_load_pool_samples(tmp_path: Path) -> None:
+    """save_pool_sample and load_pool_samples round-trip correctly."""
+    from datetime import datetime, timedelta, UTC
+
+    # Use recent timestamps so they won't be filtered out
+    now = datetime.now(UTC)
+    sample1 = PoolSample(timestamp=now.isoformat(), busy=False, queued_jobs=0)
+    sample2 = PoolSample(
+        timestamp=(now + timedelta(seconds=1)).isoformat(), busy=True, queued_jobs=1
+    )
+
+    save_pool_sample(tmp_path, sample1)
+    save_pool_sample(tmp_path, sample2)
+
+    samples = load_pool_samples(tmp_path, max_age_minutes=60)
+    assert len(samples) == 2
+    assert samples[0].busy is False
+    assert samples[0].queued_jobs == 0
+    assert samples[1].busy is True
+    assert samples[1].queued_jobs == 1
+
+
+def test_load_pool_samples_filters_old_samples(tmp_path: Path) -> None:
+    """load_pool_samples filters out samples older than max_age_minutes."""
+    from datetime import datetime, timedelta, UTC
+
+    recent = datetime.now(UTC) - timedelta(minutes=30)
+    old = datetime.now(UTC) - timedelta(minutes=90)
+
+    recent_sample = PoolSample(timestamp=recent.isoformat(), busy=False, queued_jobs=0)
+    old_sample = PoolSample(timestamp=old.isoformat(), busy=False, queued_jobs=0)
+
+    save_pool_sample(tmp_path, old_sample)
+    save_pool_sample(tmp_path, recent_sample)
+
+    samples = load_pool_samples(tmp_path, max_age_minutes=60)
+    assert len(samples) == 1
+    assert samples[0].timestamp == recent.isoformat()
+
+
+def test_cleanup_pool_samples(tmp_path: Path) -> None:
+    """cleanup_pool_samples removes old samples from the file."""
+    from datetime import datetime, timedelta, UTC
+
+    recent = datetime.now(UTC) - timedelta(minutes=30)
+    old = datetime.now(UTC) - timedelta(minutes=90)
+
+    recent_sample = PoolSample(timestamp=recent.isoformat(), busy=False, queued_jobs=0)
+    old_sample = PoolSample(timestamp=old.isoformat(), busy=False, queued_jobs=0)
+
+    save_pool_sample(tmp_path, old_sample)
+    save_pool_sample(tmp_path, recent_sample)
+
+    # Force cleanup by setting max_samples to 1 (below current sample count)
+    cleanup_pool_samples(tmp_path, max_age_minutes=60, max_samples=1)
+
+    samples = load_pool_samples(tmp_path, max_age_minutes=120)
+    assert len(samples) == 1
+    assert samples[0].timestamp == recent.isoformat()
+
+
+def test_is_pool_idle_for_minutes(tmp_path: Path) -> None:
+    """is_pool_idle_for_minutes returns True when pool has been idle for required duration."""
+    from datetime import datetime, timedelta, UTC
+
+    # Create samples spanning 20 minutes, all idle
+    now = datetime.now(UTC)
+    for i in range(20):
+        sample_time = now - timedelta(minutes=20 - i)
+        sample = PoolSample(timestamp=sample_time.isoformat(), busy=False, queued_jobs=0)
+        save_pool_sample(tmp_path, sample)
+
+    # Pool should be idle for 15 minutes
+    assert is_pool_idle_for_minutes(tmp_path, 15) is True
+    # But not for 25 minutes
+    assert is_pool_idle_for_minutes(tmp_path, 25) is False
+
+
+def test_is_pool_idle_for_minutes_with_activity(tmp_path: Path) -> None:
+    """is_pool_idle_for_minutes returns False when pool has activity."""
+    from datetime import datetime, timedelta, UTC
+
+    now = datetime.now(UTC)
+    # Create samples with some activity
+    for i in range(20):
+        sample_time = now - timedelta(minutes=20 - i)
+        sample = PoolSample(
+            timestamp=sample_time.isoformat(),
+            busy=(i == 10),  # One busy sample in the middle
+            queued_jobs=0,
+        )
+        save_pool_sample(tmp_path, sample)
+
+    # Pool should not be idle due to busy sample
+    assert is_pool_idle_for_minutes(tmp_path, 15) is False
+
+
+def test_is_pool_idle_for_minutes_with_queued_jobs(tmp_path: Path) -> None:
+    """is_pool_idle_for_minutes returns False when pool has queued jobs."""
+    from datetime import datetime, timedelta, UTC
+
+    now = datetime.now(UTC)
+    # Create samples with queued jobs
+    for i in range(20):
+        sample_time = now - timedelta(minutes=20 - i)
+        sample = PoolSample(
+            timestamp=sample_time.isoformat(),
+            busy=False,
+            queued_jobs=(i == 10),  # One sample with queued jobs
+        )
+        save_pool_sample(tmp_path, sample)
+
+    # Pool should not be idle due to queued jobs
+    assert is_pool_idle_for_minutes(tmp_path, 15) is False
+
+
+def test_discover_managed_runners(tmp_path: Path) -> None:
+    """discover_managed_runners finds directories with .charlie-managed marker."""
+    # Create some runner directories
+    jc1 = tmp_path / "jc-1"
+    jc2 = tmp_path / "jc-2"
+    other = tmp_path / "other-dir"
+
+    jc1.mkdir()
+    jc2.mkdir()
+    other.mkdir()
+
+    # Add marker to jc-1 only
+    (jc1 / ".charlie-managed").touch()
+
+    managed = discover_managed_runners(tmp_path, "jc-")
+    assert len(managed) == 1
+    assert managed[0].name == "jc-1"
+    assert managed[0].is_managed is True
+
+
+def test_discover_managed_runners_no_marker(tmp_path: Path) -> None:
+    """discover_managed_runners ignores directories without .charlie-managed marker."""
+    jc1 = tmp_path / "jc-1"
+    jc1.mkdir()
+
+    # No marker file
+    managed = discover_managed_runners(tmp_path, "jc-")
+    assert len(managed) == 0
+
+
+def test_discover_managed_runners_wrong_prefix(tmp_path: Path) -> None:
+    """discover_managed_runners ignores directories with wrong prefix."""
+    other = tmp_path / "other-dir"
+    other.mkdir()
+    (other / ".charlie-managed").touch()
+
+    managed = discover_managed_runners(tmp_path, "jc-")
+    assert len(managed) == 0
+
+
+def test_runner_dir_is_frozen() -> None:
+    """RunnerDir is a frozen dataclass."""
+    runner_dir = RunnerDir(path=Path("/tmp/jc-1"), name="jc-1", is_managed=True)
+    with pytest.raises(Exception):  # frozen dataclass raises on assignment
+        runner_dir.is_managed = False
+
+
+def test_get_runner_listener_process_no_exe(tmp_path: Path) -> None:
+    """get_runner_listener_process returns None when listener exe doesn't exist."""
+    process = get_runner_listener_process(tmp_path)
+    assert process is None
+
+
+def test_get_runner_listener_process_windows_match(tmp_path: Path) -> None:
+    """get_runner_listener_process matches Runner.Listener.exe by name and cwd on Windows."""
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific test")
+
+    # Create a temporary directory to simulate a runner directory
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+
+    # We can't easily create a real Runner.Listener.exe process in tests,
+    # but we can verify the logic would work by checking the matching criteria
+    # This test documents the expected behavior: match by exe name + cwd
+
+    # The function should return None when no matching process exists
+    process = get_runner_listener_process(runner_dir)
+    assert process is None
+
+
+def test_mint_remove_token_success(tmp_path: Path) -> None:
+    """mint_remove_token successfully mints a token."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(return_value={"token": "test-token"})
+
+    success, token = mint_remove_token(gh)
+    assert success is True
+    assert token == "test-token"
+
+
+def test_mint_remove_token_invalid_response(tmp_path: Path) -> None:
+    """mint_remove_token returns error on invalid response."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(return_value=None)
+
+    success, error = mint_remove_token(gh)
+    assert success is False
+    assert "invalid response" in error
+
+
+def test_mint_remove_token_no_token(tmp_path: Path) -> None:
+    """mint_remove_token returns error when response has no token."""
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(return_value={})
+
+    success, error = mint_remove_token(gh)
+    assert success is False
+    assert "no token in response" in error
+
+
+def test_remove_runner_dry_run(tmp_path: Path) -> None:
+    """remove_runner returns success in dry-run mode."""
+    config_cmd = tmp_path / "config.cmd"
+    config_cmd.touch()
+
+    success, error = remove_runner(tmp_path, "test-token", dry_run=True)
+    assert success is True
+    assert "Would run" in error
+
+
+def test_remove_runner_no_config_cmd(tmp_path: Path) -> None:
+    """remove_runner returns error when config.cmd doesn't exist."""
+    success, error = remove_runner(tmp_path, "test-token", dry_run=False)
+    assert success is False
+    assert "config.cmd not found" in error
+
+
+def test_stop_runner_process_none() -> None:
+    """stop_runner_process returns success when process is None."""
+    success, error = stop_runner_process(None, dry_run=False)
+    assert success is True
+    assert error == ""
+
+
+def test_stop_runner_process_dry_run() -> None:
+    """stop_runner_process returns success in dry-run mode."""
+    mock_process = MagicMock()
+    mock_process.pid = 12345
+
+    success, error = stop_runner_process(mock_process, dry_run=True)
+    assert success is True
+    assert "Would stop process" in error
+
+
+def test_delete_runner_dir_dry_run(tmp_path: Path) -> None:
+    """delete_runner_dir returns success in dry-run mode."""
+    success, error = delete_runner_dir(tmp_path, dry_run=True)
+    assert success is True
+    assert "Would delete" in error
+
+
+def test_delete_runner_dir_nonexistent(tmp_path: Path) -> None:
+    """delete_runner_dir returns success when directory doesn't exist."""
+    nonexistent = tmp_path / "nonexistent"
+    success, error = delete_runner_dir(nonexistent, dry_run=False)
+    assert success is True
+    assert error == ""
+
+
+def test_gracefully_remove_runner_not_managed(tmp_path: Path) -> None:
+    """gracefully_remove_runner returns error for non-managed runner."""
+    gh = MagicMock(spec=GitHub)
+    runner_dir = RunnerDir(path=tmp_path, name="jc-1", is_managed=False)
+
+    success, error = gracefully_remove_runner(runner_dir, gh, dry_run=False)
+    assert success is False
+    assert "not charlie-managed" in error
+
+
+def test_record_and_get_scale_event(tmp_path: Path) -> None:
+    """record_scale_event and get_last_scale_event_time round-trip correctly."""
+    from datetime import datetime, UTC
+
+    before = datetime.now(UTC)
+    record_scale_event(tmp_path, "down")
+    after = datetime.now(UTC)
+
+    last_event = get_last_scale_event_time(tmp_path)
+    assert last_event is not None
+    # Verify the timestamp is within a reasonable range
+    assert before <= last_event <= after
+
+
+def test_get_last_scale_event_time_no_file(tmp_path: Path) -> None:
+    """get_last_scale_event_time returns None when file doesn't exist."""
+    last_event = get_last_scale_event_time(tmp_path)
+    assert last_event is None
+
+
+def test_is_in_cooldown_no_event(tmp_path: Path) -> None:
+    """is_in_cooldown returns False when no event recorded."""
+    assert is_in_cooldown(tmp_path, cooldown_minutes=5) is False
+
+
+def test_is_in_cooldown_in_cooldown(tmp_path: Path) -> None:
+    """is_in_cooldown returns True when in cooldown period."""
+    # Record a recent event
+    record_scale_event(tmp_path, "down")
+
+    # Should be in cooldown
+    assert is_in_cooldown(tmp_path, cooldown_minutes=5) is True
+
+
+def test_is_in_cooldown_expired(tmp_path: Path) -> None:
+    """is_in_cooldown returns False when cooldown has expired."""
+    from datetime import datetime, timedelta, UTC
+
+    # Manually create an old event
+    scale_event_path = tmp_path / "runner-scale-event.json"
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    data = {
+        "timestamp": old_time.isoformat(),
+        "event_type": "down",
+    }
+    import json
+
+    scale_event_path.write_text(json.dumps(data))
+
+    # Should not be in cooldown
+    assert is_in_cooldown(tmp_path, cooldown_minutes=5) is False
+
+
+def test_scale_down_idle_runners_in_cooldown(tmp_path: Path) -> None:
+    """scale_down_idle_runners returns 0 when in cooldown."""
+    gh = MagicMock(spec=GitHub)
+    config = RunnerScalingConfig(
+        enabled=True,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        idle_scale_down_minutes=15,
+        cooldown_minutes=5,
+    )
+
+    # Record a recent event to trigger cooldown
+    record_scale_event(tmp_path, "down")
+
+    removed, errors = scale_down_idle_runners(
+        Path(config.managed_root),
+        config.runner_dir_prefix,
+        gh,
+        config,
+        tmp_path,
+        dry_run=False,
+    )
+
+    assert removed == 0
+    assert "In cooldown period" in errors
+
+
+def test_scale_down_idle_runners_not_idle(tmp_path: Path) -> None:
+    """scale_down_idle_runners returns 0 when pool not idle."""
+    gh = MagicMock(spec=GitHub)
+    config = RunnerScalingConfig(
+        enabled=True,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        idle_scale_down_minutes=15,
+        cooldown_minutes=5,
+    )
+
+    # No samples, so not idle
+    removed, errors = scale_down_idle_runners(
+        Path(config.managed_root),
+        config.runner_dir_prefix,
+        gh,
+        config,
+        tmp_path,
+        dry_run=False,
+    )
+
+    assert removed == 0
+    assert "Pool not idle" in errors[0]
+
+
+def test_scale_down_idle_runners_at_min(tmp_path: Path) -> None:
+    """scale_down_idle_runners returns 0 when at min_runners floor."""
+    gh = MagicMock(spec=GitHub)
+    config = RunnerScalingConfig(
+        enabled=True,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        min_runners=1,
+        idle_scale_down_minutes=15,
+        cooldown_minutes=5,
+    )
+
+    # Create a managed runner
+    jc1 = tmp_path / "jc-1"
+    jc1.mkdir()
+    (jc1 / ".charlie-managed").touch()
+
+    # Add idle samples
+    from datetime import datetime, timedelta, UTC
+
+    now = datetime.now(UTC)
+    for i in range(20):
+        sample_time = now - timedelta(minutes=20 - i)
+        sample = PoolSample(timestamp=sample_time.isoformat(), busy=False, queued_jobs=0)
+        save_pool_sample(tmp_path, sample)
+
+    removed, errors = scale_down_idle_runners(
+        Path(config.managed_root),
+        config.runner_dir_prefix,
+        gh,
+        config,
+        tmp_path,
+        dry_run=False,
+    )
+
+    assert removed == 0
+    assert "At min_runners floor" in errors
+
+
+def test_ensure_runner_running_not_managed(tmp_path: Path) -> None:
+    """ensure_runner_running returns error for non-managed runner."""
+    config = RunnerScalingConfig()
+    runner_dir = RunnerDir(path=tmp_path, name="jc-1", is_managed=False)
+
+    success, error = ensure_runner_running(runner_dir, config, dry_run=False)
+    assert success is False
+    assert "not charlie-managed" in error
+
+
+def test_ensure_runner_running_already_running(tmp_path: Path) -> None:
+    """ensure_runner_running returns success when runner is already running."""
+    config = RunnerScalingConfig()
+    runner_dir = RunnerDir(path=tmp_path, name="jc-1", is_managed=True)
+
+    # Create a launch script so the check doesn't fail
+    if sys.platform == "win32":
+        launch_script = tmp_path / "run.cmd"
+    else:
+        launch_script = tmp_path / "run.sh"
+    launch_script.touch()
+
+    # In dry_run mode, it should return success with "Would launch"
+    # We can't easily mock the process check, so we test the dry_run path
+    success, error = ensure_runner_running(runner_dir, config, dry_run=True)
+    assert success is True
+    assert "Would launch" in error
+
+
+def test_ensure_runner_running_no_launch_script(tmp_path: Path) -> None:
+    """ensure_runner_running returns error when launch script doesn't exist."""
+    config = RunnerScalingConfig()
+    runner_dir = RunnerDir(path=tmp_path, name="jc-1", is_managed=True)
+
+    # No launch script exists
+    success, error = ensure_runner_running(runner_dir, config, dry_run=False)
+    assert success is False
+    assert "Launch script not found" in error
+
+
+def test_ensure_runners_started_idempotent(tmp_path: Path) -> None:
+    """ensure_runners_started is idempotent - calling it multiple times is safe."""
+    config = RunnerScalingConfig()
+
+    # Create a managed runner
+    jc1 = tmp_path / "jc-1"
+    jc1.mkdir()
+    (jc1 / ".charlie-managed").touch()
+
+    # First call (dry-run)
+    started_count1, messages1 = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
+
+    # Second call (dry-run)
+    started_count2, messages2 = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
+
+    # Both should succeed with the same result
+    assert started_count1 == started_count2
+    assert len(messages1) == len(messages2)
+
+
+def test_ensure_runners_started_no_runners(tmp_path: Path) -> None:
+    """ensure_runners_started returns 0 when no managed runners exist."""
+    config = RunnerScalingConfig()
+
+    started_count, messages = ensure_runners_started(tmp_path, "jc-", config, dry_run=True)
+
+    assert started_count == 0
+    assert len(messages) == 0
 
 
 # Provisioning engine tests

@@ -1,15 +1,21 @@
 """Runner pool observability and provisioning for self-hosted GitHub Actions runners.
 
 This module provides:
-- Read-only observability for runner pools (status, queue depth, host metrics)
+- Read-only observability for runner pools (status, queue depth, host metrics,
+  derived pressure classification, idle detection via persistent pool samples)
 - Scale-up provisioning engine (token mint, package extract, unattended config, decontaminated launch)
+- Scale-down engine (drain, deregistration, directory cleanup) and ensure-started recovery
 """
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -17,6 +23,10 @@ from typing import Any
 from .config import RunnerScalingConfig
 from .github import GitHub
 from .subprocess_runner import RunResult, run_captured
+
+
+# Marker file name that identifies charlie-managed runner directories
+CHARLIE_MANAGED_MARKER = ".charlie-managed"
 
 
 class PoolPressure(str, Enum):
@@ -56,8 +66,748 @@ class RunnerPoolState:
     timestamp: str  # ISO 8601 timestamp of the snapshot
 
 
-# Marker file name that identifies charlie-managed runner directories
-CHARLIE_MANAGED_MARKER = ".charlie-managed"
+@dataclass(frozen=True)
+class PoolSample:
+    """A single pool state sample for idle detection.
+
+    Used to persist pool state across invoke-per-pass runs to determine
+    if the pool has been idle for a continuous period.
+    """
+
+    timestamp: str  # ISO 8601 timestamp of the sample
+    busy: bool  # Whether any runner was busy at this sample
+    queued_jobs: int  # Number of queued jobs at this sample
+
+
+def save_pool_sample(state_dir: Path, sample: PoolSample) -> None:
+    """Append a pool sample to the persistent samples file.
+
+    Uses plain append (not atomic) for single-line appends. Cross-process safety
+    is achieved by periodic cleanup rewriting the file atomically.
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        sample: The pool sample to append
+    """
+    samples_path = state_dir / "runner-pool-samples.jsonl"
+    samples_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Append to file (not atomic, but safe for single-line appends)
+    with samples_path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "timestamp": sample.timestamp,
+                    "busy": sample.busy,
+                    "queued_jobs": sample.queued_jobs,
+                }
+            )
+            + "\n"
+        )
+
+
+def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSample]:
+    """Load pool samples from the persistent samples file.
+
+    Filters out samples older than max_age_minutes to prevent unbounded growth.
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        max_age_minutes: Maximum age of samples to return (default 60 minutes)
+
+    Returns:
+        List of pool samples, sorted by timestamp (oldest first)
+    """
+    samples_path = state_dir / "runner-pool-samples.jsonl"
+    if not samples_path.exists():
+        return []
+
+    samples: list[PoolSample] = []
+    cutoff = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
+
+    with samples_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                timestamp = data.get("timestamp", "")
+                busy = data.get("busy", False)
+                queued_jobs = data.get("queued_jobs", 0)
+
+                # Parse timestamp and check age
+                try:
+                    sample_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    if sample_time < cutoff:
+                        continue  # Skip old samples
+                except (ValueError, TypeError):
+                    continue  # Skip malformed timestamps
+
+                samples.append(PoolSample(timestamp=timestamp, busy=busy, queued_jobs=queued_jobs))
+            except (json.JSONDecodeError, TypeError):
+                continue  # Skip malformed lines
+
+    return sorted(samples, key=lambda s: s.timestamp)
+
+
+def cleanup_pool_samples(
+    state_dir: Path, max_age_minutes: int = 60, max_samples: int = 1000
+) -> None:
+    """Remove old samples from the persistent samples file.
+
+    Rewrites the file with only recent samples to prevent unbounded growth.
+    Cleanup is triggered when the file exceeds max_samples to avoid frequent
+    rewrites on the observe hot path.
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        max_age_minutes: Maximum age of samples to keep (default 60 minutes)
+        max_samples: Maximum number of samples before triggering cleanup (default 1000)
+    """
+    samples_path = state_dir / "runner-pool-samples.jsonl"
+    if not samples_path.exists():
+        return
+
+    # Check if cleanup is needed (size threshold to avoid hot-path rewrites)
+    try:
+        line_count = sum(1 for _ in samples_path.open("r", encoding="utf-8"))
+        if line_count <= max_samples:
+            return  # Not enough samples to trigger cleanup
+    except OSError:
+        return  # File read error, skip cleanup
+
+    recent_samples = load_pool_samples(state_dir, max_age_minutes)
+
+    # Atomic rewrite
+    tmp_path = samples_path.with_suffix(samples_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        for sample in recent_samples:
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": sample.timestamp,
+                        "busy": sample.busy,
+                        "queued_jobs": sample.queued_jobs,
+                    }
+                )
+                + "\n"
+            )
+    tmp_path.replace(samples_path)
+
+
+def is_pool_idle_for_minutes(state_dir: Path, idle_minutes: int) -> bool:
+    """Check if the pool has been idle for a continuous period.
+
+    A pool is considered idle if:
+    - No samples show busy=True
+    - No samples show queued_jobs > 0
+    - Samples span at least idle_minutes
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        idle_minutes: Required continuous idle duration in minutes
+
+    Returns:
+        True if the pool has been idle for the required duration, False otherwise
+    """
+    samples = load_pool_samples(
+        state_dir, max_age_minutes=idle_minutes + 5
+    )  # Load slightly more than needed
+
+    if not samples:
+        return False  # No samples yet, cannot determine idle state
+
+    # Check if any sample shows activity
+    for sample in samples:
+        if sample.busy or sample.queued_jobs > 0:
+            return False  # Pool was active at some point
+
+    # Check time span
+    if len(samples) < 2:
+        return False  # Need at least 2 samples to determine duration
+
+    oldest = datetime.fromisoformat(samples[0].timestamp.replace("Z", "+00:00"))
+    newest = datetime.fromisoformat(samples[-1].timestamp.replace("Z", "+00:00"))
+    duration = (newest - oldest).total_seconds() / 60  # Convert to minutes
+
+    return duration >= idle_minutes
+
+
+@dataclass(frozen=True)
+class RunnerDir:
+    """A managed runner directory with metadata."""
+
+    path: Path  # Path to the runner directory
+    name: str  # Runner name
+    is_managed: bool  # Whether this is a charlie-managed runner (has marker file)
+
+
+def discover_managed_runners(managed_root: Path, runner_dir_prefix: str) -> list[RunnerDir]:
+    """Discover all charlie-managed runner directories under managed_root.
+
+    A runner is considered charlie-managed if it:
+    - Has a directory name matching the prefix
+    - Contains a .charlie-managed marker file
+
+    Args:
+        managed_root: Root directory where runner instances are managed
+        runner_dir_prefix: Directory name prefix for runner instances
+
+    Returns:
+        List of RunnerDir objects for all managed runners
+    """
+    if not managed_root.exists():
+        return []
+
+    managed_runners: list[RunnerDir] = []
+
+    for entry in managed_root.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith(runner_dir_prefix):
+            continue
+
+        # Check for charlie-managed marker
+        marker_path = entry / CHARLIE_MANAGED_MARKER
+        is_managed = marker_path.exists()
+
+        if is_managed:
+            managed_runners.append(RunnerDir(path=entry, name=entry.name, is_managed=True))
+
+    return managed_runners
+
+
+def _sanitize_env() -> dict[str, str]:
+    """Strip environment variables that could contaminate the runner launch.
+
+    Removes UV_*, VIRTUAL_ENV, PYTHON*, PIP_*, CLAUDE* to prevent dev-shell
+    environment contamination (2026-07-08 lesson).
+
+    Returns:
+        Sanitized environment dictionary
+    """
+    env = os.environ.copy()
+    prefixes_to_strip = [
+        "UV_",
+        "VIRTUAL_ENV",
+        "PYTHON",
+        "PIP_",
+        "CLAUDE",
+    ]
+    keys_to_remove = []
+    for key in env:
+        if any(key.startswith(prefix) for prefix in prefixes_to_strip):
+            keys_to_remove.append(key)
+    for key in keys_to_remove:
+        del env[key]
+    return env
+
+
+def get_runner_listener_process(runner_dir: Path) -> subprocess.Popen[bytes] | None:
+    """Get the listener process for a runner directory.
+
+    On Windows, the listener is identified by matching the process executable
+    name (Runner.Listener.exe) and working directory. On Unix, it's identified
+    by the script path (run.sh). Process name alone is not used to avoid false positives.
+
+    Args:
+        runner_dir: Path to the runner directory
+
+    Returns:
+        The psutil.Process object if found, None otherwise
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+
+    if sys.platform == "win32":
+        # Windows: match Runner.Listener.exe by exe name and working directory
+        # run.cmd is a batch script that launches Runner.Listener.exe as the actual process
+        listener_exe_name = "Runner.Listener.exe"
+        runner_dir_resolved = runner_dir.resolve()
+
+        for proc in psutil.process_iter(["pid", "name", "cwd", "exe"]):
+            try:
+                if proc.info["name"] == listener_exe_name:
+                    # Check if working directory matches the runner directory
+                    proc_cwd = Path(proc.info["cwd"]) if proc.info["cwd"] else None
+                    if proc_cwd and proc_cwd.resolve() == runner_dir_resolved:
+                        return proc  # type: ignore
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    else:
+        # Unix: match by script path
+        listener_script = runner_dir / "run.sh"
+        if not listener_script.exists():
+            return None
+
+        for proc in psutil.process_iter(["pid", "exe"]):
+            try:
+                if (
+                    proc.info["exe"]
+                    and Path(proc.info["exe"]).resolve() == listener_script.resolve()
+                ):
+                    return proc  # type: ignore
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+    return None
+
+
+def mint_remove_token(gh: GitHub) -> tuple[bool, str]:
+    """Mint a remove token for deregistering a runner.
+
+    Args:
+        gh: GitHub client instance
+
+    Returns:
+        Tuple of (success, token_or_error_message)
+    """
+    result = gh.run(
+        ["api", "-X", "POST", "repos/{owner}/{repo}/actions/runners/remove-token"],
+        json_output=True,
+    )
+    if not isinstance(result, dict):
+        return False, "Failed to mint remove token: invalid response"
+    token = result.get("token")
+    if not token or not isinstance(token, str):
+        return False, "Failed to mint remove token: no token in response"
+    return True, token
+
+
+def remove_runner(
+    runner_dir: Path,
+    remove_token: str,
+    *,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """Remove a runner using the config.cmd script with the remove token.
+
+    Args:
+        runner_dir: Path to the runner directory
+        remove_token: The remove token from GitHub
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    config_cmd = runner_dir / "config.cmd"
+    if not config_cmd.exists():
+        return False, f"config.cmd not found in {runner_dir}"
+
+    if dry_run:
+        # Mask the token in dry-run output to prevent credential leakage
+        return True, f"Would run: {config_cmd} remove --token ***"
+
+    try:
+        result = subprocess.run(
+            [str(config_cmd), "remove", "--token", remove_token],
+            cwd=runner_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return False, f"config.cmd remove failed: {result.stderr}"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "config.cmd remove timed out"
+    except Exception as e:
+        return False, f"config.cmd remove failed: {e}"
+
+
+def stop_runner_process(
+    process: subprocess.Popen[bytes] | None, *, dry_run: bool = False
+) -> tuple[bool, str]:
+    """Stop a runner listener process gracefully.
+
+    Args:
+        process: The process to stop (psutil.Process or Popen)
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    if process is None:
+        return True, ""
+
+    if dry_run:
+        return True, f"Would stop process {process.pid}"
+
+    try:
+        import psutil
+
+        # Convert to psutil.Process if it's a Popen
+        if not isinstance(process, psutil.Process):
+            proc = psutil.Process(process.pid)
+        else:
+            proc = process
+
+        # Try graceful termination first
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except psutil.TimeoutExpired:
+            # Force kill if graceful termination fails
+            proc.kill()
+            proc.wait(timeout=5)
+
+        return True, ""
+    except ImportError:
+        # Fallback for systems without psutil
+        try:
+            process.terminate()
+            process.wait(timeout=10)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            return True, ""
+    except Exception as e:
+        return False, f"Failed to stop process: {e}"
+
+
+def delete_runner_dir(runner_dir: Path, *, dry_run: bool = False) -> tuple[bool, str]:
+    """Delete a runner directory.
+
+    Args:
+        runner_dir: Path to the runner directory
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    if not runner_dir.exists():
+        return True, ""
+
+    if dry_run:
+        return True, f"Would delete directory: {runner_dir}"
+
+    try:
+        import shutil
+
+        shutil.rmtree(runner_dir)
+        return True, ""
+    except Exception as e:
+        return False, f"Failed to delete directory: {e}"
+
+
+def gracefully_remove_runner(
+    runner_dir: RunnerDir,
+    gh: GitHub,
+    *,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """Gracefully remove a runner: drain, deregister, stop process, delete directory.
+
+    Sequence:
+    1. Check runner is not busy (via GitHub API)
+    2. Stop listener process
+    3. Mint remove token (gated on dry_run)
+    4. Run config.cmd remove --token
+    5. Delete directory
+
+    Every step is gated on the charlie-managed marker. If any step fails,
+    the error is returned and the runner is left in a diagnosable state.
+
+    Args:
+        runner_dir: The runner directory to remove
+        gh: GitHub client instance
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    if not runner_dir.is_managed:
+        return False, f"Runner {runner_dir.name} is not charlie-managed (no marker file)"
+
+    # Step 1: Check runner is not busy
+    runners_data = gh.run(["api", "repos/{owner}/{repo}/actions/runners"], json_output=True)
+    runners = runners_data.get("runners", []) if runners_data else []
+    runner_entry = next((r for r in runners if r.get("name") == runner_dir.name), None)
+    if runner_entry and runner_entry.get("busy"):
+        return False, f"Runner {runner_dir.name} is busy, cannot remove"
+
+    # Step 2: Stop listener process (must stop before config.cmd remove to avoid file locks)
+    process = get_runner_listener_process(runner_dir.path)
+    success, error = stop_runner_process(process, dry_run=dry_run)
+    if not success:
+        return False, f"Failed to stop process: {error}"
+
+    # Step 3: Mint remove token (gated on dry_run to avoid minting tokens in dry-run mode)
+    if dry_run:
+        remove_token = "***"  # Placeholder for dry-run
+    else:
+        success, remove_token = mint_remove_token(gh)
+        if not success:
+            return False, f"Failed to mint remove token: {remove_token}"
+
+    # Step 4: Run config.cmd remove
+    success, error = remove_runner(runner_dir.path, remove_token, dry_run=dry_run)
+    if not success:
+        return False, f"config.cmd remove failed: {error}"
+
+    # Step 5: Delete directory
+    success, error = delete_runner_dir(runner_dir.path, dry_run=dry_run)
+    if not success:
+        return False, f"Failed to delete directory: {error}"
+
+    return True, ""
+
+
+def get_last_scale_event_time(state_dir: Path) -> datetime | None:
+    """Get the timestamp of the last scale event (up or down).
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+
+    Returns:
+        The timestamp of the last scale event, or None if no event recorded
+    """
+    scale_event_path = state_dir / "runner-scale-event.json"
+    if not scale_event_path.exists():
+        return None
+
+    try:
+        with scale_event_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            timestamp_str = data.get("timestamp")
+            if timestamp_str:
+                return datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    return None
+
+
+def record_scale_event(state_dir: Path, event_type: str) -> None:
+    """Record a scale event (up or down) for cooldown tracking.
+
+    Uses atomic temp-file + replace pattern.
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        event_type: The type of scale event ("up" or "down")
+    """
+    scale_event_path = state_dir / "runner-scale-event.json"
+    scale_event_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "event_type": event_type,
+    }
+
+    tmp_path = scale_event_path.with_suffix(scale_event_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    tmp_path.replace(scale_event_path)
+
+
+def is_in_cooldown(state_dir: Path, cooldown_minutes: int) -> bool:
+    """Check if we are in the cooldown period after a scale event.
+
+    Args:
+        state_dir: The state directory (e.g., .var/charlie-work)
+        cooldown_minutes: Cooldown period in minutes
+
+    Returns:
+        True if in cooldown, False otherwise
+    """
+    last_event = get_last_scale_event_time(state_dir)
+    if last_event is None:
+        return False
+
+    elapsed = (datetime.now(UTC) - last_event).total_seconds() / 60
+    return elapsed < cooldown_minutes
+
+
+def scale_down_idle_runners(
+    managed_root: Path,
+    runner_dir_prefix: str,
+    gh: GitHub,
+    config: RunnerScalingConfig,
+    state_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> tuple[int, list[str]]:
+    """Scale down idle runners by gracefully removing them.
+
+    Conditions for scale-down:
+    - Pool has been idle for at least idle_scale_down_minutes
+    - Not in cooldown period
+    - Runner is not busy
+    - Runner is charlie-managed
+    - Runner count is above min_runners
+
+    Args:
+        managed_root: Root directory where runner instances are managed
+        runner_dir_prefix: Directory name prefix for runner instances
+        gh: GitHub client instance
+        config: Runner scaling configuration
+        state_dir: The state directory (e.g., .var/charlie-work)
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (number_of_runners_removed, list_of_error_messages)
+    """
+    # Check cooldown
+    if is_in_cooldown(state_dir, config.cooldown_minutes):
+        return 0, ["In cooldown period"]
+
+    # Check idle duration
+    if not is_pool_idle_for_minutes(state_dir, config.idle_scale_down_minutes):
+        return 0, ["Pool not idle for required duration"]
+
+    # Discover managed runners
+    managed_runners = discover_managed_runners(managed_root, runner_dir_prefix)
+
+    # Check min_runners floor
+    if len(managed_runners) <= config.min_runners:
+        return 0, ["At min_runners floor"]
+
+    # Select one runner to remove (oldest by numeric index)
+    # We only remove one at a time to be conservative
+    def extract_index(runner_name: str) -> int:
+        """Extract numeric index from runner name (e.g., 'jc-1' -> 1)."""
+        try:
+            # Extract suffix after the last hyphen
+            suffix = runner_name.rsplit("-", 1)[-1]
+            return int(suffix)
+        except (ValueError, IndexError):
+            return 0  # Fallback for malformed names
+
+    runners_to_remove = sorted(managed_runners, key=lambda r: extract_index(r.name))[:1]
+
+    removed_count = 0
+    errors: list[str] = []
+
+    for runner_dir in runners_to_remove:
+        success, error = gracefully_remove_runner(runner_dir, gh, dry_run=dry_run)
+        if success:
+            removed_count += 1
+        else:
+            errors.append(f"Failed to remove {runner_dir.name}: {error}")
+
+    # Record scale event if we removed any runners
+    if removed_count > 0:
+        record_scale_event(state_dir, "down")
+
+    return removed_count, errors
+
+
+def ensure_runner_running(
+    runner_dir: RunnerDir,
+    config: RunnerScalingConfig,
+    *,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """Ensure a configured runner is running by relaunching it if necessary.
+
+    This is the recovery path for managed runners that die on reboot/logoff.
+    Managed runners are plain processes (not services), so they need to be
+    restarted via ensure-started.
+
+    Args:
+        runner_dir: The runner directory to check and potentially start
+        config: Runner scaling configuration
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    if not runner_dir.is_managed:
+        return False, f"Runner {runner_dir.name} is not charlie-managed (no marker file)"
+
+    # Check if the runner is already running by process path
+    process = get_runner_listener_process(runner_dir.path)
+    if process is not None:
+        return True, f"Runner {runner_dir.name} is already running"
+
+    # Runner is not running, relaunch it
+    # Determine the launch command based on platform
+    if sys.platform == "win32":
+        launch_script = runner_dir.path / "run.cmd"
+    else:
+        launch_script = runner_dir.path / "run.sh"
+
+    if not launch_script.exists():
+        return False, f"Launch script not found: {launch_script}"
+
+    if dry_run:
+        return True, f"Would launch runner: {launch_script}"
+
+    try:
+        # Launch the runner in a decontaminated environment
+        # Strip UV_*, VIRTUAL_ENV, PYTHON*, PIP_*, CLAUDE* to prevent dev-shell contamination
+        env = _sanitize_env()
+
+        # We use subprocess.Popen with detached flags to run as a background process
+        if sys.platform == "win32":
+            # Windows: use DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP
+            startupinfo = subprocess.STARTUPINFO()  # type: ignore
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore
+            startupinfo.wShowWindow = subprocess.SW_HIDE  # type: ignore
+            proc = subprocess.Popen(
+                [str(launch_script)],
+                cwd=runner_dir.path,
+                env=env,
+                startupinfo=startupinfo,  # type: ignore
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore
+            )
+        else:
+            # Unix: use double-fork to daemonize
+            proc = subprocess.Popen(
+                [str(launch_script)],
+                cwd=runner_dir.path,
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        return True, f"Launched runner {runner_dir.name} with PID {proc.pid}"
+    except Exception as e:
+        return False, f"Failed to launch runner: {e}"
+
+
+def ensure_runners_started(
+    managed_root: Path,
+    runner_dir_prefix: str,
+    config: RunnerScalingConfig,
+    *,
+    dry_run: bool = False,
+) -> tuple[int, list[str]]:
+    """Ensure all configured managed runners are running.
+
+    Relaunches any configured-but-not-running managed runner (decontaminated env).
+    This replaces the ad-hoc start-runners.ps1 loop.
+
+    Args:
+        managed_root: Root directory where runner instances are managed
+        runner_dir_prefix: Directory name prefix for runner instances
+        config: Runner scaling configuration
+        dry_run: If True, print what would be done without executing
+
+    Returns:
+        Tuple of (number_of_runners_started, list_of_status_messages)
+    """
+    # Discover managed runners
+    managed_runners = discover_managed_runners(managed_root, runner_dir_prefix)
+
+    started_count = 0
+    messages: list[str] = []
+
+    for runner_dir in managed_runners:
+        success, message = ensure_runner_running(runner_dir, config, dry_run=dry_run)
+        if success and "already running" not in message:
+            started_count += 1
+        messages.append(f"{runner_dir.name}: {message}")
+
+    return started_count, messages
 
 
 @dataclass(frozen=True)
@@ -82,6 +832,7 @@ def observe_runner_pool(
     *,
     workflow_filename: str | None = None,
     default_branch: str | None = None,
+    state_dir: Path | None = None,
 ) -> RunnerPoolState:
     """Observe runner pool state for a repository.
 
@@ -90,6 +841,7 @@ def observe_runner_pool(
     - Queries CI workflow run queue depth
     - Samples host CPU and RAM metrics via psutil
     - Derives pressure classification
+    - Optionally saves a pool sample for idle detection if state_dir is provided
 
     Args:
         gh: GitHub client instance
@@ -99,12 +851,14 @@ def observe_runner_pool(
         default_branch: Optional default branch name for the queue-depth query.
             Only consulted when ``workflow_filename`` is None. If also None, the
             branch is resolved once via the repository metadata endpoint.
+        state_dir: Optional state directory path for persisting pool samples.
+            If provided, a pool sample is saved for idle detection.
 
     Returns:
         RunnerPoolState snapshot
 
     Raises:
-        GitHubError: If GitHub API calls fail
+        Exception: If GitHub API calls fail
     """
     from datetime import datetime, timezone
 
@@ -182,6 +936,17 @@ def observe_runner_pool(
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+
+    # Save pool sample for idle detection if state_dir is provided
+    if state_dir is not None:
+        sample = PoolSample(
+            timestamp=timestamp,
+            busy=busy_runners > 0,
+            queued_jobs=queued_jobs,
+        )
+        save_pool_sample(state_dir, sample)
+        # Periodically clean up old samples (every call is fine, it's cheap)
+        cleanup_pool_samples(state_dir, max_age_minutes=60)
 
     return RunnerPoolState(
         total_runners=total_runners,
@@ -389,32 +1154,6 @@ def _configure_runner(
     )
 
     return result
-
-
-def _sanitize_env() -> dict[str, str]:
-    """Strip environment variables that could contaminate the runner launch.
-
-    Removes UV_*, VIRTUAL_ENV, PYTHON*, PIP_*, CLAUDE* to prevent dev-shell
-    environment contamination (2026-07-08 lesson).
-
-    Returns:
-        Sanitized environment dictionary
-    """
-    env = os.environ.copy()
-    prefixes_to_strip = [
-        "UV_",
-        "VIRTUAL_ENV",
-        "PYTHON",
-        "PIP_",
-        "CLAUDE",
-    ]
-    keys_to_remove = []
-    for key in env:
-        if any(key.startswith(prefix) for prefix in prefixes_to_strip):
-            keys_to_remove.append(key)
-    for key in keys_to_remove:
-        del env[key]
-    return env
 
 
 def _launch_runner(runner_dir: Path) -> RunResult:
