@@ -909,6 +909,7 @@ class OrchestratorApp:
             dry_run=self.dry_run,
             base_ref=self.config.dispatch.base_ref,
             tee_stream_json=claude.tee_stream_json,
+            launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
         )
 
     def _apply_concurrency_governor(

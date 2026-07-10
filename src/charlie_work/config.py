@@ -128,6 +128,12 @@ class DispatchConfig:
     # Dispatch order: "oldest" (default) selects issues by creation date ascending,
     # "newest" selects by creation date descending (previous behavior).
     order: str = "oldest"
+    # Seconds to sleep between consecutive worker-session launches within a
+    # single dispatch pass (fresh or rework lane). Bursting several launches
+    # back-to-back can trip a provider's message rate limit (observed:
+    # Devin's "overall message rate limit" firing when 3 sessions launched
+    # within 6 seconds, killing all three instantly). 0 disables the stagger.
+    launch_stagger_seconds: int = 45
 
 
 @dataclass(frozen=True)
@@ -525,6 +531,17 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if order is not None and order not in ("oldest", "newest"):
         raise ConfigError(
             f"config section 'dispatch' key 'order' must be 'oldest' or 'newest', got '{order}'"
+        )
+    launch_stagger_seconds = dispatch_data.get("launch_stagger_seconds")
+    if launch_stagger_seconds is not None and not isinstance(launch_stagger_seconds, int):
+        raise ConfigError(
+            "config section 'dispatch' key 'launch_stagger_seconds' must be an int, "
+            f"got {type(launch_stagger_seconds).__name__}"
+        )
+    if launch_stagger_seconds is not None and launch_stagger_seconds < 0:
+        raise ConfigError(
+            "config section 'dispatch' key 'launch_stagger_seconds' must be >= 0, "
+            f"got {launch_stagger_seconds}"
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
