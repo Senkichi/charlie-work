@@ -952,6 +952,59 @@ def test_load_config_rejects_invalid_dispatch_order(tmp_path: Path) -> None:
     assert "oldest" in message or "newest" in message
 
 
+def test_dispatch_launch_stagger_seconds_default_is_45() -> None:
+    """Default stagger between worker-session launches within a pass."""
+    assert DispatchConfig().launch_stagger_seconds == 45
+
+
+def test_load_config_parses_dispatch_launch_stagger_seconds_override(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "dispatch:\n  launch_stagger_seconds: 10\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_file)
+    assert config.dispatch.launch_stagger_seconds == 10
+
+
+def test_load_config_rejects_negative_launch_stagger_seconds(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "dispatch:\n  launch_stagger_seconds: -1\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_file)
+        raise AssertionError("expected ConfigError for negative launch_stagger_seconds")
+    except ConfigError as exc:
+        message = str(exc)
+
+    assert "dispatch" in message
+    assert "launch_stagger_seconds" in message
+
+
+def test_load_config_rejects_wrong_type_launch_stagger_seconds(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "dispatch:\n  launch_stagger_seconds: not-a-number\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_file)
+        raise AssertionError("expected ConfigError for non-int launch_stagger_seconds")
+    except ConfigError as exc:
+        message = str(exc)
+
+    assert "dispatch" in message
+    assert "launch_stagger_seconds" in message
+
+
 def test_default_config_disables_test_adequacy() -> None:
     """TestAdequacyConfig defaults to disabled with all default values."""
     config = load_config()
@@ -1633,6 +1686,156 @@ def test_command_adapter_positional_placeholder_returns_error_record(tmp_path: P
     assert results[0].error is not None
     # The error should mention the positional placeholder issue
     assert "0" in results[0].error or "positional" in results[0].error.lower()
+
+
+def _requests(count: int, tmp_path: Path) -> list:
+    from charlie_work.adapters import SessionRequest
+
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+    return [
+        SessionRequest(
+            issue_number=i,
+            issue_title=f"Test {i}",
+            prompt_path=prompt_path,
+            branch_name=f"agent/issue-{i}",
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def test_dispatch_sessions_staggers_between_launches(tmp_path: Path, monkeypatch) -> None:
+    """Issue: burst dispatch trips the Devin provider message rate limit (3
+    sessions launched within 6 seconds all died on "Reached overall message
+    rate limit"). dispatch_sessions must sleep launch_stagger_seconds BETWEEN
+    consecutive launches -- not before the first, not after the last."""
+    from charlie_work import adapters
+    from charlie_work.adapters import AdapterSettings, dispatch_sessions
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(adapters.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=1000 + issue_number,
+            started_at="2026-07-10T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    settings = AdapterSettings(adapter="claude-code", launch_stagger_seconds=45)
+
+    results = dispatch_sessions(
+        repo_root,
+        tmp_path / "manifest.json",
+        tmp_path / "results.json",
+        settings,
+        _requests(3, tmp_path),
+    )
+
+    assert len(results) == 3
+    assert all(r.ok for r in results)
+    assert sleep_calls == [45, 45]
+
+
+def test_dispatch_sessions_single_launch_no_stagger_sleep(tmp_path: Path, monkeypatch) -> None:
+    """A single launch has no "between launches" gap to fill -- no sleep."""
+    from charlie_work import adapters
+    from charlie_work.adapters import AdapterSettings, dispatch_sessions
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(adapters.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=1000 + issue_number,
+            started_at="2026-07-10T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    settings = AdapterSettings(adapter="claude-code", launch_stagger_seconds=45)
+
+    results = dispatch_sessions(
+        repo_root,
+        tmp_path / "manifest.json",
+        tmp_path / "results.json",
+        settings,
+        _requests(1, tmp_path),
+    )
+
+    assert len(results) == 1
+    assert sleep_calls == []
+
+
+def test_dispatch_sessions_zero_stagger_disables_sleep(tmp_path: Path, monkeypatch) -> None:
+    """launch_stagger_seconds=0 disables the stagger entirely, even with
+    multiple launches."""
+    from charlie_work import adapters
+    from charlie_work.adapters import AdapterSettings, dispatch_sessions
+    from charlie_work.claude_code import ClaudeWorkerRecord
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(adapters.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=1000 + issue_number,
+            started_at="2026-07-10T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    settings = AdapterSettings(adapter="claude-code", launch_stagger_seconds=0)
+
+    results = dispatch_sessions(
+        repo_root,
+        tmp_path / "manifest.json",
+        tmp_path / "results.json",
+        settings,
+        _requests(3, tmp_path),
+    )
+
+    assert len(results) == 3
+    assert sleep_calls == []
+
+
+def test_adapter_settings_launch_stagger_seconds_wired_from_dispatch_config(
+    tmp_path: Path,
+) -> None:
+    """_adapter_settings() must read dispatch.launch_stagger_seconds -- the
+    single point of enforcement between config and both dispatch lanes."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(launch_stagger_seconds=17))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    assert app._adapter_settings().launch_stagger_seconds == 17
 
 
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:

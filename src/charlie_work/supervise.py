@@ -98,7 +98,10 @@ def should_exit(pass_result: CommandResult, live_count: int) -> bool:
     Keeps the loop alive while:
     - any workers are live (they may open PRs or complete);
     - any fresh or rework dispatches occurred this pass (slots just filled);
-    - any merges occurred (base may have shifted for remaining PRs);
+    - any merges actually SUCCEEDED (base may have shifted for remaining PRs) --
+      a failed merge attempt (can_merge=False) does not itself indicate
+      drained-ness; the PR it failed on is still open, which the
+      ``open_tracked_prs`` check below already covers;
     - any open tracked PRs await operator verdicts (verdict → merge on next pass);
     - dispatch was deferred due to provider throttling — queued issues are still
       waiting to be dispatched once the cooldown clears, so "nothing happened
@@ -109,7 +112,10 @@ def should_exit(pass_result: CommandResult, live_count: int) -> bool:
     rework_data = data.get("dispatch_rework", {})
     dispatched = dispatch_data.get("selected_count", 0)
     rework = rework_data.get("selected_count", 0)
-    merged = len(data.get("merges", []))
+    # loop() appends merge_ready(...).data for every approved PR regardless of
+    # outcome (each entry carries a "merged" bool) -- count only entries that
+    # actually merged. A failed attempt is not "activity" in its own right.
+    merged = sum(1 for entry in data.get("merges", []) if entry.get("merged"))
     open_prs = data.get("open_tracked_prs", 0)
     throttled = (
         dispatch_data.get("deferred_reason") == "provider_throttled"
@@ -319,7 +325,14 @@ def run_supervised(
                 dispatched = data.get("dispatch", {}).get("selected_count", 0) + data.get(
                     "dispatch_rework", {}
                 ).get("selected_count", 0)
-                merged = len(data.get("merges", []))
+                # merge_ready(...) appends one entry per approved PR regardless
+                # of outcome ("merged": bool) -- count only the ones that
+                # actually merged, not every attempt (finding: a pass with 3
+                # failed can_merge=False attempts previously reported "merged
+                # 3" despite zero real merges).
+                merges = data.get("merges", [])
+                merge_attempts = len(merges)
+                merged = sum(1 for entry in merges if entry.get("merged"))
                 total_dispatched += dispatched
                 total_merged += merged
 
@@ -332,9 +345,15 @@ def run_supervised(
                 rework = data.get("dispatch_rework", {}).get("selected_count", 0)
                 reviewed = len(data.get("reviews", []))
                 skipped = data.get("skipped_reviews", 0)
+                # Compact by default ("merged N"); surface failed attempts as
+                # "merged N/M" only when they diverge from successes, so the
+                # common (all-succeeded or no-attempts) case stays stable.
+                merged_str = (
+                    f"{merged}/{merge_attempts}" if merge_attempts > merged else str(merged)
+                )
                 print(
                     f"[{now_str}] pass {pass_number}: dispatched {fresh}+{rework},"
-                    f" merged {merged}, reviewed {reviewed}(+{skipped} skipped),"
+                    f" merged {merged_str}, reviewed {reviewed}(+{skipped} skipped),"
                     f" live ~{live_count}, prs-open {open_prs}, errors {errors_count}",
                     flush=True,
                 )

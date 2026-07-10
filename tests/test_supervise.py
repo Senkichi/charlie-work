@@ -92,16 +92,26 @@ def _active_result(
     dispatched: int = 0,
     rework: int = 0,
     merged: int = 0,
+    merge_failed: int = 0,
     open_prs: int = 0,
 ) -> CommandResult:
-    """A pass result with some activity."""
+    """A pass result with some activity.
+
+    ``merged`` produces that many successful merge entries ("merged": True).
+    ``merge_failed`` produces that many failed merge ATTEMPT entries
+    ("merged": False) -- mirrors merge_ready() appending one entry per
+    approved PR regardless of outcome (workflow.py merge_ready). Both land in
+    the same "merges" list.
+    """
+    merges = [{"pr": i, "merged": True} for i in range(merged)]
+    merges += [{"pr": 1000 + i, "merged": False} for i in range(merge_failed)]
     return CommandResult(
         True,
         "loop complete",
         {
             "dispatch": {"selected_count": dispatched},
             "dispatch_rework": {"selected_count": rework},
-            "merges": [{"pr": i} for i in range(merged)],
+            "merges": merges,
             "reviews": [],
             "errors": [],
             "open_tracked_prs": open_prs,
@@ -189,6 +199,29 @@ def test_should_exit_provider_throttled_dispatch_returns_false() -> None:
         },
     )
     assert should_exit(result, live_count=0) is False
+
+
+def test_should_exit_failed_merge_attempts_only_still_blocked_by_open_prs() -> None:
+    """Regression: merge_ready() appends one "merges" entry per approved PR
+    regardless of outcome. All attempts failing (can_merge=False) must not be
+    misread as merge "activity" that would let should_exit ignore the still-
+    open PRs -- open_tracked_prs > 0 keeps the loop alive on its own, and the
+    honest (successes-only) merged count must not accidentally short-circuit
+    that.
+    """
+    result = _active_result(merge_failed=3, open_prs=2)
+    assert should_exit(result, live_count=0) is False
+
+
+def test_should_exit_all_failed_merge_attempts_no_other_activity_exits() -> None:
+    """The honest fix: failed merge attempts alone (no live workers, no
+    dispatches, no open PRs) are not "activity" -- should_exit returns True.
+    The old implementation (len(data["merges"]) as the merged count) would
+    have kept the loop alive here since 3 failed-attempt entries still made
+    len(merges) == 3 look nonzero.
+    """
+    result = _active_result(merge_failed=3, open_prs=0)
+    assert should_exit(result, live_count=0) is True
 
 
 def test_should_exit_provider_throttled_rework_returns_false() -> None:
@@ -299,6 +332,44 @@ def test_has_delta_new_verdict_file_returns_true(tmp_path: Path) -> None:
     (pr_dir / "review-decision.json").write_text('{"decision": "approved"}', encoding="utf-8")
     snap2 = take_snapshot(sessions, prs)
     assert has_delta(snap1, snap2) is True
+
+
+# ---------------------------------------------------------------------------
+# Pass summary line: merged count reflects actual merges, not attempts
+# ---------------------------------------------------------------------------
+
+
+def test_pass_summary_reports_zero_merged_for_all_failed_attempts(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Regression: today's production run printed "merged 3" for a pass where
+    all 3 merge attempts had can_merge=False and zero PRs actually merged.
+    The summary line must report the real (successful) count -- with the
+    attempt count surfaced (0/3) since it diverges from successes.
+    """
+    app = FakeApp(tmp_path, [_active_result(merge_failed=3, open_prs=3)])
+    fc = FakeClock(auto_advance=1.0)
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+
+    out = capsys.readouterr().out
+    assert "merged 0/3" in out
+    assert "merged 3" not in out.replace("merged 0/3", "")
+
+
+def test_pass_summary_reports_plain_count_when_all_attempts_succeed(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """When attempts == successes, the line stays in the compact plain form
+    ("merged N"), not "N/N" -- keeps the common case stable for callers/tests
+    that grep the plain form.
+    """
+    app = FakeApp(tmp_path, [_active_result(merged=2)])
+    fc = FakeClock(auto_advance=1.0)
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+
+    out = capsys.readouterr().out
+    assert "merged 2" in out
+    assert "merged 2/2" not in out
 
 
 # ---------------------------------------------------------------------------

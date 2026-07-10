@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .subprocess_runner import run_captured
 
@@ -53,6 +54,12 @@ class AdapterSettings:
     # origin/<default-branch>. Passed to create_worktree for both devin-shell
     # and claude-code adapters.
     base_ref: str = ""
+    # Seconds to sleep between consecutive worker-session launches within a
+    # single dispatch pass (devin-shell and claude-code only; those two spawn
+    # real out-of-process worker sessions that can trip a provider's message
+    # rate limit when launched back-to-back). 0 disables the stagger. Mirrors
+    # config.DispatchConfig.launch_stagger_seconds.
+    launch_stagger_seconds: int = 0
     # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
     # When enabled, the worker launch command is extended with --output-format stream-json
     # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
@@ -119,15 +126,17 @@ def dispatch_sessions(
             for request in requests
         ]
     elif adapter == "devin-shell":
-        results = [
-            _run_devin_shell_adapter(repo_root, request, sessions_dir, settings)
-            for request in requests
-        ]
+        results = _launch_staggered(
+            requests,
+            lambda request: _run_devin_shell_adapter(repo_root, request, sessions_dir, settings),
+            settings.launch_stagger_seconds,
+        )
     elif adapter == "claude-code":
-        results = [
-            _run_claude_code_adapter(repo_root, request, sessions_dir, settings)
-            for request in requests
-        ]
+        results = _launch_staggered(
+            requests,
+            lambda request: _run_claude_code_adapter(repo_root, request, sessions_dir, settings),
+            settings.launch_stagger_seconds,
+        )
     else:
         results = [
             _result(
@@ -139,6 +148,30 @@ def dispatch_sessions(
             for request in requests
         ]
     write_session_results(results_path, results)
+    return results
+
+
+def _launch_staggered(
+    requests: list[SessionRequest],
+    launch: Callable[[SessionRequest], SessionDispatchResult],
+    stagger_seconds: int,
+) -> list[SessionDispatchResult]:
+    """Launch each request in order, sleeping between consecutive launches.
+
+    The sleep sits BETWEEN launches only -- never before the first, never
+    after the last, and skipped entirely for a single request or when
+    ``stagger_seconds`` is 0. This is orchestration-lane pacing, not adapter
+    blocking: each individual ``launch`` call is still a non-blocking Popen
+    (CLAUDE.md invariant), this just paces the loop that calls it so a burst
+    of launches doesn't trip a provider's message rate limit (observed:
+    Devin's "overall message rate limit" firing when 3 sessions launched
+    within 6 seconds).
+    """
+    results: list[SessionDispatchResult] = []
+    for index, request in enumerate(requests):
+        if index > 0 and stagger_seconds > 0:
+            time.sleep(stagger_seconds)
+        results.append(launch(request))
     return results
 
 
