@@ -223,11 +223,11 @@ def detect_drift(
                         # Session is alive but stalled at shim marker - classify as launch_stalled
                         if w.adapter_kind == "devin":
                             update_session_record_with_failure_classification(
-                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                                sessions_dir, w.issue_number, fallback_kind="launch_stalled"
                             )
                         elif w.adapter_kind == "claude-code":
                             update_worker_record_with_failure_classification(
-                                sessions_dir, w.issue_number, failure_kind="launch_stalled"
+                                sessions_dir, w.issue_number, fallback_kind="launch_stalled"
                             )
 
                         # Kill the process tree to free the slot

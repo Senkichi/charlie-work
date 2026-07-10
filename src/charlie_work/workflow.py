@@ -53,6 +53,7 @@ from .state import (
     is_throttled,
     load_state,
     save_state,
+    set_throttled_until,
     state_lock,
     utc_now,
 )
@@ -262,8 +263,21 @@ def _detect_and_handle_stalled_sessions(
 
     A session is stalled when its PID is alive but its log file's mtime is
     older than the configured threshold, or the log contains a terminal error
-    marker. On detection, the process tree is killed, the sidecar is marked
-    with failure_kind: stalled, and a session_stalled event is logged.
+    marker. On detection, the process tree is killed and the sidecar is
+    classified via the log-tail-first helper (``update_session_record_with_
+    failure_classification`` / ``update_worker_record_with_failure_classification``),
+    falling back to failure_kind "stalled" only when the log shows no provider
+    throttle signature. This function runs before the dead-session lane in the
+    loop() pass order, so it must apply the same classify-then-fallback
+    treatment itself — otherwise a worker that actually died on a provider
+    rate limit gets permanently mislabeled "stalled" before the dead-session
+    lane ever gets a chance to classify it, and ``throttled_until`` never gets
+    set (issue #246).
+
+    When classification detects a throttle signature, ``throttled_until`` is
+    persisted to state.json (same as the dead-session lane) so the next
+    dispatch pass defers instead of relaunching into the same window. A
+    session_stalled event is logged with the resolved failure_kind.
 
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
@@ -301,15 +315,33 @@ def _detect_and_handle_stalled_sessions(
                     _kill_orphan_pid(orphan_pid)
                     killed_pids.append(orphan_pid)
 
-            # Mark the sidecar with failure_kind: stalled (adapter-specific dispatch)
+            # Classify the sidecar (adapter-specific dispatch): log-tail
+            # classification runs first, falling back to failure_kind "stalled"
+            # only when the log shows no provider throttle signature.
+            resolved_failure_kind: str | None = None
+            throttled_until: str | None = None
             if w.adapter_kind == "devin":
-                update_session_record_with_failure_classification(
-                    sessions_dir, w.issue_number, failure_kind="stalled"
+                resolved_failure_kind, throttled_until = (
+                    update_session_record_with_failure_classification(
+                        sessions_dir, w.issue_number, fallback_kind="stalled"
+                    )
                 )
             elif w.adapter_kind == "claude-code":
-                update_worker_record_with_failure_classification(
-                    sessions_dir, w.issue_number, failure_kind="stalled"
+                resolved_failure_kind, throttled_until = (
+                    update_worker_record_with_failure_classification(
+                        sessions_dir, w.issue_number, fallback_kind="stalled"
+                    )
                 )
+
+            if resolved_failure_kind and throttled_until:
+                # A throttle signature was found in the log tail even though
+                # the watchdog reaped this worker for stalling — persist the
+                # cooldown so the next dispatch pass defers instead of
+                # relaunching into the same provider rate limit/quota window.
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(state, throttled_until)
+                    save_state(state_file, state)
 
             # Log the event
             log_path = Path(w.log_path)
@@ -334,6 +366,7 @@ def _detect_and_handle_stalled_sessions(
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
                         "orphan_pids": orphan_pids if orphan_pids else None,
+                        "failure_kind": resolved_failure_kind,
                     },
                 )
                 save_state(state_file, state)
