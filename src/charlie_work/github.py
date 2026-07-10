@@ -786,7 +786,6 @@ def cancel_superseded_runs(
         queued_runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
 
         # Keep the newest, cancel the rest
-        newest_run = queued_runs[0]
         to_cancel = queued_runs[1:]
 
         result["kept"] = 1
