@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work import devin_shell
+from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.devin_shell import (
     DEFAULT_COMMAND_TEMPLATE,
     SessionRecord,
@@ -1405,6 +1406,122 @@ def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
     assert throttled_until is None  # No new throttled_until
 
     # Verify the sidecar was not changed
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def _make_session_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:
+    """Write a minimal session sidecar for failure-classification tests."""
+    sidecar_path = sessions_dir / f"issue-{issue_number}.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "branch": f"agent/issue-{issue_number}",
+                "worktree_path": "/tmp/wt",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(log_path),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
+def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) -> None:
+    """Issue #260, corrected premise: 'A tool was rejected by the user' is the
+    Devin CLI's own surfacing of a PreToolUse hook block, not a provider
+    throttle condition — it must NOT classify as rate_limited (no retry
+    semantics, no throttled_until). The original PR #263 premise treated
+    this string as a throttle signature; a correction comment on issue #260
+    established it is a hard failure that must instead route through
+    post_mortem.classify_and_record's worker_blocked log-tail fallback (see
+    test_post_mortem.py), which composes with escalation, not cooldown."""
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: A tool was rejected by the user.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_update_session_record_tool_rejected_is_not_rate_limited(tmp_path: Path) -> None:
+    """Issue #260, corrected premise: a tool-rejected sidecar log must not be
+    classified rate_limited by the adapter's own log-tail classifier — see
+    test_classify_session_failure_tool_rejected_is_not_throttle."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: A tool was rejected by the user.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_session_sidecar(sessions_dir, 42, log_path)
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="stalled"
+    )
+
+    assert failure_kind == "stalled"
+    assert throttled_until is None
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "stalled"
+
+
+def test_update_session_record_unknown_tail_falls_back_to_stalled(tmp_path: Path) -> None:
+    """Unknown log tail should fall back to the provided fallback_kind."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: something completely unrelated went wrong\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_session_sidecar(sessions_dir, 42, log_path)
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="stalled"
+    )
+
+    assert failure_kind == "stalled"
+    assert throttled_until is None
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "stalled"
+
+
+def test_update_session_record_custom_throttle_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.throttle_error_markers is configurable without code changes."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: provider-specific frobnicate limit exceeded\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_session_sidecar(sessions_dir, 42, log_path)
+
+    config = OrchestratorConfig(
+        runtime=RuntimeConfig(throttle_error_markers=("frobnicate limit exceeded",))
+    )
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, config=config
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
 

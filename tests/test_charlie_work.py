@@ -81,6 +81,24 @@ def test_default_config_runner_scaling_disabled() -> None:
     assert config.runner_scaling.enabled is False
 
 
+def test_default_config_throttle_error_markers() -> None:
+    """RuntimeConfig.throttle_error_markers defaults to genuine provider
+    throttle signatures only.
+
+    Issue #260, corrected premise: "A tool was rejected by the user" was
+    originally a default here, but it is the Devin CLI's own surfacing of a
+    PreToolUse hook block, not a provider throttle condition — it must never
+    be a default throttle marker (retry/cooldown semantics are wrong for a
+    hard hook block). See PostMortemConfig.signature_rules for the
+    worker_blocked rule that owns that signature instead.
+    """
+    config = load_config()
+    assert "Reached overall message rate limit" in config.runtime.throttle_error_markers
+    assert "rate limit" in config.runtime.throttle_error_markers
+    assert "too many requests" in config.runtime.throttle_error_markers
+    assert "A tool was rejected by the user" not in config.runtime.throttle_error_markers
+
+
 def test_runner_scaling_config_parses_with_enabled_flag(tmp_path: Path) -> None:
     """RunnerScalingConfig parses with enabled=true and custom values."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -161,6 +179,26 @@ runner_scaling:
     )
     with pytest.raises(ConfigError, match="must be a bool"):
         load_config(config_file)
+
+
+def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.throttle_error_markers is configurable from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runtime:
+  throttle_error_markers:
+    - "Reached overall message rate limit"
+    - "A tool was rejected by the user"
+    - "custom provider failure"
+"""
+    )
+    config = load_config(config_file)
+    assert config.runtime.throttle_error_markers == (
+        "Reached overall message rate limit",
+        "A tool was rejected by the user",
+        "custom provider failure",
+    )
 
 
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
@@ -7878,6 +7916,121 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     assert "session_failed_escalated" in event_kinds
 
 
+def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_suppresses_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #260 (corrected premise): the same escalate/suppress-redispatch
+    contract as test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispatch
+    above, but the worker_blocked signal comes from the log-tail fallback
+    (post_mortem.classify_and_record's _classify_worker_blocked_from_log_tail)
+    rather than a sessions.db match -- exercised here by pointing db_path at
+    a location with no database at all, so DB-based extraction degrades to
+    matched=False and the log tail ("Error: A tool was rejected by the
+    user.", the Devin CLI's own PreToolUse hook-block surfacing) is the only
+    signal available. This is the corrected #260 ask: this exact string was
+    originally misclassified as a provider throttle signature (rate_limited,
+    hot-redispatched after a cooldown) -- it must instead escalate on first
+    occurrence, identically to a DB-detected "Tool blocked:" verdict.
+
+    Mutation gate: this test is the log-tail-fallback counterpart of the
+    DB-based test above and is covered by the same
+    `if (worker_blocked or len(redispatch_at) > ...)` mutation at
+    workflow.py's _classify_dead_sessions_and_update_throttle_state; it also
+    independently covers post_mortem.classify_and_record's log-tail fallback
+    branch (see test_post_mortem.py's
+    test_classify_and_record_log_tail_fallback_detects_worker_blocked_when_db_unavailable
+    for that mutation gate's verbatim transcript).
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import AutoMergeConfig, DevinConfig, PostMortemConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+    worktree_path = str(tmp_path / "worktree")
+
+    # No sessions.db at all -- DB-based extraction must degrade to
+    # matched=False (extraction_error set), leaving the log tail as the
+    # only signal.
+    missing_db_path = tmp_path / "does-not-exist" / "sessions.db"
+
+    # Use command adapter to avoid needing a real devin binary.
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+        post_mortem=PostMortemConfig(db_path=str(missing_db_path)),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR at all — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("Error: A tool was rejected by the user.\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path=worktree_path,
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # No hot relabel-to-ready — same structural proof as the DB-based test.
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+
+    # Escalation transition actually ran.
+    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+
+    # escalation_reason recorded as worker_blocked, not the generic cap or
+    # (crucially, per the corrected premise) rate_limited.
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"]["42"]
+    assert issue_entry["status"] == "escalated"
+    assert issue_entry["escalation_reason"] == "worker_blocked"
+
+    # No throttle cooldown was set — a worker_blocked verdict must never
+    # carry rate-limit retry semantics.
+    assert state.get("throttled_until") is None
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_relabeled" not in event_kinds
+    assert "session_failed_escalated" in event_kinds
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
@@ -13455,7 +13608,15 @@ def test_supervisor_config_is_frozen() -> None:
 
 
 def test_post_mortem_config_defaults() -> None:
-    """PostMortemConfig defaults are stable and load_config picks them up."""
+    """PostMortemConfig defaults are stable and load_config picks them up.
+
+    Issue #260 (corrected premise) added a third default rule: "A tool was
+    rejected by the user" is the Devin CLI's own log/stdout surfacing of a
+    PreToolUse hook block — distinct from the "Tool blocked:" prefix that
+    appears in sessions.db message-node content — and drives
+    post_mortem.classify_and_record's log-tail fallback when the DB is
+    unavailable (see test_post_mortem.py's log-tail fallback tests).
+    """
     config = load_config()
     assert isinstance(config.post_mortem, PostMortemConfig)
     assert config.post_mortem.enabled is True
@@ -13465,6 +13626,7 @@ def test_post_mortem_config_defaults() -> None:
     assert config.post_mortem.signature_rules == (
         SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
+        SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
     )
 
 
