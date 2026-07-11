@@ -62,6 +62,7 @@ def _install_fake_create_worktree(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         if calls is not None:
             calls.append(
@@ -74,6 +75,7 @@ def _install_fake_create_worktree(
                     "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
+                    "issue_number": issue_number,
                 }
             )
         if with_venv:
@@ -381,6 +383,7 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         raise RuntimeError("git worktree add failed: branch already exists")
 
@@ -1060,6 +1063,7 @@ def test_launch_claude_worker_with_venv_source_junction(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         calls.append(
             {
@@ -1071,6 +1075,7 @@ def test_launch_claude_worker_with_venv_source_junction(
                 "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
+                "issue_number": issue_number,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1114,6 +1119,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         calls.append(
             {
@@ -1125,6 +1131,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
                 "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
+                "issue_number": issue_number,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1166,6 +1173,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         calls.append(
             {
@@ -1177,6 +1185,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
                 "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
+                "issue_number": issue_number,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1224,6 +1233,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         calls.append(
             {
@@ -1235,6 +1245,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
                 "materialize_dirs": materialize_dirs,
                 "rework": rework,
                 "recovery": recovery,
+                "issue_number": issue_number,
             }
         )
         return _fake_worktree(tmp_path, branch)

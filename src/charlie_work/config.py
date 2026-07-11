@@ -454,6 +454,67 @@ class SupervisorConfig:
 
 
 @dataclass(frozen=True)
+class SignatureRule:
+    """One config-extensible pattern -> failure_kind mapping.
+
+    ``pattern`` is a regex (re.IGNORECASE, re.search semantics) matched
+    against extracted post-mortem tool-call content. Operators can add
+    project-specific block-hook signatures without a code change — see
+    PostMortemConfig.signature_rules.
+    """
+
+    pattern: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class PostMortemConfig:
+    """Devin sessions.db post-mortem extraction (issue #261, extends #260).
+
+    After a worker is reaped as dead, this reads the last N ``message_nodes``
+    from the Devin CLI's local session store (sessions.db) to recover the
+    terminal tool call — most importantly a ``decision:block`` (a worker
+    killed by a push-gate hook mid-work, not a stall/crash/quota exhaustion).
+    That distinction matters operationally: a blocked worker's local commits
+    are real and worth preserving (see attempt_refs.py), and hot-redispatching
+    it into the same hook immediately is pointless — it escalates instead.
+
+    ``enabled`` defaults True (unlike the other opt-in sections) because
+    post-mortem extraction is read-only, best-effort, and degrades to a
+    silent no-op on any DB problem (missing file, lock, schema drift) —
+    there is no behavior to opt out of that isn't already a no-op on failure.
+
+    ``signature_rules`` classifies extracted message-node content into a
+    ``failure_kind``; only the ``worker_blocked`` kind currently changes
+    reaper behavior (suppresses hot redispatch, escalates instead), but the
+    list is config-extensible so new terminal-tool signatures can be added
+    without a code change.
+    """
+
+    enabled: bool = True
+    # "" resolves to %APPDATA%\devin\cli\sessions.db at read time (env-expanded,
+    # never hardcoded — see post_mortem._default_db_path).
+    db_path: str = ""
+    # How many of the most recent message_nodes to pull per matched session.
+    message_node_limit: int = 10
+    # Slack applied to both ends of the [started_at, reaped_at] window when
+    # matching a session by working_directory (clock skew / write-lag tolerance).
+    match_window_margin_seconds: int = 120
+    # When worker.started_at itself fails to parse, the match window can no
+    # longer be anchored to it — falling back to a narrow now-minus-margin
+    # window (the old behavior) missed real sessions that started well
+    # before "now" (the reap can run long after the worker actually died).
+    # Widen to this lookback from "now" instead; recorded on the resulting
+    # PostMortemRecord as window_start_fallback so a false non-match is
+    # diagnosable. Default 6h comfortably covers any single dispatch.
+    unparseable_started_at_lookback_seconds: int = 21600
+    signature_rules: tuple[SignatureRule, ...] = (
+        SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
+        SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
+    )
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -470,6 +531,7 @@ class OrchestratorConfig:
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -849,6 +911,72 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"got {type(value).__name__}"
             )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
+    post_mortem_data = _section(data, "post_mortem")
+    pm_enabled = post_mortem_data.get("enabled")
+    if pm_enabled is not None and not isinstance(pm_enabled, bool):
+        raise ConfigError(
+            f"config section 'post_mortem' key 'enabled' must be a bool, "
+            f"got {type(pm_enabled).__name__}"
+        )
+    db_path = post_mortem_data.get("db_path")
+    if db_path is not None and not isinstance(db_path, str):
+        raise ConfigError(
+            f"config section 'post_mortem' key 'db_path' must be a string, "
+            f"got {type(db_path).__name__}"
+        )
+    for int_key in (
+        "message_node_limit",
+        "match_window_margin_seconds",
+        "unparseable_started_at_lookback_seconds",
+    ):
+        value = post_mortem_data.get(int_key)
+        if value is not None and not isinstance(value, int):
+            raise ConfigError(
+                f"config section 'post_mortem' key '{int_key}' must be an int, "
+                f"got {type(value).__name__}"
+            )
+    signature_rules = post_mortem_data.get("signature_rules")
+    if signature_rules is not None:
+        if not isinstance(signature_rules, list):
+            raise ConfigError(
+                "config section 'post_mortem' key 'signature_rules' must be a list of "
+                f"{{pattern, kind}} mappings, got {type(signature_rules).__name__}"
+            )
+        built_rules: list[SignatureRule] = []
+        for i, item in enumerate(signature_rules):
+            if not isinstance(item, dict):
+                raise ConfigError(
+                    f"config section 'post_mortem' key 'signature_rules[{i}]' must be a "
+                    f"mapping with 'pattern' and 'kind' keys, got {type(item).__name__}"
+                )
+            unknown_rule_keys = sorted(set(item) - {"pattern", "kind"})
+            if unknown_rule_keys:
+                raise ConfigError(
+                    f"config section 'post_mortem' key 'signature_rules[{i}]' has unknown "
+                    f"key(s): {', '.join(unknown_rule_keys)} (valid: pattern, kind)"
+                )
+            pattern = item.get("pattern")
+            kind = item.get("kind")
+            if not isinstance(pattern, str) or not pattern:
+                raise ConfigError(
+                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' must "
+                    "be a non-empty string"
+                )
+            if not isinstance(kind, str) or not kind:
+                raise ConfigError(
+                    f"config section 'post_mortem' key 'signature_rules[{i}].kind' must "
+                    "be a non-empty string"
+                )
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError(
+                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' is not "
+                    f"a valid regex: {exc}"
+                ) from exc
+            built_rules.append(SignatureRule(pattern=pattern, kind=kind))
+        post_mortem_data["signature_rules"] = tuple(built_rules)
+    post_mortem = _build_section(PostMortemConfig, "post_mortem", post_mortem_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -865,4 +993,5 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         runners=runners,
         runner_scaling=runner_scaling,
         supervisor=supervisor,
+        post_mortem=post_mortem,
     )

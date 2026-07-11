@@ -84,6 +84,7 @@ def _install_fake_create_worktree(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         if calls is not None:
             calls.append(
@@ -95,6 +96,7 @@ def _install_fake_create_worktree(
                     "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
+                    "issue_number": issue_number,
                 }
             )
         if with_venv:
