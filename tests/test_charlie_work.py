@@ -7738,6 +7738,146 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
 
+def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #261 F5: a dead session whose post-mortem shows worker_blocked
+    (killed by a push-gate hook) must escalate to human review instead of
+    hot-relabeling to ready — a hot relabel would redispatch straight back
+    into the same push-gate hook and, per attempt_refs.py's motivation,
+    destroy the worker's unpushed commits on the next branch reset.
+
+    This is the workflow-level counterpart to
+    reconcile.py's test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
+    and mirrors test_classify_dead_sessions_with_open_pr_suppresses_relabel's
+    style, but the suppressing signal is a worker_blocked post-mortem verdict
+    (no open PR at all) rather than an open PR.
+
+    Mutation gate: dropping the `worker_blocked or` clause from the escalation
+    condition at workflow.py's `_classify_dead_sessions_and_update_throttle_state`
+    (the `if (worker_blocked or len(redispatch_at) > ...)` check) fails this test.
+    """
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from charlie_work.config import AutoMergeConfig, DevinConfig, PostMortemConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+    worktree_path = str(tmp_path / "worktree")
+
+    # Build a sessions.db fixture with a "Tool blocked:" message node matching
+    # this worker's worktree_path and timing — the same shape post_mortem.py's
+    # classify_and_record looks for to return "worker_blocked".
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE message_nodes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "content TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+            ("sess-1", worktree_path, now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "sess-1",
+                "tool",
+                'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}',
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Use command adapter to avoid needing a real devin binary.
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR at all — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("some work then silence\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path=worktree_path,
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # (a) No hot relabel-to-ready — the escalation path must never grant the
+    # `ready` label. Since dispatch() selects candidates via
+    # gh.issue_list(config.labels.ready), an issue that never receives this
+    # label can never be selected by a subsequent dispatch pass — this is a
+    # structural (not merely incidental) proof that redispatch cannot fire.
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+
+    # The escalation transition (redispatch_escalated) must have actually run:
+    # human_needed added, in_progress removed — proving escalation took the
+    # GitHub-mutating path rather than silently no-oping.
+    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+
+    # (b) escalation_reason recorded as worker_blocked, not the generic cap.
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"]["42"]
+    assert issue_entry["status"] == "escalated"
+    assert issue_entry["escalation_reason"] == "worker_blocked"
+
+    # No session_failed_relabeled event was appended for this issue — only
+    # session_failed_escalated.
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_relabeled" not in event_kinds
+    assert "session_failed_escalated" in event_kinds
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
