@@ -32,6 +32,7 @@ from typing import Any
 from charlie_work.process_utils import parse_proc_stat_starttime
 from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
+from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -79,6 +80,11 @@ class ClaudeWorkerRecord:
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
     log_bytes: int | None = None  # log_path.stat().st_size
+    attempt_ref: str | None = None  # refs/charlie/attempts/issue-<n>/attempt-<k> (issue #261)
+    attempt_ahead_of_main: int | None = None  # commit count ahead of base_ref at snapshot time
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     @property
     def ok(self) -> bool:
@@ -107,6 +113,9 @@ class ClaudeWorkerRecord:
             reclaimed=payload.get("reclaimed"),
             last_activity_at=payload.get("last_activity_at"),
             log_bytes=payload.get("log_bytes"),
+            attempt_ref=payload.get("attempt_ref"),
+            attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
+            rate_limit_defer_until=payload.get("rate_limit_defer_until"),
         )
 
 
@@ -370,6 +379,7 @@ def launch_claude_worker(
             rework=rework,
             recovery=recovery,
             base_ref=base_ref,
+            issue_number=issue_number,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = _error_record(
@@ -382,6 +392,13 @@ def launch_claude_worker(
             error=f"worktree creation failed: {exc}",
         )
         return _write_record(sessions_dir, record)
+
+    # A redispatch may have just preserved the prior attempt's branch tip
+    # (issue #261) — fold that into whatever post-mortem sidecar already
+    # exists for this issue so the ref is discoverable alongside the block
+    # diagnosis it belongs to. Best-effort: never blocks or fails dispatch.
+    if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
+        merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
 
     prompt_path = worktree.path / PROMPT_FILENAME
     try:
@@ -564,6 +581,10 @@ def launch_claude_worker(
         error=None,
         process_start_time=process_start_time,
         reclaimed=worktree.reclaimed,
+        attempt_ref=worktree.attempt_snapshot.ref_name if worktree.attempt_snapshot else None,
+        attempt_ahead_of_main=(
+            worktree.attempt_snapshot.ahead_of_main_count if worktree.attempt_snapshot else None
+        ),
     )
     return _write_record(sessions_dir, record)
 

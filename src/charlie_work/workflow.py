@@ -204,22 +204,28 @@ def _count_live_sessions(sessions_dir: Path) -> int:
 
 def _detect_stalled_sessions(
     sessions_dir: Path, config: OrchestratorConfig
-) -> list[dict[str, int]]:
+) -> list[dict[str, Any]]:
     """Detect stalled sessions (live PID but dead agent) without handling them.
 
     A session is stalled when its PID is alive but its log file's mtime is
     older than the configured threshold, or the log contains a terminal error
     marker. This is a read-only detection function for status/roll-call.
 
-    Returns a list of {issue, pid} dicts for stalled sessions.
+    Returns a list of {issue, pid, health, terminal_tool, terminal_reason}
+    dicts for stalled sessions. ``health`` distinguishes STALLED from DEAD
+    (issue #261) so digest callers can surface dead-worker terminal cause
+    instead of collapsing everything to "STALLED". ``terminal_tool``/
+    ``terminal_reason`` are populated only for DEAD entries with a matching
+    post-mortem sidecar (best-effort — absent when extraction found nothing).
     """
     from datetime import UTC, datetime
+    from .post_mortem import read_post_mortem
     from .worker import classify_worker_health, iter_workers
 
     if not config.watchdog.enabled:
         return []
 
-    stalled_entries: list[dict[str, int]] = []
+    stalled_entries: list[dict[str, Any]] = []
     now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
@@ -230,7 +236,17 @@ def _detect_stalled_sessions(
 
         # Both STALLED and DEAD are considered "stalled" for reporting purposes
         if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
-            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
+            entry: dict[str, Any] = {
+                "issue": w.issue_number,
+                "pid": w.pid,
+                "health": health.name,
+            }
+            if health is WorkerHealth.DEAD:
+                post_mortem = read_post_mortem(sessions_dir, w.issue_number)
+                if post_mortem is not None:
+                    entry["terminal_tool"] = post_mortem.terminal_tool
+                    entry["terminal_reason"] = post_mortem.terminal_reason
+            stalled_entries.append(entry)
 
     return stalled_entries
 
@@ -283,7 +299,11 @@ def _detect_and_handle_stalled_sessions(
     dispatch in the same pass).
     """
     from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
+    from .devin_shell import (
+        get_rate_limit_defer_until,
+        update_session_record_with_failure_classification,
+    )
+    from .post_mortem import classify_and_record
     from .worker import classify_worker_health, iter_workers, update_worker_log_stat
 
     if not config.watchdog.enabled:
@@ -292,17 +312,68 @@ def _detect_and_handle_stalled_sessions(
     stalled_entries: list[dict[str, int]] = []
     now = datetime.now(UTC)
 
+    def _parse_defer_until(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+        except (ValueError, TypeError):
+            return None
+
+    def _is_deferred(w: Any) -> bool:
+        """Return True if the worker has a stored defer deadline that has not passed."""
+        defer_until = _parse_defer_until(w.rate_limit_defer_until)
+        if defer_until is None:
+            return False
+        return now < defer_until
+
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        # Update log stat fields for progress tracking
+        # Update log stat fields for progress tracking. This also clears any
+        # stale rate-limit defer deadline when the log has resumed growing.
         update_worker_log_stat(sessions_dir, w)
 
         health = classify_worker_health(w, config, now)
 
+        # If a stalled-looking worker is still within a previously stored rate-limit
+        # defer window, skip it. The deadline is re-derived from the sidecar each pass.
+        if health == WorkerHealth.STALLED and _is_deferred(w):
+            continue
+
         # Both STALLED and DEAD are considered "stalled" for handling purposes
         if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
+            # Issue #247: before killing a stalled-looking worker, check the log tail
+            # for a rate-limit signature. If found and we are not already in a defer
+            # window, record a defer deadline and skip the kill this pass.
+            if health == WorkerHealth.STALLED and config.watchdog.rate_limit_defer_enabled:
+                if not _is_deferred(w) and w.rate_limit_defer_until is None:
+                    defer_until = get_rate_limit_defer_until(
+                        Path(w.log_path),
+                        config.watchdog.rate_limit_defer_slack_minutes,
+                        now,
+                    )
+                    if defer_until is not None:
+                        update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
+                        with state_lock(state_file):
+                            state = load_state(state_file)
+                            state = set_throttled_until(state, defer_until)
+                            state = append_event(
+                                state,
+                                "session_rate_limit_deferred",
+                                {
+                                    "issue_number": w.issue_number,
+                                    "pid": w.pid,
+                                    "defer_until": defer_until,
+                                },
+                            )
+                            save_state(state_file, state)
+                        continue
+
             # Kill the process tree (with start-time verification to prevent PID recycling)
             killed_pids = kill_process_tree(w.pid, w.process_start_time)
 
@@ -314,6 +385,17 @@ def _detect_and_handle_stalled_sessions(
                 for orphan_pid in orphan_pids:
                     _kill_orphan_pid(orphan_pid)
                     killed_pids.append(orphan_pid)
+
+            # Post-mortem extraction (issue #261): reads the Devin CLI's own
+            # session store for a terminal-tool diagnosis (esp. decision:block
+            # push-gate hooks) independent of the log tail. Runs BEFORE the
+            # log-tail classification below — when it detects a block, it
+            # writes failure_kind="worker_blocked" directly into the sidecar,
+            # which makes the classification call below a no-op via its
+            # existing "skip if already classified" short-circuit. Best-effort
+            # and read-only: any DB problem degrades to extraction_error and
+            # this never changes what happens next.
+            classify_and_record(sessions_dir, config, w, now=now)
 
             # Classify the sidecar (adapter-specific dispatch): log-tail
             # classification runs first, falling back to failure_kind "stalled"
@@ -636,6 +718,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
+    from .post_mortem import classify_and_record
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
     from .worker import iter_workers, update_worker_log_stat
 
@@ -658,6 +741,13 @@ def _classify_dead_sessions_and_update_throttle_state(
         if w.error is None and not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
+
+            # Post-mortem extraction (issue #261) — see the identical hook in
+            # _detect_and_handle_stalled_sessions above for the full rationale.
+            # Must run before the log-tail classification below: a detected
+            # worker_blocked writes failure_kind into the sidecar directly,
+            # which the classification calls below then no-op on.
+            worker_blocked = classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
 
             # Session exited without error - classify the failure (adapter-specific dispatch)
             if w.adapter_kind == "devin":
@@ -707,11 +797,22 @@ def _classify_dead_sessions_and_update_throttle_state(
                             if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
                         ]
                         redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
-                        if len(redispatch_at) > config.watchdog.max_auto_redispatch:
+                        # issue #261: a worker_blocked verdict (extracted from the
+                        # Devin CLI's session store — see post_mortem.classify_and_record)
+                        # means the worker was killed by a push-gate hook, not a
+                        # generic stall/crash. Hot-redispatching it just repeats the
+                        # same block, so it bypasses the redispatch-count cap entirely
+                        # and escalates on the very first occurrence.
+                        if (
+                            worker_blocked
+                            or len(redispatch_at) > config.watchdog.max_auto_redispatch
+                        ):
                             # Escalate to human review instead of relabeling to ready
                             entry["status"] = "escalated"
                             entry["redispatch_at"] = redispatch_at
-                            entry["escalation_reason"] = "redispatch_cap_exceeded"
+                            entry["escalation_reason"] = (
+                                "worker_blocked" if worker_blocked else "redispatch_cap_exceeded"
+                            )
                             # Clear worker PID when session fails (worker is dead)
                             entry.pop("worker_pid", None)
                             entry.pop("worker_process_start_time", None)
@@ -790,6 +891,8 @@ def _build_attention_digest(
                     "health": str,  # current health (e.g., "STALLED", "RUNAWAY", "DEAD")
                     "last_log_line": str | None,
                     "pid": int | None,
+                    "terminal_tool": str | None,  # issue #261: post-mortem terminal tool (DEAD only)
+                    "terminal_reason": str | None,  # issue #261: one-line terminal cause
                 }
             }
         repo: Repository name for the digest
@@ -828,6 +931,8 @@ def _build_attention_digest(
                         previous_health=last_health,
                         last_log_line=transition.get("last_log_line"),
                         pid=transition.get("pid"),
+                        terminal_tool=transition.get("terminal_tool"),
+                        terminal_reason=transition.get("terminal_reason"),
                     )
                 )
 
@@ -1627,9 +1732,11 @@ class OrchestratorApp:
             for entry in stalled_entries:
                 health_transitions[entry["issue"]] = {
                     "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                    "health": "STALLED",
+                    "health": entry.get("health", "STALLED"),
                     "last_log_line": None,
                     "pid": entry.get("pid"),
+                    "terminal_tool": entry.get("terminal_tool"),
+                    "terminal_reason": entry.get("terminal_reason"),
                 }
             digest = _build_attention_digest(
                 self.paths.state_file,
@@ -2626,9 +2733,11 @@ class OrchestratorApp:
         for entry in stalled_entries:
             health_transitions[entry["issue"]] = {
                 "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                "health": "STALLED",
+                "health": entry.get("health", "STALLED"),
                 "last_log_line": None,
                 "pid": entry.get("pid"),
+                "terminal_tool": entry.get("terminal_tool"),
+                "terminal_reason": entry.get("terminal_reason"),
             }
 
         # Emit notification digest if there are health transitions
@@ -3166,9 +3275,11 @@ class OrchestratorApp:
             for entry in stalled_entries:
                 health_transitions[entry["issue"]] = {
                     "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                    "health": "STALLED",
+                    "health": entry.get("health", "STALLED"),
                     "last_log_line": None,
                     "pid": entry.get("pid"),
+                    "terminal_tool": entry.get("terminal_tool"),
+                    "terminal_reason": entry.get("terminal_reason"),
                 }
             digest = _build_attention_digest(
                 self.paths.state_file,

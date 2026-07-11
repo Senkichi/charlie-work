@@ -874,6 +874,139 @@ def test_apply_fixes_session_failed_relabeled_idempotent(tmp_path: Path) -> None
     assert len(reconcile_events) == 1
 
 
+def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel(
+    tmp_path: Path,
+) -> None:
+    """Issue #261 F5: a dead session whose post-mortem shows worker_blocked
+    (killed by a push-gate hook) must NOT be relabeled to ready/redispatched
+    like an ordinary dead session — that would hot-redispatch it straight
+    back into the same hook and, per attempt_refs.py's motivation, destroy
+    its unpushed local commits on the next branch reset. It must escalate
+    (session_failed_escalated) instead, mirroring workflow.py's
+    "redispatch_escalated" edge for the same signal."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from charlie_work.config import PostMortemConfig
+    from charlie_work.devin_shell import SessionRecord
+
+    worktree_path = str(tmp_path / "worktree")
+    now = datetime.now(UTC)
+
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE message_nodes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "content TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+            ("sess-1", worktree_path, now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "sess-1",
+                "tool",
+                'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}',
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = OrchestratorConfig(post_mortem=PostMortemConfig(db_path=str(db_path)))
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("some work then silence\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path=worktree_path,
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    claude_sidecar = sessions_dir / "issue-42.claude.json"
+    if claude_sidecar.exists():
+        claude_sidecar.unlink()
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # No hot relabel-to-ready for this issue.
+    relabel_drift = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert relabel_drift == []
+
+    escalated_drift = [d for d in drift if d.kind == "session_failed_escalated"]
+    assert len(escalated_drift) == 1
+    assert escalated_drift[0].issue_number == 42
+    assert "worker_blocked" in escalated_drift[0].detail
+
+    # detect_drift is read-only regardless of the worker_blocked branch.
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+
+
+def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path) -> None:
+    """Issue #261 F5: apply_fixes must transition session_failed_escalated
+    via the 'redispatch_escalated' label edge (adds human_needed, removes
+    the other workflow labels) rather than removing active labels /
+    re-adding ready like session_failed_relabeled does."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_escalated",
+            issue_number=42,
+            pr_number=None,
+            detail=(
+                "issue #42 session died blocked by a push-gate hook (worker_blocked), "
+                "no open PR; suppressing relabel-to-ready, escalating instead"
+            ),
+            fix_actions=("transition issue #42 labels via 'redispatch_escalated' event",),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert (42, config.labels.human_needed) in gh.labels_added
+    assert (42, config.labels.ready) not in gh.labels_added
+    # ready must never be added for an escalated worker_blocked session.
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
+    assert reconcile_events[0]["payload"]["issue_number"] == 42
+
+
 def test_detect_drift_session_failed_already_has_ready_label(tmp_path: Path) -> None:
     """Issue #118: if issue already has ready label, don't add it again."""
     from charlie_work.devin_shell import SessionRecord

@@ -33,6 +33,7 @@ from typing import Any
 from charlie_work.process_utils import parse_proc_stat_starttime
 from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
+from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
@@ -89,6 +90,11 @@ class SessionRecord:
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
     log_bytes: int | None = None  # log_path.stat().st_size
+    attempt_ref: str | None = None  # refs/charlie/attempts/issue-<n>/attempt-<k> (issue #261)
+    attempt_ahead_of_main: int | None = None  # commit count ahead of base_ref at snapshot time
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -113,6 +119,9 @@ class SessionRecord:
             reclaimed=payload.get("reclaimed"),
             last_activity_at=payload.get("last_activity_at"),
             log_bytes=payload.get("log_bytes"),
+            attempt_ref=payload.get("attempt_ref"),
+            attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
+            rate_limit_defer_until=payload.get("rate_limit_defer_until"),
         )
 
 
@@ -178,6 +187,46 @@ def _classify_session_failure(
         )
 
     return None, None
+
+
+def get_rate_limit_defer_until(
+    log_path: Path, slack_minutes: int, now: datetime | None = None
+) -> str | None:
+    """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
+
+    Reads the same 2KB tail as ``_classify_session_failure`` and matches the
+    same adapter-owned rate-limit patterns (issue #247). If the tail matches
+    ``_RATE_LIMIT_PATTERN`` and a ``"resets in N minutes"`` value is found, the
+    defer deadline is ``now + N minutes + slack``. Otherwise the fallback
+    ``_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES`` is used.
+
+    Returns None when the log is missing, unreadable, or does not contain a
+    rate-limit signature. Quota exhaustion is intentionally not deferred here.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    if not log_path.exists():
+        return None
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    if not _RATE_LIMIT_PATTERN.search(tail):
+        return None
+
+    match = _RESETS_IN_PATTERN.search(tail)
+    if match:
+        minutes = int(match.group(1))
+    else:
+        minutes = _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+
+    defer_until = now + timedelta(minutes=minutes + slack_minutes)
+    return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -273,6 +322,7 @@ def launch_devin_session(
             rework=rework,
             recovery=recovery,
             base_ref=base_ref,
+            issue_number=issue_number,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         record = SessionRecord(
@@ -288,6 +338,13 @@ def launch_devin_session(
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record
+
+    # A redispatch may have just preserved the prior attempt's branch tip
+    # (issue #261) — fold that into whatever post-mortem sidecar already
+    # exists for this issue so the ref is discoverable alongside the block
+    # diagnosis it belongs to. Best-effort: never blocks or fails dispatch.
+    if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
+        merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     try:
@@ -361,6 +418,10 @@ def launch_devin_session(
         error=error,
         process_start_time=process_start_time,
         reclaimed=worktree.reclaimed,
+        attempt_ref=worktree.attempt_snapshot.ref_name if worktree.attempt_snapshot else None,
+        attempt_ahead_of_main=(
+            worktree.attempt_snapshot.ahead_of_main_count if worktree.attempt_snapshot else None
+        ),
     )
     _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
     return record
@@ -623,6 +684,7 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
+    "get_rate_limit_defer_until",
     "_get_process_start_time",
     "_sidecar_path",
 ]

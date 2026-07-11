@@ -14,6 +14,7 @@ from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.devin_shell import (
     DEFAULT_COMMAND_TEMPLATE,
     SessionRecord,
+    get_rate_limit_defer_until,
     is_session_alive,
     launch_devin_session,
     probe_devin,
@@ -84,6 +85,7 @@ def _install_fake_create_worktree(
         materialize_dirs=(),
         rework=False,
         recovery=None,
+        issue_number=None,
     ):
         if calls is not None:
             calls.append(
@@ -95,6 +97,7 @@ def _install_fake_create_worktree(
                     "materialize_dirs": materialize_dirs,
                     "rework": rework,
                     "recovery": recovery,
+                    "issue_number": issue_number,
                 }
             )
         if with_venv:
@@ -1267,6 +1270,55 @@ def test_classify_session_failure_missing_log(tmp_path: Path) -> None:
 
     assert failure_kind is None
     assert throttled_until is None
+
+
+def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
+    """Test that get_rate_limit_defer_until returns a deadline offset by the parsed reset time plus slack."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC)
+    defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
+
+    assert defer_until is not None
+    assert "T" in defer_until
+    assert "Z" in defer_until
+    expected = now + timedelta(minutes=10 + 2)
+    parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+    assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
+    """Test that get_rate_limit_defer_until uses the default cooldown when no reset time is present."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Please try again later.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC)
+    defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
+
+    assert defer_until is not None
+    expected = now + timedelta(minutes=15 + 2)
+    parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+    assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_get_rate_limit_defer_until_no_match(tmp_path: Path) -> None:
+    """Test that get_rate_limit_defer_until returns None for non-rate-limit logs."""
+    log_path = tmp_path / "session.log"
+    log_path.write_text("Working on task...\n", encoding="utf-8")
+
+    assert get_rate_limit_defer_until(log_path, slack_minutes=2) is None
 
 
 def test_update_session_record_with_failure_classification(tmp_path: Path) -> None:

@@ -32,15 +32,19 @@ $section_scope_contract
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change at the right abstraction layer.
 5. Add or update regression tests unless genuinely not applicable (justify if so).
-6. Run the full test suite with the canonical command from the worktree root:
+6. Run the tests impacted by your change from the worktree root: the test
+   file(s) you added or modified, plus `grep tests/` for every
+   module/function/symbol your production diff touched and run every
+   matching test file — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest -q --tb=short
+   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
-   CI runs the full matrix as the regression authority; your local run is a fast
-   pre-flight, not the merge gate. **You share this host's cores and RAM with
-   other concurrent workers** — if the suite uses `pytest-xdist`, bound the pool
-   (e.g. `-n 2`, not `-n auto`) so the fleet stays near one worker per core
-   instead of paging the machine into swap. Quote the exact command you ran
+   Do NOT run the full suite locally — CI runs the full matrix on push and is
+   the regression authority and merge gate; a long silent local run also
+   risks the session getting reaped as stalled. **You share this host's cores
+   and RAM with other concurrent workers** — if you use `pytest-xdist`, bound
+   the pool (e.g. `-n 2`, not `-n auto`) so the fleet stays near one worker
+   per core instead of paging the machine into swap. Quote the exact command you ran
    AND the collected/passed count in your completion report (e.g., "300 collected, 300 passed").
 7. Match CI locally before pushing and COMMIT anything the formatters touch — an
    uncommitted reflow is the #1 cause of green-locally / red-on-CI.

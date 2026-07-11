@@ -878,6 +878,110 @@ def test_recovery_fetch_fallback_on_missing_remote_branch(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
+def test_redispatch_preserves_attempt_ref_before_branch_reset(tmp_path: Path) -> None:
+    """Issue #261: a redispatch that resets a branch with unpushed commits
+    (fetch-fallback recovery path, issue #110) must preserve the old tip
+    under refs/charlie/attempts/issue-<n>/attempt-1 before ``git branch -D``
+    destroys it — that tip is the only surviving record of a worker that
+    died after committing real work but before its first push (e.g. blocked
+    by a .devin push-gate hook).
+    """
+    from charlie_work.attempt_refs import ATTEMPT_REF_PREFIX
+
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-261-attempt-preserve"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", issue_number=261)
+
+    # Simulate the dead worker having committed real work before dying
+    # (never pushed — this is exactly the fetch-fallback scenario).
+    work_file = info1.path / "work.txt"
+    work_file.write_text("unpushed work\n", encoding="utf-8")
+    _git(info1.path, "add", "work.txt")
+    _git(info1.path, "commit", "-m", "worker commit before death")
+    pre_reset_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
+
+    # Redispatch: fetch-fallback recovery detects no remote branch and
+    # resets, but must snapshot the tip first.
+    info2 = create_worktree(
+        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=261
+    )
+
+    assert info2.reclaimed == "fetch-fallback"
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.error is None
+    assert info2.attempt_snapshot.old_tip == pre_reset_tip
+    assert info2.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-261/attempt-1"
+
+    # The ref must actually resolve to the pre-reset tip in the main repo's
+    # object store, independent of the (now-deleted) branch.
+    preserved = _git(repo_root, "rev-parse", info2.attempt_snapshot.ref_name).stdout.strip()
+    assert preserved == pre_reset_tip
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_second_redispatch_increments_attempt_number(tmp_path: Path) -> None:
+    """Issue #261: a second dead-and-redispatched attempt for the same issue
+    must snapshot to attempt-2, not overwrite attempt-1 — each attempt's tip
+    is independently recoverable.
+    """
+    from charlie_work.attempt_refs import ATTEMPT_REF_PREFIX, list_attempt_refs
+
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-262-double-attempt"
+    recovery_record = {"branch_name": branch_name, "status": "dispatched"}
+
+    # Attempt 1: dies with unpushed work.
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", issue_number=262)
+    (info1.path / "attempt1.txt").write_text("attempt 1\n", encoding="utf-8")
+    _git(info1.path, "add", "attempt1.txt")
+    _git(info1.path, "commit", "-m", "attempt 1 work")
+    attempt1_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
+
+    info2 = create_worktree(
+        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
+    )
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-1"
+    assert info2.attempt_snapshot.old_tip == attempt1_tip
+
+    # Attempt 2: also dies with unpushed work.
+    (info2.path / "attempt2.txt").write_text("attempt 2\n", encoding="utf-8")
+    _git(info2.path, "add", "attempt2.txt")
+    _git(info2.path, "commit", "-m", "attempt 2 work")
+    attempt2_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
+    assert attempt2_tip != attempt1_tip
+
+    info3 = create_worktree(
+        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
+    )
+    assert info3.attempt_snapshot is not None
+    assert info3.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-2"
+    assert info3.attempt_snapshot.old_tip == attempt2_tip
+
+    refs = list_attempt_refs(repo_root, 262)
+    assert refs == (
+        f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-1",
+        f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-2",
+    )
+    # Attempt 1's tip must still be independently resolvable.
+    preserved1 = _git(repo_root, "rev-parse", refs[0]).stdout.strip()
+    assert preserved1 == attempt1_tip
+
+    # Clean up
+    remove_worktree(repo_root, info3.path)
+
+
 def test_recovery_stale_worktree_pruned_on_missing_directory(tmp_path: Path) -> None:
     """Issue #110: Stale worktree with missing directory should be pruned before fresh dispatch.
 

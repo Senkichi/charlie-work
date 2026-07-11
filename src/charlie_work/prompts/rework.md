@@ -40,10 +40,14 @@ You are done only when the existing PR has new commits addressing the review and
 
 After your final commit:
 
-1. Run the full test suite before pushing:
+1. Run the tests impacted by your change before pushing: the file(s) you
+   touched, plus `grep tests/` for every module/function/symbol the diff
+   touched — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest -q --tb=short
+   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
+   Do NOT run the full suite locally — CI runs it on push and is the merge
+   gate.
 2. Push your branch:
    ```bash
    git push origin $branch_name

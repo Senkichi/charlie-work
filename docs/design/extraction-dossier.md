@@ -361,7 +361,20 @@ almost entirely:
 
 ### Output capture reality (weakest link, dominant failure mode)
 `devin --print` writes **only the final assistant message to stdout at process exit** — no
-incremental transcript. Observed failure signatures in production logs:
+incremental transcript. There is no documented `--unbuffered`, `--verbose`, or
+`CHISEL_LOG_STDOUT` variant that streams provider-level status messages to the process stdout
+in real time; `--export` emits a per-turn transcript file after each turn rather than a
+stream, and was never wired into the launcher. Because the session log is therefore final-message-only,
+rate-limit messages cannot be observed in the log while the worker is still alive.
+
+**Fallback (issue #247):** the stall watchdog now defers killing a stalled-looking worker
+when the log tail contains a provider rate-limit signature (`Reached overall message rate limit` /
+`resets in N minutes`). The defer deadline is persisted to the session sidecar and to
+`state.json` (as `throttled_until`), so the dispatch loop also defers until the cooldown
+window passes. Once the defer deadline expires with no new log activity, the worker is killed
+and classified through the normal issue #246 path.
+
+Observed failure signatures in production logs:
 - **0-byte log**: session interrupted before emitting a final message (issue-649: recovered by
   hand-writing a `finish-prompt.md` describing what was done vs. remaining and relaunching a
   fresh session in the same worktree — the uncommitted worktree state survived the crash).
