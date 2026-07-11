@@ -43,7 +43,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .config import OrchestratorConfig, SignatureRule
+from .config import OrchestratorConfig, PostMortemConfig, SignatureRule
 
 if TYPE_CHECKING:
     from .attempt_refs import AttemptSnapshot
@@ -439,35 +439,22 @@ def _write_failure_kind_to_sidecar(
     writer(sidecar_path, payload)
 
 
-def classify_and_record(
+def _classify_via_sessions_db(
     sessions_dir: Path,
-    config: OrchestratorConfig,
+    pm_config: PostMortemConfig,
     worker: WorkerView,
-    *,
-    now: datetime | None = None,
+    resolved_now: datetime,
 ) -> str | None:
-    """Extract a post-mortem for a just-reaped dead ``worker`` and record it.
+    """DB-based post-mortem extraction — the primary signal.
 
-    Must be called BEFORE the adapter's own log-tail classification
-    (``update_session_record_with_failure_classification`` /
-    ``update_worker_record_with_failure_classification``) — when this
-    detects a ``worker_blocked`` signature, it writes ``failure_kind``
-    directly into the sidecar, which makes those functions' existing
-    "skip if already classified" short-circuit take over. This keeps the
-    integration additive: no rewrite of either adapter's regex classifier.
-
-    Returns "worker_blocked" when detected (caller should treat this as a
-    signal to suppress hot redispatch), otherwise None (existing
-    log-tail-then-stalled classification proceeds unaffected). Always
-    writes a ``post-mortem.json`` sidecar when the section is enabled and a
-    session was matched (or the reason it wasn't), for ``doctor``/digest
-    surfacing — but a write failure never propagates as an exception.
+    Always writes a diagnostic ``PostMortemRecord`` (matched True/False plus
+    why) for ``doctor``/digest surfacing; returns ``"worker_blocked"`` only
+    when a ``signature_rules`` rule of that kind matched the terminal tool
+    call, else None. Extracted from ``classify_and_record`` so the caller can
+    compose this with the log-tail fallback (``_classify_worker_blocked_
+    from_log_tail`` below) without duplicating the sidecar-diagnostics
+    plumbing.
     """
-    pm_config = config.post_mortem
-    if not pm_config.enabled:
-        return None
-
-    resolved_now = now or datetime.now(UTC)
     db_path = _resolve_db_path(pm_config.db_path)
 
     conn, temp_copy_path, open_error = _open_readonly(db_path)
@@ -542,16 +529,111 @@ def classify_and_record(
         )
         _try_write_record(sessions_dir, record)
 
-        if failure_kind == "worker_blocked":
-            _write_failure_kind_to_sidecar(sessions_dir, worker, "worker_blocked")
-            return "worker_blocked"
-        return None
+        return failure_kind if failure_kind == "worker_blocked" else None
     finally:
         try:
             conn.close()
         except sqlite3.Error:
             pass
         _cleanup_temp_copy(temp_copy_path)
+
+
+def _classify_worker_blocked_from_log_tail(
+    log_path: Path, signature_rules: tuple[SignatureRule, ...]
+) -> bool:
+    """Fallback ``worker_blocked`` classifier over the worker's own log tail.
+
+    Used when DB-based extraction (``_classify_via_sessions_db`` above)
+    misses — ``post_mortem.enabled`` is False, sessions.db is
+    locked/missing/schema-drifted, or no session matched this worker's
+    working_directory/time window. The log tail is the only signal left in
+    that case (issue #260, corrected premise: "A tool was rejected by the
+    user" is the Devin CLI's own log/stdout surfacing of a PreToolUse hook
+    block, not something that ever reaches sessions.db as a "Tool blocked:"
+    message-node row).
+
+    Reuses ``PostMortemConfig.signature_rules`` (filtered to
+    ``kind == "worker_blocked"``) rather than adding a parallel config
+    surface — see that field's docstring. Matches against the last 2KB of
+    the log, mirroring ``devin_shell._classify_session_failure``'s tail
+    window.
+
+    A ``worker_blocked`` verdict from this function must never carry
+    throttle retry semantics (no ``throttled_until``) — provider-throttle
+    tail matching is a separate, adapter-owned concern with its own retry
+    semantics (see ``throttle_signatures.match_throttle_tail``); this
+    function only ever returns a bare bool, so there is no way for a caller
+    to accidentally wire it into that retry path.
+    """
+    if not log_path.exists():
+        return False
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    for rule in signature_rules:
+        if rule.kind != "worker_blocked":
+            continue
+        try:
+            if re.search(rule.pattern, tail, re.IGNORECASE):
+                return True
+        except re.error:
+            # A malformed pattern would already have been rejected at
+            # config-load time; treat any runtime surprise as no-match
+            # rather than raising out of the reaper pass.
+            continue
+    return False
+
+
+def classify_and_record(
+    sessions_dir: Path,
+    config: OrchestratorConfig,
+    worker: WorkerView,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Extract a post-mortem for a just-reaped dead ``worker`` and record it.
+
+    Must be called BEFORE the adapter's own log-tail classification
+    (``update_session_record_with_failure_classification`` /
+    ``update_worker_record_with_failure_classification``) — when this
+    detects a ``worker_blocked`` signature, it writes ``failure_kind``
+    directly into the sidecar, which makes those functions' existing
+    "skip if already classified" short-circuit take over. This keeps the
+    integration additive: no rewrite of either adapter's regex classifier.
+
+    Tries the sessions.db extraction first (``_classify_via_sessions_db``);
+    when that misses, falls back to the worker's own log tail
+    (``_classify_worker_blocked_from_log_tail``, issue #260 corrected
+    premise) — the only remaining signal when the DB is unavailable or
+    didn't contain a matching session.
+
+    Returns "worker_blocked" when detected by either source (caller should
+    treat this as a signal to suppress hot redispatch), otherwise None
+    (existing log-tail-then-stalled classification proceeds unaffected).
+    Always writes a ``post-mortem.json`` sidecar when the section is enabled
+    and a session was matched (or the reason it wasn't), for
+    ``doctor``/digest surfacing — but a write failure never propagates as an
+    exception.
+    """
+    pm_config = config.post_mortem
+    resolved_now = now or datetime.now(UTC)
+
+    if pm_config.enabled:
+        if _classify_via_sessions_db(sessions_dir, pm_config, worker, resolved_now) == (
+            "worker_blocked"
+        ):
+            _write_failure_kind_to_sidecar(sessions_dir, worker, "worker_blocked")
+            return "worker_blocked"
+
+        if _classify_worker_blocked_from_log_tail(
+            Path(worker.log_path), pm_config.signature_rules
+        ):
+            _write_failure_kind_to_sidecar(sessions_dir, worker, "worker_blocked")
+            return "worker_blocked"
+
+    return None
 
 
 def _try_write_record(sessions_dir: Path, record: PostMortemRecord) -> None:
