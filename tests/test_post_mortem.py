@@ -27,6 +27,40 @@ from charlie_work.post_mortem import (
 )
 from charlie_work.worker import WorkerView
 
+
+def _build_sessions_db_epoch_created_at(
+    db_path: Path,
+    *,
+    session_id: str = "sess-1",
+    working_directory: str = "C:/repo/.var/worktrees/issue-42",
+    created_at_epoch: int,
+) -> None:
+    """Build a fixture sessions.db whose ``created_at`` column is declared
+    INTEGER (not TEXT) and holds a raw epoch value — reproduces a real
+    sessions.db observed storing created_at as an epoch int (e.g.
+    ``1783760135``) for some rows. SQLite's TEXT column affinity would
+    coerce an inserted int to text, so this needs its own schema rather
+    than reusing ``_build_sessions_db``.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE message_nodes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "content TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+            (session_id, working_directory, created_at_epoch),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 _NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
 
 
@@ -356,22 +390,61 @@ def test_merge_attempt_snapshot_folds_ref_into_existing_sidecar(tmp_path: Path) 
     classify_and_record(sessions_dir, config, worker, now=_NOW)
     before = read_post_mortem(sessions_dir, worker.issue_number)
     assert before is not None
-    assert before.attempt_ref is None
+    assert before.attempts == ()
 
     snapshot = AttemptSnapshot(
         ref_name="refs/charlie/attempts/issue-42/attempt-1",
         old_tip="deadbeef" * 5,
         ahead_of_main_count=3,
     )
-    merge_attempt_snapshot(sessions_dir, worker.issue_number, snapshot)
+    merge_attempt_snapshot(sessions_dir, worker.issue_number, snapshot, now=_NOW)
 
     after = read_post_mortem(sessions_dir, worker.issue_number)
     assert after is not None
-    assert after.attempt_ref == "refs/charlie/attempts/issue-42/attempt-1"
-    assert after.attempt_ahead_of_main == 3
+    assert len(after.attempts) == 1
+    assert after.attempts[0].ref == "refs/charlie/attempts/issue-42/attempt-1"
+    assert after.attempts[0].ahead_of_main == 3
     # message_nodes must survive untouched, still typed as MessageNode.
     assert after.message_nodes == before.message_nodes
     assert all(isinstance(n, MessageNode) for n in after.message_nodes)
+
+
+def test_merge_attempt_snapshot_appends_without_overwriting_prior_attempts(
+    tmp_path: Path,
+) -> None:
+    """A sidecar can outlive more than one redispatch attempt before it is
+    next read/rotated — a second merge_attempt_snapshot call must append a
+    second AttemptAttachment, not overwrite the first one (issue #261 F4:
+    the prior implementation used dataclasses.replace on singular
+    attempt_ref/attempt_ahead_of_main fields, silently losing the first
+    attempt's ref)."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(db_path, nodes=[])
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+    classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    first = AttemptSnapshot(
+        ref_name="refs/charlie/attempts/issue-42/attempt-1",
+        old_tip="a" * 40,
+        ahead_of_main_count=1,
+    )
+    second = AttemptSnapshot(
+        ref_name="refs/charlie/attempts/issue-42/attempt-2",
+        old_tip="b" * 40,
+        ahead_of_main_count=2,
+    )
+    merge_attempt_snapshot(sessions_dir, worker.issue_number, first, now=_NOW)
+    merge_attempt_snapshot(sessions_dir, worker.issue_number, second, now=_NOW)
+
+    after = read_post_mortem(sessions_dir, worker.issue_number)
+    assert after is not None
+    assert [a.ref for a in after.attempts] == [
+        "refs/charlie/attempts/issue-42/attempt-1",
+        "refs/charlie/attempts/issue-42/attempt-2",
+    ]
+    assert [a.ahead_of_main for a in after.attempts] == [1, 2]
 
 
 def test_merge_attempt_snapshot_noop_when_no_sidecar_exists(tmp_path: Path) -> None:
@@ -449,3 +522,134 @@ def test_classify_and_record_uses_custom_signature_rules(tmp_path: Path) -> None
     result = classify_and_record(sessions_dir, config, worker, now=_NOW)
 
     assert result == "worker_blocked"
+
+
+# ---------------------------------------------------------------------------
+# Session-window matching precision (issue #261 F1+F2): defensive created_at
+# parsing (epoch int, naive string) and a widened fallback window when
+# worker.started_at itself is unparseable.
+# ---------------------------------------------------------------------------
+
+
+def test_find_matching_session_accepts_epoch_int_created_at(tmp_path: Path) -> None:
+    """A real sessions.db has been observed storing created_at as a raw
+    epoch integer (e.g. 1783760135) rather than an ISO string — the column
+    is declared TEXT but SQLite's type affinity does not coerce a
+    writer-inserted INTEGER value. Must still match."""
+    db_path = tmp_path / "sessions.db"
+    created_at_dt = datetime(2026, 7, 11, 11, 56, 0, tzinfo=UTC)
+    _build_sessions_db_epoch_created_at(db_path, created_at_epoch=int(created_at_dt.timestamp()))
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None  # no message_nodes -> nothing to classify as blocked
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-1"
+
+
+def test_find_matching_session_accepts_naive_iso_string_created_at(tmp_path: Path) -> None:
+    """A naive ISO-8601 created_at (no tz offset, as sessions.db actually
+    stores it) must be treated as UTC and matched correctly against the
+    tz-aware match window computed from worker.started_at."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        created_at="2026-07-11T11:56:00",  # naive, no tz suffix
+        nodes=[],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.window_start_fallback is None  # started_at parsed fine
+
+
+def test_find_matching_session_ignores_out_of_window_row_even_if_lexicographically_greater(
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the SQL-side lexicographic-string-comparison bug:
+    a naive created_at string that would have sorted "greater than" the
+    isoformat()'d window bound as plain text, but is chronologically outside
+    the window once actually parsed, must NOT match."""
+    db_path = tmp_path / "sessions.db"
+    # worker started_at=11:55:00Z, margin=120s -> window [11:53:00, 12:02:00]Z.
+    # A calendar day later sorts "greater" lexicographically but is far
+    # outside the real time window once parsed.
+    _build_sessions_db(db_path, created_at="2026-07-12T11:56:00", nodes=[])
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is False
+
+
+def test_classify_and_record_unparseable_started_at_widens_fallback_window(
+    tmp_path: Path,
+) -> None:
+    """When worker.started_at itself fails to parse, the match window must
+    widen to the config lookback from "now" (not a narrow now-minus-margin
+    window) — a session that started well before "now" (e.g. 2h earlier,
+    outside the old ~240s window but inside the 6h default lookback) must
+    still be found, and window_start_fallback must record that this
+    fallback fired."""
+    db_path = tmp_path / "sessions.db"
+    session_created_at = _NOW.replace(hour=10)  # 2 hours before _NOW (12:00)
+    _build_sessions_db(
+        db_path,
+        created_at=session_created_at.strftime("%Y-%m-%dT%H:%M:%S"),
+        nodes=[],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(started_at="not-a-timestamp")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.window_start_fallback == "unparseable_started_at"
+
+
+def test_classify_and_record_unparseable_started_at_no_match_still_records_fallback(
+    tmp_path: Path,
+) -> None:
+    """Even when nothing matches within the widened fallback window, the
+    fact that the fallback fired must still be recorded — otherwise a false
+    non-match caused by an unparseable started_at is indistinguishable from
+    "genuinely no session ran," which is exactly the diagnosability gap F1/F2
+    close."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-999-different",
+        nodes=[],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(started_at="not-a-timestamp")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is False
+    assert record.window_start_fallback == "unparseable_started_at"
