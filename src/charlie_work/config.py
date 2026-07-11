@@ -178,11 +178,20 @@ class RuntimeConfig:
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
     # Literal substrings matched against the last 2KB of worker logs to detect
-    # provider throttling. Defaults to the two observed launch-death signatures;
-    # extend via config instead of editing code.
+    # genuine provider rate-limit/throttle conditions (retryable after a
+    # cooldown). Extend via config instead of editing code.
+    #
+    # Issue #260 (corrected premise): "A tool was rejected by the user" was
+    # originally included here, but it is the Devin CLI's own surfacing of a
+    # PreToolUse hook block (a hard, non-transient failure), not a provider
+    # throttle condition — see PostMortemConfig.signature_rules'
+    # worker_blocked rule, which owns that signature instead. Do not re-add
+    # it here: retry semantics (throttled_until, hot redispatch after
+    # cooldown) are wrong for a hook block.
     throttle_error_markers: tuple[str, ...] = (
         "Reached overall message rate limit",
-        "A tool was rejected by the user",
+        "rate limit",
+        "too many requests",
     )
 
 
@@ -496,6 +505,20 @@ class PostMortemConfig:
     reaper behavior (suppresses hot redispatch, escalates instead), but the
     list is config-extensible so new terminal-tool signatures can be added
     without a code change.
+
+    These same rules also drive ``post_mortem.classify_and_record``'s
+    log-tail fallback (issue #260, corrected premise): when sessions.db
+    extraction is disabled, unavailable (locked/missing/schema-drifted), or
+    matched but found no ``worker_blocked`` signature among the message
+    nodes, the worker's own log tail is the only remaining signal. Rather
+    than add a parallel config surface for that fallback, it reuses this
+    same ``signature_rules`` list (filtered to ``kind == "worker_blocked"``)
+    so a new block-hook signature is one config edit, not two. The
+    ``"A tool was rejected by the user"`` rule below is that fallback's
+    primary target — it is the exact phrasing the Devin CLI prints to its
+    own log/stdout when a PreToolUse hook blocks a tool call, distinct from
+    the ``"Tool blocked:"`` prefix that appears in sessions.db message-node
+    content.
     """
 
     enabled: bool = True
@@ -518,6 +541,7 @@ class PostMortemConfig:
     signature_rules: tuple[SignatureRule, ...] = (
         SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
+        SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
     )
 
 
