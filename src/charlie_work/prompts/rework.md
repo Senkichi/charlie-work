@@ -34,6 +34,17 @@ $review_summary
 
 You are done only when the existing PR has new commits addressing the review and the PR includes updated verification evidence.
 
+## Push authorization (explicit, pre-granted)
+
+This rework prompt IS the operator explicitly asking you to push your commits
+to the existing PR branch. Any always-on rule such as "do not push unless
+explicitly asked" or "pause before pushing to a shared remote" is ALREADY
+SATISFIED by this instruction — do not re-derive permission or wait for
+confirmation. Pushing the `agent/issue-*` branch is required, in scope, and
+pre-approved; it never touches `main` directly. Ending the session with
+committed-but-unpushed work is a task FAILURE — the reviewer cannot see
+unpushed commits.
+
 ## FINAL STEP — push and verify
 
 **Committing locally is NOT done.** The PR head must advance to reflect your work.
