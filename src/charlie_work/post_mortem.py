@@ -82,6 +82,21 @@ class MessageNode:
 
 
 @dataclass(frozen=True)
+class AttemptAttachment:
+    """One preserved-branch-tip attempt (issue #261) attached to a post-mortem.
+
+    A single dead-session post-mortem sidecar can outlive more than one
+    redispatch attempt before it's next read/rotated — ``PostMortemRecord.
+    attempts`` is append-only (see ``merge_attempt_snapshot``) so an earlier
+    attempt's ref is never silently overwritten by a later one.
+    """
+
+    ref: str
+    ahead_of_main: int | None
+    recorded_at: str
+
+
+@dataclass(frozen=True)
 class PostMortemRecord:
     """Result of a post-mortem extraction attempt for one dead worker.
 
@@ -90,6 +105,11 @@ class PostMortemRecord:
     matching session still sets ``matched=False`` with a human-readable
     ``extraction_error`` describing why, so ``doctor`` can distinguish "no
     signal available" from "this worker was healthy."
+
+    ``window_start_fallback`` is set only when ``worker.started_at`` failed
+    to parse and the match window had to be anchored to "now" (a config
+    lookback) instead — surfaced so a resulting non-match is diagnosable
+    rather than silently indistinguishable from "genuinely no session."
     """
 
     issue_number: int
@@ -102,8 +122,8 @@ class PostMortemRecord:
     terminal_reason: str | None = None
     failure_kind: str | None = None  # "worker_blocked" | None
     message_nodes: tuple[MessageNode, ...] = ()
-    attempt_ref: str | None = None
-    attempt_ahead_of_main: int | None = None
+    window_start_fallback: str | None = None
+    attempts: tuple[AttemptAttachment, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,6 +131,7 @@ class PostMortemRecord:
     @staticmethod
     def from_dict(payload: dict[str, Any]) -> PostMortemRecord:
         nodes = payload.get("message_nodes") or []
+        attempts = payload.get("attempts") or []
         return PostMortemRecord(
             issue_number=int(payload["issue_number"]),
             generated_at=str(payload.get("generated_at", "")),
@@ -130,8 +151,16 @@ class PostMortemRecord:
                 for n in nodes
                 if isinstance(n, dict)
             ),
-            attempt_ref=payload.get("attempt_ref"),
-            attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
+            window_start_fallback=payload.get("window_start_fallback"),
+            attempts=tuple(
+                AttemptAttachment(
+                    ref=str(a.get("ref", "")),
+                    ahead_of_main=a.get("ahead_of_main"),
+                    recorded_at=str(a.get("recorded_at", "")),
+                )
+                for a in attempts
+                if isinstance(a, dict)
+            ),
         )
 
 
@@ -216,6 +245,43 @@ def _cleanup_temp_copy(temp_copy_path: Path | None) -> None:
         pass
 
 
+def _parse_session_created_at(value: Any) -> datetime | None:
+    """Defensively parse a sessions.db ``created_at`` value.
+
+    Observed in the wild storing the same logical column as ISO-8601
+    strings (naive or tz-aware) AND as epoch integers/floats (e.g.
+    ``1783760135``) — the ``created_at`` column is declared TEXT in the
+    schema this module infers, but SQLite's type affinity does not coerce
+    a value the writer inserted as INTEGER, so both shapes can appear
+    side-by-side across rows. A naive datetime is treated as UTC (this
+    matches ``classify_and_record``'s own ``started_at`` handling). Never
+    raises — returns None on anything unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromtimestamp(float(text), tz=UTC)
+        except (OverflowError, ValueError):
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return None
+
+
 def _find_matching_session(
     conn: sqlite3.Connection,
     working_directory: str,
@@ -225,27 +291,41 @@ def _find_matching_session(
     """Find the session whose working_directory matches this worktree and
     whose created_at falls within [window_start, window_end].
 
-    Returns (session_id, error). Multiple matches pick the most recent
-    created_at (a stale prior session in the same directory is possible if
-    a worktree was reused across attempts before this window was narrowed).
+    Fetches every row for ``working_directory`` and does the time-window
+    comparison in Python rather than in the SQL query: a SQL-side
+    ``created_at >= ?`` bound compares lexicographically, which silently
+    produces wrong results whenever an ISO-string bound is compared against
+    an epoch-int row (or vice versa) — see ``_parse_session_created_at``.
+    Rows whose created_at is unparseable are skipped, not treated as a
+    match. Returns (session_id, error). Multiple matches within the window
+    pick the most recent by parsed created_at (a stale prior session in the
+    same directory is possible if a worktree was reused across attempts).
     """
     try:
         cursor = conn.execute(
-            "SELECT id FROM sessions "
-            "WHERE working_directory = ? AND created_at >= ? AND created_at <= ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (
-                working_directory,
-                window_start.isoformat(),
-                window_end.isoformat(),
-            ),
+            "SELECT id, created_at FROM sessions WHERE working_directory = ?",
+            (working_directory,),
         )
-        row = cursor.fetchone()
+        rows = cursor.fetchall()
     except sqlite3.Error as exc:
         return None, f"sessions table query failed (schema drift?): {exc}"
-    if row is None:
+
+    if not rows:
+        return None, "no session found matching working_directory"
+
+    candidates: list[tuple[datetime, str]] = []
+    for row in rows:
+        parsed = _parse_session_created_at(row[1])
+        if parsed is None:
+            continue
+        if window_start <= parsed <= window_end:
+            candidates.append((parsed, str(row[0])))
+
+    if not candidates:
         return None, "no session found matching working_directory within the time window"
-    return str(row[0]), None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1], None
 
 
 def _extract_last_n_nodes(
@@ -406,13 +486,23 @@ def classify_and_record(
 
     try:
         margin = timedelta(seconds=pm_config.match_window_margin_seconds)
+        window_start_fallback: str | None = None
         try:
             started_at = datetime.fromisoformat(worker.started_at)
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=UTC)
+            window_start = started_at - margin
         except (ValueError, TypeError):
-            started_at = resolved_now - margin
-        window_start = started_at - margin
+            # worker.started_at itself is unparseable — there is no reliable
+            # anchor for the window at all. A narrow now-minus-margin window
+            # (the old behavior) missed real sessions that actually started
+            # well before "now" (reaping can run long after a worker died).
+            # Widen to a config-derived lookback from "now" instead, and
+            # record that this fallback fired so a resulting non-match is
+            # diagnosable rather than indistinguishable from "no session."
+            window_start_fallback = "unparseable_started_at"
+            lookback = timedelta(seconds=pm_config.unparseable_started_at_lookback_seconds)
+            window_start = resolved_now - lookback
         window_end = resolved_now + margin
 
         session_id, match_error = _find_matching_session(
@@ -427,6 +517,7 @@ def classify_and_record(
                     db_path=str(db_path),
                     matched=False,
                     extraction_error=match_error,
+                    window_start_fallback=window_start_fallback,
                 ),
             )
             return None
@@ -447,6 +538,7 @@ def classify_and_record(
             terminal_reason=reason,
             failure_kind=failure_kind,
             message_nodes=nodes,
+            window_start_fallback=window_start_fallback,
         )
         _try_write_record(sessions_dir, record)
 
@@ -471,9 +563,13 @@ def _try_write_record(sessions_dir: Path, record: PostMortemRecord) -> None:
 
 
 def merge_attempt_snapshot(
-    sessions_dir: Path, issue_number: int, attempt_snapshot: AttemptSnapshot
+    sessions_dir: Path,
+    issue_number: int,
+    attempt_snapshot: AttemptSnapshot,
+    *,
+    now: datetime | None = None,
 ) -> None:
-    """Fold an ``AttemptSnapshot`` (issue #261) into an existing post-mortem sidecar.
+    """Append an ``AttemptSnapshot`` (issue #261) onto an existing post-mortem sidecar.
 
     Called by the adapters right after ``create_worktree`` returns from a
     redispatch: if a branch tip was preserved for this issue immediately
@@ -482,21 +578,28 @@ def merge_attempt_snapshot(
     sidecar (if any) already describes. No-op when there is no existing
     sidecar (nothing to attach the ref to) or when the snapshot itself has
     no ref (nothing was preserved, e.g. a clean branch with no commits).
+
+    Appends to ``PostMortemRecord.attempts`` rather than overwriting a
+    singular field: a sidecar can outlive more than one redispatch attempt
+    before it is next read or rotated, and an overwrite silently dropped
+    every attempt but the most recent one.
     """
     if attempt_snapshot.ref_name is None:
         return
     existing = read_post_mortem(sessions_dir, issue_number)
     if existing is None:
         return
-    updated = dataclasses.replace(
-        existing,
-        attempt_ref=attempt_snapshot.ref_name,
-        attempt_ahead_of_main=attempt_snapshot.ahead_of_main_count,
+    attachment = AttemptAttachment(
+        ref=attempt_snapshot.ref_name,
+        ahead_of_main=attempt_snapshot.ahead_of_main_count,
+        recorded_at=(now or datetime.now(UTC)).isoformat(),
     )
+    updated = dataclasses.replace(existing, attempts=(*existing.attempts, attachment))
     _try_write_record(sessions_dir, updated)
 
 
 __all__ = [
+    "AttemptAttachment",
     "MessageNode",
     "PostMortemRecord",
     "classify_and_record",

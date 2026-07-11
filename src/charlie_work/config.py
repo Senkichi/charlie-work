@@ -500,6 +500,14 @@ class PostMortemConfig:
     # Slack applied to both ends of the [started_at, reaped_at] window when
     # matching a session by working_directory (clock skew / write-lag tolerance).
     match_window_margin_seconds: int = 120
+    # When worker.started_at itself fails to parse, the match window can no
+    # longer be anchored to it — falling back to a narrow now-minus-margin
+    # window (the old behavior) missed real sessions that started well
+    # before "now" (the reap can run long after the worker actually died).
+    # Widen to this lookback from "now" instead; recorded on the resulting
+    # PostMortemRecord as window_start_fallback so a false non-match is
+    # diagnosable. Default 6h comfortably covers any single dispatch.
+    unparseable_started_at_lookback_seconds: int = 21600
     signature_rules: tuple[SignatureRule, ...] = (
         SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
@@ -916,7 +924,11 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"config section 'post_mortem' key 'db_path' must be a string, "
             f"got {type(db_path).__name__}"
         )
-    for int_key in ("message_node_limit", "match_window_margin_seconds"):
+    for int_key in (
+        "message_node_limit",
+        "match_window_margin_seconds",
+        "unparseable_started_at_lookback_seconds",
+    ):
         value = post_mortem_data.get(int_key)
         if value is not None and not isinstance(value, int):
             raise ConfigError(
