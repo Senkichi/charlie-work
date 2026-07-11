@@ -349,6 +349,50 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
     assert state["issues"]["1"]["health"] == "DEAD"
 
 
+def test_attention_digest_threads_terminal_tool_and_reason_through_file_sink(tmp_path):
+    """Issue #261 F6: terminal_tool/terminal_reason (recovered from a dead
+    worker's post-mortem) must survive the full plumbing —
+    health_transitions dict -> _build_attention_digest -> AttentionEntry ->
+    emit_digest -> sink serialization. Gating this through one sink (file,
+    the simplest to assert against) is sufficient: all four sinks share the
+    identical entry.terminal_tool/entry.terminal_reason mapping, just with
+    different transport, so a break in the shared AttentionEntry plumbing
+    itself would fail here regardless of which sink eventually ships it."""
+    state_file = tmp_path / "state.json"
+
+    health_transitions = {
+        7: {
+            "adapter_kind": "devin",
+            "health": "DEAD",
+            "last_log_line": "process exited",
+            "pid": None,
+            "terminal_tool": "bash",
+            "terminal_reason": "blocked by push-gate hook: rm -rf attempted",
+        }
+    }
+
+    digest = _build_attention_digest(state_file, health_transitions, repo="test-repo")
+
+    assert digest is not None
+    assert len(digest.transitions) == 1
+    entry = digest.transitions[0]
+    assert entry.issue_number == 7
+    assert entry.terminal_tool == "bash"
+    assert entry.terminal_reason == "blocked by push-gate hook: rm -rf attempted"
+
+    config = NotifyConfig(enabled=True, sink="file", file_path=str(tmp_path / "digest.jsonl"))
+    result = _file_sink(config, digest)
+
+    assert result.ok is True
+    line = (tmp_path / "digest.jsonl").read_text(encoding="utf-8").strip()
+    written = json.loads(line)
+    assert written["transitions"][0]["terminal_tool"] == "bash"
+    assert (
+        written["transitions"][0]["terminal_reason"]
+        == "blocked by push-gate hook: rm -rf attempted"
+    )
+
+
 def test_loop_completes_when_notify_sink_fails():
     """Integration-style: stub a failing sink into a loop() call with a synthetic stalled session,
     assert the CommandResult still reflects the dispatch/review/merge outcome (notify failure isolated)."""
