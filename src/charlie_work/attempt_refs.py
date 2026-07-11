@@ -14,6 +14,17 @@ This module snapshots a branch's current tip to a local, never-pushed ref
 such reset. Refs are cheap and local — they live only in the main repo's
 object store (shared by every worktree) and are safe to garbage-collect
 later; nothing here ever pushes them or blocks a redispatch on failure.
+
+Concurrency note: ``_next_attempt_number`` reads existing attempt refs via
+``git for-each-ref``, and ``snapshot_attempt_ref`` writes the new one via a
+separate ``git update-ref`` call — that read-then-write pair is not atomic.
+This is intentionally left unlocked: charlie-work's orchestrator drives
+redispatch for a given issue from a single-threaded reap pass (never two
+concurrent redispatches of the same issue), so the read and write can never
+interleave with another writer for the same ``issue_number`` in practice.
+If that invariant ever changes (e.g. concurrent reapers), this needs a
+real lock (``git update-ref`` alone does not provide compare-and-swap
+across the pair) — do not paper over it with a narrower mutex here.
 """
 
 from __future__ import annotations
