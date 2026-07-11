@@ -308,6 +308,11 @@ class WatchdogConfig:
     # Sessions whose log has not grown past the shim marker within this window
     # are classified as launch_stalled and reaped. Default 5 minutes.
     launch_stall_grace_minutes: int = 5
+    # Rate-limit deferral (issue #247): when a stalled-looking worker's log tail
+    # matches a provider rate-limit signature, defer the stall kill until the
+    # parsed reset time plus this slack has elapsed. Default 2 minutes.
+    rate_limit_defer_enabled: bool = True
+    rate_limit_defer_slack_minutes: int = 2
 
 
 @dataclass(frozen=True)
@@ -691,6 +696,21 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'watchdog' key 'launch_stall_grace_minutes' must be an int, "
             f"got {type(launch_stall_grace_minutes).__name__}"
+        )
+    # Validate rate-limit deferral config (issue #247)
+    rate_limit_defer_enabled = watchdog_data.get("rate_limit_defer_enabled")
+    if rate_limit_defer_enabled is not None and not isinstance(rate_limit_defer_enabled, bool):
+        raise ConfigError(
+            "config section 'watchdog' key 'rate_limit_defer_enabled' must be a bool, "
+            f"got {type(rate_limit_defer_enabled).__name__}"
+        )
+    rate_limit_defer_slack_minutes = watchdog_data.get("rate_limit_defer_slack_minutes")
+    if rate_limit_defer_slack_minutes is not None and not isinstance(
+        rate_limit_defer_slack_minutes, int
+    ):
+        raise ConfigError(
+            "config section 'watchdog' key 'rate_limit_defer_slack_minutes' must be an int, "
+            f"got {type(rate_limit_defer_slack_minutes).__name__}"
         )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
