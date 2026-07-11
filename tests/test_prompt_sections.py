@@ -225,8 +225,9 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         assert "## FINAL STEP — push and verify" in prompt
         # Verify the key instruction about local commits not being done
         assert "Committing locally is NOT done" in prompt
-        # Verify the full test suite instruction
-        assert "uv run --extra dev pytest -q --tb=short" in prompt
+        # Verify the canonical targeted test command (operator directive
+        # 2026-07-11: local runs are targeted only, full suite stays on CI)
+        assert "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short" in prompt
         # Verify the push instruction with RESOLVED branch name (from headRefName)
         assert "git push origin agent/issue-123-fix-search" in prompt
         # Verify the PR head verification with RESOLVED PR number
@@ -275,7 +276,7 @@ def test_worker_and_rework_templates_contain_identical_canonical_test_command() 
     uses a partial variant (issue #91).
     """
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
-    canonical_command = "uv run --extra dev pytest -q --tb=short"
+    canonical_command = "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short"
 
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         text = (prompts_dir / template_name).read_text(encoding="utf-8")
@@ -291,7 +292,7 @@ def test_rendered_worker_prompts_contain_canonical_test_command() -> None:
     This test goes through the real render_prompt call to ensure the command
     appears in the final rendered output that workers actually see.
     """
-    canonical_command = "uv run --extra dev pytest -q --tb=short"
+    canonical_command = "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short"
 
     for template_name in ("worker.md", "worker_claude_code.md"):
         prompt = _render_worker_with_sections(template_name)

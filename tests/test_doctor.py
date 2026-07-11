@@ -210,6 +210,133 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
     assert ok is True  # a warning-only sessions finding must not fail doctor
 
 
+def test_doctor_surfaces_post_mortem_terminal_cause_and_attempt_ref(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #261 F6: a dead session with a written post-mortem sidecar and a
+    preserved attempt ref must surface both in the "dead session post-mortems"
+    doctor check — otherwise operators have no visibility into a
+    push-gate-hook kill or salvaged unpushed commits without reading raw
+    sidecar JSON by hand."""
+    import subprocess
+
+    from charlie_work.attempt_refs import snapshot_attempt_ref
+    from charlie_work.post_mortem import PostMortemRecord
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    _write_sidecar(
+        sessions_dir,
+        "issue-7.json",
+        {
+            "issue_number": 7,
+            "branch": "agent/issue-7",
+            "prompt_path": "p.md",
+            "command": ["devin"],
+            "pid": None,
+            "started_at": "2026-01-01T00:00:00Z",
+            "log_path": "issue-7.log",
+            "error": "devin not found",
+        },
+    )
+    # A written post-mortem sidecar for the same dead session.
+    record = PostMortemRecord(
+        issue_number=7,
+        generated_at="2026-01-01T00:05:00+00:00",
+        db_path=str(tmp_path / "sessions.db"),
+        matched=True,
+        session_id="sess-7",
+        failure_kind="worker_blocked",
+        terminal_tool="bash",
+        terminal_reason="push-gate hook rejected: rm -rf attempted",
+    )
+    (sessions_dir / "issue-7.post-mortem.json").write_text(
+        json.dumps(record.to_dict()), encoding="utf-8"
+    )
+
+    # A real attempt ref preserved for issue 7, in a real git repo at repo_root
+    # (list_attempt_refs shells out to `git for-each-ref`).
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True
+    )
+    (tmp_path / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    snapshot = snapshot_attempt_ref(tmp_path, "HEAD", issue_number=7)
+    assert snapshot.ref_name is not None  # sanity: the fixture actually wrote a ref
+
+    monkeypatch.setattr(
+        "charlie_work.devin_shell.probe_devin",
+        lambda repo_root, **kwargs: RunResult(returncode=0, stdout="devin 1.2.3", stderr=""),
+    )
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
+
+    by_name = {check.name: check for check in checks}
+    post_mortems = by_name["dead session post-mortems"]
+    assert "issue #7" in post_mortems.detail
+    assert "failure_kind=worker_blocked" in post_mortems.detail
+    assert "terminal_tool=bash" in post_mortems.detail
+    assert "push-gate hook rejected" in post_mortems.detail
+    assert snapshot.ref_name in post_mortems.detail
+    assert post_mortems.severity == "warning"  # never blocks the run
+
+
+def test_doctor_surface_post_mortems_absent_degrades_silently(tmp_path: Path, monkeypatch) -> None:
+    """Issue #261 F6: a dead session with NO post-mortem sidecar and no
+    attempt refs must not surface a "dead session post-mortems" check at
+    all — post-mortem extraction is best-effort/opportunistic (issue #261),
+    never a doctor failure or a misleading empty finding."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    _write_sidecar(
+        sessions_dir,
+        "issue-9.json",
+        {
+            "issue_number": 9,
+            "branch": "agent/issue-9",
+            "prompt_path": "p.md",
+            "command": ["devin"],
+            "pid": None,
+            "started_at": "2026-01-01T00:00:00Z",
+            "log_path": "issue-9.log",
+            "error": "devin not found",
+        },
+    )
+    # No .post-mortem.json sidecar written, and no repo_root git refs — the
+    # extraction never ran / found nothing.
+
+    monkeypatch.setattr(
+        "charlie_work.devin_shell.probe_devin",
+        lambda repo_root, **kwargs: RunResult(returncode=0, stdout="devin 1.2.3", stderr=""),
+    )
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
+
+    by_name = {check.name: check for check in checks}
+    assert "dead session post-mortems" not in by_name
+    assert ok is True  # a failed launch alone is a warning, never a hard failure here
+
+
 def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.devin_shell.probe_devin",

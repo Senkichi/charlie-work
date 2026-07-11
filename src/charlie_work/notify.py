@@ -30,6 +30,12 @@ class AttentionEntry:
     previous_health: str | None
     last_log_line: str | None
     pid: int | None
+    # Issue #261: terminal tool call + one-line reason recovered from the
+    # Devin CLI session store post-mortem, when extraction succeeded (e.g.
+    # "bash" / "blocked by push-gate hook"). None when unset — for a live
+    # (non-DEAD) transition, or when post-mortem extraction found nothing.
+    terminal_tool: str | None = None
+    terminal_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,8 @@ def _webhook_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                         "previous_health": e.previous_health,
                         "last_log_line": e.last_log_line,
                         "pid": e.pid,
+                        "terminal_tool": e.terminal_tool,
+                        "terminal_reason": e.terminal_reason,
                     }
                     for e in digest.transitions
                 ],
@@ -101,6 +109,8 @@ def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
     if transition_count == 1:
         entry = digest.transitions[0]
         message = f"Issue #{entry.issue_number}: {entry.health} (was {entry.previous_health or 'unknown'})"
+        if entry.terminal_reason:
+            message += f" — {entry.terminal_reason}"
     else:
         message = f"{transition_count} issues need attention: {', '.join(str(e.issue_number) for e in digest.transitions)}"
 
@@ -184,6 +194,8 @@ def _shell_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                         "previous_health": e.previous_health,
                         "last_log_line": e.last_log_line,
                         "pid": e.pid,
+                        "terminal_tool": e.terminal_tool,
+                        "terminal_reason": e.terminal_reason,
                     }
                     for e in digest.transitions
                 ],
@@ -237,6 +249,8 @@ def _file_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                     "previous_health": e.previous_health,
                     "last_log_line": e.last_log_line,
                     "pid": e.pid,
+                    "terminal_tool": e.terminal_tool,
+                    "terminal_reason": e.terminal_reason,
                 }
                 for e in digest.transitions
             ],

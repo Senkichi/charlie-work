@@ -26,8 +26,10 @@ from charlie_work.config import (
     FleetConfig,
     LabelConfig,
     OrchestratorConfig,
+    PostMortemConfig,
     ReviewConfig,
     RuntimeConfig,
+    SignatureRule,
     SupervisorConfig,
     TestAdequacyConfig,
     WatchdogConfig,
@@ -2527,16 +2529,20 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     )
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
-    # Mock the liveness check to return True (simulating a live but stalled process)
+    # Mock the liveness check to return True (simulating a live but stalled process).
+    # Patch target is charlie_work.worker (not devin_shell): the stalled-detection
+    # path goes through worker.WorkerView.is_alive(), which holds its own
+    # already-bound reference to is_session_alive from its module-level import —
+    # patching devin_shell's attribute would not reach that call site.
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
     assert result.ok is True
     assert result.data["selected_count"] == 0
-    assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+    assert result.data["stalled"] == [{"issue": 123, "pid": 99999, "health": "STALLED"}]
 
 
 def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
@@ -7759,6 +7765,146 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
 
+def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #261 F5: a dead session whose post-mortem shows worker_blocked
+    (killed by a push-gate hook) must escalate to human review instead of
+    hot-relabeling to ready — a hot relabel would redispatch straight back
+    into the same push-gate hook and, per attempt_refs.py's motivation,
+    destroy the worker's unpushed commits on the next branch reset.
+
+    This is the workflow-level counterpart to
+    reconcile.py's test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
+    and mirrors test_classify_dead_sessions_with_open_pr_suppresses_relabel's
+    style, but the suppressing signal is a worker_blocked post-mortem verdict
+    (no open PR at all) rather than an open PR.
+
+    Mutation gate: dropping the `worker_blocked or` clause from the escalation
+    condition at workflow.py's `_classify_dead_sessions_and_update_throttle_state`
+    (the `if (worker_blocked or len(redispatch_at) > ...)` check) fails this test.
+    """
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from charlie_work.config import AutoMergeConfig, DevinConfig, PostMortemConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+    worktree_path = str(tmp_path / "worktree")
+
+    # Build a sessions.db fixture with a "Tool blocked:" message node matching
+    # this worker's worktree_path and timing — the same shape post_mortem.py's
+    # classify_and_record looks for to return "worker_blocked".
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE message_nodes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "content TEXT, created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+            ("sess-1", worktree_path, now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "sess-1",
+                "tool",
+                'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}',
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Use command adapter to avoid needing a real devin binary.
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR at all — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("some work then silence\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path=worktree_path,
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,  # No launch error - exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # (a) No hot relabel-to-ready — the escalation path must never grant the
+    # `ready` label. Since dispatch() selects candidates via
+    # gh.issue_list(config.labels.ready), an issue that never receives this
+    # label can never be selected by a subsequent dispatch pass — this is a
+    # structural (not merely incidental) proof that redispatch cannot fire.
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+
+    # The escalation transition (redispatch_escalated) must have actually run:
+    # human_needed added, in_progress removed — proving escalation took the
+    # GitHub-mutating path rather than silently no-oping.
+    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+
+    # (b) escalation_reason recorded as worker_blocked, not the generic cap.
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"]["42"]
+    assert issue_entry["status"] == "escalated"
+    assert issue_entry["escalation_reason"] == "worker_blocked"
+
+    # No session_failed_relabeled event was appended for this issue — only
+    # session_failed_escalated.
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_relabeled" not in event_kinds
+    assert "session_failed_escalated" in event_kinds
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
@@ -10931,7 +11077,13 @@ def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
 
 
 def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
-    """Issue #167: stalled section should remain byte-for-byte identical to pre-change output."""
+    """Issue #167: stalled section keeps its base {issue, pid} shape. Issue #261
+    intentionally extends each entry with a "health" field (STALLED vs DEAD) so
+    digest callers can surface dead-worker terminal cause instead of collapsing
+    everything to "STALLED"; terminal_tool/terminal_reason are added only for
+    DEAD entries with a matching post-mortem. This test now pins that extended
+    shape rather than the original byte-for-byte one.
+    """
     from datetime import UTC, datetime, timedelta
     import os
     from unittest.mock import patch
@@ -11000,14 +11152,18 @@ def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
     with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.status()
 
-    # Check that stalled section is unchanged (byte-for-byte identical shape)
+    # Check that the stalled section keeps its base shape plus the issue #261
+    # "health" field. This fixture is live (mocked) with a stale log, so it
+    # classifies as STALLED (not DEAD), which means no terminal_tool/
+    # terminal_reason keys are added (those are DEAD-only, per
+    # _detect_stalled_sessions).
     assert "stalled" in result.data
     assert isinstance(result.data["stalled"], list)
     assert any(entry["issue"] == 109 for entry in result.data["stalled"])
     assert any(entry["pid"] == 99999 for entry in result.data["stalled"])
-    # Ensure no extra fields were added to stalled entries
     for entry in result.data["stalled"]:
-        assert set(entry.keys()) == {"issue", "pid"}
+        assert set(entry.keys()) == {"issue", "pid", "health"}
+        assert entry["health"] == "STALLED"
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:
@@ -13318,6 +13474,133 @@ def test_supervisor_config_is_frozen() -> None:
     assert dataclasses.is_dataclass(cfg)
     with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
         cfg.poll_interval_seconds = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# PostMortemConfig tests (issue #261)
+# ---------------------------------------------------------------------------
+
+
+def test_post_mortem_config_defaults() -> None:
+    """PostMortemConfig defaults are stable and load_config picks them up."""
+    config = load_config()
+    assert isinstance(config.post_mortem, PostMortemConfig)
+    assert config.post_mortem.enabled is True
+    assert config.post_mortem.db_path == ""
+    assert config.post_mortem.message_node_limit == 10
+    assert config.post_mortem.match_window_margin_seconds == 120
+    assert config.post_mortem.signature_rules == (
+        SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
+        SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
+    )
+
+
+def test_post_mortem_config_parses_custom_values(tmp_path: Path) -> None:
+    """Custom post_mortem section values, including signature_rules, are parsed correctly."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  enabled: false
+  db_path: "C:/custom/sessions.db"
+  message_node_limit: 5
+  match_window_margin_seconds: 30
+  signature_rules:
+    - pattern: "custom-block-signature"
+      kind: "worker_blocked"
+"""
+    )
+    config = load_config(config_file)
+    assert config.post_mortem.enabled is False
+    assert config.post_mortem.db_path == "C:/custom/sessions.db"
+    assert config.post_mortem.message_node_limit == 5
+    assert config.post_mortem.match_window_margin_seconds == 30
+    assert config.post_mortem.signature_rules == (
+        SignatureRule(pattern="custom-block-signature", kind="worker_blocked"),
+    )
+
+
+def test_post_mortem_config_unknown_key_raises(tmp_path: Path) -> None:
+    """Unknown keys in post_mortem section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  enabled: true
+  unknown_key: 99
+"""
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong types in post_mortem section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  message_node_limit: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_signature_rules_wrong_shape_raises(tmp_path: Path) -> None:
+    """signature_rules must be a list of {pattern, kind} mappings."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  signature_rules: "not-a-list"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_signature_rule_bad_regex_raises(tmp_path: Path) -> None:
+    """An invalid regex pattern in a signature rule raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  signature_rules:
+    - pattern: "["
+      kind: "worker_blocked"
+"""
+    )
+    with pytest.raises(ConfigError, match="not a valid regex"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_is_frozen() -> None:
+    """PostMortemConfig is a frozen dataclass."""
+    import dataclasses
+
+    cfg = PostMortemConfig()
+    assert dataclasses.is_dataclass(cfg)
+    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
+        cfg.enabled = False  # type: ignore[misc]
+
+
+def test_signature_rule_is_frozen() -> None:
+    """SignatureRule is a frozen dataclass."""
+    import dataclasses
+
+    rule = SignatureRule(pattern="x", kind="worker_blocked")
+    assert dataclasses.is_dataclass(rule)
+    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
+        rule.kind = "other"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

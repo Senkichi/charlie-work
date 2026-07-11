@@ -203,6 +203,7 @@ def detect_drift(
     if repo_root is not None:
         from .claude_code import update_worker_record_with_failure_classification
         from .devin_shell import update_session_record_with_failure_classification
+        from .post_mortem import classify_and_record
         from .worker import _log_is_stalled_at_shim, iter_workers, update_worker_log_stat
 
         sessions_dir = repo_root / config.devin.sessions_dir
@@ -284,6 +285,23 @@ def detect_drift(
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)
 
+                    # Issue #261: post-mortem extraction must run BEFORE the
+                    # adapter's own log-tail classification below — see
+                    # classify_and_record's docstring. A "worker_blocked"
+                    # verdict (worker killed by a push-gate hook) writes
+                    # failure_kind into the sidecar directly, which makes the
+                    # adapter classifiers' "already classified" short-circuit
+                    # take over, and must suppress the relabel-to-ready /
+                    # redispatch below (mirrors workflow.py's dead-session
+                    # reaper: a blocked worker escalates instead of getting
+                    # hot-redispatched straight back into the same hook).
+                    # classify_and_record never raises — any DB/matching
+                    # failure degrades to matched=False and this is None.
+                    worker_blocked = (
+                        classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                        == "worker_blocked"
+                    )
+
                     # Session exited without error - classify the failure (adapter-specific dispatch)
                     if w.adapter_kind == "devin":
                         failure_kind, throttled_until = (
@@ -329,7 +347,34 @@ def detect_drift(
                         if issue:
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
-                            if active_labels:
+                            if active_labels and worker_blocked:
+                                # Issue #261: a session killed by a push-gate
+                                # hook must never be hot-relabeled to ready —
+                                # that would redispatch it straight back into
+                                # the same hook. Escalate instead (mirrors
+                                # workflow.py's "redispatch_escalated" edge)
+                                # and leave the active labels in place so a
+                                # human sees it via agent:human-needed.
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_failed_escalated",
+                                        issue_number=w.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{w.issue_number} session died blocked by a "
+                                            f"push-gate hook (worker_blocked), no open PR; "
+                                            f"suppressing relabel-to-ready, escalating instead"
+                                        ),
+                                        fix_actions=(
+                                            f"transition issue #{w.issue_number} labels via "
+                                            "'redispatch_escalated' event",
+                                        ),
+                                    )
+                                )
+                                # Mark this issue as handled to avoid double-emission with
+                                # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
+                                issues_handled_by_session_relabel.add(w.issue_number)
+                            elif active_labels:
                                 # Remove all active labels and ensure ready label is present
                                 fix_actions = [
                                     f"remove label '{label}' from issue #{w.issue_number}"
@@ -535,6 +580,29 @@ def apply_fixes(
                     throttled_until = action.split("=", 1)[1]
                     new_state = set_throttled_until(new_state, throttled_until)
                     break
+
+        elif item.kind == "session_failed_escalated":
+            # Issue #261: worker was killed by a push-gate hook — escalate
+            # via the same "redispatch_escalated" label edge workflow.py's
+            # reaper uses, instead of relabeling to ready.
+            if item.issue_number is not None:
+                result = transition(gh, config.labels, item.issue_number, "redispatch_escalated")
+                fix_actions = list(item.fix_actions)
+                if result.outcome != TransitionOutcome.APPLIED:
+                    fix_actions.append(
+                        f"transition outcome: {result.outcome.value}, "
+                        f"add_failures: {result.add_failures}, "
+                        f"remove_failures: {result.remove_failures}"
+                    )
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         elif item.kind == "session_failed_relabeled":
             # Issue #118: reconcile labels for dead sessions with no open PR

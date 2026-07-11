@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .subprocess_runner import run_captured
 
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -35,6 +36,9 @@ class WorktreeInfo:
     branch: str
     venv_junction: Path | None
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
+    # Set when a redispatch reset a branch tip that had commits worth
+    # preserving (issue #261) — see attempt_refs.snapshot_attempt_ref.
+    attempt_snapshot: AttemptSnapshot | None = None
 
 
 def _slugify(value: str, *, max_length: int = 80) -> str:
@@ -327,6 +331,7 @@ def create_worktree(
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
+    issue_number: int | None = None,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -365,6 +370,15 @@ def create_worktree(
       a git fetch before worktree creation to ensure the ref is up-to-date.
     - Any other ref (e.g., "HEAD", a commit SHA, or a local branch name) is
       used as-is without fetching.
+
+    ``issue_number``, when given, enables attempt-tip preservation (issue
+    #261): immediately before any ``git branch -D`` in this function that
+    could discard commits a dead worker made but never got to push, the old
+    tip is snapshotted to ``refs/charlie/attempts/issue-<n>/attempt-<k>``
+    (see ``attempt_refs.snapshot_attempt_ref``) and surfaced on the returned
+    ``WorktreeInfo.attempt_snapshot``. Best-effort — a snapshot failure never
+    blocks the branch reset. When ``issue_number`` is None, no snapshot is
+    attempted (existing callers/tests are unaffected).
     """
     # Resolve base_ref: empty string means auto-resolve to origin/<default>
     resolved_base_ref = base_ref
@@ -393,6 +407,22 @@ def create_worktree(
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None
+    attempt_snapshot: AttemptSnapshot | None = None
+
+    def _snapshot_before_delete(target_branch: str) -> None:
+        """Best-effort attempt-tip snapshot immediately before a branch reset.
+
+        Updates the enclosing ``attempt_snapshot`` (last snapshot wins — only
+        one branch-delete path fires per call). No-op when ``issue_number``
+        was not provided.
+        """
+        nonlocal attempt_snapshot
+        if issue_number is None:
+            return
+        attempt_snapshot = snapshot_attempt_ref(
+            repo_root, target_branch, issue_number, base_ref=resolved_base_ref
+        )
+
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
         recovery_branch = recovery.get("branch_name")
@@ -446,6 +476,11 @@ def create_worktree(
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
             if branch_result.ok and branch_result.stdout.strip():
+                # fetch-fallback: the branch never made it to origin, so this
+                # is the ONLY place the tip (possibly real, unpushed commits
+                # from a worker that died before its first push) still
+                # exists — snapshot it before it is gone for good.
+                _snapshot_before_delete(branch)
                 branch_delete_result = run_captured(
                     ["git", "branch", "-D", branch],
                     cwd=repo_root,
@@ -524,6 +559,7 @@ def create_worktree(
                             f"Failed to remove leftover worktree {wt_path} for recovery"
                         )
                     # Delete the branch and check the result
+                    _snapshot_before_delete(branch)
                     branch_delete_result = run_captured(
                         ["git", "branch", "-D", branch],
                         cwd=repo_root,
@@ -569,6 +605,7 @@ def create_worktree(
                         rework = True
                     else:
                         # Clean: delete branch and create fresh
+                        _snapshot_before_delete(branch)
                         branch_delete_result = run_captured(
                             ["git", "branch", "-D", branch],
                             cwd=repo_root,
@@ -640,7 +677,11 @@ def create_worktree(
                         remove_worktree(repo_root, worktree_path, force=True, branch=None)
                         raise
             return WorktreeInfo(
-                path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+                path=worktree_path,
+                branch=branch,
+                venv_junction=venv_junction,
+                reclaimed=reclaimed,
+                attempt_snapshot=attempt_snapshot,
             )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
@@ -724,6 +765,10 @@ def create_worktree(
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
         if branch_result.ok and branch_result.stdout.strip():
+            # Leftover branch from a killed session may hold real, unpushed
+            # commits (e.g. it died between committing and pushing) — snapshot
+            # before reclaiming it, same as the fetch-fallback recovery path.
+            _snapshot_before_delete(branch)
             branch_delete_result = run_captured(
                 ["git", "branch", "-D", branch],
                 cwd=repo_root,
@@ -772,7 +817,11 @@ def create_worktree(
             ) from exc
 
     return WorktreeInfo(
-        path=worktree_path, branch=branch, venv_junction=venv_junction, reclaimed=reclaimed
+        path=worktree_path,
+        branch=branch,
+        venv_junction=venv_junction,
+        reclaimed=reclaimed,
+        attempt_snapshot=attempt_snapshot,
     )
 
 
