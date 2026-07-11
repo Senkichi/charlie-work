@@ -167,6 +167,56 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
 
     add("launched sessions", not failed, detail, severity="warning")
 
+    if failed or exited:
+        _surface_post_mortems(add, repo_root, sessions_dir, [*failed, *exited])
+
+
+def _surface_post_mortems(
+    add: Any, repo_root: Path, sessions_dir: Path, dead_records: list[Any]
+) -> None:
+    """Issue #261: for each dead session, surface its post-mortem terminal
+    cause (from the Devin CLI session store, when extraction succeeded) and
+    any preserved attempt refs (unpushed commits salvaged before a redispatch
+    reset the branch) — both invisible in the plain session-record summary
+    above.
+
+    Best-effort/read-only: a missing or unreadable post-mortem sidecar for a
+    given issue is silently skipped (worker_blocked detection is opportunistic,
+    not guaranteed), never treated as a doctor failure.
+    """
+    from .attempt_refs import list_attempt_refs
+    from .post_mortem import read_post_mortem
+
+    issue_numbers = sorted({record.issue_number for record in dead_records})
+    lines: list[str] = []
+    for issue_number in issue_numbers:
+        post_mortem = read_post_mortem(sessions_dir, issue_number)
+        attempt_refs = list_attempt_refs(repo_root, issue_number)
+        if post_mortem is None and not attempt_refs:
+            continue
+        parts = [f"issue #{issue_number}"]
+        if post_mortem is not None:
+            if post_mortem.failure_kind:
+                parts.append(f"failure_kind={post_mortem.failure_kind}")
+            if post_mortem.terminal_tool:
+                parts.append(f"terminal_tool={post_mortem.terminal_tool}")
+            if post_mortem.terminal_reason:
+                reason = post_mortem.terminal_reason.strip().splitlines()[0][:120]
+                parts.append(f"reason={reason!r}")
+            if not post_mortem.matched and post_mortem.extraction_error:
+                parts.append(f"extraction_error={post_mortem.extraction_error}")
+        if attempt_refs:
+            parts.append(f"attempt_refs={list(attempt_refs)}")
+        lines.append(" ".join(parts))
+
+    if lines:
+        add(
+            "dead session post-mortems",
+            True,
+            "; ".join(lines),
+            severity="warning",
+        )
+
 
 def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
     """Validate gh --json field lists against the live gh CLI.

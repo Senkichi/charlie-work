@@ -26,8 +26,10 @@ from charlie_work.config import (
     FleetConfig,
     LabelConfig,
     OrchestratorConfig,
+    PostMortemConfig,
     ReviewConfig,
     RuntimeConfig,
+    SignatureRule,
     SupervisorConfig,
     TestAdequacyConfig,
     WatchdogConfig,
@@ -2500,16 +2502,20 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     )
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
-    # Mock the liveness check to return True (simulating a live but stalled process)
+    # Mock the liveness check to return True (simulating a live but stalled process).
+    # Patch target is charlie_work.worker (not devin_shell): the stalled-detection
+    # path goes through worker.WorkerView.is_alive(), which holds its own
+    # already-bound reference to is_session_alive from its module-level import —
+    # patching devin_shell's attribute would not reach that call site.
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
     assert result.ok is True
     assert result.data["selected_count"] == 0
-    assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+    assert result.data["stalled"] == [{"issue": 123, "pid": 99999, "health": "STALLED"}]
 
 
 def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
@@ -10904,7 +10910,13 @@ def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
 
 
 def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
-    """Issue #167: stalled section should remain byte-for-byte identical to pre-change output."""
+    """Issue #167: stalled section keeps its base {issue, pid} shape. Issue #261
+    intentionally extends each entry with a "health" field (STALLED vs DEAD) so
+    digest callers can surface dead-worker terminal cause instead of collapsing
+    everything to "STALLED"; terminal_tool/terminal_reason are added only for
+    DEAD entries with a matching post-mortem. This test now pins that extended
+    shape rather than the original byte-for-byte one.
+    """
     from datetime import UTC, datetime, timedelta
     import os
     from unittest.mock import patch
@@ -10973,14 +10985,18 @@ def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
     with patch("charlie_work.worker.is_session_alive", return_value=True):
         result = app.status()
 
-    # Check that stalled section is unchanged (byte-for-byte identical shape)
+    # Check that the stalled section keeps its base shape plus the issue #261
+    # "health" field. This fixture is live (mocked) with a stale log, so it
+    # classifies as STALLED (not DEAD), which means no terminal_tool/
+    # terminal_reason keys are added (those are DEAD-only, per
+    # _detect_stalled_sessions).
     assert "stalled" in result.data
     assert isinstance(result.data["stalled"], list)
     assert any(entry["issue"] == 109 for entry in result.data["stalled"])
     assert any(entry["pid"] == 99999 for entry in result.data["stalled"])
-    # Ensure no extra fields were added to stalled entries
     for entry in result.data["stalled"]:
-        assert set(entry.keys()) == {"issue", "pid"}
+        assert set(entry.keys()) == {"issue", "pid", "health"}
+        assert entry["health"] == "STALLED"
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:
@@ -13291,6 +13307,133 @@ def test_supervisor_config_is_frozen() -> None:
     assert dataclasses.is_dataclass(cfg)
     with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
         cfg.poll_interval_seconds = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# PostMortemConfig tests (issue #261)
+# ---------------------------------------------------------------------------
+
+
+def test_post_mortem_config_defaults() -> None:
+    """PostMortemConfig defaults are stable and load_config picks them up."""
+    config = load_config()
+    assert isinstance(config.post_mortem, PostMortemConfig)
+    assert config.post_mortem.enabled is True
+    assert config.post_mortem.db_path == ""
+    assert config.post_mortem.message_node_limit == 10
+    assert config.post_mortem.match_window_margin_seconds == 120
+    assert config.post_mortem.signature_rules == (
+        SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
+        SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
+    )
+
+
+def test_post_mortem_config_parses_custom_values(tmp_path: Path) -> None:
+    """Custom post_mortem section values, including signature_rules, are parsed correctly."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  enabled: false
+  db_path: "C:/custom/sessions.db"
+  message_node_limit: 5
+  match_window_margin_seconds: 30
+  signature_rules:
+    - pattern: "custom-block-signature"
+      kind: "worker_blocked"
+"""
+    )
+    config = load_config(config_file)
+    assert config.post_mortem.enabled is False
+    assert config.post_mortem.db_path == "C:/custom/sessions.db"
+    assert config.post_mortem.message_node_limit == 5
+    assert config.post_mortem.match_window_margin_seconds == 30
+    assert config.post_mortem.signature_rules == (
+        SignatureRule(pattern="custom-block-signature", kind="worker_blocked"),
+    )
+
+
+def test_post_mortem_config_unknown_key_raises(tmp_path: Path) -> None:
+    """Unknown keys in post_mortem section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  enabled: true
+  unknown_key: 99
+"""
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong types in post_mortem section raise ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  message_node_limit: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_signature_rules_wrong_shape_raises(tmp_path: Path) -> None:
+    """signature_rules must be a list of {pattern, kind} mappings."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  signature_rules: "not-a-list"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_signature_rule_bad_regex_raises(tmp_path: Path) -> None:
+    """An invalid regex pattern in a signature rule raises ConfigError."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+post_mortem:
+  signature_rules:
+    - pattern: "["
+      kind: "worker_blocked"
+"""
+    )
+    with pytest.raises(ConfigError, match="not a valid regex"):
+        load_config(config_file)
+
+
+def test_post_mortem_config_is_frozen() -> None:
+    """PostMortemConfig is a frozen dataclass."""
+    import dataclasses
+
+    cfg = PostMortemConfig()
+    assert dataclasses.is_dataclass(cfg)
+    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
+        cfg.enabled = False  # type: ignore[misc]
+
+
+def test_signature_rule_is_frozen() -> None:
+    """SignatureRule is a frozen dataclass."""
+    import dataclasses
+
+    rule = SignatureRule(pattern="x", kind="worker_blocked")
+    assert dataclasses.is_dataclass(rule)
+    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
+        rule.kind = "other"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
