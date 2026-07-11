@@ -177,6 +177,13 @@ class RuntimeConfig:
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
+    # Literal substrings matched against the last 2KB of worker logs to detect
+    # provider throttling. Defaults to the two observed launch-death signatures;
+    # extend via config instead of editing code.
+    throttle_error_markers: tuple[str, ...] = (
+        "Reached overall message rate limit",
+        "A tool was rejected by the user",
+    )
 
 
 @dataclass(frozen=True)
@@ -578,7 +585,22 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                     f"is managed by the orchestrator and cannot be specified in merge_flags"
                 )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
-    runtime = _build_section(RuntimeConfig, "runtime", _section(data, "runtime"))
+    runtime_data = _section(data, "runtime")
+    throttle_error_markers = runtime_data.get("throttle_error_markers")
+    if throttle_error_markers is not None:
+        if not isinstance(throttle_error_markers, list):
+            raise ConfigError(
+                "config section 'runtime' key 'throttle_error_markers' must be a list of "
+                f"strings, got {type(throttle_error_markers).__name__}"
+            )
+        for item in throttle_error_markers:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'runtime' key 'throttle_error_markers' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        runtime_data["throttle_error_markers"] = tuple(throttle_error_markers)
+    runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):
         command_value = devin_data.get(command_key)

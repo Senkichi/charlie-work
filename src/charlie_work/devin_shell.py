@@ -24,12 +24,14 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import parse_proc_stat_starttime
+from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
@@ -39,12 +41,9 @@ _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
 
 # Provider throttle signatures — matched against session log tails to classify
-# failure kinds. Keep these in one adapter-owned constant, not scattered.
-# Pattern for rate-limit errors (e.g., "Reached overall message rate limit")
-_RATE_LIMIT_PATTERN = re.compile(
-    r"Reached overall message rate limit|rate limit|too many requests",
-    re.IGNORECASE,
-)
+# failure kinds. The defaults are sourced from RuntimeConfig so there is a single
+# default list; callers can override via config for new provider phrasings.
+_DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
 # Pattern for quota-exhaustion errors (e.g., "daily usage quota has been exhausted")
 _QUOTA_EXHAUSTED_PATTERN = re.compile(
     r"daily usage quota has been exhausted|quota exceeded|usage limit",
@@ -126,7 +125,10 @@ def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) ->
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
-def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
+def _classify_session_failure(
+    log_path: Path,
+    throttle_error_markers: Sequence[str] | None = None,
+) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
@@ -155,8 +157,14 @@ def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
             "+00:00", "Z"
         )
 
-    # Check for rate limiting
-    if _RATE_LIMIT_PATTERN.search(tail):
+    # Check for rate limiting / provider throttling using configurable substrings
+    markers = (
+        throttle_error_markers
+        if throttle_error_markers is not None
+        else _DEFAULT_THROTTLE_ERROR_MARKERS
+    )
+    tail_lower = tail.lower()
+    if any(marker.lower() in tail_lower for marker in markers):
         # Try to parse "resets in N minutes"
         match = _RESETS_IN_PATTERN.search(tail)
         if match:
@@ -543,7 +551,11 @@ def is_session_alive(record: SessionRecord) -> bool:
 
 
 def update_session_record_with_failure_classification(
-    sessions_dir: Path, issue_number: int, *, fallback_kind: str | None = None
+    sessions_dir: Path,
+    issue_number: int,
+    *,
+    fallback_kind: str | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> tuple[str | None, str | None]:
     """Update a session record with failure classification after the session exits.
 
@@ -560,6 +572,9 @@ def update_session_record_with_failure_classification(
     because it hit a provider rate limit must be classified as such even when
     the caller only knows "this looked stalled" — otherwise ``throttled_until``
     never gets set and dispatch keeps relaunching workers into the same limit.
+
+    ``config`` is optional for backward compatibility; when provided, its
+    ``runtime.throttle_error_markers`` are used instead of the defaults.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
@@ -586,7 +601,10 @@ def update_session_record_with_failure_classification(
     throttled_until: str | None = None
     log_path_str = payload.get("log_path")
     if log_path_str:
-        classified_kind, throttled_until = _classify_session_failure(Path(log_path_str))
+        throttle_markers = config.runtime.throttle_error_markers if config is not None else None
+        classified_kind, throttled_until = _classify_session_failure(
+            Path(log_path_str), throttle_markers
+        )
 
     resolved_kind = classified_kind or fallback_kind
     if resolved_kind is None:

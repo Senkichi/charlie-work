@@ -323,13 +323,19 @@ def _detect_and_handle_stalled_sessions(
             if w.adapter_kind == "devin":
                 resolved_failure_kind, throttled_until = (
                     update_session_record_with_failure_classification(
-                        sessions_dir, w.issue_number, fallback_kind="stalled"
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="stalled",
+                        config=config,
                     )
                 )
             elif w.adapter_kind == "claude-code":
                 resolved_failure_kind, throttled_until = (
                     update_worker_record_with_failure_classification(
-                        sessions_dir, w.issue_number, fallback_kind="stalled"
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="stalled",
+                        config=config,
                     )
                 )
 
@@ -656,11 +662,11 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Session exited without error - classify the failure (adapter-specific dispatch)
             if w.adapter_kind == "devin":
                 failure_kind, throttled_until = update_session_record_with_failure_classification(
-                    sessions_dir, w.issue_number
+                    sessions_dir, w.issue_number, config=config
                 )
             elif w.adapter_kind == "claude-code":
                 failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir, w.issue_number
+                    sessions_dir, w.issue_number, config=config
                 )
             else:
                 failure_kind, throttled_until = None, None

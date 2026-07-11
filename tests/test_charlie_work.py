@@ -79,6 +79,13 @@ def test_default_config_runner_scaling_disabled() -> None:
     assert config.runner_scaling.enabled is False
 
 
+def test_default_config_throttle_error_markers() -> None:
+    """RuntimeConfig.throttle_error_markers defaults to the two known signatures."""
+    config = load_config()
+    assert "Reached overall message rate limit" in config.runtime.throttle_error_markers
+    assert "A tool was rejected by the user" in config.runtime.throttle_error_markers
+
+
 def test_runner_scaling_config_parses_with_enabled_flag(tmp_path: Path) -> None:
     """RunnerScalingConfig parses with enabled=true and custom values."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -159,6 +166,26 @@ runner_scaling:
     )
     with pytest.raises(ConfigError, match="must be a bool"):
         load_config(config_file)
+
+
+def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.throttle_error_markers is configurable from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runtime:
+  throttle_error_markers:
+    - "Reached overall message rate limit"
+    - "A tool was rejected by the user"
+    - "custom provider failure"
+"""
+    )
+    config = load_config(config_file)
+    assert config.runtime.throttle_error_markers == (
+        "Reached overall message rate limit",
+        "A tool was rejected by the user",
+        "custom provider failure",
+    )
 
 
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:

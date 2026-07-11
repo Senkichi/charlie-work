@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work import claude_code
+from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.claude_code import (
     ClaudeProgress,
     ClaudeWorkerRecord,
@@ -984,6 +985,117 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
     assert throttled_until is not None
 
     # Verify the sidecar was updated
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def _make_worker_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:
+    """Write a minimal worker sidecar for failure-classification tests."""
+    sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "branch": f"agent/issue-{issue_number}",
+                "worktree_path": "/tmp/wt",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(log_path),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
+def test_classify_session_failure_tool_rejected(tmp_path: Path) -> None:
+    """Issue #260: 'A tool was rejected by the user' must classify as rate_limited."""
+    from charlie_work.claude_code import _classify_session_failure
+    from datetime import UTC, datetime, timedelta
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: A tool was rejected by the user.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=15)
+    assert abs((throttle_time - expected_time).total_seconds()) < 1
+
+
+def test_update_worker_record_tool_rejected_sets_rate_limited(tmp_path: Path) -> None:
+    """Issue #260: a tool-rejected sidecar log is classified as rate_limited."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        "Error: A tool was rejected by the user.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_worker_sidecar(sessions_dir, 42, log_path)
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_update_worker_record_unknown_tail_falls_back_to_stalled(tmp_path: Path) -> None:
+    """Unknown log tail should fall back to the provided fallback_kind."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        "Error: something completely unrelated went wrong\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_worker_sidecar(sessions_dir, 42, log_path)
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="stalled"
+    )
+
+    assert failure_kind == "stalled"
+    assert throttled_until is None
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "stalled"
+
+
+def test_update_worker_record_custom_throttle_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.throttle_error_markers is configurable without code changes."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        "Error: provider-specific frobnicate limit exceeded\n",
+        encoding="utf-8",
+    )
+    sidecar_path = _make_worker_sidecar(sessions_dir, 42, log_path)
+
+    config = OrchestratorConfig(
+        runtime=RuntimeConfig(throttle_error_markers=("frobnicate limit exceeded",))
+    )
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, config=config
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
 
