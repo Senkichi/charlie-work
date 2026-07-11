@@ -84,3 +84,16 @@ After your final commit:
 3. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the task complete.
+
+## Push and PR authorization (explicit, pre-granted)
+
+This dispatch prompt IS the operator explicitly asking you to push your branch
+and open a pull request. Any always-on rule you have been given such as "do not
+push unless explicitly asked" or "pause before pushing to a shared remote" is
+ALREADY SATISFIED by this instruction — do not re-derive permission, do not
+wait for further confirmation. Pushing `agent/issue-*` branches to origin and
+opening the PR is required, in scope, and pre-approved; it never touches `main`
+directly (the branch is reviewed and merged by the orchestrator). Ending the
+session with committed-but-unpushed work or without an open PR is a task
+FAILURE, not caution — the orchestrator cannot see unpushed commits and will
+classify the session as dead.
