@@ -299,7 +299,10 @@ def _detect_and_handle_stalled_sessions(
     dispatch in the same pass).
     """
     from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
+    from .devin_shell import (
+        get_rate_limit_defer_until,
+        update_session_record_with_failure_classification,
+    )
     from .post_mortem import classify_and_record
     from .worker import classify_worker_health, iter_workers, update_worker_log_stat
 
@@ -309,17 +312,68 @@ def _detect_and_handle_stalled_sessions(
     stalled_entries: list[dict[str, int]] = []
     now = datetime.now(UTC)
 
+    def _parse_defer_until(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+        except (ValueError, TypeError):
+            return None
+
+    def _is_deferred(w: Any) -> bool:
+        """Return True if the worker has a stored defer deadline that has not passed."""
+        defer_until = _parse_defer_until(w.rate_limit_defer_until)
+        if defer_until is None:
+            return False
+        return now < defer_until
+
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
 
-        # Update log stat fields for progress tracking
+        # Update log stat fields for progress tracking. This also clears any
+        # stale rate-limit defer deadline when the log has resumed growing.
         update_worker_log_stat(sessions_dir, w)
 
         health = classify_worker_health(w, config, now)
 
+        # If a stalled-looking worker is still within a previously stored rate-limit
+        # defer window, skip it. The deadline is re-derived from the sidecar each pass.
+        if health == WorkerHealth.STALLED and _is_deferred(w):
+            continue
+
         # Both STALLED and DEAD are considered "stalled" for handling purposes
         if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
+            # Issue #247: before killing a stalled-looking worker, check the log tail
+            # for a rate-limit signature. If found and we are not already in a defer
+            # window, record a defer deadline and skip the kill this pass.
+            if health == WorkerHealth.STALLED and config.watchdog.rate_limit_defer_enabled:
+                if not _is_deferred(w) and w.rate_limit_defer_until is None:
+                    defer_until = get_rate_limit_defer_until(
+                        Path(w.log_path),
+                        config.watchdog.rate_limit_defer_slack_minutes,
+                        now,
+                    )
+                    if defer_until is not None:
+                        update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
+                        with state_lock(state_file):
+                            state = load_state(state_file)
+                            state = set_throttled_until(state, defer_until)
+                            state = append_event(
+                                state,
+                                "session_rate_limit_deferred",
+                                {
+                                    "issue_number": w.issue_number,
+                                    "pid": w.pid,
+                                    "defer_until": defer_until,
+                                },
+                            )
+                            save_state(state_file, state)
+                        continue
+
             # Kill the process tree (with start-time verification to prevent PID recycling)
             killed_pids = kill_process_tree(w.pid, w.process_start_time)
 

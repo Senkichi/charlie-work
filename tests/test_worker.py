@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
+import os
+
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.config import OrchestratorConfig, WatchdogConfig
+from charlie_work.devin_shell import (
+    SessionRecord,
+    _sidecar_path as devin_sidecar_path,
+    _write_json,
+)
 from charlie_work.worker import WorkerView, _log_is_stalled_at_shim, iter_workers
 
 
@@ -763,3 +771,229 @@ def test_log_is_stalled_at_shim_nonexistent_log(tmp_path: Path) -> None:
     log_path = tmp_path / "issue-1.log"
     now = datetime.now(UTC)
     assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit stall deferral (issue #247)
+# ---------------------------------------------------------------------------
+
+
+def _make_stalled_devin_session(
+    tmp_path: Path,
+    issue_number: int,
+    log_text: str,
+    *,
+    rate_limit_defer_until: str | None = None,
+) -> tuple[Path, Path, Path]:
+    """Create a sessions directory, sidecar, and stale log for a live worker."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    # Set mtime to 30 minutes ago so the log looks stalled at the default
+    # 20-minute stall threshold.
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}",
+        worktree_path=str(tmp_path / "worktree"),
+        prompt_path=str(tmp_path / "prompt.md"),
+        command=("devin", "--prompt-file", str(tmp_path / "prompt.md")),
+        pid=99999,
+        started_at=(datetime.now(UTC) - timedelta(minutes=31)).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at=old_time.isoformat().replace("+00:00", "Z"),
+        log_bytes=log_path.stat().st_size,
+        rate_limit_defer_until=rate_limit_defer_until,
+    )
+    _write_json(sidecar_path, record.to_dict())
+    state_file = tmp_path / "state.json"
+    return sessions_dir, state_file, log_path
+
+
+def test_stalled_worker_with_rate_limit_signature_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled-looking worker whose log tail contains a rate-limit signature is deferred, not killed."""
+    from charlie_work import workflow
+
+    issue_number = 247
+    log_text = (
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n"
+    )
+    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    killed = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        )
+    )
+
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+
+    assert result == []
+    assert killed == []
+
+    sidecar = json.loads(
+        (devin_sidecar_path(sessions_dir, issue_number)).read_text(encoding="utf-8")
+    )
+    assert sidecar["rate_limit_defer_until"] is not None
+    defer_until = datetime.fromisoformat(sidecar["rate_limit_defer_until"].replace("Z", "+00:00"))
+    expected_min = datetime.now(UTC) + timedelta(minutes=10 + 2 - 1)
+    expected_max = datetime.now(UTC) + timedelta(minutes=10 + 2 + 1)
+    assert expected_min <= defer_until <= expected_max
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state.get("events", []) if e.get("kind") == "session_rate_limit_deferred"]
+    assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == issue_number
+    assert events[0]["payload"]["defer_until"] == sidecar["rate_limit_defer_until"]
+
+
+def test_deferred_worker_log_resumes_exits_deferred_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred worker whose log resumes growing exits the deferred state and is not killed."""
+    from charlie_work import workflow
+
+    issue_number = 248
+    log_text = (
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n"
+    )
+    future_defer = (datetime.now(UTC) + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    sessions_dir, state_file, log_path = _make_stalled_devin_session(
+        tmp_path, issue_number, log_text, rate_limit_defer_until=future_defer
+    )
+
+    # Now the log resumes: update mtime and size to "now".
+    log_path.write_text(log_text + "Resumed work after provider window reset\n", encoding="utf-8")
+    recent_time = datetime.now(UTC) - timedelta(minutes=1)
+    os.utime(log_path, (recent_time.timestamp(), recent_time.timestamp()))
+
+    killed = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        )
+    )
+
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+
+    assert result == []
+    assert killed == []
+
+    sidecar = json.loads(
+        (devin_sidecar_path(sessions_dir, issue_number)).read_text(encoding="utf-8")
+    )
+    assert sidecar["rate_limit_defer_until"] is None
+
+
+def test_deferred_worker_past_deadline_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred worker still silent past the deadline is killed and classified via the rate-limit path."""
+    from charlie_work import workflow
+
+    issue_number = 249
+    log_text = (
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n"
+    )
+    past_defer = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    sessions_dir, state_file, _ = _make_stalled_devin_session(
+        tmp_path, issue_number, log_text, rate_limit_defer_until=past_defer
+    )
+
+    killed = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        )
+    )
+
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+
+    assert result == [{"issue": issue_number, "pid": 99999}]
+    assert killed == [99999]
+
+    sidecar = json.loads(
+        (devin_sidecar_path(sessions_dir, issue_number)).read_text(encoding="utf-8")
+    )
+    assert sidecar["failure_kind"] == "rate_limited"
+    # The sidecar still carries the expired defer deadline; the global throttle
+    # state is set to the freshly computed cooldown from the log tail.
+    assert sidecar["rate_limit_defer_until"] is not None
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state.get("throttled_until") is not None
+    throttled_until = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
+    expected_min = datetime.now(UTC) + timedelta(minutes=10 - 1)
+    expected_max = datetime.now(UTC) + timedelta(minutes=10 + 1)
+    assert expected_min <= throttled_until <= expected_max
+
+
+def test_stalled_worker_without_rate_limit_signature_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled worker with a genuinely quiet tail (no rate-limit signature) keeps existing stall-kill behavior."""
+    from charlie_work import workflow
+
+    issue_number = 250
+    log_text = "Working on task...\nLast line\n"
+    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    killed = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        )
+    )
+
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+
+    assert result == [{"issue": issue_number, "pid": 99999}]
+    assert killed == [99999]
+
+    sidecar = json.loads(
+        (devin_sidecar_path(sessions_dir, issue_number)).read_text(encoding="utf-8")
+    )
+    assert sidecar["failure_kind"] == "stalled"
+    assert sidecar.get("rate_limit_defer_until") is None

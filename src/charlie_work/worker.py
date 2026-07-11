@@ -223,6 +223,9 @@ class WorkerView:
     reclaimed: str | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
     log_bytes: int | None = None  # log_path.stat().st_size
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -247,6 +250,7 @@ class WorkerView:
                 reclaimed=self.reclaimed,
                 last_activity_at=self.last_activity_at,
                 log_bytes=self.log_bytes,
+                rate_limit_defer_until=self.rate_limit_defer_until,
             )
             return is_session_alive(record)
         elif self.adapter_kind == "claude-code":
@@ -266,6 +270,7 @@ class WorkerView:
                 reclaimed=self.reclaimed,
                 last_activity_at=self.last_activity_at,
                 log_bytes=self.log_bytes,
+                rate_limit_defer_until=self.rate_limit_defer_until,
             )
             return is_worker_alive(record)
         else:
@@ -522,6 +527,7 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         reclaimed=record.reclaimed,
         last_activity_at=record.last_activity_at,
         log_bytes=record.log_bytes,
+        rate_limit_defer_until=record.rate_limit_defer_until,
     )
 
 
@@ -541,6 +547,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         reclaimed=record.reclaimed,
         last_activity_at=record.last_activity_at,
         log_bytes=record.log_bytes,
+        rate_limit_defer_until=record.rate_limit_defer_until,
     )
 
 
@@ -571,16 +578,57 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
     return workers
 
 
-def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
+def _log_activity_advanced(
+    log_stat_result: stat_result | None,
+    previous_activity_at: str | None,
+) -> bool:
+    """Return True if the log has advanced since the previous stored stat.
+
+    A log advances when the log file is accessible and its mtime is newer than
+    the previous stored mtime. The first successful stat after launch
+    (previous_activity_at is None) is treated as the baseline, not an advance.
+    """
+    if log_stat_result is None:
+        return False
+    if previous_activity_at is None:
+        return False
+    previous_mtime = _iso_to_timestamp(previous_activity_at)
+    if previous_mtime is None:
+        return False
+    return log_stat_result.st_mtime > previous_mtime
+
+
+def _iso_to_timestamp(value: str) -> float | None:
+    """Parse an ISO timestamp (Z or +HH:MM) into a Unix timestamp."""
+    from datetime import UTC
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def update_worker_log_stat(
+    sessions_dir: Path, worker: WorkerView, *, rate_limit_defer_until: str | None = None
+) -> None:
     """Update last_activity_at and log_bytes fields on a worker's sidecar.
 
     This reads the current sidecar, updates the log stat fields from a fresh
     stat() of the log file, and writes back atomically. This is called during
     passes over live workers to keep progress signals fresh.
 
+    If the log has advanced (new mtime or larger size) and no new
+    rate_limit_defer_until is being set, any previously stored defer deadline
+    is cleared because the worker has resumed activity.
+
     Args:
         sessions_dir: Directory containing session sidecar files
         worker: WorkerView to update (must have valid log_path)
+        rate_limit_defer_until: Optional new defer deadline to persist on the
+            sidecar. When provided, the defer field is set and not cleared.
     """
     import json
 
@@ -604,6 +652,9 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
     if not isinstance(payload, dict):
         return
 
+    # Preserve the previously stored values so we can detect new log activity.
+    previous_activity_at = payload.get("last_activity_at")
+
     # Stat the log file
     log_stat_result = worker.log_stat()
     if log_stat_result is None:
@@ -616,6 +667,16 @@ def update_worker_log_stat(sessions_dir: Path, worker: WorkerView) -> None:
             log_stat_result.st_mtime, tz=timezone.utc
         ).isoformat()
         payload["log_bytes"] = log_stat_result.st_size
+
+    if rate_limit_defer_until is not None:
+        # Caller is explicitly setting a new defer deadline.
+        payload["rate_limit_defer_until"] = rate_limit_defer_until
+    else:
+        # If the log has advanced, the worker is no longer stalled; clear the
+        # defer deadline. Otherwise keep it level-triggered for the next pass.
+        activity_advanced = _log_activity_advanced(log_stat_result, previous_activity_at)
+        if activity_advanced:
+            payload["rate_limit_defer_until"] = None
 
     # Write back atomically using the adapter-specific helper
     if worker.adapter_kind == "devin":

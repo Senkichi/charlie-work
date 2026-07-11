@@ -93,6 +93,9 @@ class SessionRecord:
     log_bytes: int | None = None  # log_path.stat().st_size
     attempt_ref: str | None = None  # refs/charlie/attempts/issue-<n>/attempt-<k> (issue #261)
     attempt_ahead_of_main: int | None = None  # commit count ahead of base_ref at snapshot time
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -119,6 +122,7 @@ class SessionRecord:
             log_bytes=payload.get("log_bytes"),
             attempt_ref=payload.get("attempt_ref"),
             attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
+            rate_limit_defer_until=payload.get("rate_limit_defer_until"),
         )
 
 
@@ -175,6 +179,46 @@ def _classify_session_failure(log_path: Path) -> tuple[str | None, str | None]:
         )
 
     return None, None
+
+
+def get_rate_limit_defer_until(
+    log_path: Path, slack_minutes: int, now: datetime | None = None
+) -> str | None:
+    """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
+
+    Reads the same 2KB tail as ``_classify_session_failure`` and matches the
+    same adapter-owned rate-limit patterns (issue #247). If the tail matches
+    ``_RATE_LIMIT_PATTERN`` and a ``"resets in N minutes"`` value is found, the
+    defer deadline is ``now + N minutes + slack``. Otherwise the fallback
+    ``_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES`` is used.
+
+    Returns None when the log is missing, unreadable, or does not contain a
+    rate-limit signature. Quota exhaustion is intentionally not deferred here.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    if not log_path.exists():
+        return None
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    if not _RATE_LIMIT_PATTERN.search(tail):
+        return None
+
+    match = _RESETS_IN_PATTERN.search(tail)
+    if match:
+        minutes = int(match.group(1))
+    else:
+        minutes = _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+
+    defer_until = now + timedelta(minutes=minutes + slack_minutes)
+    return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -622,6 +666,7 @@ __all__ = [
     "probe_devin",
     "is_session_alive",
     "update_session_record_with_failure_classification",
+    "get_rate_limit_defer_until",
     "_get_process_start_time",
     "_sidecar_path",
 ]

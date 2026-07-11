@@ -83,6 +83,9 @@ class ClaudeWorkerRecord:
     log_bytes: int | None = None  # log_path.stat().st_size
     attempt_ref: str | None = None  # refs/charlie/attempts/issue-<n>/attempt-<k> (issue #261)
     attempt_ahead_of_main: int | None = None  # commit count ahead of base_ref at snapshot time
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     @property
     def ok(self) -> bool:
@@ -113,6 +116,7 @@ class ClaudeWorkerRecord:
             log_bytes=payload.get("log_bytes"),
             attempt_ref=payload.get("attempt_ref"),
             attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
+            rate_limit_defer_until=payload.get("rate_limit_defer_until"),
         )
 
 
