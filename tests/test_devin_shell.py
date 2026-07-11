@@ -1432,10 +1432,16 @@ def _make_session_sidecar(sessions_dir: Path, issue_number: int, log_path: Path)
     return sidecar_path
 
 
-def test_classify_session_failure_tool_rejected(tmp_path: Path) -> None:
-    """Issue #260: 'A tool was rejected by the user' must classify as rate_limited."""
+def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) -> None:
+    """Issue #260, corrected premise: 'A tool was rejected by the user' is the
+    Devin CLI's own surfacing of a PreToolUse hook block, not a provider
+    throttle condition — it must NOT classify as rate_limited (no retry
+    semantics, no throttled_until). The original PR #263 premise treated
+    this string as a throttle signature; a correction comment on issue #260
+    established it is a hard failure that must instead route through
+    post_mortem.classify_and_record's worker_blocked log-tail fallback (see
+    test_post_mortem.py), which composes with escalation, not cooldown."""
     from charlie_work.devin_shell import _classify_session_failure
-    from datetime import UTC, datetime, timedelta
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -1445,15 +1451,14 @@ def test_classify_session_failure_tool_rejected(tmp_path: Path) -> None:
 
     failure_kind, throttled_until = _classify_session_failure(log_path)
 
-    assert failure_kind == "rate_limited"
-    assert throttled_until is not None
-    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=15)
-    assert abs((throttle_time - expected_time).total_seconds()) < 1
+    assert failure_kind is None
+    assert throttled_until is None
 
 
-def test_update_session_record_tool_rejected_sets_rate_limited(tmp_path: Path) -> None:
-    """Issue #260: a tool-rejected sidecar log is classified as rate_limited."""
+def test_update_session_record_tool_rejected_is_not_rate_limited(tmp_path: Path) -> None:
+    """Issue #260, corrected premise: a tool-rejected sidecar log must not be
+    classified rate_limited by the adapter's own log-tail classifier — see
+    test_classify_session_failure_tool_rejected_is_not_throttle."""
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
 
@@ -1465,13 +1470,13 @@ def test_update_session_record_tool_rejected_sets_rate_limited(tmp_path: Path) -
     sidecar_path = _make_session_sidecar(sessions_dir, 42, log_path)
 
     failure_kind, throttled_until = update_session_record_with_failure_classification(
-        sessions_dir, 42
+        sessions_dir, 42, fallback_kind="stalled"
     )
 
-    assert failure_kind == "rate_limited"
-    assert throttled_until is not None
+    assert failure_kind == "stalled"
+    assert throttled_until is None
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    assert updated_sidecar["failure_kind"] == "rate_limited"
+    assert updated_sidecar["failure_kind"] == "stalled"
 
 
 def test_update_session_record_unknown_tail_falls_back_to_stalled(tmp_path: Path) -> None:
