@@ -36,6 +36,7 @@ from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
+from .throttle_signatures import match_throttle_tail
 from .worktree import WorktreeInfo, create_worktree, remove_worktree
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -44,14 +45,15 @@ _WIN_STILL_ACTIVE = 259
 # Provider throttle signatures — matched against session log tails to classify
 # failure kinds. The defaults are sourced from RuntimeConfig so there is a single
 # default list; callers can override via config for new provider phrasings.
+# Matching itself (substring + "resets in N minutes" extraction) is unified in
+# throttle_signatures.match_throttle_tail — used here and by
+# get_rate_limit_defer_until below (PR #262 review findings F1/F5).
 _DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
 # Pattern for quota-exhaustion errors (e.g., "daily usage quota has been exhausted")
 _QUOTA_EXHAUSTED_PATTERN = re.compile(
     r"daily usage quota has been exhausted|quota exceeded|usage limit",
     re.IGNORECASE,
 )
-# Pattern for "resets in N minutes" to extract cooldown duration
-_RESETS_IN_PATTERN = re.compile(r"resets? in (\d+) minutes?", re.IGNORECASE)
 
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
@@ -166,21 +168,21 @@ def _classify_session_failure(
             "+00:00", "Z"
         )
 
-    # Check for rate limiting / provider throttling using configurable substrings
+    # Check for rate limiting / provider throttling using configurable substrings.
+    # Single point of enforcement (throttle_signatures.match_throttle_tail) shared
+    # with get_rate_limit_defer_until below — see that function's docstring.
     markers = (
         throttle_error_markers
         if throttle_error_markers is not None
         else _DEFAULT_THROTTLE_ERROR_MARKERS
     )
-    tail_lower = tail.lower()
-    if any(marker.lower() in tail_lower for marker in markers):
-        # Try to parse "resets in N minutes"
-        match = _RESETS_IN_PATTERN.search(tail)
-        if match:
-            minutes = int(match.group(1))
-            cooldown = timedelta(minutes=minutes)
-        else:
-            cooldown = timedelta(minutes=_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES)
+    matched, reset_minutes = match_throttle_tail(tail, markers)
+    if matched:
+        cooldown = timedelta(
+            minutes=reset_minutes
+            if reset_minutes is not None
+            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+        )
         throttled_until = datetime.now(UTC) + cooldown
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -190,15 +192,24 @@ def _classify_session_failure(
 
 
 def get_rate_limit_defer_until(
-    log_path: Path, slack_minutes: int, now: datetime | None = None
+    log_path: Path,
+    slack_minutes: int,
+    now: datetime | None = None,
+    throttle_error_markers: Sequence[str] | None = None,
 ) -> str | None:
     """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
 
-    Reads the same 2KB tail as ``_classify_session_failure`` and matches the
-    same adapter-owned rate-limit patterns (issue #247). If the tail matches
-    ``_RATE_LIMIT_PATTERN`` and a ``"resets in N minutes"`` value is found, the
-    defer deadline is ``now + N minutes + slack``. Otherwise the fallback
+    Reads the same 2KB tail as ``_classify_session_failure`` and matches
+    against the same config-driven markers via ``throttle_signatures.
+    match_throttle_tail`` (issue #247; unified with ``_classify_session_
+    failure`` per PR #262 review findings F1/F5 — previously each function
+    carried its own copy of this matching logic). If the tail matches and a
+    ``"resets in N minutes"`` value is found, the defer deadline is
+    ``now + N minutes + slack``. Otherwise the fallback
     ``_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES`` is used.
+
+    ``throttle_error_markers`` defaults to ``RuntimeConfig``'s default list
+    when not provided (backward compatible with pre-#260 callers).
 
     Returns None when the log is missing, unreadable, or does not contain a
     rate-limit signature. Quota exhaustion is intentionally not deferred here.
@@ -216,14 +227,16 @@ def get_rate_limit_defer_until(
 
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
 
-    if not _RATE_LIMIT_PATTERN.search(tail):
+    markers = (
+        throttle_error_markers
+        if throttle_error_markers is not None
+        else _DEFAULT_THROTTLE_ERROR_MARKERS
+    )
+    matched, reset_minutes = match_throttle_tail(tail, markers)
+    if not matched:
         return None
 
-    match = _RESETS_IN_PATTERN.search(tail)
-    if match:
-        minutes = int(match.group(1))
-    else:
-        minutes = _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+    minutes = reset_minutes if reset_minutes is not None else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
 
     defer_until = now + timedelta(minutes=minutes + slack_minutes)
     return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
