@@ -40,13 +40,19 @@ The following skills are available to help you complete this task:
 2. Read `CLAUDE.md`, `CONTRIBUTING.md`, the issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
-5. Run the full test suite with the canonical command from the worktree root:
+5. Run the tests impacted by your change from the worktree root: the test
+   file(s) you added or modified, plus `grep tests/` for every
+   module/function/symbol your production diff touched and run every
+   matching test file — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest -q --tb=short
+   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
-   The `/test` skill is a convenience shortcut but may not run the full suite — always
-   use the explicit command for final verification. Quote the exact command you ran
-   AND the collected/passed count in your completion report (e.g., "300 collected, 300 passed").
+   Do NOT run the full suite locally — CI runs it on every push and is the
+   merge gate; a long silent local run also risks the session getting reaped
+   as stalled. The `/test` skill is a convenience shortcut but may not cover
+   every impacted file — always use the explicit command for final
+   verification. Quote the exact command you ran AND the collected/passed count
+   in your completion report (e.g., "300 collected, 300 passed").
 6. Add or update regression tests unless not applicable.
 7. Use `/commit` to commit your changes with conventional format.
 8. Use `/preflight` to match CI (ruff, ruff-format, pre-commit). Commit anything it
