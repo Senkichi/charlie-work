@@ -80,6 +80,9 @@ class ClaudeWorkerRecord:
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
     log_bytes: int | None = None  # log_path.stat().st_size
+    rate_limit_defer_until: str | None = (
+        None  # ISO timestamp when the stall kill is deferred (issue #247)
+    )
 
     @property
     def ok(self) -> bool:
@@ -108,6 +111,7 @@ class ClaudeWorkerRecord:
             reclaimed=payload.get("reclaimed"),
             last_activity_at=payload.get("last_activity_at"),
             log_bytes=payload.get("log_bytes"),
+            rate_limit_defer_until=payload.get("rate_limit_defer_until"),
         )
 
 
