@@ -12,6 +12,7 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfi
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeInfo,
+    WorktreeProbeFailedError,
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
@@ -1376,7 +1377,12 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
     """Issue #257: Failed dirty-probe should be treated as dirty and refused.
 
     When git status --porcelain fails (index lock, corruption, permissions),
-    the guard should refuse to reset rather than risk discarding work.
+    the guard should refuse to reset rather than risk discarding work. Per
+    the issue #288 follow-up review (PR #314), this is raised as the distinct
+    ``WorktreeProbeFailedError`` rather than ``WorktreeUnsafeError`` — a probe
+    failure is transient contention, not a confirmed-dirty worktree, so the
+    launch shim must classify it under a separate failure_kind that does not
+    escalate to a human on first occurrence.
     """
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -1412,8 +1418,9 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
 
     try:
         # Fresh dispatch should refuse to reset because the probe could not confirm
-        # the worktree is clean.
-        with pytest.raises(WorktreeUnsafeError, match="worktree status probe failed"):
+        # the worktree is clean — but as a distinct exception type from a
+        # confirmed-dirty worktree (see WorktreeProbeFailedError docstring).
+        with pytest.raises(WorktreeProbeFailedError, match="worktree status probe failed"):
             create_worktree(repo_root, branch_name, base_ref="HEAD")
 
         # Verify the worktree still exists (not removed)

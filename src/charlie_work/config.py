@@ -14,6 +14,11 @@ DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worker_blocked", "worktree_unsafe"}
 )
+# Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
+# A failed safety probe (e.g. git status --porcelain hitting an index lock) is
+# transient contention, not a confirmed-dirty worktree — it must take the
+# ordinary redispatch-cap path instead of escalating on first occurrence
+# (issue #288 follow-up, PR #314).
 
 
 class ConfigError(ValueError):

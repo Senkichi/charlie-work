@@ -839,9 +839,21 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     entry = state["issues"].get(str(w.issue_number), {})
                     now = datetime.now(UTC)
-                    redispatch_at = [now.isoformat().replace("+00:00", "Z")]
+                    # Append to prior history within the redispatch window rather
+                    # than overwriting it, matching the dead-session lane below
+                    # (~line 1001-1006).
+                    window_start = now - timedelta(
+                        minutes=config.watchdog.redispatch_window_minutes
+                    )
+                    prior = [
+                        t
+                        for t in entry.get("redispatch_at", [])
+                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                    ]
+                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
                     entry["status"] = "escalated"
                     entry["escalation_reason"] = failure_kind
+                    entry["redispatch_at"] = redispatch_at
                     entry.pop("worker_pid", None)
                     entry.pop("worker_process_start_time", None)
                     state["issues"][str(w.issue_number)] = entry

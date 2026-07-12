@@ -39,6 +39,7 @@ from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
     WorktreeInfo,
+    WorktreeProbeFailedError,
     WorktreeUnsafeError,
     create_worktree,
     remove_worktree,
@@ -397,7 +398,12 @@ def launch_claude_worker(
             config=config,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-        if isinstance(exc, WorktreeUnsafeError):
+        if isinstance(exc, WorktreeProbeFailedError):
+            # Transient probe contention (e.g. index lock), not a confirmed-dirty
+            # worktree. Must stay off DETERMINISTIC_ESCALATION_FAILURE_KINDS so it
+            # takes the ordinary redispatch-cap path (issue #288 follow-up, PR #314).
+            failure_kind = "worktree_probe_failed"
+        elif isinstance(exc, WorktreeUnsafeError):
             failure_kind = "worktree_unsafe"
         elif isinstance(exc, LiveWorkerRedispatchError):
             failure_kind = "live_worker_redispatch_averted"
