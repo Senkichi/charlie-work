@@ -153,13 +153,15 @@ class GitHub:
         error: str | None = None
         value: Any | None = None
         if result.returncode != 0:
-            error = result.stderr.strip() or result.stdout.strip() or f"gh exited {result.returncode}"
+            error = (
+                result.stderr.strip() or result.stdout.strip() or f"gh exited {result.returncode}"
+            )
         if not json_output:
             value = output if result.returncode == 0 else None
         elif output:
             try:
                 value = json.loads(output)
-            except json.JSONDecodeError as exc:
+            except json.JSONDecodeError:
                 error = f"Expected JSON from gh command: {' '.join(command)}"
                 value = None
         return GitHubRunResult(
@@ -422,14 +424,34 @@ class GitHub:
 
         probe = "nonexistent"  # Invalid field name, gh will list valid ones
         field_lists: list[tuple[str, list[str], str]] = [
-            ("ISSUE_LIST_FIELDS", ["issue", "list", "--state", "open", "--limit", "1", "--json", probe], ISSUE_LIST_FIELDS),
+            (
+                "ISSUE_LIST_FIELDS",
+                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
+                ISSUE_LIST_FIELDS,
+            ),
             ("ISSUE_VIEW_FIELDS", ["issue", "view", "0", "--json", probe], ISSUE_VIEW_FIELDS),
-            ("PR_LIST_FIELDS", ["pr", "list", "--state", "open", "--limit", "1", "--json", probe], PR_LIST_FIELDS),
+            (
+                "PR_LIST_FIELDS",
+                ["pr", "list", "--state", "open", "--limit", "1", "--json", probe],
+                PR_LIST_FIELDS,
+            ),
             ("PR_VIEW_FIELDS", ["pr", "view", "0", "--json", probe], PR_VIEW_FIELDS),
             ("PR_CHECKS_FIELDS", ["pr", "checks", "0", "--json", probe], PR_CHECKS_FIELDS),
-            ("LABEL_LIST_FIELDS", ["label", "list", "--limit", "1", "--json", probe], LABEL_LIST_FIELDS),
-            ("RECONCILE_PR_FIELDS", ["pr", "list", "--state", "all", "--limit", "1", "--json", probe], RECONCILE_PR_FIELDS),
-            ("RECONCILE_ISSUE_FIELDS", ["issue", "list", "--state", "open", "--limit", "1", "--json", probe], RECONCILE_ISSUE_FIELDS),
+            (
+                "LABEL_LIST_FIELDS",
+                ["label", "list", "--limit", "1", "--json", probe],
+                LABEL_LIST_FIELDS,
+            ),
+            (
+                "RECONCILE_PR_FIELDS",
+                ["pr", "list", "--state", "all", "--limit", "1", "--json", probe],
+                RECONCILE_PR_FIELDS,
+            ),
+            (
+                "RECONCILE_ISSUE_FIELDS",
+                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
+                RECONCILE_ISSUE_FIELDS,
+            ),
             ("RUN_LIST_FIELDS", ["run", "list", "--limit", "1", "--json", probe], RUN_LIST_FIELDS),
         ]
 
