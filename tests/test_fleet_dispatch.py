@@ -231,6 +231,7 @@ def test_fleet_loop_calls_loop_per_repo(
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
     mock_runtime_paths.return_value = mock_paths
 
     # Mock OrchestratorApp instances
@@ -301,6 +302,7 @@ def test_fleet_loop_work_only_calls_dispatch(
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
     mock_runtime_paths.return_value = mock_paths
 
     # Mock OrchestratorApp
@@ -404,6 +406,7 @@ def test_fleet_loop_github_error_isolated(
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
     mock_runtime_paths.return_value = mock_paths
 
     # Mock OrchestratorApp instances - first one raises GitHubError
@@ -473,6 +476,7 @@ def test_fleet_loop_dry_run_propagates(
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
     mock_runtime_paths.return_value = mock_paths
 
     # Mock OrchestratorApp
@@ -541,6 +545,7 @@ def test_fleet_loop_digest_aggregation(
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
     mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
     mock_runtime_paths.return_value = mock_paths
 
     # Mock OrchestratorApp instances with attention events
@@ -592,3 +597,210 @@ def test_fleet_loop_digest_aggregation(
     # Verify orphan_sweep_calls metric is present
     assert "orphan_sweep_calls" in digest
     assert digest["orphan_sweep_calls"] == 2  # One per repo
+
+
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_fleet_loop_skips_repo_when_supervisor_lock_held(
+    mock_load_registry: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_app_class: MagicMock,
+    mock_try_acquire: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """If the supervisor lock is held, the repo is skipped and others are still processed."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    lock = MagicMock()
+    # repo1 is held (external supervised loop), repo2 is free
+    mock_try_acquire.side_effect = [None, lock]
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # repo1 was skipped because the lock was held
+    assert "owner/repo1" in result.data["repos"]
+    repo1_data = result.data["repos"]["owner/repo1"]
+    assert repo1_data["ok"] is True
+    assert repo1_data["skipped"] is True
+    assert repo1_data["reason"] == "supervisor_lock_held"
+
+    # repo2 still ran
+    assert "owner/repo2" in result.data["repos"]
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app2.loop.call_count == 1
+
+    # The lock taken for repo2 was released
+    lock.release.assert_called_once()
+
+    # The fleet digest surfaces the skipped repo
+    skipped_events = [e for e in result.data["digest"]["events"] if e["type"] == "skipped"]
+    assert len(skipped_events) == 1
+    assert skipped_events[0]["repo_key"] == "owner/repo1"
+    assert skipped_events[0]["reason"] == "supervisor_lock_held"
+
+
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_fleet_loop_releases_lock_after_each_repo(
+    mock_load_registry: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_app_class: MagicMock,
+    mock_try_acquire: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The per-repo supervisor lock is released after each repo, and the next repo can acquire it."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(True, "repo1 loop complete", {})
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    lock1 = MagicMock()
+    lock2 = MagicMock()
+    mock_try_acquire.side_effect = [lock1, lock2]
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    assert result.ok is True
+    assert mock_app1.loop.call_count == 1
+    assert mock_app2.loop.call_count == 1
+    assert lock1.release.called
+    assert lock2.release.called
+
+
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_fleet_loop_work_only_skips_locked_repo(
+    mock_load_registry: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_app_class: MagicMock,
+    mock_try_acquire: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The dispatch-only (work_only) path also respects the supervisor lock."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    (tmp_path / "repo1").mkdir()
+
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app = MagicMock()
+    mock_app_class.return_value = mock_app
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    mock_try_acquire.return_value = None
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=None,
+        dry_run=False,
+        work_only=True,
+    )
+
+    assert mock_app.dispatch.call_count == 0
+    repo_data = result.data["repos"]["owner/repo1"]
+    assert repo_data["ok"] is True
+    assert repo_data["skipped"] is True
+    assert repo_data["reason"] == "supervisor_lock_held"
