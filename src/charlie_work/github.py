@@ -916,6 +916,12 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
         value = result
 
     if value is None:
+        # Legacy FakeGitHub may return None for an allow_failure=True call; in
+        # production gh.run returns a GitHubRunResult with ok=False and error.
+        logger.warning(
+            "GitHub dependencies API returned None for issue #%d - treating as no dependencies",
+            issue_number,
+        )
         return []
     elif isinstance(value, dict):
         # 404/410 error response — feature not available on this repo

@@ -3204,7 +3204,12 @@ def test_merge_ready_update_open_prs_zero_matching_returns_empty_list(tmp_path: 
 
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, args, output="", stderr="Reference does not exist")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="Reference does not exist",
+        )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
