@@ -1556,13 +1556,13 @@ class OrchestratorApp:
                             live_dispatched.add(issue_number)
                 issues_with_open_tracked_prs = set(pr_by_issue.keys())
             candidates = [
-                    issue
-                    for issue in issues
-                    if self._is_dispatchable(issue)
-                    and int(issue["number"]) not in live_dispatched
-                    and int(issue["number"]) not in stalled_issues
-                    and int(issue["number"]) not in issues_with_open_tracked_prs
-                ]
+                issue
+                for issue in issues
+                if self._is_dispatchable(issue)
+                and int(issue["number"]) not in live_dispatched
+                and int(issue["number"]) not in stalled_issues
+                and int(issue["number"]) not in issues_with_open_tracked_prs
+            ]
 
             # Apply dependency gate: skip issues with open blockers (dry-run)
             # Done outside the lock to avoid holding it during GitHub API calls

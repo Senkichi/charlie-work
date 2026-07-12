@@ -2485,7 +2485,7 @@ class FakeGitHub:
         raise ValueError(f"Issue {number} not found")
 
     def pr_list(self):
-        return [pr for pr in self.prs if pr.get("state", "").upper() == "OPEN"]
+        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
     def pr_view(self, number: int):
         # Return the PR matching the requested number

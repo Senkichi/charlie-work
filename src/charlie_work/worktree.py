@@ -564,9 +564,7 @@ def create_worktree(
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""
         check_path = target_path or worktree_path
-        reason = _worktree_refuse_to_reset_reason(
-            repo_root, branch, resolved_base_ref, check_path
-        )
+        reason = _worktree_refuse_to_reset_reason(repo_root, branch, resolved_base_ref, check_path)
         if reason:
             raise WorktreeUnsafeError(reason)
 
