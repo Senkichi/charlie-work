@@ -3269,8 +3269,12 @@ class OrchestratorApp:
         if not isinstance(commit_committer, dict):
             commit_committer = {}
         committer_login = committer.get("login")
-        committer_name = commit_committer.get("name") or committer.get("name")
-        if committer_login != "web-flow" and committer_name != "GitHub":
+        committer_name = commit_committer.get("name")
+        # Both identity signals must match a GitHub-generated merge. The git
+        # metadata name is pusher-settable, and the account login can be
+        # spoofed via the committer email, so accepting either alone would let
+        # a crafted racing push get blessed as a base sync. Fail closed.
+        if committer_login != "web-flow" or committer_name != "GitHub":
             return None
 
         return new_head_sha

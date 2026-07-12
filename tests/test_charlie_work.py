@@ -9768,6 +9768,105 @@ def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) ->
     assert decision["reviewed_head_sha"] == "sha-abc123"
 
 
+def _make_racing_merge_ready_app(
+    tmp_path: Path, racing_commit: dict[str, Any]
+) -> tuple[Any, Any, Any]:
+    """Build an app whose update-branch races in a crafted merge commit.
+
+    The racing commit's parents deliberately satisfy the structural checks
+    (two parents, old head included) so only the committer-identity predicate
+    is under test.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubRacingUpdate(FakeGitHub):
+        def pr_update_branch(self, pr_number: int) -> bool:
+            ok = super().pr_update_branch(pr_number)
+            racing = "racing-sha"
+            self.pr_head_shas[pr_number] = racing
+            self.commits[racing] = racing_commit
+            return ok
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubRacingUpdate()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return app, fake_gh, paths
+
+
+def test_merge_ready_race_with_spoofed_committer_name_rejected(tmp_path: Path) -> None:
+    """A racing push whose git metadata claims name 'GitHub' must still be rejected.
+
+    The commit.committer.name field is settable by any pusher; only the
+    web-flow account login together with the GitHub name identifies a real
+    base-sync merge. Structural parent checks are satisfied on purpose.
+    """
+    app, fake_gh, paths = _make_racing_merge_ready_app(
+        tmp_path,
+        {
+            "parents": [{"sha": "sha-abc123"}, {"sha": "main-tip-sha"}],
+            "committer": {"login": "attacker"},
+            "commit": {"committer": {"name": "GitHub"}},
+        },
+    )
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_merge_ready_race_with_spoofed_webflow_login_rejected(tmp_path: Path) -> None:
+    """A racing push attributed to web-flow but with a non-GitHub name is rejected.
+
+    Login attribution follows the committer email, which a pusher can set to
+    noreply@github.com; the git metadata name must corroborate it.
+    """
+    app, fake_gh, paths = _make_racing_merge_ready_app(
+        tmp_path,
+        {
+            "parents": [{"sha": "sha-abc123"}, {"sha": "main-tip-sha"}],
+            "committer": {"login": "web-flow"},
+            "commit": {"committer": {"name": "Devin Worker"}},
+        },
+    )
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
 def test_update_open_agent_prs_merge_train_post_sync_head_race_rejected(
     tmp_path: Path,
 ) -> None:
