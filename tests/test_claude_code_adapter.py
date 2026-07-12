@@ -64,6 +64,7 @@ def _install_fake_create_worktree(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         if calls is not None:
             calls.append(
@@ -77,6 +78,7 @@ def _install_fake_create_worktree(
                     "rework": rework,
                     "recovery": recovery,
                     "issue_number": issue_number,
+                    "config": config,
                 }
             )
         if with_venv:
@@ -385,6 +387,7 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         raise RuntimeError("git worktree add failed: branch already exists")
 
@@ -1178,6 +1181,7 @@ def test_launch_claude_worker_with_venv_source_junction(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         calls.append(
             {
@@ -1190,6 +1194,7 @@ def test_launch_claude_worker_with_venv_source_junction(
                 "rework": rework,
                 "recovery": recovery,
                 "issue_number": issue_number,
+                "config": config,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1234,6 +1239,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         calls.append(
             {
@@ -1246,6 +1252,7 @@ def test_launch_claude_worker_with_custom_worktrees_dir(
                 "rework": rework,
                 "recovery": recovery,
                 "issue_number": issue_number,
+                "config": config,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1288,6 +1295,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         calls.append(
             {
@@ -1300,6 +1308,7 @@ def test_launch_claude_worker_rework_mode_reuses_existing_worktree(
                 "rework": rework,
                 "recovery": recovery,
                 "issue_number": issue_number,
+                "config": config,
             }
         )
         return _fake_worktree(tmp_path, branch)
@@ -1348,6 +1357,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         calls.append(
             {
@@ -1360,6 +1370,7 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
                 "rework": rework,
                 "recovery": recovery,
                 "issue_number": issue_number,
+                "config": config,
             }
         )
         return _fake_worktree(tmp_path, branch)

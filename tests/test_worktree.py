@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
+from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeInfo,
     WorktreeState,
     WorktreeUnsafeError,
+    LiveWorkerRedispatchError,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -21,6 +26,7 @@ from charlie_work.worktree import (
     remove_worktree,
     _is_git_tracked,
     _materialize_directory,
+    _slugify,
 )
 
 
@@ -2568,3 +2574,340 @@ def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     assert "agent/issue-4" in remote_refs.stdout
 
     remove_worktree(repo, info.path, branch="agent/issue-4")
+
+
+def test_recovery_aborts_when_worker_pid_alive(tmp_path: Path) -> None:
+    """Issue #282: recovery must not remove a worktree if the recorded worker PID is still alive."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-live-worker"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Spawn a real long-running child process so we have a live PID and a valid start time.
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        start_time = get_process_start_time(process.pid)
+        assert start_time is not None
+
+        recovery_record = {
+            "branch_name": branch_name,
+            "status": "dispatched",
+            "worker_pid": process.pid,
+            "worker_process_start_time": start_time,
+        }
+
+        with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+            create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+        assert exc_info.value.probe_result == "pid_alive"
+        assert exc_info.value.pid == process.pid
+        # The worktree and branch must survive the aborted redispatch.
+        assert info1.path.exists()
+        assert branch_name in _git(repo_root, "branch", "--list").stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
+    """Issue #282: recovery must not remove a worktree if sessions.db shows fresh activity."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-db-activity"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # Build a fake Devin sessions.db with a recent session/message for this worktree.
+    db_path = tmp_path / "sessions.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+    )
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+        ("session-1", str(worktree_path), now),
+    )
+    conn.execute(
+        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        ("session-1", "tool", "tool result", now),
+    )
+    conn.commit()
+    conn.close()
+
+    # The per-PID Devin log source must also resolve WITHOUT an error (issue
+    # #282 rework: any errored source makes the whole probe inconclusive and
+    # aborts recovery on its own, which would mask this test's actual signal
+    # under test — sessions.db activity alone being sufficient). Give it a
+    # confirmed-stale (not fresh) timestamp so sessions.db remains the
+    # freshest, deciding source.
+    logs_dir = db_path.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stale_log = logs_dir / "devin_test_999999.log"
+    stale_log.write_text("old log\n", encoding="utf-8")
+    stale_time = (datetime.now(UTC) - timedelta(hours=2)).timestamp()
+    os.utime(stale_log, (stale_time, stale_time))
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    # Use a dead PID (no such process) so the sessions.db probe is the deciding signal.
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "sessions_db_activity"
+    # No worktree should have been created yet and the branch should not exist.
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_path: Path) -> None:
+    """Issue #282 rework: an errored sessions.db probe is INCONCLUSIVE, not
+    confirmed-dead — even when the per-PID log source has no signal of its
+    own either. Reproduces the exact live-incident signature (sqlite schema
+    drift, "no such column: id") that let the prior fail-open guard proceed
+    into a destructive reset of a live worker.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-db-schema-error"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions table is missing the `id` column the probe's query selects -
+    # the exact schema-drift shape from the live incident.
+    db_path = tmp_path / "sessions.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (working_directory TEXT, created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    # No logs/ directory at all -> devin_per_pid_log is silent too (its own
+    # "not found" error), never a confirmed timestamp either way.
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "probe_error"
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_aborts_when_all_sources_errored(tmp_path: Path) -> None:
+    """Issue #282 rework: if every activity source errors, liveness is
+    unknown, not confirmed-dead — recovery must abort rather than proceed as
+    if the worker were genuinely stale.
+
+    Mutation-checked: reverting ``_probe_recovery_liveness`` to the prior
+    fail-open guard (``if source.name == "sessions.db" and
+    source.staleness_seconds is not None``) makes this test FAIL, because
+    that guard silently returns without raising when every source errors.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-all-sources-errored"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db does not exist on disk at all -> _open_readonly errors
+    # immediately, before any query is even attempted.
+    db_path = tmp_path / "missing-sessions.db"
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    # No logs/ directory either -> devin_per_pid_log also errors.
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "probe_error"
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_aborts_on_fresh_per_pid_log_despite_sessions_db_error(tmp_path: Path) -> None:
+    """Issue #282 rework: fresh devin_per_pid_log activity must abort
+    recovery even when sessions.db is the source that errored — this is the
+    exact tonight's-incident shape (an 8-second-fresh per-PID log) that the
+    prior sessions.db-only check never looked at.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-per-pid-log-fresh-db-error"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db missing entirely -> errored source.
+    db_path = tmp_path / "missing-sessions.db"
+
+    # Fresh per-PID Devin log for the recorded worker pid.
+    logs_dir = db_path.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    fresh_log = logs_dir / "devin_test_999999.log"
+    fresh_log.write_text("fresh activity\n", encoding="utf-8")
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    # Aborted either way (the errored sessions.db source is already enough on
+    # its own) - the point of this regression test is that the fresh
+    # devin_per_pid_log signal is never silently ignored just because it
+    # isn't the sessions.db source.
+    assert exc_info.value.probe_result == "probe_error"
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
+    tmp_path: Path,
+) -> None:
+    """Issue #282 rework, requirement 2 in isolation: even when sessions.db
+    positively confirms only stale (non-error) activity, a fresh
+    devin_per_pid_log signal on its own must still abort recovery. The prior
+    guard only ever inspected the "sessions.db" source by name and would have
+    silently ignored this signal.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-per-pid-log-only-fresh"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    db_path = tmp_path / "sessions.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+    )
+    stale_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    conn.execute(
+        "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+        ("session-1", str(worktree_path), stale_iso),
+    )
+    conn.execute(
+        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        ("session-1", "tool", "tool result", stale_iso),
+    )
+    conn.commit()
+    conn.close()
+
+    # Fresh per-PID Devin log (mtime defaults to "now" via write_text).
+    logs_dir = db_path.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    fresh_log = logs_dir / "devin_test_999999.log"
+    fresh_log.write_text("fresh activity\n", encoding="utf-8")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": stale_iso,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "devin_per_pid_log_activity"
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout

@@ -65,6 +65,7 @@ from charlie_work.workflow import (
     slugify,
 )
 from charlie_work.worktree import create_worktree
+from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.devin_shell import SessionRecord
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
@@ -5029,6 +5030,59 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
     assert captured["recovery"]["status"] == "dispatched"
     assert captured["recovery"]["branch_name"] == "agent/issue-123-fix-search"
     assert (123, "agent:in-progress") in fake_gh.labels_added
+
+
+def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #282: a recovery redispatch that detects a live worker must abort
+    and restore the in-progress label, not clobber the worktree."""
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+            error="pid_alive",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=1_234_567.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 4242,
+        "worker_process_start_time": 1_234_567.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+    assert any(
+        event["kind"] == "live_worker_redispatch_averted"
+        and event["payload"]["issue_number"] == 123
+        for event in state.get("events", [])
+    )
 
 
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
@@ -14706,9 +14760,9 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert entry.get("status") == "rework_requested"
     assert entry.get("dispatched_at") is None
 
-    # Worker PID should be cleared
-    assert "worker_pid" not in entry
-    assert "worker_process_start_time" not in entry
+    # Worker PID should be preserved for recovery-path verification (issue #282)
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
 
     # Verify the event was logged
     events = state.get("events", [])
@@ -14774,9 +14828,9 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     # Status should NOT be reset (still dispatched)
     assert entry.get("status") == "dispatched"
 
-    # Worker PID should be cleared
-    assert "worker_pid" not in entry
-    assert "worker_process_start_time" not in entry
+    # Worker PID should be preserved for recovery-path verification (issue #282)
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
 
     # Verify drift event was logged
     events = state.get("events", [])
@@ -14910,9 +14964,9 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
     # Status should be reset to rework_requested
     assert entry.get("status") == "rework_requested"
 
-    # Worker PID should be cleared
-    assert "worker_pid" not in entry
-    assert "worker_process_start_time" not in entry
+    # Worker PID should be preserved for recovery-path verification (issue #282)
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
 
     # Verify recovered event was logged
     events = state.get("events", [])
@@ -14963,9 +15017,9 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     # Status should NOT be reset (still dispatched)
     assert entry.get("status") == "dispatched"
 
-    # Worker PID should be cleared
-    assert "worker_pid" not in entry
-    assert "worker_process_start_time" not in entry
+    # Worker PID should be preserved for recovery-path verification (issue #282)
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
 
     # Verify drift event was logged (not recovered)
     events = state.get("events", [])
@@ -15082,8 +15136,9 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
     # run regardless of the orphan_flagged_at suppression.
     assert entry.get("status") == "rework_requested"
     assert entry.get("dispatched_at") is None
-    assert "worker_pid" not in entry
-    assert "worker_process_start_time" not in entry
+    # Worker PID should be preserved for recovery-path verification (issue #282)
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
 
     events = state.get("events", [])
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]

@@ -36,7 +36,13 @@ from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
-from .worktree import WorktreeInfo, WorktreeUnsafeError, create_worktree, remove_worktree
+from .worktree import (
+    LiveWorkerRedispatchError,
+    WorktreeInfo,
+    WorktreeUnsafeError,
+    create_worktree,
+    remove_worktree,
+)
 
 PROMPT_FILENAME = ".orchestrator-prompt.md"
 
@@ -306,6 +312,8 @@ def _error_record(
     log_path: str,
     error: str,
     failure_kind: str | None = None,
+    pid: int | None = None,
+    process_start_time: float | None = None,
 ) -> ClaudeWorkerRecord:
     return ClaudeWorkerRecord(
         issue_number=issue_number,
@@ -313,11 +321,12 @@ def _error_record(
         worktree_path=worktree_path,
         prompt_path=prompt_path,
         command=command,
-        pid=None,
+        pid=pid,
         started_at=utc_now(),
         log_path=log_path,
         error=error,
         failure_kind=failure_kind,
+        process_start_time=process_start_time,
     )
 
 
@@ -354,6 +363,7 @@ def launch_claude_worker(
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     tee_stream_json: bool = False,
+    config: OrchestratorConfig | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -384,9 +394,15 @@ def launch_claude_worker(
             recovery=recovery,
             base_ref=base_ref,
             issue_number=issue_number,
+            config=config,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-        failure_kind = "worktree_unsafe" if isinstance(exc, WorktreeUnsafeError) else None
+        if isinstance(exc, WorktreeUnsafeError):
+            failure_kind = "worktree_unsafe"
+        elif isinstance(exc, LiveWorkerRedispatchError):
+            failure_kind = "live_worker_redispatch_averted"
+        else:
+            failure_kind = None
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -394,8 +410,14 @@ def launch_claude_worker(
             prompt_path="",
             command=command_template,
             log_path=str(log_path),
-            error=f"worktree creation failed: {exc}",
+            error=str(exc)
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
+            pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
+            process_start_time=exc.process_start_time
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else None,
         )
         return _write_record(sessions_dir, record)
 

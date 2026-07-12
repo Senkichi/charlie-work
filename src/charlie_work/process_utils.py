@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -198,6 +200,110 @@ def _enumerate_child_pids(pid: int) -> list[int]:
     return children
 
 
+def get_process_start_time(pid: int) -> float | None:
+    """Return the process start time as a Unix timestamp, or None if unavailable.
+
+    Used to verify process identity and detect PID recycling. The value is
+    resolved from the operating system, not from a cached sidecar, so it can be
+    compared against a stored fingerprint to decide whether a PID still refers
+    to the same process.
+    """
+    if pid <= 0:
+        return None
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            creation_time = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation_time),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
+                return filetime / 10_000_000 - 11644473600
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        # POSIX: read /proc/<pid>/stat
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat = f.read()
+            starttime_ticks = parse_proc_stat_starttime(stat)
+            if starttime_ticks is None:
+                return None
+            tick_hz = os.sysconf("SC_CLK_TCK")
+            if tick_hz <= 0:
+                tick_hz = 100
+            try:
+                with open("/proc/uptime", "r") as f:
+                    uptime_seconds = float(f.read().split()[0])
+            except (OSError, ValueError, IndexError):
+                uptime_seconds = 0
+            boot_time = time.time() - uptime_seconds
+            return boot_time + (starttime_ticks / tick_hz)
+        except (OSError, ValueError, IndexError):
+            return None
+
+
+def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
+    """Return True if ``pid`` is a live process and (optionally) start time matches.
+
+    On Windows this uses ``OpenProcess`` + ``GetExitCodeProcess``; on POSIX it
+    uses ``os.kill(pid, 0)``. When ``expected_start_time`` is provided, the
+    current process start time is also fetched and compared against the stored
+    fingerprint, returning False if the PID has been recycled.
+    """
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        _WIN_STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            if exit_code.value != _WIN_STILL_ACTIVE:
+                return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            return False
+
+    if expected_start_time is not None:
+        current_start_time = get_process_start_time(pid)
+        if current_start_time is None:
+            return False
+        if abs(current_start_time - expected_start_time) > 1.0:
+            return False
+
+    return True
+
+
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
@@ -226,56 +332,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
 
     # Re-verify process identity via start time if provided
     if expected_start_time is not None:
-        import sys
-        import time
-
-        current_start_time = None
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
-
-            _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                try:
-                    creation_time = wintypes.FILETIME()
-                    exit_time = wintypes.FILETIME()
-                    kernel_time = wintypes.FILETIME()
-                    user_time = wintypes.FILETIME()
-                    if kernel32.GetProcessTimes(
-                        handle,
-                        ctypes.byref(creation_time),
-                        ctypes.byref(exit_time),
-                        ctypes.byref(kernel_time),
-                        ctypes.byref(user_time),
-                    ):
-                        filetime = (
-                            creation_time.dwHighDateTime << 32
-                        ) | creation_time.dwLowDateTime
-                        unix_time = filetime / 10_000_000 - 11644473600
-                        current_start_time = unix_time
-                finally:
-                    kernel32.CloseHandle(handle)
-        else:
-            # POSIX: read /proc/<pid>/stat
-            try:
-                with open(f"/proc/{pid}/stat", "r") as f:
-                    stat = f.read()
-                starttime_ticks = parse_proc_stat_starttime(stat)
-                if starttime_ticks is not None:
-                    tick_hz = os.sysconf("SC_CLK_TCK")
-                    if tick_hz <= 0:
-                        tick_hz = 100
-                    try:
-                        with open("/proc/uptime", "r") as f:
-                            uptime_seconds = float(f.read().split()[0])
-                    except (OSError, ValueError, IndexError):
-                        uptime_seconds = 0
-                    boot_time = time.time() - uptime_seconds
-                    current_start_time = boot_time + (starttime_ticks / tick_hz)
-            except (OSError, ValueError, IndexError):
-                pass
+        current_start_time = get_process_start_time(pid)
 
         # If we couldn't get current start time, conservatively don't kill
         if current_start_time is None:
