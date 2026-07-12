@@ -32,9 +32,33 @@ _DEFAULT_TIMEOUT_SECONDS = 60
 
 
 class WorktreeUnsafeError(RuntimeError):
-    """Raised when ``create_worktree`` is about to reset a worktree that contains
-    local work (uncommitted modifications or local commits not on the remote
-    branch). The launch shim should surface this as a distinct ``failure_kind``.
+    """Raised when ``create_worktree`` is about to reset a worktree that is
+    CONFIRMED to contain local work (uncommitted modifications, or local
+    commits not on the remote branch). This is a deterministic finding — the
+    launch shim surfaces it as ``failure_kind="worktree_unsafe"``, which sits
+    in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a
+    human on first occurrence. Do not raise this for a probe that merely
+    *failed to determine* dirtiness — see ``WorktreeProbeFailedError``.
+    """
+
+
+class WorktreeProbeFailedError(RuntimeError):
+    """Raised when the safety probe used to decide whether a worktree/branch
+    reset would destroy local work itself failed (e.g. ``git status
+    --porcelain`` hit an index lock, I/O error, or permissions issue) — NOT
+    when the probe ran and confirmed the worktree is dirty.
+
+    This is transient contention that an ordinary redispatch-cap retry would
+    plausibly heal, unlike a confirmed-dirty worktree. The launch shim
+    surfaces it as ``failure_kind="worktree_probe_failed"``, which must stay
+    OFF ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` so it takes the
+    normal redispatch-cap path instead of escalating on first occurrence
+    (issue #288 follow-up review finding, PR #314).
+
+    The reset is still refused (the caller cannot confirm safety), so this
+    is a sibling of ``WorktreeUnsafeError`` rather than a subclass of it —
+    keeping the two independent avoids an ``isinstance`` check on the more
+    general class silently reclassifying a probe failure as confirmed-dirty.
     """
 
 
@@ -229,6 +253,14 @@ def _worktree_refuse_to_reset_reason(
         branch does not exist)
 
     This is read-only: it never commits, fetches, or resets.
+
+    Raises:
+        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
+            fails (index lock, corruption, permissions). The reset is still
+            refused (we cannot confirm the worktree is clean), but this is
+            classified distinctly from a confirmed-dirty worktree — see the
+            class docstring for why callers must not conflate the two under
+            the same ``failure_kind``.
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
@@ -237,10 +269,13 @@ def _worktree_refuse_to_reset_reason(
             cwd=worktree_path,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
-        # If the probe fails (index lock, corruption, permissions), treat as dirty
-        # to be safe and refuse the reset.
+        # If the probe fails (index lock, corruption, permissions), we cannot
+        # confirm the worktree is clean. Refuse the reset (safe default), but
+        # raise a distinct exception: this is transient probe contention, not
+        # a confirmed-dirty worktree, and must not be classified the same way
+        # (issue #288 follow-up, PR #314).
         if not status_result.ok:
-            return "worktree status probe failed; treating as dirty"
+            raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
         if status_result.stdout.strip():
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(

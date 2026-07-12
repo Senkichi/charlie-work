@@ -9176,6 +9176,183 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     assert "session_failed_escalated" in event_kinds
 
 
+def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #288: a launch result whose sidecar carries failure_kind=worktree_unsafe
+    must escalate immediately, bypass the redispatch cap, and not be relabeled to ready.
+    A subsequent dispatch pass must not select the issue.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.ready}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Launch failure — process never started
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # No hot relabel-to-ready.
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+    # Escalation transition added human_needed.
+    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # The launch never succeeded, so the issue should not be marked in_progress.
+    assert (42, config.labels.in_progress) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"]["42"]
+    assert issue_entry["status"] == "escalated"
+    assert issue_entry["escalation_reason"] == "worktree_unsafe"
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_relabeled" not in event_kinds
+    assert "session_failed_escalated" in event_kinds
+
+    fake_gh.issues[0]["labels"].append({"name": config.labels.human_needed})
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+    assert result.data["selected_count"] == 0
+
+
+def test_worktree_probe_failed_launch_failure_does_not_escalate(
+    tmp_path: Path,
+) -> None:
+    """PR #314 review follow-up to issue #288: a launch result whose sidecar
+    carries failure_kind=worktree_probe_failed (the git status --porcelain
+    safety probe itself failed -- index lock, I/O error, etc. -- NOT a
+    confirmed-dirty worktree) must NOT escalate on first occurrence. It must
+    take the ordinary redispatch-cap path so a subsequent dispatch pass can
+    still select the issue.
+
+    This is the mirror of
+    test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch:
+    confirmed-dirty (worktree_unsafe) escalates immediately; a failed probe
+    (worktree_probe_failed) must not, because it is transient contention an
+    ordinary redispatch retry would plausibly heal.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.ready}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("index.lock: File exists\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Launch failure — process never started
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree status probe failed; treating as dirty",
+        failure_kind="worktree_probe_failed",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # No escalation transition — human_needed must NOT be added, and the
+    # issue must not be marked in_progress (the launch never succeeded).
+    assert (42, config.labels.human_needed) not in fake_gh.labels_added
+    assert (42, config.labels.in_progress) not in fake_gh.labels_added
+    assert (42, config.labels.ready) not in fake_gh.labels_removed
+
+    # No escalated status recorded in state for this issue.
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"].get("42")
+    assert issue_entry is None or issue_entry.get("status") != "escalated"
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_escalated" not in event_kinds
+
+    # Because nothing removed the "ready" label or marked the issue escalated,
+    # a subsequent dispatch pass must still be able to select it — the
+    # opposite of the confirmed-dirty (worktree_unsafe) case above.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+    assert result.data["selected_count"] == 1
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
@@ -14811,12 +14988,18 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     workflow_source = inspect.getsource(workflow_module)
 
     # Count occurrences of redispatch_at assignments to entry
-    # We have 2 assignments in dispatch_rework (lines 2472, 2451) and 2 in _classify_dead_sessions_and_update_throttle_state (lines 502, 483)
-    # Total of 4 assignments is correct - 2 in each function for the two code paths (normal vs escalation)
+    # We have 2 assignments in dispatch_rework (normal + escalation) and 3 in
+    # _classify_dead_sessions_and_update_throttle_state: the dead-session normal
+    # and escalation paths, plus (issue #288 follow-up, PR #314) the
+    # launch-failure escalation path, which now appends to prior history
+    # instead of overwriting it with a single-entry list.
+    # Total of 5 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    # Should be exactly 4: 2 in dispatch_rework (normal + escalation), 2 in _classify_dead_sessions_and_update_throttle_state (normal + escalation)
-    assert redispatch_assignments == 4, (
-        f"Expected 4 redispatch_at assignments, found {redispatch_assignments}"
+    # Should be exactly 5: 2 in dispatch_rework (normal + escalation), 3 in
+    # _classify_dead_sessions_and_update_throttle_state (launch-failure
+    # escalation + dead-session normal + dead-session escalation).
+    assert redispatch_assignments == 5, (
+        f"Expected 5 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 

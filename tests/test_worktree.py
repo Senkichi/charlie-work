@@ -12,6 +12,7 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfi
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeInfo,
+    WorktreeProbeFailedError,
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
@@ -1376,7 +1377,12 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
     """Issue #257: Failed dirty-probe should be treated as dirty and refused.
 
     When git status --porcelain fails (index lock, corruption, permissions),
-    the guard should refuse to reset rather than risk discarding work.
+    the guard should refuse to reset rather than risk discarding work. Per
+    the issue #288 follow-up review (PR #314), this is raised as the distinct
+    ``WorktreeProbeFailedError`` rather than ``WorktreeUnsafeError`` — a probe
+    failure is transient contention, not a confirmed-dirty worktree, so the
+    launch shim must classify it under a separate failure_kind that does not
+    escalate to a human on first occurrence.
     """
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -1412,8 +1418,9 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
 
     try:
         # Fresh dispatch should refuse to reset because the probe could not confirm
-        # the worktree is clean.
-        with pytest.raises(WorktreeUnsafeError, match="worktree status probe failed"):
+        # the worktree is clean — but as a distinct exception type from a
+        # confirmed-dirty worktree (see WorktreeProbeFailedError docstring).
+        with pytest.raises(WorktreeProbeFailedError, match="worktree status probe failed"):
             create_worktree(repo_root, branch_name, base_ref="HEAD")
 
         # Verify the worktree still exists (not removed)
@@ -2631,7 +2638,7 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     now = datetime.now(UTC).isoformat()
     conn.execute(
@@ -2639,8 +2646,8 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
         ("session-1", str(worktree_path), now),
     )
     conn.execute(
-        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        ("session-1", "tool", "tool result", now),
+        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("session-1", 1, "tool", "tool result", now),
     )
     conn.commit()
     conn.close()
@@ -2708,7 +2715,7 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     conn.commit()
     conn.close()
@@ -2866,7 +2873,7 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     stale_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     conn.execute(
@@ -2874,8 +2881,8 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
         ("session-1", str(worktree_path), stale_iso),
     )
     conn.execute(
-        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        ("session-1", "tool", "tool result", stale_iso),
+        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("session-1", 1, "tool", "tool result", stale_iso),
     )
     conn.commit()
     conn.close()
