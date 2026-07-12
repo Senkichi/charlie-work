@@ -127,6 +127,34 @@ def _build_sessions_db(
         conn.close()
 
 
+def _insert_session_row(
+    db_path: Path,
+    *,
+    session_id: str,
+    working_directory: str,
+    created_at: str,
+    nodes: list[tuple[str, str, str]] = (),
+) -> None:
+    """Insert an additional session row and its message_nodes into an existing
+    fixture sessions.db created by ``_build_sessions_db``.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+            (session_id, working_directory, created_at),
+        )
+        for role, content, node_created_at in nodes:
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, role, content, node_created_at),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _config_with_db(db_path: Path, **overrides) -> OrchestratorConfig:
     pm_kwargs = {"db_path": str(db_path)}
     pm_kwargs.update(overrides)
@@ -995,3 +1023,218 @@ def test_real_activity_probe_to_payload() -> None:
     assert payload["sources"][0]["timestamp"] == "2026-07-11T11:59:00+00:00"
     assert payload["sources"][0]["staleness_seconds"] == 60.0
     assert payload["sources"][1]["error"] == "no pid"
+
+
+# ---------------------------------------------------------------------------
+# working_directory normalization (issue #281)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_and_record_matches_worktree_with_forward_slash_separator(
+    tmp_path: Path,
+) -> None:
+    """A sessions.db row using forward slashes must match a worker whose
+    worktree_path uses native Windows backslashes."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-1"
+
+
+def test_classify_and_record_matches_worktree_with_different_case(tmp_path: Path) -> None:
+    """A sessions.db row whose working_directory differs only by case must
+    match the worker's worktree_path."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="c:/repo/.var/worktrees/issue-42",
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-1"
+
+
+def test_classify_and_record_matches_worktree_with_trailing_separator(
+    tmp_path: Path,
+) -> None:
+    """A sessions.db row whose working_directory has a trailing separator must
+    still match the worker's worktree_path."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42/",
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-1"
+
+
+def test_classify_and_record_matches_worktree_with_msys_style_leading_slash(
+    tmp_path: Path,
+) -> None:
+    r"""A sessions.db row using a POSIX/MSYS-style /c/... path must match a
+    worker whose worktree_path is a native Windows C:\... path."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="/c/repo/.var/worktrees/issue-42",
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-1"
+
+
+def test_classify_and_record_normalized_match_outside_window_still_within_window_error(
+    tmp_path: Path,
+) -> None:
+    """If a normalized working_directory matches a row but its created_at is
+    outside the match window, the existing "within the time window" error path
+    still fires exactly as today."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="c:/repo/.var/worktrees/issue-42",
+        created_at="2026-07-12T11:56:00",
+        nodes=[],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is False
+    assert record.extraction_error is not None
+    assert "within the time window" in record.extraction_error
+
+
+def test_classify_and_record_no_normalized_match_surfaces_distinct_directories(
+    tmp_path: Path,
+) -> None:
+    """When exact and normalized working_directory matching both fail, the
+    extraction_error must include a sample of distinct working_directory values
+    actually present in sessions.db for diagnostics."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-999-different",
+        nodes=[],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result is None
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is False
+    assert record.extraction_error is not None
+    assert "sample distinct working_directory values" in record.extraction_error
+    assert "C:/repo/.var/worktrees/issue-999-different" in record.extraction_error
+
+
+def test_classify_and_record_multiple_normalized_sessions_returns_latest(
+    tmp_path: Path,
+) -> None:
+    """A reused worktree with multiple prior dead sessions in the same
+    normalized working directory must return the most recent in-window session's
+    transcript, just as it does once the row is found."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="c:/repo/.var/worktrees/issue-42/",
+        created_at="2026-07-11T11:54:00",
+        nodes=[("tool", json.dumps({"tool": "bash"}), "2026-07-11T11:54:00")],
+    )
+    _insert_session_row(
+        db_path,
+        session_id="sess-2",
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        created_at="2026-07-11T11:56:00",
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:56:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(worktree_path=r"C:\repo\.var\worktrees\issue-42")
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.session_id == "sess-2"
+    assert record.failure_kind == "worker_blocked"
+
+
+def test_real_activity_for_worker_matches_normalized_worktree_path(
+    tmp_path: Path,
+) -> None:
+    """real_activity_for_worker must also match a sessions.db row whose
+    working_directory is a differently-formatted path for the same logical
+    worktree."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="/c/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(pid=12345)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        r"C:\repo\.var\worktrees\issue-42",
+        worker.started_at,
+        worker.pid,
+        now,
+    )
+
+    assert probe.latest_source == "sessions.db"
+    assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 57, 0, tzinfo=UTC)
