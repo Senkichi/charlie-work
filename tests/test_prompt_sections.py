@@ -33,6 +33,37 @@ def test_section_variables_discovers_package_sections() -> None:
     assert "Do not batch unrelated fixes." in sections["section_scope_contract"]
 
 
+def test_execution_contract_section_present_and_rendered() -> None:
+    """Verify the conditional full-suite execution contract is a shared section and appears in all worker prompts."""
+    sections = section_variables()
+
+    assert "section_execution_contract" in sections
+    contract = sections["section_execution_contract"]
+    assert "self-detect from your diff" in contract
+    assert "public function signature" in contract
+    assert "return shape" in contract
+    assert "exception type" in contract
+    assert "DB schema" in contract
+    assert "module re-export" in contract
+    assert "run the **FULL suite** locally at the final head before pushing" in contract
+
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert contract in prompt
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    rework_values = {
+        "pr_number": 456,
+        "pr_title": "fix: search is broken",
+        "pr_url": "https://example.test/pull/456",
+        "issue_number": 123,
+        "review_summary": "Fix the typo in the search function.",
+        "branch_name": "agent/issue-123-fix-search",
+    }
+    rework_prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
+    assert contract in rework_prompt
+
+
 def test_section_variables_has_no_hardcoded_name_list(tmp_path: Path) -> None:
     worker_sections = tmp_path / "worker_sections"
     worker_sections.mkdir()
