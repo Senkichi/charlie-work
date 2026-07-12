@@ -143,6 +143,39 @@ def test_create_worktree_junctions_shared_venv(tmp_path: Path) -> None:
     ) == "shared contents\n"
 
 
+def test_create_worktree_no_venv_source_isolates_uv_sync_writes(tmp_path: Path) -> None:
+    """Issue #274: with no venv_source, a worker's uv sync creates a local .venv
+    and cannot poison the operator's shared venv editable-install metadata.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    pth = shared_venv / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    pth.parent.mkdir(parents=True)
+    pth.write_text("operator/src\n", encoding="utf-8")
+
+    info = create_worktree(
+        repo_root, "agent/issue-274-no-junction", base_ref="HEAD", venv_source=None
+    )
+
+    # With the fix, no .venv junction is created at worktree creation time.
+    assert info.venv_junction is None
+    assert not (info.path / ".venv").exists()
+    assert not is_junction(info.path / ".venv")
+
+    # Simulate a worker running uv sync and installing an editable .pth in the
+    # worktree's own (cold-built) .venv.
+    local_venv = info.path / ".venv"
+    local_venv.mkdir(parents=True)
+    local_pth = local_venv / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    local_pth.parent.mkdir(parents=True)
+    local_pth.write_text("worktree/src\n", encoding="utf-8")
+
+    # The shared venv's editable .pth must remain untouched.
+    assert pth.read_text(encoding="utf-8") == "operator/src\n"
+
+
 def test_remove_worktree_refuses_when_venv_is_real_directory(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)

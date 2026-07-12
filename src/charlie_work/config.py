@@ -246,9 +246,11 @@ class ClaudeCodeConfig:
     command: tuple[str, ...] = ()
     # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
     worktrees_dir: str | None = None
-    # Relative to the consumer repo root; junctioned into each worktree so
-    # workers share one venv (operator decision 2026-07-01). None disables.
-    venv_source: str | None = ".venv"
+    # Disabled by default: a claude-code worker has a full agentic shell and
+    # can run uv sync, which would rewrite the shared venv's editable install
+    # metadata to point at the worktree (issue #274). Setting a relative path
+    # re-enables the legacy shared-venv junction; None disables it.
+    venv_source: str | None = None
     # Extra environment variables merged over the orchestrator's env in every
     # worker's launch process. Primary use: bound local test parallelism on a
     # shared host — set PYTEST_XDIST_AUTO_NUM_WORKERS to cap `pytest -n auto` at

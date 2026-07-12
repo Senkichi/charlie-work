@@ -4876,7 +4876,7 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
 
     assert result.ok is True
     assert "Issue #123" in str(captured["prompt_text"])  # rendered prompt fed through
-    assert captured["venv_source"] == tmp_path / ".venv"  # junction default ON
+    assert captured["venv_source"] is None  # issue #274: no shared venv by default
     assert (123, "agent:in-progress") in fake_gh.labels_added
 
 
