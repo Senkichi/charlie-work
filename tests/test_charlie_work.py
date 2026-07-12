@@ -571,6 +571,18 @@ def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
     assert summary.infra_failed == ()
 
 
+def test_summarize_checks_none_returns_unavailable_required_checks() -> None:
+    """Command-level gh failure (checks=None) marks every required check unavailable."""
+    summary = summarize_checks(None, ("Tests",))
+
+    assert summary.ready is False
+    assert summary.unavailable == ("Tests",)
+    assert summary.passed == ()
+    assert summary.pending == ()
+    assert summary.failed == ()
+    assert summary.missing == ()
+
+
 def test_is_infrastructure_failure_zero_step_job() -> None:
     """Jobs with zero non-setup steps should be classified as infrastructure failure."""
     job = {
@@ -3389,6 +3401,50 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert fake_gh.merged == []
+
+
+def test_review_checks_unavailable_blocks_and_preserves_labels(tmp_path: Path) -> None:
+    """gh pr checks command failure must block review, leave labels unchanged, and surface checks_unavailable."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data["checks_unavailable"] is True
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+
+
+def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -> None:
+    """A PR whose review is blocked by checks unavailable must be recorded as an error, not reviewed or merged."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.ok is False
+    assert result.data["reviews"] == []
+    assert result.data["merges"] == []
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["pr"] == 456
+    assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
