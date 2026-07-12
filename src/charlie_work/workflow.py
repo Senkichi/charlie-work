@@ -536,6 +536,10 @@ def _detect_and_handle_orphaned_workers(
             continue
         if entry.get("status") != "dispatched":
             continue
+        # Issue #259: once we have emitted orphaned_worker_drift for a dead
+        # worker with no open PR, do not re-detect it on every subsequent pass.
+        if entry.get("orphan_flagged_at"):
+            continue
 
         if not _worker_pid_alive(entry):
             orphaned_issues.append(int(issue_number_str))
@@ -624,6 +628,8 @@ def _detect_and_handle_orphaned_workers(
             else:
                 # No open PR - emit drift event, leave recovery to mop-up
                 # Mop-up will handle label transition back to ready (issue #118)
+                # Issue #259: mark the entry so it is not re-flagged every pass.
+                entry["orphan_flagged_at"] = utc_now()
                 state = append_event(
                     state,
                     "orphaned_worker_drift",

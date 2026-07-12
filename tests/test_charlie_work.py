@@ -14214,6 +14214,56 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
     assert len(recovered_events) == 0
 
+    # Issue #259: the entry should be marked so it is not re-flagged every pass.
+    assert "orphan_flagged_at" in entry
+
+
+def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None:
+    """Issue #259: sweep must emit only one drift event per zombie across N passes."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["259"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(3):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    drift_events = [e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1, (
+        f"Expected exactly one orphaned_worker_drift event, got {len(drift_events)}"
+    )
+    assert drift_events[0]["payload"]["issue_number"] == 259
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+    entry = state["issues"]["259"]
+    assert entry.get("status") == "dispatched"
+    assert "orphan_flagged_at" in entry
+
 
 # ---------------------------------------------------------------------------
 # SupervisorConfig tests

@@ -58,6 +58,24 @@ class DriftItem:
     base_branch: str | None = None
 
 
+# State-machine statuses that mean "this issue is in the orchestrator's pipeline".
+# Any of these on a closed GitHub issue is a drift condition (issue #259).
+ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
+    {"dispatched", "dispatch_pending", "rework_requested", "reviewing"}
+)
+
+
+def _issue_state(issue: dict[str, Any] | None) -> str:
+    """Return the upper-cased GitHub state for an issue dict.
+
+    Missing state defaults to OPEN to keep tests/fixtures that pre-date the
+    `--state all` issue list (issue #259) behaving as open issues.
+    """
+    if issue is None:
+        return ""
+    return str(issue.get("state") or "OPEN").upper()
+
+
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
     result = gh.run(
         [
@@ -81,7 +99,7 @@ def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
             "issue",
             "list",
             "--state",
-            "open",
+            "all",
             "--limit",
             str(_LIST_LIMIT),
             "--json",
@@ -97,7 +115,7 @@ def detect_drift(
 ) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
-    Issues exactly two ``gh.run`` list queries (all PRs, open issues) and
+    Issues exactly two ``gh.run`` list queries (all PRs, all issues) and
     performs every drift check against those two in-memory snapshots — no
     per-item ``gh`` calls.
 
@@ -258,7 +276,9 @@ def detect_drift(
                             if issue:
                                 issue_labels = label_names(issue)
                                 active_labels = issue_labels & labels_cfg.active
-                                if active_labels:
+                                # Only relabel to ready when the GitHub issue is still open;
+                                # closed issues are finalized by state_active_status_issue_closed.
+                                if active_labels and _issue_state(issue) == "OPEN":
                                     # Remove all active labels and ensure ready label is present
                                     fix_actions = [
                                         f"remove label '{label}' from issue #{w.issue_number}"
@@ -386,7 +406,9 @@ def detect_drift(
                     # Only count OPEN PRs (not CLOSED/MERGED) for the guard
                     if w.issue_number not in open_prs_by_issue:
                         issue = issues_by_number.get(w.issue_number)
-                        if issue:
+                        # Only relabel salvage/escalate open issues. Closed issues with
+                        # active state-machine status are finalized by state_active_status_issue_closed.
+                        if issue and _issue_state(issue) == "OPEN":
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
                             if active_labels and worker_blocked:
@@ -502,6 +524,7 @@ def detect_drift(
             and not prs_linking_issue.get(issue_number)
             and issue_number not in issues_handled_by_session_relabel
             and issue_number not in live_session_issue_numbers
+            and _issue_state(issue) == "OPEN"
         ):
             drift.append(
                 DriftItem(
@@ -561,6 +584,45 @@ def detect_drift(
                     fix_actions=(f"clear dispatch_pending claim for issue #{issue_number}",),
                 )
             )
+
+    # Issue #259: a state entry with an active status but a closed GitHub issue
+    # means the orchestrator lost the lifecycle edge (e.g. a crash before the
+    # worker saw the issue close). Finalize the state and strip any labels that
+    # still look active.
+    for issue_number_str, entry in state_issues.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            issue_number = int(issue_number_str)
+        except ValueError:
+            continue
+        status = entry.get("status")
+        if status not in ACTIVE_STATE_STATUSES:
+            continue
+        issue = issues_by_number.get(issue_number)
+        if issue is None or _issue_state(issue) != "CLOSED":
+            continue
+        issue_labels = label_names(issue)
+        active_labels = issue_labels & labels_cfg.active
+        terminal_present = issue_labels & labels_cfg.terminal
+        # If a terminal+active contradiction is already being repaired, let that
+        # drift item remove the active labels; this item finalizes state status.
+        remove_labels = () if terminal_present else tuple(sorted(active_labels))
+        fix_actions = [f"set state issues[{issue_number}].status = 'closed'"]
+        for label in remove_labels:
+            fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
+        drift.append(
+            DriftItem(
+                kind="state_active_status_issue_closed",
+                issue_number=issue_number,
+                pr_number=None,
+                detail=(
+                    f"issue #{issue_number} is CLOSED on GitHub but state status is {status!r}"
+                ),
+                fix_actions=tuple(fix_actions),
+                remove_labels=remove_labels,
+            )
+        )
 
     return drift
 
@@ -654,6 +716,31 @@ def apply_fixes(
                 issue_key = str(item.issue_number)
                 # Clear the stale claim by removing the entry entirely
                 new_issues.pop(issue_key, None)
+
+        elif item.kind == "state_active_status_issue_closed":
+            # Issue #259: finalize the state entry and strip any active labels that
+            # still remain on the closed issue.
+            if item.issue_number is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                new_issues[issue_key] = {**existing_issue, "status": "closed"}
+                label_ok = True
+                for label in item.remove_labels:
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                    # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
 
         elif item.kind == "provider_throttle_detected":
             # Extract throttled_until from fix_actions

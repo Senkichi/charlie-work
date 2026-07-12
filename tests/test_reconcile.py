@@ -86,13 +86,14 @@ def _pr(
     }
 
 
-def _issue(number: int, labels: list[str]) -> dict[str, Any]:
+def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any]:
     return {
         "number": number,
         "title": f"issue {number}",
         "url": f"https://example.test/issues/{number}",
         "body": "",
         "labels": [{"name": label} for label in labels],
+        "state": state,
     }
 
 
@@ -350,6 +351,75 @@ def test_apply_fixes_state_pr_missing_on_github_drops_entry() -> None:
 
     assert "999" not in new_state["prs"]
     assert "999" in state["prs"]
+
+
+def test_detect_drift_finds_state_active_status_issue_closed() -> None:
+    """Issue #259: a closed issue with an active state-machine status is drift."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.done], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 259
+    assert matches[0].fix_actions == ("set state issues[259].status = 'closed'",)
+
+
+def test_detect_drift_state_active_status_issue_closed_removes_active_labels() -> None:
+    """Issue #259: lingering active labels are stripped from the closed issue."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.in_progress], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(matches) == 1
+    assert matches[0].remove_labels == (config.labels.in_progress,)
+    assert f"remove label '{config.labels.in_progress}' from issue #259" in matches[0].fix_actions
+
+
+def test_apply_fixes_state_active_status_issue_closed_finalizes_state_and_labels() -> None:
+    """Issue #259: apply_fixes sets status closed and removes active labels."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.in_progress], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["issues"]["259"]["status"] == "closed"
+    assert (259, config.labels.in_progress) in gh.labels_removed
+    assert state["issues"]["259"]["status"] == "dispatched"
+
+
+def test_apply_fixes_state_active_status_issue_closed_idempotent() -> None:
+    """Issue #259: re-running reconcile on a finalized issue is a no-op."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.done], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "closed"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
 
 
 def test_apply_fixes_appends_reconcile_event() -> None:
