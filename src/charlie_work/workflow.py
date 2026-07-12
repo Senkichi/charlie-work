@@ -756,20 +756,29 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Launch-failure sidecar: terminal by construction (issue #266).
             # The process never launched, so it can never transition to live.
             failure_kind = "launch_failed"
+            throttled_until = None
             if w.adapter_kind == "devin":
-                failure_kind, _ = update_session_record_with_failure_classification(
+                failure_kind, throttled_until = update_session_record_with_failure_classification(
                     sessions_dir,
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
                 )
             elif w.adapter_kind == "claude-code":
-                failure_kind, _ = update_worker_record_with_failure_classification(
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
                     sessions_dir,
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
                 )
+            if failure_kind and throttled_until:
+                # A throttle-caused launch failure must persist its window just
+                # like the dead-session branch below — otherwise the governor
+                # relaunches straight into the same throttled provider.
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(state, throttled_until)
+                    save_state(state_file, state)
             w.reap_sidecar(sessions_dir)
             reaped.append(
                 {
