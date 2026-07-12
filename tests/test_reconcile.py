@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -86,13 +87,14 @@ def _pr(
     }
 
 
-def _issue(number: int, labels: list[str]) -> dict[str, Any]:
+def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any]:
     return {
         "number": number,
         "title": f"issue {number}",
         "url": f"https://example.test/issues/{number}",
         "body": "",
         "labels": [{"name": label} for label in labels],
+        "state": state,
     }
 
 
@@ -352,6 +354,75 @@ def test_apply_fixes_state_pr_missing_on_github_drops_entry() -> None:
     assert "999" in state["prs"]
 
 
+def test_detect_drift_finds_state_active_status_issue_closed() -> None:
+    """Issue #259: a closed issue with an active state-machine status is drift."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.done], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 259
+    assert matches[0].fix_actions == ("set state issues[259].status = 'closed'",)
+
+
+def test_detect_drift_state_active_status_issue_closed_removes_active_labels() -> None:
+    """Issue #259: lingering active labels are stripped from the closed issue."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.in_progress], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(matches) == 1
+    assert matches[0].remove_labels == (config.labels.in_progress,)
+    assert f"remove label '{config.labels.in_progress}' from issue #259" in matches[0].fix_actions
+
+
+def test_apply_fixes_state_active_status_issue_closed_finalizes_state_and_labels() -> None:
+    """Issue #259: apply_fixes sets status closed and removes active labels."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.in_progress], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "dispatched"}
+
+    drift = detect_drift(gh, state, config)
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["issues"]["259"]["status"] == "closed"
+    assert (259, config.labels.in_progress) in gh.labels_removed
+    assert state["issues"]["259"]["status"] == "dispatched"
+
+
+def test_apply_fixes_state_active_status_issue_closed_idempotent() -> None:
+    """Issue #259: re-running reconcile on a finalized issue is a no-op."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(259, [config.labels.done], state="CLOSED")],
+    )
+    state = empty_state()
+    state["issues"]["259"] = {"number": 259, "status": "closed"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
+
+
 def test_apply_fixes_appends_reconcile_event() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])
@@ -466,6 +537,79 @@ def test_apply_fixes_clears_stale_dispatch_pending_claims() -> None:
 def test_reconcile_and_github_share_list_limit_constant() -> None:
     """Issue #45: reconcile and github.py must derive limits from the same constant."""
     assert reconcile_list_limit == github_list_limit
+
+
+def test_detect_drift_snapshot_truncated_skips_closed_issue_finalization(
+    caplog,
+) -> None:
+    """Issue #259 review: a snapshot that hits the page limit is incomplete.
+
+    The finalization sweep must be skipped to avoid acting on a provably
+    incomplete snapshot, and a warning drift item must be emitted.
+    """
+    caplog.set_level(logging.WARNING)
+    config = OrchestratorConfig()
+    # Exactly _LIST_LIMIT issues: the snapshot is provably truncated.
+    closed_issue_number = reconcile_list_limit
+    issues = [_issue(i, [config.labels.ready]) for i in range(1, reconcile_list_limit)]
+    issues.append(_issue(closed_issue_number, [config.labels.in_progress], state="CLOSED"))
+    gh = FakeGitHub(prs=[], issues=issues)
+    state = empty_state()
+    state["issues"][str(closed_issue_number)] = {
+        "number": closed_issue_number,
+        "status": "dispatched",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
+    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
+    assert len(truncated) == 1
+    assert truncated[0].issue_number is None
+    assert "truncated" in caplog.text.lower()
+
+
+def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:
+    """Issue #259 review: a below-limit snapshot is complete; sweep works."""
+    config = OrchestratorConfig()
+    closed_issue_number = reconcile_list_limit - 1
+    issues = [_issue(i, [config.labels.ready]) for i in range(1, closed_issue_number)]
+    issues.append(_issue(closed_issue_number, [config.labels.in_progress], state="CLOSED"))
+    gh = FakeGitHub(prs=[], issues=issues)
+    state = empty_state()
+    state["issues"][str(closed_issue_number)] = {
+        "number": closed_issue_number,
+        "status": "dispatched",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "snapshot_truncated"] == []
+    closed_items = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(closed_items) == 1
+    assert closed_items[0].issue_number == closed_issue_number
+
+
+def test_apply_fixes_snapshot_truncated_emits_reconcile_event() -> None:
+    """Issue #259 review: a truncated snapshot produces a warning event."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="snapshot_truncated",
+            issue_number=None,
+            pr_number=None,
+            detail="snapshot truncated",
+            fix_actions=("skip completeness-dependent sweeps",),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "snapshot_truncated"
 
 
 def test_detect_drift_fork_pr_branch_name_does_not_bind() -> None:

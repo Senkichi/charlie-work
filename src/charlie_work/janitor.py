@@ -881,7 +881,7 @@ def check_stub_tests(diff: str, config: TestAdequacyConfig) -> tuple[str, ...]:
                 product_modules.add(_module_from_path(filename))
 
         for filename, hunk_lines in test_files:
-            source_lines, added = _reconstruct_post_image(hunk_lines)
+            source_lines, touched = _reconstruct_post_image(hunk_lines)
             source = "\n".join(source_lines)
             try:
                 tree = ast.parse(source, filename=filename)
@@ -890,9 +890,15 @@ def check_stub_tests(diff: str, config: TestAdequacyConfig) -> tuple[str, ...]:
             test_defined_names = _collect_test_defined_names(tree)
             alias_map = _collect_import_aliases(tree)
             for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                    if node.lineno is None or not (
-                        0 < node.lineno <= len(added) and added[node.lineno - 1]
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ) and node.name.startswith("test_"):
+                    if node.lineno is None:
+                        continue
+                    end_lineno = node.end_lineno if node.end_lineno is not None else node.lineno
+                    if not any(
+                        0 < i <= len(touched) and touched[i - 1]
+                        for i in range(node.lineno, end_lineno + 1)
                     ):
                         continue
                     if _body_is_only_pass_ellipsis_docstring(node):
@@ -932,11 +938,14 @@ def _reconstruct_post_image(hunk_lines: list[str]) -> tuple[list[str], list[bool
     """Build the new-file source from unified-diff hunk lines.
 
     Returns a list of source lines and a parallel list of booleans indicating
-    whether each line was added (``+``) or came from context (`` ``). The
-    reconstruction is best-effort; missing context is represented as blank lines.
+    whether each line was touched by the diff: added (``+``), or adjacent to a
+    deletion (``-``). Marking the post-image line just before a deletion is what
+    lets deletion-only gutting (removing assertions without adding replacement
+    lines) attribute the change to the enclosing function. The reconstruction is
+    best-effort; missing context is represented as blank lines.
     """
     source: list[str] = []
-    added: list[bool] = []
+    touched: list[bool] = []
     new_index: int | None = None
     for line in hunk_lines:
         header = _HUNK_HEADER_RE.match(line)
@@ -944,38 +953,47 @@ def _reconstruct_post_image(hunk_lines: list[str]) -> tuple[list[str], list[bool
             new_index = int(header.group(1)) - 1
             continue
         if line.startswith("-"):
+            # A deletion sits between post-image lines new_index-1 and
+            # new_index; mark the preceding line so the function that lost
+            # body lines is inspected even when nothing was added in it.
+            if new_index is not None and new_index > 0:
+                mark = new_index - 1
+                if mark >= len(source):
+                    source.extend([""] * (mark + 1 - len(source)))
+                    touched.extend([False] * (mark + 1 - len(touched)))
+                touched[mark] = True
             continue
         if line.startswith("+"):
             content = line[1:]
-            is_added = True
+            is_touched = True
         elif line.startswith(" "):
             content = line[1:]
-            is_added = False
+            is_touched = False
         else:
             continue
         if new_index is None:
             continue
         if new_index > len(source):
             source.extend([""] * (new_index - len(source)))
-            added.extend([False] * (new_index - len(added)))
+            touched.extend([False] * (new_index - len(touched)))
         if new_index < len(source):
             source[new_index] = content
-            added[new_index] = is_added
+            touched[new_index] = touched[new_index] or is_touched
         else:
             source.append(content)
-            added.append(is_added)
+            touched.append(is_touched)
         new_index += 1
-    while source and source[-1] == "" and not added[-1]:
+    while source and source[-1] == "" and not touched[-1]:
         source.pop()
-        added.pop()
-    return source, added
+        touched.pop()
+    return source, touched
 
 
 def _collect_test_defined_names(tree: ast.AST) -> frozenset[str]:
     """Collect top-level function, class, and assignment names in the test file."""
     names: set[str] = set()
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
@@ -1014,7 +1032,7 @@ def _collect_import_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def _collect_local_names(node: ast.FunctionDef) -> frozenset[str]:
+def _collect_local_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
     """Collect argument names and locally assigned names for a function."""
     names: set[str] = set()
     for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
@@ -1029,7 +1047,7 @@ def _collect_local_names(node: ast.FunctionDef) -> frozenset[str]:
     return frozenset(names)
 
 
-def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef) -> bool:
+def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return True if the function body is only pass/.../docstring."""
     for stmt in node.body:
         if isinstance(stmt, ast.Pass):
@@ -1042,7 +1060,7 @@ def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef) -> bool:
 
 
 def _assertion_is_constant(
-    node: ast.FunctionDef,
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
     alias_map: dict[str, str],
     product_modules: set[str],
     test_defined_names: frozenset[str],
@@ -1144,13 +1162,15 @@ def _attribute_prefixes(alias_module: str, attrs: list[str]) -> Iterator[str]:
         yield module
 
 
-def _function_seam_keywords(node: ast.FunctionDef, keywords: tuple[str, ...]) -> tuple[str, ...]:
+def _function_seam_keywords(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, keywords: tuple[str, ...]
+) -> tuple[str, ...]:
     """Return the configured seam keywords that appear in the function name."""
     funcname = node.name.lower()
     return tuple(kw for kw in keywords if kw in funcname)
 
 
-def _body_calls_seam(node: ast.FunctionDef, keyword: str) -> bool:
+def _body_calls_seam(node: ast.FunctionDef | ast.AsyncFunctionDef, keyword: str) -> bool:
     """Return True if the function body contains the seam keyword in an identifier or string."""
     keyword = keyword.lower()
     for stmt in node.body:

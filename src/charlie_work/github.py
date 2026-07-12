@@ -39,7 +39,7 @@ LABEL_LIST_FIELDS = "name"
 RECONCILE_PR_FIELDS = (
     "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
 )
-RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
+RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
 # Flag constants for merge_pr — single source of truth for both argv construction
@@ -410,6 +410,22 @@ class GitHub:
         if isinstance(result, GitHubRunResult):
             return result.value if result.ok and isinstance(result.value, list) else []
         return result if isinstance(result, list) else []
+
+    def commit(self, sha: str) -> dict[str, Any] | None:
+        """Fetch a single commit's metadata by SHA.
+
+        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}``. Returns the parsed
+        JSON response, including ``parents`` and ``committer``/``commit.committer``,
+        or ``None`` on failure. Errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, dict) else None
+        return result if isinstance(result, dict) else None
 
     def validate_field_lists(self) -> None:
         """Validate the compile-time ``--json`` field lists against ``gh``.

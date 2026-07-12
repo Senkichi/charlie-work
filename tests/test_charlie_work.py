@@ -80,6 +80,12 @@ def test_default_config_failed_attempt_alarm() -> None:
     assert config.auto_merge.failed_attempt_alarm == 3
 
 
+def test_default_config_update_open_prs_is_next() -> None:
+    """Default update_open_prs is merge-train mode."""
+    config = load_config()
+    assert config.auto_merge.update_open_prs == "next"
+
+
 def test_default_config_tee_stream_json_disabled() -> None:
     """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
     config = load_config()
@@ -204,6 +210,57 @@ auto_merge:
 """
     )
     with pytest.raises(ConfigError, match="failed_attempt_alarm.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_update_open_prs_boolean_aliases(tmp_path: Path) -> None:
+    """update_open_prs boolean aliases are normalized for backward compatibility."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: true
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.update_open_prs == "all"
+
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: false
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.update_open_prs == "off"
+
+
+def test_load_config_update_open_prs_string_values(tmp_path: Path) -> None:
+    """update_open_prs accepts all/next/off string values."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    for value in ("all", "next", "off", "ALL", "Next", "OFF"):
+        config_file.write_text(
+            f"""
+auto_merge:
+  update_open_prs: {value}
+"""
+        )
+        config = load_config(config_file)
+        assert config.auto_merge.update_open_prs == value.lower()
+
+
+def test_load_config_update_open_prs_rejects_invalid_value(tmp_path: Path) -> None:
+    """update_open_prs rejects unknown string values."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: sometimes
+"""
+    )
+    with pytest.raises(ConfigError, match="update_open_prs.*'all', 'next', 'off'"):
         load_config(config_file)
 
 
@@ -2435,6 +2492,7 @@ class FakeGitHub:
                 "url": "https://example.test/pull/456",
                 "headRefName": "agent/issue-123-fix-search",
                 "headRefOid": "sha-abc123",
+                "mergeStateStatus": "CLEAN",
                 "body": "Closes #123\n\nTests: regression coverage added.",
                 "labels": [],
                 "isCrossRepository": False,
@@ -2455,6 +2513,7 @@ class FakeGitHub:
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
         self.closed_issues: list[int] = []
+        self.commits: dict[str, dict[str, Any]] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -2560,7 +2619,18 @@ class FakeGitHub:
             if pr["number"] == pr_number:
                 # Append a merge-SHA marker to simulate the head moving
                 old_head = pr.get("headRefOid", "")
-                pr["headRefOid"] = f"{old_head}-updated"
+                new_head = f"{old_head}-updated"
+                pr["headRefOid"] = new_head
+                # Record the fake commit metadata so the post-sync verification
+                # helper sees a valid GitHub web-flow merge commit.
+                self.commits[new_head] = {
+                    "parents": [
+                        {"sha": old_head},
+                        {"sha": "base-sha"},
+                    ],
+                    "committer": {"login": "web-flow"},
+                    "commit": {"committer": {"name": "GitHub"}},
+                }
                 return self.update_branch_ok
         return False
 
@@ -2598,6 +2668,9 @@ class FakeGitHub:
         if json_output:
             return []
         return ""
+
+    def commit(self, sha: str) -> dict[str, Any] | None:
+        return self.commits.get(sha)
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -6614,6 +6687,38 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
     assert result.data["attempted_count"] == 0
 
 
+def test_dispatch_clears_stale_orphan_flagged_at(tmp_path: Path) -> None:
+    """Issue #259 review: a fresh dispatch must clear a stale orphan flag."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="manual",  # Use manual to avoid actual worker launch
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Close the default PR so the issue is dispatchable.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "orphan_flagged_at": "2024-01-01T00:00:00Z",
+        "title": "Test issue",
+        "url": "https://github.com/test/repo/issues/123",
+    }
+    save_state(paths.state_file, seed)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    assert result.data["attempted_count"] == 1
+    assert result.data["selected_count"] == 1
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry.get("status") == "manifest_written"
+    assert "orphan_flagged_at" not in entry
+
+
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
     """Issue #135: PARTIAL_FAILURE during dispatch label transition must be recorded."""
     from charlie_work import devin_shell
@@ -9414,6 +9519,457 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert result_789.data["can_merge"] is True
     assert result_789.data.get("head_moved") is not True  # Should not trigger head-moved gate
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+
+def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:
+    """Merge-train head with a BEHIND mergeStateStatus is base-synced before merge."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeStateStatus"] = "BEHIND"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # The branch was synced before the merge
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123-updated"
+    # The approved head was updated to match the new base
+    decision = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text())
+    assert decision["reviewed_head_sha"] == "sha-abc123-updated"
+
+
+def test_merge_ready_next_mode_skips_non_head(tmp_path: Path) -> None:
+    """In merge-train mode, a non-head approved PR cannot be merged."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    # Ensure 456 is the head of the queue regardless of when approvals occurred.
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(789, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert "not the head" in result.message
+    assert fake_gh.merged == []
+
+
+def test_update_open_agent_prs_next_mode_syncs_head_of_queue(tmp_path: Path) -> None:
+    """In merge-train mode, post-merge only syncs the head of the approved queue."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 101,
+            "title": "Fix #125: third",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-third",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Approve in order: 456 first (head), then 789, then 101.
+    for pr_number in (456, 789, 101):
+        app.record_review(pr_number, "approved", summary="lgtm")
+    # Override timestamps so fast tests don't all land in the same second.
+    for idx, pr_number in enumerate((456, 789, 101)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    # Merge the head of the queue.
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # Post-merge only the next candidate (789) should be base-synced.
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456-updated"
+    # The third PR should be untouched (not the head of the queue).
+    assert fake_gh.prs[2]["headRefOid"] == "sha-ghi789"
+
+
+def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -> None:
+    """In merge-train mode, an up-to-date head candidate is not re-synced."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    # Ensure 456 is the head of the queue.
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is False
+    assert update_results[0]["skipped_reason"] == "up-to-date"
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) -> None:
+    """If pr_view returns a non-qualifying head after update-branch, do not merge.
+
+    Regression test for the TOCTOU described in issue #258: a racing push to the
+    PR branch in the update-window must not be blessed as the approved head.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubRacingUpdate(FakeGitHub):
+        def pr_update_branch(self, pr_number: int) -> bool:
+            ok = super().pr_update_branch(pr_number)
+            for pr in self.prs:
+                if pr["number"] == pr_number:
+                    racing = "racing-sha"
+                    self.pr_head_shas[pr_number] = racing
+                    self.commits[racing] = {
+                        "parents": [{"sha": "other-sha"}],
+                        "committer": {"login": "not-web-flow"},
+                        "commit": {"committer": {"name": "Not GitHub"}},
+                    }
+            return ok
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubRacingUpdate()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    # The approved head must not be migrated to the racing SHA.
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def _make_racing_merge_ready_app(
+    tmp_path: Path, racing_commit: dict[str, Any]
+) -> tuple[Any, Any, Any]:
+    """Build an app whose update-branch races in a crafted merge commit.
+
+    The racing commit's parents deliberately satisfy the structural checks
+    (two parents, old head included) so only the committer-identity predicate
+    is under test.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubRacingUpdate(FakeGitHub):
+        def pr_update_branch(self, pr_number: int) -> bool:
+            ok = super().pr_update_branch(pr_number)
+            racing = "racing-sha"
+            self.pr_head_shas[pr_number] = racing
+            self.commits[racing] = racing_commit
+            return ok
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubRacingUpdate()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return app, fake_gh, paths
+
+
+def test_merge_ready_race_with_spoofed_committer_name_rejected(tmp_path: Path) -> None:
+    """A racing push whose git metadata claims name 'GitHub' must still be rejected.
+
+    The commit.committer.name field is settable by any pusher; only the
+    web-flow account login together with the GitHub name identifies a real
+    base-sync merge. Structural parent checks are satisfied on purpose.
+    """
+    app, fake_gh, paths = _make_racing_merge_ready_app(
+        tmp_path,
+        {
+            "parents": [{"sha": "sha-abc123"}, {"sha": "main-tip-sha"}],
+            "committer": {"login": "attacker"},
+            "commit": {"committer": {"name": "GitHub"}},
+        },
+    )
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_merge_ready_race_with_spoofed_webflow_login_rejected(tmp_path: Path) -> None:
+    """A racing push attributed to web-flow but with a non-GitHub name is rejected.
+
+    Login attribution follows the committer email, which a pusher can set to
+    noreply@github.com; the git metadata name must corroborate it.
+    """
+    app, fake_gh, paths = _make_racing_merge_ready_app(
+        tmp_path,
+        {
+            "parents": [{"sha": "sha-abc123"}, {"sha": "main-tip-sha"}],
+            "committer": {"login": "web-flow"},
+            "commit": {"committer": {"name": "Devin Worker"}},
+        },
+    )
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_update_open_agent_prs_merge_train_post_sync_head_race_rejected(
+    tmp_path: Path,
+) -> None:
+    """If pr_view returns a non-qualifying head after update-branch, do not bless it.
+
+    Regression test for the _update_open_agent_prs "next" path: a racing push
+    must be rejected and the approved head left unchanged.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    # Simulate a racing push that lands on PR 789's branch between update and view.
+    fake_gh.pr_head_shas[789] = "racing-sha"
+    fake_gh.commits["racing-sha"] = {
+        "parents": [{"sha": "other-sha"}],
+        "committer": {"login": "not-web-flow"},
+        "commit": {"committer": {"name": "Not GitHub"}},
+    }
+
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["error"] == "post-sync head verification failed"
+    # The approved head must remain unchanged.
+    decision = json.loads(
+        (paths.prs / "pr-789" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-def456"
 
 
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
@@ -14397,6 +14953,118 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     # Verify NO recovered event
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
     assert len(recovered_events) == 0
+
+    # Issue #259: the entry should be marked so it is not re-flagged every pass.
+    assert "orphan_flagged_at" in entry
+
+
+def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None:
+    """Issue #259: sweep must emit only one drift event per zombie across N passes."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["259"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(3):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    drift_events = [e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1, (
+        f"Expected exactly one orphaned_worker_drift event, got {len(drift_events)}"
+    )
+    assert drift_events[0]["payload"]["issue_number"] == 259
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+    entry = state["issues"]["259"]
+    assert entry.get("status") == "dispatched"
+    assert "orphan_flagged_at" in entry
+
+
+def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_path: Path) -> None:
+    """Issue #259 review: orphan suppression must not block open-PR recovery paths."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_flagged_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # With an open PR and request_changes with unchanged head, recovery should
+    # run regardless of the orphan_flagged_at suppression.
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
 
 
 # ---------------------------------------------------------------------------
