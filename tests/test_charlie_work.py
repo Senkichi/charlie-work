@@ -73,6 +73,12 @@ def test_default_config_enables_auto_merge() -> None:
     assert config.labels.ready == "automated-ready"
 
 
+def test_default_config_failed_attempt_alarm() -> None:
+    """Issue #254: default merge attempt alarm threshold is 3."""
+    config = load_config()
+    assert config.auto_merge.failed_attempt_alarm == 3
+
+
 def test_default_config_tee_stream_json_disabled() -> None:
     """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
     config = load_config()
@@ -182,6 +188,21 @@ runner_scaling:
 """
     )
     with pytest.raises(ConfigError, match="must be a bool"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_int_failed_attempt_alarm(tmp_path: Path) -> None:
+    """Issue #254: auto_merge.failed_attempt_alarm must be an int."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  failed_attempt_alarm: "three"
+"""
+    )
+    with pytest.raises(ConfigError, match="failed_attempt_alarm.*must be an int"):
         load_config(config_file)
 
 
@@ -2403,6 +2424,24 @@ class FakeGitHub:
 
     def pr_comment(self, number: int, body_file: Path) -> None:
         pass
+
+
+class FakeGitHubWithChecks(FakeGitHub):
+    """FakeGitHub whose pr_checks returns a configurable list."""
+
+    def __init__(self, checks: list[dict[str, Any]] | None = None) -> None:
+        super().__init__()
+        self.checks = checks if checks is not None else []
+
+    def pr_checks(self, number: int) -> list[dict[str, Any]]:
+        return self.checks
+
+
+class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
+    """No required checks present at all, so every required check is missing."""
+
+    def __init__(self) -> None:
+        super().__init__(checks=[])
 
 
 def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> None:
@@ -5767,6 +5806,168 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
     persisted = load_state(paths.state_file)["prs"]["456"]
     assert persisted["status"] == "merged"
     assert persisted["merged"] is True
+
+
+def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path) -> None:
+    """Issue #254: after N approved-but-unmergeable passes, emit an alarm once."""
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # First two failed attempts do not alarm.
+    result1 = app.merge_ready(456, merge=False)
+    assert result1.data["can_merge"] is False
+    assert result1.data["consecutive_failed_merge_attempts"] == 1
+    assert result1.data["merge_attempt_alarm"] is False
+    assert result1.data["merge_attempt_warning"] is None
+
+    result2 = app.merge_ready(456, merge=False)
+    assert result2.data["consecutive_failed_merge_attempts"] == 2
+    assert result2.data["merge_attempt_alarm"] is False
+
+    # Third attempt crosses the threshold.
+    result3 = app.merge_ready(456, merge=False)
+    assert result3.data["consecutive_failed_merge_attempts"] == 3
+    assert result3.data["merge_attempt_alarm"] is True
+    warning = result3.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "PR #456 approved but unmergeable for 3 passes" in warning
+    assert "required checks missing while GitHub shows the PR open" in warning
+
+    # Fourth attempt is still unmergeable but does not re-alarm.
+    result4 = app.merge_ready(456, merge=False)
+    assert result4.data["consecutive_failed_merge_attempts"] == 4
+    assert result4.data["merge_attempt_alarm"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 4
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["pr_number"] == 456
+    assert alarm_events[0]["payload"]["attempts"] == 3
+    assert set(alarm_events[0]["payload"]["checks_summary"].keys()) == {
+        "required",
+        "passed",
+        "pending",
+        "failed",
+        "missing",
+        "infra_failed",
+    }
+
+
+def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> None:
+    """Issue #254: a successful merge resets the failed attempt counter."""
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    missing_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, missing_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    for _ in range(3):
+        app.merge_ready(456, merge=False)
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 3
+
+    # Now the checks turn green and merge succeeds.
+    passing_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, passing_gh)
+    result = app.merge_ready(456, merge=True)
+    assert result.data["merged"] is True
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+    assert state["issues"]["123"]["merge_alert"] == "OK"
+
+
+def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) -> None:
+    """Issue #254: a head move after approval resets the failed attempt counter."""
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.merge_ready(456, merge=False)
+    app.merge_ready(456, merge=False)
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
+
+    # Simulate the PR head advancing on GitHub.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    result = app.merge_ready(456, merge=False)
+    assert result.data["head_moved"] is True
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+    assert state["issues"]["123"]["merge_alert"] == "OK"
+
+
+def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Path) -> None:
+    """Issue #254: a decision change resets the failed attempt counter."""
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.merge_ready(456, merge=False)
+    app.merge_ready(456, merge=False)
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
+
+    # Operator changes decision to request_changes.
+    app.record_review(456, "request_changes", summary="needs work")
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+    assert state["issues"]["123"]["merge_alert"] == "OK"
 
 
 def test_merge_ready_pr_list_error_during_update_open_prs_is_caught(tmp_path: Path) -> None:
