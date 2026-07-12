@@ -784,6 +784,8 @@ def main(argv: list[str] | None = None) -> int:
                 # repo_data now includes the ok field from fleet_dispatch
                 ok = repo_data.get("ok", True)
                 status = "OK" if ok else "FAILED"
+                if repo_data.get("skipped"):
+                    status = "SKIPPED"
                 print(f"  {repo_key}: {status}")
             digest = result.data.get("digest", {})
             event_count = digest.get("count", 0)
