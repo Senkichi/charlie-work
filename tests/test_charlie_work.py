@@ -51,6 +51,7 @@ from charlie_work.github import label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
+    append_event,
     is_throttled,
     load_state,
     save_state,
@@ -14921,6 +14922,62 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     # Verify NO recovered event
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
     assert len(recovered_events) == 0
+
+
+def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_path: Path) -> None:
+    """Regression test for issue #275: a single bulk reap sweep must not evict unrelated diagnostic events.
+
+    A 500-issue orphan sweep would previously emit 500 ``orphaned_worker_drift``
+    events and overrun the 200-entry event buffer. The sweep now aggregates
+    same-kind events into one summary event, so prior diagnostic events survive.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    diagnostic_count = 199
+    for seq in range(diagnostic_count):
+        state = append_event(state, "diagnostic_event", {"seq": seq})
+    for issue_number in range(1, 501):
+        state["issues"][str(issue_number)] = {
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "dispatched_at": "2024-01-01T00:00:00Z",
+        }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPrs(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.prs = []
+
+    fake_gh = FakeGitHubNoPrs()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state["events"]
+
+    # The 200-entry cap must not be exceeded and the buffer must not be flooded
+    assert len(events) <= 200
+    diagnostic_events = [e for e in events if e.get("kind") == "diagnostic_event"]
+    assert len(diagnostic_events) == diagnostic_count
+
+    # A single sweep summary should represent all 500 orphan drifts
+    sweep_events = [e for e in events if e.get("kind") == "orphaned_worker_drift_sweep"]
+    assert len(sweep_events) == 1
+    assert sweep_events[0]["payload"]["count"] == 500
+    assert set(sweep_events[0]["payload"]["issue_numbers"]) == set(range(1, 501))
 
 
 # ---------------------------------------------------------------------------

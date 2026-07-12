@@ -508,6 +508,40 @@ def _worker_pid_alive(entry: dict[str, Any]) -> bool:
     return pid_alive
 
 
+def _append_sweep_events(
+    state: dict[str, Any], sweep_events: list[tuple[str, dict[str, Any]]]
+) -> dict[str, Any]:
+    """Append events collected during a sweep, aggregating same-kind runs.
+
+    A single occurrence of a kind is emitted with the original kind and payload.
+    Multiple occurrences of the same kind are emitted as one ``{kind}_sweep`` event
+    with a count and issue-numbers list. This prevents a single bulk sweep from
+    flooding the bounded event buffer and evicting unrelated diagnostic history.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for kind, payload in sweep_events:
+        grouped.setdefault(kind, []).append(payload)
+
+    for kind, payloads in grouped.items():
+        if len(payloads) == 1:
+            state = append_event(state, kind, payloads[0])
+        else:
+            issue_numbers = [
+                payload["issue_number"]
+                for payload in payloads
+                if payload.get("issue_number") is not None
+            ]
+            state = append_event(
+                state,
+                f"{kind}_sweep",
+                {
+                    "count": len(payloads),
+                    "issue_numbers": issue_numbers,
+                },
+            )
+    return state
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig, gh: GitHub
 ) -> None:
@@ -558,6 +592,7 @@ def _detect_and_handle_orphaned_workers(
     # Handle orphaned workers
     with state_lock(state_file):
         state = load_state(state_file)
+        sweep_events: list[tuple[str, dict[str, Any]]] = []
         for issue_number in orphaned_issues:
             entry = state["issues"].get(str(issue_number), {})
             if not isinstance(entry, dict):
@@ -582,56 +617,60 @@ def _detect_and_handle_orphaned_workers(
                         # Safe to reset to rework_requested - PR head unchanged since request_changes
                         entry["status"] = "rework_requested"
                         entry["dispatched_at"] = None
-                        state = append_event(
-                            state,
-                            "orphaned_worker_recovered",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number,
-                                "previous_status": "dispatched",
-                                "new_status": "rework_requested",
-                                "reason": "dead_worker_with_request_changes",
-                            },
+                        sweep_events.append(
+                            (
+                                "orphaned_worker_recovered",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "new_status": "rework_requested",
+                                    "reason": "dead_worker_with_request_changes",
+                                },
+                            )
                         )
                     else:
                         # PR head has changed - surface as drift for human triage
-                        state = append_event(
-                            state,
+                        sweep_events.append(
+                            (
+                                "orphaned_worker_drift",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "last_decision": last_decision,
+                                    "reviewed_head_sha": reviewed_head_sha,
+                                    "live_head_sha": live_head_sha,
+                                    "reason": "dead_worker_with_head_change",
+                                },
+                            )
+                        )
+                else:
+                    # Not a simple request_changes case - surface as drift
+                    sweep_events.append(
+                        (
                             "orphaned_worker_drift",
                             {
                                 "issue_number": issue_number,
                                 "pr_number": pr_number,
                                 "previous_status": "dispatched",
                                 "last_decision": last_decision,
-                                "reviewed_head_sha": reviewed_head_sha,
-                                "live_head_sha": live_head_sha,
-                                "reason": "dead_worker_with_head_change",
+                                "reason": "dead_worker_unsafe_to_auto_reset",
                             },
                         )
-                else:
-                    # Not a simple request_changes case - surface as drift
-                    state = append_event(
-                        state,
-                        "orphaned_worker_drift",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "previous_status": "dispatched",
-                            "last_decision": last_decision,
-                            "reason": "dead_worker_unsafe_to_auto_reset",
-                        },
                     )
             else:
                 # No open PR - emit drift event, leave recovery to mop-up
                 # Mop-up will handle label transition back to ready (issue #118)
-                state = append_event(
-                    state,
-                    "orphaned_worker_drift",
-                    {
-                        "issue_number": issue_number,
-                        "previous_status": "dispatched",
-                        "reason": "dead_worker_no_open_pr",
-                    },
+                sweep_events.append(
+                    (
+                        "orphaned_worker_drift",
+                        {
+                            "issue_number": issue_number,
+                            "previous_status": "dispatched",
+                            "reason": "dead_worker_no_open_pr",
+                        },
+                    )
                 )
 
             # Clear the worker PID from state.json
@@ -639,6 +678,7 @@ def _detect_and_handle_orphaned_workers(
             entry.pop("worker_process_start_time", None)
             state["issues"][str(issue_number)] = entry
 
+        state = _append_sweep_events(state, sweep_events)
         save_state(state_file, state)
 
 
