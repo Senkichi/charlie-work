@@ -2638,7 +2638,7 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     now = datetime.now(UTC).isoformat()
     conn.execute(
@@ -2646,8 +2646,8 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
         ("session-1", str(worktree_path), now),
     )
     conn.execute(
-        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        ("session-1", "tool", "tool result", now),
+        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("session-1", 1, "tool", "tool result", now),
     )
     conn.commit()
     conn.close()
@@ -2715,7 +2715,7 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     conn.commit()
     conn.close()
@@ -2873,7 +2873,7 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
     conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
     )
     stale_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     conn.execute(
@@ -2881,8 +2881,8 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
         ("session-1", str(worktree_path), stale_iso),
     )
     conn.execute(
-        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        ("session-1", "tool", "tool result", stale_iso),
+        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("session-1", 1, "tool", "tool result", stale_iso),
     )
     conn.commit()
     conn.close()
