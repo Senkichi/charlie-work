@@ -361,9 +361,13 @@ def launch_devin_session(
             pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
             started_at=utc_now(),
             log_path=str(log_path),
-            error=str(exc) if isinstance(exc, LiveWorkerRedispatchError) else f"worktree creation failed: {exc}",
+            error=str(exc)
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
-            process_start_time=exc.process_start_time if isinstance(exc, LiveWorkerRedispatchError) else None,
+            process_start_time=exc.process_start_time
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else None,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record

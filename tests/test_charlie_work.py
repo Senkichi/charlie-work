@@ -5074,7 +5074,8 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
     assert state["issues"]["123"]["status"] == "dispatched"
     assert (123, "agent:in-progress") in fake_gh.labels_added
     assert any(
-        event["kind"] == "live_worker_redispatch_averted" and event["payload"]["issue_number"] == 123
+        event["kind"] == "live_worker_redispatch_averted"
+        and event["payload"]["issue_number"] == 123
         for event in state.get("events", [])
     )
 

@@ -410,10 +410,14 @@ def launch_claude_worker(
             prompt_path="",
             command=command_template,
             log_path=str(log_path),
-            error=str(exc) if isinstance(exc, LiveWorkerRedispatchError) else f"worktree creation failed: {exc}",
+            error=str(exc)
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
             pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
-            process_start_time=exc.process_start_time if isinstance(exc, LiveWorkerRedispatchError) else None,
+            process_start_time=exc.process_start_time
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else None,
         )
         return _write_record(sessions_dir, record)
 

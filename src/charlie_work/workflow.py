@@ -1993,7 +1993,11 @@ class OrchestratorApp:
                         save_state(self.paths.state_file, state)
                     if is_live_worker:
                         result = next(
-                            (r for r in dispatch_results if r.issue_number == request.issue_number),
+                            (
+                                r
+                                for r in dispatch_results
+                                if r.issue_number == request.issue_number
+                            ),
                             None,
                         )
                         state = append_event(
@@ -2003,7 +2007,9 @@ class OrchestratorApp:
                                 "issue_number": request.issue_number,
                                 "branch_name": request.branch_name,
                                 "pid": result.pid if result else None,
-                                "process_start_time": result.process_start_time if result else None,
+                                "process_start_time": result.process_start_time
+                                if result
+                                else None,
                                 "probe_result": result.error if result else None,
                             },
                         )

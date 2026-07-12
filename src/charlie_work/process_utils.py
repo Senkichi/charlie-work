@@ -232,9 +232,7 @@ def get_process_start_time(pid: int) -> float | None:
                 ctypes.byref(kernel_time),
                 ctypes.byref(user_time),
             ):
-                filetime = (
-                    creation_time.dwHighDateTime << 32
-                ) | creation_time.dwLowDateTime
+                filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
                 return filetime / 10_000_000 - 11644473600
             return None
         finally:
