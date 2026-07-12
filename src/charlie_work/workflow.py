@@ -708,7 +708,7 @@ def _sweep_orphan_processes_for_dead_sessions(
 
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path, state_file: Path, gh: GitHub, config: OrchestratorConfig
-) -> None:
+) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
     This is called from the production loop to detect provider throttling
@@ -721,6 +721,9 @@ def _classify_dead_sessions_and_update_throttle_state(
     Issue #252: if a dead worker has a clean worktree with unpushed commits
     (completed-but-unpublished), push the branch, create a PR, and move the
     issue to ``pr_open`` instead of re-dispatching.
+
+    Issue #266: launch-failure sidecars (pid=None, error set) are terminal by
+    construction and are reaped immediately, reported in the returned list.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
@@ -746,7 +749,38 @@ def _classify_dead_sessions_and_update_throttle_state(
 
     repo_root = getattr(gh, "repo_root", None)
 
+    reaped: list[dict[str, Any]] = []
+
     for w in iter_workers(sessions_dir):
+        if w.pid is None and w.error is not None:
+            # Launch-failure sidecar: terminal by construction (issue #266).
+            # The process never launched, so it can never transition to live.
+            failure_kind = "launch_failed"
+            if w.adapter_kind == "devin":
+                failure_kind, _ = update_session_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                )
+            elif w.adapter_kind == "claude-code":
+                failure_kind, _ = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                )
+            w.reap_sidecar(sessions_dir)
+            reaped.append(
+                {
+                    "issue_number": w.issue_number,
+                    "adapter_kind": w.adapter_kind,
+                    "failure_kind": failure_kind,
+                    "error": w.error,
+                    "pid": w.pid,
+                }
+            )
+            continue
         if w.error is None and not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
@@ -827,6 +861,15 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
             w.reap_sidecar(sessions_dir)
+            reaped.append(
+                {
+                    "issue_number": w.issue_number,
+                    "adapter_kind": w.adapter_kind,
+                    "failure_kind": failure_kind,
+                    "error": w.error,
+                    "pid": w.pid,
+                }
+            )
 
             # Issue #118: reconcile labels for dead sessions with no open PR
             if w.issue_number not in open_prs_by_issue:
@@ -937,6 +980,8 @@ def _classify_dead_sessions_and_update_throttle_state(
                         },
                     )
                     save_state(state_file, state)
+
+    return reaped
 
 
 def _attempt_salvage(
@@ -3004,7 +3049,7 @@ class OrchestratorApp:
         # This detects provider throttling from worker deaths and sets cooldown
         # Also reconciles labels for dead sessions with no open PR (issue #118)
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        _classify_dead_sessions_and_update_throttle_state(
+        reaped = _classify_dead_sessions_and_update_throttle_state(
             sessions_dir, self.paths.state_file, self.gh, self.config
         )
 
@@ -3180,6 +3225,7 @@ class OrchestratorApp:
             "warnings": warnings,
             "open_tracked_prs": open_tracked_prs,
             "skipped_reviews": skipped_reviews,
+            "reaped": reaped,
         }
         # Propagate concurrency info from dispatch results
         if gov.enabled:
