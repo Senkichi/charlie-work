@@ -19,6 +19,8 @@ compare worktree/branch state against the PR diff.
 
 from __future__ import annotations
 
+import ast
+import builtins
 import fnmatch
 import hashlib
 import re
@@ -33,6 +35,9 @@ from charlie_work.github import linked_issue_number
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
+
+# Builtin names that should not be treated as external constants in assertions.
+_BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith("_"))
 
 
 # Case-insensitive word-boundary regex for tests/rationale markers.
@@ -187,6 +192,9 @@ def run_janitor(
     _check_title_conventional(pr, warnings)
     _check_diff_size(pr, warnings)
     _check_base_movement(pr, config, warnings)
+
+    if pr_diff is not None and pr_diff.strip():
+        warnings.extend(check_stub_tests(pr_diff, config.test_adequacy))
 
     # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
     if repo_root is not None:
@@ -721,6 +729,320 @@ def check_test_adequacy(
             warnings=("diff unparseable — test-adequacy skipped",),
             facts=default_facts,
         )
+
+
+def check_stub_tests(diff: str, config: TestAdequacyConfig) -> tuple[str, ...]:
+    """Flag stub tests in the PR diff.
+
+    Heuristic warnings only — they do not block the janitor gate. The three checks are:
+    1. body is only pass/.../docstring
+    2. assertion does not reference a product module from the diff
+    3. test name contains a seam keyword but the body never calls/mentions it
+    """
+    warnings: list[str] = []
+    try:
+        product_modules: set[str] = set()
+        test_files: list[tuple[str, list[str]]] = []
+        for filename, _is_new_file, hunk_lines in iter_diff_files(diff):
+            is_test = any(fnmatch.fnmatch(filename, glob) for glob in config.test_path_globs)
+            is_exempt = any(fnmatch.fnmatch(filename, glob) for glob in config.exempt_path_globs)
+            if is_test and not is_exempt:
+                test_files.append((filename, hunk_lines))
+            elif not is_exempt:
+                product_modules.add(_module_from_path(filename))
+
+        for filename, hunk_lines in test_files:
+            source_lines, added = _reconstruct_post_image(hunk_lines)
+            source = "\n".join(source_lines)
+            try:
+                tree = ast.parse(source, filename=filename)
+            except SyntaxError:
+                continue
+            test_defined_names = _collect_test_defined_names(tree)
+            alias_map = _collect_import_aliases(tree)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                    if node.lineno is None or not (
+                        0 < node.lineno <= len(added) and added[node.lineno - 1]
+                    ):
+                        continue
+                    if _body_is_only_pass_ellipsis_docstring(node):
+                        warnings.append(
+                            f"Stub test (FAIL): {filename}:{node.name} body is only pass/.../docstring"
+                        )
+                    if _assertion_is_constant(
+                        node, alias_map, product_modules, test_defined_names
+                    ):
+                        warnings.append(
+                            f"Stub test (assert-constant): {filename}:{node.name} assertion does not reference the module under test"
+                        )
+                    for keyword in _function_seam_keywords(node, config.stub_test_seam_keywords):
+                        if not _body_calls_seam(node, keyword):
+                            warnings.append(
+                                f"Stub test (seam-name): {filename}:{node.name} name contains '{keyword}' but body never calls it"
+                            )
+    except Exception:
+        warnings.append("diff unparseable — stub test checks skipped")
+    return tuple(warnings)
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _module_from_path(filename: str) -> str:
+    """Convert a file path to its import-style module name, ignoring src/ layout."""
+    path = filename
+    if path.startswith("src/"):
+        path = path[4:]
+    if path.endswith(".py"):
+        path = path[:-3]
+    return path.replace("/", ".")
+
+
+def _reconstruct_post_image(hunk_lines: list[str]) -> tuple[list[str], list[bool]]:
+    """Build the new-file source from unified-diff hunk lines.
+
+    Returns a list of source lines and a parallel list of booleans indicating
+    whether each line was added (``+``) or came from context (`` ``). The
+    reconstruction is best-effort; missing context is represented as blank lines.
+    """
+    source: list[str] = []
+    added: list[bool] = []
+    new_index: int | None = None
+    for line in hunk_lines:
+        header = _HUNK_HEADER_RE.match(line)
+        if header:
+            new_index = int(header.group(1)) - 1
+            continue
+        if line.startswith("-"):
+            continue
+        if line.startswith("+"):
+            content = line[1:]
+            is_added = True
+        elif line.startswith(" "):
+            content = line[1:]
+            is_added = False
+        else:
+            continue
+        if new_index is None:
+            continue
+        if new_index > len(source):
+            source.extend([""] * (new_index - len(source)))
+            added.extend([False] * (new_index - len(added)))
+        if new_index < len(source):
+            source[new_index] = content
+            added[new_index] = is_added
+        else:
+            source.append(content)
+            added.append(is_added)
+        new_index += 1
+    while source and source[-1] == "" and not added[-1]:
+        source.pop()
+        added.pop()
+    return source, added
+
+
+def _collect_test_defined_names(tree: ast.AST) -> frozenset[str]:
+    """Collect top-level function, class, and assignment names in the test file."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_names_in_target(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_names_in_target(node.target))
+    return frozenset(names)
+
+
+def _names_in_target(target: ast.AST) -> list[str]:
+    """Extract the ``Name`` ids from an assignment target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for elt in target.elts for name in _names_in_target(elt)]
+    return []
+
+
+def _collect_import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Map top-level import aliases to their fully qualified module names."""
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname if alias.asname else alias.name.split(".")[0]
+                aliases[local] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                continue
+            module = node.module or ""
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname if alias.asname else alias.name
+                aliases[local] = f"{module}.{alias.name}" if module else alias.name
+    return aliases
+
+
+def _collect_local_names(node: ast.FunctionDef) -> frozenset[str]:
+    """Collect argument names and locally assigned names for a function."""
+    names: set[str] = set()
+    for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
+        names.add(arg.arg)
+    if node.args.vararg:
+        names.add(node.args.vararg.arg)
+    if node.args.kwarg:
+        names.add(node.args.kwarg.arg)
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+            names.add(child.id)
+    return frozenset(names)
+
+
+def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef) -> bool:
+    """Return True if the function body is only pass/.../docstring."""
+    for stmt in node.body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            if isinstance(stmt.value.value, str) or stmt.value.value is ...:
+                continue
+        return False
+    return True
+
+
+def _assertion_is_constant(
+    node: ast.FunctionDef,
+    alias_map: dict[str, str],
+    product_modules: set[str],
+    test_defined_names: frozenset[str],
+) -> bool:
+    """Return True if any assertion in the function only references constants."""
+    local_names = _collect_local_names(node)
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assert):
+            if _assert_expr_is_constant(
+                child, alias_map, product_modules, local_names, test_defined_names
+            ):
+                return True
+    return False
+
+
+def _assert_expr_is_constant(
+    assert_node: ast.Assert,
+    alias_map: dict[str, str],
+    product_modules: set[str],
+    local_names: frozenset[str],
+    test_defined_names: frozenset[str],
+) -> bool:
+    """Return True if the assertion expression does not reference a product module."""
+    if any(isinstance(n, ast.Call) for n in ast.walk(assert_node.test)):
+        return False
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(assert_node.test):
+        for child in ast.iter_child_nodes(node):
+            parent_map[child] = node
+    has_name = False
+    has_product = False
+    has_non_trivial = False
+    for node in ast.walk(assert_node.test):
+        if isinstance(node, ast.Attribute):
+            root, attrs = _attribute_root_and_attrs(node)
+            if root is None or not isinstance(root, ast.Name):
+                has_non_trivial = True
+                continue
+            if (
+                root.id in local_names
+                or root.id in test_defined_names
+                or root.id in _BUILTIN_NAMES
+            ):
+                continue
+            if root.id in alias_map:
+                module = alias_map[root.id]
+                for prefix in _attribute_prefixes(module, attrs):
+                    if prefix in product_modules:
+                        has_product = True
+                        break
+                else:
+                    has_non_trivial = True
+                continue
+            has_non_trivial = True
+            continue
+        if isinstance(node, ast.Name):
+            has_name = True
+            parent = parent_map.get(node)
+            if isinstance(parent, ast.Attribute) and parent.value is node:
+                continue
+            if (
+                node.id in local_names
+                or node.id in test_defined_names
+                or node.id in _BUILTIN_NAMES
+            ):
+                continue
+            if node.id in alias_map:
+                if alias_map[node.id] in product_modules:
+                    has_product = True
+                else:
+                    has_non_trivial = True
+                continue
+            has_non_trivial = True
+    if has_product:
+        return False
+    if has_non_trivial:
+        return True
+    return not has_name
+
+
+def _attribute_root_and_attrs(node: ast.Attribute) -> tuple[ast.Name | None, list[str]]:
+    """Return the root Name of an attribute chain and the list of attributes in order."""
+    attrs: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        attrs.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        return current, attrs[::-1]
+    return None, []
+
+
+def _attribute_prefixes(alias_module: str, attrs: list[str]) -> Iterator[str]:
+    """Yield the module and each attribute prefix of an attribute chain."""
+    module = alias_module
+    yield module
+    for attr in attrs:
+        module = f"{module}.{attr}"
+        yield module
+
+
+def _function_seam_keywords(node: ast.FunctionDef, keywords: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the configured seam keywords that appear in the function name."""
+    funcname = node.name.lower()
+    return tuple(kw for kw in keywords if kw in funcname)
+
+
+def _body_calls_seam(node: ast.FunctionDef, keyword: str) -> bool:
+    """Return True if the function body contains the seam keyword in an identifier or string."""
+    keyword = keyword.lower()
+    for stmt in node.body:
+        if (
+            stmt is node.body[0]
+            and isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        for child in ast.walk(stmt):
+            if isinstance(child, ast.Name):
+                if keyword in child.id.lower():
+                    return True
+            elif isinstance(child, ast.Attribute):
+                if keyword in child.attr.lower():
+                    return True
+            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+                if keyword in child.value.lower():
+                    return True
+    return False
 
 
 def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) -> tuple[str, ...]:

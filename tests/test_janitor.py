@@ -17,6 +17,7 @@ from charlie_work.janitor import (
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
+    check_stub_tests,
     check_test_adequacy,
     iter_diff_files,
     run_janitor,
@@ -2189,3 +2190,103 @@ index 123..456 100644
     assert verdict.facts.added_product_loc == 0
     assert verdict.facts.added_test_loc == 5
     assert verdict.facts.test_files_changed == 1
+
+
+# Stub-test detection tests (issue #224)
+
+
+def test_check_stub_tests_pass_body_marker() -> None:
+    """Only-pass/.../docstring bodies are flagged as stub tests."""
+    diff = '''diff --git a/tests/test_feature.py b/tests/test_feature.py
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/tests/test_feature.py
+@@ -0,0 +1,6 @@
++def test_pass_stub():
++    pass  # placeholder
++def test_ellipsis_stub():
++    ...
++def test_docstring_stub():
++    """docstring"""
+'''
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert len(warnings) == 3
+    assert any("test_pass_stub" in w for w in warnings)
+    assert any("test_ellipsis_stub" in w for w in warnings)
+    assert any("test_docstring_stub" in w for w in warnings)
+
+
+def test_check_stub_tests_assert_constant_ignores_product_references() -> None:
+    """Assertions referencing product modules are fine; unrelated module constants are flagged."""
+    diff = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,2 +1,2 @@
+ def feature():
+-    return 1
++    return 2
+diff --git a/tests/test_feature.py b/tests/test_feature.py
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/tests/test_feature.py
+@@ -0,0 +1,9 @@
++from feature import do_thing
++from other import UNRELATED
++def test_do_thing_works():
++    assert do_thing() is not None
++def test_constant_stub():
++    assert UNRELATED > 0
++def test_local_only():
++    result = do_thing()
++    assert result == 1
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert any("test_constant_stub" in w and "assert-constant" in w for w in warnings)
+    assert not any("test_do_thing_works" in w for w in warnings)
+    assert not any("test_local_only" in w for w in warnings)
+
+
+def test_check_stub_tests_seam_name_mismatch() -> None:
+    """Test names containing a seam keyword require the body to call/mention that seam."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/tests/test_feature.py
+@@ -0,0 +1,5 @@
++def test_call_model_smoke():
++    assert True
++def test_call_model_real():
++    call_model()
++def test_route_smoke():
++    assert True
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert any("test_call_model_smoke" in w and "seam-name" in w for w in warnings)
+    assert any("test_route_smoke" in w and "seam-name" in w for w in warnings)
+    assert not any("test_call_model_real" in w and "seam-name" in w for w in warnings)
+
+
+def test_run_janitor_appends_stub_warnings_from_pr_diff() -> None:
+    """run_janitor calls check_stub_tests and adds its warnings to the verdict."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/tests/test_feature.py
+@@ -0,0 +1,2 @@
++def test_pass_stub():
++    pass  # placeholder
+"""
+    verdict = run_janitor(
+        _green_pr(), _green_checks(), _config(), repo_root=Path.cwd(), pr_diff=diff
+    )
+
+    assert verdict.ok is True
+    assert any("test_pass_stub" in w for w in verdict.warnings)
