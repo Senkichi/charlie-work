@@ -94,6 +94,7 @@ def _active_result(
     merged: int = 0,
     merge_failed: int = 0,
     open_prs: int = 0,
+    warnings: list[str] | None = None,
 ) -> CommandResult:
     """A pass result with some activity.
 
@@ -114,6 +115,7 @@ def _active_result(
             "merges": merges,
             "reviews": [],
             "errors": [],
+            "warnings": warnings if warnings is not None else [],
             "open_tracked_prs": open_prs,
             "skipped_reviews": 0,
         },
@@ -370,6 +372,19 @@ def test_pass_summary_reports_plain_count_when_all_attempts_succeed(
     out = capsys.readouterr().out
     assert "merged 2" in out
     assert "merged 2/2" not in out
+
+
+def test_pass_summary_reports_warnings_count(tmp_path: Path, capsys: Any) -> None:
+    """Issue #254: the summary line counts pass warnings (e.g. merge alarms)."""
+    app = FakeApp(
+        tmp_path,
+        [_active_result(warnings=["PR #456 approved but unmergeable for 3 passes"])],
+    )
+    fc = FakeClock(auto_advance=1.0)
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+
+    out = capsys.readouterr().out
+    assert "warnings 1" in out
 
 
 # ---------------------------------------------------------------------------

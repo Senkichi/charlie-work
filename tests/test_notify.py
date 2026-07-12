@@ -349,6 +349,52 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
     assert state["issues"]["1"]["health"] == "DEAD"
 
 
+def test_attention_digest_state_field_tracks_separate_alert_dimension(tmp_path):
+    """Issue #254: _build_attention_digest can track a non-health field like merge_alert."""
+    from charlie_work.state import load_state
+
+    state_file = tmp_path / "state.json"
+
+    transitions = {
+        123: {
+            "adapter_kind": "unknown",
+            "health": "MERGE_BLOCKED",
+            "last_log_line": None,
+            "pid": None,
+            "terminal_tool": None,
+            "terminal_reason": "PR #456 approved but unmergeable for 3 passes",
+        }
+    }
+
+    digest = _build_attention_digest(
+        state_file,
+        transitions,
+        repo="test-repo",
+        state_field="merge_alert",
+    )
+
+    assert digest is not None
+    assert len(digest.transitions) == 1
+    assert digest.transitions[0].issue_number == 123
+    assert digest.transitions[0].health == "MERGE_BLOCKED"
+    assert digest.transitions[0].previous_health is None
+
+    state = load_state(state_file)
+    assert state["issues"]["123"]["merge_alert"] == "MERGE_BLOCKED"
+
+    # Repeating the same transition with the same state field is a no-op.
+    digest_same = _build_attention_digest(
+        state_file,
+        transitions,
+        repo="test-repo",
+        state_field="merge_alert",
+    )
+    assert digest_same is None
+
+    # Health field is independent and untouched.
+    assert state["issues"]["123"].get("health") is None
+
+
 def test_attention_digest_threads_terminal_tool_and_reason_through_file_sink(tmp_path):
     """Issue #261 F6: terminal_tool/terminal_reason (recovered from a dead
     worker's post-mortem) must survive the full plumbing —
