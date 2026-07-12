@@ -277,9 +277,15 @@ Mitigations (the fleet is charlie-work's, but the test config is the
   `Add-MpPreference -ExclusionPath '<worktrees-root>'` (check first with
   `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`, which itself
   needs admin).
-- **Do not give each worktree its own full venv** to dodge this — it costs disk
-  and sync time and does not touch the CPU/RAM ceiling. The shared-venv junction
-  (`claude_code.venv_source`) is correct; bound parallelism instead.
+- **Per-worktree venvs are the default for `claude-code`** (the
+  `claude_code.venv_source` option is `null` by default). Each worker builds its
+  own isolated `.venv` inside its worktree, which is the only safe choice for a
+  shell-capable worker that can run `uv sync` — a shared-venv junction lets a
+  worker rewrite the shared venv's editable-install `.pth` to point at the
+  worktree and corrupt the operator's `charlie` CLI. If you explicitly set
+  `claude_code.venv_source`, you are opting back into the junction and the
+  cleanup hazard described above; bound parallelism with `PYTEST_XDIST_AUTO_NUM_WORKERS`
+  instead of disabling isolation.
 
 ## Fleet: cross-repo dispatch
 

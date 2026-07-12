@@ -176,6 +176,57 @@ def test_create_worktree_no_venv_source_isolates_uv_sync_writes(tmp_path: Path) 
     assert pth.read_text(encoding="utf-8") == "operator/src\n"
 
 
+def test_rework_unlinks_pre_existing_venv_junction_when_venv_source_none(
+    tmp_path: Path,
+) -> None:
+    """Issue #274: reusing a worktree with no venv_source must remove a pre-existing
+    .venv junction so the worker's uv sync writes to a local .venv instead of
+    poisoning the operator's shared venv.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    pth = shared_venv / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    pth.parent.mkdir(parents=True)
+    pth.write_text("operator/src\n", encoding="utf-8")
+
+    branch_name = "agent/issue-274-reuse-no-junction"
+
+    # Pre-PR era: worktree was created with a shared-venv junction.
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", venv_source=shared_venv)
+    assert info1.venv_junction == info1.path / ".venv"
+    assert is_junction(info1.venv_junction)
+
+    # Re-dispatch with the new default (venv_source=None) should unlink the
+    # junction, not follow it, so the shared venv is untouched.
+    info2 = create_worktree(repo_root, branch_name, rework=True, venv_source=None)
+
+    assert info2.path == info1.path
+    assert info2.venv_junction is None
+    assert not is_junction(info2.path / ".venv")
+    assert not (info2.path / ".venv").exists()
+
+    # The shared venv's editable .pth must remain untouched and unreachable.
+    assert pth.read_text(encoding="utf-8") == "operator/src\n"
+    assert not (
+        info2.path / ".venv" / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    ).exists()
+
+    # Simulate a worker running uv sync into a now-isolated per-worktree venv.
+    local_venv = info2.path / ".venv"
+    local_venv.mkdir(parents=True)
+    local_pth = local_venv / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    local_pth.parent.mkdir(parents=True)
+    local_pth.write_text("worktree/src\n", encoding="utf-8")
+
+    # The shared venv's editable .pth must still be untouched.
+    assert pth.read_text(encoding="utf-8") == "operator/src\n"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
 def test_remove_worktree_refuses_when_venv_is_real_directory(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)

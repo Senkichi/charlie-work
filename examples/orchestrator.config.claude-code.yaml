@@ -54,8 +54,10 @@ runtime:
   # prompts_dir: orchestrator-prompts
 
 devin:
-  # claude-code launches each worker headless in an isolated git worktree with
-  # the shared venv junctioned in. Verify with `charlie doctor
+  # claude-code launches each worker headless in an isolated git worktree.
+  # Each worker cold-builds its own per-worktree `.venv` by default (issue
+  # #274); set `claude_code.venv_source` to a path only if you want to opt
+  # back into the shared-venv junction. Verify with `charlie doctor
   # --adapter-probe`. Fall back to `adapter: manual` to paste prompts by hand.
   adapter: claude-code
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
