@@ -890,9 +890,15 @@ def check_stub_tests(diff: str, config: TestAdequacyConfig) -> tuple[str, ...]:
             test_defined_names = _collect_test_defined_names(tree)
             alias_map = _collect_import_aliases(tree)
             for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                    if node.lineno is None or not (
-                        0 < node.lineno <= len(added) and added[node.lineno - 1]
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ) and node.name.startswith("test_"):
+                    if node.lineno is None:
+                        continue
+                    end_lineno = node.end_lineno if node.end_lineno is not None else node.lineno
+                    if not any(
+                        0 < i <= len(added) and added[i - 1]
+                        for i in range(node.lineno, end_lineno + 1)
                     ):
                         continue
                     if _body_is_only_pass_ellipsis_docstring(node):
@@ -1014,7 +1020,7 @@ def _collect_import_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def _collect_local_names(node: ast.FunctionDef) -> frozenset[str]:
+def _collect_local_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
     """Collect argument names and locally assigned names for a function."""
     names: set[str] = set()
     for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
@@ -1029,7 +1035,7 @@ def _collect_local_names(node: ast.FunctionDef) -> frozenset[str]:
     return frozenset(names)
 
 
-def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef) -> bool:
+def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return True if the function body is only pass/.../docstring."""
     for stmt in node.body:
         if isinstance(stmt, ast.Pass):
@@ -1042,7 +1048,7 @@ def _body_is_only_pass_ellipsis_docstring(node: ast.FunctionDef) -> bool:
 
 
 def _assertion_is_constant(
-    node: ast.FunctionDef,
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
     alias_map: dict[str, str],
     product_modules: set[str],
     test_defined_names: frozenset[str],
@@ -1144,13 +1150,15 @@ def _attribute_prefixes(alias_module: str, attrs: list[str]) -> Iterator[str]:
         yield module
 
 
-def _function_seam_keywords(node: ast.FunctionDef, keywords: tuple[str, ...]) -> tuple[str, ...]:
+def _function_seam_keywords(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, keywords: tuple[str, ...]
+) -> tuple[str, ...]:
     """Return the configured seam keywords that appear in the function name."""
     funcname = node.name.lower()
     return tuple(kw for kw in keywords if kw in funcname)
 
 
-def _body_calls_seam(node: ast.FunctionDef, keyword: str) -> bool:
+def _body_calls_seam(node: ast.FunctionDef | ast.AsyncFunctionDef, keyword: str) -> bool:
     """Return True if the function body contains the seam keyword in an identifier or string."""
     keyword = keyword.lower()
     for stmt in node.body:
