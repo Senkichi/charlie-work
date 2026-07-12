@@ -80,6 +80,12 @@ def test_default_config_failed_attempt_alarm() -> None:
     assert config.auto_merge.failed_attempt_alarm == 3
 
 
+def test_default_config_update_open_prs_is_next() -> None:
+    """Default update_open_prs is merge-train mode."""
+    config = load_config()
+    assert config.auto_merge.update_open_prs == "next"
+
+
 def test_default_config_tee_stream_json_disabled() -> None:
     """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
     config = load_config()
@@ -204,6 +210,57 @@ auto_merge:
 """
     )
     with pytest.raises(ConfigError, match="failed_attempt_alarm.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_update_open_prs_boolean_aliases(tmp_path: Path) -> None:
+    """update_open_prs boolean aliases are normalized for backward compatibility."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: true
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.update_open_prs == "all"
+
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: false
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.update_open_prs == "off"
+
+
+def test_load_config_update_open_prs_string_values(tmp_path: Path) -> None:
+    """update_open_prs accepts all/next/off string values."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    for value in ("all", "next", "off", "ALL", "Next", "OFF"):
+        config_file.write_text(
+            f"""
+auto_merge:
+  update_open_prs: {value}
+"""
+        )
+        config = load_config(config_file)
+        assert config.auto_merge.update_open_prs == value.lower()
+
+
+def test_load_config_update_open_prs_rejects_invalid_value(tmp_path: Path) -> None:
+    """update_open_prs rejects unknown string values."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: sometimes
+"""
+    )
+    with pytest.raises(ConfigError, match="update_open_prs.*'all', 'next', 'off'"):
         load_config(config_file)
 
 
@@ -2435,6 +2492,7 @@ class FakeGitHub:
                 "url": "https://example.test/pull/456",
                 "headRefName": "agent/issue-123-fix-search",
                 "headRefOid": "sha-abc123",
+                "mergeStateStatus": "CLEAN",
                 "body": "Closes #123\n\nTests: regression coverage added.",
                 "labels": [],
                 "isCrossRepository": False,
@@ -9171,6 +9229,226 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert result_789.data["can_merge"] is True
     assert result_789.data.get("head_moved") is not True  # Should not trigger head-moved gate
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+
+def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:
+    """Merge-train head with a BEHIND mergeStateStatus is base-synced before merge."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeStateStatus"] = "BEHIND"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # The branch was synced before the merge
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123-updated"
+    # The approved head was updated to match the new base
+    decision = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text())
+    assert decision["reviewed_head_sha"] == "sha-abc123-updated"
+
+
+def test_merge_ready_next_mode_skips_non_head(tmp_path: Path) -> None:
+    """In merge-train mode, a non-head approved PR cannot be merged."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    # Ensure 456 is the head of the queue regardless of when approvals occurred.
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(789, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert "not the head" in result.message
+    assert fake_gh.merged == []
+
+
+def test_update_open_agent_prs_next_mode_syncs_head_of_queue(tmp_path: Path) -> None:
+    """In merge-train mode, post-merge only syncs the head of the approved queue."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 101,
+            "title": "Fix #125: third",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-third",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Approve in order: 456 first (head), then 789, then 101.
+    for pr_number in (456, 789, 101):
+        app.record_review(pr_number, "approved", summary="lgtm")
+    # Override timestamps so fast tests don't all land in the same second.
+    for idx, pr_number in enumerate((456, 789, 101)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    # Merge the head of the queue.
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # Post-merge only the next candidate (789) should be base-synced.
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456-updated"
+    # The third PR should be untouched (not the head of the queue).
+    assert fake_gh.prs[2]["headRefOid"] == "sha-ghi789"
+
+
+def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -> None:
+    """In merge-train mode, an up-to-date head candidate is not re-synced."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    # Ensure 456 is the head of the queue.
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is False
+    assert update_results[0]["skipped_reason"] == "up-to-date"
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
 
 
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
