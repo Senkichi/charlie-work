@@ -1090,6 +1090,21 @@ def _build_attention_digest(
     )
 
 
+def _is_pending_only(summary: CheckSummary) -> bool:
+    """Return True if the only reason the PR cannot merge is in-flight checks.
+
+    A summary whose only defect is pending checks is not a structural merge
+    failure; it should not arm the failed-attempt alarm.
+    """
+    return (
+        bool(summary.pending)
+        and not summary.failed
+        and not summary.missing
+        and not summary.infra_failed
+        and not summary.unavailable
+    )
+
+
 def _format_merge_attempt_alarm_message(
     pr_number: int, attempts: int, summary: CheckSummary
 ) -> str:
@@ -2587,7 +2602,7 @@ class OrchestratorApp:
             new_attempts = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
-            if approved and not can_merge:
+            if approved and not can_merge and not _is_pending_only(summary):
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
@@ -2607,6 +2622,16 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
+            if approved and can_merge and merge_output is None:
+                # merge=False / auto_merge.enabled=False: can_merge recovered but no
+                # merge was attempted. Clear the merge alert so a subsequent
+                # degradation can re-fire the digest (last_health == current_health
+                # dedup would otherwise drop it).
+                if issue_number is not None:
+                    _issue_key = str(issue_number)
+                    _issue_entry = state["issues"].get(_issue_key, {})
+                    if _issue_entry.get("merge_alert") != "OK":
+                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
             prs_entry: dict[str, Any] = {
                 **existing,
                 "number": pr_number,

@@ -6117,6 +6117,7 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
         "failed",
         "missing",
         "infra_failed",
+        "unavailable",
     }
 
 
@@ -6221,6 +6222,136 @@ def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Pa
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     assert state["issues"]["123"]["merge_alert"] == "OK"
+
+
+def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Path) -> None:
+    """Issue #254: pending-only checks must not count toward failed merge attempts."""
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    pending_checks = [
+        {"name": "Tests passed", "state": "PENDING"},
+        {"name": "Lint & Format", "state": "PENDING"},
+        {"name": "Pre-commit", "state": "PENDING"},
+    ]
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=pending_checks)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+        assert result.data["can_merge"] is False
+        assert result.data["merge_attempt_alarm"] is False
+        assert result.data["merge_attempt_warning"] is None
+        assert result.data["consecutive_failed_merge_attempts"] == 0
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 0
+
+
+def test_merge_ready_merge_alert_refires_after_can_merge_recovery(tmp_path: Path) -> None:
+    """Issue #254: merge=False recovery resets merge_alert so a second degradation
+    can re-fire the notify digest.
+    """
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.workflow import _build_attention_digest
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    failing_checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "state": "FAILURE"},
+        {"name": "Pre-commit", "state": "FAILURE"},
+    ]
+    passing_checks = [
+        {"name": "Tests passed", "state": "SUCCESS"},
+        {"name": "Lint & Format", "state": "SUCCESS"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    failing_gh = FakeGitHubWithChecks(checks=failing_checks)
+    app = OrchestratorApp(tmp_path, paths, config, failing_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # First degradation to threshold.
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+
+    # Simulate the loop digest that would set merge_alert to MERGE_BLOCKED.
+    _build_attention_digest(
+        paths.state_file,
+        {
+            123: {
+                "adapter_kind": "unknown",
+                "health": "MERGE_BLOCKED",
+                "last_log_line": None,
+                "pid": None,
+                "terminal_tool": None,
+                "terminal_reason": warning,
+            }
+        },
+        repo="test-repo",
+        state_field="merge_alert",
+    )
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["merge_alert"] == "MERGE_BLOCKED"
+
+    # Recovery: can_merge=True but no merge attempted (merge=False).
+    passing_gh = FakeGitHubWithChecks(checks=passing_checks)
+    app = OrchestratorApp(tmp_path, paths, config, passing_gh)
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["merge_alert"] == "OK"
+
+    # Second degradation to threshold.
+    app = OrchestratorApp(tmp_path, paths, config, failing_gh)
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+
+    # The digest should fire again because merge_alert moved OK -> MERGE_BLOCKED.
+    digest = _build_attention_digest(
+        paths.state_file,
+        {
+            123: {
+                "adapter_kind": "unknown",
+                "health": "MERGE_BLOCKED",
+                "last_log_line": None,
+                "pid": None,
+                "terminal_tool": None,
+                "terminal_reason": warning,
+            }
+        },
+        repo="test-repo",
+        state_field="merge_alert",
+    )
+    assert digest is not None
+    assert len(digest.transitions) == 1
+    assert digest.transitions[0].health == "MERGE_BLOCKED"
+    assert digest.transitions[0].previous_health == "OK"
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["merge_alert"] == "MERGE_BLOCKED"
 
 
 def test_merge_ready_pr_list_error_during_update_open_prs_is_caught(tmp_path: Path) -> None:
