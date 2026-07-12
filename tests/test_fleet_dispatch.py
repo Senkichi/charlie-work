@@ -517,6 +517,8 @@ def test_fleet_loop_unclassified_exception_isolated(
 
     # Verify the failing repo's message is recorded
     assert "fleet pass error" in result.data["repos"]["owner/repo1"].get("message", "")
+    # The exception type must be part of the surfaced message (diagnosability).
+    assert "RuntimeError" in result.data["repos"]["owner/repo1"]["message"]
 
     # Verify overall result is False (one repo failed)
     assert result.ok is False

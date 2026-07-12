@@ -787,6 +787,8 @@ def main(argv: list[str] | None = None) -> int:
                 if repo_data.get("skipped"):
                     status = "SKIPPED"
                 print(f"  {repo_key}: {status}")
+                if status != "OK" and repo_data.get("message"):
+                    print(f"    {repo_data['message']}")
             digest = result.data.get("digest", {})
             event_count = digest.get("count", 0)
             orphan_sweep_calls = digest.get("orphan_sweep_calls", 0)

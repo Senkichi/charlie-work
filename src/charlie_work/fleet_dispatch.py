@@ -503,8 +503,12 @@ def fleet_loop(
             # Per-repo isolation: catch any provider/logic failure at the
             # iteration boundary and continue. Keep the rest of the fleet
             # pass alive instead of crashing on one unclassified exception.
-            per_repo_results[repo_key] = CommandResult(False, f"fleet pass error: {exc}", {})
-            logger.error(f"Error processing repo {repo_key}: {exc}")
+            # The exception type is part of the message and the full traceback
+            # goes to the log — an unclassified failure must stay diagnosable.
+            per_repo_results[repo_key] = CommandResult(
+                False, f"fleet pass error: {type(exc).__name__}: {exc}", {}
+            )
+            logger.exception("Error processing repo %s", repo_key)
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
