@@ -410,6 +410,20 @@ def is_junction(path: Path) -> bool:
     return os.path.islink(path)
 
 
+def _unlink_reparse_point(path: Path) -> None:
+    """Remove a reparse point (Windows junction/symlink) or POSIX symlink.
+
+    ``os.rmdir`` is used on Windows because it removes the reparse point
+    itself without following into the target directory. ``os.unlink`` is used
+    on POSIX because ``os.rmdir`` raises on a symlink. In both cases the
+    target is left untouched.
+    """
+    if os.name == "nt":
+        os.rmdir(path)
+    else:
+        os.unlink(path)
+
+
 def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
     if link_path.exists() or is_junction(link_path):
         raise RuntimeError(f"venv link target already exists: {link_path}")
@@ -815,10 +829,9 @@ def create_worktree(
                         f"Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
-            # Skip venv junction creation for reused worktrees (already exists)
-            venv_junction = None
+            venv_link = worktree_path / ".venv"
+            venv_junction: Path | None = None
             if venv_source is not None:
-                venv_link = worktree_path / ".venv"
                 if venv_link.exists() or is_junction(venv_link):
                     venv_junction = venv_link
                 else:
@@ -829,6 +842,12 @@ def create_worktree(
                         # Clean up the orphan worktree (but not the branch, which already exists in rework mode)
                         remove_worktree(repo_root, worktree_path, force=True, branch=None)
                         raise
+            else:
+                # If a pre-existing .venv junction from the previous default era
+                # is present, unlink it so the worker's uv sync creates a local
+                # .venv instead of writing through the reparse point.
+                if is_junction(venv_link):
+                    _unlink_reparse_point(venv_link)
             return WorktreeInfo(
                 path=worktree_path,
                 branch=branch,
@@ -990,14 +1009,8 @@ def remove_worktree(
         # never raise, so one worktree's teardown can't crash the whole batch.
         try:
             if is_junction(venv_path):
-                # Windows junctions (reparse points) are removed with os.rmdir,
-                # which unlinks only the reparse point — never follows into the
-                # target. On POSIX, symlinks must be removed with os.unlink;
-                # os.rmdir raises NotADirectoryError/OSError on a symlink.
-                if os.name == "nt":
-                    os.rmdir(venv_path)
-                else:
-                    os.unlink(venv_path)
+                # Unlink the reparse point itself; never follow into the target.
+                _unlink_reparse_point(venv_path)
             elif venv_path.is_dir():
                 if not force:
                     return False

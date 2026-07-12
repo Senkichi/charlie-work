@@ -54,8 +54,10 @@ runtime:
   # prompts_dir: orchestrator-prompts
 
 devin:
-  # claude-code launches each worker headless in an isolated git worktree with
-  # the shared venv junctioned in. Verify with `charlie doctor
+  # claude-code launches each worker headless in an isolated git worktree.
+  # Each worker cold-builds its own per-worktree `.venv` by default (issue
+  # #274); set `claude_code.venv_source` to a path only if you want to opt
+  # back into the shared-venv junction. Verify with `charlie doctor
   # --adapter-probe`. Fall back to `adapter: manual` to paste prompts by hand.
   adapter: claude-code
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
@@ -68,10 +70,11 @@ claude_code:
   # command: [claude, -p, --permission-mode, acceptEdits]
   # Worktrees live under .var/charlie-work/worktrees unless overridden.
   # worktrees_dir: .var/charlie-work/worktrees
-  # Junctioned into each worktree so workers share one venv. NEVER remove a
-  # worktree before its .venv junction is deleted (remove_worktree handles
-  # the ordering). Set to null to disable venv sharing.
-  venv_source: .venv
+  # Disabled by default (issue #274): a claude-code worker has a full agentic
+  # shell and can run uv sync, which would rewrite the shared venv's editable
+  # install metadata. Set to a path to re-enable the legacy shared-venv
+  # junction; set to null to keep it disabled.
+  venv_source: null
   # Extra env merged over the orchestrator's env in every worker process. Each
   # claude-code worker runs LOCALLY on this host, so a default_limit-wide wave
   # stacks K test runs here. PYTEST_XDIST_AUTO_NUM_WORKERS caps `pytest -n auto`
