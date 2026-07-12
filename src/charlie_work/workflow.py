@@ -1113,6 +1113,11 @@ class OrchestratorApp:
             self.prompt_dirs = ()
         self.paths.ensure()
 
+        # Startup self-check: validate gh --json field lists against the
+        # installed CLI. Fail fast before any dispatch/review/merge work.
+        if isinstance(self.gh, GitHub):
+            self.gh.validate_field_lists()
+
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
 
@@ -1956,6 +1961,7 @@ class OrchestratorApp:
                     "janitor_ok": False,
                     "janitor_failures": list(verdict.failures),
                     "janitor_warnings": list(verdict.warnings),
+                    "checks_unavailable": checks is None,
                 },
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
@@ -2121,6 +2127,7 @@ class OrchestratorApp:
                 "cross_family_ok": cf_result.ok if cf_result else None,
                 "cross_family_reused": cf_result.reused if cf_result else None,
                 "label_error": label_error,
+                "checks_unavailable": False,
             },
         )
 
@@ -2410,25 +2417,34 @@ class OrchestratorApp:
                     },
                 )
         checks = self.gh.pr_checks(pr_number)
-        # Enrich check data with infrastructure failure detection for FAILED checks
-        # This implements detection signals 1 (zero-step jobs) and 2 (billing annotations)
-        # from issue #210, keeping summarize_checks pure by enriching at the data boundary
-        enriched_checks = []
-        for check in checks:
-            state = str(check.get("state") or "").upper()
-            if state == "FAILURE":
-                # Check if this failure is due to infrastructure issues
-                check_run_id = check.get("databaseId")
-                if check_run_id and isinstance(check_run_id, int):
-                    # The databaseId from gh pr checks IS the GitHub Actions job id
-                    job = self.gh.actions_job(check_run_id)
-                    annotations = self.gh.check_run_annotations(check_run_id)
-                    if job and is_infrastructure_failure(job, annotations):
-                        # Reclassify as infrastructure failure by setting state to a marker
-                        # that summarize_checks will route to infra_failed
-                        check = {**check, "state": "INFRA_FAILURE"}
-            enriched_checks.append(check)
-        summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
+        checks_unavailable = checks is None
+
+        if checks_unavailable:
+            # gh pr checks command itself failed. Treat every required check as
+            # unavailable (not missing) and do not merge; callers/loop will count
+            # this as an infrastructure error.
+            summary = summarize_checks(None, self.config.auto_merge.required_checks)
+            enriched_checks: list[dict[str, Any]] = []
+        else:
+            # Enrich check data with infrastructure failure detection for FAILED checks
+            # This implements detection signals 1 (zero-step jobs) and 2 (billing annotations)
+            # from issue #210, keeping summarize_checks pure by enriching at the data boundary
+            enriched_checks = []
+            for check in checks:
+                state = str(check.get("state") or "").upper()
+                if state == "FAILURE":
+                    # Check if this failure is due to infrastructure issues
+                    check_run_id = check.get("databaseId")
+                    if check_run_id and isinstance(check_run_id, int):
+                        # The databaseId from gh pr checks IS the GitHub Actions job id
+                        job = self.gh.actions_job(check_run_id)
+                        annotations = self.gh.check_run_annotations(check_run_id)
+                        if job and is_infrastructure_failure(job, annotations):
+                            # Reclassify as infrastructure failure by setting state to a marker
+                            # that summarize_checks will route to infra_failed
+                            check = {**check, "state": "INFRA_FAILURE"}
+                enriched_checks.append(check)
+            summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
         # Run containment check for worker edits leaked into operator checkout
         diff = self.gh.pr_diff(pr_number)
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
@@ -2518,6 +2534,7 @@ class OrchestratorApp:
             "branch_deleted": branch_deleted,
             "review_decision": decision,
             "checks": asdict(summary),
+            "checks_unavailable": checks_unavailable,
             "label_error": label_error,
             "update_open_prs_results": update_results,
             "cancel_superseded_runs_results": cancel_results,
@@ -2547,9 +2564,11 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
         message = "merge readiness evaluated"
-        if label_error:
+        if checks_unavailable:
+            message = "checks unavailable (gh failure)"
+        elif label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
-        return CommandResult(True, message, data)
+        return CommandResult(not checks_unavailable, message, data)
 
     def spec_review(self, artifact_path: Path) -> CommandResult:
         """Run an explicit cross-family adversarial pass over a spec/plan file.
@@ -2820,6 +2839,35 @@ class OrchestratorApp:
 
         return results
 
+    def _record_review_or_error(
+        self,
+        review_result: CommandResult,
+        errors: list[dict[str, Any]],
+        reviews: list[dict[str, Any]],
+    ) -> bool:
+        """Append a review result to reviews or errors if checks are unavailable.
+
+        Returns True if the caller should continue to the next PR (the unavailable
+        case has already been recorded as an error).
+        """
+        if review_result.data.get("checks_unavailable"):
+            errors.append({"pr": review_result.data.get("pr"), "error": review_result.message})
+            return True
+        reviews.append(review_result.data)
+        return False
+
+    def _record_merge_or_error(
+        self,
+        merge_result: CommandResult,
+        errors: list[dict[str, Any]],
+        merges: list[dict[str, Any]],
+    ) -> None:
+        """Append a merge_ready result to merges or errors if checks are unavailable."""
+        if merge_result.data.get("checks_unavailable"):
+            errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
+        else:
+            merges.append(merge_result.data)
+
     def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
@@ -2923,13 +2971,16 @@ class OrchestratorApp:
                         and live_head_sha == reviewed_head_sha
                     )
                     if head_matches:
-                        merges.append(self.merge_ready(pr_number, merge=merge).data)
+                        merge_result = self.merge_ready(pr_number, merge=merge)
+                        self._record_merge_or_error(merge_result, errors, merges)
                     else:
                         review = self.review(pr_number)
-                        reviews.append(review.data)
+                        if self._record_review_or_error(review, errors, reviews):
+                            continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved":
-                            merges.append(self.merge_ready(pr_number, merge=merge).data)
+                            merge_result = self.merge_ready(pr_number, merge=merge)
+                            self._record_merge_or_error(merge_result, errors, merges)
                 else:
                     # Same-head packet skip: if we already have a review packet
                     # for this exact head SHA and no decision has been recorded
@@ -2956,13 +3007,16 @@ class OrchestratorApp:
                         skipped_reviews += 1
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved":
-                            merges.append(self.merge_ready(pr_number, merge=merge).data)
+                            merge_result = self.merge_ready(pr_number, merge=merge)
+                            self._record_merge_or_error(merge_result, errors, merges)
                     else:
                         review = self.review(pr_number)
-                        reviews.append(review.data)
+                        if self._record_review_or_error(review, errors, reviews):
+                            continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved":
-                            merges.append(self.merge_ready(pr_number, merge=merge).data)
+                            merge_result = self.merge_ready(pr_number, merge=merge)
+                            self._record_merge_or_error(merge_result, errors, merges)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors

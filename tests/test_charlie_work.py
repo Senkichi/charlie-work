@@ -22,6 +22,7 @@ from charlie_work.checks import summarize_checks
 from charlie_work.github import is_infrastructure_failure
 from charlie_work.config import (
     ClaudeCodeConfig,
+    ConfigError,
     CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
@@ -568,6 +569,18 @@ def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
     assert summary.ready is False
     assert summary.failed == ("test",)
     assert summary.infra_failed == ()
+
+
+def test_summarize_checks_none_returns_unavailable_required_checks() -> None:
+    """Command-level gh failure (checks=None) marks every required check unavailable."""
+    summary = summarize_checks(None, ("Tests",))
+
+    assert summary.ready is False
+    assert summary.unavailable == ("Tests",)
+    assert summary.passed == ()
+    assert summary.pending == ()
+    assert summary.failed == ()
+    assert summary.missing == ()
 
 
 def test_is_infrastructure_failure_zero_step_job() -> None:
@@ -1931,7 +1944,48 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
         ["pr", "checks", "123"], json_output=True, allow_failure=True
     )
 
-    assert result == [{"name": "Tests passed", "state": "FAILURE"}]
+    # allow_failure=True now returns a structured result with an ok flag.
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is False
+    assert result.value == [{"name": "Tests passed", "state": "FAILURE"}]
+
+
+def test_github_run_allow_failure_returns_result_for_success(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='{"number": 123}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).run(
+        ["pr", "view", "123"], json_output=True, allow_failure=True
+    )
+
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is True
+    assert result.value == {"number": 123}
+
+
+def test_github_run_allow_failure_text_value_on_success(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="diff text",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).run(["pr", "diff", "123"], allow_failure=True)
+
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is True
+    assert result.value == "diff text"
 
 
 def test_pr_checks_fields_excludes_database_id() -> None:
@@ -2012,6 +2066,135 @@ def test_pr_checks_injects_database_id_from_link(monkeypatch, tmp_path: Path) ->
 
     assert checks[0]["databaseId"] == 42
     assert checks[1]["databaseId"] is None
+
+
+def test_pr_checks_returns_empty_list_on_empty_success(monkeypatch, tmp_path: Path) -> None:
+    """Empty successful gh pr checks --json response returns [], not None."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    checks = github_module.GitHub(tmp_path).pr_checks(123)
+
+    assert checks == []
+
+
+def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Path) -> None:
+    """gh pr checks command-level failure (Unknown JSON field) returns None."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr='Unknown JSON field: "databaseId"\nAvailable fields:\n  name\n  state\n  bucket\n  link',
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    checks = github_module.GitHub(tmp_path).pr_checks(123)
+
+    assert checks is None
+
+
+def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
+    """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=2,
+            stdout='[{"name": "Tests", "state": "FAILURE", "bucket": "fail", "link": ""}]',
+            stderr="checks failed",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    checks = github_module.GitHub(tmp_path).pr_checks(123)
+
+    assert checks == [
+        {"name": "Tests", "state": "FAILURE", "bucket": "fail", "link": "", "databaseId": None}
+    ]
+
+
+def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_path: Path) -> None:
+    """Startup self-check accepts field lists gh supports."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(cmd)
+        # Return a generic "all these fields are available" stderr.
+        available_fields = [
+            "number",
+            "title",
+            "name",
+            "state",
+            "bucket",
+            "link",
+            "url",
+            "body",
+            "labels",
+            "headRefName",
+            "baseRefName",
+            "isCrossRepository",
+            "mergeable",
+            "headRefOid",
+            "databaseId",
+            "status",
+            "createdAt",
+            "headBranch",
+            "assignees",
+            "author",
+            "updatedAt",
+            "createdAt",
+            "description",
+            "color",
+            "comments",
+            "isDraft",
+            "reviewDecision",
+            "statusCheckRollup",
+            "mergeStateStatus",
+            "additions",
+            "deletions",
+        ]
+        stderr = (
+            'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
+            + "\n  ".join(available_fields)
+            + "\n"
+        )
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr=stderr,
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    github_module.GitHub(tmp_path).validate_field_lists()
+
+    # Should have probed all 9 field-list constants.
+    assert len(captured) == 9
+    assert all(c[0] == "gh" for c in captured)
+
+
+def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: Path) -> None:
+    """Startup self-check fails fast if a configured field is not supported by gh."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr='Unknown JSON field: "nonexistent"\nAvailable fields:\n  name\n  state\n  bucket',
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    with pytest.raises(ConfigError):
+        github_module.GitHub(tmp_path).validate_field_lists()
 
 
 def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
@@ -3199,9 +3382,79 @@ def test_merge_ready_update_open_prs_zero_matching_returns_empty_list(tmp_path: 
     assert ready.data["update_open_prs_results"] == []
 
 
+def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
+    """gh pr checks command failure must be reported as checks unavailable, not merge."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert result.data["checks_unavailable"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+
+
+def test_review_checks_unavailable_blocks_and_preserves_labels(tmp_path: Path) -> None:
+    """gh pr checks command failure must block review, leave labels unchanged, and surface checks_unavailable."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data["checks_unavailable"] is True
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+
+
+def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -> None:
+    """A PR whose review is blocked by checks unavailable must be recorded as an error, not reviewed or merged."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.ok is False
+    assert result.data["reviews"] == []
+    assert result.data["merges"] == []
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["pr"] == 456
+    assert "checks unavailable" in result.data["errors"][0]["error"].lower()
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, args, output="", stderr="Reference does not exist")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="Reference does not exist",
+        )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
