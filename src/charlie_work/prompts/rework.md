@@ -62,11 +62,16 @@ After your final commit:
    ```bash
    git push origin $branch_name
    ```
-3. Verify the PR head advanced:
+3. Verify the remote branch head matches your local HEAD:
+   ```bash
+   git ls-remote origin $branch_name
+   ```
+   The first column of the output must equal `git rev-parse HEAD`. If the SHAs do not match, retry the push until they do; do not report success.
+4. Verify the PR head advanced:
    ```bash
    gh pr view $pr_number --json headRefOid
    ```
    Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
-4. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
+5. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the rework complete.
