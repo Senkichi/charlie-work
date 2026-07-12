@@ -12,6 +12,7 @@ from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import runtime_paths
+from .supervise import try_acquire_supervisor_lock
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -354,6 +355,17 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+        elif event_type == "skipped":
+            entries.append(
+                AttentionEntry(
+                    issue_number=-1,
+                    adapter_kind=event["repo_key"],
+                    health="SKIPPED",
+                    previous_health=None,
+                    last_log_line=event.get("reason"),
+                    pid=None,
+                )
+            )
 
     return AttentionDigest(
         generated_at=utc_now(),
@@ -436,33 +448,56 @@ def fleet_loop(
             # both a per-repo and a fleet-level notification.
             config = replace(config, notify=replace(config.notify, enabled=False))
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, dry_run=dry_run)
-            app = OrchestratorApp(
-                repo_root,
-                paths,
-                config,
-                gh,
-                dry_run=dry_run,
-                fleet_dir_override=fleet_dir_override,
-            )
 
-            # Call the appropriate per-repo method
-            if work_only:
-                # Dispatch-only path (no review/merge)
-                result = app.dispatch(limit)
-            else:
-                # Full loop (intake -> dispatch -> review -> merge)
-                result = app.loop(limit, merge=merge)
+            # Non-blocking supervisor lock: fleet passes must be mutually exclusive
+            # with a supervised bash-rats loop on the same repo to avoid double-
+            # dispatching through the governor's read-then-launch window.
+            lock = try_acquire_supervisor_lock(paths.root / "supervisor.lock")
+            if lock is None:
+                per_repo_results[repo_key] = CommandResult(
+                    True,
+                    "supervisor lock held, skipped",
+                    {"skipped": True, "reason": "supervisor_lock_held"},
+                )
+                attention_events.append(
+                    {
+                        "repo_key": repo_key,
+                        "type": "skipped",
+                        "reason": "supervisor_lock_held",
+                    }
+                )
+                continue
 
-            per_repo_results[repo_key] = result
-            attention_events.extend(_extract_attention_events(repo_key, result))
+            try:
+                gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+                app = OrchestratorApp(
+                    repo_root,
+                    paths,
+                    config,
+                    gh,
+                    dry_run=dry_run,
+                    fleet_dir_override=fleet_dir_override,
+                )
 
-            # Count orphan sweep calls (B6a interaction)
-            # Each loop() call internally triggers orphan sweep via
-            # _sweep_orphan_processes_for_dead_sessions
-            # We count this as a metric for the follow-up optimization
-            if not work_only:
-                orphan_sweep_calls += 1
+                # Call the appropriate per-repo method
+                if work_only:
+                    # Dispatch-only path (no review/merge)
+                    result = app.dispatch(limit)
+                else:
+                    # Full loop (intake -> dispatch -> review -> merge)
+                    result = app.loop(limit, merge=merge)
+
+                per_repo_results[repo_key] = result
+                attention_events.extend(_extract_attention_events(repo_key, result))
+
+                # Count orphan sweep calls (B6a interaction)
+                # Each loop() call internally triggers orphan sweep via
+                # _sweep_orphan_processes_for_dead_sessions
+                # We count this as a metric for the follow-up optimization
+                if not work_only:
+                    orphan_sweep_calls += 1
+            finally:
+                lock.release()
 
         except (GitHubError, ConfigError) as exc:
             # Per-repo isolation: catch at iteration boundary and continue
