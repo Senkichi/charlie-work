@@ -17,11 +17,15 @@ import re
 import shutil
 import stat
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
+from .config import OrchestratorConfig
+from .post_mortem import real_activity_for_worker
+from .process_utils import is_pid_alive
 from .subprocess_runner import run_captured
 
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -32,6 +36,28 @@ class WorktreeUnsafeError(RuntimeError):
     local work (uncommitted modifications or local commits not on the remote
     branch). The launch shim should surface this as a distinct ``failure_kind``.
     """
+
+
+class LiveWorkerRedispatchError(RuntimeError):
+    """Raised when a recovery/redispatch path is about to destroy a worktree
+    but the recorded worker process is still alive (or sessions.db shows fresh
+    activity). Carries the probe result so the orchestrator can restore labels
+    and emit a diagnostic event.
+    """
+
+    def __init__(
+        self,
+        *,
+        issue_number: int | None,
+        pid: int | None,
+        process_start_time: float | None,
+        probe_result: str,
+    ) -> None:
+        self.issue_number = issue_number
+        self.pid = pid
+        self.process_start_time = process_start_time
+        self.probe_result = probe_result
+        super().__init__(probe_result)
 
 
 # Known porcelain flag keys that may appear as space-less lines (value=True)
@@ -473,6 +499,73 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     shutil.copytree(source, target)
 
 
+def _probe_recovery_liveness(
+    recovery: dict[str, Any],
+    worktree_path: Path,
+    config: OrchestratorConfig | None,
+    issue_number: int | None,
+) -> None:
+    """Abort recovery/redispatch if the recorded worker is still alive.
+
+    Checks the recorded PID with start-time fingerprint matching first. If the
+    PID is dead/wrong, corroborate with the Devin CLI's sessions.db for devin-
+    shell sessions — a recent ``message_nodes`` row for this worktree means the
+    real leaf session is still moving even if the wrapper PID is gone.
+
+    Raises ``LiveWorkerRedispatchError`` when a live signal is detected.
+    """
+    resolved_config = config or OrchestratorConfig()
+
+    worker_pid = recovery.get("worker_pid")
+    worker_process_start_time = recovery.get("worker_process_start_time")
+    if worker_pid is None:
+        worker_pid = recovery.get("last_known_worker_pid")
+        worker_process_start_time = recovery.get("last_known_worker_process_start_time")
+
+    try:
+        worker_pid = int(worker_pid) if worker_pid is not None else None
+    except (TypeError, ValueError):
+        worker_pid = None
+
+    if worker_pid is not None and is_pid_alive(worker_pid, worker_process_start_time):
+        raise LiveWorkerRedispatchError(
+            issue_number=issue_number,
+            pid=worker_pid,
+            process_start_time=worker_process_start_time,
+            probe_result="pid_alive",
+        )
+
+    # For devin-shell sessions, sessions.db is the real source of truth even
+    # when the wrapper PID is gone or has been recycled.
+    if resolved_config.devin.adapter == "devin-shell":
+        started_at = recovery.get("started_at") or recovery.get("dispatched_at") or ""
+        pm_config = resolved_config.post_mortem
+        now = datetime.now(UTC)
+        try:
+            probe = real_activity_for_worker(
+                pm_config,
+                str(worktree_path),
+                started_at,
+                worker_pid,
+                now,
+            )
+        except Exception:
+            # The probe is best-effort; never let it crash the recovery path.
+            return
+
+        stall_minutes = resolved_config.watchdog.stall_minutes or 20
+        stall_seconds = stall_minutes * 60
+        for source in probe.sources:
+            if source.name == "sessions.db" and source.staleness_seconds is not None:
+                if source.staleness_seconds <= stall_seconds:
+                    raise LiveWorkerRedispatchError(
+                        issue_number=issue_number,
+                        pid=worker_pid,
+                        process_start_time=worker_process_start_time,
+                        probe_result="sessions_db_activity",
+                    )
+
+
 def create_worktree(
     repo_root: Path,
     branch: str,
@@ -484,6 +577,7 @@ def create_worktree(
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
     issue_number: int | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -590,6 +684,12 @@ def create_worktree(
                 f"Recovery record branch_name {recovery_branch!r} does not match "
                 f"requested branch {branch!r}"
             )
+
+        # Issue #282: verify the prior worker is actually dead before any
+        # destructive reset. If the recorded PID (or sessions.db real activity)
+        # says the worker is still alive, abort the redispatch and let the
+        # orchestrator restore the in-progress label.
+        _probe_recovery_liveness(recovery, worktree_path, config, issue_number)
 
         # Issue #110: Check if the branch exists on origin before attempting fetch
         # If the branch doesn't exist on origin (killed before first push), fall through

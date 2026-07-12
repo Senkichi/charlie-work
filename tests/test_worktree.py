@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
+from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeInfo,
     WorktreeState,
     WorktreeUnsafeError,
+    LiveWorkerRedispatchError,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -21,6 +26,7 @@ from charlie_work.worktree import (
     remove_worktree,
     _is_git_tracked,
     _materialize_directory,
+    _slugify,
 )
 
 
@@ -2568,3 +2574,101 @@ def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     assert "agent/issue-4" in remote_refs.stdout
 
     remove_worktree(repo, info.path, branch="agent/issue-4")
+
+
+def test_recovery_aborts_when_worker_pid_alive(tmp_path: Path) -> None:
+    """Issue #282: recovery must not remove a worktree if the recorded worker PID is still alive."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-live-worker"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+
+    # Spawn a real long-running child process so we have a live PID and a valid start time.
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        start_time = get_process_start_time(process.pid)
+        assert start_time is not None
+
+        recovery_record = {
+            "branch_name": branch_name,
+            "status": "dispatched",
+            "worker_pid": process.pid,
+            "worker_process_start_time": start_time,
+        }
+
+        with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+            create_worktree(repo_root, branch_name, base_ref="HEAD", recovery=recovery_record)
+
+        assert exc_info.value.probe_result == "pid_alive"
+        assert exc_info.value.pid == process.pid
+        # The worktree and branch must survive the aborted redispatch.
+        assert info1.path.exists()
+        assert branch_name in _git(repo_root, "branch", "--list").stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
+    """Issue #282: recovery must not remove a worktree if sessions.db shows fresh activity."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-db-activity"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # Build a fake Devin sessions.db with a recent session/message for this worktree.
+    db_path = tmp_path / "sessions.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.execute(
+        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT)"
+    )
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
+        ("session-1", str(worktree_path), now),
+    )
+    conn.execute(
+        "INSERT INTO message_nodes (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        ("session-1", "tool", "tool result", now),
+    )
+    conn.commit()
+    conn.close()
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    # Use a dead PID (no such process) so the sessions.db probe is the deciding signal.
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "sessions_db_activity"
+    # No worktree should have been created yet and the branch should not exist.
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout

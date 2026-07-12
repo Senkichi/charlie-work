@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .config import OrchestratorConfig
 from .subprocess_runner import run_captured
 
 
@@ -66,6 +67,8 @@ class AdapterSettings:
     # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
     # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
     tee_stream_json: bool = False
+    # Full orchestrator config passed to worktree creation/recovery for liveness probes.
+    config: OrchestratorConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ class SessionDispatchResult:
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     pid: int | None = None  # Worker process PID for state-based liveness detection
     process_start_time: float | None = None  # Process creation time for PID recycling protection
+    failure_kind: str | None = None  # stable machine-readable classification of a failure
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +105,7 @@ class SessionDispatchResult:
             "reclaimed": self.reclaimed,
             "pid": self.pid,
             "process_start_time": self.process_start_time,
+            "failure_kind": self.failure_kind,
         }
 
 
@@ -267,6 +272,7 @@ def _run_devin_shell_adapter(
             rework=request.rework,
             recovery=request.recovery,
             base_ref=settings.base_ref,
+            config=settings.config,
         )
         # Non-blocking launch: there is no returncode/stdout to report — liveness
         # and output live in the sidecar JSON and per-session log.
@@ -280,6 +286,7 @@ def _run_devin_shell_adapter(
             reclaimed=record.reclaimed,
             pid=record.pid,
             process_start_time=record.process_start_time,
+            failure_kind=record.failure_kind,
         )
     except Exception as exc:
         # Catch any unexpected exception and return as a failure result
@@ -322,6 +329,7 @@ def _run_claude_code_adapter(
         rework=request.rework,
         recovery=request.recovery,
         base_ref=settings.base_ref,
+        config=settings.config,
         **kwargs,
     )
     ok = record.error is None and record.pid is not None
@@ -334,6 +342,7 @@ def _run_claude_code_adapter(
         reclaimed=record.reclaimed,
         pid=record.pid,
         process_start_time=record.process_start_time,
+        failure_kind=record.failure_kind,
     )
 
 
@@ -412,6 +421,7 @@ def _result(
     reclaimed: str | None = None,
     pid: int | None = None,
     process_start_time: float | None = None,
+    failure_kind: str | None = None,
 ) -> SessionDispatchResult:
     return SessionDispatchResult(
         issue_number=request.issue_number,
@@ -428,6 +438,7 @@ def _result(
         reclaimed=reclaimed,
         pid=pid,
         process_start_time=process_start_time,
+        failure_kind=failure_kind,
     )
 
 

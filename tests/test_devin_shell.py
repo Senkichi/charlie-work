@@ -86,6 +86,7 @@ def _install_fake_create_worktree(
         rework=False,
         recovery=None,
         issue_number=None,
+        config=None,
     ):
         if calls is not None:
             calls.append(
@@ -98,6 +99,7 @@ def _install_fake_create_worktree(
                     "rework": rework,
                     "recovery": recovery,
                     "issue_number": issue_number,
+                    "config": config,
                 }
             )
         if with_venv:

@@ -5,7 +5,6 @@ import os
 import re
 import signal
 import subprocess
-import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,7 +57,7 @@ from .state import (
     state_lock,
     utc_now,
 )
-from .process_utils import kill_process_tree, sweep_orphan_processes
+from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth
 
 
@@ -464,6 +463,7 @@ def _detect_and_handle_stalled_sessions(
                     {
                         "issue_number": w.issue_number,
                         "pid": w.pid,
+                        "process_start_time": w.process_start_time,
                         "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
@@ -496,31 +496,11 @@ def _worker_pid_alive(entry: dict[str, Any]) -> bool:
         True if the worker PID is alive and the start time matches (if available),
         False otherwise.
     """
-    from .devin_shell import _get_process_start_time, _win_is_alive, _posix_is_alive
-
     worker_pid = entry.get("worker_pid")
     if worker_pid is None:
         return False
 
-    # Check if the worker PID is still alive
-    pid_alive = False
-    if sys.platform == "win32":
-        pid_alive = _win_is_alive(worker_pid)
-    else:
-        pid_alive = _posix_is_alive(worker_pid)
-
-    # Verify process identity via start time if available
-    if pid_alive:
-        process_start_time = entry.get("worker_process_start_time")
-        if process_start_time is not None:
-            current_start_time = _get_process_start_time(worker_pid)
-            if current_start_time is None:
-                pid_alive = False
-            elif abs(current_start_time - process_start_time) > 1.0:
-                # Start time mismatch - PID has been recycled
-                pid_alive = False
-
-    return pid_alive
+    return is_pid_alive(worker_pid, entry.get("worker_process_start_time"))
 
 
 def _append_sweep_events(
@@ -571,7 +551,8 @@ def _detect_and_handle_orphaned_workers(
     - If the PID is dead, check the linked PR's last review decision
     - If last decision was "request_changes" and head unchanged, reset to "rework_requested"
     - Otherwise, surface as drift for human triage
-    - Clear worker_pid from state.json after handling
+    - Do NOT clear worker_pid from state.json after handling (issue #282: the
+      recovery path needs the fingerprint to verify the worktree is safe to reset).
     """
     if not config.watchdog.enabled:
         return
@@ -617,9 +598,10 @@ def _detect_and_handle_orphaned_workers(
             if entry.get("status") != "dispatched":
                 continue
 
-            # The worker is dead; clear its PID before deciding recovery.
-            entry.pop("worker_pid", None)
-            entry.pop("worker_process_start_time", None)
+            # Issue #282: do not clear the liveness fingerprint here. The worker
+            # is dead (``_worker_pid_alive`` returned False), but the PID record
+            # may still be needed by the recovery path to decide whether the
+            # worktree is safe to reset.
 
             pr_data = pr_by_issue.get(issue_number)
 
@@ -1004,9 +986,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                         entry["escalation_reason"] = (
                             "worker_blocked" if worker_blocked else "redispatch_cap_exceeded"
                         )
-                        # Clear worker PID when session fails (worker is dead)
-                        entry.pop("worker_pid", None)
-                        entry.pop("worker_process_start_time", None)
+                        # Issue #282: preserve the liveness fingerprint for the
+                        # recovery path. The PID is already verified dead by the
+                        # time we reach this branch, but clearing it removes the
+                        # only signal the recovery probe can cross-check.
                         state["issues"][str(w.issue_number)] = entry
                         save_state(state_file, state)
                         transition(gh, config.labels, w.issue_number, "redispatch_escalated")
@@ -1035,10 +1018,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # Record the relabel event
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    # Clear worker PID when session fails (worker is dead)
-                    if str(w.issue_number) in state.get("issues", {}):
-                        state["issues"][str(w.issue_number)].pop("worker_pid", None)
-                        state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
+                    # Issue #282: preserve the liveness fingerprint so the
+                    # recovery path can verify the worker is dead before removing
+                    # the worktree, even after the session is classified as dead.
                     state = append_event(
                         state,
                         "session_failed_relabeled",
@@ -1093,9 +1075,8 @@ def _attempt_salvage(
 
     with state_lock(state_file):
         state = load_state(state_file)
-        if str(issue_number) in state.get("issues", {}):
-            state["issues"][str(issue_number)].pop("worker_pid", None)
-            state["issues"][str(issue_number)].pop("worker_process_start_time", None)
+        # Issue #282: preserve the liveness fingerprint so the recovery path
+        # can verify the worker is dead before the worktree is reclaimed.
         state = append_event(
             state,
             "session_salvaged",
@@ -1317,6 +1298,7 @@ class OrchestratorApp:
             base_ref=self.config.dispatch.base_ref,
             tee_stream_json=claude.tee_stream_json,
             launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
+            config=self.config,
         )
 
     def _apply_concurrency_governor(
@@ -1930,8 +1912,15 @@ class OrchestratorApp:
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
+        live_worker_issue_numbers = {
+            result.issue_number
+            for result in dispatch_results
+            if not result.ok and result.failure_kind == "live_worker_redispatch_averted"
+        }
         failed_issue_numbers = {
-            result.issue_number for result in dispatch_results if not result.ok
+            result.issue_number
+            for result in dispatch_results
+            if not result.ok and result.issue_number not in live_worker_issue_numbers
         }
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         manual = self.config.devin.adapter == "manual"
@@ -1941,6 +1930,17 @@ class OrchestratorApp:
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
+                is_live_worker = request.issue_number in live_worker_issue_numbers
+                if ok:
+                    status = "manifest_written" if manual else "dispatched"
+                    dispatched_at = utc_now()
+                elif is_live_worker:
+                    status = "dispatched"
+                    prev_entry = previous_entries.get(request.issue_number, {})
+                    dispatched_at = prev_entry.get("dispatched_at") or utc_now()
+                else:
+                    status = "dispatch_failed"
+                    dispatched_at = None
                 entry = {
                     **state["issues"].get(str(request.issue_number), {}),
                     "number": request.issue_number,
@@ -1948,16 +1948,14 @@ class OrchestratorApp:
                     "url": full_issue.get("url"),
                     "branch_name": request.branch_name,
                     "prompt_path": str(request.prompt_path),
-                    "status": ("manifest_written" if manual else "dispatched")
-                    if ok
-                    else "dispatch_failed",
-                    "dispatched_at": utc_now() if ok else None,
+                    "status": status,
+                    "dispatched_at": dispatched_at,
                 }
                 # Clear the claim timestamp on successful upgrade
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
-                # A successful dispatch supersedes any previous orphan flag.
-                if ok:
+                # A successful or live-worker recovery supersedes any previous orphan flag.
+                if ok or is_live_worker:
                     entry.pop("orphan_flagged_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
@@ -1976,7 +1974,7 @@ class OrchestratorApp:
                 # transition is isolated per-issue so one failure never aborts the
                 # rest of the batch (orphaning already-launched workers).
                 save_state(self.paths.state_file, state)
-                if ok:
+                if ok or is_live_worker:
                     target = "queued" if manual else "dispatched"
                     result = transition(
                         self.gh,
@@ -1993,11 +1991,29 @@ class OrchestratorApp:
                         }
                         label_errors.append(request.issue_number)
                         save_state(self.paths.state_file, state)
+                    if is_live_worker:
+                        result = next(
+                            (r for r in dispatch_results if r.issue_number == request.issue_number),
+                            None,
+                        )
+                        state = append_event(
+                            state,
+                            "live_worker_redispatch_averted",
+                            {
+                                "issue_number": request.issue_number,
+                                "branch_name": request.branch_name,
+                                "pid": result.pid if result else None,
+                                "process_start_time": result.process_start_time if result else None,
+                                "probe_result": result.error if result else None,
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
             state = append_event(
                 state,
                 "dispatch",
                 {
                     "issue_numbers": sorted(successful_issue_numbers),
+                    "live_worker_issue_numbers": sorted(live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
@@ -2009,6 +2025,8 @@ class OrchestratorApp:
         message = "dispatch complete"
         if failed_issue_numbers:
             message = "dispatch completed with failures"
+        elif live_worker_issue_numbers:
+            message = "dispatch completed with live worker redispatch averted"
         if skipped_issue_numbers:
             message += f" (skipped non-dispatchable: {skipped_issue_numbers})"
         if label_errors:
@@ -2017,6 +2035,7 @@ class OrchestratorApp:
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "live_worker_count": len(live_worker_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),

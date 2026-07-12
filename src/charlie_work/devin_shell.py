@@ -37,7 +37,13 @@ from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
-from .worktree import WorktreeInfo, WorktreeUnsafeError, create_worktree, remove_worktree
+from .worktree import (
+    LiveWorkerRedispatchError,
+    WorktreeInfo,
+    WorktreeUnsafeError,
+    create_worktree,
+    remove_worktree,
+)
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
@@ -297,6 +303,7 @@ def launch_devin_session(
     rework: bool = False,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
+    config: OrchestratorConfig | None = None,
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -336,20 +343,27 @@ def launch_devin_session(
             recovery=recovery,
             base_ref=base_ref,
             issue_number=issue_number,
+            config=config,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-        failure_kind = "worktree_unsafe" if isinstance(exc, WorktreeUnsafeError) else None
+        if isinstance(exc, WorktreeUnsafeError):
+            failure_kind = "worktree_unsafe"
+        elif isinstance(exc, LiveWorkerRedispatchError):
+            failure_kind = "live_worker_redispatch_averted"
+        else:
+            failure_kind = None
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
             worktree_path="",
             prompt_path=str(prompt_path),
             command=command_template,
-            pid=None,
+            pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
             started_at=utc_now(),
             log_path=str(log_path),
-            error=f"worktree creation failed: {exc}",
+            error=str(exc) if isinstance(exc, LiveWorkerRedispatchError) else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
+            process_start_time=exc.process_start_time if isinstance(exc, LiveWorkerRedispatchError) else None,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record
