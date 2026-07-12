@@ -66,6 +66,12 @@ devin:
   # will include "--model <value>" when set. Run `charlie doctor` to verify the
   # effective model before dispatching.
   worker_model: ""
+  # Disabled by default (issue #112): a devin-shell worker has a full shell and
+  # can run uv sync, which would rewrite a shared venv's editable-install .pth
+  # to point at the worktree, causing other worktrees to silently import that
+  # worktree's code. Set to a relative path to opt back into the shared-venv
+  # junction; set to null (or omit) to keep each worktree isolated.
+  venv_source: null
   # Launch command override; empty uses the built-in default (shown below).
   # Placeholders: {prompt_path} {issue_number} {branch} {model_args}. A list runs without a
   # shell. --permission-mode dangerous is required for headless workers; without

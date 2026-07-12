@@ -340,6 +340,27 @@ def _parse_session_created_at(value: Any) -> datetime | None:
     return None
 
 
+def _normalize_working_directory(path: str) -> tuple[str, ...]:
+    """Return a path representation that is insensitive to case, separator
+    style, trailing separators, and leading drive-letter punctuation.
+
+    Two paths that differ only by these formatting details (e.g.
+    ``C:\\repo\\.var\\worktrees\\issue-42``,
+    ``C:/repo/.var/worktrees/issue-42``,
+    ``/c/repo/.var/worktrees/issue-42``,
+    or ``c:/repo/.var/worktrees/issue-42/``) collapse to the same tuple of
+    segments. This avoids assuming a single canonical string representation
+    for the ``working_directory`` value written by the Devin CLI.
+    """
+    if not isinstance(path, str):
+        path = str(path)
+    lowered = path.lower().replace("\\", "/")
+    parts = [part for part in lowered.split("/") if part]
+    if parts and len(parts[0]) == 2 and parts[0][1] == ":" and parts[0][0].isalpha():
+        parts[0] = parts[0][0]
+    return tuple(parts)
+
+
 def _find_matching_session(
     conn: sqlite3.Connection,
     working_directory: str,
@@ -358,18 +379,49 @@ def _find_matching_session(
     match. Returns (session_id, error). Multiple matches within the window
     pick the most recent by parsed created_at (a stale prior session in the
     same directory is possible if a worktree was reused across attempts).
+
+    If the exact SQL match for ``working_directory`` returns no rows, this
+    falls back to a tolerant comparison using ``_normalize_working_directory``
+    before giving up, and when it does give up it surfaces a sample of the
+    distinct ``working_directory`` values actually stored in the database for
+    diagnostics.
     """
     try:
         cursor = conn.execute(
             "SELECT id, created_at FROM sessions WHERE working_directory = ?",
             (working_directory,),
         )
-        rows = cursor.fetchall()
+        exact_rows = cursor.fetchall()
     except sqlite3.Error as exc:
         return None, f"sessions table query failed (schema drift?): {exc}"
 
-    if not rows:
-        return None, "no session found matching working_directory"
+    if exact_rows:
+        rows = exact_rows
+    else:
+        # No byte-for-byte match. Try a tolerant comparison with the whole
+        # table (we are already in the rare miss path) before declaring defeat.
+        try:
+            cursor = conn.execute("SELECT id, working_directory, created_at FROM sessions")
+            all_rows = cursor.fetchall()
+        except sqlite3.Error as exc:
+            return None, f"sessions table query failed (schema drift?): {exc}"
+
+        target_norm = _normalize_working_directory(working_directory)
+        norm_rows = [
+            (row[0], row[2])
+            for row in all_rows
+            if _normalize_working_directory(row[1]) == target_norm
+        ]
+        if norm_rows:
+            rows = norm_rows
+        else:
+            distinct = sorted({str(row[1]) for row in all_rows if row[1] is not None})[:10]
+            if distinct:
+                return (
+                    None,
+                    f"no session found matching working_directory; sample distinct working_directory values in sessions.db: {distinct}",
+                )
+            return None, "no session found matching working_directory"
 
     candidates: list[tuple[datetime, str]] = []
     for row in rows:

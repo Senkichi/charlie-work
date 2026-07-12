@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work import devin_shell
-from charlie_work.config import OrchestratorConfig, RuntimeConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.devin_shell import (
     DEFAULT_COMMAND_TEMPLATE,
     SessionRecord,
@@ -24,7 +24,7 @@ from charlie_work.devin_shell import (
     _write_json,
 )
 from charlie_work.env_sanitize import sanitize_env
-from charlie_work.worktree import WorktreeInfo
+from charlie_work.worktree import WorktreeInfo, create_worktree, is_junction, remove_worktree
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
 # sys.executable to dodge PATH entirely (mirrors the sys.executable fake-binary
@@ -107,6 +107,32 @@ def _install_fake_create_worktree(
         return _fake_worktree(tmp_path, branch)
 
     monkeypatch.setattr(devin_shell, "create_worktree", fake_create_worktree)
+
+
+def _init_repo(repo_root: Path) -> None:
+    """Create a minimal git repo at ``repo_root`` for worktree tests."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"], cwd=repo_root, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"], cwd=repo_root, check=True, capture_output=True
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"], cwd=repo_root, check=True, capture_output=True
+    )
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1784,6 +1810,141 @@ def test_launch_devin_session_passes_venv_source_to_create_worktree(
 
     assert len(worktree_calls) == 1
     assert worktree_calls[0]["venv_source"] == venv_source
+
+
+def test_devin_config_default_venv_source_is_none() -> None:
+    """Issue #112: devin-shell must default to isolated per-worktree venvs."""
+    assert DevinConfig().venv_source is None
+    assert OrchestratorConfig().devin.venv_source is None
+
+
+def test_devin_shell_reuse_unlinks_shared_venv_junction_and_isolates_imports(
+    tmp_path: Path,
+) -> None:
+    """Issue #112: devin-shell reuse with venv_source=None must unlink a pre-existing
+    .venv junction so a raw `python -c "import <pkg>"` resolves inside the worktree's
+    own isolated venv, not the shared venv's stale .pth target.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    other_worktree = tmp_path / "other-worktree"
+    other_worktree.mkdir()
+    other_src = other_worktree / "src"
+    other_src.mkdir(parents=True)
+    (other_src / "job_finder.py").write_text("# other\n", encoding="utf-8")
+
+    # Pre-seed the shared venv with an editable .pth pointing at another worktree,
+    # simulating the last `uv sync` having been run from worktree A.
+    pth = shared_venv / "Lib" / "site-packages" / "_editable_impl_job_finder.pth"
+    pth.parent.mkdir(parents=True)
+    pth.write_text(str(other_src) + "\n", encoding="utf-8")
+
+    branch_name = "agent/issue-112-isolated"
+
+    # Pre-PR default: create the worktree with a shared-venv junction.
+    info1 = create_worktree(
+        repo_root,
+        branch_name,
+        base_ref="HEAD",
+        venv_source=shared_venv,
+    )
+    assert info1.venv_junction == info1.path / ".venv"
+    assert is_junction(info1.path / ".venv")
+
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    # Fake devin CLI: create a local venv in the worktree, install an editable .pth
+    # pointing at the worktree's own src, and run `python -c "import job_finder"`.
+    probe_script = tmp_path / "probe_devin.py"
+    probe_script_content = "\n".join(
+        [
+            "import os",
+            "import stat",
+            "import subprocess",
+            "import sys",
+            "from pathlib import Path",
+            "",
+            "worktree = Path(os.getcwd())",
+            "venv = worktree / '.venv'",
+            "",
+            "# If the junction was not unlinked, the venv would be created in the shared",
+            "# venv target and poison every other worktree. Fail loudly in that case.",
+            "if os.name == 'nt':",
+            "    if venv.exists() and (venv.stat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):",
+            "        raise SystemExit('BUG: .venv is still a junction')",
+            "else:",
+            "    if venv.is_symlink():",
+            "        raise SystemExit('BUG: .venv is still a symlink')",
+            "",
+            "subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(venv)], check=True)",
+            "",
+            "py_version = f'{sys.version_info.major}.{sys.version_info.minor}'",
+            "if os.name == 'nt':",
+            "    site_packages = venv / 'Lib/site-packages'",
+            "else:",
+            "    site_packages = venv / f'lib/python{py_version}/site-packages'",
+            "site_packages.mkdir(parents=True, exist_ok=True)",
+            "",
+            "src = worktree / 'src'",
+            "src.mkdir(exist_ok=True)",
+            "(src / 'job_finder.py').write_text('__file__ = __file__\\n', encoding='utf-8')",
+            "pth = site_packages / '_editable_impl_job_finder.pth'",
+            "pth.write_text(str(src) + '\\n', encoding='utf-8')",
+            "",
+            "py = venv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')",
+            "cmd = 'import job_finder, inspect; print(inspect.getfile(job_finder))'",
+            "result = subprocess.run([str(py), '-c', cmd], capture_output=True, text=True)",
+            "sys.stdout.write(result.stdout)",
+            "sys.stderr.write(result.stderr)",
+            "raise SystemExit(result.returncode)",
+        ]
+    )
+    probe_script.write_text(probe_script_content, encoding="utf-8")
+
+    # Re-dispatch with the new default (venv_source=None) via the devin-shell code path.
+    record = launch_devin_session(
+        112,
+        branch_name,
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        venv_source=None,
+        command_template=(sys.executable, str(probe_script)),
+        rework=True,
+    )
+
+    assert record.error is None, record.error
+    assert record.pid is not None
+    assert record.worktree_path == str(info1.path)
+
+    # Wait for the probe to finish and assert the import resolved inside the worktree.
+    deadline = time.time() + 30
+    log_path = Path(record.log_path)
+    while time.time() < deadline:
+        log_text = log_path.read_text(encoding="utf-8")
+        if log_text.strip() and not is_session_alive(record):
+            break
+        time.sleep(0.05)
+
+    log_text = log_path.read_text(encoding="utf-8").strip()
+    assert log_text, "probe produced no output"
+    assert not log_text.startswith(str(other_src)), (
+        f"import resolved from the shared-venv target: {log_text!r}"
+    )
+    assert Path(log_text).resolve().is_relative_to(Path(info1.path).resolve()), (
+        f"import did not resolve inside the worktree: {log_text!r}"
+    )
+
+    # The shared venv's stale .pth must remain untouched and still point to A.
+    assert pth.read_text(encoding="utf-8").strip() == str(other_src)
+
+    # Cleanup
+    remove_worktree(repo_root, info1.path, force=True, branch=branch_name)
 
 
 def test_launch_devin_session_injects_worker_env(
