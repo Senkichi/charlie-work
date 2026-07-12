@@ -3558,12 +3558,12 @@ class OrchestratorApp:
                 errors.append({"pr": pr_number, "error": str(exc)})
         warnings: list[str] = []
         merge_alert_transitions: dict[int, dict[str, Any]] = {}
-        for merge in merges:
-            warning = merge.get("merge_attempt_warning")
+        for merge_result in merges:
+            warning = merge_result.get("merge_attempt_warning")
             if warning:
                 warnings.append(warning)
-            if merge.get("merge_attempt_alarm") and merge.get("issue") is not None:
-                issue = merge["issue"]
+            if merge_result.get("merge_attempt_alarm") and merge_result.get("issue") is not None:
+                issue = merge_result["issue"]
                 merge_alert_transitions[issue] = {
                     "adapter_kind": "unknown",
                     "health": "MERGE_BLOCKED",
