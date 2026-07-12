@@ -58,7 +58,12 @@ from charlie_work.state import (
     set_throttled_until,
     state_lock,
 )
-from charlie_work.workflow import ConcurrencyGovernorResult, OrchestratorApp, slugify
+from charlie_work.workflow import (
+    CommandResult,
+    ConcurrencyGovernorResult,
+    OrchestratorApp,
+    slugify,
+)
 from charlie_work.worktree import create_worktree
 from charlie_work.devin_shell import SessionRecord
 
@@ -14422,7 +14427,9 @@ def test_dispatch_rework_reaps_unconditionally_when_max_concurrent_zero(tmp_path
     import charlie_work.workflow as workflow_module
     import inspect
 
-    dispatch_rework_source = inspect.getsource(workflow_module.OrchestratorApp.dispatch_rework)
+    dispatch_rework_source = inspect.getsource(
+        workflow_module.OrchestratorApp._dispatch_rework_impl
+    )
 
     # Verify the unconditional call exists
     assert "_detect_and_handle_stalled_sessions" in dispatch_rework_source
@@ -15838,3 +15845,127 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
     assert len(events) == 1
     assert events[0]["payload"].get("salvage_failed") is True
+
+
+def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) -> None:
+    """Independent dispatch() calls across two repos sharing a fleet cap cannot
+    over-dispatch. Without the fleet lock, both repos could read a stale live
+    count of 0 and dispatch up to the cap each, oversubscribing the fleet.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.devin_shell import _sidecar_path
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    shared_fleet_dir = str(fleet_dir)
+
+    # Fake a non-blocking devin-shell launch that writes a sidecar so the
+    # fleet-wide live count is visible to subsequent dispatchers.
+    def fake_run_devin_shell(
+        repo_root: Path,
+        request: Any,
+        sessions_dir: Path,
+        settings: Any,
+    ) -> SessionDispatchResult:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        record = SessionRecord(
+            issue_number=request.issue_number,
+            branch=request.branch_name,
+            worktree_path=str(repo_root),
+            prompt_path=str(request.prompt_path),
+            command=("devin",),
+            pid=9999,
+            started_at="2024-01-01T00:00:00Z",
+            log_path=str(sessions_dir / f"issue-{request.issue_number}.log"),
+            error=None,
+            process_start_time=1.0,
+        )
+        _sidecar_path(sessions_dir, request.issue_number).write_text(
+            json.dumps(record.to_dict()), encoding="utf-8"
+        )
+        return SessionDispatchResult(
+            issue_number=request.issue_number,
+            issue_title=request.issue_title,
+            prompt_path=str(request.prompt_path),
+            branch_name=request.branch_name,
+            adapter="devin-shell",
+            ok=True,
+            command=list(record.command),
+            pid=record.pid,
+            process_start_time=record.process_start_time,
+        )
+
+    monkeypatch.setattr("charlie_work.adapters._run_devin_shell_adapter", fake_run_devin_shell)
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+
+    # Build two independent repos, each sharing the same fleet directory.
+    apps: list[OrchestratorApp] = []
+    repo_entries: dict[str, dict[str, str]] = {}
+    for repo_name in ("owner/repo-a", "owner/repo-b"):
+        repo_root = tmp_path / repo_name.replace("/", "--")
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+        paths = runtime_paths(repo_root, ".var/charlie-work")
+        repo_entries[repo_name] = {
+            "repo_root": str(repo_root),
+            "state_dir": str(paths.root),
+        }
+
+        config = OrchestratorConfig(
+            devin=DevinConfig(adapter="devin-shell"),
+            dispatch=DispatchConfig(
+                default_limit=3,
+                launch_stagger_seconds=0,
+            ),
+            fleet=FleetConfig(global_max_concurrent_sessions=2),
+        )
+        fake_gh = FakeGitHub()
+        fake_gh.prs = []
+        fake_gh.issues = [
+            {
+                "number": 100 + i,
+                "title": f"Issue {i}",
+                "url": f"https://example.test/issues/{100 + i}",
+                "body": "",
+                "labels": [{"name": "automated-ready"}],
+                "state": "OPEN",
+            }
+            for i in range(3)
+        ]
+        app = OrchestratorApp(
+            repo_root,
+            paths,
+            config,
+            fake_gh,
+            fleet_dir_override=shared_fleet_dir,
+        )
+        apps.append(app)
+
+    # Seed the fleet registry so both repos are visible to count_fleet_live_sessions.
+    save_state(fleet_dir / "fleet.json", {"repos": repo_entries})
+
+    # Launch both dispatch() calls concurrently from the same barrier.
+    barrier = threading.Barrier(2)
+    results: list[CommandResult] = []
+
+    def worker(app: OrchestratorApp) -> None:
+        barrier.wait(timeout=5)
+        results.append(app.dispatch())
+
+    threads = [threading.Thread(target=worker, args=(app,)) for app in apps]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    total_dispatched = sum(r.data.get("selected_count", 0) for r in results)
+    # With a fleet cap of 2 and 3 ready issues in each repo, the combined
+    # dispatch across both repos must never exceed the fleet-wide cap.
+    assert total_dispatched <= 2, (
+        f"fleet-wide dispatch over-subscribed: {total_dispatched} workers launched"
+    )
+    # Exactly one path should have succeeded; the other either clamped to 0 or
+    # deferred because the fleet lock was held.
+    assert any(r.data.get("fleet_live_session_count") is not None for r in results), (
+        "fleet live count should be reported in dispatch results"
+    )

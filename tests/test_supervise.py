@@ -241,6 +241,21 @@ def test_should_exit_provider_throttled_rework_returns_false() -> None:
     assert should_exit(result, live_count=0) is False
 
 
+def test_should_exit_fleet_lock_held_returns_false() -> None:
+    """Dispatch deferred because another repo holds the fleet lock is not drained."""
+    result = CommandResult(
+        True,
+        "dispatch deferred: fleet lock held",
+        {
+            "dispatch": {"selected_count": 0, "deferred_reason": "fleet_lock_held"},
+            "dispatch_rework": {"selected_count": 0},
+            "merges": [],
+            "open_tracked_prs": 0,
+        },
+    )
+    assert should_exit(result, live_count=0) is False
+
+
 # ---------------------------------------------------------------------------
 # has_delta / take_snapshot tests
 # ---------------------------------------------------------------------------
@@ -868,3 +883,33 @@ def test_run_supervised_lock_released_after_run(tmp_path: Path) -> None:
     lock = try_acquire_supervisor_lock(lock_path)
     assert lock is not None, "lock should be free after run_supervised exits"
     lock.release()
+
+
+def test_run_supervised_summary_uses_fleet_live_count(tmp_path: Path, capfd: Any) -> None:
+    """The 'live ~N' summary line uses the dispatch-scoped fleet-wide count, not the local snapshot."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "dispatch": {
+                "selected_count": 0,
+                "fleet_live_session_count": 2,
+                "live_session_count": 1,
+            },
+            "dispatch_rework": {"selected_count": 0},
+            "merges": [],
+            "reviews": [],
+            "errors": [],
+            "open_tracked_prs": 0,
+            "skipped_reviews": 0,
+        },
+    )
+    app = FakeApp(tmp_path, [result])
+    fc = FakeClock(auto_advance=0.0)
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+
+    out = capfd.readouterr().out
+    assert "live ~2" in out, "summary should report fleet-wide live count"
+    assert "live ~1" not in out, (
+        "summary should not report local snapshot count when fleet count is available"
+    )

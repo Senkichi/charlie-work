@@ -117,9 +117,10 @@ def should_exit(pass_result: CommandResult, live_count: int) -> bool:
       drained-ness; the PR it failed on is still open, which the
       ``open_tracked_prs`` check below already covers;
     - any open tracked PRs await operator verdicts (verdict → merge on next pass);
-    - dispatch was deferred due to provider throttling — queued issues are still
-      waiting to be dispatched once the cooldown clears, so "nothing happened
-      this pass" must not be read as "drained".
+    - dispatch was deferred due to provider throttling or a held fleet lock —
+      queued issues are still waiting to be dispatched once the cooldown clears
+      or the lock becomes available, so "nothing happened this pass" must not be
+      read as "drained".
     """
     data = pass_result.data
     dispatch_data = data.get("dispatch", {})
@@ -131,11 +132,9 @@ def should_exit(pass_result: CommandResult, live_count: int) -> bool:
     # actually merged. A failed attempt is not "activity" in its own right.
     merged = sum(1 for entry in data.get("merges", []) if entry.get("merged"))
     open_prs = data.get("open_tracked_prs", 0)
-    throttled = (
-        dispatch_data.get("deferred_reason") == "provider_throttled"
-        or rework_data.get("deferred_reason") == "provider_throttled"
-    )
-    if throttled:
+    # Any deferred_reason (provider throttling, fleet lock held) means the loop
+    # should stay alive and retry instead of reporting "drained".
+    if dispatch_data.get("deferred_reason") or rework_data.get("deferred_reason"):
         return False
     return live_count == 0 and dispatched == 0 and rework == 0 and merged == 0 and open_prs == 0
 
@@ -366,10 +365,23 @@ def run_supervised(
                 merged_str = (
                     f"{merged}/{merge_attempts}" if merge_attempts > merged else str(merged)
                 )
+                # Prefer the dispatch-scoped governor's live count; it is the same
+                # number the governor used for its clamp decision this pass.
+                # Fall back to the local snapshot count only when the governor did
+                # not emit a live count.
+                summary_live_count = live_count
+                for source in (data.get("dispatch", {}), data.get("dispatch_rework", {}), data):
+                    for key in ("fleet_live_session_count", "live_session_count"):
+                        if key in source:
+                            summary_live_count = source[key]
+                            break
+                    else:
+                        continue
+                    break
                 print(
                     f"[{now_str}] pass {pass_number}: dispatched {fresh}+{rework},"
                     f" merged {merged_str}, reviewed {reviewed}(+{skipped} skipped),"
-                    f" live ~{live_count}, prs-open {open_prs},"
+                    f" live ~{summary_live_count}, prs-open {open_prs},"
                     f" errors {errors_count}, warnings {warnings_count}",
                     flush=True,
                 )
