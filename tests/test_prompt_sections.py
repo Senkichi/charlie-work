@@ -64,6 +64,21 @@ def test_execution_contract_section_present_and_rendered() -> None:
     assert contract in rework_prompt
 
 
+def test_api_shape_validation_section_present_and_rendered() -> None:
+    """Verify the live-payload API shape validation section is a shared section and appears in both worker prompts."""
+    sections = section_variables()
+
+    assert "section_api_shape_validation" in sections
+    validation = sections["section_api_shape_validation"]
+    assert "live call transcript" in validation
+    assert "signature/docstring" in validation
+    assert "tests/fixtures/" in validation
+
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert validation in prompt
+
+
 def test_section_variables_has_no_hardcoded_name_list(tmp_path: Path) -> None:
     worker_sections = tmp_path / "worker_sections"
     worker_sections.mkdir()

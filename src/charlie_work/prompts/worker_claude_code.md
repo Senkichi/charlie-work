@@ -23,6 +23,8 @@ $issue_body
 
 $section_scope_contract
 
+$section_api_shape_validation
+
 ## Required implementation loop
 
 1. Branch off the current `main`:
