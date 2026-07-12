@@ -47,6 +47,7 @@ from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
+from .worktree import inspect_worktree_state, push_branch, resolve_base_branch_name
 from .state import (
     append_event,
     is_claim_stale,
@@ -716,12 +717,17 @@ def _classify_dead_sessions_and_update_throttle_state(
     Also reconciles labels for dead sessions with no open PR (issue #118):
     a dead worker with no open PR is recoverable and should be relabeled
     as dispatchable (remove active labels, ensure ready label present).
+
+    Issue #252: if a dead worker has a clean worktree with unpushed commits
+    (completed-but-unpublished), push the branch, create a PR, and move the
+    issue to ``pr_open`` instead of re-dispatching.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
     from .post_mortem import classify_and_record
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
     from .worker import iter_workers, update_worker_log_stat
+    from .worktree import WorktreeState
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -738,29 +744,78 @@ def _classify_dead_sessions_and_update_throttle_state(
         if issue_number is not None:
             open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
+    repo_root = getattr(gh, "repo_root", None)
+
     for w in iter_workers(sessions_dir):
         if w.error is None and not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
 
-            # Post-mortem extraction (issue #261) — see the identical hook in
-            # _detect_and_handle_stalled_sessions above for the full rationale.
-            # Must run before the log-tail classification below: a detected
-            # worker_blocked writes failure_kind into the sidecar directly,
-            # which the classification calls below then no-op on.
-            worker_blocked = classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+            # Inspect the worktree before deciding how to classify and relabel.
+            # This is the single enforcement point for issue #252.
+            worktree_path = Path(w.worktree_path)
+            inspection = inspect_worktree_state(worktree_path, config.dispatch.base_ref)
+            is_completed = inspection.state == WorktreeState.COMPLETED
 
-            # Session exited without error - classify the failure (adapter-specific dispatch)
-            if w.adapter_kind == "devin":
-                failure_kind, throttled_until = update_session_record_with_failure_classification(
-                    sessions_dir, w.issue_number, config=config
-                )
-            elif w.adapter_kind == "claude-code":
-                failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir, w.issue_number, config=config
-                )
+            # Post-mortem extraction (issue #261) is intertwined with log-tail
+            # classification. For a completed-but-unpublished worktree, we want
+            # failure_kind to be "unpublished_work" even if the terminal log
+            # tail would otherwise look like a tool-rejection (worker_blocked).
+            # Call update_* first when completed, then run classify_and_record
+            # for diagnostics (it will no-op on the sidecar because failure_kind
+            # is already set). For non-completed sessions, preserve the original
+            # ordering so worker_blocked still escalates.
+            if is_completed:
+                if w.adapter_kind == "devin":
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                        )
+                    )
+                elif w.adapter_kind == "claude-code":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                        )
+                    )
+                else:
+                    failure_kind, throttled_until = None, None
+                # Diagnostic post-mortem; its worker_blocked verdict is ignored
+                # because the worktree itself proves the work was completed.
+                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                worker_blocked = False
             else:
-                failure_kind, throttled_until = None, None
+                worker_blocked = (
+                    classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                    == "worker_blocked"
+                )
+                fallback_kind = "stalled" if inspection.state != WorktreeState.UNKNOWN else None
+                if w.adapter_kind == "devin":
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                        )
+                    )
+                elif w.adapter_kind == "claude-code":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                        )
+                    )
+                else:
+                    failure_kind, throttled_until = None, None
 
             if failure_kind and throttled_until:
                 # Update state with throttle window
@@ -782,86 +837,160 @@ def _classify_dead_sessions_and_update_throttle_state(
                     continue
                 issue_labels = label_names(issue)
                 active_labels = issue_labels & config.labels.active
-                if active_labels:
-                    # Track redispatch count for escalation cap (issue #165)
-                    # This relabel-to-ready path is a redispatch event
-                    with state_lock(state_file):
-                        state = load_state(state_file)
-                        entry = state["issues"].get(str(w.issue_number), {})
-                        now = datetime.now(UTC)
-                        window_start = now - timedelta(
-                            minutes=config.watchdog.redispatch_window_minutes
+                if not active_labels:
+                    continue
+
+                # Issue #252: completed-but-unpublished work takes the salvage
+                # path (push + PR) instead of re-dispatching.
+                salvage_error: str | None = None
+                if is_completed and repo_root is not None:
+                    salvaged, salvage_error = _attempt_salvage(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        worktree_path=worktree_path,
+                        branch=w.branch,
+                        base_ref=inspection.resolved_base_ref or "",
+                        issue_number=w.issue_number,
+                        active_labels=active_labels,
+                        issue_labels=issue_labels,
+                        state_file=state_file,
+                        failure_kind=failure_kind,
+                    )
+                    if salvaged:
+                        continue
+                    # Salvage failed: fall through to the normal relabel path below.
+
+                # Track redispatch count for escalation cap (issue #165)
+                # This relabel-to-ready path is a redispatch event
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    entry = state["issues"].get(str(w.issue_number), {})
+                    now = datetime.now(UTC)
+                    window_start = now - timedelta(
+                        minutes=config.watchdog.redispatch_window_minutes
+                    )
+                    prior = [
+                        t
+                        for t in entry.get("redispatch_at", [])
+                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                    ]
+                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    # issue #261: a worker_blocked verdict (extracted from the
+                    # Devin CLI's session store — see post_mortem.classify_and_record)
+                    # means the worker was killed by a push-gate hook, not a
+                    # generic stall/crash. Hot-redispatching it just repeats the
+                    # same block, so it bypasses the redispatch-count cap entirely
+                    # and escalates on the very first occurrence.
+                    if worker_blocked or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+                        # Escalate to human review instead of relabeling to ready
+                        entry["status"] = "escalated"
+                        entry["redispatch_at"] = redispatch_at
+                        entry["escalation_reason"] = (
+                            "worker_blocked" if worker_blocked else "redispatch_cap_exceeded"
                         )
-                        prior = [
-                            t
-                            for t in entry.get("redispatch_at", [])
-                            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-                        ]
-                        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
-                        # issue #261: a worker_blocked verdict (extracted from the
-                        # Devin CLI's session store — see post_mortem.classify_and_record)
-                        # means the worker was killed by a push-gate hook, not a
-                        # generic stall/crash. Hot-redispatching it just repeats the
-                        # same block, so it bypasses the redispatch-count cap entirely
-                        # and escalates on the very first occurrence.
-                        if (
-                            worker_blocked
-                            or len(redispatch_at) > config.watchdog.max_auto_redispatch
-                        ):
-                            # Escalate to human review instead of relabeling to ready
-                            entry["status"] = "escalated"
-                            entry["redispatch_at"] = redispatch_at
-                            entry["escalation_reason"] = (
-                                "worker_blocked" if worker_blocked else "redispatch_cap_exceeded"
-                            )
-                            # Clear worker PID when session fails (worker is dead)
-                            entry.pop("worker_pid", None)
-                            entry.pop("worker_process_start_time", None)
-                            state["issues"][str(w.issue_number)] = entry
-                            save_state(state_file, state)
-                            transition(gh, config.labels, w.issue_number, "redispatch_escalated")
-                            state = append_event(
-                                state,
-                                "session_failed_escalated",
-                                {
-                                    "issue_number": w.issue_number,
-                                    "failure_kind": failure_kind,
-                                    "removed_labels": sorted(active_labels),
-                                    "redispatch_count": len(redispatch_at),
-                                },
-                            )
-                            save_state(state_file, state)
-                            continue
-                        else:
-                            entry["redispatch_at"] = redispatch_at
-                            state["issues"][str(w.issue_number)] = entry
-                            save_state(state_file, state)
-                    # Remove all active labels (error-as-value)
-                    for label in sorted(active_labels):
-                        gh.remove_issue_label(w.issue_number, label)
-                    # Ensure ready label is present (error-as-value)
-                    if config.labels.ready not in issue_labels:
-                        gh.add_issue_label(w.issue_number, config.labels.ready)
-                    # Record the relabel event
-                    with state_lock(state_file):
-                        state = load_state(state_file)
                         # Clear worker PID when session fails (worker is dead)
-                        if str(w.issue_number) in state.get("issues", {}):
-                            state["issues"][str(w.issue_number)].pop("worker_pid", None)
-                            state["issues"][str(w.issue_number)].pop(
-                                "worker_process_start_time", None
-                            )
+                        entry.pop("worker_pid", None)
+                        entry.pop("worker_process_start_time", None)
+                        state["issues"][str(w.issue_number)] = entry
+                        save_state(state_file, state)
+                        transition(gh, config.labels, w.issue_number, "redispatch_escalated")
                         state = append_event(
                             state,
-                            "session_failed_relabeled",
+                            "session_failed_escalated",
                             {
                                 "issue_number": w.issue_number,
                                 "failure_kind": failure_kind,
                                 "removed_labels": sorted(active_labels),
-                                "added_ready": config.labels.ready not in issue_labels,
+                                "redispatch_count": len(redispatch_at),
                             },
                         )
                         save_state(state_file, state)
+                        continue
+                    else:
+                        entry["redispatch_at"] = redispatch_at
+                        state["issues"][str(w.issue_number)] = entry
+                        save_state(state_file, state)
+                # Remove all active labels (error-as-value)
+                for label in sorted(active_labels):
+                    gh.remove_issue_label(w.issue_number, label)
+                # Ensure ready label is present (error-as-value)
+                if config.labels.ready not in issue_labels:
+                    gh.add_issue_label(w.issue_number, config.labels.ready)
+                # Record the relabel event
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    # Clear worker PID when session fails (worker is dead)
+                    if str(w.issue_number) in state.get("issues", {}):
+                        state["issues"][str(w.issue_number)].pop("worker_pid", None)
+                        state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
+                    state = append_event(
+                        state,
+                        "session_failed_relabeled",
+                        {
+                            "issue_number": w.issue_number,
+                            "failure_kind": failure_kind,
+                            "removed_labels": sorted(active_labels),
+                            "added_ready": config.labels.ready not in issue_labels,
+                            "salvage_failed": is_completed,
+                            "salvage_error": salvage_error,
+                        },
+                    )
+                    save_state(state_file, state)
+
+
+def _attempt_salvage(
+    *,
+    gh: GitHub,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    worktree_path: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+    state_file: Path,
+    failure_kind: str | None,
+) -> tuple[bool, str | None]:
+    """Push a completed branch and open a PR, then move labels to ``pr_open``.
+
+    Returns ``(ok, error)``. Errors are recorded as values and never raised.
+    """
+    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    if not push_ok:
+        return False, push_error
+
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    title = f"Salvaged work for issue #{issue_number}"
+    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a completed-but-unpublished worker worktree."
+    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
+    if pr_number is None:
+        pr_error = "gh pr create failed or returned no PR number"
+        return False, pr_error
+
+    for label in sorted(active_labels):
+        gh.remove_issue_label(issue_number, label)
+    if config.labels.pr_open not in issue_labels:
+        gh.add_issue_label(issue_number, config.labels.pr_open)
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        if str(issue_number) in state.get("issues", {}):
+            state["issues"][str(issue_number)].pop("worker_pid", None)
+            state["issues"][str(issue_number)].pop("worker_process_start_time", None)
+        state = append_event(
+            state,
+            "session_salvaged",
+            {
+                "issue_number": issue_number,
+                "failure_kind": failure_kind,
+                "removed_labels": sorted(active_labels),
+                "pr_number": pr_number,
+            },
+        )
+        save_state(state_file, state)
+    return True, None
 
 
 def _issues_with_live_workers(sessions_dir: Path) -> set[int]:

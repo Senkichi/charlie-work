@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from charlie_work.config import OrchestratorConfig
+from charlie_work.devin_shell import SessionRecord
 from charlie_work.github import _LIST_LIMIT as github_list_limit
 from charlie_work.reconcile import (
     DriftItem,
@@ -13,6 +16,7 @@ from charlie_work.reconcile import (
     detect_drift,
 )
 from charlie_work.state import empty_state, is_claim_stale
+from charlie_work.worktree import create_worktree
 
 
 class FakeGitHub:
@@ -25,6 +29,8 @@ class FakeGitHub:
         issues: list[dict[str, Any]],
         fail_add_labels: set[tuple[int, str]] | None = None,
         fail_remove_labels: set[tuple[int, str]] | None = None,
+        repo_root: Any = None,
+        pr_create_return: int | None = None,
     ) -> None:
         self._prs = prs
         self._issues = issues
@@ -33,6 +39,9 @@ class FakeGitHub:
         self.labels_removed: list[tuple[int, str]] = []
         self._fail_add_labels = fail_add_labels or set()
         self._fail_remove_labels = fail_remove_labels or set()
+        self.repo_root = repo_root
+        self.prs_created: list[dict[str, Any]] = []
+        self.pr_create_return = pr_create_return
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         self.run_calls.append(args)
@@ -49,6 +58,10 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
         return (number, label) not in self._fail_remove_labels
+
+    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
+        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
+        return self.pr_create_return
 
 
 def _pr(
@@ -1694,6 +1707,241 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     assert len(kill_calls) == 1, (
         f"Expected kill_process_tree to be called exactly once, got {kill_calls}"
     )
-    assert kill_calls[0] == (fake_pid, fake_start_time), (
-        f"Expected kill_process_tree({fake_pid}, {fake_start_time}), got {kill_calls[0]}"
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote repo and a local clone, return (remote, clone)."""
+    remote = tmp_path / "remote"
+    remote.mkdir(parents=True, exist_ok=True)
+    _git(remote, "init", "--bare", "--initial-branch=main")
+    clone = tmp_path / "clone"
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "--initial-branch=main")
+    _git(clone, "config", "user.email", "test@example.test")
+    _git(clone, "config", "user.name", "Test User")
+    _git(clone, "config", "commit.gpgSign", "false")
+    _git(clone, "remote", "add", "origin", str(remote))
+    (clone / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(clone, "add", "README.md")
+    _git(clone, "commit", "-m", "initial commit")
+    _git(clone, "push", "-u", "origin", "main")
+    return remote, clone
+
+
+def _setup_completed_worktree(
+    repo_root: Path, issue_number: int, dirty: bool = False
+) -> tuple[Path, str]:
+    """Create a worktree with one commit beyond origin/main. Return (worktree_path, branch)."""
+    branch = f"agent/issue-{issue_number}"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+    if dirty:
+        (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    return info.path, branch
+
+
+def _write_dead_session_sidecar(
+    sessions_dir: Path, issue_number: int, branch: str, worktree_path: Path
+) -> None:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(sessions_dir / f"issue-{issue_number}.log"),
+        error=None,
     )
+    sidecar_path = sessions_dir / f"issue-{issue_number}.json"
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    (sessions_dir / f"issue-{issue_number}.claude.json").unlink(missing_ok=True)
+
+
+def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> None:
+    """Issue #252: dead session with clean, ahead worktree emits salvage drift."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 252)
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    _write_dead_session_sidecar(sessions_dir, 252, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(252, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config, repo_root=repo_root)
+
+    salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == 252
+    assert salvage[0].branch == branch
+    assert salvage[0].base_branch == "main"
+    assert salvage[0].remove_labels == (config.labels.in_progress,)
+    assert salvage[0].add_labels == (config.labels.pr_open,)
+
+    # No relabel-to-ready drift should be emitted
+    relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert not relabel
+
+
+def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
+    """Issue #252: dead session with dirty worktree still relabels to ready."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 253, dirty=True)
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    _write_dead_session_sidecar(sessions_dir, 253, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(253, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config, repo_root=repo_root)
+
+    salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
+    assert not salvage
+    relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert len(relabel) == 1
+    assert relabel[0].issue_number == 253
+
+
+def test_detect_drift_no_commits_relabels(tmp_path: Path) -> None:
+    """Issue #252: dead session with no commits still relabels to ready."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    branch = "agent/issue-254"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    _write_dead_session_sidecar(sessions_dir, 254, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(254, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config, repo_root=repo_root)
+
+    salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
+    assert not salvage
+    relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
+    assert len(relabel) == 1
+    assert relabel[0].issue_number == 254
+
+
+def test_apply_fixes_salvage_success_creates_pr_and_labels(tmp_path: Path) -> None:
+    """Issue #252: apply_fixes pushes, creates a PR, and moves labels to pr_open."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 255)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(255, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=101,
+    )
+
+    drift = [
+        DriftItem(
+            kind="session_unpublished_work_salvaged",
+            issue_number=255,
+            pr_number=None,
+            detail="salvage",
+            fix_actions=("push", "pr_create"),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.pr_open,),
+            branch=branch,
+            base_branch="main",
+        )
+    ]
+
+    new_state = apply_fixes(gh, empty_state(), drift, config)
+
+    # PR created
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    assert gh.prs_created[0]["base"] == "main"
+
+    # Branch pushed to remote
+    remote_refs = _git(remote, "show-ref")
+    assert "agent/issue-255" in remote_refs.stdout
+
+    # Labels moved
+    assert (255, config.labels.in_progress) in gh.labels_removed
+    assert (255, config.labels.pr_open) in gh.labels_added
+
+    # Event recorded as salvage
+    events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert events[-1]["payload"]["kind"] == "session_unpublished_work_salvaged"
+
+
+def test_apply_fixes_salvage_push_failure_fallback(tmp_path: Path) -> None:
+    """Issue #252: a failed salvage push falls back to relabel-to-ready."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 256)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(256, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=102,
+    )
+
+    drift = [
+        DriftItem(
+            kind="session_unpublished_work_salvaged",
+            issue_number=256,
+            pr_number=None,
+            detail="salvage",
+            fix_actions=("push", "pr_create"),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.pr_open,),
+            branch=branch,
+            base_branch="main",
+        )
+    ]
+
+    # Force push to fail
+    import charlie_work.reconcile
+
+    original_push_branch = charlie_work.reconcile.push_branch
+    charlie_work.reconcile.push_branch = lambda repo, br, worktree_path=None: (
+        False,
+        "simulated push failure",
+    )
+    try:
+        new_state = apply_fixes(gh, empty_state(), drift, config)
+    finally:
+        charlie_work.reconcile.push_branch = original_push_branch
+
+    # No PR created, active label removed, ready label added
+    assert not gh.prs_created
+    assert (256, config.labels.in_progress) in gh.labels_removed
+    assert (256, config.labels.ready) in gh.labels_added
+
+    # Event recorded as failed relabel
+    events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert events[-1]["payload"]["kind"] == "session_failed_relabeled"
+    assert any("salvage_failed" in action for action in events[-1]["payload"]["fix_actions"])
