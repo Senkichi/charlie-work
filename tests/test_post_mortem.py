@@ -2,11 +2,15 @@
 the Devin CLI's local session store, and the worker_blocked classification
 that suppresses hot redispatch into a push-gate hook.
 
-The ``message_nodes`` schema this module reads is not officially documented
-(see post_mortem.py's module docstring and extraction-dossier.md item 23) —
-these tests build a fixture sessions.db against the schema this module
-assumes, and separately verify that any schema mismatch degrades to a
-recorded ``extraction_error`` rather than raising.
+The fixture sessions.db built here uses the REAL production schema, copied
+verbatim from a live ``%APPDATA%\\devin\\cli\\sessions.db`` (2026-07-12,
+~268k message_nodes rows): message_nodes has no ``id``/``role``/``content``
+columns — role and content live inside the ``chat_message`` JSON blob,
+ordering is by per-session ``node_id``, and ``created_at`` is an epoch
+integer. An earlier revision of these fixtures used the schema post_mortem
+merely assumed, which let every test pass while the real queries failed on
+``no such column: role`` in production. Schema-mismatch degradation to a
+recorded ``extraction_error`` is verified separately below.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 
 from charlie_work.attempt_refs import AttemptSnapshot
@@ -31,40 +36,35 @@ from charlie_work.post_mortem import (
 from charlie_work.worker import WorkerView
 
 
-def _build_sessions_db_epoch_created_at(
-    db_path: Path,
-    *,
-    session_id: str = "sess-1",
-    working_directory: str = "C:/repo/.var/worktrees/issue-42",
-    created_at_epoch: int,
-) -> None:
-    """Build a fixture sessions.db whose ``created_at`` column is declared
-    INTEGER (not TEXT) and holds a raw epoch value — reproduces a real
-    sessions.db observed storing created_at as an epoch int (e.g.
-    ``1783760135``) for some rows. SQLite's TEXT column affinity would
-    coerce an inserted int to text, so this needs its own schema rather
-    than reusing ``_build_sessions_db``.
-    """
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at INTEGER)"
-        )
-        conn.execute(
-            "CREATE TABLE message_nodes ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
-            "content TEXT, created_at TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
-            (session_id, working_directory, created_at_epoch),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 _NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+# Real production DDL, copied verbatim from a live sessions.db (2026-07-12) —
+# see this module's docstring. Keep in sync with post_mortem.py's docstring.
+_REAL_SESSIONS_DDL = """
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  working_directory TEXT NOT NULL,
+  backend_type TEXT NOT NULL,
+  model TEXT NOT NULL,
+  agent_mode TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_activity_at INTEGER NOT NULL, title TEXT, main_chain_id INTEGER,
+  shell_last_seen_index INTEGER DEFAULT 0, cogs_json TEXT,
+  workspace_dirs TEXT, hidden INTEGER NOT NULL DEFAULT 0, metadata TEXT)
+"""
+
+_REAL_MESSAGE_NODES_DDL = """
+CREATE TABLE message_nodes (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  node_id INTEGER NOT NULL,
+  parent_node_id INTEGER,
+  chat_message TEXT NOT NULL,
+  created_at INTEGER NOT NULL, metadata TEXT,
+  FOREIGN KEY (session_id) REFERENCES sessions(id),
+  UNIQUE(session_id, node_id)
+)
+"""
 
 
 def _make_worker(
@@ -95,32 +95,50 @@ def _build_sessions_db(
     *,
     session_id: str = "sess-1",
     working_directory: str = "C:/repo/.var/worktrees/issue-42",
-    created_at: str = "2026-07-11T11:56:00",
-    nodes: list[tuple[str, str, str]] = (),
+    created_at: str | int = "2026-07-11T11:56:00",
+    nodes: tuple[tuple, ...] | list[tuple] = (),
 ) -> None:
-    """Build a fixture sessions.db against the schema post_mortem.py assumes:
-    sessions(id, working_directory, created_at) and
-    message_nodes(id, session_id, role, content, created_at).
+    """Build a fixture sessions.db against the REAL production schema.
+
+    ``created_at`` values are inserted as given: the real columns are
+    declared INTEGER, but SQLite affinity stores a non-numeric ISO string
+    as TEXT — exactly the mixed-shape drift ``_parse_session_created_at``
+    defends against, so tests deliberately pass either shape.
+
+    ``nodes`` entries are ``(role, content, created_at)`` or
+    ``(role, content, created_at, extra)`` where ``extra`` is a dict merged
+    into the ``chat_message`` JSON blob (e.g. ``tool_calls`` on an
+    assistant node, ``tool_call_id`` on a tool-result node).
     """
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute(_REAL_SESSIONS_DDL)
+        conn.execute(_REAL_MESSAGE_NODES_DDL)
         conn.execute(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, created_at TEXT)"
+            "INSERT INTO sessions (id, working_directory, backend_type, model, "
+            "agent_mode, created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
+            (session_id, working_directory, created_at, created_at),
         )
-        conn.execute(
-            "CREATE TABLE message_nodes ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
-            "content TEXT, created_at TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
-            (session_id, working_directory, created_at),
-        )
-        for role, content, node_created_at in nodes:
+        for node_id, spec in enumerate(nodes, start=1):
+            role, content, node_created_at = spec[0], spec[1], spec[2]
+            extra = spec[3] if len(spec) > 3 else {}
+            chat_message = {
+                "message_id": f"msg-{node_id}",
+                "role": role,
+                "content": content,
+                "metadata": None,
+                **extra,
+            }
             conn.execute(
-                "INSERT INTO message_nodes (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, role, content, node_created_at),
+                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, "
+                "chat_message, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    node_id,
+                    node_id - 1 if node_id > 1 else None,
+                    json.dumps(chat_message),
+                    node_created_at,
+                ),
             )
         conn.commit()
     finally:
@@ -137,26 +155,43 @@ def _insert_session_row(
 ) -> None:
     """Insert an additional session row and its message_nodes into an existing
     fixture sessions.db created by ``_build_sessions_db``.
+
+    Uses the same real-schema shape as ``_build_sessions_db`` (chat_message
+    JSON blob keyed by per-session ``node_id``) — see this module's
+    docstring.
     """
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
-            (session_id, working_directory, created_at),
+            "INSERT INTO sessions (id, working_directory, backend_type, model, "
+            "agent_mode, created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
+            (session_id, working_directory, created_at, created_at),
         )
-        for role, content, node_created_at in nodes:
+        for node_id, (role, content, node_created_at) in enumerate(nodes, start=1):
+            chat_message = {
+                "message_id": f"msg-{node_id}",
+                "role": role,
+                "content": content,
+                "metadata": None,
+            }
             conn.execute(
-                "INSERT INTO message_nodes (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, role, content, node_created_at),
+                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, "
+                "chat_message, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    node_id,
+                    node_id - 1 if node_id > 1 else None,
+                    json.dumps(chat_message),
+                    node_created_at,
+                ),
             )
         conn.commit()
     finally:
         conn.close()
 
 
-def _config_with_db(db_path: Path, **overrides) -> OrchestratorConfig:
-    pm_kwargs = {"db_path": str(db_path)}
+def _config_with_db(db_path: Path, **overrides: object) -> OrchestratorConfig:
+    pm_kwargs: dict[str, Any] = {"db_path": str(db_path)}
     pm_kwargs.update(overrides)
     return OrchestratorConfig(post_mortem=PostMortemConfig(**pm_kwargs))
 
@@ -272,6 +307,94 @@ def test_classify_and_record_writes_failure_kind_to_devin_sidecar(tmp_path: Path
     with _sidecar_path(sessions_dir, worker.issue_number).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     assert payload["failure_kind"] == "worker_blocked"
+
+
+def test_extract_resolves_tool_name_via_tool_call_id_join(tmp_path: Path) -> None:
+    """The REAL chat_message shape puts the tool name in the assistant
+    node's ``tool_calls[].name``, not in the tool-result node's content —
+    the extractor must resolve ``MessageNode.tool_name`` by joining the
+    tool node's ``tool_call_id`` back to the assistant's tool_calls, and
+    classification must surface it as ``terminal_tool``."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        nodes=[
+            (
+                "assistant",
+                "",
+                int(datetime(2026, 7, 11, 11, 57, 0, tzinfo=UTC).timestamp()),
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "bash",
+                            "arguments": {"command": "git push"},
+                            "index": 0,
+                            "kind": "function",
+                        }
+                    ]
+                },
+            ),
+            (
+                "tool",
+                'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}',
+                int(datetime(2026, 7, 11, 11, 58, 0, tzinfo=UTC).timestamp()),
+                {"tool_call_id": "call_1"},
+            ),
+        ],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    assert record.terminal_tool == "bash"
+    roles = [n.role for n in record.message_nodes]
+    assert roles == ["assistant", "tool"]
+    tool_node = record.message_nodes[-1]
+    assert tool_node.tool_name == "bash"
+    assert tool_node.content.startswith("Tool blocked:")
+    # Epoch created_at is normalized to ISO-8601 in the sidecar.
+    assert tool_node.created_at == "2026-07-11T11:58:00+00:00"
+
+
+def test_extract_non_json_chat_message_degrades_to_raw_content(tmp_path: Path) -> None:
+    """A chat_message blob that is not JSON (or not a dict) must degrade to
+    role="" with the raw text as content — never raise, and never abort the
+    rest of the extraction (the surrounding parseable nodes still classify)."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        nodes=[("tool", "Tool blocked: push rejected", "2026-07-11T11:58:00")],
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, node_id, parent_node_id, "
+            "chat_message, created_at) VALUES ('sess-1', 2, 1, ?, ?)",
+            ("this is not json at all", "2026-07-11T11:59:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    config = _config_with_db(db_path)
+    worker = _make_worker()
+    sessions_dir = tmp_path / "sessions"
+
+    result = classify_and_record(sessions_dir, config, worker, now=_NOW)
+
+    assert result == "worker_blocked"
+    record = read_post_mortem(sessions_dir, worker.issue_number)
+    assert record is not None
+    assert record.matched is True
+    raw_node = record.message_nodes[-1]
+    assert raw_node.role == ""
+    assert raw_node.content == "this is not json at all"
 
 
 # ---------------------------------------------------------------------------
@@ -783,13 +906,12 @@ def test_classify_and_record_uses_custom_signature_rules(tmp_path: Path) -> None
 
 
 def test_find_matching_session_accepts_epoch_int_created_at(tmp_path: Path) -> None:
-    """A real sessions.db has been observed storing created_at as a raw
-    epoch integer (e.g. 1783760135) rather than an ISO string — the column
-    is declared TEXT but SQLite's type affinity does not coerce a
-    writer-inserted INTEGER value. Must still match."""
+    """An epoch-integer created_at (e.g. 1783760135) is the REAL production
+    shape — sessions.created_at is declared INTEGER in the live schema.
+    Must match."""
     db_path = tmp_path / "sessions.db"
     created_at_dt = datetime(2026, 7, 11, 11, 56, 0, tzinfo=UTC)
-    _build_sessions_db_epoch_created_at(db_path, created_at_epoch=int(created_at_dt.timestamp()))
+    _build_sessions_db(db_path, created_at=int(created_at_dt.timestamp()))
     config = _config_with_db(db_path)
     worker = _make_worker()
     sessions_dir = tmp_path / "sessions"
@@ -804,9 +926,10 @@ def test_find_matching_session_accepts_epoch_int_created_at(tmp_path: Path) -> N
 
 
 def test_find_matching_session_accepts_naive_iso_string_created_at(tmp_path: Path) -> None:
-    """A naive ISO-8601 created_at (no tz offset, as sessions.db actually
-    stores it) must be treated as UTC and matched correctly against the
-    tz-aware match window computed from worker.started_at."""
+    """A naive ISO-8601 created_at (no tz offset) — the drift shape, since
+    the live schema declares the column INTEGER but SQLite affinity stores
+    a writer-inserted string as TEXT — must be treated as UTC and matched
+    correctly against the tz-aware match window from worker.started_at."""
     db_path = tmp_path / "sessions.db"
     _build_sessions_db(
         db_path,
@@ -907,14 +1030,20 @@ def test_classify_and_record_unparseable_started_at_no_match_still_records_fallb
 
 
 def test_real_activity_for_worker_sessions_db_source(tmp_path: Path) -> None:
-    """A matched sessions.db with message_nodes is the freshest real activity source."""
+    """A matched sessions.db with message_nodes is the freshest real activity
+    source. Node created_at values are epoch integers here — the real
+    production shape (message_nodes.created_at is declared INTEGER)."""
     db_path = tmp_path / "sessions.db"
     _build_sessions_db(
         db_path,
         working_directory="C:/repo/.var/worktrees/issue-42",
         nodes=[
-            ("user", "hello", "2026-07-11T11:55:00"),
-            ("assistant", "working", "2026-07-11T11:59:00"),
+            ("user", "hello", int(datetime(2026, 7, 11, 11, 55, 0, tzinfo=UTC).timestamp())),
+            (
+                "assistant",
+                "working",
+                int(datetime(2026, 7, 11, 11, 59, 0, tzinfo=UTC).timestamp()),
+            ),
         ],
     )
     config = _config_with_db(db_path)

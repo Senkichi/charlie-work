@@ -22,11 +22,17 @@ strictly best-effort, read-only side channel:
   a recorded ``extraction_error`` and this module never raises — the
   reaper's existing log-tail classification always still runs as the
   fallback, unaffected.
-- ``message_nodes`` schema (role/content/created_at columns keyed by
-  session_id) is inferred from the block-payload behavior described in the
-  issue, not from official Devin CLI documentation (none exists for this
-  table — see extraction-dossier.md item 23). Any mismatch is caught by
-  ``sqlite3.Error`` and treated as schema drift, not a crash.
+- ``message_nodes`` schema was verified against a live production
+  sessions.db (2026-07-12, ~268k rows): ``(row_id INTEGER PRIMARY KEY,
+  session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message
+  TEXT, created_at INTEGER, metadata TEXT)`` with UNIQUE(session_id,
+  node_id). There is no ``role``/``content``/``id`` column — role and
+  content live inside the ``chat_message`` JSON blob (see
+  ``_parse_chat_message``), per-session ordering is by ``node_id``, and
+  ``created_at`` is an epoch integer. There is still no official Devin CLI
+  documentation for this table (extraction-dossier.md item 23), so any
+  future drift is caught by ``sqlite3.Error`` / defensive JSON parsing and
+  treated as schema drift, not a crash.
 """
 
 from __future__ import annotations
@@ -134,9 +140,19 @@ class RealActivityProbe:
 
 @dataclass(frozen=True)
 class MessageNode:
+    """One message_nodes row, mapped out of its ``chat_message`` JSON blob.
+
+    ``tool_name`` is resolved for role="tool" nodes by joining their
+    ``tool_call_id`` against the ``tool_calls`` of the assistant nodes in
+    the same extraction window (see ``_extract_last_n_nodes``) — None when
+    the issuing assistant node fell outside the window or the blob had no
+    ``tool_call_id``.
+    """
+
     role: str
     content: str
     created_at: str | None = None
+    tool_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +221,7 @@ class PostMortemRecord:
                     role=str(n.get("role", "")),
                     content=str(n.get("content", "")),
                     created_at=n.get("created_at"),
+                    tool_name=n.get("tool_name"),
                 )
                 for n in nodes
                 if isinstance(n, dict)
@@ -438,30 +455,102 @@ def _find_matching_session(
     return candidates[0][1], None
 
 
+def _parse_chat_message(raw: Any) -> tuple[str, str, dict[str, str], str | None]:
+    """Map one ``message_nodes.chat_message`` JSON blob to
+    ``(role, content, tool_call_names, tool_call_id)``.
+
+    Verified shape (live sessions.db, 2026-07-12): ``{"message_id": ...,
+    "role": "assistant"|"tool"|"system"|"user", "content": str,
+    "tool_calls": [{"id": ..., "name": ..., "arguments": ...}, ...],
+    "tool_call_id": ..., "thinking": ..., "metadata": ...}`` —
+    ``tool_calls`` appears on assistant nodes, ``tool_call_id`` on the
+    tool-result nodes answering them. Never raises: a non-JSON or non-dict
+    blob degrades to ``("", raw_text, {}, None)`` so signature
+    classification still sees the raw content.
+    """
+    text = raw if isinstance(raw, str) else str(raw)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return "", text, {}, None
+    if not isinstance(payload, dict):
+        return "", text, {}, None
+    role = payload.get("role")
+    content = payload.get("content")
+    if not isinstance(content, str):
+        content = json.dumps(content) if content is not None else ""
+    tool_call_names: dict[str, str] = {}
+    tool_calls = payload.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if isinstance(call, dict):
+                call_id = call.get("id")
+                call_name = call.get("name")
+                if isinstance(call_id, str) and isinstance(call_name, str):
+                    tool_call_names[call_id] = call_name
+    tool_call_id = payload.get("tool_call_id")
+    return (
+        role if isinstance(role, str) else "",
+        content,
+        tool_call_names,
+        tool_call_id if isinstance(tool_call_id, str) else None,
+    )
+
+
 def _extract_last_n_nodes(
     conn: sqlite3.Connection, session_id: str, limit: int
 ) -> tuple[tuple[MessageNode, ...], str | None]:
-    """Return the last ``limit`` message_nodes for ``session_id`` in chronological order."""
+    """Return the last ``limit`` message_nodes for ``session_id`` in chronological order.
+
+    Ordered by ``node_id`` — per-session monotonic and backed by the real
+    schema's UNIQUE(session_id, node_id) index; the table has no ``id``
+    column. Each row's ``chat_message`` JSON blob is mapped through
+    ``_parse_chat_message``; tool-result nodes get ``tool_name`` resolved by
+    joining their ``tool_call_id`` against the ``tool_calls`` of assistant
+    nodes earlier in the window (a single chronological pass suffices — the
+    issuing assistant node always precedes its results). ``created_at``
+    epoch integers are normalized to ISO-8601 for the JSON sidecar.
+    """
     try:
         cursor = conn.execute(
-            "SELECT role, content, created_at FROM message_nodes "
-            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            "SELECT chat_message, created_at FROM message_nodes "
+            "WHERE session_id = ? ORDER BY node_id DESC LIMIT ?",
             (session_id, limit),
         )
         rows = cursor.fetchall()
     except sqlite3.Error as exc:
         return (), f"message_nodes table query failed (schema drift?): {exc}"
-    nodes = tuple(
-        MessageNode(role=str(r[0]), content=str(r[1]), created_at=r[2]) for r in reversed(rows)
-    )
-    return nodes, None
+
+    nodes: list[MessageNode] = []
+    tool_call_names: dict[str, str] = {}
+    for chat_message, created_raw in reversed(rows):
+        role, content, call_names, tool_call_id = _parse_chat_message(chat_message)
+        tool_call_names.update(call_names)
+        created_dt = _parse_session_created_at(created_raw)
+        if created_dt is not None:
+            created_at = created_dt.isoformat()
+        else:
+            created_at = str(created_raw) if created_raw is not None else None
+        nodes.append(
+            MessageNode(
+                role=role,
+                content=content,
+                created_at=created_at,
+                tool_name=tool_call_names.get(tool_call_id) if tool_call_id else None,
+            )
+        )
+    return tuple(nodes), None
 
 
 def _terminal_tool_name(content: str) -> str | None:
     """Best-effort extraction of a tool name from a role=tool node's content.
 
-    The content is often JSON (``{"tool": "...", ...}``) but this must never
-    raise on non-JSON content — plain-text tool output is equally valid.
+    Fallback for when the ``tool_call_id`` join in ``_extract_last_n_nodes``
+    did not resolve a ``MessageNode.tool_name`` (issuing assistant node
+    outside the window, or a block payload written directly as content per
+    the issue #261 spec). The content is sometimes JSON
+    (``{"tool": "...", ...}``) but this must never raise on non-JSON
+    content — plain-text tool output is equally valid.
     """
     try:
         payload = json.loads(content)
@@ -489,7 +578,8 @@ def _classify_nodes(
     if not tool_nodes:
         return None, None, None
 
-    terminal_tool = _terminal_tool_name(tool_nodes[-1].content)
+    terminal_node = tool_nodes[-1]
+    terminal_tool = terminal_node.tool_name or _terminal_tool_name(terminal_node.content)
 
     for node in reversed(tool_nodes):
         for rule in signature_rules:
@@ -498,7 +588,11 @@ def _classify_nodes(
                     reason = node.content
                     if node.content.startswith(_BLOCK_CONTENT_PREFIX):
                         reason = node.content[len(_BLOCK_CONTENT_PREFIX) :].strip()
-                    return rule.kind, reason, terminal_tool or _terminal_tool_name(node.content)
+                    return (
+                        rule.kind,
+                        reason,
+                        terminal_tool or node.tool_name or _terminal_tool_name(node.content),
+                    )
             except re.error:
                 # A malformed pattern would already have been rejected at
                 # config-load time; treat any runtime surprise as no-match
@@ -574,7 +668,8 @@ def real_activity_for_worker(
             else:
                 try:
                     row = conn.execute(
-                        "SELECT created_at FROM message_nodes WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                        "SELECT created_at FROM message_nodes "
+                        "WHERE session_id = ? ORDER BY node_id DESC LIMIT 1",
                         (session_id,),
                     ).fetchone()
                     if row is None:
