@@ -508,11 +508,23 @@ def _probe_recovery_liveness(
     """Abort recovery/redispatch if the recorded worker is still alive.
 
     Checks the recorded PID with start-time fingerprint matching first. If the
-    PID is dead/wrong, corroborate with the Devin CLI's sessions.db for devin-
-    shell sessions — a recent ``message_nodes`` row for this worktree means the
-    real leaf session is still moving even if the wrapper PID is gone.
+    PID is dead/wrong, corroborate with the Devin CLI's real-activity probe
+    (``real_activity_for_worker``) for devin-shell sessions — a recent
+    ``sessions.db`` message_nodes row OR a fresh per-PID Devin log for this
+    worktree means the real leaf session is still moving even if the wrapper
+    PID is gone.
 
-    Raises ``LiveWorkerRedispatchError`` when a live signal is detected.
+    The probe is best-effort and never raises by design: a schema-drifted or
+    locked sessions.db, or an unreadable per-PID log, comes back as an
+    ``ActivitySource`` with ``error`` set rather than a timestamp. That is an
+    INCONCLUSIVE result, not a confirmed-dead one — treating it as "no
+    activity" would fail OPEN into the same destructive reset issue #282 exists
+    to prevent (this reintroduced that exact shape once already; see the
+    review that required this fix). So any source with a non-null ``error``
+    aborts recovery just as certainly as confirmed fresh activity does.
+
+    Raises ``LiveWorkerRedispatchError`` when a live signal is detected, or
+    when liveness could not be determined.
     """
     resolved_config = config or OrchestratorConfig()
 
@@ -535,8 +547,9 @@ def _probe_recovery_liveness(
             probe_result="pid_alive",
         )
 
-    # For devin-shell sessions, sessions.db is the real source of truth even
-    # when the wrapper PID is gone or has been recycled.
+    # For devin-shell sessions, the real-activity probe (sessions.db +
+    # per-PID Devin log) is the source of truth even when the wrapper PID is
+    # gone or has been recycled.
     if resolved_config.devin.adapter == "devin-shell":
         started_at = recovery.get("started_at") or recovery.get("dispatched_at") or ""
         pm_config = resolved_config.post_mortem
@@ -553,17 +566,34 @@ def _probe_recovery_liveness(
             # The probe is best-effort; never let it crash the recovery path.
             return
 
+        # Any errored source means liveness is UNKNOWN for that signal, not
+        # confirmed dead — never let an inconclusive probe fall through to a
+        # destructive reset (issue #282 rework).
+        for source in probe.sources:
+            if source.error is not None:
+                raise LiveWorkerRedispatchError(
+                    issue_number=issue_number,
+                    pid=worker_pid,
+                    process_start_time=worker_process_start_time,
+                    probe_result="probe_error",
+                )
+
+        # Consult BOTH activity sources via the probe's own freshest-signal
+        # aggregation (the same corroboration classify_worker_health uses for
+        # the stall watchdog, issue #280) instead of a sessions.db-only check
+        # that would ignore fresh devin_per_pid_log activity.
         stall_minutes = resolved_config.watchdog.stall_minutes or 20
         stall_seconds = stall_minutes * 60
-        for source in probe.sources:
-            if source.name == "sessions.db" and source.staleness_seconds is not None:
-                if source.staleness_seconds <= stall_seconds:
-                    raise LiveWorkerRedispatchError(
-                        issue_number=issue_number,
-                        pid=worker_pid,
-                        process_start_time=worker_process_start_time,
-                        probe_result="sessions_db_activity",
-                    )
+        if probe.latest_timestamp is not None:
+            staleness_seconds = (now - probe.latest_timestamp).total_seconds()
+            if staleness_seconds <= stall_seconds:
+                source_label = (probe.latest_source or "real_activity").replace(".", "_")
+                raise LiveWorkerRedispatchError(
+                    issue_number=issue_number,
+                    pid=worker_pid,
+                    process_start_time=worker_process_start_time,
+                    probe_result=f"{source_label}_activity",
+                )
 
 
 def create_worktree(
