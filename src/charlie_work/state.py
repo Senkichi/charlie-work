@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +20,34 @@ _LOCK_TIMEOUT_SECONDS = 30
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
 logger = logging.getLogger(__name__)
+
+# Intra-process serialization for state_lock.
+#
+# The file lock below (msvcrt.locking / fcntl.flock) serializes across
+# PROCESSES, but byte-range file locks are owned by the process, not the
+# thread — two threads in the SAME process are not serialized by it and both
+# enter the read-modify-write section concurrently. On Windows their atomic
+# ``tmp.replace(state.json)`` calls then collide (destination held open by the
+# other thread's read) and raise ``PermissionError``; on any platform the
+# concurrent load→save races lose updates (issue #16).
+#
+# A per-path threading.Lock, acquired before the file lock, restores
+# deterministic intra-process serialization. Keyed by normalized absolute path
+# so distinct Path objects for the same file share one lock. The registry
+# itself is guarded by a plain lock; entries are created on demand and never
+# removed (one small Lock per distinct state path for the process lifetime).
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[key] = lock
+        return lock
 
 
 def utc_now() -> str:
@@ -52,11 +82,17 @@ def state_lock(state_path: Path):
     Best-effort: if locking fails, the context manager still yields — the orchestrator
     prefers forward progress over perfect serialization, and atomic writes already
     prevent torn files.
+
+    A per-path threading.Lock is held around the whole critical section so that
+    concurrent THREADS in this process are serialized too (the file lock only
+    serializes across processes — see ``_thread_lock_for``).
     """
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
     lock_file = None
     acquired = False
 
+    thread_lock = _thread_lock_for(state_path)
+    thread_lock.acquire()
     try:
         # Create lock file if it doesn't exist.
         # Write 1 byte so msvcrt.locking(... 1) has a byte-range to lock:
@@ -146,6 +182,10 @@ def state_lock(state_path: Path):
             except OSError:
                 # Best-effort close — ignore failures
                 pass
+        # Release the intra-process thread lock last, after the file handle is
+        # closed, so the next thread never observes a half-released critical
+        # section. Always paired with the acquire() above the try.
+        thread_lock.release()
 
 
 def empty_state() -> dict[str, Any]:
