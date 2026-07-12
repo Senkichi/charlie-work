@@ -217,7 +217,7 @@ class TestAdequacyVerdict:
 
 def run_janitor(
     pr: dict[str, Any],
-    checks: list[dict[str, Any]],
+    checks: list[dict[str, Any]] | None,
     config: OrchestratorConfig,
     *,
     pr_state: dict[str, Any] | None = None,
@@ -279,7 +279,7 @@ def _check_mergeable(pr: dict[str, Any], failures: list[str]) -> None:
 
 
 def _check_required_checks(
-    checks: list[dict[str, Any]],
+    checks: list[dict[str, Any]] | None,
     config: OrchestratorConfig,
     failures: list[str],
     warnings: list[str],
@@ -288,6 +288,8 @@ def _check_required_checks(
     if not required:
         return
     summary = summarize_checks(checks, required)
+    if summary.unavailable:
+        failures.append(f"Checks unavailable (gh failure): {', '.join(summary.unavailable)}")
     if summary.failed:
         failures.append(f"Required check(s) failed: {', '.join(summary.failed)}")
     if summary.infra_failed:

@@ -12,13 +12,36 @@ class CheckSummary:
     failed: tuple[str, ...]
     missing: tuple[str, ...]
     infra_failed: tuple[str, ...]
+    unavailable: tuple[str, ...] = ()
 
     @property
     def ready(self) -> bool:
-        return not self.pending and not self.failed and not self.missing and not self.infra_failed
+        return (
+            not self.pending
+            and not self.failed
+            and not self.missing
+            and not self.infra_failed
+            and not self.unavailable
+        )
 
 
-def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) -> CheckSummary:
+def summarize_checks(
+    checks: list[dict[str, Any]] | None, required: tuple[str, ...]
+) -> CheckSummary:
+    if checks is None:
+        # Command-level failure (gh returned no parseable check list). Every
+        # required check is reported as unavailable, not missing, so callers can
+        # distinguish a broken gh CLI from genuinely missing checks.
+        return CheckSummary(
+            required=required,
+            passed=(),
+            pending=(),
+            failed=(),
+            missing=(),
+            infra_failed=(),
+            unavailable=required,
+        )
+
     # Group all runs by name (multiple runs can share the same name, e.g., matrix legs)
     by_name: dict[str, list[dict[str, Any]]] = {}
     for check in checks:
@@ -91,4 +114,5 @@ def summarize_checks(checks: list[dict[str, Any]], required: tuple[str, ...]) ->
         failed=tuple(failed),
         missing=tuple(missing),
         infra_failed=tuple(infra_failed),
+        unavailable=(),
     )

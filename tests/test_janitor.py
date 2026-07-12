@@ -136,6 +136,13 @@ def test_required_check_missing_blocks() -> None:
     assert any("missing" in f.lower() and "Tests passed" in f for f in verdict.failures)
 
 
+def test_required_checks_unavailable_blocks() -> None:
+    verdict = run_janitor(_green_pr(), None, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert any("Checks unavailable (gh failure)" in f for f in verdict.failures)
+
+
 def test_required_check_pending_warns_not_fails() -> None:
     checks = [
         {"name": "Tests passed", "state": "PENDING"},
