@@ -2652,6 +2652,29 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
+def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
+    """Issue #257: a labeled issue with an open tracked PR must never be a
+    dispatch candidate, even with no state.json entry (label drift after
+    manual salvage or escalation churn) — GitHub's open-PR set is the
+    ground truth, not labels or state."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # The default FakeGitHub fixture is exactly the hazard case: issue 123 is
+    # labeled ready and has NO state entry, while open PR 456 tracks it.
+    assert app.gh.prs[0]["state"] == "OPEN"
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert not prompt_path.exists()
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
