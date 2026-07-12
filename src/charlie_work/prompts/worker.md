@@ -24,6 +24,10 @@ $section_scope_contract
 
 $section_api_shape_validation
 
+$section_parallel_investigation
+
+$section_config_parity
+
 ## Available skills
 
 The following skills are available to help you complete this task:
@@ -50,20 +54,18 @@ The following skills are available to help you complete this task:
    uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
    $section_execution_contract
-   For all other diffs, do NOT run the full suite locally — CI runs it on every push and is the
-   merge gate; a long silent local run also risks the session getting reaped
-   as stalled. The `/test` skill is a convenience shortcut but may not cover
+   The `/test` skill is a convenience shortcut but may not cover
    every impacted file — always use the explicit command for final
-   verification. Quote the exact command you ran AND the collected/passed count
-   in your completion report (e.g., "300 collected, 300 passed").
+   verification.
 6. Add or update regression tests unless not applicable.
-7. Use `/commit` to commit your changes with conventional format.
-8. Use `/preflight` to match CI (ruff, ruff-format, pre-commit). Commit anything it
+7. $section_ruff_preflight
+8. Use `/commit` to commit your changes with conventional format.
+9. Use `/preflight` to match CI (ruff, ruff-format, pre-commit). Commit anything it
    fixes — an uncommitted reflow or an un-normalized fixture is the #1 cause of a
    green-locally / red-on-CI PR, and the push/PR gate will block you on it.
-9. Use `/push` to push your branch to GitHub.
-10. Use `/create-pr` to create a pull request with proper formatting.
-11. Use `/complete` to finalize the session.
+10. Use `/push` to push your branch to GitHub.
+11. Use `/create-pr` to create a pull request with proper formatting.
+12. Use `/complete` to finalize the session.
 
 ## PR requirements
 
@@ -89,12 +91,17 @@ After your final commit:
    ```bash
    git push origin $branch_name
    ```
-2. Verify the PR exists and points at your commit:
+2. Verify the remote branch head matches your local HEAD:
+   ```bash
+   git ls-remote origin $branch_name
+   ```
+   The first column of the output must equal `git rev-parse HEAD`. If the SHAs do not match, retry the push until they do; do not report success.
+3. Verify the PR exists and points at your commit:
    ```bash
    gh pr view $branch_name --json headRefOid
    ```
    Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
-3. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
+4. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the task complete.
 

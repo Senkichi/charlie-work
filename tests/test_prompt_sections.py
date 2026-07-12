@@ -402,6 +402,48 @@ def test_worker_and_rework_templates_contain_body_reconciliation_requirement() -
         )
 
 
+def test_worker_prompts_require_git_ls_remote_push_verification() -> None:
+    """Verify that worker.md and worker_claude_code.md require a git ls-remote check after push (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "git ls-remote origin agent/issue-123-fix-search" in prompt
+        assert "git rev-parse HEAD" in prompt
+        assert "retry the push" in prompt
+
+
+def test_worker_prompts_require_config_parity_check() -> None:
+    """Verify that worker.md and worker_claude_code.md require config parity (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "config example file" in prompt
+        assert "counterpart" in prompt
+        assert "parity tests" in prompt
+
+
+def test_worker_prompts_require_ruff_preflight_before_commit() -> None:
+    """Verify that worker.md and worker_claude_code.md require ruff check + format before commit (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "uv run ruff check ." in prompt
+        assert "uv run ruff format ." in prompt
+        assert "Before committing" in prompt
+
+
+def test_worker_prompts_require_parallel_investigation() -> None:
+    """Verify that worker.md and worker_claude_code.md instruct parallel independent investigation (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "fan out independent investigation" in prompt
+        assert "in parallel" in prompt
+
+
+def test_worker_prompts_require_body_checklist_revalidation() -> None:
+    """Verify that worker.md and worker_claude_code.md require checklist revalidation at the final head (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "including the checklist" in prompt
+
+
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:
     """Verify that review.md contains the $test_adequacy_section placeholder (issue #180)."""
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"

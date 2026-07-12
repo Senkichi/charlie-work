@@ -58,8 +58,6 @@ After your final commit:
    uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
    $section_execution_contract
-   For all other diffs, do NOT run the full suite locally — CI runs it on push and is the merge
-   gate.
 2. Push your branch:
    ```bash
    git push origin $branch_name
