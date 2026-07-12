@@ -25,6 +25,10 @@ $section_scope_contract
 
 $section_api_shape_validation
 
+$section_parallel_investigation
+
+$section_config_parity
+
 ## Required implementation loop
 
 1. Branch off the current `main`:
@@ -42,18 +46,15 @@ $section_api_shape_validation
    uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
    $section_execution_contract
-   For all other diffs, do NOT run the full suite locally — CI runs the full matrix on push and is
-   the regression authority and merge gate; a long silent local run also
-   risks the session getting reaped as stalled. **You share this host's cores
-   and RAM with other concurrent workers** — if you use `pytest-xdist`, bound
+   **You share this host's cores and RAM with other concurrent workers** — if you use `pytest-xdist`, bound
    the pool (e.g. `-n 2`, not `-n auto`) so the fleet stays near one worker
-   per core instead of paging the machine into swap. Quote the exact command you ran
-   AND the collected/passed count in your completion report (e.g., "300 collected, 300 passed").
-7. Match CI locally before pushing and COMMIT anything the formatters touch — an
-   uncommitted reflow is the #1 cause of green-locally / red-on-CI.
+   per core instead of paging the machine into swap.
+7. $section_ruff_preflight
 8. Commit with a Conventional-Commits message (`type(scope): description`).
-9. Push: `git push -u origin $branch_name`.
-10. Open the PR (see requirements below).
+9. Match CI locally before pushing and COMMIT anything the formatters touch — an
+   uncommitted reflow is the #1 cause of green-locally / red-on-CI.
+10. Push: `git push -u origin $branch_name`.
+11. Open the PR (see requirements below).
 
 ## PR requirements
 
@@ -79,12 +80,17 @@ After your final commit:
    ```bash
    git push -u origin $branch_name
    ```
-2. Verify the PR exists and points at your commit:
+2. Verify the remote branch head matches your local HEAD:
+   ```bash
+   git ls-remote origin $branch_name
+   ```
+   The first column of the output must equal `git rev-parse HEAD`. If the SHAs do not match, retry the push until they do; do not report success.
+3. Verify the PR exists and points at your commit:
    ```bash
    gh pr view $branch_name --json headRefOid
    ```
    Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
-3. After verifying the push, re-read your PR body and make every claim literally true at the pushed head: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
+4. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
 
 Only when the PR head points at your pushed commit is the task complete.
 

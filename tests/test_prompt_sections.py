@@ -13,6 +13,10 @@ ISSUE_VALUES = {
     "issue_body": "Body text",
     "branch_name": "agent/issue-123-fix-search",
     "worker_model_tier": "capable",
+    "pr_number": 456,
+    "pr_title": "fix: search is broken",
+    "pr_url": "https://example.test/pull/456",
+    "review_summary": "Fix the typo in the search function.",
 }
 
 
@@ -40,28 +44,20 @@ def test_execution_contract_section_present_and_rendered() -> None:
     assert "section_execution_contract" in sections
     contract = sections["section_execution_contract"]
     assert "self-detect from your diff" in contract
+    assert "the default is the targeted command" in contract
     assert "public function signature" in contract
     assert "return shape" in contract
     assert "exception type" in contract
     assert "DB schema" in contract
     assert "module re-export" in contract
     assert "run the **FULL suite** locally at the final head before pushing" in contract
+    assert "For all other diffs, do NOT run the full suite locally" in contract
+    assert "CI runs it on every push and is the merge gate" in contract
+    assert "Quote the exact command you ran" in contract
 
-    for template_name in ("worker.md", "worker_claude_code.md"):
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         prompt = _render_worker_with_sections(template_name)
         assert contract in prompt
-
-    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
-    rework_values = {
-        "pr_number": 456,
-        "pr_title": "fix: search is broken",
-        "pr_url": "https://example.test/pull/456",
-        "issue_number": 123,
-        "review_summary": "Fix the typo in the search function.",
-        "branch_name": "agent/issue-123-fix-search",
-    }
-    rework_prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
-    assert contract in rework_prompt
 
 
 def test_api_shape_validation_section_present_and_rendered() -> None:
@@ -400,6 +396,48 @@ def test_worker_and_rework_templates_contain_body_reconciliation_requirement() -
             f"Template {template_name} does not contain the body-reconciliation requirement. "
             f"Expected to find: {body_reconciliation_text}"
         )
+
+
+def test_worker_prompts_require_git_ls_remote_push_verification() -> None:
+    """Verify that worker.md, worker_claude_code.md, and rework.md require a git ls-remote check after push (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "git ls-remote origin agent/issue-123-fix-search" in prompt
+        assert "git rev-parse HEAD" in prompt
+        assert "retry the push" in prompt
+
+
+def test_worker_prompts_require_config_parity_check() -> None:
+    """Verify that worker.md and worker_claude_code.md require config parity (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "config example file" in prompt
+        assert "counterpart" in prompt
+        assert "parity tests" in prompt
+
+
+def test_worker_prompts_require_ruff_preflight_before_commit() -> None:
+    """Verify that worker.md and worker_claude_code.md require ruff check + format before commit (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "uv run ruff check ." in prompt
+        assert "uv run ruff format ." in prompt
+        assert "Before committing" in prompt
+
+
+def test_worker_prompts_require_parallel_investigation() -> None:
+    """Verify that worker.md and worker_claude_code.md instruct parallel independent investigation (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "fan out independent investigation" in prompt
+        assert "in parallel" in prompt
+
+
+def test_worker_prompts_require_body_checklist_revalidation() -> None:
+    """Verify that worker.md, worker_claude_code.md, and rework.md require checklist revalidation at the final head (issue #256)."""
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "including the checklist" in prompt
 
 
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:

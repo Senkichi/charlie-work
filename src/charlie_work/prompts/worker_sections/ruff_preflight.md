@@ -1,0 +1,1 @@
+Before committing, run `uv run ruff check .` and `uv run ruff format .`. `ruff format` may modify files; `ruff check` only modifies files if you run it with `--fix`. Stage any changes the tools produce and include them in the same commit. Do not commit with uncommitted lint or formatting fixes.
