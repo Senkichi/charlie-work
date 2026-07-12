@@ -20,6 +20,7 @@ direct ``remove_issue_label`` calls only for label combinations that
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -240,7 +241,12 @@ def detect_drift(
         from .claude_code import update_worker_record_with_failure_classification
         from .devin_shell import update_session_record_with_failure_classification
         from .post_mortem import classify_and_record
-        from .worker import _log_is_stalled_at_shim, iter_workers, update_worker_log_stat
+        from .worker import (
+            _log_is_stalled_at_shim,
+            iter_workers,
+            real_activity_probe_for,
+            update_worker_log_stat,
+        )
 
         sessions_dir = repo_root / config.devin.sessions_dir
         if sessions_dir.is_dir():
@@ -250,12 +256,16 @@ def detect_drift(
                     live_session_issue_numbers.add(w.issue_number)
 
                 # Issue #221: detect launch_stalled sessions (alive but hung at shim marker)
-                # This check runs before the dead session check to catch zombies
+                # Issue #280: corroborate against real-session activity before killing.
                 if w.error is None and w.is_alive():
                     now = datetime.now(UTC)
                     log_path = Path(w.log_path)
+                    probe = real_activity_probe_for(w, config, now)
                     if _log_is_stalled_at_shim(
-                        log_path, config.watchdog.launch_stall_grace_minutes, now
+                        log_path,
+                        config.watchdog.launch_stall_grace_minutes,
+                        now,
+                        real_activity_probe=probe,
                     ):
                         # Session is alive but stalled at shim marker - classify as launch_stalled
                         if w.adapter_kind == "devin":
@@ -301,6 +311,7 @@ def detect_drift(
                                         )
                                         add_labels = (labels_cfg.ready,)
 
+                                    activity_payload = probe.to_payload()
                                     drift.append(
                                         DriftItem(
                                             kind="session_failed_relabeled",
@@ -308,8 +319,8 @@ def detect_drift(
                                             pr_number=None,
                                             detail=(
                                                 f"issue #{w.issue_number} session launch_stalled "
-                                                f"(hung at shim marker), no open PR, "
-                                                f"reconciling labels from {sorted(active_labels)} to dispatchable"
+                                                f"(hung at shim marker), activity_sources={json.dumps(activity_payload)}, "
+                                                f"no open PR, reconciling labels from {sorted(active_labels)} to dispatchable"
                                             ),
                                             fix_actions=tuple(fix_actions),
                                             remove_labels=tuple(sorted(active_labels)),
@@ -922,6 +933,7 @@ def apply_fixes(
                 "issue_number": item.issue_number,
                 "pr_number": item.pr_number,
                 "fix_actions": list(item.fix_actions),
+                "detail": item.detail,
             },
         )
 
