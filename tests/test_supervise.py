@@ -336,6 +336,123 @@ def test_has_delta_new_verdict_file_returns_true(tmp_path: Path) -> None:
     assert has_delta(snap1, snap2) is True
 
 
+def test_take_snapshot_excludes_launch_failure_sidecar(tmp_path: Path) -> None:
+    """Issue #266: a launch-failure sidecar (pid=None, error set) is not counted as live."""
+    import json
+    from charlie_work.devin_shell import SessionRecord
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+
+    sidecar = sessions / "issue-1.json"
+    sidecar.write_text(
+        json.dumps(
+            SessionRecord(
+                issue_number=1,
+                branch="agent/issue-1-x",
+                worktree_path="/tmp/worktree",
+                prompt_path="/tmp/prompt.md",
+                command=("devin",),
+                pid=None,
+                started_at="2024-01-01T00:00:00Z",
+                log_path="/tmp/issue-1.log",
+                error="worktree path already exists",
+            ).to_dict()
+        ),
+        encoding="utf-8",
+    )
+
+    snap = take_snapshot(sessions, prs)
+    assert snap.live_count == 0
+    assert len(snap.sidecar_mtimes) == 1
+
+
+def test_take_snapshot_counts_alive_workers_not_sidecar_files(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #266: live_count reflects actual live workers, not raw file count."""
+    import json
+    from charlie_work.devin_shell import SessionRecord
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+
+    sidecar = sessions / "issue-1.json"
+    sidecar.write_text(
+        json.dumps(
+            SessionRecord(
+                issue_number=1,
+                branch="agent/issue-1-x",
+                worktree_path="/tmp/worktree",
+                prompt_path="/tmp/prompt.md",
+                command=("devin",),
+                pid=12345,
+                started_at="2024-01-01T00:00:00Z",
+                log_path="/tmp/issue-1.log",
+            ).to_dict()
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    snap = take_snapshot(sessions, prs)
+    assert snap.live_count == 1
+
+
+def test_run_supervised_exits_with_launch_failure_sidecar(tmp_path: Path) -> None:
+    """Issue #266: loop exits when only a launch-failure sidecar is present."""
+    import json
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.config import SupervisorConfig
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    sidecar = sessions / "issue-1.json"
+    sidecar.write_text(
+        json.dumps(
+            SessionRecord(
+                issue_number=1,
+                branch="agent/issue-1-x",
+                worktree_path="/tmp/worktree",
+                prompt_path="/tmp/prompt.md",
+                command=("devin",),
+                pid=None,
+                started_at="2024-01-01T00:00:00Z",
+                log_path="/tmp/issue-1.log",
+                error="devin binary not found",
+            ).to_dict()
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = SupervisorConfig(
+        full_pass_interval_seconds=999,
+        active_cooldown_seconds=0,
+        max_runtime_minutes=999,
+    )
+    app = FakeApp(tmp_path, results=[], supervisor_cfg=cfg)
+    app._sessions_dir = sessions
+
+    def _remove_sidecar_and_drain(limit: Any = None, *, merge: Any = None) -> CommandResult:
+        sidecar.unlink(missing_ok=True)
+        return _drained_result()
+
+    app.loop = _remove_sidecar_and_drain
+
+    result = run_supervised(
+        app,
+        sleep=FakeClock().sleep,
+        clock=FakeClock().now,
+        max_passes=2,
+    )
+    assert result.ok is True
+    assert not sidecar.exists()
+
+
 # ---------------------------------------------------------------------------
 # Pass summary line: merged count reflects actual merges, not attempts
 # ---------------------------------------------------------------------------

@@ -7970,6 +7970,190 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     assert dispatch_result.data["selected_count"] == 0
 
 
+def test_loop_reaps_launch_failure_sidecar_and_reports_reaped(
+    tmp_path: Path,
+) -> None:
+    """Issue #266: loop() reaps launch-failure sidecars (pid=None, error set)
+    and reports them in the ``reaped`` section of the pass result.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(sessions_dir / "issue-42.log"),
+        error="devin binary not found",
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    result = app.loop(limit=0)
+
+    assert not sidecar_path.exists()
+    reaped = result.data.get("reaped", [])
+    assert len(reaped) == 1
+    assert reaped[0]["issue_number"] == 42
+    assert reaped[0]["failure_kind"] == "launch_failed"
+    assert reaped[0]["error"] == "devin binary not found"
+
+
+def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
+    tmp_path: Path,
+) -> None:
+    """Issue #266 + cross-family finding: a throttle-caused LAUNCH failure must
+    persist throttled_until exactly like the dead-session lane.
+
+    A launch-failure sidecar (pid=None, error set) whose log carries the
+    rate-limit signature is classified through the same failure classifier;
+    discarding its throttled_until would relaunch straight into the throttled
+    provider. This test MUST fail if the launch-failure branch drops the
+    classifier's throttle window.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime, timedelta
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="Reached overall message rate limit. Your limit will reset in 10 minutes.",
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    result = app.loop(limit=0)
+
+    # The launch-failure sidecar is reaped and reported
+    reaped = result.data.get("reaped", [])
+    matching = [entry for entry in reaped if entry["issue_number"] == 42]
+    assert len(matching) == 1
+    assert not sidecar_path.exists()
+
+    # The throttle window from the classifier is persisted, same as the
+    # dead-session lane
+    state = load_state(paths.state_file)
+    assert state.get("throttled_until") is not None
+    throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
+    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    assert abs((throttle_time - expected_time).total_seconds()) < 5
+
+
+def test_loop_pid_none_no_error_not_classified_as_launch_failed(
+    tmp_path: Path,
+) -> None:
+    """Issue #266: a pid=None + error=None sidecar is a dead session, not a launch failure.
+
+    The launch-failure branch must not fire here; the dead-session branch handles
+    it and does not tag it with failure_kind="launch_failed".
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(sessions_dir / "issue-42.log"),
+        error=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    result = app.loop(limit=0)
+
+    reaped = result.data.get("reaped", [])
+    # The record must actually be reaped (dead-session lane owns it) — a bare
+    # loop over a possibly-empty list would pass vacuously if the sidecar were
+    # skipped entirely, which is the old pin-the-loop-open behavior.
+    matching = [entry for entry in reaped if entry["issue_number"] == 42]
+    assert len(matching) == 1
+    assert matching[0]["failure_kind"] != "launch_failed"
+
+
 def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
     """Issue #118 AC3: classification pass relabel is idempotent - two-pass test.
 
