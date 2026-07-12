@@ -2533,6 +2533,49 @@ index 123..456 100644
     assert not any("test_one" in w or "test_two" in w for w in warnings)
 
 
+def test_check_stub_tests_async_helper_reference_not_assert_constant() -> None:
+    """A test asserting on a top-level async helper's name is not assert-constant.
+
+    _collect_test_defined_names must record AsyncFunctionDef names; otherwise
+    the helper name reads as an unknown external and the assertion is
+    misclassified as constant.
+    """
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/tests/test_feature.py
+@@ -0,0 +1,7 @@
++async def _drain_queue():
++    return 1
++
++
++def test_helper_is_exported():
++    handler = _drain_queue
++    assert handler is _drain_queue
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert not any("test_helper_is_exported" in w for w in warnings)
+
+
+def test_check_stub_tests_gutted_existing_async_body_is_flagged() -> None:
+    """An existing async test gutted to pass is flagged even if the def line is context."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,3 +1,2 @@
+ async def test_existing_async():
+-    result = await feature()
+-    assert result
++    pass
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert any("test_existing_async" in w for w in warnings)
+
+
 def test_run_janitor_appends_stub_warnings_from_pr_diff() -> None:
     """run_janitor calls check_stub_tests and adds its warnings to the verdict."""
     diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py

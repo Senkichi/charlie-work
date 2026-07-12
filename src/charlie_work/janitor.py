@@ -981,7 +981,7 @@ def _collect_test_defined_names(tree: ast.AST) -> frozenset[str]:
     """Collect top-level function, class, and assignment names in the test file."""
     names: set[str] = set()
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
