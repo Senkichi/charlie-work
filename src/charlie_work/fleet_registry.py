@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,27 @@ from .state import save_state, state_lock
 from .worker import iter_workers
 
 logger = logging.getLogger(__name__)
+
+# Intra-process serialization for try_acquire_fleet_lock.
+#
+# File locks (msvcrt.locking / fcntl.flock) serialize across PROCESSES, but
+# byte-range file locks are owned by the process, not the thread — two threads
+# in the SAME process may not be serialized by the file lock alone. A per-path
+# threading.Lock, acquired before the file lock attempt, restores deterministic
+# intra-process serialization.
+_FLEET_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_FLEET_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _fleet_thread_lock_for(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _FLEET_THREAD_LOCKS_GUARD:
+        lock = _FLEET_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _FLEET_THREAD_LOCKS[key] = lock
+        return lock
+
 
 FLEET_REGISTRY_VERSION = 1
 
@@ -182,6 +206,95 @@ def count_fleet_live_sessions(
         total_live_count += live_count
 
     return total_live_count, skipped_repos
+
+
+class FleetLock:
+    """Holds an OS-level non-blocking lock on ``fleet.lock`` for a dispatch window.
+
+    Released in ``__del__`` and explicit ``release()``; also released on process
+    death (OS closes all file handles).
+    """
+
+    def __init__(self, path: Path, handle: object) -> None:
+        self._path = path
+        self._handle = handle
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        # Unlock and close are independent failure modes: an msvcrt/fcntl
+        # unlock raising OSError must not skip closing the handle (that would
+        # leak the file descriptor and, on Windows, keep the lock file
+        # undeletable/unlockable by anyone else).
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        try:
+            self._handle.close()  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+    def __del__(self) -> None:
+        self.release()
+
+
+def try_acquire_fleet_lock(fleet_dir_override: str | None) -> FleetLock | None:
+    """Try to acquire the fleet-wide dispatch lock non-blocking.
+
+    Returns a ``FleetLock`` if acquired; ``None`` if another process (or thread)
+    holds it. Never raises. The lock is held across the read→dispatch window so
+    that independently-running supervised loops cannot over-dispatch against a
+    shared fleet-wide cap.
+    """
+    try:
+        lock_dir = fleet_dir(override=fleet_dir_override)
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "fleet.lock"
+        # Write 1 byte so msvcrt.locking(..., 1) has a byte range to lock.
+        if not lock_path.exists():
+            lock_path.write_bytes(b"\x00")
+
+        thread_lock = _fleet_thread_lock_for(lock_path)
+        if not thread_lock.acquire(blocking=False):
+            return None
+        try:
+            handle = lock_path.open("r+b", encoding=None)
+            if sys.platform == "win32":
+                import msvcrt
+
+                # Guard against a pre-existing 0-byte lock file.
+                if handle.seek(0, 2) == 0:
+                    handle.write(b"\x00")
+                    handle.flush()
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    handle.close()
+                    return None
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (IOError, BlockingIOError):
+                    handle.close()
+                    return None
+            return FleetLock(lock_path, handle)
+        finally:
+            thread_lock.release()
+    except OSError:
+        return None
 
 
 def count_fleet_runners(

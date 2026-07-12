@@ -15,7 +15,7 @@ from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
-from .fleet_registry import count_fleet_live_sessions
+from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .cross_family import (
     CrossFamilyResult,
@@ -1579,6 +1579,27 @@ class OrchestratorApp:
     def dispatch(
         self, limit: int | None = None, *, only_issues: str | None = None
     ) -> CommandResult:
+        fleet_lock = None
+        if self.config.fleet.global_max_concurrent_sessions > 0:
+            fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
+            if fleet_lock is None:
+                return CommandResult(
+                    True,
+                    "dispatch deferred: fleet lock held",
+                    {
+                        "selected_count": 0,
+                        "deferred_reason": "fleet_lock_held",
+                    },
+                )
+        try:
+            return self._dispatch_impl(limit, only_issues=only_issues)
+        finally:
+            if fleet_lock is not None:
+                fleet_lock.release()
+
+    def _dispatch_impl(
+        self, limit: int | None = None, *, only_issues: str | None = None
+    ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
 
@@ -1615,7 +1636,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.clamped:
+                if gov.enabled or gov.fleet_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -1755,7 +1776,7 @@ class OrchestratorApp:
                 ],
                 "stalled": stalled_entries,
             }
-            if gov.clamped:
+            if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -2030,7 +2051,7 @@ class OrchestratorApp:
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
         }
-        if gov.clamped:
+        if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
@@ -3607,8 +3628,20 @@ class OrchestratorApp:
             "reaped": reaped,
         }
         # Propagate concurrency info from dispatch results
-        if gov.enabled:
+        if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
+        # Prefer the dispatch-scoped governor values (they reflect sidecars
+        # written by this pass and the most accurate fleet-wide live count).
+        for lane in ("dispatch", "dispatch_rework"):
+            for key in (
+                "concurrency_limit",
+                "live_session_count",
+                "available_slots",
+                "fleet_concurrency_limit",
+                "fleet_live_session_count",
+            ):
+                if key in data[lane]:
+                    data[key] = data[lane][key]
         return CommandResult(
             ok,
             message,
@@ -3616,6 +3649,29 @@ class OrchestratorApp:
         )
 
     def dispatch_rework(
+        self, limit: int | None = None, *, only_issues: str | None = None
+    ) -> CommandResult:
+        """Dispatch rework workers for issues in needs-rework state with open PRs."""
+        fleet_lock = None
+        if self.config.fleet.global_max_concurrent_sessions > 0:
+            fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
+            if fleet_lock is None:
+                return CommandResult(
+                    True,
+                    "rework dispatch deferred: fleet lock held",
+                    {
+                        "adapter": self.config.devin.adapter,
+                        "selected_count": 0,
+                        "deferred_reason": "fleet_lock_held",
+                    },
+                )
+        try:
+            return self._dispatch_rework_impl(limit, only_issues=only_issues)
+        finally:
+            if fleet_lock is not None:
+                fleet_lock.release()
+
+    def _dispatch_rework_impl(
         self, limit: int | None = None, *, only_issues: str | None = None
     ) -> CommandResult:
         """Dispatch rework workers for issues in needs-rework state with open PRs.
@@ -3682,7 +3738,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.clamped:
+                if gov.enabled or gov.fleet_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -3732,7 +3788,7 @@ class OrchestratorApp:
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
             }
-            if gov.clamped:
+            if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -3786,7 +3842,7 @@ class OrchestratorApp:
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
             }
-            if gov.clamped:
+            if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -3857,7 +3913,7 @@ class OrchestratorApp:
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
             }
-            if gov.clamped:
+            if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -4020,7 +4076,7 @@ class OrchestratorApp:
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
         }
-        if gov.clamped:
+        if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
