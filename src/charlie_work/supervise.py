@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .worker import iter_workers
+
 if TYPE_CHECKING:
     from .workflow import CommandResult, OrchestratorApp
 
@@ -71,8 +73,20 @@ def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
             except OSError:
                 pass
 
+    # Count actual live workers, not just sidecar files. This correctly
+    # excludes terminal launch-failure sidecars (pid=None, error set) and
+    # dead workers while still using sidecar mtimes for delta detection.
+    live_count = 0
+    if sessions_dir.exists():
+        try:
+            live_count = sum(
+                1 for w in iter_workers(sessions_dir) if w.error is None and w.is_alive()
+            )
+        except Exception:
+            live_count = 0
+
     return LocalSnapshot(
-        live_count=len(sidecar_mtimes),
+        live_count=live_count,
         sidecar_mtimes=frozenset(sidecar_mtimes),
         verdict_mtimes=frozenset(verdict_mtimes),
     )
