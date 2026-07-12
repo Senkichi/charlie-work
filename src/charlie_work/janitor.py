@@ -52,6 +52,56 @@ _CONVENTIONAL_COMMIT_RE = re.compile(
     r"^(" + "|".join(sorted(CONVENTIONAL_COMMIT_TYPES)) + r")(\(|:|!)"
 )
 
+# External API/library call patterns. These are heuristic, not AST, and intentionally
+# broad: the gate is a warning, not a block, and the goal is to catch invented shapes.
+_LINE_EXTERNAL_API_RE = re.compile(
+    r"""
+    \bgh\s+api\b
+    |
+    \bcur[lL]\b
+    |
+    \bwget\b
+    |
+    \brequests\.(?:get|post|put|delete|patch|head|options)\b
+    |
+    \bhttpx\.(?:get|post|put|delete|patch|head|options)\b
+    |
+    \burllib\.request\.(?:urlopen|Request)\b
+    |
+    \bhttp\.client\.
+    |
+    \baiohttp\.(?:ClientSession|request|get|post)\b
+    |
+    ["']gh["']\s*,\s*["']api["']
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Multi-line gh.run / self.run / subprocess.run(["gh", "api", ...) calls.
+_MULTILINE_API_CALL_RE = re.compile(
+    r"""
+    # gh.run(["api", ...]) or self.run(["api", ...]) or any <x>.run(["api", ...])
+    # except subprocess.run, which is handled separately.
+    (?:\w+)?(?<!subprocess)\.run\s*\([^)]*?\[\s*["']api["'][^)]*\)
+    |
+    # subprocess.run(["gh", "api", ...])
+    subprocess\.run\s*\([^)]*?\[\s*["']gh["']\s*,\s*["']api["'][^)]*\)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Path segment that identifies a vendored test fixture directory.
+_FIXTURE_PATH_RE = re.compile(r"fixtures?[/\\]", re.IGNORECASE)
+
+# Evidence in the PR body that the real external API/library shape was verified.
+_LIVE_PAYLOAD_EVIDENCE_RE = re.compile(
+    r"(?:"
+    r"\b(?:live payload|live call|transcript|fixture|captured|doc link|gh api|curl|wget)\b|"
+    r"docs\.github\.com|api\.github\.com|https://docs\.|https://api\."
+    r")",
+    re.IGNORECASE,
+)
+
 # Oversized-diff warning threshold: additions + deletions above this line
 # count flags the PR as a warning (not a block) for reviewer awareness.
 _OVERSIZED_DIFF_THRESHOLD = 1500
@@ -188,6 +238,9 @@ def run_janitor(
     _check_diff_size(pr, warnings)
     _check_base_movement(pr, config, warnings)
 
+    if pr_diff is not None:
+        _check_external_api_fixtures(pr, pr_diff, config, warnings)
+
     # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
     if repo_root is not None:
         _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
@@ -311,6 +364,82 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def _check_external_api_fixtures(
+    pr: dict[str, Any],
+    pr_diff: str,
+    config: OrchestratorConfig,
+    warnings: list[str],
+) -> None:
+    """Warn when the diff adds an external API/library call without live-payload evidence.
+
+    The check is heuristic: it looks for added lines exercising ``gh api`` or HTTP
+    client libraries in product files, then requires either a vendored fixture file in
+    the diff or explicit evidence in the PR body. Test files and exempt files are
+    excluded from call detection; fixture files are detected by a ``fixtures/`` path
+    segment.
+    """
+    body = str(pr.get("body") or "")
+    if _LIVE_PAYLOAD_EVIDENCE_RE.search(body):
+        return
+
+    added_calls: list[str] = []
+    fixture_added = False
+    test_globs = config.test_adequacy.test_path_globs
+    exempt_globs = config.test_adequacy.exempt_path_globs
+
+    for filename, _is_new_file, hunk_lines in iter_diff_files(pr_diff):
+        if any(fnmatch.fnmatch(filename, glob) for glob in exempt_globs):
+            continue
+        if _FIXTURE_PATH_RE.search(filename):
+            fixture_added = True
+            continue
+        if any(fnmatch.fnmatch(filename, glob) for glob in test_globs):
+            continue
+
+        added_lines = [
+            line[1:] for line in hunk_lines if line.startswith("+") and not line.startswith("+++")
+        ]
+        added_content = "\n".join(added_lines)
+
+        multi_match = _MULTILINE_API_CALL_RE.search(added_content)
+        if multi_match:
+            added_calls.append(f"{_call_match_repr(multi_match)} in {filename}")
+            continue
+
+        for line in added_lines:
+            line_match = _LINE_EXTERNAL_API_RE.search(line)
+            if line_match:
+                added_calls.append(f"{_call_match_repr(line_match)} in {filename}")
+                break
+
+    if not added_calls:
+        return
+
+    if fixture_added:
+        return
+
+    if _LIVE_PAYLOAD_EVIDENCE_RE.search(body):
+        return
+
+    warnings.append(
+        "Diff adds external API/library call(s): "
+        + ", ".join(added_calls[:3])
+        + " with no test fixture sourced from a live payload or PR-body evidence. "
+        "Add a fixture under tests/fixtures/ or include a live call transcript / doc link in the PR body."
+    )
+
+
+def _call_match_repr(match: re.Match) -> str:
+    """Return a concise, single-line representation of an API-call regex match."""
+    text = match.group(0)
+    if "\n" in text:
+        text = text.splitlines()[0].strip() + "..."
+    text = text.strip()
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return text
 
 
 def _check_no_op_rework(

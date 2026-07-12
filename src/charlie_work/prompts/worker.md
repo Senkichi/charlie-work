@@ -22,6 +22,8 @@ $issue_body
 
 $section_scope_contract
 
+$section_execution_contract
+
 ## Available skills
 
 The following skills are available to help you complete this task:
