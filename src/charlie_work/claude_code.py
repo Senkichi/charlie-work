@@ -36,7 +36,7 @@ from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
-from .worktree import WorktreeInfo, create_worktree, remove_worktree
+from .worktree import WorktreeInfo, WorktreeUnsafeError, create_worktree, remove_worktree
 
 PROMPT_FILENAME = ".orchestrator-prompt.md"
 
@@ -305,6 +305,7 @@ def _error_record(
     command: tuple[str, ...],
     log_path: str,
     error: str,
+    failure_kind: str | None = None,
 ) -> ClaudeWorkerRecord:
     return ClaudeWorkerRecord(
         issue_number=issue_number,
@@ -316,6 +317,7 @@ def _error_record(
         started_at=utc_now(),
         log_path=log_path,
         error=error,
+        failure_kind=failure_kind,
     )
 
 
@@ -384,6 +386,7 @@ def launch_claude_worker(
             issue_number=issue_number,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        failure_kind = "worktree_unsafe" if isinstance(exc, WorktreeUnsafeError) else None
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -392,6 +395,7 @@ def launch_claude_worker(
             command=command_template,
             log_path=str(log_path),
             error=f"worktree creation failed: {exc}",
+            failure_kind=failure_kind,
         )
         return _write_record(sessions_dir, record)
 

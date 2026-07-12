@@ -37,7 +37,7 @@ from .post_mortem import merge_attempt_snapshot
 from .state import utc_now
 from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
-from .worktree import WorktreeInfo, create_worktree, remove_worktree
+from .worktree import WorktreeInfo, WorktreeUnsafeError, create_worktree, remove_worktree
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
@@ -338,6 +338,7 @@ def launch_devin_session(
             issue_number=issue_number,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        failure_kind = "worktree_unsafe" if isinstance(exc, WorktreeUnsafeError) else None
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
@@ -348,6 +349,7 @@ def launch_devin_session(
             started_at=utc_now(),
             log_path=str(log_path),
             error=f"worktree creation failed: {exc}",
+            failure_kind=failure_kind,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record

@@ -2438,6 +2438,7 @@ class FakeGitHub:
                 "body": "Closes #123\n\nTests: regression coverage added.",
                 "labels": [],
                 "isCrossRepository": False,
+                "state": "OPEN",
             }
         ]
         self.labels_added: list[tuple[int, str]] = []
@@ -2484,7 +2485,7 @@ class FakeGitHub:
         raise ValueError(f"Issue {number} not found")
 
     def pr_list(self):
-        return self.prs
+        return [pr for pr in self.prs if pr.get("state", "").upper() == "OPEN"]
 
     def pr_view(self, number: int):
         # Return the PR matching the requested number
@@ -2633,6 +2634,7 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -2658,6 +2660,7 @@ def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
 
     # Numbers not among the dispatchable candidates are skipped; only the
     # explicit, dispatchable match is selected (dependency-ordered waves).
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(only_issues="999, 123")
 
     assert result.ok is True
@@ -2670,6 +2673,7 @@ def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) ->
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
+    app.gh.prs[0]["state"] = "CLOSED"
     app.dispatch(limit=1)
 
     prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
@@ -2686,6 +2690,7 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
+    app.gh.prs[0]["state"] = "CLOSED"
     app.dispatch(limit=1)
 
     prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
@@ -2708,6 +2713,7 @@ def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> Non
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -2731,6 +2737,7 @@ def test_command_dispatch_failure_does_not_label_in_progress(tmp_path: Path) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is False
@@ -2790,6 +2797,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     with patch("charlie_work.worker.is_session_alive", return_value=True):
+        app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -2848,6 +2856,7 @@ def test_dispatch_oldest_first_by_default(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Dispatch 2 issues - should select oldest first (792, then 793)
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=2)
 
     assert result.ok is True
@@ -2906,6 +2915,7 @@ def test_dispatch_newest_first_with_config(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Dispatch 2 issues - should select newest first (808, then 793)
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=2)
 
     assert result.ok is True
@@ -3001,6 +3011,7 @@ def test_dispatch_sorts_by_out_degree_blocked_dependents(tmp_path: Path) -> None
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Dispatch 2 issues - should select Y (3 dependents) before X (0 dependents)
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=2)
 
     assert result.ok is True
@@ -3071,6 +3082,7 @@ def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
     # Dispatch should not crash on cyclic dependencies
     # Since A and B block each other, both should be filtered out
     # Only C should be dispatchable
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=2)
 
     assert result.ok is True
@@ -3129,6 +3141,7 @@ def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Dispatch all 3 - missing createdAt should sort last
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=3)
 
     assert result.ok is True
@@ -3269,6 +3282,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+        app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch(limit=1)
 
     # The stalled issue should be excluded from dispatch
@@ -4341,6 +4355,7 @@ def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is False
@@ -4648,6 +4663,7 @@ def test_dispatch_skips_prose_only_deps_labeled_issues(tmp_path: Path) -> None:
     fake_gh = ProseOnlyDepsGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=10)
 
     # Only issue 910 should be dispatched (908 is labeled with prose-only-deps)
@@ -4795,6 +4811,7 @@ def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path, mo
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -4831,6 +4848,7 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -4900,6 +4918,7 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
     save_state(paths.state_file, seed)
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -6438,6 +6457,7 @@ def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path:
         tmp.replace(sidecar_path)
         app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+        app.gh.prs[0]["state"] = "OPEN"
         result = app.dispatch(limit=3)
 
         assert result.data["attempted_count"] == 0  # not re-dispatched
@@ -6457,8 +6477,8 @@ def test_dispatch_recovers_dead_worker_without_open_pr(tmp_path: Path) -> None:
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    # Override prs to return empty list (no open PRs)
-    fake_gh.prs = []
+    # Mark the default PR as closed so the issue is considered dispatchable.
+    fake_gh.prs[0]["state"] = "CLOSED"
     # Simulate a prior dispatch that crashed before PR opened
     seed = load_state(paths.state_file)
     seed["issues"]["123"] = {
@@ -6496,6 +6516,7 @@ def test_dispatch_recovers_dead_worker_without_open_pr(tmp_path: Path) -> None:
     tmp.replace(sidecar_path)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=3)
 
     # The issue should be re-dispatched since the worker is dead and there's no open PR
@@ -6522,6 +6543,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
             "title": "Fix issue 123",
             "headRefName": "agent/issue-123",
             "url": "https://github.com/test/repo/pull/456",
+            "state": "OPEN",
             "isCrossRepository": False,
         }
     ]
@@ -6562,6 +6584,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
     tmp.replace(sidecar_path)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "OPEN"
     result = app.dispatch(limit=3)
 
     # The issue should NOT be re-dispatched since there's an open PR
@@ -6597,6 +6620,7 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     # Worker launched and recorded even though labeling failed - no crash.
@@ -6614,6 +6638,7 @@ def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(only_issues="123,999")
 
     assert result.data["skipped_issue_numbers"] == [999]
@@ -6633,6 +6658,7 @@ def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> Non
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # First dispatch creates a dispatch_pending claim
+    app.gh.prs[0]["state"] = "CLOSED"
     first_result = app.dispatch(limit=1)
     assert first_result.data["attempted_count"] == 1
 
@@ -6648,6 +6674,7 @@ def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> Non
     save_state(paths.state_file, state)
 
     # Second dispatch should be blocked by the fresh claim
+    app.gh.prs[0]["state"] = "CLOSED"
     second_result = app.dispatch(limit=1)
     assert second_result.data["attempted_count"] == 0  # Blocked by claim
 
@@ -6691,6 +6718,7 @@ def test_stale_dispatch_pending_claim_is_redispatchable(tmp_path: Path, monkeypa
     save_state(paths.state_file, seed)
 
     # Dispatch should re-dispatch the stale claim
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     assert result.data["attempted_count"] == 1  # Re-dispatched
@@ -6909,6 +6937,7 @@ def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
     )
 
     # Run dry-run dispatch
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Verify the result indicates dry-run
@@ -6995,6 +7024,7 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
     fake_gh = FakeGitHubWithDryRunDependencyGate()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     # Only the eligible issue should be selected (blocked issue doesn't consume slot)
@@ -7311,6 +7341,7 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Step 1: Fresh dispatch marks the issue as dispatched
+    app.gh.prs[0]["state"] = "CLOSED"
     dispatch_result = app.dispatch(limit=1)
     assert dispatch_result.ok is True
     assert dispatch_result.data["selected_count"] == 1
@@ -7336,6 +7367,7 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
 
     # Step 4: dispatch_rework SELECTS the issue and launches via command adapter
     # The issue already has needs-rework label from the request_changes transition
+    app.gh.prs[0]["state"] = "OPEN"
     rework_result = app.dispatch_rework()
 
     # Verify dispatch_rework selected and launched the issue
@@ -7372,6 +7404,7 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Step 1: Fresh dispatch marks the issue as dispatched
+    app.gh.prs[0]["state"] = "CLOSED"
     dispatch_result = app.dispatch(limit=1)
     assert dispatch_result.ok is True
     assert dispatch_result.data["selected_count"] == 1
@@ -7462,6 +7495,7 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Step 1: Fresh dispatch
+    app.gh.prs[0]["state"] = "CLOSED"
     dispatch_result = app.dispatch(limit=1)
     assert dispatch_result.ok is True
 
@@ -7846,6 +7880,7 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
         }
     ]
 
+    app.gh.prs[0]["state"] = "CLOSED"
     dispatch_result = app.dispatch(limit=1)
     # Dispatch should be deferred due to throttle (ok=False is expected for deferral)
     assert dispatch_result.ok is False
@@ -8180,6 +8215,7 @@ def test_classify_dead_sessions_dispatch_recovery_integration(tmp_path: Path) ->
         save_state(paths.state_file, state)
 
     # Step 2: Run dispatch pass - should select the relabeled issue
+    app.gh.prs[0]["state"] = "CLOSED"
     dispatch_result = app.dispatch(limit=1)
 
     # Verify dispatch selected the issue
@@ -9183,6 +9219,7 @@ def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should dispatch normally without concurrency clamping
@@ -9210,6 +9247,7 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should clamp to 0 since 2 sessions are alive and cap is 2
@@ -9306,6 +9344,7 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should allow only 1 launch since 1 session is alive and cap is 2
@@ -9399,6 +9438,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Request dispatch of all 3 issues, but cap is 2
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(only_issues="101,102,103")
 
     # Should dispatch exactly 2, defer the third
@@ -9470,6 +9510,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Request dispatch of all 3 issues, but only 1 slot available (2 cap - 1 live)
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(only_issues="101,102,103")
 
     # Should dispatch exactly 1, defer the other 2
@@ -9540,6 +9581,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Request dry-run dispatch of all 3 issues, but cap is 2
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(only_issues="101,102,103")
 
     # Should report exactly 2 would be dispatched, third deferred
@@ -9624,6 +9666,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "body": "Closes #101",
                     "labels": [],
                     "isCrossRepository": False,
+                    "state": "OPEN",
                 },
                 {
                     "number": 457,
@@ -9634,6 +9677,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "body": "Closes #102",
                     "labels": [],
                     "isCrossRepository": False,
+                    "state": "OPEN",
                 },
                 {
                     "number": 458,
@@ -9644,6 +9688,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                     "body": "Closes #103",
                     "labels": [],
                     "isCrossRepository": False,
+                    "state": "OPEN",
                 },
             ]
 
@@ -9742,6 +9787,7 @@ def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeyp
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should dispatch normally without fleet concurrency clamping
@@ -9771,6 +9817,7 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should clamp to 0 since fleet cap is 3 and fleet live is 3
@@ -9803,6 +9850,7 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Fleet cap (1) is tighter than per-repo cap (2), so should clamp to 0
@@ -9837,6 +9885,7 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeyp
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Per-repo cap (1) is tighter than fleet cap (5), so should clamp to 0
@@ -10254,6 +10303,7 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                     "headRefOid": "abc123",
                     "isCrossRepository": False,
                     "headRefName": "agent/issue-123",
+                    "state": "OPEN",
                 },
                 {
                     "number": 457,
@@ -10262,6 +10312,7 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                     "headRefOid": "def456",
                     "isCrossRepository": False,
                     "headRefName": "agent/issue-124",
+                    "state": "OPEN",
                 },
             ]
 
@@ -10554,6 +10605,7 @@ def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
         state = set_throttled_until(state, throttled_until)
         save_state(paths.state_file, state)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should defer with provider_throttled reason
@@ -10584,6 +10636,7 @@ def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
         state = set_throttled_until(state, throttled_until)
         save_state(paths.state_file, state)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
 
     # Should proceed normally (not throttled)
@@ -10971,6 +11024,7 @@ def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
     fake_gh = FakeGitHubWithBlockers()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=10)
 
     # Issue 752 should be skipped due to open blocker #743
@@ -11046,6 +11100,7 @@ def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
     fake_gh = FakeGitHubWithClosedBlocker()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=10)
 
     # Issue 752 should be dispatched since blocker is closed
@@ -11127,6 +11182,7 @@ def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
     fake_gh = FakeGitHubWithMultipleBlockers()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=10)
 
     # Issue 752 should be skipped since #744 is still open
@@ -11176,6 +11232,7 @@ def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
 
     # Capture warning logs
     with patch("logging.Logger.warning") as mock_warning:
+        app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch(limit=10)
 
         # Issue should be dispatched (self-reference filtered out)
@@ -11539,6 +11596,7 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
     fake_gh = FakeGitHubWithSlotTest()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
 
     # Only the eligible issue should dispatch (blocked issue doesn't consume slot)
@@ -12249,6 +12307,7 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
         # dispatch():~1180) before checking is_throttled — keep the same mocks active
         # so this second reap pass over the already-classified sidecar stays cheap
         # and deterministic instead of shelling out to real process/PowerShell calls.
+        app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch()
 
     assert result.ok is False
@@ -12856,6 +12915,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Call dispatch() with max_concurrent_sessions > 0
+    app.gh.prs[0]["state"] = "CLOSED"
     app.dispatch()
 
     # Verify stall detection was called exactly once
@@ -14356,6 +14416,9 @@ def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp,
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
+    # Ensure PRs passed into loop tests are treated as open even if callers omit state.
+    for pr in prs:
+        pr.setdefault("state", "OPEN")
     fake_gh.prs = prs
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     return app, fake_gh
