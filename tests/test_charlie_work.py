@@ -9060,6 +9060,90 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     assert "session_failed_escalated" in event_kinds
 
 
+def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #288: a launch result whose sidecar carries failure_kind=worktree_unsafe
+    must escalate immediately, bypass the redispatch cap, and not be relabeled to ready.
+    A subsequent dispatch pass must not select the issue.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.ready}],
+        }
+    ]
+    fake_gh.prs = []  # No open PR — the ordinary relabel path would fire here.
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Launch failure — process never started
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # No hot relabel-to-ready.
+    assert (42, config.labels.ready) not in fake_gh.labels_added
+    # Escalation transition added human_needed.
+    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # The launch never succeeded, so the issue should not be marked in_progress.
+    assert (42, config.labels.in_progress) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"]["42"]
+    assert issue_entry["status"] == "escalated"
+    assert issue_entry["escalation_reason"] == "worktree_unsafe"
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
+    assert "session_failed_relabeled" not in event_kinds
+    assert "session_failed_escalated" in event_kinds
+
+    fake_gh.issues[0]["labels"].append({"name": config.labels.human_needed})
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+    assert result.data["selected_count"] == 0
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig

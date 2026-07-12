@@ -11,6 +11,10 @@ from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
+DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worker_blocked", "worktree_unsafe"}
+)
+
 
 class ConfigError(ValueError):
     """A config file was structurally invalid (unknown keys, wrong shapes)."""

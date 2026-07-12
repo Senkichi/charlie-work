@@ -13,7 +13,7 @@ from typing import Any
 from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .checks import CheckSummary, summarize_checks
-from .config import CrossFamilyConfig, OrchestratorConfig
+from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .cross_family import (
@@ -824,6 +824,41 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     state = set_throttled_until(state, throttled_until)
                     save_state(state_file, state)
+
+            if (
+                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                and w.issue_number not in open_prs_by_issue
+            ):
+                try:
+                    issue = gh.issue_view(w.issue_number)
+                except Exception:
+                    issue = None
+                issue_labels = label_names(issue) if issue else set()
+                active_labels = issue_labels & config.labels.active
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    entry = state["issues"].get(str(w.issue_number), {})
+                    now = datetime.now(UTC)
+                    redispatch_at = [now.isoformat().replace("+00:00", "Z")]
+                    entry["status"] = "escalated"
+                    entry["escalation_reason"] = failure_kind
+                    entry.pop("worker_pid", None)
+                    entry.pop("worker_process_start_time", None)
+                    state["issues"][str(w.issue_number)] = entry
+                    save_state(state_file, state)
+                    transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                    state = append_event(
+                        state,
+                        "session_failed_escalated",
+                        {
+                            "issue_number": w.issue_number,
+                            "failure_kind": failure_kind,
+                            "removed_labels": sorted(active_labels),
+                            "redispatch_count": len(redispatch_at),
+                        },
+                    )
+                    save_state(state_file, state)
+
             w.reap_sidecar(sessions_dir)
             reaped.append(
                 {
@@ -877,12 +912,8 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # Diagnostic post-mortem; its worker_blocked verdict is ignored
                 # because the worktree itself proves the work was completed.
                 classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                worker_blocked = False
             else:
-                worker_blocked = (
-                    classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                    == "worker_blocked"
-                )
+                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
                 fallback_kind = "stalled" if inspection.state != WorktreeState.UNKNOWN else None
                 if w.adapter_kind == "devin":
                     failure_kind, throttled_until = (
@@ -979,12 +1010,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # generic stall/crash. Hot-redispatching it just repeats the
                     # same block, so it bypasses the redispatch-count cap entirely
                     # and escalates on the very first occurrence.
-                    if worker_blocked or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+                    terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    if (
+                        terminal_failure
+                        or len(redispatch_at) > config.watchdog.max_auto_redispatch
+                    ):
                         # Escalate to human review instead of relabeling to ready
                         entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
                         entry["escalation_reason"] = (
-                            "worker_blocked" if worker_blocked else "redispatch_cap_exceeded"
+                            failure_kind if terminal_failure else "redispatch_cap_exceeded"
                         )
                         # Issue #282: preserve the liveness fingerprint for the
                         # recovery path. The PID is already verified dead by the
