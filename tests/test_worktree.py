@@ -9,6 +9,7 @@ import pytest
 from charlie_work.worktree import (
     WorktreeInfo,
     WorktreeState,
+    WorktreeUnsafeError,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -881,16 +882,10 @@ def test_recovery_fetch_fallback_on_missing_remote_branch(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
-def test_redispatch_preserves_attempt_ref_before_branch_reset(tmp_path: Path) -> None:
-    """Issue #261: a redispatch that resets a branch with unpushed commits
-    (fetch-fallback recovery path, issue #110) must preserve the old tip
-    under refs/charlie/attempts/issue-<n>/attempt-1 before ``git branch -D``
-    destroys it — that tip is the only surviving record of a worker that
-    died after committing real work but before its first push (e.g. blocked
-    by a .devin push-gate hook).
+def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> None:
+    """Issue #257: a redispatch with local commits not on the remote branch
+    must hard-refuse to reset the worktree rather than discarding work.
     """
-    from charlie_work.attempt_refs import ATTEMPT_REF_PREFIX
-
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
     repo_root = tmp_path / "repo"
@@ -906,36 +901,26 @@ def test_redispatch_preserves_attempt_ref_before_branch_reset(tmp_path: Path) ->
     work_file.write_text("unpushed work\n", encoding="utf-8")
     _git(info1.path, "add", "work.txt")
     _git(info1.path, "commit", "-m", "worker commit before death")
-    pre_reset_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
 
-    # Redispatch: fetch-fallback recovery detects no remote branch and
-    # resets, but must snapshot the tip first.
-    info2 = create_worktree(
-        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=261
-    )
+    # Redispatch must refuse to reset the worktree because it has local commits.
+    with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
+        create_worktree(
+            repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=261
+        )
 
-    assert info2.reclaimed == "fetch-fallback"
-    assert info2.attempt_snapshot is not None
-    assert info2.attempt_snapshot.error is None
-    assert info2.attempt_snapshot.old_tip == pre_reset_tip
-    assert info2.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-261/attempt-1"
-
-    # The ref must actually resolve to the pre-reset tip in the main repo's
-    # object store, independent of the (now-deleted) branch.
-    preserved = _git(repo_root, "rev-parse", info2.attempt_snapshot.ref_name).stdout.strip()
-    assert preserved == pre_reset_tip
+    # The original worktree and branch must remain intact.
+    assert info1.path.exists()
+    branches = _git(repo_root, "branch", "--list", branch_name).stdout.strip()
+    assert branch_name in branches
 
     # Clean up
-    remove_worktree(repo_root, info2.path)
+    remove_worktree(repo_root, info1.path)
 
 
-def test_second_redispatch_increments_attempt_number(tmp_path: Path) -> None:
-    """Issue #261: a second dead-and-redispatched attempt for the same issue
-    must snapshot to attempt-2, not overwrite attempt-1 — each attempt's tip
-    is independently recoverable.
+def test_second_redispatch_refuses_with_unpushed_commits(tmp_path: Path) -> None:
+    """Issue #257: each redispatch with local commits not on the remote branch
+    must hard-refuse to reset; the worktree is left intact.
     """
-    from charlie_work.attempt_refs import ATTEMPT_REF_PREFIX, list_attempt_refs
-
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
     repo_root = tmp_path / "repo"
@@ -949,40 +934,18 @@ def test_second_redispatch_increments_attempt_number(tmp_path: Path) -> None:
     (info1.path / "attempt1.txt").write_text("attempt 1\n", encoding="utf-8")
     _git(info1.path, "add", "attempt1.txt")
     _git(info1.path, "commit", "-m", "attempt 1 work")
-    attempt1_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
 
-    info2 = create_worktree(
-        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
-    )
-    assert info2.attempt_snapshot is not None
-    assert info2.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-1"
-    assert info2.attempt_snapshot.old_tip == attempt1_tip
+    with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
+        create_worktree(
+            repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
+        )
 
-    # Attempt 2: also dies with unpushed work.
-    (info2.path / "attempt2.txt").write_text("attempt 2\n", encoding="utf-8")
-    _git(info2.path, "add", "attempt2.txt")
-    _git(info2.path, "commit", "-m", "attempt 2 work")
-    attempt2_tip = _git(repo_root, "rev-parse", branch_name).stdout.strip()
-    assert attempt2_tip != attempt1_tip
-
-    info3 = create_worktree(
-        repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
-    )
-    assert info3.attempt_snapshot is not None
-    assert info3.attempt_snapshot.ref_name == f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-2"
-    assert info3.attempt_snapshot.old_tip == attempt2_tip
-
-    refs = list_attempt_refs(repo_root, 262)
-    assert refs == (
-        f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-1",
-        f"{ATTEMPT_REF_PREFIX}/issue-262/attempt-2",
-    )
-    # Attempt 1's tip must still be independently resolvable.
-    preserved1 = _git(repo_root, "rev-parse", refs[0]).stdout.strip()
-    assert preserved1 == attempt1_tip
+    # The original worktree remains intact.
+    assert info1.path.exists()
+    assert (info1.path / "attempt1.txt").exists()
 
     # Clean up
-    remove_worktree(repo_root, info3.path)
+    remove_worktree(repo_root, info1.path)
 
 
 def test_recovery_stale_worktree_pruned_on_missing_directory(tmp_path: Path) -> None:
@@ -1068,11 +1031,9 @@ def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
-    """Issue #110: Fresh dispatch with dirty stale worktree should salvage and recreate.
-
-    When a stale worktree exists with dirty changes (not in recovery mode),
-    fresh dispatch should salvage the work, remove the worktree, and create fresh.
+def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
+    """Issue #257: Fresh dispatch with a dirty stale worktree must hard-refuse
+    to reset rather than discarding uncommitted modifications.
     """
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo, bare=True)
@@ -1096,40 +1057,16 @@ def test_fresh_dispatch_dirty_worktree_salvaged(tmp_path: Path) -> None:
     )
     assert status_result.stdout.strip()
 
-    # Fresh dispatch should salvage and recreate
-    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    # Fresh dispatch must refuse to reset the dirty worktree.
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo_root, branch_name, base_ref="HEAD")
 
-    # Should be a fresh worktree (same path, but recreated)
-    assert info2.path == info1.path
-    assert info2.path.exists()
-    assert info2.reclaimed == "salvaged"
-    # The dirty file should NOT be there (it was salvaged)
-    assert not (info2.path / "dirty.txt").exists()
-
-    # Verify salvage ref was created locally
-    salvage_refs = subprocess.run(
-        ["git", "show-ref"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    assert salvage_refs.returncode == 0
-    # The salvage ref should be in the output (it's under refs/salvage/)
-    assert "salvage/" in salvage_refs.stdout or "refs/salvage/" in salvage_refs.stdout
-
-    # Verify salvage ref was pushed to origin
-    remote_refs = subprocess.run(
-        ["git", "show-ref"],
-        cwd=remote_repo,
-        capture_output=True,
-        text=True,
-    )
-    assert remote_refs.returncode == 0
-    # The salvage ref should be in the output (it's under refs/salvage/)
-    assert "salvage/" in remote_refs.stdout or "refs/salvage/" in remote_refs.stdout
+    # The original worktree and the dirty file must remain intact.
+    assert info1.path.exists()
+    assert (info1.path / "dirty.txt").exists()
 
     # Clean up
-    remove_worktree(repo_root, info2.path)
+    remove_worktree(repo_root, info1.path)
 
 
 def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
@@ -1298,11 +1235,13 @@ def test_recovery_transient_fetch_failure_via_probe_aborts(tmp_path: Path) -> No
     remove_worktree(repo_root, info1.path)
 
 
-def test_salvage_push_failure_survives_worktree(tmp_path: Path) -> None:
-    """Issue #110: Salvage push failure should surface error and leave worktree intact.
+def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
+    tmp_path: Path,
+) -> None:
+    """Issue #257: A dirty worktree must be refused even if the remote is broken.
 
-    When the salvage push to origin fails, the worktree should NOT be removed.
-    The error should be surfaced as a value in the dispatch result.
+    The salvage path is no longer used; the guard should refuse to reset before
+    any push is attempted and leave the worktree intact.
     """
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -1329,8 +1268,8 @@ def test_salvage_push_failure_survives_worktree(tmp_path: Path) -> None:
     # Break the origin remote to simulate push failure
     _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
 
-    # Fresh dispatch should fail on salvage push, leaving worktree intact
-    with pytest.raises(RuntimeError, match="Failed to push salvage ref"):
+    # Fresh dispatch should refuse to reset the dirty worktree without trying to push.
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
     # Verify the worktree still exists (not removed)
@@ -1343,13 +1282,11 @@ def test_salvage_push_failure_survives_worktree(tmp_path: Path) -> None:
     remove_worktree(repo_root, info1.path, force=True)
 
 
-def test_dirty_probe_failure_treats_as_dirty(tmp_path: Path) -> None:
-    """Issue #110: Failed dirty-probe should treat as dirty (safe default), not clean.
+def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
+    """Issue #257: Failed dirty-probe should be treated as dirty and refused.
 
     When git status --porcelain fails (index lock, corruption, permissions),
-    the code should treat the worktree as dirty (salvage/abort) rather than clean
-    (which would trigger force removal without salvage). This test verifies that
-    nothing is removed when the probe fails and salvage also fails.
+    the guard should refuse to reset rather than risk discarding work.
     """
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
@@ -1384,12 +1321,9 @@ def test_dirty_probe_failure_treats_as_dirty(tmp_path: Path) -> None:
     charlie_work.worktree.run_captured = mock_run_captured
 
     try:
-        # Break the origin remote to ensure salvage push also fails
-        _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
-
-        # Fresh dispatch should treat the failed probe as dirty and attempt salvage
-        # Since salvage push fails, the worktree should NOT be removed
-        with pytest.raises(RuntimeError, match="Failed to salvage stale worktree"):
+        # Fresh dispatch should refuse to reset because the probe could not confirm
+        # the worktree is clean.
+        with pytest.raises(WorktreeUnsafeError, match="worktree status probe failed"):
             create_worktree(repo_root, branch_name, base_ref="HEAD")
 
         # Verify the worktree still exists (not removed)
