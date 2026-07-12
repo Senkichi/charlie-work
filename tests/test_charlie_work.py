@@ -8789,6 +8789,122 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
 
+def test_classify_dead_rework_session_returns_to_rework_requested(
+    tmp_path: Path,
+) -> None:
+    """Issue #295: a dead/launch-failed rework session with an open PR and a
+    rework prompt on disk must be restored to rework_requested so the next
+    dispatch_rework can re-select it.
+
+    Mutation gate: dropping the rework prompt fallback or the rework_requested
+    status rollback from _classify_dead_sessions_and_update_throttle_state fails
+    this test.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    # Issue is stuck in the dispatched state with the rework worker label.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    # PR state does not include a recorded request_changes decision; the rework
+    # prompt on disk is the only fallback signal.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "prompt_path": str(paths.prs / "pr-456" / "rework-prompt.md"),
+            "redispatch_at": ["2020-01-01T00:00:00Z"],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+        }
+        save_state(paths.state_file, state)
+
+    # Create the rework prompt on disk (the rework brief).
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # Create a sessions directory with a launch-failure sidecar (rate-limit signature).
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(rework_prompt),
+        command=("devin", "--prompt-file", str(rework_prompt)),
+        pid=None,  # launch-failure sidecar
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # Run the reap pass.
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    # Verify state was restored to rework_requested for the owning lane.
+    state = load_state(paths.state_file)
+    entry = state["issues"].get("123")
+    assert entry is not None
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+    # redispatch_at history must be preserved (not cleared by the reap)
+    assert entry.get("redispatch_at") == ["2020-01-01T00:00:00Z"]
+    # Liveness fingerprint preserved for recovery path (issue #282)
+    assert entry.get("worker_pid") == 99999
+    assert entry.get("worker_process_start_time") == 1234567890.0
+    # Label transitioned from in_progress to needs_rework
+    assert (123, config.labels.in_progress) in fake_gh.labels_removed
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    # Next dispatch_rework should re-select the issue.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["sessions"][0]["issue_number"] == 123
+    assert str(result.data["sessions"][0]["prompt_path"]).endswith("rework-prompt.md")
+
+
 def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispatch(
     tmp_path: Path,
 ) -> None:

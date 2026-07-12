@@ -58,7 +58,7 @@ from .state import (
     utc_now,
 )
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
-from .worker import WorkerHealth
+from .worker import WorkerHealth, WorkerView
 
 
 @dataclass(frozen=True)
@@ -751,6 +751,110 @@ def _sweep_orphan_processes_for_dead_sessions(
                 save_state(state_file, state)
 
 
+def _rework_pr_for_worker(
+    open_prs_by_issue: dict[int, list[dict[str, Any]]],
+    worker: WorkerView,
+) -> dict[str, Any] | None:
+    """Return the most likely open PR for a dead/launch-failed rework worker.
+
+    Prefer the PR whose ``headRefName`` matches the worker's branch, falling back
+    to the lowest PR number for the issue.
+    """
+    prs = open_prs_by_issue.get(worker.issue_number, [])
+    if not prs:
+        return None
+    for pr in prs:
+        if pr.get("headRefName") == worker.branch:
+            return pr
+    return min(prs, key=lambda pr: int(pr["number"]))
+
+
+def _reap_restore_rework_requested(
+    state_file: Path,
+    gh: GitHub,
+    config: OrchestratorConfig,
+    open_prs_by_issue: dict[int, list[dict[str, Any]]],
+    worker: WorkerView,
+    failure_kind: str | None = None,
+) -> None:
+    """Restore a dead/launch-failed rework worker to ``rework_requested``.
+
+    Called when a reaped session has an open linked PR. If the PR has a
+    recorded ``request_changes`` verdict and the head hasn't changed, or a
+    rework prompt exists on disk, the issue is returned to ``rework_requested``
+    so ``dispatch_rework`` can re-select it. The stale ``in_progress`` label is
+    replaced with ``needs_rework``.
+
+    Issue #295: this is the rework counterpart to the no-open-PR relabel path.
+    It preserves ``redispatch_at`` and the escalation cap, and does not clear the
+    liveness fingerprint (``worker_pid`` / ``worker_process_start_time``).
+    """
+    pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
+    if pr_data is None:
+        return
+
+    pr_number = int(pr_data["number"])
+    live_head_sha = pr_data.get("headRefOid")
+    prs_dir = state_file.parent / "prs"
+    rework_prompt_path = prs_dir / f"pr-{pr_number}" / "rework-prompt.md"
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        entry = state["issues"].get(str(worker.issue_number), {})
+        if not isinstance(entry, dict) or entry.get("status") != "dispatched":
+            return
+
+        pr_state = state.get("prs", {}).get(str(pr_number), {})
+        last_decision = pr_state.get("decision")
+        reviewed_head_sha = pr_state.get("reviewed_head_sha")
+
+        has_request_changes = (
+            last_decision == "request_changes"
+            and reviewed_head_sha is not None
+            and live_head_sha is not None
+            and reviewed_head_sha == live_head_sha
+        )
+        has_rework_prompt = rework_prompt_path.exists()
+
+        if not has_request_changes and not has_rework_prompt:
+            return
+
+        entry["status"] = "rework_requested"
+        entry["dispatched_at"] = None
+        # Preserve redispatch_at and worker_pid (issues #165, #282, #295)
+        state["issues"][str(worker.issue_number)] = entry
+        state = append_event(
+            state,
+            "rework_requeued",
+            {
+                "issue_number": worker.issue_number,
+                "pr_number": pr_number,
+                "failure_kind": failure_kind,
+                "previous_status": "dispatched",
+                "reason": "dead_rework_session_recovered",
+                "has_request_changes": has_request_changes,
+                "has_rework_prompt": has_rework_prompt,
+            },
+        )
+        save_state(state_file, state)
+
+    # Transition labels to rework_requested (needs_rework), removing the stale
+    # in_progress label from the failed launch.
+    result = transition(gh, config.labels, worker.issue_number, "rework_requested")
+    if result.outcome != TransitionOutcome.APPLIED:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            entry = state["issues"].get(str(worker.issue_number), {})
+            entry["label_error"] = {
+                "edge": "rework_requested",
+                "outcome": result.outcome.value,
+                "add_failures": result.add_failures,
+                "remove_failures": result.remove_failures,
+            }
+            state["issues"][str(worker.issue_number)] = entry
+            save_state(state_file, state)
+
+
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path, state_file: Path, gh: GitHub, config: OrchestratorConfig
 ) -> list[dict[str, Any]]:
@@ -769,6 +873,10 @@ def _classify_dead_sessions_and_update_throttle_state(
 
     Issue #266: launch-failure sidecars (pid=None, error set) are terminal by
     construction and are reaped immediately, reported in the returned list.
+
+    Issue #295: dead/launch-failed rework sessions with an open PR and a
+    request_changes verdict (or a rework prompt on disk) are restored to
+    ``rework_requested`` so ``dispatch_rework`` can re-select them.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
@@ -833,6 +941,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                     "error": w.error,
                     "pid": w.pid,
                 }
+            )
+            # Issue #295: a launch-failed rework session must still be returned to
+            # rework_requested so its owning lane can re-dispatch it.
+            _reap_restore_rework_requested(
+                state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
             )
             continue
         if w.error is None and not w.is_alive():
@@ -1034,6 +1147,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                         },
                     )
                     save_state(state_file, state)
+            else:
+                # Issue #295: open PR with request_changes or rework prompt =>
+                # restore to rework_requested for its owning lane.
+                _reap_restore_rework_requested(
+                    state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
+                )
 
     return reaped
 
