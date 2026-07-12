@@ -38,7 +38,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -72,6 +72,64 @@ def _resolve_db_path(configured: str) -> Path:
     if configured:
         return Path(os.path.expandvars(os.path.expanduser(configured)))
     return _default_db_path()
+
+
+def _devin_logs_dir(db_path: Path) -> Path:
+    """Resolve the Devin CLI per-PID log directory alongside sessions.db."""
+    return db_path.parent / "logs"
+
+
+@dataclass(frozen=True)
+class ActivitySource:
+    """One real-activity source consulted for a live worker session."""
+
+    name: str
+    timestamp: datetime | None
+    staleness_seconds: float | None
+    error: str | None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "timestamp": self.timestamp.isoformat() if self.timestamp is not None else None,
+            "staleness_seconds": self.staleness_seconds,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class RealActivityProbe:
+    """Corroboration probe for a live worker session.
+
+    Bundles every real-activity source that was consulted (sessions.db last
+    message node, per-PID Devin log mtime) and the freshest timestamp among
+    them. Used by the stall watchdog to avoid false-positive kills when a shim
+    has frozen the sidecar log but the real Devin session is still working.
+    """
+
+    sources: tuple[ActivitySource, ...]
+    latest_timestamp: datetime | None = field(init=False)
+    latest_source: str | None = field(init=False)
+
+    def __post_init__(self) -> None:
+        latest: datetime | None = None
+        latest_source: str | None = None
+        for source in self.sources:
+            if source.timestamp is not None:
+                if latest is None or source.timestamp > latest:
+                    latest = source.timestamp
+                    latest_source = source.name
+        object.__setattr__(self, "latest_timestamp", latest)
+        object.__setattr__(self, "latest_source", latest_source)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "sources": [source.to_payload() for source in self.sources],
+            "latest_timestamp": self.latest_timestamp.isoformat()
+            if self.latest_timestamp is not None
+            else None,
+            "latest_source": self.latest_source,
+        }
 
 
 @dataclass(frozen=True)
@@ -398,6 +456,161 @@ def _classify_nodes(
     return None, None, terminal_tool
 
 
+def real_activity_for_worker(
+    pm_config: PostMortemConfig,
+    worktree_path: str,
+    started_at: str,
+    pid: int | None,
+    now: datetime,
+) -> RealActivityProbe:
+    """Build a ``RealActivityProbe`` for a live worker session.
+
+    Corroborates the sidecar log's mtime against two independent, real-session
+    signals that continue to advance even when a shim has frozen the sidecar:
+
+    1. The Devin CLI's sessions.db ``message_nodes`` table, matched by the
+       worker's ``worktree_path`` and its ``started_at`` window.
+    2. The Devin CLI's own per-PID log file(s) for the worker PID, located
+       in the ``logs/`` sibling of sessions.db.
+
+    Either source is sufficient to show the worker is healthy. If both are
+    quiet past the threshold, the caller should treat the session as genuinely
+    stalled. Any I/O or schema problem is recorded as a source ``error`` and
+    does not raise — this is best-effort, just like the post-mortem extractor.
+    """
+    sources: list[ActivitySource] = []
+    db_path = _resolve_db_path(pm_config.db_path)
+    logs_dir = _devin_logs_dir(db_path)
+
+    # --- Source 1: sessions.db last message_nodes row for the matching session
+    conn: sqlite3.Connection | None = None
+    temp_copy_path: Path | None = None
+    db_error: str | None = None
+    db_timestamp: datetime | None = None
+    try:
+        conn, temp_copy_path, db_error = _open_readonly(db_path)
+        if conn is None:
+            sources.append(
+                ActivitySource(
+                    name="sessions.db", timestamp=None, staleness_seconds=None, error=db_error
+                )
+            )
+        else:
+            margin = timedelta(seconds=pm_config.match_window_margin_seconds)
+            try:
+                started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=UTC)
+                window_start = started_dt - margin
+            except (ValueError, TypeError):
+                lookback = timedelta(seconds=pm_config.unparseable_started_at_lookback_seconds)
+                window_start = now - lookback
+            window_end = now + margin
+
+            session_id, match_error = _find_matching_session(
+                conn, worktree_path, window_start, window_end
+            )
+            if session_id is None:
+                sources.append(
+                    ActivitySource(
+                        name="sessions.db",
+                        timestamp=None,
+                        staleness_seconds=None,
+                        error=match_error,
+                    )
+                )
+            else:
+                try:
+                    row = conn.execute(
+                        "SELECT created_at FROM message_nodes WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if row is None:
+                        db_error = "no message_nodes for matched session"
+                    else:
+                        db_timestamp = _parse_session_created_at(row[0])
+                        if db_timestamp is None:
+                            db_error = f"unparseable message_nodes.created_at {row[0]!r}"
+                except sqlite3.Error as exc:
+                    db_error = f"message_nodes query failed (schema drift?): {exc}"
+
+                if db_timestamp is None:
+                    sources.append(
+                        ActivitySource(
+                            name="sessions.db",
+                            timestamp=None,
+                            staleness_seconds=None,
+                            error=db_error,
+                        )
+                    )
+                else:
+                    sources.append(
+                        ActivitySource(
+                            name="sessions.db",
+                            timestamp=db_timestamp,
+                            staleness_seconds=(now - db_timestamp).total_seconds(),
+                            error=None,
+                        )
+                    )
+    except Exception as exc:
+        # Belt-and-suspenders: _open_readonly is already defensive, but if
+        # something unexpected escapes, record it and keep going.
+        sources.append(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error=f"unexpected: {exc}",
+            )
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        _cleanup_temp_copy(temp_copy_path)
+
+    # --- Source 2: per-PID Devin log mtime
+    per_pid_timestamp: datetime | None = None
+    per_pid_error: str | None = None
+    if pid is None:
+        per_pid_error = "no pid"
+    elif not logs_dir.is_dir():
+        per_pid_error = "per-PID log directory not found"
+    else:
+        try:
+            log_paths = list(logs_dir.glob(f"devin_*_{pid}.log"))
+            if not log_paths:
+                per_pid_error = "no per-PID log found"
+            else:
+                latest_log = max(log_paths, key=lambda p: p.stat().st_mtime)
+                per_pid_timestamp = datetime.fromtimestamp(latest_log.stat().st_mtime, tz=UTC)
+        except OSError as exc:
+            per_pid_error = f"per-PID log stat failed: {exc}"
+
+    if per_pid_timestamp is None:
+        sources.append(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error=per_pid_error,
+            )
+        )
+    else:
+        sources.append(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=per_pid_timestamp,
+                staleness_seconds=(now - per_pid_timestamp).total_seconds(),
+                error=None,
+            )
+        )
+
+    return RealActivityProbe(sources=tuple(sources))
+
+
 def _write_failure_kind_to_sidecar(
     sessions_dir: Path, worker: WorkerView, failure_kind: str
 ) -> None:
@@ -681,10 +894,13 @@ def merge_attempt_snapshot(
 
 
 __all__ = [
+    "ActivitySource",
     "AttemptAttachment",
     "MessageNode",
     "PostMortemRecord",
+    "RealActivityProbe",
     "classify_and_record",
     "merge_attempt_snapshot",
     "read_post_mortem",
+    "real_activity_for_worker",
 ]

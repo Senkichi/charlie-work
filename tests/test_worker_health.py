@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from charlie_work.config import OrchestratorConfig, WatchdogConfig
+from charlie_work.post_mortem import ActivitySource, RealActivityProbe
 from charlie_work.worker import (
     WorkerHealth,
     WorkerView,
@@ -88,6 +89,54 @@ def test_classify_worker_health_stalled_by_mtime(tmp_path: Path) -> None:
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         assert health == WorkerHealth.STALLED
+
+
+def test_classify_worker_health_stalled_by_mtime_overridden_by_real_activity(
+    tmp_path: Path,
+) -> None:
+    """Issue #280: stale sidecar mtime is not a kill if real activity is fresh."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    import os
+    import time
+
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    fresh_timestamp = now - timedelta(minutes=1)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=fresh_timestamp,
+                staleness_seconds=(now - fresh_timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.HEALTHY
 
 
 def test_classify_worker_health_dead_by_terminal_marker(tmp_path: Path) -> None:

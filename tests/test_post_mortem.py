@@ -20,10 +20,13 @@ from pathlib import Path
 from charlie_work.attempt_refs import AttemptSnapshot
 from charlie_work.config import OrchestratorConfig, PostMortemConfig, SignatureRule
 from charlie_work.post_mortem import (
+    ActivitySource,
     MessageNode,
+    RealActivityProbe,
     classify_and_record,
     merge_attempt_snapshot,
     read_post_mortem,
+    real_activity_for_worker,
 )
 from charlie_work.worker import WorkerView
 
@@ -70,12 +73,13 @@ def _make_worker(
     worktree_path: str = "C:/repo/.var/worktrees/issue-42",
     started_at: str = "2026-07-11T11:55:00+00:00",
     adapter_kind: str = "devin",
+    pid: int | None = None,
 ) -> WorkerView:
     return WorkerView(
         adapter_kind=adapter_kind,
         issue_number=issue_number,
         repo_key="",
-        pid=None,
+        pid=pid,
         started_at=started_at,
         process_start_time=None,
         log_path=str(Path(worktree_path) / "session.log"),
@@ -872,3 +876,122 @@ def test_classify_and_record_unparseable_started_at_no_match_still_records_fallb
     assert record is not None
     assert record.matched is False
     assert record.window_start_fallback == "unparseable_started_at"
+
+
+def test_real_activity_for_worker_sessions_db_source(tmp_path: Path) -> None:
+    """A matched sessions.db with message_nodes is the freshest real activity source."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[
+            ("user", "hello", "2026-07-11T11:55:00"),
+            ("assistant", "working", "2026-07-11T11:59:00"),
+        ],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(pid=12345)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        worker.worktree_path,
+        worker.started_at,
+        worker.pid,
+        now,
+    )
+
+    assert probe.latest_source == "sessions.db"
+    assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 59, 0, tzinfo=UTC)
+    # Per-PID log directory does not exist, so it should be recorded as missing.
+    per_pid = next(s for s in probe.sources if s.name == "devin_per_pid_log")
+    assert per_pid.error is not None
+    assert per_pid.timestamp is None
+
+
+def test_real_activity_for_worker_per_pid_log_source(tmp_path: Path) -> None:
+    """Per-PID Devin log mtime is picked when sessions.db is missing."""
+    db_path = tmp_path / "sessions.db"
+    # sessions.db is explicitly non-existent so the probe must fall back cleanly.
+    config = _config_with_db(db_path)
+    worker = _make_worker(pid=99999)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    log_path = logs_dir / f"devin_20260711_114500_{worker.pid}.log"
+    log_path.write_text("some devin log\n")
+    mtime = datetime(2026, 7, 11, 11, 58, 0, tzinfo=UTC).timestamp()
+    log_path.touch()
+    # Set explicit mtime after touch
+    import os
+
+    os.utime(log_path, (mtime, mtime))
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        worker.worktree_path,
+        worker.started_at,
+        worker.pid,
+        now,
+    )
+
+    assert probe.latest_source == "devin_per_pid_log"
+    assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 58, 0, tzinfo=UTC)
+    sessions_db = next(s for s in probe.sources if s.name == "sessions.db")
+    assert sessions_db.error is not None
+    assert sessions_db.timestamp is None
+
+
+def test_real_activity_for_worker_prefers_latest_source(tmp_path: Path) -> None:
+    """latest_timestamp and latest_source come from the freshest of both sources."""
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[
+            ("assistant", "plan", "2026-07-11T11:57:00"),
+        ],
+    )
+    config = _config_with_db(db_path)
+    worker = _make_worker(pid=11111)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    log_path = logs_dir / f"devin_20260711_115000_{worker.pid}.log"
+    log_path.write_text("log\n")
+    mtime = datetime(2026, 7, 11, 11, 59, 30, tzinfo=UTC).timestamp()
+    import os
+
+    os.utime(log_path, (mtime, mtime))
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        worker.worktree_path,
+        worker.started_at,
+        worker.pid,
+        now,
+    )
+
+    assert probe.latest_source == "devin_per_pid_log"
+    assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 59, 30, tzinfo=UTC)
+
+
+def test_real_activity_probe_to_payload() -> None:
+    """to_payload serializes datetimes into JSON-safe strings and lists sources."""
+    ts = datetime(2026, 7, 11, 11, 59, 0, tzinfo=UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(name="sessions.db", timestamp=ts, staleness_seconds=60.0, error=None),
+            ActivitySource(
+                name="devin_per_pid_log", timestamp=None, staleness_seconds=None, error="no pid"
+            ),
+        )
+    )
+    payload = probe.to_payload()
+    assert payload["latest_timestamp"] == "2026-07-11T11:59:00+00:00"
+    assert payload["latest_source"] == "sessions.db"
+    assert payload["sources"][0]["timestamp"] == "2026-07-11T11:59:00+00:00"
+    assert payload["sources"][0]["staleness_seconds"] == 60.0
+    assert payload["sources"][1]["error"] == "no pid"

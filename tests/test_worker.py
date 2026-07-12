@@ -15,6 +15,7 @@ from charlie_work.devin_shell import (
     _sidecar_path as devin_sidecar_path,
     _write_json,
 )
+from charlie_work.post_mortem import ActivitySource, RealActivityProbe
 from charlie_work.worker import WorkerView, _log_is_stalled_at_shim, iter_workers
 
 
@@ -771,6 +772,56 @@ def test_log_is_stalled_at_shim_nonexistent_log(tmp_path: Path) -> None:
     log_path = tmp_path / "issue-1.log"
     now = datetime.now(UTC)
     assert not _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now)
+
+
+def test_log_is_stalled_at_shim_with_fresh_real_activity(tmp_path: Path) -> None:
+    """Issue #280: frozen sidecar log is ignored when real-session activity is fresh."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    fresh_timestamp = now - timedelta(minutes=1)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=fresh_timestamp,
+                staleness_seconds=(now - fresh_timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+    assert not _log_is_stalled_at_shim(
+        log_path, grace_minutes=5, now=now, real_activity_probe=probe
+    )
+
+
+def test_log_is_stalled_at_shim_with_stale_real_activity(tmp_path: Path) -> None:
+    """Issue #280: launch stall is still detected when real activity is also stale."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    stale_timestamp = now - timedelta(minutes=10)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=stale_timestamp,
+                staleness_seconds=(now - stale_timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+    assert _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now, real_activity_probe=probe)
 
 
 # ---------------------------------------------------------------------------

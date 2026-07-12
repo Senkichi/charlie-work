@@ -221,7 +221,7 @@ def _detect_stalled_sessions(
     """
     from datetime import UTC, datetime
     from .post_mortem import read_post_mortem
-    from .worker import classify_worker_health, iter_workers
+    from .worker import classify_worker_health, iter_workers, real_activity_probe_for
 
     if not config.watchdog.enabled:
         return []
@@ -233,7 +233,10 @@ def _detect_stalled_sessions(
         if w.pid is None or w.error is not None:
             continue
 
-        health = classify_worker_health(w, config, now)
+        # Issue #280: corroborate against real-session activity for read-only
+        # detection too (status/dry-run/digest).
+        probe = real_activity_probe_for(w, config, now)
+        health = classify_worker_health(w, config, now, probe)
 
         # Both STALLED and DEAD are considered "stalled" for reporting purposes
         if health in (WorkerHealth.STALLED, WorkerHealth.DEAD):
@@ -305,7 +308,12 @@ def _detect_and_handle_stalled_sessions(
         update_session_record_with_failure_classification,
     )
     from .post_mortem import classify_and_record
-    from .worker import classify_worker_health, iter_workers, update_worker_log_stat
+    from .worker import (
+        classify_worker_health,
+        iter_workers,
+        real_activity_probe_for,
+        update_worker_log_stat,
+    )
 
     if not config.watchdog.enabled:
         return []
@@ -339,7 +347,11 @@ def _detect_and_handle_stalled_sessions(
         # stale rate-limit defer deadline when the log has resumed growing.
         update_worker_log_stat(sessions_dir, w)
 
-        health = classify_worker_health(w, config, now)
+        # Issue #280: corroborate sidecar mtime against real-session activity
+        # (sessions.db message_nodes and per-PID Devin log mtime) before
+        # deciding whether to kill the worker.
+        probe = real_activity_probe_for(w, config, now)
+        health = classify_worker_health(w, config, now, probe)
 
         # If a stalled-looking worker is still within a previously stored rate-limit
         # defer window, skip it. The deadline is re-derived from the sidecar each pass.
@@ -457,6 +469,9 @@ def _detect_and_handle_stalled_sessions(
                         "killed_pids": killed_pids,
                         "orphan_pids": orphan_pids if orphan_pids else None,
                         "failure_kind": resolved_failure_kind,
+                        "activity_sources": probe.to_payload().get("sources", []),
+                        "latest_real_activity_at": probe.to_payload().get("latest_timestamp"),
+                        "latest_real_activity_source": probe.to_payload().get("latest_source"),
                     },
                 )
                 save_state(state_file, state)
@@ -1368,16 +1383,18 @@ class OrchestratorApp:
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
 
         # Build workers list with health classification
-        from .worker import classify_worker_health, iter_workers
+        from .worker import classify_worker_health, iter_workers, real_activity_probe_for
 
         worker_views = list(iter_workers(sessions_dir))
-        workers = [
-            self._summarize_worker(
-                view, classify_worker_health(view, self.config, datetime.now(UTC))
+        now = datetime.now(UTC)
+        workers = []
+        for view in worker_views:
+            if not view.is_alive():
+                continue
+            probe = real_activity_probe_for(view, self.config, now)
+            workers.append(
+                self._summarize_worker(view, classify_worker_health(view, self.config, now, probe))
             )
-            for view in worker_views
-            if view.is_alive()
-        ]
 
         # Observe runner pool if feature is enabled
         runners_data = None

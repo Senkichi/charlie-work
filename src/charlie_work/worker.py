@@ -27,6 +27,7 @@ from .devin_shell import (
     is_session_alive,
     read_session_records,
 )
+from .post_mortem import RealActivityProbe, real_activity_for_worker
 
 
 # Shim marker that indicates successful infra materialization (issue #221)
@@ -57,24 +58,36 @@ def _log_has_shim_marker(log_path: Path) -> bool:
         return False
 
 
-def _log_is_stalled_at_shim(log_path: Path, grace_minutes: int, now: datetime) -> bool:
+def _log_is_stalled_at_shim(
+    log_path: Path,
+    grace_minutes: int,
+    now: datetime,
+    *,
+    real_activity_probe: RealActivityProbe | None = None,
+) -> bool:
     """Check if a log is stalled at the shim marker (issue #221).
 
     A log is considered stalled at shim if:
     1. The shim marker is present in the log
     2. The log file has not been modified within the grace period
     3. The log is small (<= 1KB) - indicating no real progress
+    4. Independent real-session activity (sessions.db or per-PID Devin log)
+       is also quiet past the grace period
 
     This detects workers that hang immediately after shim materialization
-    with error:null, alive PID, and frozen logs.
+    with error:null, alive PID, and frozen logs, while avoiding false
+    positives for shim-wrapped workers whose real activity lives outside
+    the sidecar log (issue #280).
 
     Args:
         log_path: Path to the worker's log file
         grace_minutes: Grace period in minutes to allow for shim materialization
         now: Current datetime for staleness calculation
+        real_activity_probe: Optional corroboration probe from real-session
+            activity sources. When fresh, the sidecar stall is ignored.
 
     Returns:
-        True if the log is stalled at shim, False otherwise
+        True if the log is stalled at shim and real activity is quiet, False otherwise
     """
     from datetime import UTC
 
@@ -98,6 +111,12 @@ def _log_is_stalled_at_shim(log_path: Path, grace_minutes: int, now: datetime) -
         age = now - log_mtime
         if age <= timedelta(minutes=grace_minutes):
             return False
+
+        # Corroborate against real-session activity before declaring a stall
+        if real_activity_probe is not None and real_activity_probe.latest_timestamp is not None:
+            real_age = now - real_activity_probe.latest_timestamp
+            if real_age <= timedelta(minutes=grace_minutes):
+                return False
 
         return True
     except OSError:
@@ -377,7 +396,10 @@ def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
 
 
 def classify_worker_health(
-    view: WorkerView, config: OrchestratorConfig, now: datetime
+    view: WorkerView,
+    config: OrchestratorConfig,
+    now: datetime,
+    real_activity_probe: RealActivityProbe | None = None,
 ) -> WorkerHealth:
     """Classify a worker's health based on liveness, staleness, and terminal markers.
 
@@ -394,10 +416,17 @@ def classify_worker_health(
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
     7. (none of the above) → HEALTHY
 
+    Signal 3 (progress staleness) is corroborated against ``real_activity_probe``.
+    If the sidecar log is stale but the real-session activity source (sessions.db
+    or per-PID Devin log) is fresh, the worker is not classified as STALLED
+    (issue #280).
+
     Args:
         view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
         config: OrchestratorConfig containing watchdog settings
         now: Current datetime for staleness calculation
+        real_activity_probe: Optional pre-fetched real-session activity probe.
+            When fresh, it overrides a stale sidecar log mtime.
 
     Returns:
         WorkerHealth enum member indicating the worker's health status
@@ -437,7 +466,19 @@ def classify_worker_health(
         is_stalled_by_mtime = age > timedelta(minutes=config.watchdog.stall_minutes)
 
         if is_stalled_by_mtime:
-            return WorkerHealth.STALLED
+            # Corroborate against real-session activity before killing (issue #280)
+            if (
+                real_activity_probe is not None
+                and real_activity_probe.latest_timestamp is not None
+            ):
+                real_age = now - real_activity_probe.latest_timestamp
+                if real_age <= timedelta(minutes=config.watchdog.stall_minutes):
+                    # Sidecar log is frozen but the real session is still moving
+                    pass
+                else:
+                    return WorkerHealth.STALLED
+            else:
+                return WorkerHealth.STALLED
 
     # Signal 4: wall-clock deadline (both adapters)
     try:
@@ -692,6 +733,25 @@ def update_worker_log_stat(
         _write_json_atomic(sidecar_path, payload)
 
 
+def real_activity_probe_for(
+    view: WorkerView, config: OrchestratorConfig, now: datetime
+) -> RealActivityProbe:
+    """Build a real-session activity probe for ``view``.
+
+    This is the convenience wrapper that the watchdog callers use; it delegates
+    to ``post_mortem.real_activity_for_worker`` with the fields ``view`` already
+    carries (worktree_path, started_at, pid) so the rest of the codebase does
+    not repeat that plumbing.
+    """
+    return real_activity_for_worker(
+        config.post_mortem,
+        view.worktree_path,
+        view.started_at,
+        view.pid,
+        now,
+    )
+
+
 __all__ = [
     "WorkerHealth",
     "UsageSnapshot",
@@ -699,6 +759,7 @@ __all__ = [
     "classify_worker_health",
     "iter_workers",
     "parse_cumulative_usage",
+    "real_activity_probe_for",
     "update_worker_log_stat",
     "_log_is_stalled_at_shim",
 ]
