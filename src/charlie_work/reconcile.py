@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import OrchestratorConfig
+from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHub,
     _LIST_LIMIT,
@@ -371,12 +371,8 @@ def detect_drift(
                         # Diagnostic post-mortem; its worker_blocked verdict is ignored
                         # because the worktree itself proves the work was completed.
                         classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                        worker_blocked = False
                     else:
-                        worker_blocked = (
-                            classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                            == "worker_blocked"
-                        )
+                        classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
                         fallback_kind = (
                             "stalled" if inspection.state != WorktreeState.UNKNOWN else None
                         )
@@ -432,22 +428,18 @@ def detect_drift(
                         if issue and _issue_state(issue) == "OPEN":
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
-                            if active_labels and worker_blocked:
-                                # Issue #261: a session killed by a push-gate
-                                # hook must never be hot-relabeled to ready —
-                                # that would redispatch it straight back into
-                                # the same hook. Escalate instead (mirrors
-                                # workflow.py's "redispatch_escalated" edge)
-                                # and leave the active labels in place so a
-                                # human sees it via agent:human-needed.
+                            if (
+                                active_labels
+                                and failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                            ):
                                 drift.append(
                                     DriftItem(
                                         kind="session_failed_escalated",
                                         issue_number=w.issue_number,
                                         pr_number=None,
                                         detail=(
-                                            f"issue #{w.issue_number} session died blocked by a "
-                                            f"push-gate hook (worker_blocked), no open PR; "
+                                            f"issue #{w.issue_number} session died with "
+                                            f"deterministic failure ({failure_kind}), no open PR; "
                                             f"suppressing relabel-to-ready, escalating instead"
                                         ),
                                         fix_actions=(
