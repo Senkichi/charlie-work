@@ -499,8 +499,10 @@ def fleet_loop(
             finally:
                 lock.release()
 
-        except (GitHubError, ConfigError) as exc:
-            # Per-repo isolation: catch at iteration boundary and continue
+        except Exception as exc:
+            # Per-repo isolation: catch any provider/logic failure at the
+            # iteration boundary and continue. Keep the rest of the fleet
+            # pass alive instead of crashing on one unclassified exception.
             per_repo_results[repo_key] = CommandResult(False, f"fleet pass error: {exc}", {})
             logger.error(f"Error processing repo {repo_key}: {exc}")
 
@@ -526,11 +528,12 @@ def fleet_loop(
         failed_count = sum(1 for r in per_repo_results.values() if not r.ok)
         message += f", {failed_count} failed"
 
-    # Build repos data with ok field included for CLI rendering
+    # Build repos data with ok/message fields included for CLI rendering
     repos_data: dict[str, dict[str, Any]] = {}
     for k, r in per_repo_results.items():
         repo_data = dict(r.data)  # Copy to avoid mutation
         repo_data["ok"] = r.ok  # Add ok field for CLI rendering
+        repo_data["message"] = r.message  # Surface per-repo failure message
         repos_data[k] = repo_data
 
     return CommandResult(

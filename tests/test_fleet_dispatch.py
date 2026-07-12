@@ -365,8 +365,7 @@ def test_fleet_loop_missing_repo_root_skipped(
     assert "repos" in result.data
     assert "owner/repo1" in result.data["repos"]
     assert result.data["repos"]["owner/repo1"]["ok"] is False
-    # The message is in the CommandResult, not in the data dict
-    # We check ok=False which indicates failure
+    assert "missing, skipped" in result.data["repos"]["owner/repo1"]["message"]
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
@@ -439,6 +438,85 @@ def test_fleet_loop_github_error_isolated(
     # Verify first repo failed but second succeeded
     assert result.data["repos"]["owner/repo1"]["ok"] is False
     assert result.data["repos"]["owner/repo2"]["ok"] is True
+
+    # Verify overall result is False (one repo failed)
+    assert result.ok is False
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_unclassified_exception_isolated(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop isolates an unclassified exception from one repo and continues to others."""
+    # Setup registry with two repos
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Create temp repo dirs
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # Mock config and paths
+    mock_config = OrchestratorConfig()
+    mock_load_layered_config.return_value = mock_config
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    # Mock OrchestratorApp instances - first one raises an unclassified RuntimeError
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.side_effect = RuntimeError("provider response malformed")
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+
+    # Mock GitHub
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # Run fleet_loop - should not propagate the RuntimeError
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Verify both repos are present in the result
+    assert "repos" in result.data
+    assert "owner/repo1" in result.data["repos"]
+    assert "owner/repo2" in result.data["repos"]
+
+    # Verify repo1 failed, repo2 succeeded and was processed
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app2.loop.call_count == 1
+
+    # Verify the failing repo's message is recorded
+    assert "fleet pass error" in result.data["repos"]["owner/repo1"].get("message", "")
 
     # Verify overall result is False (one repo failed)
     assert result.ok is False
