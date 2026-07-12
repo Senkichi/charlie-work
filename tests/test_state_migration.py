@@ -11,6 +11,7 @@ OLD in-repo orchestrators without dropping fields it doesn't know about.
 from __future__ import annotations
 
 import json
+import pathlib
 import shutil
 from pathlib import Path
 
@@ -230,3 +231,68 @@ def test_old_orchestrator_state_file_loads_cleanly_end_to_end(tmp_path: Path) ->
     assert isinstance(loaded["prs"], dict)
     assert isinstance(loaded["events"], list)
     assert loaded["version"] == 1
+
+
+def test_load_state_tolerates_bom_prefixed_json(tmp_path: Path) -> None:
+    """A state.json with a leading UTF-8 BOM must load cleanly, not quarantine."""
+    state_path = tmp_path / "state.json"
+    payload = {
+        "version": 1,
+        "issues": {"1100": {"status": "rework_requested"}},
+        "prs": {
+            "1142": {
+                "decision": "request_changes",
+                "status": "request_changes",
+                "request_changes_count": 1,
+                "reviewed_head_sha": "64603c35",
+            }
+        },
+    }
+    state_path.write_bytes("\ufeff".encode("utf-8") + json.dumps(payload).encode("utf-8"))
+
+    loaded = load_state(state_path)
+
+    assert loaded["issues"]["1100"]["status"] == "rework_requested"
+    assert loaded["prs"]["1142"]["decision"] == "request_changes"
+    assert loaded["prs"]["1142"]["reviewed_head_sha"] == "64603c35"
+    assert list(tmp_path.glob("state.json.corrupt-*")) == []
+
+
+def test_load_state_quarantines_genuine_corruption(tmp_path: Path) -> None:
+    """Truncated/corrupt JSON must still be quarantined and return empty_state."""
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{truncated garbage", encoding="utf-8")
+
+    loaded = load_state(state_path)
+
+    assert loaded["issues"] == {}
+    assert not state_path.exists()
+    quarantined = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert "truncated garbage" in quarantined[0].read_text(encoding="utf-8")
+
+
+def test_load_state_retries_transient_oserror(tmp_path: Path, monkeypatch) -> None:
+    """A transient OSError (e.g. Windows sharing violation) must retry and succeed."""
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "issues": {"1": {"status": "ok"}}}),
+        encoding="utf-8",
+    )
+
+    calls: list[pathlib.Path] = []
+    real_open = pathlib.Path.open
+
+    def flaky_open(self: pathlib.Path, *args, **kwargs):
+        calls.append(self)
+        if len(calls) == 1:
+            raise OSError("simulated sharing violation")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", flaky_open)
+
+    loaded = load_state(state_path)
+
+    assert len(calls) == 2
+    assert loaded["issues"]["1"]["status"] == "ok"
+    assert list(tmp_path.glob("state.json.corrupt-*")) == []

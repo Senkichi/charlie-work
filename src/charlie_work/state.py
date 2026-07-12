@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,11 @@ STATE_VERSION = 1
 
 # Cross-process lock timeout (seconds) — best-effort to prevent wedging
 _LOCK_TIMEOUT_SECONDS = 30
+
+# Retry for transient read errors (e.g. Windows sharing violations) before
+# treating the file as unrecoverable.
+_LOAD_RETRY_ATTEMPTS = 3
+_LOAD_RETRY_DELAY_SECONDS = 0.1
 
 # Stale claim timeout (minutes) — claims older than this are re-dispatchable
 # to prevent crashed phase-2 from wedging issues
@@ -199,21 +205,50 @@ def empty_state() -> dict[str, Any]:
     }
 
 
+def _quarantine_state(path: Path, exc: Exception) -> None:
+    """Rename an unparseable state file for forensics and log a loud signal.
+
+    The dispatch/loop path calls ``load_state`` frequently; emitting a
+    top-level error here makes a silent state wipe visible in logs.
+    """
+    quarantine = path.with_name(f"{path.name}.corrupt-{utc_now().replace(':', '')}")
+    logger.error(
+        "State file %s is unrecoverable (%s: %s); quarantining to %s",
+        path,
+        type(exc).__name__,
+        exc,
+        quarantine,
+    )
+    try:
+        path.replace(quarantine)
+    except OSError as move_err:
+        logger.error("Failed to quarantine state file %s: %s", path, move_err)
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return empty_state()
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, OSError):
-        # Never crash the orchestrator on a truncated/corrupt state file, and
-        # never silently discard it either — quarantine it for forensics.
-        quarantine = path.with_name(f"{path.name}.corrupt-{utc_now().replace(':', '')}")
+
+    data: Any = None
+    for attempt in range(_LOAD_RETRY_ATTEMPTS):
         try:
-            path.replace(quarantine)
-        except OSError:
-            pass
-        return empty_state()
+            with path.open("r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            # Genuine JSON corruption (truncated files, etc.) — quarantine.
+            _quarantine_state(path, exc)
+            return empty_state()
+        except OSError as exc:
+            # Sharing/permission violations on Windows are often transient.
+            # Retry before falling back to quarantine.
+            if attempt < _LOAD_RETRY_ATTEMPTS - 1:
+                time.sleep(_LOAD_RETRY_DELAY_SECONDS)
+                continue
+            _quarantine_state(path, exc)
+            return empty_state()
+        else:
+            break
+
     if not isinstance(data, dict):
         return empty_state()
     data.setdefault("version", STATE_VERSION)

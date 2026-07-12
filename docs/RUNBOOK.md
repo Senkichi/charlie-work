@@ -287,6 +287,18 @@ Mitigations (the fleet is charlie-work's, but the test config is the
   cleanup hazard described above; bound parallelism with `PYTEST_XDIST_AUTO_NUM_WORKERS`
   instead of disabling isolation.
 
+## Shared-venv isolation for devin-shell
+
+Per-worktree venvs are also the default for `devin-shell` (the `devin.venv_source`
+option is `null` by default, issue #112). The `devin --prompt-file ... --print`
+worker has a full shell and can run `uv sync`, so a shared-venv junction would
+let a worker rewrite the shared venv's editable-install `.pth` to point at its
+own worktree. Any other worktree that later runs `python -c "import <pkg>"` (or
+`uv run --active python ...`) silently imports that worktree's code, producing
+fabricated verification results. If you explicitly set `devin.venv_source`, you
+are opting back into the junction and the cleanup hazard described above; keep
+per-worktree isolation unless you have a specific reason to share a venv.
+
 ## Fleet: cross-repo dispatch
 
 The fleet layer extends the single-repo orchestrator to operate across multiple
