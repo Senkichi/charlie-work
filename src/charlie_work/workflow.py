@@ -2575,18 +2575,12 @@ class OrchestratorApp:
                             )
                 if not sync_failed and self._should_update_pr_branch(pr):
                     if self.gh.pr_update_branch(pr_number):
-                        updated_pr = self.gh.pr_view(pr_number)
-                        if (
-                            updated_pr
-                            and updated_pr.get("headRefOid")
-                            and updated_pr.get("headRefOid") != live_head_sha
-                        ):
-                            self._update_approval_head(
-                                pr_number, decision, updated_pr["headRefOid"]
-                            )
-                            pr = updated_pr
+                        new_head = self._verify_synced_head(pr_number, live_head_sha)
+                        if new_head and new_head != live_head_sha:
+                            self._update_approval_head(pr_number, decision, new_head)
+                            pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
-                        elif updated_pr and updated_pr.get("headRefOid") == live_head_sha:
+                        elif new_head == live_head_sha:
                             # Already up-to-date; nothing to do.
                             pass
                         else:
@@ -2998,8 +2992,7 @@ class OrchestratorApp:
                 ]
 
             old_head = pr.get("headRefOid")
-            success = self.gh.pr_update_branch(pr_number)
-            if not success:
+            if not self.gh.pr_update_branch(pr_number):
                 return [
                     {
                         "pr_number": pr_number,
@@ -3009,19 +3002,17 @@ class OrchestratorApp:
                     }
                 ]
 
-            updated_pr = self.gh.pr_view(pr_number)
-            new_head = updated_pr.get("headRefOid") if updated_pr else old_head
-            if new_head and new_head != old_head:
-                self._update_approval_head(pr_number, decision, new_head)
+            new_head = self._verify_synced_head(pr_number, old_head)
+            if new_head is None:
                 return [
                     {
                         "pr_number": pr_number,
                         "head_ref": head,
-                        "updated": True,
-                        "new_head": new_head,
+                        "updated": False,
+                        "error": "post-sync head verification failed",
                     }
                 ]
-            elif new_head == old_head:
+            if new_head == old_head:
                 return [
                     {
                         "pr_number": pr_number,
@@ -3030,12 +3021,14 @@ class OrchestratorApp:
                         "skipped_reason": "up-to-date",
                     }
                 ]
+
+            self._update_approval_head(pr_number, decision, new_head)
             return [
                 {
                     "pr_number": pr_number,
                     "head_ref": head,
-                    "updated": False,
-                    "error": "pr_view failed after update",
+                    "updated": True,
+                    "new_head": new_head,
                 }
             ]
 
@@ -3239,6 +3232,48 @@ class OrchestratorApp:
                 or "",
             }
             save_state(self.paths.state_file, state)
+
+    def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
+        """Verify that the new head of a PR is a valid base-sync merge commit.
+
+        After ``gh pr update-branch`` advances the PR head, we must not bless the
+        new SHA until we confirm it is a GitHub-generated merge commit (web-flow)
+        whose parents include the previously approved head. This closes the
+        approval-integrity TOCTOU: a racing push to the PR branch could otherwise
+        be mistaken for a base update and auto-merged without review.
+        """
+        pr = self.gh.pr_view(pr_number)
+        if not pr:
+            return None
+        new_head_sha = pr.get("headRefOid")
+        if not new_head_sha:
+            return None
+        if new_head_sha == old_head_sha:
+            return new_head_sha
+
+        commit = self.gh.commit(new_head_sha)
+        if not commit:
+            return None
+
+        parents = commit.get("parents") or []
+        if len(parents) != 2:
+            return None
+        parent_shas = [str(p.get("sha")) for p in parents if isinstance(p, dict)]
+        if old_head_sha not in parent_shas:
+            return None
+
+        committer = commit.get("committer") or {}
+        if not isinstance(committer, dict):
+            committer = {}
+        commit_committer = commit.get("commit", {}).get("committer") or {}
+        if not isinstance(commit_committer, dict):
+            commit_committer = {}
+        committer_login = committer.get("login")
+        committer_name = commit_committer.get("name") or committer.get("name")
+        if committer_login != "web-flow" and committer_name != "GitHub":
+            return None
+
+        return new_head_sha
 
     def _should_update_pr_branch(self, pr: dict[str, Any]) -> bool:
         """Return True if the PR branch may be behind its base and should be synced.

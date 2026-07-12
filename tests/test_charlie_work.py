@@ -2513,6 +2513,7 @@ class FakeGitHub:
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
         self.closed_issues: list[int] = []
+        self.commits: dict[str, dict[str, Any]] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -2618,7 +2619,18 @@ class FakeGitHub:
             if pr["number"] == pr_number:
                 # Append a merge-SHA marker to simulate the head moving
                 old_head = pr.get("headRefOid", "")
-                pr["headRefOid"] = f"{old_head}-updated"
+                new_head = f"{old_head}-updated"
+                pr["headRefOid"] = new_head
+                # Record the fake commit metadata so the post-sync verification
+                # helper sees a valid GitHub web-flow merge commit.
+                self.commits[new_head] = {
+                    "parents": [
+                        {"sha": old_head},
+                        {"sha": "base-sha"},
+                    ],
+                    "committer": {"login": "web-flow"},
+                    "commit": {"committer": {"name": "GitHub"}},
+                }
                 return self.update_branch_ok
         return False
 
@@ -2656,6 +2668,9 @@ class FakeGitHub:
         if json_output:
             return []
         return ""
+
+    def commit(self, sha: str) -> dict[str, Any] | None:
+        return self.commits.get(sha)
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -9692,6 +9707,138 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
     assert update_results[0]["updated"] is False
     assert update_results[0]["skipped_reason"] == "up-to-date"
     assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) -> None:
+    """If pr_view returns a non-qualifying head after update-branch, do not merge.
+
+    Regression test for the TOCTOU described in issue #258: a racing push to the
+    PR branch in the update-window must not be blessed as the approved head.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubRacingUpdate(FakeGitHub):
+        def pr_update_branch(self, pr_number: int) -> bool:
+            ok = super().pr_update_branch(pr_number)
+            for pr in self.prs:
+                if pr["number"] == pr_number:
+                    racing = "racing-sha"
+                    self.pr_head_shas[pr_number] = racing
+                    self.commits[racing] = {
+                        "parents": [{"sha": "other-sha"}],
+                        "committer": {"login": "not-web-flow"},
+                        "commit": {"committer": {"name": "Not GitHub"}},
+                    }
+            return ok
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubRacingUpdate()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+    # The approved head must not be migrated to the racing SHA.
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_update_open_agent_prs_merge_train_post_sync_head_race_rejected(
+    tmp_path: Path,
+) -> None:
+    """If pr_view returns a non-qualifying head after update-branch, do not bless it.
+
+    Regression test for the _update_open_agent_prs "next" path: a racing push
+    must be rejected and the approved head left unchanged.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    # Simulate a racing push that lands on PR 789's branch between update and view.
+    fake_gh.pr_head_shas[789] = "racing-sha"
+    fake_gh.commits["racing-sha"] = {
+        "parents": [{"sha": "other-sha"}],
+        "committer": {"login": "not-web-flow"},
+        "commit": {"committer": {"name": "Not GitHub"}},
+    }
+
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["error"] == "post-sync head verification failed"
+    # The approved head must remain unchanged.
+    decision = json.loads(
+        (paths.prs / "pr-789" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-def456"
 
 
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
