@@ -536,10 +536,6 @@ def _detect_and_handle_orphaned_workers(
             continue
         if entry.get("status") != "dispatched":
             continue
-        # Issue #259: once we have emitted orphaned_worker_drift for a dead
-        # worker with no open PR, do not re-detect it on every subsequent pass.
-        if entry.get("orphan_flagged_at"):
-            continue
 
         if not _worker_pid_alive(entry):
             orphaned_issues.append(int(issue_number_str))
@@ -570,6 +566,10 @@ def _detect_and_handle_orphaned_workers(
             # Re-verify status (state may have changed between lock windows)
             if entry.get("status") != "dispatched":
                 continue
+
+            # The worker is dead; clear its PID before deciding recovery.
+            entry.pop("worker_pid", None)
+            entry.pop("worker_process_start_time", None)
 
             pr_data = pr_by_issue.get(issue_number)
 
@@ -629,6 +629,11 @@ def _detect_and_handle_orphaned_workers(
                 # No open PR - emit drift event, leave recovery to mop-up
                 # Mop-up will handle label transition back to ready (issue #118)
                 # Issue #259: mark the entry so it is not re-flagged every pass.
+                # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
+                # paths must run regardless of the flag.
+                if entry.get("orphan_flagged_at"):
+                    state["issues"][str(issue_number)] = entry
+                    continue
                 entry["orphan_flagged_at"] = utc_now()
                 state = append_event(
                     state,
@@ -640,9 +645,6 @@ def _detect_and_handle_orphaned_workers(
                     },
                 )
 
-            # Clear the worker PID from state.json
-            entry.pop("worker_pid", None)
-            entry.pop("worker_process_start_time", None)
             state["issues"][str(issue_number)] = entry
 
         save_state(state_file, state)
@@ -1821,12 +1823,15 @@ class OrchestratorApp:
                 previous_entries[issue_number] = state["issues"].get(str(issue_number), {})
             # Mark selected issues as "dispatch_pending" to claim them before launching
             for issue_number in selected_issue_numbers:
-                state["issues"][str(issue_number)] = {
+                entry = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
                     "status": "dispatch_pending",
                     "dispatch_pending_at": utc_now(),
                 }
+                # A fresh dispatch supersedes any previous orphan flag.
+                entry.pop("orphan_flagged_at", None)
+                state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
@@ -1894,6 +1899,9 @@ class OrchestratorApp:
                 # Clear the claim timestamp on successful upgrade
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
+                # A successful dispatch supersedes any previous orphan flag.
+                if ok:
+                    entry.pop("orphan_flagged_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -3405,12 +3413,15 @@ class OrchestratorApp:
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Mark selected issues as "dispatch_pending"
             for issue_number in selected_issue_numbers:
-                state["issues"][str(issue_number)] = {
+                entry = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
                     "status": "dispatch_pending",
                     "dispatch_pending_at": utc_now(),
                 }
+                # A fresh dispatch supersedes any previous orphan flag.
+                entry.pop("orphan_flagged_at", None)
+                state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
 
         if not selected_issue_numbers:
@@ -3553,6 +3564,9 @@ class OrchestratorApp:
                 }
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
+                # A successful dispatch supersedes any previous orphan flag.
+                if ok:
+                    entry.pop("orphan_flagged_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:

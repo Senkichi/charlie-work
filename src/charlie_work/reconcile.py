@@ -20,6 +20,7 @@ direct ``remove_issue_label`` calls only for label combinations that
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,8 @@ from .worktree import (
     resolve_base_branch_name,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class DriftItem:
@@ -60,8 +63,10 @@ class DriftItem:
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
 # Any of these on a closed GitHub issue is a drift condition (issue #259).
+# "escalated" is included so a closed-while-escalated issue gets its state entry
+# finalized; the terminal human_needed label is intentionally preserved.
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
-    {"dispatched", "dispatch_pending", "rework_requested", "reviewing"}
+    {"dispatched", "dispatch_pending", "rework_requested", "reviewing", "escalated"}
 )
 
 
@@ -126,6 +131,11 @@ def detect_drift(
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
+    # Issue #45: the `--state all` query is capped at _LIST_LIMIT. If it returns
+    # that many, the snapshot is provably incomplete; refuse to run sweeps that
+    # depend on seeing every issue, but still run per-issue checks for the
+    # issues that ARE in the snapshot.
+    issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
     state_prs: dict[str, Any] = state.get("prs", {})
 
     drift: list[DriftItem] = []
@@ -588,39 +598,66 @@ def detect_drift(
     # Issue #259: a state entry with an active status but a closed GitHub issue
     # means the orchestrator lost the lifecycle edge (e.g. a crash before the
     # worker saw the issue close). Finalize the state and strip any labels that
-    # still look active.
-    for issue_number_str, entry in state_issues.items():
-        if not isinstance(entry, dict):
-            continue
-        try:
-            issue_number = int(issue_number_str)
-        except ValueError:
-            continue
-        status = entry.get("status")
-        if status not in ACTIVE_STATE_STATUSES:
-            continue
-        issue = issues_by_number.get(issue_number)
-        if issue is None or _issue_state(issue) != "CLOSED":
-            continue
-        issue_labels = label_names(issue)
-        active_labels = issue_labels & labels_cfg.active
-        terminal_present = issue_labels & labels_cfg.terminal
-        # If a terminal+active contradiction is already being repaired, let that
-        # drift item remove the active labels; this item finalizes state status.
-        remove_labels = () if terminal_present else tuple(sorted(active_labels))
-        fix_actions = [f"set state issues[{issue_number}].status = 'closed'"]
-        for label in remove_labels:
-            fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
+    # still look active. This sweep depends on a complete issue snapshot, so it is
+    # skipped when the issue list is provably truncated (issue #259 review).
+    if not issue_snapshot_truncated:
+        for issue_number_str, entry in state_issues.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                issue_number = int(issue_number_str)
+            except ValueError:
+                continue
+            status = entry.get("status")
+            if status not in ACTIVE_STATE_STATUSES:
+                continue
+            issue = issues_by_number.get(issue_number)
+            if issue is None or _issue_state(issue) != "CLOSED":
+                continue
+            issue_labels = label_names(issue)
+            active_labels = issue_labels & labels_cfg.active
+            terminal_present = issue_labels & labels_cfg.terminal
+            # If a terminal+active contradiction is already being repaired, let that
+            # drift item remove the active labels; this item finalizes state status.
+            remove_labels = () if terminal_present else tuple(sorted(active_labels))
+            fix_actions = [f"set state issues[{issue_number}].status = 'closed'"]
+            for label in remove_labels:
+                fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
+            drift.append(
+                DriftItem(
+                    kind="state_active_status_issue_closed",
+                    issue_number=issue_number,
+                    pr_number=None,
+                    detail=(
+                        f"issue #{issue_number} is CLOSED on GitHub but state status is {status!r}"
+                    ),
+                    fix_actions=tuple(fix_actions),
+                    remove_labels=remove_labels,
+                )
+            )
+
+    # Issue #15 / issue #259: if the issue snapshot hit the page limit, it is
+    # provably incomplete. Emit a loud warning and refuse to act on completeness-
+    # dependent sweeps for this pass. Full pagination is issue #45's scope.
+    if issue_snapshot_truncated:
+        logger.warning(
+            "Issue snapshot is truncated at the page limit (%d); skipping "
+            "state_active_status_issue_closed finalization sweep for this pass",
+            _LIST_LIMIT,
+        )
         drift.append(
             DriftItem(
-                kind="state_active_status_issue_closed",
-                issue_number=issue_number,
+                kind="snapshot_truncated",
+                issue_number=None,
                 pr_number=None,
                 detail=(
-                    f"issue #{issue_number} is CLOSED on GitHub but state status is {status!r}"
+                    f"issue snapshot returned {_LIST_LIMIT} issues, matching the page limit; "
+                    "snapshot may be incomplete"
                 ),
-                fix_actions=tuple(fix_actions),
-                remove_labels=remove_labels,
+                fix_actions=(
+                    "skip completeness-dependent sweeps for this pass",
+                    "full pagination is tracked in issue #45",
+                ),
             )
         )
 
