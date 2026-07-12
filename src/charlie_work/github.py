@@ -40,6 +40,7 @@ RECONCILE_PR_FIELDS = (
     "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
+RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
 # Flag constants for merge_pr — single source of truth for both argv construction
 # and config validation. Derive ORCHESTRATOR_MANAGED_MERGE_FLAGS from these so that
@@ -55,6 +56,23 @@ ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
 
 class GitHubError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class GitHubRunResult:
+    """Result of a ``gh`` invocation when ``allow_failure=True``.
+
+    Errors stay as values: callers check ``ok`` and ``error`` and only use
+    ``value`` when ``ok`` is True. ``value`` is the parsed JSON (when
+    ``json_output=True``) or the captured stdout (when ``json_output=False``).
+    """
+
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    value: Any | None = None
+    error: str | None = None
 
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.
@@ -100,23 +118,58 @@ class GitHub:
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
-                check=not allow_failure,
+                check=False,
             )
         except FileNotFoundError as exc:
+            if allow_failure:
+                return GitHubRunResult(
+                    ok=False,
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                    value=None,
+                    error="GitHub CLI `gh` is not installed or not on PATH.",
+                )
             raise GitHubError("GitHub CLI `gh` is not installed or not on PATH.") from exc
-        except subprocess.CalledProcessError as exc:
-            raise GitHubError(exc.stderr.strip() or exc.stdout.strip() or str(exc)) from exc
+
         output = result.stdout.strip()
-        if result.returncode != 0 and allow_failure and not output:
-            return None if json_output else result.stderr.strip()
+
+        if not allow_failure:
+            if result.returncode != 0:
+                raise GitHubError(
+                    result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                )
+            if not json_output:
+                return output
+            if not output:
+                return None
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError as exc:
+                raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
+
+        # allow_failure=True: always return a structured result so callers can
+        # distinguish command failure from empty-but-legitimate output.
+        error: str | None = None
+        value: Any | None = None
+        if result.returncode != 0:
+            error = result.stderr.strip() or result.stdout.strip() or f"gh exited {result.returncode}"
         if not json_output:
-            return output
-        if not output:
-            return None
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError as exc:
-            raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
+            value = output if result.returncode == 0 else None
+        elif output:
+            try:
+                value = json.loads(output)
+            except json.JSONDecodeError as exc:
+                error = f"Expected JSON from gh command: {' '.join(command)}"
+                value = None
+        return GitHubRunResult(
+            ok=result.returncode == 0 and error is None,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            value=value,
+            error=error,
+        )
 
     def pr_create(
         self,
@@ -289,15 +342,32 @@ class GitHub:
 
     def pr_diff(self, number: int) -> str:
         result = self.run(["pr", "diff", str(number)], allow_failure=True)
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok else ""
         return result if isinstance(result, str) else ""
 
-    def pr_checks(self, number: int) -> list[dict[str, Any]]:
+    def pr_checks(self, number: int) -> list[dict[str, Any]] | None:
         result = self.run(
             ["pr", "checks", str(number), "--json", PR_CHECKS_FIELDS],
             json_output=True,
             allow_failure=True,
         )
-        checks = result if isinstance(result, list) else []
+        if isinstance(result, GitHubRunResult):
+            # gh pr checks exits non-zero both when the command itself fails (e.g.
+            # an unsupported JSON field) and when checks are failing. The
+            # difference is in the value: a command failure yields no parseable
+            # list, while genuinely failing checks still produce a list of results.
+            if isinstance(result.value, list):
+                checks = result.value
+            elif result.ok and result.value is None:
+                # Empty successful response (no checks reported) is legitimate.
+                return []
+            else:
+                # Command-level failure (Unknown JSON field, GraphQL error, etc.)
+                return None
+        else:
+            # Legacy pre-result-object fallback
+            checks = result if isinstance(result, list) else []
         # gh pr checks --json has no databaseId field; derive the GitHub Actions
         # job id from "link" and inject it so downstream consumers (workflow.py)
         # keep reading check.get("databaseId") unchanged.
@@ -317,9 +387,9 @@ class GitHub:
             json_output=True,
             allow_failure=True,
         )
-        if isinstance(result, dict):
-            return result
-        return None
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, dict) else None
+        return result if isinstance(result, dict) else None
 
     def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
         """Fetch annotations for a specific check run.
@@ -335,9 +405,69 @@ class GitHub:
             json_output=True,
             allow_failure=True,
         )
-        if isinstance(result, list):
-            return result
-        return []
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, list) else []
+        return result if isinstance(result, list) else []
+
+    def validate_field_lists(self) -> None:
+        """Validate the compile-time ``--json`` field lists against ``gh``.
+
+        Probes each list with an invalid field and parses the ``Available
+        fields:`` section of the stderr. Fails fast with a ``ConfigError`` naming
+        the constant and the offending field(s) when the installed ``gh`` CLI
+        does not support a configured field.
+        """
+        # Import lazily to avoid the config -> github import cycle.
+        from .config import ConfigError
+
+        probe = "nonexistent"  # Invalid field name, gh will list valid ones
+        field_lists: list[tuple[str, list[str], str]] = [
+            ("ISSUE_LIST_FIELDS", ["issue", "list", "--state", "open", "--limit", "1", "--json", probe], ISSUE_LIST_FIELDS),
+            ("ISSUE_VIEW_FIELDS", ["issue", "view", "0", "--json", probe], ISSUE_VIEW_FIELDS),
+            ("PR_LIST_FIELDS", ["pr", "list", "--state", "open", "--limit", "1", "--json", probe], PR_LIST_FIELDS),
+            ("PR_VIEW_FIELDS", ["pr", "view", "0", "--json", probe], PR_VIEW_FIELDS),
+            ("PR_CHECKS_FIELDS", ["pr", "checks", "0", "--json", probe], PR_CHECKS_FIELDS),
+            ("LABEL_LIST_FIELDS", ["label", "list", "--limit", "1", "--json", probe], LABEL_LIST_FIELDS),
+            ("RECONCILE_PR_FIELDS", ["pr", "list", "--state", "all", "--limit", "1", "--json", probe], RECONCILE_PR_FIELDS),
+            ("RECONCILE_ISSUE_FIELDS", ["issue", "list", "--state", "open", "--limit", "1", "--json", probe], RECONCILE_ISSUE_FIELDS),
+            ("RUN_LIST_FIELDS", ["run", "list", "--limit", "1", "--json", probe], RUN_LIST_FIELDS),
+        ]
+
+        for name, args, fields in field_lists:
+            try:
+                result = subprocess.run(
+                    ["gh", *args],
+                    cwd=self.repo_root,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc
+
+            if result.returncode == 0:
+                raise ConfigError(
+                    f"gh did not reject invalid field for {name}; cannot validate field list"
+                )
+
+            stderr = result.stderr
+            if "Unknown JSON field" not in stderr and "Available fields" not in stderr:
+                raise ConfigError(
+                    f"Could not validate field list {name}: {stderr.strip() or result.stdout.strip()}"
+                )
+
+            available: set[str] = set()
+            match = re.search(r"Available fields:\n((?:  .+\n)+)", stderr)
+            if match:
+                available = {line.strip() for line in match.group(1).splitlines() if line.strip()}
+
+            unsupported = [field for field in fields.split(",") if field not in available]
+            if unsupported:
+                raise ConfigError(
+                    f"gh does not support field(s) for {name}: {', '.join(unsupported)}"
+                )
 
     def add_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--add-label", label])
@@ -772,23 +902,34 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     )
 
     # Handle different return types from allow_failure=True
-    if result is None:
-        # Transient error or gh not available — fail open with warning
-        logger.warning(
-            f"GitHub dependencies API returned None for issue #{issue_number} - treating as no dependencies"
-        )
+    if isinstance(result, GitHubRunResult):
+        if not result.ok:
+            # Transient error or gh not available — fail open with warning
+            logger.warning(
+                "GitHub dependencies API failed for issue #%d: %s - treating as no dependencies",
+                issue_number,
+                result.error,
+            )
+            return []
+        value = result.value
+    else:
+        value = result
+
+    if value is None:
         return []
-    elif isinstance(result, dict):
+    elif isinstance(value, dict):
         # 404/410 error response — feature not available on this repo
         # This is expected for repos without dependencies enabled
         return []
-    elif isinstance(result, list):
+    elif isinstance(value, list):
         # Extract issue numbers from the dependency list
-        return [int(dep.get("number", 0)) for dep in result if dep.get("number")]
+        return [int(dep.get("number", 0)) for dep in value if dep.get("number")]
     else:
         # Unexpected type — fail open with warning
         logger.warning(
-            f"GitHub dependencies API returned unexpected type {type(result)} for issue #{issue_number} - treating as no dependencies"
+            "GitHub dependencies API returned unexpected type %s for issue #%d - treating as no dependencies",
+            type(value),
+            issue_number,
         )
         return []
 
@@ -846,17 +987,26 @@ def cancel_superseded_runs(
                 "--limit",
                 "100",
                 "--json",
-                "databaseId,status,createdAt,headBranch",
+                RUN_LIST_FIELDS,
             ],
             json_output=True,
             allow_failure=True,
         )
 
-        if not isinstance(runs, list):
-            result["errors"].append(f"Expected list from gh run list, got {type(runs)}")
-            return result
+        if isinstance(runs, GitHubRunResult):
+            if not runs.ok or not isinstance(runs.value, list):
+                result["errors"].append(
+                    f"Expected list from gh run list, got {type(runs.value)} (error: {runs.error})"
+                )
+                return result
+            runs_list = runs.value
+        else:
+            if not isinstance(runs, list):
+                result["errors"].append(f"Expected list from gh run list, got {type(runs)}")
+                return result
+            runs_list = runs
 
-        queued_runs = [r for r in runs if r.get("status") == "queued"]
+        queued_runs = [r for r in runs_list if r.get("status") == "queued"]
         result["total_queued"] = len(queued_runs)
 
         if len(queued_runs) <= 1:
@@ -880,8 +1030,14 @@ def cancel_superseded_runs(
 
             try:
                 cancel_result = gh.run(["run", "cancel", str(run_id)], allow_failure=True)
-                # With allow_failure=True, gh.run returns None on failure
-                if cancel_result is not None:
+                # With allow_failure=True, gh.run returns a structured result. A
+                # dry-run string is also truthy. Count as cancelled only when the
+                # result indicates success (or dry-run).
+                if isinstance(cancel_result, GitHubRunResult):
+                    cancelled = cancel_result.ok
+                else:
+                    cancelled = cancel_result is not None
+                if cancelled:
                     result["cancelled_run_ids"].append(run_id)
                     result["cancelled"] += 1
                 else:

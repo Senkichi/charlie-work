@@ -1931,7 +1931,10 @@ def test_github_run_parses_allow_failure_json_stdout(monkeypatch, tmp_path: Path
         ["pr", "checks", "123"], json_output=True, allow_failure=True
     )
 
-    assert result == [{"name": "Tests passed", "state": "FAILURE"}]
+    # allow_failure=True now returns a structured result with an ok flag.
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is False
+    assert result.value == [{"name": "Tests passed", "state": "FAILURE"}]
 
 
 def test_pr_checks_fields_excludes_database_id() -> None:
