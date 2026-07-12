@@ -26,6 +26,14 @@ from .subprocess_runner import run_captured
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 
+
+class WorktreeUnsafeError(RuntimeError):
+    """Raised when ``create_worktree`` is about to reset a worktree that contains
+    local work (uncommitted modifications or local commits not on the remote
+    branch). The launch shim should surface this as a distinct ``failure_kind``.
+    """
+
+
 # Known porcelain flag keys that may appear as space-less lines (value=True)
 # These are the only keys that map to True in git worktree --porcelain output
 KNOWN_FLAG_KEYS = frozenset({"bare", "detached", "locked", "prunable"})
@@ -177,6 +185,109 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
         return True
     # Branch does not exist (exit 0 with empty stdout)
     return False
+
+
+def _worktree_refuse_to_reset_reason(
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    worktree_path: Path | None = None,
+) -> str | None:
+    """Return a human-readable reason if resetting the branch/worktree would destroy
+    local work, otherwise ``None``.
+
+    Checks for:
+      - uncommitted modifications in ``worktree_path`` (if it exists)
+      - local commits that are not present on the remote branch (``git ls-remote``
+        comparison, falling back to the merge-base with ``base_ref`` when the remote
+        branch does not exist)
+
+    This is read-only: it never commits, fetches, or resets.
+    """
+    # Uncommitted modifications are only meaningful when the worktree directory exists.
+    if worktree_path is not None and worktree_path.is_dir():
+        status_result = run_captured(
+            ["git", "status", "--porcelain"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        # If the probe fails (index lock, corruption, permissions), treat as dirty
+        # to be safe and refuse the reset.
+        if not status_result.ok:
+            return "worktree status probe failed; treating as dirty"
+        if status_result.stdout.strip():
+            return "worktree has uncommitted modifications"
+        local_tip_result = run_captured(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+    else:
+        local_tip_result = run_captured(
+            ["git", "rev-parse", "--verify", branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+
+    if not local_tip_result.ok or not local_tip_result.stdout.strip():
+        # No branch or no commit; nothing to lose.
+        return None
+
+    local_sha = local_tip_result.stdout.strip()
+
+    # Compare against the remote branch via git ls-remote.
+    remote_sha: str | None = None
+    if _has_origin_remote(repo_root):
+        ls_remote_result = run_captured(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if ls_remote_result.ok and ls_remote_result.stdout.strip():
+            remote_sha = ls_remote_result.stdout.strip().split()[0]
+
+    if remote_sha is None:
+        # Branch does not exist on origin (or the probe failed). Any commits beyond
+        # the base ref are unpushed and must not be discarded.
+        base = base_ref if base_ref else _resolve_default_branch_ref(repo_root)
+        merge_base_result = run_captured(
+            ["git", "merge-base", base, local_sha],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not merge_base_result.ok:
+            return "worktree has local commits not on remote branch"
+        merge_base = merge_base_result.stdout.strip()
+        rev_list_result = run_captured(
+            ["git", "rev-list", "--count", f"{merge_base}..{local_sha}"],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if (
+            rev_list_result.ok
+            and rev_list_result.stdout.strip().isdigit()
+            and int(rev_list_result.stdout.strip()) > 0
+        ):
+            return f"worktree has {rev_list_result.stdout.strip()} local commit(s) not on remote branch"
+        return None
+
+    # Remote branch exists. If local tip matches the remote tip, there are no
+    # local-only commits.
+    if local_sha == remote_sha:
+        return None
+
+    # local_sha != remote_sha. If local_sha is an ancestor of remote_sha, the local
+    # branch is behind the remote and has no local commits not on remote. Otherwise
+    # local is ahead or has diverged, which means local commits not on remote.
+    ancestor_result = run_captured(
+        ["git", "merge-base", "--is-ancestor", local_sha, remote_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if ancestor_result.ok:
+        return None
+
+    return "worktree has local commits not on remote branch"
 
 
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
