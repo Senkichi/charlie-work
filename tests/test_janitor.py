@@ -2576,6 +2576,40 @@ index 123..456 100644
     assert any("test_existing_async" in w for w in warnings)
 
 
+def test_check_stub_tests_deletion_only_gutted_body_is_flagged() -> None:
+    """Gutting by pure deletion (no added lines in the function) is still caught."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,4 +1,2 @@
+ def test_existing():
+     '''checks the feature'''
+-    result = feature()
+-    assert result
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert any("test_existing" in w for w in warnings)
+
+
+def test_check_stub_tests_deletion_near_healthy_test_not_flagged() -> None:
+    """A deletion adjacent to a substantive test does not flag that test."""
+    diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
+index 123..456 100644
+--- a/tests/test_feature.py
++++ b/tests/test_feature.py
+@@ -1,4 +1,3 @@
+ def test_existing():
+     result = feature()
+     assert result
+-# stale comment
+"""
+    warnings = check_stub_tests(diff, _test_adequacy_config())
+
+    assert not any("test_existing" in w for w in warnings)
+
+
 def test_run_janitor_appends_stub_warnings_from_pr_diff() -> None:
     """run_janitor calls check_stub_tests and adds its warnings to the verdict."""
     diff = """diff --git a/tests/test_feature.py b/tests/test_feature.py
