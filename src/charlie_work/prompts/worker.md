@@ -22,7 +22,7 @@ $issue_body
 
 $section_scope_contract
 
-$section_execution_contract
+$section_api_shape_validation
 
 ## Available skills
 
@@ -49,7 +49,8 @@ The following skills are available to help you complete this task:
    ```bash
    uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
-   Do NOT run the full suite locally — CI runs it on every push and is the
+   $section_execution_contract
+   For all other diffs, do NOT run the full suite locally — CI runs it on every push and is the
    merge gate; a long silent local run also risks the session getting reaped
    as stalled. The `/test` skill is a convenience shortcut but may not cover
    every impacted file — always use the explicit command for final

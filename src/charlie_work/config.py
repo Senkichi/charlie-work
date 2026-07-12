@@ -358,6 +358,15 @@ class TestAdequacyConfig:
     )
     comment_prefixes: tuple[str, ...] = ("#",)
     require_assertions: bool = False
+    stub_test_seam_keywords: tuple[str, ...] = (
+        "route",
+        "e2e",
+        "byte",
+        "call_model",
+        "dispatch",
+        "lock",
+        "concurrent",
+    )
     exempt_marker: str = "Test-exempt:"
     # Tier 3 (reserved, deferred): diff-coverage extension, not read by any
     # code path yet.
@@ -823,12 +832,13 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
 
-    # Five tuple-of-str fields: reject non-list, coerce elements to str.
+    # Six tuple-of-str fields: reject non-list, coerce elements to str.
     _TEST_ADEQUACY_TUPLE_FIELDS = (
         "test_path_globs",
         "exempt_path_globs",
         "assertion_markers",
         "comment_prefixes",
+        "stub_test_seam_keywords",
         "coverage_command",
     )
     for key in _TEST_ADEQUACY_TUPLE_FIELDS:

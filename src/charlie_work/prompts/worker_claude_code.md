@@ -23,7 +23,7 @@ $issue_body
 
 $section_scope_contract
 
-$section_execution_contract
+$section_api_shape_validation
 
 ## Required implementation loop
 
@@ -41,7 +41,8 @@ $section_execution_contract
    ```bash
    uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
    ```
-   Do NOT run the full suite locally — CI runs the full matrix on push and is
+   $section_execution_contract
+   For all other diffs, do NOT run the full suite locally — CI runs the full matrix on push and is
    the regression authority and merge gate; a long silent local run also
    risks the session getting reaped as stalled. **You share this host's cores
    and RAM with other concurrent workers** — if you use `pytest-xdist`, bound

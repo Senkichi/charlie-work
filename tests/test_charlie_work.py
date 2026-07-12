@@ -1070,6 +1070,9 @@ def test_config_test_adequacy_coerces_tuple_fields_to_tuple(tmp_path: Path) -> N
   comment_prefixes:
     - "#"
     - "//"
+  stub_test_seam_keywords:
+    - "route"
+    - "call_model"
   coverage_command:
     - "pytest"
     - "--cov"
@@ -1087,6 +1090,8 @@ def test_config_test_adequacy_coerces_tuple_fields_to_tuple(tmp_path: Path) -> N
     assert config.test_adequacy.assertion_markers == ("assert ", "pytest.raises")
     assert isinstance(config.test_adequacy.comment_prefixes, tuple)
     assert config.test_adequacy.comment_prefixes == ("#", "//")
+    assert isinstance(config.test_adequacy.stub_test_seam_keywords, tuple)
+    assert config.test_adequacy.stub_test_seam_keywords == ("route", "call_model")
     assert isinstance(config.test_adequacy.coverage_command, tuple)
     assert config.test_adequacy.coverage_command == ("pytest", "--cov")
 
@@ -1279,6 +1284,9 @@ def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
   comment_prefixes:
     - "//"
   require_assertions: true
+  stub_test_seam_keywords:
+    - "route"
+    - "byte"
   exempt_marker: "Custom-exempt:"
   coverage_enabled: true
   coverage_command:
@@ -1298,6 +1306,7 @@ def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
     assert config.test_adequacy.assertion_markers == ("custom_assert",)
     assert config.test_adequacy.comment_prefixes == ("//",)
     assert config.test_adequacy.require_assertions is True
+    assert config.test_adequacy.stub_test_seam_keywords == ("route", "byte")
     assert config.test_adequacy.exempt_marker == "Custom-exempt:"
     assert config.test_adequacy.coverage_enabled is True
     assert config.test_adequacy.coverage_command == ("custom", "cov")
