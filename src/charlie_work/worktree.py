@@ -17,6 +17,7 @@ import re
 import shutil
 import stat
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,32 @@ class WorktreeInfo:
     # Set when a redispatch reset a branch tip that had commits worth
     # preserving (issue #261) — see attempt_refs.snapshot_attempt_ref.
     attempt_snapshot: AttemptSnapshot | None = None
+
+
+class WorktreeState(str, Enum):
+    """Classification of a worker worktree after the process dies.
+
+    - completed: branch is ahead of the dispatch base and the working tree is clean.
+    - partial: the worktree has uncommitted changes (with or without commits).
+    - no_commits: the working tree is clean and has no commits beyond the base.
+    - unknown: git probing failed; treat as partial and avoid destructive actions.
+    """
+
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    NO_COMMITS = "no_commits"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class WorktreeInspection:
+    """Result of inspecting a worker worktree after the process dies."""
+
+    state: WorktreeState
+    ahead_count: int = 0
+    dirty: bool = False
+    resolved_base_ref: str | None = None
+    error: str | None = None
 
 
 def _slugify(value: str, *, max_length: int = 80) -> str:
@@ -896,6 +923,175 @@ def remove_worktree(
         branch_deleted = branch_result.ok
 
     return worktree_removed and branch_deleted
+
+
+def inspect_worktree_state(worktree_path: Path, base_ref: str = "") -> WorktreeInspection:
+    """Inspect a worker worktree after the process dies.
+
+    Returns a ``WorktreeInspection`` describing whether the worker has:
+    - completed work (clean working tree and commits ahead of the dispatch base)
+    - partial work (uncommitted changes)
+    - no commits (clean and at the base)
+    - unknown (git probing failed)
+
+    This is the single enforcement point for worktree inspection; it is used by
+    both the workflow dead-session lane and reconcile.py drift detection.
+    """
+    if not worktree_path.is_dir():
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error=f"worktree path does not exist: {worktree_path}",
+        )
+
+    status_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok:
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error=status_result.error or status_result.stderr or "git status failed",
+        )
+
+    dirty = bool(status_result.stdout.strip())
+
+    if base_ref == "":
+        try:
+            resolved_base_ref = _resolve_default_branch_ref(worktree_path)
+        except RuntimeError as exc:
+            return WorktreeInspection(
+                WorktreeState.UNKNOWN,
+                error=f"failed to resolve base ref: {exc}",
+            )
+    else:
+        resolved_base_ref = base_ref
+
+    merge_base_result = run_captured(
+        ["git", "merge-base", resolved_base_ref, "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not merge_base_result.ok:
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error=merge_base_result.error or merge_base_result.stderr or "merge-base failed",
+        )
+
+    merge_base = merge_base_result.stdout.strip()
+    rev_list_result = run_captured(
+        ["git", "rev-list", "--count", f"{merge_base}..HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not rev_list_result.ok:
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error=rev_list_result.error or rev_list_result.stderr or "rev-list failed",
+        )
+
+    try:
+        ahead_count = int(rev_list_result.stdout.strip())
+    except ValueError:
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error=f"invalid rev-list count: {rev_list_result.stdout!r}",
+        )
+
+    if ahead_count > 0 and not dirty:
+        return WorktreeInspection(
+            WorktreeState.COMPLETED,
+            ahead_count=ahead_count,
+            dirty=False,
+            resolved_base_ref=resolved_base_ref,
+        )
+    if ahead_count > 0 and dirty:
+        return WorktreeInspection(
+            WorktreeState.PARTIAL,
+            ahead_count=ahead_count,
+            dirty=True,
+            resolved_base_ref=resolved_base_ref,
+        )
+    if dirty:
+        return WorktreeInspection(
+            WorktreeState.PARTIAL,
+            ahead_count=0,
+            dirty=True,
+            resolved_base_ref=resolved_base_ref,
+        )
+    return WorktreeInspection(
+        WorktreeState.NO_COMMITS,
+        ahead_count=0,
+        dirty=False,
+        resolved_base_ref=resolved_base_ref,
+    )
+
+
+def push_branch(
+    repo_root: Path, branch: str, worktree_path: Path | None = None
+) -> tuple[bool, str | None]:
+    """Push ``branch`` to origin and verify via ``git ls-remote``.
+
+    Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
+    remote branch tip is explicitly checked and compared to the local branch tip.
+    """
+    cwd = worktree_path if worktree_path else repo_root
+    push_result = run_captured(
+        ["git", "push", "origin", branch],
+        cwd=cwd,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not push_result.ok:
+        return False, push_result.error or push_result.stderr or "git push failed"
+
+    ls_remote_result = run_captured(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=cwd,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not ls_remote_result.ok:
+        return False, ls_remote_result.error or ls_remote_result.stderr or "git ls-remote failed"
+
+    remote_line = ls_remote_result.stdout.strip()
+    if not remote_line:
+        return False, f"remote branch {branch} not found after push"
+
+    remote_sha = remote_line.split()[0]
+    local_sha_result = run_captured(
+        ["git", "rev-parse", "--verify", branch],
+        cwd=cwd,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not local_sha_result.ok:
+        return False, local_sha_result.error or local_sha_result.stderr or "git rev-parse failed"
+
+    if local_sha_result.stdout.strip() == remote_sha:
+        return True, None
+    return False, f"remote branch {branch} does not match local tip after push"
+
+
+def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
+    """Convert a base ref (e.g. ``origin/main`` or ``HEAD``) into a branch name.
+
+    ``gh pr create --base`` expects a simple branch name. Remote-tracking refs
+    are stripped to their local branch name; ``HEAD`` falls back to the current
+    branch or ``main``.
+    """
+    if base_ref.startswith("refs/remotes/origin/"):
+        return base_ref[len("refs/remotes/origin/") :]
+    if base_ref.startswith("refs/heads/"):
+        return base_ref[len("refs/heads/") :]
+    if base_ref.startswith("origin/"):
+        return base_ref[len("origin/") :]
+    if base_ref == "HEAD":
+        current_branch = run_captured(
+            ["git", "branch", "--show-current"],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if current_branch.ok and current_branch.stdout.strip():
+            return current_branch.stdout.strip()
+    return "main"
 
 
 def list_worktrees(repo_root: Path) -> list[dict]:

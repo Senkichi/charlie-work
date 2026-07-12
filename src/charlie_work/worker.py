@@ -221,6 +221,7 @@ class WorkerView:
     error: str | None
     failure_kind: str | None
     reclaimed: str | None
+    branch: str = ""
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
     log_bytes: int | None = None  # log_path.stat().st_size
     rate_limit_defer_until: str | None = (
@@ -522,6 +523,7 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         process_start_time=record.process_start_time,
         log_path=record.log_path,
         worktree_path=record.worktree_path,
+        branch=record.branch,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,
@@ -542,6 +544,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         process_start_time=record.process_start_time,
         log_path=record.log_path,
         worktree_path=record.worktree_path,
+        branch=record.branch,
         error=record.error,
         failure_kind=record.failure_kind,
         reclaimed=record.reclaimed,

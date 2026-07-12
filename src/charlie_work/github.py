@@ -118,6 +118,48 @@ class GitHub:
         except json.JSONDecodeError as exc:
             raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
 
+    def pr_create(
+        self,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> int | None:
+        """Create a GitHub PR for ``head`` into ``base``.
+
+        Returns the PR number, or ``None`` if creation failed or the local ``gh``
+        does not support JSON output. Errors are returned as values, never raised.
+        """
+        if self.dry_run:
+            return 0
+        try:
+            result = self.run(
+                [
+                    "pr",
+                    "create",
+                    "--head",
+                    head,
+                    "--base",
+                    base,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                    "--json",
+                    "number",
+                ],
+                json_output=True,
+            )
+        except GitHubError:
+            return None
+        if isinstance(result, dict) and "number" in result:
+            return int(result["number"])
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict) and "number" in first:
+                return int(first["number"])
+        return None
+
     def _run_bool(self, args: list[str]) -> bool:
         """Run a gh command and return True iff returncode == 0.
 

@@ -8,7 +8,9 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -55,6 +57,8 @@ from charlie_work.state import (
     state_lock,
 )
 from charlie_work.workflow import ConcurrencyGovernorResult, OrchestratorApp, slugify
+from charlie_work.worktree import create_worktree
+from charlie_work.devin_shell import SessionRecord
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
@@ -2207,7 +2211,8 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
 
 
 class FakeGitHub:
-    def __init__(self) -> None:
+    def __init__(self, repo_root: Any = None) -> None:
+        self.repo_root = repo_root
         self.issues = [
             {
                 "number": 123,
@@ -2234,6 +2239,8 @@ class FakeGitHub:
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_created: list[tuple[str, str, str]] = []
+        self.prs_created: list[dict[str, Any]] = []
+        self.pr_create_return: int | None = None
         self.merged: list[tuple[int, str]] = []
         self.merged_admin_flags: list[bool] = []
         self.merged_merge_flags: list[tuple[str, ...]] = []
@@ -2285,6 +2292,10 @@ class FakeGitHub:
                     pr_copy["headRefOid"] = self.pr_head_shas[number]
                 return pr_copy
         raise ValueError(f"PR {number} not found")
+
+    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
+        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
+        return self.pr_create_return
 
     def pr_checks(self, number: int):
         return [
@@ -13964,3 +13975,226 @@ def test_loop_undecided_no_packet_invokes_review(tmp_path: Path) -> None:
 
     assert result.data["skipped_reviews"] == 0
     assert 456 in review_calls
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote repo and a local clone, return (remote, clone)."""
+    remote = tmp_path / "remote"
+    remote.mkdir(parents=True, exist_ok=True)
+    _git(remote, "init", "--bare", "--initial-branch=main")
+    clone = tmp_path / "clone"
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "--initial-branch=main")
+    _git(clone, "config", "user.email", "test@example.test")
+    _git(clone, "config", "user.name", "Test User")
+    _git(clone, "config", "commit.gpgSign", "false")
+    _git(clone, "remote", "add", "origin", str(remote))
+    (clone / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(clone, "add", "README.md")
+    _git(clone, "commit", "-m", "initial commit")
+    _git(clone, "push", "-u", "origin", "main")
+    return remote, clone
+
+
+def _setup_completed_worktree(
+    repo_root: Path, issue_number: int, dirty: bool = False
+) -> tuple[Path, str]:
+    """Create a worktree with one commit beyond origin/main. Return (worktree_path, branch)."""
+    branch = f"agent/issue-{issue_number}"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+    if dirty:
+        (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    return info.path, branch
+
+
+def _write_dead_session_sidecar(
+    sessions_dir: Path, issue_number: int, branch: str, worktree_path: Path
+) -> None:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(sessions_dir / f"issue-{issue_number}.log"),
+        error=None,
+    )
+    sidecar_path = sessions_dir / f"issue-{issue_number}.json"
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+
+def _make_classify_state(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a state file and sessions dir under tmp_path, return (sessions_dir, state_file)."""
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
+    return sessions_dir, state_file
+
+
+def test_classify_dead_sessions_salvages_completed_unpublished_work(
+    tmp_path: Path,
+) -> None:
+    """Issue #252: a clean, ahead worktree is salvaged (push + PR + pr_open label)."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 252)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 252, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 252,
+            "title": "Test issue",
+            "url": "https://example.test/issues/252",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # Branch pushed and PR created
+    remote_refs = _git(remote, "show-ref")
+    assert "agent/issue-252" in remote_refs.stdout
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    assert gh.prs_created[0]["base"] == "main"
+
+    # Labels moved to pr_open
+    assert (252, config.labels.in_progress) in gh.labels_removed
+    assert (252, config.labels.pr_open) in gh.labels_added
+
+    # Sidecar reaped and event recorded
+    assert not (sessions_dir / "issue-252.json").exists()
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == 252
+    assert events[0]["payload"]["pr_number"] == 101
+
+
+def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path) -> None:
+    """Issue #252: a dirty worktree is not salvaged; it relabels to ready."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 253, dirty=True)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 253, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 253,
+            "title": "Test issue",
+            "url": "https://example.test/issues/253",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # No PR created, active label removed, ready label added
+    assert not gh.prs_created
+    assert (253, config.labels.in_progress) in gh.labels_removed
+    assert (253, config.labels.ready) in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+
+
+def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> None:
+    """Issue #252: a clean worktree with no commits relabels to ready."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    branch = "agent/issue-254"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 254, branch, info.path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 254,
+            "title": "Test issue",
+            "url": "https://example.test/issues/254",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    assert not gh.prs_created
+    assert (254, config.labels.in_progress) in gh.labels_removed
+    assert (254, config.labels.ready) in gh.labels_added
+
+
+def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
+    """Issue #252: a failed salvage push records failure and falls back to relabel."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 255)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 255, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 255,
+            "title": "Test issue",
+            "url": "https://example.test/issues/255",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    original_push_branch = workflow_module.push_branch
+    workflow_module.push_branch = lambda repo, br, worktree_path=None: (
+        False,
+        "simulated push failure",
+    )
+    try:
+        _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    finally:
+        workflow_module.push_branch = original_push_branch
+
+    # No PR created, active label removed, ready label added, event records salvage failure
+    assert not gh.prs_created
+    assert (255, config.labels.in_progress) in gh.labels_removed
+    assert (255, config.labels.ready) in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"].get("salvage_failed") is True

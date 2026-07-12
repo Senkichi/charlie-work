@@ -37,6 +37,12 @@ from .github import (
 from .labels import TransitionOutcome, transition
 from .process_utils import kill_process_tree
 from .state import append_event, is_claim_stale, set_throttled_until
+from .worktree import (
+    WorktreeState,
+    inspect_worktree_state,
+    push_branch,
+    resolve_base_branch_name,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,8 @@ class DriftItem:
     fix_actions: tuple[str, ...]
     remove_labels: tuple[str, ...] = ()
     add_labels: tuple[str, ...] = ()
+    branch: str | None = None
+    base_branch: str | None = None
 
 
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
@@ -285,38 +293,72 @@ def detect_drift(
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)
 
-                    # Issue #261: post-mortem extraction must run BEFORE the
-                    # adapter's own log-tail classification below — see
-                    # classify_and_record's docstring. A "worker_blocked"
-                    # verdict (worker killed by a push-gate hook) writes
-                    # failure_kind into the sidecar directly, which makes the
-                    # adapter classifiers' "already classified" short-circuit
-                    # take over, and must suppress the relabel-to-ready /
-                    # redispatch below (mirrors workflow.py's dead-session
-                    # reaper: a blocked worker escalates instead of getting
-                    # hot-redispatched straight back into the same hook).
-                    # classify_and_record never raises — any DB/matching
-                    # failure degrades to matched=False and this is None.
-                    worker_blocked = (
-                        classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                        == "worker_blocked"
-                    )
+                    # Issue #252: inspect the worktree before deciding how to classify.
+                    # This is the single enforcement point shared with workflow.py.
+                    worktree_path = Path(w.worktree_path)
+                    inspection = inspect_worktree_state(worktree_path, config.dispatch.base_ref)
+                    is_completed = inspection.state == WorktreeState.COMPLETED
 
-                    # Session exited without error - classify the failure (adapter-specific dispatch)
-                    if w.adapter_kind == "devin":
-                        failure_kind, throttled_until = (
-                            update_session_record_with_failure_classification(
-                                sessions_dir, w.issue_number, config=config
+                    # Issue #261: post-mortem extraction is intertwined with log-tail
+                    # classification. For a completed-but-unpublished worktree, we want
+                    # failure_kind to be "unpublished_work" even if the terminal log
+                    # tail would otherwise look like a tool-rejection (worker_blocked).
+                    # Call update_* first when completed, then run classify_and_record
+                    # for diagnostics. For non-completed sessions, preserve the original
+                    # ordering so worker_blocked still escalates.
+                    if is_completed:
+                        if w.adapter_kind == "devin":
+                            failure_kind, throttled_until = (
+                                update_session_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind="unpublished_work",
+                                    config=config,
+                                )
                             )
-                        )
-                    elif w.adapter_kind == "claude-code":
-                        failure_kind, throttled_until = (
-                            update_worker_record_with_failure_classification(
-                                sessions_dir, w.issue_number, config=config
+                        elif w.adapter_kind == "claude-code":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind="unpublished_work",
+                                    config=config,
+                                )
                             )
-                        )
+                        else:
+                            failure_kind, throttled_until = None, None
+                        # Diagnostic post-mortem; its worker_blocked verdict is ignored
+                        # because the worktree itself proves the work was completed.
+                        classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                        worker_blocked = False
                     else:
-                        failure_kind, throttled_until = None, None
+                        worker_blocked = (
+                            classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                            == "worker_blocked"
+                        )
+                        fallback_kind = (
+                            "stalled" if inspection.state != WorktreeState.UNKNOWN else None
+                        )
+                        if w.adapter_kind == "devin":
+                            failure_kind, throttled_until = (
+                                update_session_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind=fallback_kind,
+                                    config=config,
+                                )
+                            )
+                        elif w.adapter_kind == "claude-code":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind=fallback_kind,
+                                    config=config,
+                                )
+                            )
+                        else:
+                            failure_kind, throttled_until = None, None
 
                     if failure_kind and throttled_until:
                         # Update state with throttle window
@@ -369,6 +411,46 @@ def detect_drift(
                                             f"transition issue #{w.issue_number} labels via "
                                             "'redispatch_escalated' event",
                                         ),
+                                    )
+                                )
+                                # Mark this issue as handled to avoid double-emission with
+                                # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
+                                issues_handled_by_session_relabel.add(w.issue_number)
+                            elif active_labels and is_completed:
+                                # Issue #252: completed-but-unpublished work takes the salvage
+                                # path (push + PR) instead of re-dispatching.
+                                base_branch = None
+                                if inspection.resolved_base_ref:
+                                    base_branch = resolve_base_branch_name(
+                                        repo_root, inspection.resolved_base_ref
+                                    )
+                                fix_actions = [
+                                    f"push branch '{w.branch}' to origin",
+                                    f"create PR for issue #{w.issue_number} from branch '{w.branch}'",
+                                ]
+                                add_labels = (labels_cfg.pr_open,)
+                                for label in sorted(active_labels):
+                                    fix_actions.append(
+                                        f"remove label '{label}' from issue #{w.issue_number}"
+                                    )
+                                fix_actions.append(
+                                    f"add label '{labels_cfg.pr_open}' to issue #{w.issue_number}"
+                                )
+                                drift.append(
+                                    DriftItem(
+                                        kind="session_unpublished_work_salvaged",
+                                        issue_number=w.issue_number,
+                                        pr_number=None,
+                                        detail=(
+                                            f"issue #{w.issue_number} session has a clean worktree "
+                                            f"with {inspection.ahead_count} unpushed commit(s); "
+                                            f"salvaging by pushing branch '{w.branch}' and opening a PR"
+                                        ),
+                                        fix_actions=tuple(fix_actions),
+                                        remove_labels=tuple(sorted(active_labels)),
+                                        add_labels=add_labels,
+                                        branch=w.branch,
+                                        base_branch=base_branch,
                                     )
                                 )
                                 # Mark this issue as handled to avoid double-emission with
@@ -602,6 +684,83 @@ def apply_fixes(
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
+                    )
+
+        elif item.kind == "session_unpublished_work_salvaged":
+            # Issue #252: push the completed branch, create a PR, and move labels to pr_open.
+            # If any step fails, fall back to the normal relabel-to-ready path.
+            if item.issue_number is not None and item.branch and item.base_branch:
+                repo_root = getattr(gh, "repo_root", None)
+                salvage_ok = False
+                salvage_error = "repo_root not available"
+                pr_number = None
+                if repo_root is not None:
+                    push_ok, push_error = push_branch(repo_root, item.branch)
+                    if push_ok:
+                        pr_create = getattr(gh, "pr_create", None)
+                        if pr_create is not None:
+                            pr_number = pr_create(
+                                head=item.branch,
+                                base=item.base_branch,
+                                title=f"Salvaged work for issue #{item.issue_number}",
+                                body=(
+                                    f"Closes #{item.issue_number}\n\n"
+                                    "Salvaged by the orchestrator from a completed-but-unpublished "
+                                    "worker worktree."
+                                ),
+                            )
+                        if pr_number is not None:
+                            salvage_ok = True
+                        else:
+                            salvage_error = "gh pr create failed or returned no PR number"
+                    else:
+                        salvage_error = push_error or "git push failed"
+
+                if salvage_ok:
+                    label_ok = True
+                    for label in item.remove_labels:
+                        if not gh.remove_issue_label(item.issue_number, label):
+                            label_ok = False
+                    for label in item.add_labels:
+                        if not gh.add_issue_label(item.issue_number, label):
+                            label_ok = False
+                    fix_actions = list(item.fix_actions)
+                    if not label_ok:
+                        fix_actions.append("label_write_failed: true")
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                        branch=item.branch,
+                        base_branch=item.base_branch,
+                    )
+                else:
+                    # Fallback: treat as session_failed_relabeled and add ready label
+                    label_ok = True
+                    for label in item.remove_labels:
+                        if not gh.remove_issue_label(item.issue_number, label):
+                            label_ok = False
+                    if config.labels.ready not in item.add_labels:
+                        if not gh.add_issue_label(item.issue_number, config.labels.ready):
+                            label_ok = False
+                    fix_actions = list(item.fix_actions)
+                    fix_actions.append(f"salvage_failed: {salvage_error}")
+                    if not label_ok:
+                        fix_actions.append("label_write_failed: true")
+                    item = DriftItem(
+                        kind="session_failed_relabeled",
+                        issue_number=item.issue_number,
+                        pr_number=None,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=(config.labels.ready,),
+                        branch=item.branch,
+                        base_branch=item.base_branch,
                     )
 
         elif item.kind == "session_failed_relabeled":

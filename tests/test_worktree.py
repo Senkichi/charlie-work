@@ -8,12 +8,15 @@ import pytest
 
 from charlie_work.worktree import (
     WorktreeInfo,
+    WorktreeState,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
     create_worktree,
+    inspect_worktree_state,
     is_junction,
     list_worktrees,
+    push_branch,
     remove_worktree,
     _is_git_tracked,
     _materialize_directory,
@@ -2465,3 +2468,85 @@ def test_salvage_worktree_no_origin_conservative(tmp_path: Path) -> None:
 
     # Clean up
     remove_worktree(repo_root, worktree_path, force=True, branch=branch_name)
+
+
+def _init_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote and a local clone, return (remote, repo)."""
+    remote = tmp_path / "remote"
+    _init_repo(remote, bare=True)
+    repo = tmp_path / "repo"
+    _clone_repo(remote, repo)
+    return remote, repo
+
+
+def test_inspect_worktree_state_completed(tmp_path: Path) -> None:
+    """A clean worktree with commits beyond the base is completed."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    info = create_worktree(repo, "agent/issue-1", base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    inspection = inspect_worktree_state(info.path, base_ref="origin/main")
+    assert inspection.state == WorktreeState.COMPLETED
+    assert inspection.ahead_count == 1
+    assert inspection.dirty is False
+    assert inspection.resolved_base_ref == "origin/main"
+
+    remove_worktree(repo, info.path, branch="agent/issue-1")
+
+
+def test_inspect_worktree_state_partial_dirty(tmp_path: Path) -> None:
+    """A worktree with uncommitted changes is partial, regardless of commits."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    info = create_worktree(repo, "agent/issue-2", base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+    (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    inspection = inspect_worktree_state(info.path, base_ref="origin/main")
+    assert inspection.state == WorktreeState.PARTIAL
+    assert inspection.dirty is True
+
+    remove_worktree(repo, info.path, branch="agent/issue-2")
+
+
+def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
+    """A clean worktree with no commits beyond the base is no_commits."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    info = create_worktree(repo, "agent/issue-3", base_ref="origin/main")
+
+    inspection = inspect_worktree_state(info.path, base_ref="origin/main")
+    assert inspection.state == WorktreeState.NO_COMMITS
+    assert inspection.ahead_count == 0
+    assert inspection.dirty is False
+
+    remove_worktree(repo, info.path, branch="agent/issue-3")
+
+
+def test_inspect_worktree_state_unknown_missing_path(tmp_path: Path) -> None:
+    """A missing worktree path returns unknown."""
+    inspection = inspect_worktree_state(tmp_path / "does-not-exist")
+    assert inspection.state == WorktreeState.UNKNOWN
+    assert inspection.error is not None
+
+
+def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
+    """push_branch pushes a local branch to origin and verifies the remote tip."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    info = create_worktree(repo, "agent/issue-4", base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    ok, error = push_branch(repo, "agent/issue-4", worktree_path=info.path)
+    assert ok, error
+
+    remote_refs = _git(remote, "show-ref")
+    assert "agent/issue-4" in remote_refs.stdout
+
+    remove_worktree(repo, info.path, branch="agent/issue-4")
