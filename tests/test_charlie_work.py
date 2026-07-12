@@ -6688,6 +6688,38 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
     assert result.data["attempted_count"] == 0
 
 
+def test_dispatch_clears_stale_orphan_flagged_at(tmp_path: Path) -> None:
+    """Issue #259 review: a fresh dispatch must clear a stale orphan flag."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="manual",  # Use manual to avoid actual worker launch
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Close the default PR so the issue is dispatchable.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "orphan_flagged_at": "2024-01-01T00:00:00Z",
+        "title": "Test issue",
+        "url": "https://github.com/test/repo/issues/123",
+    }
+    save_state(paths.state_file, seed)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    assert result.data["attempted_count"] == 1
+    assert result.data["selected_count"] == 1
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry.get("status") == "manifest_written"
+    assert "orphan_flagged_at" not in entry
+
+
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
     """Issue #135: PARTIAL_FAILURE during dispatch label transition must be recorded."""
     from charlie_work import devin_shell
@@ -14922,6 +14954,178 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     # Verify NO recovered event
     recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
     assert len(recovered_events) == 0
+
+    # Issue #259: the entry should be marked so it is not re-flagged every pass.
+    assert "orphan_flagged_at" in entry
+
+
+def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None:
+    """Issue #259: sweep must emit only one drift event per zombie across N passes."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["259"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(3):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    drift_events = [e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1, (
+        f"Expected exactly one orphaned_worker_drift event, got {len(drift_events)}"
+    )
+    assert drift_events[0]["payload"]["issue_number"] == 259
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+    entry = state["issues"]["259"]
+    assert entry.get("status") == "dispatched"
+    assert "orphan_flagged_at" in entry
+
+
+def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_path: Path) -> None:
+    """Issue #259 review: orphan suppression must not block open-PR recovery paths."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_flagged_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # With an open PR and request_changes with unchanged head, recovery should
+    # run regardless of the orphan_flagged_at suppression.
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+    assert "worker_pid" not in entry
+    assert "worker_process_start_time" not in entry
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+
+def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Path) -> None:
+    """Issue #275 review: a sweep must aggregate only newly-flagged orphans.
+
+    Pre-flagged entries (from #290's orphan_flagged_at guard) are suppressed
+    before aggregation. A fresh bulk sweep of the remaining orphans is emitted
+    as a single aggregated event.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    pre_flagged = {1, 2, 3}
+    fresh = {4, 5, 6}
+    for issue_number in pre_flagged | fresh:
+        state["issues"][str(issue_number)] = {
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "dispatched_at": "2024-01-01T00:00:00Z",
+        }
+    for issue_number in pre_flagged:
+        state["issues"][str(issue_number)]["orphan_flagged_at"] = "2024-01-01T00:00:00Z"
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoOrphanPrs(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoOrphanPrs()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 0, "pre-flagged orphans must not emit individual drift events"
+
+    sweep_events = [e for e in events if e.get("kind") == "orphaned_worker_drift_sweep"]
+    assert len(sweep_events) == 1
+    assert sweep_events[0]["payload"]["count"] == len(fresh)
+    assert set(sweep_events[0]["payload"]["issue_numbers"]) == fresh
+
+    for issue_number in pre_flagged | fresh:
+        entry = state["issues"][str(issue_number)]
+        assert entry.get("status") == "dispatched"
+        assert "orphan_flagged_at" in entry
 
 
 def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_path: Path) -> None:

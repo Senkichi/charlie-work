@@ -39,7 +39,7 @@ LABEL_LIST_FIELDS = "name"
 RECONCILE_PR_FIELDS = (
     "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
 )
-RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels"
+RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
 # Flag constants for merge_pr — single source of truth for both argv construction
