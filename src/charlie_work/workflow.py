@@ -2460,7 +2460,13 @@ class OrchestratorApp:
             },
         )
 
-    def merge_ready(self, pr_number: int, *, merge: bool | None = None) -> CommandResult:
+    def merge_ready(
+        self,
+        pr_number: int,
+        *,
+        merge: bool | None = None,
+        merge_train_head: int | None = None,
+    ) -> CommandResult:
         # Idempotence: if state already records this PR as merged, short-circuit
         # to a success no-op. Re-running `ship-it` on a completed PR must not
         # re-attempt `gh pr merge` (which fails on an already-merged PR and
@@ -2497,6 +2503,7 @@ class OrchestratorApp:
         )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
+        sync_failed = False
         if approved:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
@@ -2555,6 +2562,45 @@ class OrchestratorApp:
                         "label_error": label_error,
                     },
                 )
+            # Head matches the approved SHA. In merge-train mode, only the head
+            # of the approved queue is allowed to proceed, and it must be
+            # up-to-date with main before checks are evaluated.
+            if self.config.auto_merge.update_open_prs == "next":
+                if merge_train_head is not None and merge_train_head != pr_number:
+                    return self._merge_not_ready_result(
+                        pr_number,
+                        issue_number,
+                        decision,
+                        existing_pr_state,
+                    )
+                if merge_train_head is None:
+                    try:
+                        prs = self.gh.pr_list()
+                    except GitHubError:
+                        sync_failed = True
+                    else:
+                        head = self._merge_train_head(prs)
+                        if head is not None and head != pr_number:
+                            return self._merge_not_ready_result(
+                                pr_number,
+                                issue_number,
+                                decision,
+                                existing_pr_state,
+                            )
+                if not sync_failed and self._should_update_pr_branch(pr):
+                    if self.gh.pr_update_branch(pr_number):
+                        new_head = self._verify_synced_head(pr_number, live_head_sha)
+                        if new_head and new_head != live_head_sha:
+                            self._update_approval_head(pr_number, decision, new_head)
+                            pr = self.gh.pr_view(pr_number) or pr
+                            decision = self._review_decision(pr_number)
+                        elif new_head == live_head_sha:
+                            # Already up-to-date; nothing to do.
+                            pass
+                        else:
+                            sync_failed = True
+                    else:
+                        sync_failed = True
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -2601,8 +2647,10 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
-        can_merge = summary.ready and (
-            approved or not self.config.auto_merge.require_approved_review
+        can_merge = (
+            summary.ready
+            and (approved or not self.config.auto_merge.require_approved_review)
+            and not sync_failed
         )
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
@@ -2659,7 +2707,7 @@ class OrchestratorApp:
                 head_ref = str(pr.get("headRefName") or "")
                 branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
             # Update remaining open agent PRs after successful merge (if configured)
-            if self.config.auto_merge.update_open_prs:
+            if self.config.auto_merge.update_open_prs in {"all", "next"}:
                 update_results = self._update_open_agent_prs(pr_number)
             # Cancel superseded queued runs on default branch after successful merge (if configured)
             if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
@@ -2919,18 +2967,86 @@ class OrchestratorApp:
     def _update_open_agent_prs(self, merged_pr_number: int) -> list[dict[str, Any]]:
         """Update remaining open agent PRs after a successful merge.
 
-        Calls `gh pr update-branch` on all open PRs that:
-        - Are same-repo (not forks)
-        - Have the configured branch prefix
-        - Are not the just-merged PR
-        - Are NOT approved-pending-ship (decision == "approved" with live head == reviewed_head_sha)
-        - Do NOT have required checks in PENDING/IN_PROGRESS state (to avoid cancelling in-flight CI)
+        Behavior is controlled by ``auto_merge.update_open_prs``:
+
+        - "all" (legacy): update every open tracked PR that is not approved-pending-ship
+          and has no required checks currently in-flight.
+        - "next" (merge-train): update only the head of the approved queue, so a single
+          merge only causes one CI reset (the next candidate) instead of N-1.
+        - "off": do nothing.
 
         Per-PR failures (conflicts, network errors) are reported as values and
         never abort the batch operation. A GitHubError from pr_list is also
         reported as a value and never propagates.
         """
         results: list[dict[str, Any]] = []
+        mode = self.config.auto_merge.update_open_prs
+        if mode == "off":
+            return results
+
+        if mode == "next":
+            try:
+                candidates = self._merge_train_candidates(exclude_pr_number=merged_pr_number)
+            except GitHubError as exc:
+                return [{"error": f"pr_list failed: {exc}"}]
+
+            if not candidates:
+                return results
+
+            # Only the head of the merge-train queue is synced.
+            _, pr_number, pr, decision, head = candidates[0]
+            if not self._should_update_pr_branch(pr):
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "up-to-date",
+                    }
+                ]
+
+            old_head = pr.get("headRefOid")
+            if not self.gh.pr_update_branch(pr_number):
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "error": "pr_update_branch failed",
+                    }
+                ]
+
+            new_head = self._verify_synced_head(pr_number, old_head)
+            if new_head is None:
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "error": "post-sync head verification failed",
+                    }
+                ]
+            if new_head == old_head:
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "up-to-date",
+                    }
+                ]
+
+            self._update_approval_head(pr_number, decision, new_head)
+            return [
+                {
+                    "pr_number": pr_number,
+                    "head_ref": head,
+                    "updated": True,
+                    "new_head": new_head,
+                }
+            ]
+
+        # mode == "all": legacy behavior — update every qualifying PR.
         try:
             prs = self.gh.pr_list()
         except GitHubError as exc:
@@ -3019,6 +3135,174 @@ class OrchestratorApp:
             )
 
         return results
+
+    def _merge_not_ready_result(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        decision: dict[str, Any],
+        existing_pr_state: dict[str, Any],
+    ) -> CommandResult:
+        """Return a non-mergeable result for an approved PR that is not the train head."""
+        return CommandResult(
+            True,
+            f"PR #{pr_number} is not the head of the merge-train queue",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "can_merge": False,
+                "auto_merge_enabled": self.config.auto_merge.enabled,
+                "merged": False,
+                "merge_output": None,
+                "branch_deleted": None,
+                "review_decision": decision,
+                "checks": asdict(summarize_checks([], self.config.auto_merge.required_checks)),
+                "checks_unavailable": False,
+                "label_error": None,
+                "update_open_prs_results": None,
+                "cancel_superseded_runs_results": None,
+                "containment_warnings": [],
+                "consecutive_failed_merge_attempts": existing_pr_state.get(
+                    "consecutive_failed_merge_attempts", 0
+                ),
+                "merge_attempt_alarm": False,
+                "merge_attempt_warning": None,
+            },
+        )
+
+    def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
+        """Return the PR number of the head of the merge-train queue, or None.
+
+        The head is the earliest approved-pending-ship PR (same-repo, matching
+        the configured branch prefix) ordered by reviewed_at (falling back to
+        updatedAt), then by PR number for determinism.
+        """
+        candidates = self._merge_train_candidates(prs=prs)
+        return candidates[0][1] if candidates else None
+
+    def _merge_train_candidates(
+        self,
+        prs: list[dict[str, Any]] | None = None,
+        exclude_pr_number: int | None = None,
+    ) -> list[tuple[str, int, dict[str, Any], dict[str, Any], str]]:
+        """Return approved-pending-ship candidates sorted by approval time.
+
+        Each tuple contains (sort_key, pr_number, pr, decision, head_ref).
+        """
+        if prs is None:
+            prs = self.gh.pr_list()
+
+        branch_prefix = self.config.dispatch.branch_prefix
+        candidates: list[tuple[str, int, dict[str, Any], dict[str, Any], str]] = []
+        for pr in prs:
+            pr_number = int(pr.get("number", 0))
+            if pr_number == exclude_pr_number:
+                continue
+            if pr.get("isCrossRepository"):
+                continue
+            head = str(pr.get("headRefName") or "")
+            if not head.startswith(branch_prefix):
+                continue
+            decision = self._review_decision(pr_number)
+            if decision.get("decision") != "approved":
+                continue
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+            live_head_sha = pr.get("headRefOid")
+            if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
+                continue
+            reviewed_at = decision.get("reviewed_at") or pr.get("updatedAt") or ""
+            candidates.append((str(reviewed_at), pr_number, pr, decision, head))
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates
+
+    def _update_approval_head(
+        self,
+        pr_number: int,
+        decision: dict[str, Any],
+        new_head: str,
+    ) -> None:
+        """Persist an updated review head for a PR whose branch was synced.
+
+        Keeps the approval valid when the branch was base-updated without
+        content changes. Updates both review-decision.json and state.json.
+        """
+        decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        updated_decision = dict(decision)
+        updated_decision["reviewed_head_sha"] = new_head
+        self._write_json(decision_path, updated_decision)
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "decision": pr_state.get("decision") or decision.get("decision") or "approved",
+                "status": pr_state.get("status") or decision.get("decision") or "approved",
+                "reviewed_head_sha": new_head,
+                "reviewed_patch_id": pr_state.get("reviewed_patch_id")
+                or decision.get("reviewed_patch_id")
+                or "",
+            }
+            save_state(self.paths.state_file, state)
+
+    def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
+        """Verify that the new head of a PR is a valid base-sync merge commit.
+
+        After ``gh pr update-branch`` advances the PR head, we must not bless the
+        new SHA until we confirm it is a GitHub-generated merge commit (web-flow)
+        whose parents include the previously approved head. This closes the
+        approval-integrity TOCTOU: a racing push to the PR branch could otherwise
+        be mistaken for a base update and auto-merged without review.
+        """
+        pr = self.gh.pr_view(pr_number)
+        if not pr:
+            return None
+        new_head_sha = pr.get("headRefOid")
+        if not new_head_sha:
+            return None
+        if new_head_sha == old_head_sha:
+            return new_head_sha
+
+        commit = self.gh.commit(new_head_sha)
+        if not commit:
+            return None
+
+        parents = commit.get("parents") or []
+        if len(parents) != 2:
+            return None
+        parent_shas = [str(p.get("sha")) for p in parents if isinstance(p, dict)]
+        if old_head_sha not in parent_shas:
+            return None
+
+        committer = commit.get("committer") or {}
+        if not isinstance(committer, dict):
+            committer = {}
+        commit_committer = commit.get("commit", {}).get("committer") or {}
+        if not isinstance(commit_committer, dict):
+            commit_committer = {}
+        committer_login = committer.get("login")
+        committer_name = commit_committer.get("name")
+        # Both identity signals must match a GitHub-generated merge. The git
+        # metadata name is pusher-settable, and the account login can be
+        # spoofed via the committer email, so accepting either alone would let
+        # a crafted racing push get blessed as a base sync. Fail closed.
+        if committer_login != "web-flow" or committer_name != "GitHub":
+            return None
+
+        return new_head_sha
+
+    def _should_update_pr_branch(self, pr: dict[str, Any]) -> bool:
+        """Return True if the PR branch may be behind its base and should be synced.
+
+        mergeStateStatus values that mean "up-to-date or not a base issue" are
+        skipped. All others (including unknown/missing) are attempted: a real
+        `gh pr update-branch` is a no-op when already up-to-date and returns
+        failure on genuine conflicts.
+        """
+        status = str(pr.get("mergeStateStatus") or "").upper()
+        return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
 
     def _record_review_or_error(
         self,
@@ -3118,7 +3402,13 @@ class OrchestratorApp:
         errors: list[dict[str, Any]] = []
         open_tracked_prs = 0
         skipped_reviews = 0
-        for pr in self.gh.pr_list():
+        prs = self.gh.pr_list()
+        merge_train_head = (
+            self._merge_train_head(prs)
+            if self.config.auto_merge.update_open_prs == "next"
+            else None
+        )
+        for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
@@ -3129,6 +3419,7 @@ class OrchestratorApp:
             # Count every PR with a resolvable linked issue (includes skipped ones)
             open_tracked_prs += 1
             pr_number = int(pr["number"])
+            is_merge_head = merge_train_head is None or pr_number == merge_train_head
             # Per-PR isolation: one PR's merge conflict or gh failure must not
             # abort review/merge of every remaining PR in the batch.
             try:
@@ -3151,16 +3442,20 @@ class OrchestratorApp:
                         and live_head_sha is not None
                         and live_head_sha == reviewed_head_sha
                     )
-                    if head_matches:
-                        merge_result = self.merge_ready(pr_number, merge=merge)
+                    if head_matches and is_merge_head:
+                        merge_result = self.merge_ready(
+                            pr_number, merge=merge, merge_train_head=merge_train_head
+                        )
                         self._record_merge_or_error(merge_result, errors, merges)
-                    else:
+                    elif not head_matches:
                         review = self.review(pr_number)
                         if self._record_review_or_error(review, errors, reviews):
                             continue
                         decision = self._review_decision(pr_number)
-                        if decision.get("decision") == "approved":
-                            merge_result = self.merge_ready(pr_number, merge=merge)
+                        if decision.get("decision") == "approved" and is_merge_head:
+                            merge_result = self.merge_ready(
+                                pr_number, merge=merge, merge_train_head=merge_train_head
+                            )
                             self._record_merge_or_error(merge_result, errors, merges)
                 else:
                     # Same-head packet skip: if we already have a review packet
@@ -3187,16 +3482,20 @@ class OrchestratorApp:
                         # approval, same as the decided path.
                         skipped_reviews += 1
                         decision = self._review_decision(pr_number)
-                        if decision.get("decision") == "approved":
-                            merge_result = self.merge_ready(pr_number, merge=merge)
+                        if decision.get("decision") == "approved" and is_merge_head:
+                            merge_result = self.merge_ready(
+                                pr_number, merge=merge, merge_train_head=merge_train_head
+                            )
                             self._record_merge_or_error(merge_result, errors, merges)
                     else:
                         review = self.review(pr_number)
                         if self._record_review_or_error(review, errors, reviews):
                             continue
                         decision = self._review_decision(pr_number)
-                        if decision.get("decision") == "approved":
-                            merge_result = self.merge_ready(pr_number, merge=merge)
+                        if decision.get("decision") == "approved" and is_merge_head:
+                            merge_result = self.merge_ready(
+                                pr_number, merge=merge, merge_train_head=merge_train_head
+                            )
                             self._record_merge_or_error(merge_result, errors, merges)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})

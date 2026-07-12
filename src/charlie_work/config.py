@@ -169,9 +169,38 @@ class AutoMergeConfig:
     failed_attempt_alarm: int = 3
     # After a successful ship-it merge, update remaining open agent PRs
     # (same-repo + configured branch prefix) to rebase them against the
-    # new base. Default false to preserve existing behavior; per-PR failures
-    # (e.g., conflicts) are reported as values and never abort the merge pass.
-    update_open_prs: bool = False
+    # new base.
+    #
+    # Supported values:
+    # - "all": update every open tracked PR branch (legacy behavior)
+    # - "next": merge-train mode — only update the head of the approved queue
+    # - "off": never update open PR branches
+    #
+    # Boolean aliases are accepted for backward compatibility:
+    #   true -> "all", false -> "off"
+    # Default "next" preserves the pre-merge combination-testing guarantee
+    # while eliminating N-1 wasted CI resets per merge.
+    update_open_prs: str | bool = "next"
+
+    def __post_init__(self) -> None:
+        value = self.update_open_prs
+        if isinstance(value, bool):
+            normalized = "all" if value else "off"
+        elif isinstance(value, str):
+            normalized = value.lower()
+            if normalized not in {"all", "next", "off"}:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'update_open_prs' must be "
+                    "'all', 'next', 'off', or a boolean, "
+                    f"got {value!r}"
+                )
+        else:
+            raise ConfigError(
+                "config section 'auto_merge' key 'update_open_prs' must be "
+                "a string or boolean, "
+                f"got {type(value).__name__}"
+            )
+        object.__setattr__(self, "update_open_prs", normalized)
 
 
 @dataclass(frozen=True)
