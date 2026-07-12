@@ -22,6 +22,8 @@ $issue_body
 
 $section_scope_contract
 
+$section_api_shape_validation
+
 ## Available skills
 
 The following skills are available to help you complete this task:
