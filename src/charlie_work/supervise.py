@@ -339,6 +339,7 @@ def run_supervised(
                 # One-line summary
                 now_str = datetime.datetime.now().strftime("%H:%M:%S")
                 errors_count = len(data.get("errors", []))
+                warnings_count = len(data.get("warnings", []))
                 open_prs = data.get("open_tracked_prs", 0)
                 # Dispatch: fresh+rework
                 fresh = data.get("dispatch", {}).get("selected_count", 0)
@@ -354,7 +355,8 @@ def run_supervised(
                 print(
                     f"[{now_str}] pass {pass_number}: dispatched {fresh}+{rework},"
                     f" merged {merged_str}, reviewed {reviewed}(+{skipped} skipped),"
-                    f" live ~{live_count}, prs-open {open_prs}, errors {errors_count}",
+                    f" live ~{live_count}, prs-open {open_prs},"
+                    f" errors {errors_count}, warnings {warnings_count}",
                     flush=True,
                 )
 

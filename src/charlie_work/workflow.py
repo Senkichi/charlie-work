@@ -13,7 +13,7 @@ from typing import Any
 
 from . import CLI_NAME
 from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
-from .checks import summarize_checks
+from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -1009,6 +1009,7 @@ def _build_attention_digest(
     state_file: Path,
     health_transitions: dict[int, dict[str, Any]],
     repo: str,
+    state_field: str = "health",
 ) -> AttentionDigest | None:
     """Build an AttentionDigest from health transitions observed in a pass.
 
@@ -1026,6 +1027,9 @@ def _build_attention_digest(
                 }
             }
         repo: Repository name for the digest
+        state_field: The state["issues"][n] field to read/write for transition
+            comparison. Defaults to "health"; callers tracking a separate alert
+            dimension (e.g. merge_alert) can pass their own field name.
 
     Returns:
         AttentionDigest if there are transitions, None otherwise. Updates per-issue
@@ -1049,7 +1053,7 @@ def _build_attention_digest(
             # Read the last persisted health for this issue
             issue_key = str(issue_number)
             issue_entry = state.get("issues", {}).get(issue_key, {})
-            last_health = issue_entry.get("health")
+            last_health = issue_entry.get(state_field)
 
             # Only include if health changed (or no previous health persisted)
             if last_health != current_health:
@@ -1069,7 +1073,7 @@ def _build_attention_digest(
                 # Update the persisted health for this issue
                 state["issues"][issue_key] = {
                     **issue_entry,
-                    "health": current_health,
+                    state_field: current_health,
                 }
 
         # Save the updated health baselines
@@ -1084,6 +1088,46 @@ def _build_attention_digest(
         repo=repo,
         transitions=tuple(entries),
     )
+
+
+def _is_pending_only(summary: CheckSummary) -> bool:
+    """Return True if the only reason the PR cannot merge is in-flight checks.
+
+    A summary whose only defect is pending checks is not a structural merge
+    failure; it should not arm the failed-attempt alarm.
+    """
+    return (
+        bool(summary.pending)
+        and not summary.failed
+        and not summary.missing
+        and not summary.infra_failed
+        and not summary.unavailable
+    )
+
+
+def _format_merge_attempt_alarm_message(
+    pr_number: int, attempts: int, summary: CheckSummary
+) -> str:
+    """Human-readable alarm message for an approved PR that cannot merge.
+
+    The message is surfaced in pass warnings, the merge_failed_attempt_alarm
+    state event, and the notify digest terminal_reason.
+    """
+    buckets: list[str] = []
+    if summary.missing:
+        # Issue #253 signature: required checks missing while the PR is still open
+        buckets.append("required checks missing while GitHub shows the PR open")
+    if summary.pending:
+        buckets.append(f"pending: {', '.join(summary.pending)}")
+    if summary.failed:
+        buckets.append(f"failed: {', '.join(summary.failed)}")
+    if summary.infra_failed:
+        buckets.append(f"infra_failed: {', '.join(summary.infra_failed)}")
+    if not buckets:
+        buckets.append("check summary unknown")
+    checks_str = "; ".join(buckets)
+    pass_str = "pass" if attempts == 1 else "passes"
+    return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
 class OrchestratorApp:
@@ -2064,7 +2108,12 @@ class OrchestratorApp:
                 "janitor_warnings": list(merged_warnings),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
+                "consecutive_failed_merge_attempts": 0,
             }
+            if issue_number is not None:
+                _issue_key = str(issue_number)
+                _issue_entry = state["issues"].get(_issue_key, {})
+                state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
             state = append_event(
                 state,
                 "review_packet",
@@ -2221,6 +2270,7 @@ class OrchestratorApp:
                 "reviewed_patch_id": reviewed_patch_id,
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
+                "consecutive_failed_merge_attempts": 0,
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
@@ -2233,6 +2283,7 @@ class OrchestratorApp:
                             **state["issues"].get(str(issue_number), {}),
                             "number": issue_number,
                             "status": "rework_requested",
+                            "merge_alert": "OK",
                         }
                     else:
                         # Clear rework_requested status when escalated to prevent selection
@@ -2240,12 +2291,14 @@ class OrchestratorApp:
                             **state["issues"].get(str(issue_number), {}),
                             "number": issue_number,
                             "status": "escalated",
+                            "merge_alert": "OK",
                         }
                 elif decision == "approved":
                     state["issues"][str(issue_number)] = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
                         "status": "approved",
+                        "merge_alert": "OK",
                     }
                     # Clear worker PID when issue is approved (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
@@ -2255,6 +2308,7 @@ class OrchestratorApp:
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
                         "status": "blocked",
+                        "merge_alert": "OK",
                     }
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
@@ -2343,6 +2397,14 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             existing_pr_state = state["prs"].get(str(pr_number), {})
             if existing_pr_state.get("status") == "merged":
+                # Clear any stale merge alert so a reopened issue can re-alert.
+                _issue_number = existing_pr_state.get("issue_number")
+                if _issue_number is not None:
+                    _issue_key = str(_issue_number)
+                    _issue_entry = state["issues"].get(_issue_key, {})
+                    if _issue_entry.get("merge_alert") != "OK":
+                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        save_state(self.paths.state_file, state)
                 return CommandResult(
                     True,
                     f"PR #{pr_number} already merged",
@@ -2390,7 +2452,12 @@ class OrchestratorApp:
                         "head_moved": True,
                         "reviewed_head_sha": reviewed_head_sha,
                         "live_head_sha": live_head_sha,
+                        "consecutive_failed_merge_attempts": 0,
                     }
+                    if issue_number is not None:
+                        _issue_key = str(issue_number)
+                        _issue_entry = state["issues"].get(_issue_key, {})
+                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
                     state = append_event(
                         state,
                         "head_moved",
@@ -2493,7 +2560,12 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     "status": "merged",
                     "merged": True,
+                    "consecutive_failed_merge_attempts": 0,
                 }
+                if issue_number is not None:
+                    _issue_key = str(issue_number)
+                    _issue_entry = state["issues"].get(_issue_key, {})
+                    state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
                 save_state(self.paths.state_file, state)
             # Label + branch cleanup are best-effort; the merged fact is already
             # durable. A branch-deletion failure (head branch checked out in a
@@ -2524,29 +2596,47 @@ class OrchestratorApp:
                     self.config.runners.default_branch,
                     self.config.runners.workflow_name,
                 )
-        data = {
-            "pr": pr_number,
-            "issue": issue_number,
-            "can_merge": can_merge,
-            "auto_merge_enabled": self.config.auto_merge.enabled,
-            "merged": bool(merge_output),
-            "merge_output": merge_output,
-            "branch_deleted": branch_deleted,
-            "review_decision": decision,
-            "checks": asdict(summary),
-            "checks_unavailable": checks_unavailable,
-            "label_error": label_error,
-            "update_open_prs_results": update_results,
-            "cancel_superseded_runs_results": cancel_results,
-            "containment_warnings": list(containment_warnings),
-        }
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
+            new_attempts = 0
+            merge_attempt_alarm = False
+            merge_attempt_warning: str | None = None
+            if approved and not can_merge and not _is_pending_only(summary):
+                new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
+                threshold = self.config.auto_merge.failed_attempt_alarm
+                merge_attempt_alarm = threshold > 0 and new_attempts == threshold
+                if merge_attempt_alarm:
+                    merge_attempt_warning = _format_merge_attempt_alarm_message(
+                        pr_number, new_attempts, summary
+                    )
+                    state = append_event(
+                        state,
+                        "merge_failed_attempt_alarm",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "attempts": new_attempts,
+                            "threshold": threshold,
+                            "checks_summary": asdict(summary),
+                            "message": merge_attempt_warning,
+                        },
+                    )
+            if approved and can_merge and merge_output is None:
+                # merge=False / auto_merge.enabled=False: can_merge recovered but no
+                # merge was attempted. Clear the merge alert so a subsequent
+                # degradation can re-fire the digest (last_health == current_health
+                # dedup would otherwise drop it).
+                if issue_number is not None:
+                    _issue_key = str(issue_number)
+                    _issue_entry = state["issues"].get(_issue_key, {})
+                    if _issue_entry.get("merge_alert") != "OK":
+                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
             prs_entry: dict[str, Any] = {
                 **existing,
                 "number": pr_number,
                 "issue_number": issue_number,
+                "consecutive_failed_merge_attempts": new_attempts,
             }
             if merge_output:
                 prs_entry["status"] = "merged"
@@ -2563,6 +2653,25 @@ class OrchestratorApp:
                 },
             )
             save_state(self.paths.state_file, state)
+        data = {
+            "pr": pr_number,
+            "issue": issue_number,
+            "can_merge": can_merge,
+            "auto_merge_enabled": self.config.auto_merge.enabled,
+            "merged": bool(merge_output),
+            "merge_output": merge_output,
+            "branch_deleted": branch_deleted,
+            "review_decision": decision,
+            "checks": asdict(summary),
+            "checks_unavailable": checks_unavailable,
+            "label_error": label_error,
+            "update_open_prs_results": update_results,
+            "cancel_superseded_runs_results": cancel_results,
+            "containment_warnings": list(containment_warnings),
+            "consecutive_failed_merge_attempts": new_attempts,
+            "merge_attempt_alarm": merge_attempt_alarm,
+            "merge_attempt_warning": merge_attempt_warning,
+        }
         message = "merge readiness evaluated"
         if checks_unavailable:
             message = "checks unavailable (gh failure)"
@@ -3019,6 +3128,34 @@ class OrchestratorApp:
                             self._record_merge_or_error(merge_result, errors, merges)
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
+        warnings: list[str] = []
+        merge_alert_transitions: dict[int, dict[str, Any]] = {}
+        for merge in merges:
+            warning = merge.get("merge_attempt_warning")
+            if warning:
+                warnings.append(warning)
+            if merge.get("merge_attempt_alarm") and merge.get("issue") is not None:
+                issue = merge["issue"]
+                merge_alert_transitions[issue] = {
+                    "adapter_kind": "unknown",
+                    "health": "MERGE_BLOCKED",
+                    "last_log_line": None,
+                    "pid": None,
+                    "terminal_tool": None,
+                    "terminal_reason": warning,
+                }
+
+        # Emit a merge-lane alert digest when a PR crosses the threshold.
+        if merge_alert_transitions and self.config.notify.enabled:
+            digest = _build_attention_digest(
+                self.paths.state_file,
+                merge_alert_transitions,
+                repo=self.repo_root.name,
+                state_field="merge_alert",
+            )
+            if digest:
+                emit_digest(self.config.notify, digest)
+
         ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors
         message = "loop complete"
         if errors:
@@ -3036,6 +3173,7 @@ class OrchestratorApp:
             "reviews": reviews,
             "merges": merges,
             "errors": errors,
+            "warnings": warnings,
             "open_tracked_prs": open_tracked_prs,
             "skipped_reviews": skipped_reviews,
         }

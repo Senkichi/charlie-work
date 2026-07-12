@@ -164,6 +164,9 @@ class AutoMergeConfig:
     delete_branch: bool = True
     require_approved_review: bool = True
     required_checks: tuple[str, ...] = ()
+    # After this many consecutive approved-but-unmergeable passes, emit a
+    # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
+    failed_attempt_alarm: int = 3
     # After a successful ship-it merge, update remaining open agent PRs
     # (same-repo + configured branch prefix) to rebase them against the
     # new base. Default false to preserve existing behavior; per-PR failures
@@ -684,6 +687,12 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                     f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
                     f"is managed by the orchestrator and cannot be specified in merge_flags"
                 )
+    failed_attempt_alarm = auto_merge_data.get("failed_attempt_alarm")
+    if failed_attempt_alarm is not None and not isinstance(failed_attempt_alarm, int):
+        raise ConfigError(
+            "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
+            f"got {type(failed_attempt_alarm).__name__}"
+        )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
