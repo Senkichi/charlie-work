@@ -12680,6 +12680,161 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
     assert result.data["selected_count"] == 0
 
 
+def _dispatch_rework_config() -> OrchestratorConfig:
+    return OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+
+
+def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
+    tmp_path: Path,
+) -> None:
+    """Issue #339: a rework worker relaunched onto a PR whose rework was
+    already pushed (head moved past the last request_changes verdict) finds
+    nothing to do, idles, and gets watchdog-reaped, burning a session and a
+    concurrency slot. dispatch_rework must detect the head-moved-with-real-
+    content-change case and route the issue to the review lane instead of
+    launching a redundant worker (acceptance criterion 1).
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record a request_changes decision: this puts the issue into
+    # rework_requested and pins reviewed_head_sha/reviewed_patch_id to the
+    # current (pre-rework) head/diff.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        assert state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+
+    # Simulate the rework already having been pushed: head advances AND the
+    # diff content genuinely changes (not just a sync-merge).
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+
+    # A rework prompt exists — absent the fix, this is exactly what lets
+    # dispatch proceed and launch a redundant worker.
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["routed_to_review"] == [123]
+    assert result.data["skipped_head_indeterminate"] == []
+    # No rework worker was launched for issue 123.
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    # Routed to the review lane instead: needs_rework cleared, reviewing/pr_open added.
+    assert (123, "agent:needs-rework") in fake_gh.labels_removed
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "reviewing"
+    assert any(e["kind"] == "rework_already_pushed" for e in state["events"])
+
+
+def test_dispatch_rework_launches_when_head_matches_reviewed_sha(tmp_path: Path) -> None:
+    """Regression pin (issue #339 acceptance criterion 2): dispatch_rework
+    must still launch exactly as before when the PR head is unchanged since
+    the request_changes verdict — the rework is genuinely outstanding.
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Head is unchanged (still the default "sha-abc123") — genuinely outstanding.
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["routed_to_review"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+
+
+def test_dispatch_rework_skips_without_stranding_when_head_indeterminate(
+    tmp_path: Path,
+) -> None:
+    """Issue #339 fail-safe direction: if content identity can't be
+    established after a head change (diff fetch fails), dispatch_rework must
+    not launch a redundant worker, but must also not strand the issue — it
+    stays rework_requested so the next pass retries (acceptance: fail-closed
+    without permanent stranding).
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Head moves, but the diff fetch now fails — GitHub.pr_diff's real
+    # allow_failure=True contract returns "" on failure, so an empty diff is
+    # the correct fake-adapter stand-in for "gh pr diff failed".
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = ""
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["routed_to_review"] == []
+    assert result.data["skipped_head_indeterminate"] == [123]
+    # Not stranded: still rework_requested so the next pass retries.
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # No launch, and no review-lane relabeling either — genuinely indeterminate.
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
 def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path: Path) -> None:
     """Janitor blocks review when head hasn't changed after request_changes (no-op rework).
 

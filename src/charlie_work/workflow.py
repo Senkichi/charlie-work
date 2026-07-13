@@ -4214,6 +4214,74 @@ class OrchestratorApp:
         # list does not include "state", so no per-PR state check here.
         candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
+        # Issue #339: a rework worker relaunched onto a PR whose rework was
+        # already pushed (PR head moved past the last request_changes verdict)
+        # finds nothing to do, idles, and is watchdog-reaped — burning a
+        # session and a concurrency slot. Filter those candidates out here,
+        # before any dispatch_pending claim, and route them to the review
+        # lane instead. A sync-merge-only head advance (patch-id unchanged)
+        # is NOT treated as "already reworked" — the same patch still needs a
+        # genuine rework cycle, so it remains a legitimate launch candidate.
+        head_check_state = load_state_locked(self.paths.state_file)
+        routed_to_review: list[int] = []
+        head_indeterminate: list[int] = []
+        filtered_candidates = []
+        for issue in candidates:
+            issue_number = int(issue["number"])
+            pr_data = pr_by_issue[issue_number]
+            pr_number = int(pr_data["number"])
+            live_head_sha = pr_data.get("headRefOid")
+            pr_state = head_check_state.get("prs", {}).get(str(pr_number), {})
+            reviewed_head_sha = pr_state.get("reviewed_head_sha")
+
+            if not reviewed_head_sha:
+                # No recorded request_changes head to compare against —
+                # nothing to disambiguate; proceed as a legitimate candidate.
+                filtered_candidates.append(issue)
+                continue
+            if not live_head_sha:
+                # Live head cannot be determined — fail closed against a
+                # wasted launch, but don't strand the issue: status is left
+                # untouched so the next pass retries with fresh PR data.
+                head_indeterminate.append(issue_number)
+                continue
+            if live_head_sha == reviewed_head_sha:
+                filtered_candidates.append(issue)
+                continue
+
+            # Head moved since the request_changes verdict. Disambiguate a
+            # real content push from a sync-merge-only advance using the same
+            # patch-id helper the janitor's no-op-rework gate relies on
+            # (issue #222).
+            reviewed_patch_id = pr_state.get("reviewed_patch_id")
+            diff = self.gh.pr_diff(pr_number)
+            live_patch_id = _calculate_patch_id(diff) if diff else ""
+            if not reviewed_patch_id or not live_patch_id:
+                # Can't establish content identity (no recorded baseline, or
+                # the diff fetch itself failed) — fail closed rather than
+                # guess; retry next pass instead of stranding the issue.
+                head_indeterminate.append(issue_number)
+                continue
+            if live_patch_id == reviewed_patch_id:
+                # Sync-merge only: the patch itself is unchanged, so the
+                # rework is still genuinely outstanding.
+                filtered_candidates.append(issue)
+                continue
+
+            routed_to_review.append(issue_number)
+
+        candidates = filtered_candidates
+        for routed_issue_number in routed_to_review:
+            routed_pr_number = int(pr_by_issue[routed_issue_number]["number"])
+            reviewed_head_sha_before = (
+                head_check_state.get("prs", {})
+                .get(str(routed_pr_number), {})
+                .get("reviewed_head_sha")
+            )
+            self._route_rework_candidate_to_review(
+                routed_issue_number, routed_pr_number, reviewed_head_sha_before
+            )
+
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
@@ -4235,6 +4303,8 @@ class OrchestratorApp:
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "routed_to_review": sorted(routed_to_review),
+                "skipped_head_indeterminate": sorted(head_indeterminate),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4289,6 +4359,8 @@ class OrchestratorApp:
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "routed_to_review": sorted(routed_to_review),
+                "skipped_head_indeterminate": sorted(head_indeterminate),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4360,6 +4432,8 @@ class OrchestratorApp:
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "routed_to_review": sorted(routed_to_review),
+                "skipped_head_indeterminate": sorted(head_indeterminate),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4523,6 +4597,8 @@ class OrchestratorApp:
             "session_results": str(results_path),
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
+            "routed_to_review": sorted(routed_to_review),
+            "skipped_head_indeterminate": sorted(head_indeterminate),
         }
         if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
@@ -4555,6 +4631,54 @@ class OrchestratorApp:
             message,
             data,
         )
+
+    def _route_rework_candidate_to_review(
+        self,
+        issue_number: int,
+        pr_number: int,
+        reviewed_head_sha_before: str | None,
+    ) -> CommandResult:
+        """Route a rework_requested issue back to the review lane instead of
+        relaunching a worker onto a PR whose rework was already pushed
+        (issue #339): the PR head moved past the last request_changes verdict,
+        so the previous worker's output is already live and a relaunch would
+        find nothing to do, idle, and get watchdog-reaped.
+
+        Reuses ``review()`` — the review lane's own packet-regeneration entry
+        point — instead of duplicating its janitor/test-adequacy gating and
+        label-transition logic here.
+
+        ``review()`` can itself invoke ``record_review`` (the test-adequacy
+        hard gate re-failing on the new head), which already reconciles the
+        issue's status and ``reviewed_head_sha``. This only steps in when
+        ``review()`` left the packet pending (no fresh decision recorded
+        against the new head) — it must never clobber a status
+        ``record_review`` already reconciled to something other than a stale
+        ``rework_requested``.
+        """
+        review_result = self.review(pr_number)
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            entry = state["issues"].get(str(issue_number), {})
+            decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
+            if (
+                decision_unchanged
+                and isinstance(entry, dict)
+                and entry.get("status") == "rework_requested"
+            ):
+                state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
+            state = append_event(
+                state,
+                "rework_already_pushed",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "review_ok": review_result.ok,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        return review_result
 
     def _is_dispatchable(self, issue: dict[str, Any]) -> bool:
         names = label_names(issue)
