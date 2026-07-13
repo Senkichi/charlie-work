@@ -382,8 +382,32 @@ def _normalize_working_directory(path: str) -> tuple[str, ...]:
 # _find_matching_session (issue #343). Fleet worktree paths are built as
 # ``<worktrees-dir>/<slug>`` where ``<slug>`` embeds the issue number (see
 # worktree.create_worktree's ``target_dir / _slugify(branch)``), so the last
-# two segments (parent dir name + issue-numbered leaf) are effectively unique
-# within one sessions.db even when the absolute prefix differs entirely.
+# two segments (parent dir name + issue-numbered leaf) are the most that can
+# be matched reliably.
+#
+# NOT a cross-repo-unique key. ``sessions.db`` is machine-wide
+# (``%APPDATA%\devin\cli\sessions.db``, see ``_default_db_path``), shared by
+# every fleet repo dispatched from this machine, and this 2-segment suffix
+# carries no repo identity at all -- it is only (parent-dir-literal,
+# issue-slug). Two different repos in the fleet that both dispatch the same
+# issue number with a similar-enough title (so ``_slugify`` produces the same
+# slug) inside overlapping dispatch windows (see the ``created_at`` window
+# filter in ``_find_matching_session``) can collide here, misattributing one
+# repo's session data to another repo's worker.
+#
+# Widening this to include a repo-identifying segment (e.g. 5 segments to
+# reach ``<repo-dir>/.var/charlie-work/worktrees/<slug>``) was considered and
+# rejected: production evidence (``test_real_activity_for_worker_matches_
+# real_fleet_working_directory_shape`` in tests/test_post_mortem.py, sampled
+# from a live sessions.db 2026-07-13) shows the Devin CLI's recorded
+# ``working_directory`` is frequently rooted under an unrelated
+# ``AppData\Local\Temp\...`` session directory that preserves *none* of the
+# worktree path's ``.var/charlie-work/worktrees`` segments -- only the
+# trailing ``worktrees/<slug>`` pair survives. A wider suffix would silently
+# stop matching that real shape, trading a narrow cross-repo collision risk
+# for a total loss of corroboration on the common case this fallback exists
+# for. The collision risk above is accepted for now (tracked as a follow-up,
+# not solved by widening the suffix).
 _WORKING_DIRECTORY_SUFFIX_SEGMENTS = 2
 
 
@@ -397,6 +421,9 @@ def _working_directory_suffix(path: str) -> tuple[str, ...]:
     this process computed (different resolved root / mount point / capture
     point), while the dispatch-unique trailing segments -- the worktrees
     directory name and the issue-numbered slug leaf -- are identical.
+
+    This is a coarse, machine-wide, repo-agnostic key -- see the collision
+    caveat on ``_WORKING_DIRECTORY_SUFFIX_SEGMENTS`` above.
     """
     normalized = _normalize_working_directory(path)
     if len(normalized) < _WORKING_DIRECTORY_SUFFIX_SEGMENTS:

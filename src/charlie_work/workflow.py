@@ -400,7 +400,19 @@ def _detect_and_handle_stalled_sessions(
         health = classify_worker_health(w, config, now, probe)
 
         # Issue #338: persist Signal-1's inconclusive-probe deferral counter so the
-        # escalation cap is tracked across passes.
+        # escalation cap is tracked across passes. This lane is the sole writer of
+        # this counter for a not-alive worker (issue #343 Finding 2): it is the
+        # only lane guaranteed to run at least once whenever the watchdog is
+        # enabled -- dispatch()/dispatch_rework() each call this lane standalone
+        # (no dead-session lane in the same call), and loop() always runs this
+        # lane immediately before the dead-session lane
+        # (_classify_dead_sessions_and_update_throttle_state). The dead lane
+        # deliberately does NOT also persist this counter for a not-alive worker
+        # when the watchdog is enabled -- see the comment there -- so it is
+        # written at most once per worker per pass instead of twice (0->1 here,
+        # then re-read and ->2 there), which halved the effective deferral grace
+        # period and was the very mechanism that opened Finding 1's pass-2
+        # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
         update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
 
@@ -981,7 +993,12 @@ def _reap_restore_rework_requested(
 
 
 def _classify_dead_sessions_and_update_throttle_state(
-    sessions_dir: Path, state_file: Path, gh: GitHub, config: OrchestratorConfig
+    sessions_dir: Path,
+    state_file: Path,
+    gh: GitHub,
+    config: OrchestratorConfig,
+    *,
+    persist_inconclusive_probe_counter: bool = True,
 ) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
@@ -1002,6 +1019,26 @@ def _classify_dead_sessions_and_update_throttle_state(
     Issue #295: dead/launch-failed rework sessions with an open PR and a
     request_changes verdict (or a rework prompt on disk) are restored to
     ``rework_requested`` so ``dispatch_rework`` can re-select them.
+
+    ``persist_inconclusive_probe_counter`` (issue #343 Finding 2): controls
+    whether this lane persists Signal-1's inconclusive-probe deferral counter
+    for a not-alive, pid-bearing worker. Defaults to True so this function
+    remains fully self-sufficient when called on its own (as every existing
+    unit test does, and as any future standalone caller would expect).
+    ``loop()`` is the one caller that always runs the sibling stall lane
+    (``_detect_and_handle_stalled_sessions``, the sole writer of this counter
+    for an ALIVE-but-stalled worker, and -- unconditionally, regardless of
+    liveness -- the first lane to see every worker each pass) immediately
+    before this one, in the same pass; it passes False there so this lane
+    does not ALSO increment the same counter on top of what the stall lane
+    just wrote a moment earlier -- that double counting (0->1 in the stall
+    lane, then re-read and ->2 here) halved the effective deferral grace
+    period and was the very mechanism that opened Finding 1's pass-2
+    phantom-sidecar window. classify_worker_health's own cap-check always
+    reads whatever value is currently on the sidecar, regardless of which
+    lane -- or how many passes ago -- last wrote it, so suppressing the
+    write here never affects the DEAD-vs-deferred decision made below,
+    only which lane's write ends up on disk for a given pass.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
@@ -1158,10 +1195,19 @@ def _classify_dead_sessions_and_update_throttle_state(
             if w.pid is not None:
                 probe = real_activity_probe_for(w, config, now_for_health)
                 health = classify_worker_health(w, config, now_for_health, probe)
-                new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
-                update_worker_log_stat(
-                    sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
-                )
+                # Issue #343 Finding 2: persist_inconclusive_probe_counter (see
+                # the docstring) lets loop() suppress this write when it just
+                # ran the sibling stall lane a moment earlier in the same pass
+                # -- that lane already persisted this exact counter for a
+                # not-alive worker, and writing it again here double-increments
+                # it. Every other caller (including every existing unit test)
+                # leaves this at its default True, so this lane remains fully
+                # self-sufficient when called on its own.
+                if persist_inconclusive_probe_counter:
+                    new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
+                    update_worker_log_stat(
+                        sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
+                    )
                 if health is not WorkerHealth.DEAD:
                     # Corroboration vetoed the DEAD verdict (fresh real-session
                     # activity) or the probe was inconclusive and the deferral
@@ -4066,8 +4112,16 @@ class OrchestratorApp:
         # This detects provider throttling from worker deaths and sets cooldown
         # Also reconciles labels for dead sessions with no open PR (issue #118)
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Issue #343 Finding 2: the stall lane at the top of this method
+        # (line ~4100) already ran this pass and is the sole writer of the
+        # inconclusive-probe deferral counter for a not-alive worker -- tell
+        # this lane not to persist it again on top of that write.
         reaped = _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, self.paths.state_file, self.gh, self.config
+            sessions_dir,
+            self.paths.state_file,
+            self.gh,
+            self.config,
+            persist_inconclusive_probe_counter=False,
         )
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
