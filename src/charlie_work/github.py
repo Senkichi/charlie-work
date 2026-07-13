@@ -427,6 +427,23 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def compare(self, base: str, head: str) -> dict[str, Any] | None:
+        """Compare two commits and return the comparison metadata.
+
+        Wraps ``gh api repos/{owner}/{repo}/compare/{base}...{head}``. Returns
+        the parsed JSON response, including ``base_commit`` and
+        ``merge_base_commit``, or ``None`` on failure. Errors are returned as
+        values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/compare/{base}...{head}"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, dict) else None
+        return result if isinstance(result, dict) else None
+
     def validate_field_lists(self) -> None:
         """Validate the compile-time ``--json`` field lists against ``gh``.
 
