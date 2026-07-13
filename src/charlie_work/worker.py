@@ -395,6 +395,16 @@ def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
         return None
 
 
+def _parse_started_at(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (ValueError, TypeError):
+        return None
+
+
 def classify_worker_health(
     view: WorkerView,
     config: OrchestratorConfig,
@@ -432,6 +442,8 @@ def classify_worker_health(
         WorkerHealth enum member indicating the worker's health status
     """
     from datetime import UTC, timedelta
+
+    started_at = _parse_started_at(view.started_at)
 
     # Signal 1: liveness
     if not view.is_alive():
@@ -481,16 +493,10 @@ def classify_worker_health(
                 return WorkerHealth.STALLED
 
     # Signal 4: wall-clock deadline (both adapters)
-    try:
-        started_at = datetime.fromisoformat(view.started_at)
-        if started_at.tzinfo is None:
-            started_at = started_at.replace(tzinfo=UTC)
+    if started_at is not None:
         wall_clock_age = now - started_at
         if wall_clock_age > timedelta(minutes=config.watchdog.wall_clock_minutes):
             return WorkerHealth.RUNAWAY if config.watchdog.wall_clock_kill else WorkerHealth.SLOW
-    except (ValueError, TypeError):
-        # Invalid started_at format - skip this signal
-        pass
 
     # Signal 5: loop/no-progress detection (Claude Code only)
     if view.adapter_kind == "claude-code":
@@ -506,13 +512,19 @@ def classify_worker_health(
                 )
 
                 # Calculate time since last tool call (or since start if never seen)
-                no_new_tool_call_for = now - (last_tool_call_at or started_at)
+                if last_tool_call_at is not None or started_at is not None:
+                    no_new_tool_call_for = now - (last_tool_call_at or started_at)
 
-                # Trip if log is advancing but no tool calls for 2 * stall_minutes
-                if log_still_advancing and no_new_tool_call_for > timedelta(
-                    minutes=config.watchdog.loop_stall_multiplier * config.watchdog.stall_minutes
-                ):
-                    return WorkerHealth.RUNAWAY if config.watchdog.loop_kill else WorkerHealth.SLOW
+                    # Trip if log is advancing but no tool calls for 2 * stall_minutes
+                    if log_still_advancing and no_new_tool_call_for > timedelta(
+                        minutes=config.watchdog.loop_stall_multiplier
+                        * config.watchdog.stall_minutes
+                    ):
+                        return (
+                            WorkerHealth.RUNAWAY
+                            if config.watchdog.loop_kill
+                            else WorkerHealth.SLOW
+                        )
     elif view.adapter_kind == "devin":
         # Devin has no structured event stream - this tripwire caps at SLOW
         # regardless of config, to avoid killing chatty-but-healthy patterns
