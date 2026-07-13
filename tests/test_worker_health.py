@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -1334,3 +1335,120 @@ def test_classify_worker_health_incident_285_routine_exit_not_stalled(
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
+
+
+def _dead_devin_view(tmp_path: Path, *, inconclusive_probe_deferred_count: int = 0) -> WorkerView:
+    """Build a WorkerView for a dead devin worker with a stale sidecar log."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    return WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        inconclusive_probe_deferred_count=inconclusive_probe_deferred_count,
+    )
+
+
+def _all_errored_probe() -> RealActivityProbe:
+    return RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error="message_nodes query failed (schema drift?): no such column: id",
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="no per-PID log found",
+            ),
+        )
+    )
+
+
+def _no_match_yet_probe() -> RealActivityProbe:
+    return RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+        )
+    )
+
+
+def test_classify_worker_health_dead_by_liveness_inconclusive_all_errored_deferred_then_escalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #338: dead PID + all-errored probe defers, then reaps after cap."""
+    view = _dead_devin_view(tmp_path)
+    probe = _all_errored_probe()
+    now = datetime.now(UTC)
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2))
+        # Below the cap: defer rather than fail open to DEAD.
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.HEALTHY
+
+        # At the cap: escalation, reap.
+        capped = replace(view, inconclusive_probe_deferred_count=2)
+        health = classify_worker_health(capped, config, now, probe)
+        assert health == WorkerHealth.DEAD
+
+
+def test_classify_worker_health_dead_by_liveness_inconclusive_no_match_yet_deferred_then_escalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #338: dead PID + no-match-yet probe defers, then reaps after cap."""
+    view = _dead_devin_view(tmp_path)
+    probe = _no_match_yet_probe()
+    now = datetime.now(UTC)
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2))
+        # Below the cap: defer rather than fail open to DEAD.
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.HEALTHY
+
+        # At the cap: escalation, reap.
+        capped = replace(view, inconclusive_probe_deferred_count=2)
+        health = classify_worker_health(capped, config, now, probe)
+        assert health == WorkerHealth.DEAD
+
+
+def test_classify_worker_health_dead_by_liveness_inconclusive_cap_zero_reaps_immediately(
+    tmp_path: Path,
+) -> None:
+    """Issue #338: a max_inconclusive_probe_deferrals of 0 disables deferral."""
+    view = _dead_devin_view(tmp_path)
+    probe = _all_errored_probe()
+    now = datetime.now(UTC)
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0))
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.DEAD

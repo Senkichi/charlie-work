@@ -383,6 +383,12 @@ class WatchdogConfig:
     # parsed reset time plus this slack has elapsed. Default 2 minutes.
     rate_limit_defer_enabled: bool = True
     rate_limit_defer_slack_minutes: int = 2
+    # Inconclusive real-activity probe deferral cap (issue #338). A dead worker
+    # whose probe is inconclusive (all sources errored or no match yet) is
+    # deferred this many passes before Signal-1 reaps it. Prevents a permanently
+    # broken probe from pinning a slot indefinitely while still allowing the
+    # downstream liveness checks to avoid false reaps.
+    max_inconclusive_probe_deferrals: int = 3
 
 
 @dataclass(frozen=True)
@@ -888,6 +894,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'watchdog' key 'rate_limit_defer_slack_minutes' must be an int, "
             f"got {type(rate_limit_defer_slack_minutes).__name__}"
+        )
+    max_inconclusive_probe_deferrals = watchdog_data.get("max_inconclusive_probe_deferrals")
+    if max_inconclusive_probe_deferrals is not None and not isinstance(
+        max_inconclusive_probe_deferrals, int
+    ):
+        raise ConfigError(
+            "config section 'watchdog' key 'max_inconclusive_probe_deferrals' must be an int, "
+            f"got {type(max_inconclusive_probe_deferrals).__name__}"
         )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")
