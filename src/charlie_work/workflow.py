@@ -310,6 +310,7 @@ def _detect_and_handle_stalled_sessions(
     )
     from .post_mortem import classify_and_record
     from .worker import (
+        _next_inconclusive_probe_deferred_count,
         classify_worker_health,
         iter_workers,
         real_activity_probe_for,
@@ -353,6 +354,11 @@ def _detect_and_handle_stalled_sessions(
         # events.jsonl) before deciding whether to kill the worker.
         probe = real_activity_probe_for(w, config, now)
         health = classify_worker_health(w, config, now, probe)
+
+        # Issue #338: persist Signal-1's inconclusive-probe deferral counter so the
+        # escalation cap is tracked across passes.
+        new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
+        update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
 
         # If a stalled-looking worker is still within a previously stored rate-limit
         # defer window, skip it. The deadline is re-derived from the sidecar each pass.
