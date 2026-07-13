@@ -490,6 +490,63 @@ def test_review_template_contains_exemption_scrutiny_instruction() -> None:
     assert "not a fact to accept" in text
 
 
+def test_review_template_contains_self_report_distrust_rule() -> None:
+    """Verify that review.md tells the reviewer not to trust the PR's self-report."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "review.md").read_text(encoding="utf-8")
+
+    assert "## Do not trust the PR's self-report" in text
+    assert "never by itself downgrades a finding's severity" in text
+
+
+def test_review_template_contains_investigation_discipline() -> None:
+    """Verify that review.md bounds out-of-diff investigation and forbids re-running the full suite."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "review.md").read_text(encoding="utf-8")
+
+    assert "do not otherwise crawl the broader codebase" in text
+    assert "Do not\nre-run the full test suite to confirm results already reported by CI" in text
+
+
+def test_review_template_contains_calibration_section() -> None:
+    """Verify that review.md has a severity-calibration section distinguishing Critical/Important/Minor."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "review.md").read_text(encoding="utf-8")
+
+    assert "## Calibration" in text
+    assert "Tag every finding Critical, Important, or Minor" in text
+    assert "label it\nplan-mandated" in text
+    assert "Acknowledge what was done well before listing issues" in text
+
+
+def test_review_template_summary_requires_strengths_and_severity_tags() -> None:
+    """Verify that review.md's required summary fields include Strengths and severity-tagged Findings."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "review.md").read_text(encoding="utf-8")
+
+    assert "Strengths — what's done well, specifically" in text
+    assert "Findings, each tagged Critical / Important / Minor" in text
+
+
+def test_rework_template_severity_aware_required_behavior() -> None:
+    """Verify that rework.md tells the worker Minor findings are optional to address."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "rework.md").read_text(encoding="utf-8")
+
+    assert "Address every Critical and Important finding directly" in text
+    assert "Minor findings are" in text and "optional" in text
+
+
+def test_cross_family_review_contains_self_report_distrust_rule() -> None:
+    """Verify that cross_family_review.md tells the reviewer a stated rationale never lowers severity."""
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "cross_family_review.md").read_text(encoding="utf-8")
+
+    assert "is the author grading their own work" in text
+    assert "it never by itself lowers a finding's" in text
+    assert "Verify the claim against the code; if it doesn't hold, the finding stands." in text
+
+
 def test_review_rendered_with_populated_test_adequacy_section() -> None:
     """Verify that review.md renders with populated test-adequacy facts when enabled (issue #180)."""
     from charlie_work.janitor import TestAdequacyFacts

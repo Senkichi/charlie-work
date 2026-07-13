@@ -21,7 +21,9 @@ $review_summary
   into your branch to incorporate any base changes that landed since the branch was created.
   This catches skew even when auto-update is off.
 - Update the existing PR. Do not open a new PR unless the branch is unrecoverable.
-- Address every required change directly.
+- Address every Critical and Important finding directly. Minor findings are
+  optional — if you skip one, say so explicitly rather than silently
+  dropping it.
 - Preserve the original issue scope.
 - Add or update tests for the review findings.
 - Before pushing, run `/preflight` (ruff + ruff-format + pre-commit) and COMMIT anything

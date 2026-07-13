@@ -30,6 +30,20 @@ $cross_family_section$janitor_section
 6. Compare the implementation against project invariants in `CLAUDE.md`.
 7. Look for subtle bugs, edge cases, security risks, data-loss risks, migration risks, Windows/macOS/Linux differences, flaky tests, and unrelated changes.
 
+## Do not trust the PR's self-report
+
+Treat the PR body, commit messages, and code comments as unverified claims,
+not facts. A stated rationale — "kept it simple deliberately," "out of
+scope for this issue," "existing behavior, unchanged" — is the worker
+grading its own work and never by itself downgrades a finding's severity.
+Verify every claim against the diff and the actual code before accepting it.
+
+**Investigation discipline:** inspect code outside the diff only to evaluate
+a concrete, named risk — do not otherwise crawl the broader codebase. Do not
+re-run the full test suite to confirm results already reported by CI or the
+PR body; run a single targeted test only if reading the diff raises a
+specific doubt those results don't resolve.
+
 ## Test adequacy
 
 Build a behavior-coverage table: for every behavior this diff adds or changes,
@@ -61,6 +75,22 @@ Approve only if all of these are true:
 - No high or medium severity concern remains.
 - The PR body links the issue with `Closes #$issue_number` or equivalent.
 
+## Calibration
+
+Tag every finding Critical, Important, or Minor. Not everything is Critical:
+reserve `request_changes` for Critical or Important findings — incorrect or
+fragile behavior, a missed requirement, or maintainability damage you would
+block a merge over (verbatim duplication of a logic block, a swallowed
+error, a test that asserts nothing). Note Minor findings (polish, "coverage
+could be broader") in the summary without blocking on them.
+
+If the issue or a prior review comment mandates something this rubric
+treats as a defect, that is still a finding — tag it Important and label it
+plan-mandated; the human decides, the mandate does not grade its own work.
+
+Acknowledge what was done well before listing issues — accurate praise
+helps the rework pass trust the rest of the feedback.
+
 ## Decision output
 
 Write your review summary to a Markdown file, then record one decision:
@@ -75,6 +105,7 @@ Your summary must include:
 
 - Decision
 - What was reviewed
-- Findings
-- Required changes, if any
+- Strengths — what's done well, specifically
+- Findings, each tagged Critical / Important / Minor
+- Required changes, if any (derived from Critical/Important findings only)
 - Verification expectations
