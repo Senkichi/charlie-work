@@ -8454,6 +8454,53 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     assert dispatch_result.data["selected_count"] == 0
 
 
+def test_loop_wires_persist_inconclusive_probe_counter_false_to_dead_lane(
+    tmp_path: Path,
+) -> None:
+    """Issue #343 Finding 2 wiring test: loop() must call the dead lane with
+    persist_inconclusive_probe_counter=False.
+
+    The stall lane runs unconditionally at the top of loop() (line ~4100) and is
+    the sole writer of the not-alive-worker inconclusive-probe deferral counter
+    for that pass. If loop()'s call to _classify_dead_sessions_and_update_throttle_state
+    (line ~4119) ever drops the persist_inconclusive_probe_counter=False keyword
+    (e.g. reverted to the default True during a rebase), the dead lane would
+    silently double-write that counter on top of the stall lane's write within a
+    single loop() pass.
+
+    This MUST fail if that call site's persist_inconclusive_probe_counter=False
+    keyword is removed or flipped to True -- verified by temporarily reverting the
+    call site during development of this test (not asserted here, since a
+    mutation test would require editing production code from within a test).
+
+    Deliberately does not assert on the inconclusive-probe counter's persisted
+    value: the stall lane itself runs 3x per loop() pass (direct, plus via
+    dispatch_rework() and dispatch()'s own internal calls -- a separate,
+    pre-existing redundancy tracked outside this issue), which would make an
+    end-to-end counter-value assertion through loop() fragile. Pinning the
+    call-args of the dead lane directly is the precise, stable way to gate this
+    specific wiring.
+    """
+    from charlie_work.workflow import (
+        _classify_dead_sessions_and_update_throttle_state as real_classify_dead_sessions,
+    )
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with patch(
+        "charlie_work.workflow._classify_dead_sessions_and_update_throttle_state",
+        wraps=real_classify_dead_sessions,
+    ) as mock_classify:
+        app.loop(limit=0)
+
+    mock_classify.assert_called_once()
+    assert mock_classify.call_args.kwargs["persist_inconclusive_probe_counter"] is False
+
+
 def test_loop_reaps_launch_failure_sidecar_and_reports_reaped(
     tmp_path: Path,
 ) -> None:

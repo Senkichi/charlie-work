@@ -1236,8 +1236,13 @@ def test_detect_drift_claude_code_session_collision_with_unrelated_open_pr(tmp_p
         encoding="utf-8",
     )
 
-    # Write a claude-code worker record for a dead session (pid=None to simulate dead)
-    sidecar_path = sessions_dir / "issue-42-claude-code.json"
+    # Write a claude-code worker record for a dead session (pid=None to simulate dead).
+    # Filename must match claude_code.py's real sidecar convention (issue-{N}.claude.json,
+    # see _sidecar_path in claude_code.py) so claude_code.read_worker_records actually
+    # picks it up. The old "issue-42-claude-code.json" name never matched that glob and
+    # only produced a drift item because devin_shell.py's pre-issue-#343-fix exclusion
+    # check let it slip through as a phantom devin session.
+    sidecar_path = sessions_dir / "issue-42.claude.json"
     record = ClaudeWorkerRecord(
         issue_number=42,
         branch="agent/issue-42-x",
