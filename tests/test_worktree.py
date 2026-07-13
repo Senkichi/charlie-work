@@ -5,11 +5,13 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
+from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeInfo,
@@ -20,12 +22,14 @@ from charlie_work.worktree import (
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
+    clean_worktrees,
     create_worktree,
     inspect_worktree_state,
     is_junction,
     list_worktrees,
     push_branch,
     remove_worktree,
+    verify_shared_venv,
     _is_git_tracked,
     _materialize_directory,
     _slugify,
@@ -2896,3 +2900,274 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     assert exc_info.value.probe_result == "devin_per_pid_log_activity"
     assert not worktree_path.exists()
     assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:
+    return {
+        "issues": {str(issue_number): {"number": issue_number}},
+        "prs": {
+            str(pr_number): {
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": status,
+                "merged": status == "merged",
+            }
+        },
+        "events": [],
+    }
+
+
+class _FakeGH:
+    def __init__(
+        self, pr_state: str = "MERGED", merged_at: str | None = "2026-07-13T01:33:43Z"
+    ) -> None:
+        self.pr_state = pr_state
+        self.merged_at = merged_at
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> GitHubRunResult:
+        if args[:2] == ["pr", "view"] and json_output and allow_failure:
+            return GitHubRunResult(
+                ok=True,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value={"state": self.pr_state, "mergedAt": self.merged_at},
+                error=None,
+            )
+        return GitHubRunResult(
+            ok=False,
+            returncode=1,
+            stdout="",
+            stderr="",
+            value=None,
+            error="unexpected fake gh command",
+        )
+
+
+def _create_shared_venv(repo_root: Path, pth_target: Path | None = None) -> Path:
+    """Create a fake shared venv with an editable .pth pointing at the target src."""
+    pth = repo_root / "shared-venv" / "Lib" / "site-packages" / "_editable_impl_charlie_work.pth"
+    pth.parent.mkdir(parents=True)
+    target = pth_target or (repo_root / "src")
+    pth.write_text(str(target.resolve()) + "\n", encoding="utf-8")
+    return repo_root / "shared-venv"
+
+
+def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path: Path) -> None:
+    """Editable .pth pointing at a worker worktree is the poisoned-venv case."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    worktree = tmp_path / "stolen-worktree"
+    worktree.mkdir()
+    _create_shared_venv(repo_root, pth_target=worktree / "src")
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "points outside main checkout" in message
+    assert "uv sync --all-extras --reinstall-package charlie-work" in message
+
+
+def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "main checkout" in message
+
+
+def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
+    tmp_path: Path,
+) -> None:
+    """Junction-safe removal deletes the worktree and leaves the shared venv valid."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-1-merged", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=1, pr_number=101)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+    )
+
+    assert result["ok"] is True
+    assert len(result["data"]["removed"]) == 1
+    assert not info.path.exists()
+    assert result["data"]["venv_ok"] is True
+    assert "main checkout" in result["data"]["venv_message"]
+
+
+def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-2-dirty", base_ref="HEAD")
+    (info.path / "dirty_file.txt").write_text("local changes", encoding="utf-8")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=2, pr_number=102)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+    )
+
+    assert result["ok"] is True
+    assert len(result["data"]["skipped"]) == 1
+    assert "uncommitted" in result["data"]["skipped"][0]["reason"]
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_unpushed_worktree(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-3-unpushed", base_ref="HEAD")
+    _git(info.path, "config", "user.email", "test@example.test")
+    _git(info.path, "config", "user.name", "Test User")
+    (info.path / "new_file.txt").write_text("unpushed work", encoding="utf-8")
+    _git(info.path, "add", "new_file.txt")
+    _git(info.path, "commit", "-m", "unpushed commit")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=3, pr_number=103)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+    )
+
+    assert result["ok"] is True
+    assert len(result["data"]["skipped"]) == 1
+    assert "local" in result["data"]["skipped"][0]["reason"].lower()
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_live_worker(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-4-live", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    issue_state = {
+        "number": 4,
+        "worker_pid": os.getpid(),
+        "worker_process_start_time": get_process_start_time(os.getpid()),
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    state = _make_state(issue_number=4, pr_number=104)
+    state["issues"]["4"] = issue_state
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+    )
+
+    assert result["ok"] is True
+    assert len(result["data"]["skipped"]) == 1
+    assert "live" in result["data"]["skipped"][0]["reason"].lower()
+    assert info.path.exists()
+
+
+def test_clean_worktrees_dry_run_reports_plan_and_does_not_remove(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-5-dry-run", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=5, pr_number=105)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    assert len(result["data"]["planned"]) == 1
+    assert len(result["data"]["removed"]) == 0
+    assert info.path.exists()
+
+
+def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) -> None:
+    """If removal leaves the shared venv .pth pointing at a worktree, report it."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+
+    info = create_worktree(repo_root, "agent/issue-6-poison", base_ref="HEAD")
+    _create_shared_venv(repo_root, pth_target=info.path / "src")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=6, pr_number=106)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(),
+    )
+
+    assert result["ok"] is False
+    assert len(result["data"]["removed"]) == 1
+    assert result["data"]["venv_ok"] is False
+    assert "points outside main checkout" in result["data"]["venv_message"]

@@ -21,6 +21,7 @@ ISSUE_VIEW_FIELDS = (
 )
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
+PR_VIEW_MERGED_FIELDS = "state,mergedAt"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls

@@ -17,6 +17,7 @@ from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
+from .state import load_state_locked
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -28,6 +29,7 @@ from .runners import (
     scale_down_idle_runners,
     ScaleAction,
 )
+from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
 
 
@@ -192,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
 
+    subparsers.add_parser("worktree-clean")
+
     return parser
 
 
@@ -225,6 +229,23 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
         else f"doctor: {len(failed)} finding(s), at least one blocking"
     )
     return CommandResult(ok, message, {"checks": [check.to_dict() for check in checks]})
+
+
+def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    state = load_state_locked(paths.state_file)
+    result = clean_worktrees(
+        repo_root,
+        paths.root / "worktrees",
+        state,
+        config,
+        gh,
+        dry_run=args.dry_run,
+    )
+    return CommandResult(result["ok"], result["message"], result["data"])
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -741,6 +762,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
                 )
+        elif args.command == "worktree-clean":
+            result = run_worktree_clean_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
