@@ -470,6 +470,9 @@ def launch_devin_session(
     return record
 
 
+_DEVIN_SIDECAR_STEM_RE = re.compile(r"^issue-\d+$")
+
+
 def read_session_records(sessions_dir: Path) -> list[SessionRecord]:
     """Read every sidecar JSON in ``sessions_dir`` back into ``SessionRecord``s.
 
@@ -481,10 +484,16 @@ def read_session_records(sessions_dir: Path) -> list[SessionRecord]:
         return []
     records: list[SessionRecord] = []
     for path in sorted(sessions_dir.glob("issue-*.json")):
-        # `issue-*.json` also matches the claude-code adapter's
-        # `issue-N.claude.json` sidecars (both adapters share one sessions_dir).
-        # Skip them so doctor doesn't read every Claude worker twice.
-        if path.name.endswith(".claude.json"):
+        # `issue-*.json` also matches every other adapter's/subsystem's
+        # sidecar that happens to share the `issue-<n>.<extra>.json` naming
+        # scheme in the same sessions_dir — e.g. the claude-code adapter's
+        # `issue-N.claude.json` and post_mortem's `issue-N.post-mortem.json`.
+        # A devin session sidecar's stem (path name minus the final `.json`)
+        # is exactly `issue-<digits>`; anything with additional dotted
+        # segments belongs to a different writer and must be skipped, or its
+        # foreign schema gets misread as a bogus SessionRecord (pid=None)
+        # that bypasses corroboration downstream (issue #343).
+        if not _DEVIN_SIDECAR_STEM_RE.match(path.stem):
             continue
         try:
             with path.open("r", encoding="utf-8") as handle:

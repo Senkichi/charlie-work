@@ -378,6 +378,59 @@ def _normalize_working_directory(path: str) -> tuple[str, ...]:
     return tuple(parts)
 
 
+# Number of trailing path segments used by the suffix-match fallback in
+# _find_matching_session (issue #343). Fleet worktree paths are built as
+# ``<worktrees-dir>/<slug>`` where ``<slug>`` embeds the issue number (see
+# worktree.create_worktree's ``target_dir / _slugify(branch)``), so the last
+# two segments (parent dir name + issue-numbered leaf) are the most that can
+# be matched reliably.
+#
+# NOT a cross-repo-unique key. ``sessions.db`` is machine-wide
+# (``%APPDATA%\devin\cli\sessions.db``, see ``_default_db_path``), shared by
+# every fleet repo dispatched from this machine, and this 2-segment suffix
+# carries no repo identity at all -- it is only (parent-dir-literal,
+# issue-slug). Two different repos in the fleet that both dispatch the same
+# issue number with a similar-enough title (so ``_slugify`` produces the same
+# slug) inside overlapping dispatch windows (see the ``created_at`` window
+# filter in ``_find_matching_session``) can collide here, misattributing one
+# repo's session data to another repo's worker.
+#
+# Widening this to include a repo-identifying segment (e.g. 5 segments to
+# reach ``<repo-dir>/.var/charlie-work/worktrees/<slug>``) was considered and
+# rejected: production evidence (``test_real_activity_for_worker_matches_
+# real_fleet_working_directory_shape`` in tests/test_post_mortem.py, sampled
+# from a live sessions.db 2026-07-13) shows the Devin CLI's recorded
+# ``working_directory`` is frequently rooted under an unrelated
+# ``AppData\Local\Temp\...`` session directory that preserves *none* of the
+# worktree path's ``.var/charlie-work/worktrees`` segments -- only the
+# trailing ``worktrees/<slug>`` pair survives. A wider suffix would silently
+# stop matching that real shape, trading a narrow cross-repo collision risk
+# for a total loss of corroboration on the common case this fallback exists
+# for. The collision risk above is accepted for now (tracked as a follow-up,
+# not solved by widening the suffix).
+_WORKING_DIRECTORY_SUFFIX_SEGMENTS = 2
+
+
+def _working_directory_suffix(path: str) -> tuple[str, ...]:
+    """Return the last ``_WORKING_DIRECTORY_SUFFIX_SEGMENTS`` normalized segments.
+
+    Used as a last-resort match key when neither an exact nor a fully
+    normalized ``working_directory`` comparison finds a row (issue #343):
+    production evidence shows the Devin CLI can record a ``working_directory``
+    whose absolute prefix bears no relationship at all to the worktree path
+    this process computed (different resolved root / mount point / capture
+    point), while the dispatch-unique trailing segments -- the worktrees
+    directory name and the issue-numbered slug leaf -- are identical.
+
+    This is a coarse, machine-wide, repo-agnostic key -- see the collision
+    caveat on ``_WORKING_DIRECTORY_SUFFIX_SEGMENTS`` above.
+    """
+    normalized = _normalize_working_directory(path)
+    if len(normalized) < _WORKING_DIRECTORY_SUFFIX_SEGMENTS:
+        return normalized
+    return normalized[-_WORKING_DIRECTORY_SUFFIX_SEGMENTS:]
+
+
 def _find_matching_session(
     conn: sqlite3.Connection,
     working_directory: str,
@@ -398,10 +451,14 @@ def _find_matching_session(
     same directory is possible if a worktree was reused across attempts).
 
     If the exact SQL match for ``working_directory`` returns no rows, this
-    falls back to a tolerant comparison using ``_normalize_working_directory``
-    before giving up, and when it does give up it surfaces a sample of the
-    distinct ``working_directory`` values actually stored in the database for
-    diagnostics.
+    falls back to a tolerant comparison using ``_normalize_working_directory``,
+    and then to a suffix-only comparison using ``_working_directory_suffix``
+    (issue #343: real fleet dispatches have been observed where the Devin
+    CLI's recorded ``working_directory`` shares no absolute-prefix
+    relationship at all with the worktree path, only the trailing
+    issue-numbered slug) before giving up, and when it does give up it
+    surfaces a sample of the distinct ``working_directory`` values actually
+    stored in the database for diagnostics.
     """
     try:
         cursor = conn.execute(
@@ -432,6 +489,20 @@ def _find_matching_session(
         if norm_rows:
             rows = norm_rows
         else:
+            # Last resort: match on the trailing (worktrees-dir, issue-slug)
+            # segment pair only, ignoring the absolute prefix entirely.
+            target_suffix = _working_directory_suffix(working_directory)
+            suffix_rows = [
+                (row[0], row[2])
+                for row in all_rows
+                if target_suffix and _working_directory_suffix(row[1]) == target_suffix
+            ]
+            if suffix_rows:
+                rows = suffix_rows
+            else:
+                rows = []
+
+        if not rows:
             distinct = sorted({str(row[1]) for row in all_rows if row[1] is not None})[:10]
             if distinct:
                 return (

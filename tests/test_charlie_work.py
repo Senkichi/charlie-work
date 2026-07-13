@@ -8521,6 +8521,53 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     assert dispatch_result.data["selected_count"] == 0
 
 
+def test_loop_wires_persist_inconclusive_probe_counter_false_to_dead_lane(
+    tmp_path: Path,
+) -> None:
+    """Issue #343 Finding 2 wiring test: loop() must call the dead lane with
+    persist_inconclusive_probe_counter=False.
+
+    The stall lane runs unconditionally at the top of loop() (line ~4100) and is
+    the sole writer of the not-alive-worker inconclusive-probe deferral counter
+    for that pass. If loop()'s call to _classify_dead_sessions_and_update_throttle_state
+    (line ~4119) ever drops the persist_inconclusive_probe_counter=False keyword
+    (e.g. reverted to the default True during a rebase), the dead lane would
+    silently double-write that counter on top of the stall lane's write within a
+    single loop() pass.
+
+    This MUST fail if that call site's persist_inconclusive_probe_counter=False
+    keyword is removed or flipped to True -- verified by temporarily reverting the
+    call site during development of this test (not asserted here, since a
+    mutation test would require editing production code from within a test).
+
+    Deliberately does not assert on the inconclusive-probe counter's persisted
+    value: the stall lane itself runs 3x per loop() pass (direct, plus via
+    dispatch_rework() and dispatch()'s own internal calls -- a separate,
+    pre-existing redundancy tracked outside this issue), which would make an
+    end-to-end counter-value assertion through loop() fragile. Pinning the
+    call-args of the dead lane directly is the precise, stable way to gate this
+    specific wiring.
+    """
+    from charlie_work.workflow import (
+        _classify_dead_sessions_and_update_throttle_state as real_classify_dead_sessions,
+    )
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with patch(
+        "charlie_work.workflow._classify_dead_sessions_and_update_throttle_state",
+        wraps=real_classify_dead_sessions,
+    ) as mock_classify:
+        app.loop(limit=0)
+
+    mock_classify.assert_called_once()
+    assert mock_classify.call_args.kwargs["persist_inconclusive_probe_counter"] is False
+
+
 def test_loop_reaps_launch_failure_sidecar_and_reports_reaped(
     tmp_path: Path,
 ) -> None:
@@ -10168,6 +10215,445 @@ def test_worktree_probe_failed_launch_failure_does_not_escalate(
     assert result.data["selected_count"] == 1
 
 
+@pytest.mark.real_activity_probe_live
+def test_classify_dead_sessions_retains_sidecar_on_inconclusive_probe(
+    tmp_path: Path,
+) -> None:
+    """Issue #343: a not-alive-looking pid with an inconclusive real-activity
+    probe must have its sidecar RETAINED (deferred), not reaped, on this pass.
+
+    Before this fix, ``_classify_dead_sessions_and_update_throttle_state``
+    treated ``not w.is_alive()`` as sufficient grounds to relabel the issue
+    and delete the sidecar unconditionally -- bypassing the same
+    corroboration + inconclusive-probe deferral cap that
+    ``classify_worker_health`` already enforces for the sibling stall/kill
+    lane. That let a fail-open reap remove the sidecar of a worker whose
+    liveness signal was merely ambiguous, leaving the underlying process
+    invisible to the concurrency governor (issue #343's concrete production
+    instance: pid 23440 verified alive via ``Get-Process``, yet its sidecar
+    was removed after a ``matched: false`` post-mortem).
+
+    Marked ``real_activity_probe_live`` so the autouse
+    ``_stub_real_activity_probe_for_stalled_tests`` fixture (issue #307)
+    leaves ``real_activity_probe_for`` unstubbed -- that stub always returns
+    a 30-minute-stale-but-non-erroring probe, which is never "inconclusive"
+    (``_real_activity_is_inconclusive`` requires every source to error), so
+    it would defeat this test's premise. With the real probe, pointing
+    ``post_mortem.db_path`` at a nonexistent path makes every source error
+    deterministically regardless of what happens to be on the test host.
+
+    MUTATION GATE: reverting the ``if health is not WorkerHealth.DEAD:
+    continue`` gate in ``_classify_dead_sessions_and_update_throttle_state``
+    (src/charlie_work/workflow.py) makes this test fail -- the sidecar would
+    be reaped and the issue relabeled on this single pass.
+    """
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        # Point post-mortem's sessions.db at a path that can never exist, so
+        # the real-activity probe is deterministically inconclusive (every
+        # source errors) regardless of what happens to be on the test host.
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 343,
+            "title": "Ghost sidecar issue",
+            "url": "https://example.test/issues/343",
+            "body": "x",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-343.log"
+    log_path.write_text("Working...\n", encoding="utf-8")
+
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 343)
+    record = SessionRecord(
+        issue_number=343,
+        branch="agent/issue-343-x",
+        worktree_path=str(tmp_path / "worktree-343"),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=54321,  # A pid our liveness check will report as gone (mocked below)
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=1_700_000_000.0,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, paths.state_file, fake_gh, config
+        )
+
+    assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
+    assert (343, config.labels.in_progress) not in fake_gh.labels_removed
+    assert (343, config.labels.ready) not in fake_gh.labels_added
+
+    # The Signal-1 deferral counter must have advanced so the escalation cap
+    # (max_inconclusive_probe_deferrals) is still reachable over later passes.
+    persisted = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert persisted.get("inconclusive_probe_deferred_count") == 1
+
+
+def test_classify_dead_sessions_reaps_sidecar_when_probe_conclusively_stale(
+    tmp_path: Path,
+) -> None:
+    """Regression pin: a genuinely dead pid whose corroboration probe is
+    conclusively stale (not fresh, not inconclusive) is still reaped
+    immediately -- the issue #343 fix must not invert into "never reap".
+    """
+    from datetime import timedelta
+
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 344,
+            "title": "Genuinely dead worker",
+            "url": "https://example.test/issues/344",
+            "body": "x",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-344.log"
+    log_path.write_text("Working...\n", encoding="utf-8")
+
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 344)
+    record = SessionRecord(
+        issue_number=344,
+        branch="agent/issue-344-x",
+        worktree_path=str(tmp_path / "worktree-344"),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=54322,
+        started_at=(datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=1_700_000_000.0,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    stale_probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=datetime.now(UTC) - timedelta(hours=2),
+                staleness_seconds=7200.0,
+                error=None,
+            ),
+        )
+    )
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=False),
+        patch("charlie_work.worker.real_activity_probe_for", return_value=stale_probe),
+    ):
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, paths.state_file, fake_gh, config
+        )
+
+    assert not sidecar_path.exists(), "a conclusively-stale probe must still allow reaping"
+    assert (344, config.labels.in_progress) in fake_gh.labels_removed
+    assert (344, config.labels.ready) in fake_gh.labels_added
+
+
+@pytest.mark.real_activity_probe_live
+def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
+    tmp_path: Path,
+) -> None:
+    """Issue #343 Finding 2: the stall lane (_detect_and_handle_stalled_sessions)
+    and the dead lane (_classify_dead_sessions_and_update_throttle_state) both
+    corroborate a not-alive, pid-bearing, error-free worker against the same
+    real-activity probe, and both used to unconditionally persist Signal-1's
+    inconclusive-probe deferral counter. Within a single ``loop()`` pass that
+    double-incremented the counter (0->1 in the stall lane, then re-read and
+    ->2 in the dead lane) -- halving the effective deferral grace period, and
+    the very mechanism that opens Finding 1's pass-2 phantom-sidecar window.
+
+    ``loop()`` (workflow.py, ~4100/~4119) always runs the stall lane
+    immediately before the dead lane and passes the dead lane
+    ``persist_inconclusive_probe_counter=False`` for exactly this reason --
+    this test drives both lanes once in that same order, with that same
+    argument, and pins the counter at exactly 1 after the pass. Every other
+    caller (every existing standalone unit test, plus dispatch()/
+    dispatch_rework(), which never call the dead lane at all) leaves the
+    dead lane's default (True) alone, so the stall lane remains the correct
+    sole writer when the dead lane doesn't run in the same pass -- see
+    ``test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_
+    then_escalated`` in test_worker.py, which pins that standalone case.
+
+    MUTATION GATE: dropping the ``persist_inconclusive_probe_counter=False``
+    argument from this call (i.e. reverting to the unconditional write) makes
+    this test fail -- the counter would read 2, not 1.
+    """
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+    from charlie_work.workflow import (
+        _classify_dead_sessions_and_update_throttle_state,
+        _detect_and_handle_stalled_sessions,
+    )
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 343,
+            "title": "Double-increment guard",
+            "url": "https://example.test/issues/343",
+            "body": "x",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-343.log"
+    log_path.write_text("Working...\n", encoding="utf-8")
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 343)
+    record = SessionRecord(
+        issue_number=343,
+        branch="agent/issue-343-x",
+        worktree_path=str(tmp_path / "worktree-343"),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=54321,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=1_700_000_000.0,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    inconclusive_probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="sessions.db unavailable",
+            ),
+        )
+    )
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=False),
+        patch("charlie_work.worker.real_activity_probe_for", return_value=inconclusive_probe),
+    ):
+        # loop() order and arguments: stall lane runs before the dead lane,
+        # which is told not to persist the counter itself this pass.
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir,
+            paths.state_file,
+            fake_gh,
+            config,
+            persist_inconclusive_probe_counter=False,
+        )
+
+    assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
+    persisted = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert persisted.get("inconclusive_probe_deferred_count") == 1, (
+        "counter must increment at most once per worker per pass, not twice"
+    )
+
+
+@pytest.mark.real_activity_probe_live
+def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
+    tmp_path: Path,
+) -> None:
+    """Issue #343 Finding 1 (composition gap): every pre-existing test drives
+    ``_classify_dead_sessions_and_update_throttle_state`` in isolation. In
+    production, ``loop()`` always runs the stall lane
+    (``_detect_and_handle_stalled_sessions``) immediately before the dead
+    lane, and the stall lane can itself reach a DEAD verdict and write a
+    ``issue-N.post-mortem.json`` sidecar (via ``classify_and_record``)
+    without reaping the session sidecar (it never reaps -- only the dead lane
+    does). Before the ``read_session_records`` fix, that leftover post-mortem
+    file was misread by the devin glob (``issue-*.json``) as a bogus phantom
+    ``SessionRecord(pid=None, log_path="")``. The phantom's ``pid is None``
+    skips corroboration entirely and reaches ``reap_sidecar``, which resolves
+    to the SAME path as the REAL ``issue-343.json`` sidecar and deletes it --
+    even when the real worker's own corroboration correctly defers it as not
+    (yet) provably dead.
+
+    Setup: forces the stall lane to reach a DEAD verdict via an unconditional
+    terminal-error-marker log line (Signal 2, which "bypasses corroboration
+    and still returns DEAD immediately" per classify_worker_health's
+    docstring) so it writes the post-mortem sidecar without needing to
+    fabricate a diverging probe. The marker line is then removed so the two
+    "real" passes that follow are driven by one ordinary inconclusive probe
+    throughout, exactly like the simpler double-increment test above.
+
+    Drives the stall lane then the dead lane, in ``loop()``'s own order and
+    with its own ``persist_inconclusive_probe_counter=False`` argument,
+    across two passes with the stale post-mortem sidecar from setup still on
+    disk throughout. Asserts the REAL sidecar survives both passes (still
+    deferred) and the deferral counter advances by exactly 1 per pass
+    (0 -> 1 -> 2), pinning both Finding 1 (the phantom must never be read
+    back as a session) and Finding 2 (at most one increment per worker per
+    pass) together.
+
+    MUTATION GATE: reverting either the ``read_session_records`` stem
+    exclusion (Finding 1) or dropping
+    ``persist_inconclusive_probe_counter=False`` from the dead lane call
+    (Finding 2) makes this test fail -- the sidecar is deleted mid-pass, or
+    the counter overshoots to 2/4 instead of 1/2.
+    """
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+    from charlie_work.workflow import (
+        _classify_dead_sessions_and_update_throttle_state,
+        _detect_and_handle_stalled_sessions,
+    )
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 343,
+            "title": "Phantom post-mortem sidecar",
+            "url": "https://example.test/issues/343",
+            "body": "x",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-343.log"
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 343)
+    record = SessionRecord(
+        issue_number=343,
+        branch="agent/issue-343-x",
+        worktree_path=str(tmp_path / "worktree-343"),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=54321,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=1_700_000_000.0,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    inconclusive_probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="sessions.db unavailable",
+            ),
+        )
+    )
+
+    def _run_stall_lane() -> None:
+        with (
+            patch("charlie_work.worker.is_session_alive", return_value=False),
+            patch(
+                "charlie_work.worker.real_activity_probe_for",
+                return_value=inconclusive_probe,
+            ),
+        ):
+            _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    def _run_dead_lane() -> None:
+        with (
+            patch("charlie_work.worker.is_session_alive", return_value=False),
+            patch(
+                "charlie_work.worker.real_activity_probe_for",
+                return_value=inconclusive_probe,
+            ),
+        ):
+            _classify_dead_sessions_and_update_throttle_state(
+                sessions_dir,
+                paths.state_file,
+                fake_gh,
+                config,
+                persist_inconclusive_probe_counter=False,
+            )
+
+    def _run_pass() -> None:
+        # loop() order and arguments: stall lane runs before the dead lane,
+        # which is told not to persist the counter itself.
+        _run_stall_lane()
+        _run_dead_lane()
+
+    # Setup (not one of the two counted passes): a terminal-error-marker log
+    # line makes the stall lane's classify_worker_health call return DEAD
+    # unconditionally (Signal 2 bypasses corroboration), so it writes the
+    # post-mortem sidecar without reaping (the stall lane never reaps). The
+    # marker is cleared BEFORE the dead lane runs -- matching loop()'s own
+    # sequential order, where nothing else touches the log between the two
+    # calls -- so the dead lane's own corroboration this pass is driven by
+    # the inconclusive probe alone; otherwise Signal 2 would ALSO fire there
+    # and reap the sidecar during setup.
+    log_path.write_text("Error: Agent error: fatal\n", encoding="utf-8")
+    _run_stall_lane()
+    log_path.write_text("Working...\n", encoding="utf-8")
+    _run_dead_lane()
+
+    post_mortem_path = sessions_dir / "issue-343.post-mortem.json"
+    assert post_mortem_path.exists(), "setup precondition: stall lane must have written it"
+    assert sidecar_path.exists(), "setup must not reap -- dead lane saw a clean log, deferred"
+
+    # Pass 1: ordinary inconclusive probe: both lanes defer.
+    _run_pass()
+
+    assert sidecar_path.exists(), "real sidecar must survive pass 1 (deferred, not DEAD)"
+    persisted = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert persisted.get("inconclusive_probe_deferred_count") == 1
+
+    # Pass 2: inconclusive again; the stale post-mortem sidecar from setup
+    # is still on disk.
+    _run_pass()
+
+    assert post_mortem_path.exists(), "post-mortem sidecars are never reaped by this code path"
+    assert sidecar_path.exists(), "real sidecar must survive pass 2 (deferred, not DEAD)"
+    persisted = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert persisted.get("inconclusive_probe_deferred_count") == 2, (
+        "counter must advance by exactly 1 per pass across both passes"
+    )
+
+
 def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
     """Test that pr_update_branch failures are reported as values, not successes."""
     from charlie_work.config import AutoMergeConfig
@@ -11696,7 +12182,7 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
     """When max_concurrent_sessions is set and there are live sessions, dispatch should be clamped."""
 
     # Mock _count_live_sessions to return 2 live sessions
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 2
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -11724,7 +12210,7 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
     """Concurrency governor should also clamp rework dispatch."""
 
     # Mock _count_live_sessions to return 2 live sessions (at the cap)
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 2
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -11783,7 +12269,7 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
     """When some slots are available, dispatch should launch up to that limit."""
 
     # Mock _count_live_sessions to return 1 live session
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 1
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -11854,7 +12340,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
     """Issue #105: when --issues names more issues than available slots, excess should be deferred by concurrency."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 0
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -11926,7 +12412,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
     """Issue #105: when --issues names more issues than available slots (with live sessions), excess should be deferred."""
 
     # Mock _count_live_sessions to return 1 live session
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 1
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -11997,7 +12483,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
     """Issue #105: dry-run with --issues should also respect concurrency governor."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 0
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -12068,7 +12554,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
     """Issue #105: dispatch_rework with --issues should also respect concurrency governor."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 0
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -12299,7 +12785,7 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
         return 1, []
 
     # Mock _count_live_sessions to return 1 local live session
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 1
 
     monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
@@ -12336,7 +12822,7 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeyp
         return 1, []
 
     # Mock _count_live_sessions to return 1 local live session
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 1
 
     monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live)
@@ -12566,7 +13052,7 @@ def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
 def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) -> None:
     """_apply_concurrency_governor returns clamped result when sessions are alive."""
 
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 2
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -12591,7 +13077,7 @@ def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) 
 def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeypatch) -> None:
     """_apply_concurrency_governor returns partial clamped result when some slots available."""
 
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 1
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
@@ -13586,6 +14072,63 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     # Count live sessions (both have pid=None, so count should be 0)
     count = _count_live_sessions(sessions_dir)
     assert count == 0  # No live sessions since both have pid=None
+
+
+def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
+    tmp_path: Path,
+) -> None:
+    """Issue #343: a live ``worker_pid`` recorded in state.json with NO
+    corresponding session sidecar (a "ghost") must still be counted against
+    the concurrency governor.
+
+    Before this fix, ``_count_live_sessions`` only counted sidecar files on
+    disk. If a sidecar goes missing for a still-live process -- e.g. the
+    dead-session reap lane removed it on ambiguous evidence, or any other
+    path stranded state.json's dispatch record -- the live worker became
+    invisible to the governor and looked like free capacity, letting the
+    next dispatch pass launch past the configured concurrency cap even
+    though the ghost's process was still actually running (issue #343's
+    concrete production instance: pid 23440 verified alive via
+    ``Get-Process`` with its sidecar already gone).
+
+    This test uses the current test process's own real, genuinely-alive pid
+    (recorded only in state.json, never in a sidecar) to prove the ghost is
+    now counted, without needing to spawn or mock a child process.
+
+    MUTATION GATE: removing the ``if state_file is not None:`` state.json
+    corroboration block in ``_count_live_sessions``
+    (src/charlie_work/workflow.py) makes this test fail -- the count would
+    revert to 0 and the ghost worker would look like free capacity again.
+    """
+    from charlie_work.devin_shell import _get_process_start_time
+    from charlie_work.workflow import _count_live_sessions
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # No sidecar file is written for issue 343 -- this is the "ghost" case:
+    # a live worker_pid with no session sidecar on disk at all.
+
+    current_pid = os.getpid()
+    current_start_time = _get_process_start_time(current_pid)
+    state = load_state(paths.state_file)
+    state["issues"]["343"] = {
+        "status": "dispatched",
+        "worker_pid": current_pid,
+        "worker_process_start_time": current_start_time,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    count = _count_live_sessions(sessions_dir, paths.state_file)
+    assert count == 1, "a ghost worker_pid that is genuinely alive must count against the cap"
+
+    # Without state.json corroboration (the pre-fix behavior), the same ghost
+    # is invisible -- pin the contrast so a future regression that silently
+    # drops the state_file argument elsewhere is easy to diagnose.
+    assert _count_live_sessions(sessions_dir) == 0
 
 
 def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> None:
@@ -15876,7 +16419,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     )
 
     # Mock _count_live_sessions to return 0 (no live sessions)
-    def mock_count_live(sessions_dir):
+    def mock_count_live(sessions_dir, state_file=None):
         return 0
 
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
