@@ -72,7 +72,8 @@ def _log_is_stalled_at_shim(
     2. The log file has not been modified within the grace period
     3. The log is small (<= 1KB) - indicating no real progress
     4. Independent real-session activity (sessions.db, per-PID Devin log, or
-       Claude Code events.jsonl) is also quiet past the grace period
+       Claude Code events.jsonl) is also quiet past the grace period, and the
+       probe was conclusive (see below)
 
     This detects workers that hang immediately after shim materialization
     with error:null, alive PID, and frozen logs, while avoiding false
@@ -84,10 +85,16 @@ def _log_is_stalled_at_shim(
         grace_minutes: Grace period in minutes to allow for shim materialization
         now: Current datetime for staleness calculation
         real_activity_probe: Optional corroboration probe from real-session
-            activity sources. When fresh, the sidecar stall is ignored.
+            activity sources. When fresh, the sidecar stall is ignored. When
+            inconclusive (``_real_activity_is_inconclusive`` — every source
+            errored, or every source is error-free but no-match-yet), the
+            stall verdict is also deferred rather than failing open (issue
+            #307): this call site is reached only for a CONFIRMED-ALIVE
+            worker and its True return drives an immediate process kill.
 
     Returns:
-        True if the log is stalled at shim and real activity is quiet, False otherwise
+        True if the log is stalled at shim and real activity is quiet and
+        conclusive, False otherwise
     """
     from datetime import UTC
 
@@ -117,6 +124,12 @@ def _log_is_stalled_at_shim(
             real_age = now - real_activity_probe.latest_timestamp
             if real_age <= timedelta(minutes=grace_minutes):
                 return False
+        elif _real_activity_is_inconclusive(real_activity_probe):
+            # Probe was consulted but produced no timestamp evidence either way
+            # (issue #307: same single enforcement point as classify_worker_health's
+            # Signal 3). That is insufficient evidence to kill a CONFIRMED-ALIVE
+            # worker; defer rather than fail open to a stall verdict.
+            return False
 
         return True
     except OSError:
@@ -421,14 +434,25 @@ def _real_activity_is_fresh(
 
 
 def _real_activity_is_inconclusive(probe: RealActivityProbe | None) -> bool:
-    """Return True when every consulted source errored and produced no timestamp.
+    """Return True when the probe produced no timestamp evidence either way.
 
-    An all-errored probe is insufficient evidence of death/stall, so the caller
-    should defer the verdict rather than fail open to STALLED.
+    This is the single enforcement point for "insufficient evidence to kill",
+    shared by both classify_worker_health's Signal 3 and
+    ``_log_is_stalled_at_shim`` (issue #307). It covers both inconclusive
+    shapes by keying off ``probe.latest_timestamp`` (computed once in
+    ``RealActivityProbe.__post_init__``):
+
+    1. every source errored (e.g. sessions.db schema drift, no per-PID log)
+    2. every source returned no error but also no timestamp match yet (e.g.
+       a young devin-shell session within the launch-stall grace period
+       whose sessions.db row hasn't landed)
+
+    Neither shape is evidence the worker is actually dead/stalled, so callers
+    should defer the verdict rather than fail open to DEAD/STALLED.
     """
     if probe is None or not probe.sources:
         return False
-    return all(source.error is not None for source in probe.sources)
+    return probe.latest_timestamp is None
 
 
 def classify_worker_health(
@@ -517,8 +541,10 @@ def classify_worker_health(
                 # Sidecar log is frozen but the real session is still moving
                 pass
             elif _real_activity_is_inconclusive(real_activity_probe):
-                # Probe was consulted but every source errored. That is insufficient
-                # evidence to kill; defer rather than fail open to STALLED.
+                # Probe was consulted but produced no timestamp evidence either
+                # way (all sources errored, or all sources are error-free but
+                # no-match-yet). That is insufficient evidence to kill; defer
+                # rather than fail open to STALLED.
                 pass
             else:
                 return WorkerHealth.STALLED

@@ -1186,6 +1186,62 @@ def test_classify_worker_health_stalled_by_mtime_inconclusive_probe_deferred(
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
 
 
+def test_classify_worker_health_stalled_by_mtime_no_match_yet_probe_deferred(
+    tmp_path: Path,
+) -> None:
+    """Issue #307 scope-extension: the second inconclusive shape.
+
+    Distinct from test_classify_worker_health_stalled_by_mtime_inconclusive_probe_deferred
+    (which covers all-errored sources): here every source is error-free but
+    returned no timestamp match at all (e.g. a young devin-shell session whose
+    sessions.db row hasn't landed yet). This must funnel into the same defer
+    branch, not fail open to STALLED.
+    """
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
+
+
 def test_classify_worker_health_terminal_marker_still_dead_with_fresh_probe(
     tmp_path: Path,
 ) -> None:

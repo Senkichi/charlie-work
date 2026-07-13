@@ -74,7 +74,7 @@ EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
 @pytest.fixture(autouse=True)
-def _stub_real_activity_probe_for_for_stalled_tests(
+def _stub_real_activity_probe_for_stalled_tests(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """Issue #307: stall-detection tests need a stale real-activity probe.
@@ -82,13 +82,11 @@ def _stub_real_activity_probe_for_for_stalled_tests(
     Without this fixture, ``real_activity_probe_for`` reaches the host's real
     ``sessions.db`` and per-PID logs and returns an all-errored probe. Issue #307
     makes an all-errored probe fail-open (defer), so stall tests that are not
-    about real-activity corroboration would otherwise return HEALTHY. The one
-    test that intentionally exercises a fresh probe is excluded by name.
+    about real-activity corroboration would otherwise return HEALTHY. Tests that
+    intentionally exercise a live (unstubbed) probe opt out via the
+    ``real_activity_probe_live`` marker instead of a rename-fragile name match.
     """
-    if (
-        request.node.originalname
-        == "test_status_workers_not_killed_when_real_activity_probe_fresh"
-    ):
+    if request.node.get_closest_marker("real_activity_probe_live") is not None:
         return
 
     from datetime import datetime, timedelta, UTC
@@ -13568,6 +13566,7 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
     assert worker["cost_usd"] is None
 
 
+@pytest.mark.real_activity_probe_live
 def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path) -> None:
     """Issue #301 status()-path wiring: a claude-code worker whose sidecar log is
     frozen but whose events.jsonl sibling carries fresh activity must be
@@ -13579,6 +13578,11 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
     post_mortem.real_activity_for_worker, must make this test fail (the
     worker reports health="stalled") rather than silently reverting to
     mtime-only classification.
+
+    Marked ``real_activity_probe_live`` so the autouse
+    ``_stub_real_activity_probe_for_stalled_tests`` fixture leaves
+    ``real_activity_probe_for`` unstubbed for this test only (rename-safe
+    opt-out; issue #307 non-blocking cleanup).
     """
     from datetime import timedelta
 
