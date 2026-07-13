@@ -1294,3 +1294,73 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
 
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar.get("failure_kind") is None
+
+
+def _inconclusive_probe_for_signal_1(
+    view: WorkerView,
+    config: OrchestratorConfig,
+    now: datetime,
+) -> RealActivityProbe:
+    """Return an all-errored real-activity probe for issue #338 kill-path tests."""
+    return RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error="message_nodes query failed (schema drift?): no such column: id",
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="no per-PID log found",
+            ),
+        )
+    )
+
+
+def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_escalated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #338 kill-path: a dead worker with an inconclusive probe is deferred,
+    the sidecar counter increments, and the worker is reaped once the cap is hit.
+    """
+    from charlie_work import workflow
+
+    issue_number = 338
+    log_text = "Working on task...\n"
+    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    killed: list[int] = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    monkeypatch.setattr(
+        "charlie_work.worker.real_activity_probe_for", _inconclusive_probe_for_signal_1
+    )
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=1),
+    )
+
+    # First pass: dead PID + inconclusive probe → defer, counter advances.
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    assert result == []
+    assert killed == []
+
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+    assert sidecar.get("failure_kind") is None
+
+    # Second pass: counter is now at the cap → reap.
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    assert result == [{"issue": issue_number, "pid": 99999}]
+    assert killed == [99999]
+
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar["failure_kind"] == "stalled"
+    assert sidecar.get("inconclusive_probe_deferred_count") == 0
