@@ -650,6 +650,63 @@ def test_read_session_records_skips_claude_code_sidecars(tmp_path: Path) -> None
     assert [record.issue_number for record in records] == [5]
 
 
+def test_read_session_records_skips_post_mortem_sidecars(tmp_path: Path) -> None:
+    """Issue #343 Finding 1: the devin glob `issue-*.json` also matches
+    post_mortem's `issue-N.post-mortem.json` sidecars (both live in the same
+    sessions_dir). SessionRecord.from_dict only strictly requires
+    `issue_number` (present in a PostMortemRecord payload too), so an
+    unfiltered post-mortem file parses into a bogus SessionRecord(pid=None,
+    log_path=""). That phantom bypasses `if w.pid is not None:`
+    corroboration downstream in the dead-session reaper and reaches
+    `reap_sidecar`, which resolves to the SAME path as the real
+    `issue-N.json` sidecar and deletes it -- silently reaping a worker whose
+    liveness was never actually re-verified.
+
+    read_session_records must skip `issue-N.post-mortem.json` (and, for
+    completeness, the pre-existing `issue-N.claude.json` exclusion) and
+    return exactly the one real devin sidecar.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    devin_payload = {
+        "issue_number": 343,
+        "branch": "agent/issue-343-x",
+        "worktree_path": "/tmp/wt/issue-343",
+        "prompt_path": "p.md",
+        "command": ["devin", "--print"],
+        "pid": 4242,
+        "started_at": "2026-01-01T00:00:00Z",
+        "log_path": "issue-343.log",
+        "error": None,
+    }
+    (sessions_dir / "issue-343.json").write_text(json.dumps(devin_payload), encoding="utf-8")
+    (sessions_dir / "issue-343.log").write_text("Working...\n", encoding="utf-8")
+    # A post-mortem sidecar with a foreign schema (issue_number is the only
+    # key it shares with SessionRecord) -- if the exclusion regressed, this
+    # would parse into a bogus pid=None SessionRecord.
+    post_mortem_payload = {
+        "issue_number": 343,
+        "generated_at": "2026-01-01T00:05:00Z",
+        "db_path": "C:/fake/sessions.db",
+        "matched": False,
+        "extraction_error": "no session found matching working_directory",
+    }
+    (sessions_dir / "issue-343.post-mortem.json").write_text(
+        json.dumps(post_mortem_payload), encoding="utf-8"
+    )
+    # The claude-code adapter's sidecar, included for completeness alongside
+    # the pre-existing exclusion this test also guards.
+    (sessions_dir / "issue-343.claude.json").write_text(
+        json.dumps({"issue_number": 343, "worktree": "wt", "pid": 9999}), encoding="utf-8"
+    )
+
+    records = read_session_records(sessions_dir)
+
+    assert len(records) == 1
+    assert records[0].issue_number == 343
+    assert records[0].pid == 4242
+
+
 def test_probe_devin_ok_for_zero_exit_fake(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

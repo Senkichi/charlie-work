@@ -1392,3 +1392,49 @@ def test_find_matching_session_suffix_fallback_rejects_different_issue_slug(
     assert probe.latest_timestamp is None
     db_source = next(s for s in probe.sources if s.name == "sessions.db")
     assert db_source.error is not None
+
+
+def test_find_matching_session_suffix_fallback_requires_parent_segment_match(
+    tmp_path: Path,
+) -> None:
+    """The suffix-match fallback must compare the segment above the
+    issue-slug leaf too, not just the leaf segment alone (issue #343
+    Finding 3).
+
+    ``test_find_matching_session_suffix_fallback_rejects_different_issue_slug``
+    above is satisfied by the two working_directory values having different
+    trailing slug segments, so it passes at
+    ``_WORKING_DIRECTORY_SUFFIX_SEGMENTS`` == 1 or == 2 alike -- it does not
+    by itself pin the segment count. This test constructs a DB row whose
+    working_directory shares the exact same trailing slug segment as the
+    target worktree but sits under an unrelated parent directory (not the
+    fleet worktrees-dir), so a 1-segment suffix would wrongly match it while
+    the real 2-segment suffix correctly rejects it.
+
+    MUTATION GATE: shrinking ``_WORKING_DIRECTORY_SUFFIX_SEGMENTS`` from 2 to
+    1 makes this test fail -- the unrelated row would wrongly match on the
+    shared leaf segment alone.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory=(
+            r"C:\Users\senki\AppData\Local\Temp\some-unrelated-tool-cache"
+            r"\agent-issue-203-fix"
+        ),
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+    )
+
+    assert probe.latest_timestamp is None
+    db_source = next(s for s in probe.sources if s.name == "sessions.db")
+    assert db_source.error is not None
