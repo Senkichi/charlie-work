@@ -826,6 +826,81 @@ def test_log_is_stalled_at_shim_with_stale_real_activity(tmp_path: Path) -> None
     assert _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now, real_activity_probe=probe)
 
 
+def test_log_is_stalled_at_shim_with_all_errored_probe_deferred(tmp_path: Path) -> None:
+    """Issue #307 scope-extension: _log_is_stalled_at_shim must not fail open on an
+    all-errored probe.
+
+    This is the site the reviewer reproduced directly: reconcile.py:264 reaches
+    this function only for a CONFIRMED-ALIVE worker, and a True return here
+    drives an immediate kill_process_tree (reconcile.py:288). An all-errored
+    probe is insufficient evidence of a stall.
+    """
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error="message_nodes query failed (schema drift?): no such column: id",
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="no per-PID log found",
+            ),
+        )
+    )
+
+    assert not _log_is_stalled_at_shim(
+        log_path, grace_minutes=5, now=now, real_activity_probe=probe
+    )
+
+
+def test_log_is_stalled_at_shim_with_no_match_yet_probe_deferred(tmp_path: Path) -> None:
+    """Issue #307 scope-extension: the second inconclusive shape at the shim site.
+
+    Distinct from test_log_is_stalled_at_shim_with_all_errored_probe_deferred:
+    here every source is error-free but returned no timestamp match at all
+    (e.g. a young session within launch_stall_grace_minutes whose sessions.db
+    row hasn't landed yet). This must also defer rather than report a stall.
+    """
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    now = datetime.now(UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+        )
+    )
+
+    assert not _log_is_stalled_at_shim(
+        log_path, grace_minutes=5, now=now, real_activity_probe=probe
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit stall deferral (issue #247)
 # ---------------------------------------------------------------------------
@@ -871,6 +946,28 @@ def _make_stalled_devin_session(
     return sessions_dir, state_file, log_path
 
 
+def _stale_devin_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+    """Return a probe that is stale (not fresh) and not all-errored.
+
+    Issue #307: a worker with a stale sidecar log and a stale real-session
+    activity signal must still be classified as STALLED. Tests that exercise
+    the rate-limit defer path must not be tripped up by an all-errored probe,
+    which now defers to avoid the fail-open bug in Signal 3.
+    """
+    now = datetime.now(UTC)
+    timestamp = now - timedelta(minutes=30)
+    return RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=timestamp,
+                staleness_seconds=(now - timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+
 def test_stalled_worker_with_rate_limit_signature_is_deferred(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -890,6 +987,7 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(
@@ -987,6 +1085,7 @@ def test_deferred_worker_past_deadline_is_killed(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(
@@ -1032,6 +1131,7 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(

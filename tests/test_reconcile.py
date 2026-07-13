@@ -1772,6 +1772,11 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     Mutation check: this test FAILS against the old inline-kill code (which calls
     os.killpg / ctypes.TerminateProcess directly and never touches kill_process_tree)
     and PASSES against the fix (which calls kill_process_tree from process_utils).
+
+    Issue #307: the real-activity probe must be conclusive (a genuinely stale,
+    non-None timestamp from sessions.db) rather than left to hit the host's real
+    sessions.db, which would produce an all-errored/inconclusive probe for this
+    fake worktree and now correctly defer instead of killing.
     """
     import json
     import os
@@ -1779,7 +1784,27 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
 
     from charlie_work.devin_shell import SessionRecord
 
-    config = OrchestratorConfig()
+    worktree_path = "/tmp/worktree-55"
+    now = datetime.now(UTC)
+
+    db_path = tmp_path / "sessions.db"
+    make_sessions_db(
+        db_path,
+        session_id="sess-55",
+        working_directory=worktree_path,
+        created_at=now.isoformat(),
+        rows=[
+            {
+                "role": "assistant",
+                "content": "still working",
+                # Stale past the launch-stall grace period: conclusive evidence
+                # of a real stall, not the no-match-yet shape.
+                "created_at": (now - timedelta(minutes=20)).isoformat(),
+            }
+        ],
+    )
+
+    config = OrchestratorConfig(post_mortem=PostMortemConfig(db_path=str(db_path)))
     gh = FakeGitHub(prs=[], issues=[_issue(55, [config.labels.in_progress])])
     state = empty_state()
 
@@ -1790,7 +1815,7 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     # Write a small log with only the shim marker — frozen well past grace period
     log_path = sessions_dir / "issue-55.log"
     log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
-    old_time = datetime.now(UTC) - timedelta(minutes=20)
+    old_time = now - timedelta(minutes=20)
     os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
 
     # Use a fake PID that passes is_alive() without actually checking the OS.
@@ -1804,7 +1829,7 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     record = SessionRecord(
         issue_number=55,
         branch="agent/issue-55",
-        worktree_path="/tmp/worktree-55",
+        worktree_path=worktree_path,
         prompt_path="/tmp/prompt-55.md",
         command=("devin", "prompt.md"),
         pid=fake_pid,

@@ -1090,3 +1090,247 @@ def test_classify_worker_health_malformed_started_at_claude_no_tool_calls(
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         assert isinstance(health, WorkerHealth)
+
+
+def test_classify_worker_health_dead_by_liveness_deferred_by_fresh_probe(
+    tmp_path: Path,
+) -> None:
+    """Issue #307: a dead PID with a fresh real-session activity signal is not DEAD this pass."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    # Freeze the sidecar log so Signal 3 would fire if reached.
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    fresh_timestamp = now - timedelta(seconds=8)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=fresh_timestamp,
+                staleness_seconds=(now - fresh_timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.HEALTHY
+
+
+def test_classify_worker_health_stalled_by_mtime_inconclusive_probe_deferred(
+    tmp_path: Path,
+) -> None:
+    """Issue #307: a probe with all errored sources must not fail open to STALLED."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error="message_nodes query failed (schema drift?): no such column: id",
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error="no per-PID log found",
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
+
+
+def test_classify_worker_health_stalled_by_mtime_no_match_yet_probe_deferred(
+    tmp_path: Path,
+) -> None:
+    """Issue #307 scope-extension: the second inconclusive shape.
+
+    Distinct from test_classify_worker_health_stalled_by_mtime_inconclusive_probe_deferred
+    (which covers all-errored sources): here every source is error-free but
+    returned no timestamp match at all (e.g. a young devin-shell session whose
+    sessions.db row hasn't landed yet). This must funnel into the same defer
+    branch, not fail open to STALLED.
+    """
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=None,
+                staleness_seconds=None,
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
+
+
+def test_classify_worker_health_terminal_marker_still_dead_with_fresh_probe(
+    tmp_path: Path,
+) -> None:
+    """Issue #307: a terminal marker still wins even when the real probe is fresh."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nError: A tool was rejected", encoding="utf-8")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    now = datetime.now(UTC)
+    fresh_timestamp = now - timedelta(seconds=8)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=fresh_timestamp,
+                staleness_seconds=(now - fresh_timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.DEAD
+
+
+def test_classify_worker_health_incident_285_routine_exit_not_stalled(
+    tmp_path: Path,
+) -> None:
+    """Issue #307: reproduce the incident — dead PID, PR log line, fresh per-PID log."""
+    log_file = tmp_path / "issue-285.log"
+    log_file.write_text(
+        "PR: https://github.com/Senkichi/charlie-work/pull/306\n", encoding="utf-8"
+    )
+
+    now = datetime.now(UTC)
+    eight_sec_ago = now - timedelta(seconds=8)
+    os.utime(log_file, (time.time(), eight_sec_ago.timestamp()))
+
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=285,
+        repo_key="",
+        pid=28028,
+        started_at=(now - timedelta(minutes=10)).isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=None,
+                staleness_seconds=None,
+                error="message_nodes query failed (schema drift?): no such column: id",
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=eight_sec_ago,
+                staleness_seconds=8.0,
+                error=None,
+            ),
+        )
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=False):
+        config = OrchestratorConfig()
+        health = classify_worker_health(view, config, now, probe)
+        assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
