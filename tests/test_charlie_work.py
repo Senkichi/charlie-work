@@ -49,7 +49,7 @@ from charlie_work.cross_family import (
     report_body_is_valid,
     run_cross_family_review,
 )
-from charlie_work.github import label_names, linked_issue_number
+from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
@@ -467,6 +467,37 @@ def test_linked_issue_number_ignores_unqualified_body_references() -> None:
         )
         is None
     )
+
+
+def test_issue_numbers_mentioned_by_pr_matches_issue_reference() -> None:
+    pr = {
+        "title": "fix(scope): reap sidecar files on session exit (issue #113)",
+        "body": "This PR addresses issue #113. PR #181 is an unrelated refactor.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {113}
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_fenced_code_blocks() -> None:
+    # A code sample that happens to contain the literal text must not count
+    # as a real reference — advisory-only matching per the function's
+    # contract, but obviously-wrong matches are worth stripping.
+    pr = {
+        "title": "docs: add example",
+        "body": "Example:\n```\n# see issue #113 for context\n```\nNo real reference here.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_blockquoted_lines() -> None:
+    # Quoted reply text (e.g. an email-style blockquote) must not count.
+    pr = {
+        "title": "chore: reply to review",
+        "body": "> unlike issue #113, this one is fine\n\nAddressed the other comments.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
 
 
 def test_summarize_checks_requires_all_configured_checks() -> None:
@@ -2619,6 +2650,9 @@ class FakeGitHub:
     def pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
+    def merged_pr_list(self):
+        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
+
     def pr_view(self, number: int):
         # Return the PR matching the requested number
         for pr in self.prs:
@@ -3034,6 +3068,135 @@ def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     assert not prompt_path.exists()
     assert (123, "agent:queued") not in fake_gh.labels_added
     assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def test_dispatch_skips_ready_issue_with_merged_pr_reference(tmp_path: Path) -> None:
+    """Issue #203: a ready issue whose merged PR is hijack-safely *bound* to it
+    (here: the default fixture's ``agent/issue-123-...`` head branch matches the
+    configured branch prefix) must not be dispatched, and — because binding is
+    the same trust level issue #220 uses at merge time — the issue should be
+    closed and labeled done as a belt-and-suspenders retry.
+
+    Note: this fixture's PR title/body also happens to contain an "issue #123"
+    text mention, but that is incidental to this test — the branch binding
+    alone is sufficient to authorize the close. The mention-only path (no
+    branch/closing-keyword binding) is isolated separately in
+    test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention,
+    which is the actual regression coverage for a bare-mention reference.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR #456 is merged; its headRefName ("agent/issue-123-fix-search", from
+    # the default fixture) safely binds it to issue #123 via branch prefix.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["title"] = "fix(scope): reap sidecar files on session exit (issue #123)"
+    fake_gh.prs[0]["body"] = "This PR addresses issue #123."
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == [123]
+    assert result.data["merged_pr_closed_issue_numbers"] == [123]
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    assert 123 in fake_gh.closed_issues
+    assert (123, "agent:done") in fake_gh.labels_added
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert not prompt_path.exists()
+
+
+def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
+    tmp_path: Path,
+) -> None:
+    """Issue #203 (review redesign): a merged PR that only *mentions* the issue
+    in free text — no branch-prefix binding, no closing keyword — must never
+    authorize an autonomous close. It must be excluded from dispatch and
+    flagged with the human-needed label, and the issue must stay open, for
+    the operator to decide.
+
+    Isolates the mention-only path from the hijack-safe binding path: unlike
+    test_dispatch_skips_ready_issue_with_merged_pr_reference (which reuses the
+    default fixture's agent/issue-123-... head branch), this PR's head branch
+    does not match the configured branch prefix and its body contains no
+    closing keyword, so linked_issue_number() cannot bind it — only the loose
+    "issue #N" text scan can find it.
+
+    Mutation-verify: gutting issue_numbers_mentioned_by_pr() to return an
+    empty set makes this test fail (selected_count would become 1 and no
+    human-needed label would be added).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR #456 is merged, same-repo, but its head branch does not match the
+    # "agent/issue" prefix and neither title nor body has a closing keyword —
+    # only a bare "issue #123" mention.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    assert fake_gh.prs[0]["isCrossRepository"] is False
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == [123]
+    assert result.data["merged_pr_closed_issue_numbers"] == []
+    assert result.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert 123 not in fake_gh.closed_issues
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+    assert (123, "agent:done") not in fake_gh.labels_added
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    # The issue itself is left open — only the label lifecycle is touched.
+    assert fake_gh.issue_view(123)["state"] == "OPEN"
+
+
+def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
+    """Regression for the isCrossRepository guard (workflow.py,
+    _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
+    cross-repo (isCrossRepository=True) must never have its free-text "issue
+    #N" mention counted, even though the text itself is indistinguishable
+    from a same-repo mention. isCrossRepository describes head-branch
+    provenance, not which repo the text refers to, but it is the only
+    provenance signal available and must still gate the mention scan.
+
+    Before this test, mutating the guard to unconditionally count mentions
+    (e.g. `if True:` regardless of isCrossRepository) passed every existing
+    test — this pins the behavior so that mutation is caught: issue #123
+    must remain a normal, undisturbed dispatch candidate.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Merged PR #456 is cross-repo (e.g. a fork), has no branch/closing-keyword
+    # binding, but its body text mentions "issue #123".
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "some-fork-branch"
+    fake_gh.prs[0]["title"] = "unrelated fork PR"
+    fake_gh.prs[0]["body"] = "Unrelated change; see issue #123 in a different project."
+    fake_gh.prs[0]["isCrossRepository"] = True
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    # Issue #123 is dispatched normally — the cross-repo mention must not
+    # exclude or flag it.
+    assert result.data["selected_count"] == 1
+    assert result.data["merged_pr_referenced_issue_numbers"] == []
+    assert result.data["merged_pr_closed_issue_numbers"] == []
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    assert 123 not in fake_gh.closed_issues
+    assert (123, "agent:human-needed") not in fake_gh.labels_added
 
 
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
@@ -14150,6 +14313,84 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
     assert worker["tool_calls"] is None  # Devin has no structured stream
     assert worker["tokens"] is None
     assert worker["cost_usd"] is None
+
+
+def test_status_workers_section_claude_code_rework_layout(tmp_path: Path) -> None:
+    """Issue #329 (F1): status()'s _summarize_worker must use the canonical
+    events.jsonl derivation for rework-layout claude-code sessions too.
+
+    A rework claude-code session logs to ``issue-<n>-rework.claude.log``, with
+    its structured events at ``issue-<n>-rework.events.jsonl`` -- not
+    ``issue-<n>.events.jsonl``, which the old rework=False-only
+    ``_events_path(sessions_dir, issue_number)`` derivation would read instead
+    (a stale prior attempt's tool_calls/tokens/cost_usd, or nothing). This
+    test plants both a stale non-rework events.jsonl and the real rework
+    sibling, and asserts the workers section reports the rework sibling's
+    usage, not the stale one's.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithWorkers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubWithWorkers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    issue_number = 329
+    log_file = sessions_dir / f"issue-{issue_number}-rework.claude.log"
+    log_file.write_text("reworking issue\n", encoding="utf-8")
+
+    # Stale events.jsonl from a prior (non-rework) attempt: different usage.
+    stale_events_file = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    stale_events_file.write_text(
+        '{"type": "tool_call", "tokens": 111, "cost_usd": 0.11}\n',
+        encoding="utf-8",
+    )
+
+    # The real rework events.jsonl sibling: the usage that must be reported.
+    events_file = sessions_dir / f"issue-{issue_number}-rework.events.jsonl"
+    events_file.write_text(
+        '{"type": "tool_call", "tokens": 987654, "cost_usd": 12.34}\n{"type": "tool_call"}\n',
+        encoding="utf-8",
+    )
+
+    record = ClaudeWorkerRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}",
+        worktree_path="/fake/path",
+        prompt_path="/fake/prompt",
+        command=("claude", "-p"),
+        pid=54321,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+    )
+    sidecar = sessions_dir / f"issue-{issue_number}-rework.claude.json"
+    sidecar.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    assert len(result.data["workers"]) == 1
+    worker = result.data["workers"][0]
+    assert worker["issue"] == issue_number
+    assert worker["adapter"] == "claude-code"
+    assert worker["tool_calls"] == 2
+    assert worker["tokens"] == 987654
+    assert worker["cost_usd"] == 12.34
 
 
 @pytest.mark.real_activity_probe_live

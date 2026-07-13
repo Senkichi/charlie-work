@@ -64,6 +64,14 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         "merged": ((labels.done,), _compute_remove((labels.done,))),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
+        # Issue #203: a merged PR only *mentions* the issue in free text, with
+        # no hijack-safe branch/closing-keyword binding. That never authorizes
+        # a close — flag it for a human decision instead, same label as any
+        # other human-needed escalation.
+        "merged_pr_mention_flagged": (
+            (labels.human_needed,),
+            _compute_remove((labels.human_needed,)),
+        ),
     }
 
 
