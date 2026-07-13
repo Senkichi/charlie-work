@@ -4840,7 +4840,8 @@ class OrchestratorApp:
         Returns:
             Dict with worker summary fields for status() JSON output
         """
-        from .claude_code import _events_path, parse_claude_events
+        from .claude_code import parse_claude_events
+        from .post_mortem import _events_path_from_log
 
         # Resolve repo_key: use view.repo_key if present, otherwise fall back to gh.name_with_owner()
         # This handles both fleet mode (repo_key populated by iter_workers) and single-repo mode
@@ -4858,9 +4859,10 @@ class OrchestratorApp:
         cost_usd = None
 
         if view.adapter_kind == "claude-code":
-            # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
-            sessions_dir = Path(view.log_path).parent
-            events_path = _events_path(sessions_dir, view.issue_number)
+            # Canonical derivation (issue #329): supports both plain
+            # issue-<n>.claude.log and rework-layout issue-<n>-rework.claude.log,
+            # matching the events.jsonl sibling that claude_code actually writes.
+            events_path = _events_path_from_log(Path(view.log_path))
             progress = parse_claude_events(events_path)
             if progress is not None:
                 tool_calls = progress.tool_call_count
