@@ -13530,6 +13530,76 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
     assert worker["cost_usd"] is None
 
 
+def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path) -> None:
+    """Issue #301 status()-path wiring: a claude-code worker whose sidecar log is
+    frozen but whose events.jsonl sibling carries fresh activity must be
+    reported healthy (not stalled) in the status() workers section (~1616).
+
+    A future edit that drops the ``probe`` argument from the
+    classify_worker_health call inside status(), or that neuters the
+    claude_events_jsonl Source-3 construction in
+    post_mortem.real_activity_for_worker, must make this test fail (the
+    worker reports health="stalled") rather than silently reverting to
+    mtime-only classification.
+    """
+    from datetime import timedelta
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    issue_number = 303
+
+    log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+    log_path.write_text("Working on task...\nLast line", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_path, (time.time(), old_time.timestamp()))
+
+    events_path = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    fresh_time = datetime.now(UTC) - timedelta(minutes=1)
+    events_path.write_text(
+        f'{{"type": "tool_call", "timestamp": "{fresh_time.isoformat()}"}}\n',
+        encoding="utf-8",
+    )
+    os.utime(events_path, (time.time(), fresh_time.timestamp()))
+
+    sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "branch": f"agent/issue-{issue_number}",
+                "worktree_path": str(tmp_path / "worktree"),
+                "prompt_path": str(tmp_path / "prompt.md"),
+                "command": ["claude", "prompt.md"],
+                "pid": 77777,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+                "log_path": str(log_path),
+                "error": None,
+                "failure_kind": None,
+                "process_start_time": 1710000000.0,
+                "reclaimed": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    workers = [w for w in result.data["workers"] if w["issue"] == issue_number]
+    assert len(workers) == 1
+    assert workers[0]["health"] == "healthy"
+
+
 def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
     """Issue #167: workers section should be empty list when no live sessions exist."""
     config = OrchestratorConfig(

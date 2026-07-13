@@ -233,7 +233,7 @@ def _detect_stalled_sessions(
         if w.pid is None or w.error is not None:
             continue
 
-        # Issue #280: corroborate against real-session activity for read-only
+        # Issues #280/#301: corroborate against real-session activity for read-only
         # detection too (status/dry-run/digest).
         probe = real_activity_probe_for(w, config, now)
         health = classify_worker_health(w, config, now, probe)
@@ -347,9 +347,9 @@ def _detect_and_handle_stalled_sessions(
         # stale rate-limit defer deadline when the log has resumed growing.
         update_worker_log_stat(sessions_dir, w)
 
-        # Issue #280: corroborate sidecar mtime against real-session activity
-        # (sessions.db message_nodes and per-PID Devin log mtime) before
-        # deciding whether to kill the worker.
+        # Issues #280/#301: corroborate sidecar mtime against real-session activity
+        # (sessions.db message_nodes, per-PID Devin log mtime, and Claude Code
+        # events.jsonl) before deciding whether to kill the worker.
         probe = real_activity_probe_for(w, config, now)
         health = classify_worker_health(w, config, now, probe)
 
