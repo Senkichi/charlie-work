@@ -750,18 +750,35 @@ def linked_issue_number(
 # mistaken for an issue reference.  Closing-keyword binding is handled by
 # ``linked_issue_number``.
 _ISSUE_MENTION_RE = re.compile(r"\b(?:issue|issues)\s*#(\d+)\b", flags=re.IGNORECASE)
+# Stripped before matching to cut two concrete false-positive classes: a
+# fenced code sample that happens to contain the literal text, and quoted
+# reply text (e.g. an email-style ``> see issue #123`` blockquote).
+_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
+_BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]*>.*$", flags=re.MULTILINE)
 
 
 def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
-    """Return the set of issue numbers explicitly referenced by a PR title/body.
+    """Return issue numbers loosely referenced by a PR's title/body — advisory only.
 
     Matches the literal phrase ``issue #N`` / ``issues #N`` (case-insensitive,
-    with or without a space between the word and the hash).  This is a strict
-    subset of GitHub's issue-reference syntax: it does not treat a bare
-    ``#N`` (which could be a PR number) as an issue reference, and it does not
-    treat closing keywords like ``Fixes #N`` as any more than a reference.
+    with or without a space between the word and the hash), after stripping
+    fenced code blocks and blockquoted lines. This is a strict subset of
+    GitHub's issue-reference syntax: it does not treat a bare ``#N`` (which
+    could be a PR number) as an issue reference, and it does not treat
+    closing keywords like ``Fixes #N`` as any more than a reference.
+
+    This is looser than ``linked_issue_number``'s hijack-safety guarantee —
+    phrases like "unlike issue #N", "follow-up to issue #N", or a collision
+    with another repo's issue #N in the same text all still match, and there
+    is no reliable lexical way to rule those out. Callers MUST treat a match
+    as advisory only: it may be used to flag an issue for human review or
+    exclude it from automation, but it must NEVER by itself authorize closing
+    an issue or any other lifecycle-mutating action. Only ``linked_issue_number``
+    (same-repo branch-prefix or closing-action verb) may authorize that.
     """
     text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
+    text = _FENCED_CODE_BLOCK_RE.sub("", text)
+    text = _BLOCKQUOTE_LINE_RE.sub("", text)
     return {int(m.group(1)) for m in _ISSUE_MENTION_RE.finditer(text)}
 
 
