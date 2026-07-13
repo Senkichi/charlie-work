@@ -8,6 +8,7 @@ scattered drift incident across the test suite.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -77,3 +78,38 @@ def test_make_sessions_db_schema_satisfies_post_mortem_queries(tmp_path: Path) -
     )
     assert probe.latest_source == "sessions.db"
     assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 56, 0, tzinfo=UTC)
+
+
+def test_no_hand_rolled_message_nodes_ddl_in_tests() -> None:
+    """Every DDL that creates the ``message_nodes`` table in tests must live
+    in ``_sessions_db_fixtures.py``.
+
+    Hand-rolled SQL that creates a ``message_nodes`` table in test fixtures is
+    the drift class that broke main in incident #316. Use the shared
+    ``make_sessions_db`` helper (or add behavior there) instead of reintroducing
+    a one-off table definition.
+    """
+    tests_dir = Path(__file__).resolve().parent
+    # Match the SQL used to create a message_nodes table, including the
+    # IF NOT EXISTS variant.
+    ddl_pattern = re.compile(
+        r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+message_nodes",
+        re.IGNORECASE,
+    )
+
+    offenders: list[str] = []
+    for source_file in tests_dir.rglob("*.py"):
+        if source_file.name == "_sessions_db_fixtures.py":
+            continue
+        for lineno, line in enumerate(
+            source_file.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if ddl_pattern.search(line):
+                offenders.append(
+                    f"{source_file.relative_to(tests_dir.parent)}:{lineno}: {line.strip()}"
+                )
+
+    assert not offenders, (
+        "Hand-rolled message_nodes DDL found in tests. "
+        "Use _sessions_db_fixtures.make_sessions_db instead:\n" + "\n".join(offenders)
+    )
