@@ -104,6 +104,7 @@ class SessionRecord:
     rate_limit_defer_until: str | None = (
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
+    inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -131,6 +132,9 @@ class SessionRecord:
             attempt_ref=payload.get("attempt_ref"),
             attempt_ahead_of_main=payload.get("attempt_ahead_of_main"),
             rate_limit_defer_until=payload.get("rate_limit_defer_until"),
+            inconclusive_probe_deferred_count=int(
+                payload.get("inconclusive_probe_deferred_count") or 0
+            ),
         )
 
 
