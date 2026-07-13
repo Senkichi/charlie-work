@@ -238,6 +238,11 @@ def load_state(path: Path) -> dict[str, Any]:
             # Genuine JSON corruption (truncated files, etc.) — quarantine.
             _quarantine_state(path, exc)
             return empty_state()
+        except (LookupError, ValueError) as exc:
+            # Decoding-level corruption (e.g. UTF-16LE+BOM, unknown encoding).
+            # A wrong-encoding state file is not a transient read error.
+            _quarantine_state(path, exc)
+            return empty_state()
         except OSError as exc:
             # Sharing/permission violations on Windows are often transient.
             # Retry before falling back to quarantine.
