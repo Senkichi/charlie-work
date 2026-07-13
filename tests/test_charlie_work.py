@@ -2570,6 +2570,7 @@ class FakeGitHub:
         # the merge-base freshness gate.
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._record_pr_heads(self.prs)
 
     def __setattr__(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
@@ -2824,15 +2825,22 @@ class FakeGitHub:
             queue: list[tuple[str, int]] = [(source, 0)]
             while queue:
                 current, dist = queue.pop(0)
-                for parent in self._ancestors(current):
-                    if parent == target:
+                commit = self.commits.get(current)
+                if not isinstance(commit, dict):
+                    continue
+                for parent in commit.get("parents", []):
+                    if isinstance(parent, dict):
+                        parent_sha = parent.get("sha")
+                    else:
+                        parent_sha = parent
+                    if parent_sha == target:
                         return dist + 1
-                    if parent not in visited:
-                        visited.add(parent)
-                        queue.append((parent, dist + 1))
-            return len(common)
+                    if parent_sha and parent_sha not in visited:
+                        visited.add(parent_sha)
+                        queue.append((parent_sha, dist + 1))
+            return len(self.commits)
 
-        best.sort(key=lambda sha: (_distance(base_sha, sha), _distance(head_sha, sha)))
+        best.sort(key=lambda sha: (_distance(base_sha, sha), _distance(head_sha, sha), sha))
         return best[0]
 
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
@@ -2920,6 +2928,65 @@ class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
 
     def __init__(self) -> None:
         super().__init__(checks=[])
+
+
+def test_fake_github_default_pr_head_is_indexed() -> None:
+    """Issue #347: the default FakeGitHub fixture must index the PR head in commits.
+
+    The default fixture assigns ``self.prs`` before ``self.commits`` exists, so
+    the ``__setattr__`` hook's call to ``_record_pr_heads`` silently no-ops.
+    This test ensures the PR head is indexed and that ``compare()`` can derive
+    the merge-base from the commit graph.
+    """
+    gh = FakeGitHub()
+    assert "sha-abc123" in gh.commits
+    assert gh.commits["sha-abc123"]["parents"] == [{"sha": "base-sha"}]
+    assert gh.base_head_sha in gh.commits
+    result = gh.compare("main", "sha-abc123")
+    assert result is not None
+    assert result["merge_base_commit"]["sha"] == gh.base_head_sha
+
+
+def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
+    """Issue #347: _merge_base must be deterministic across PYTHONHASHSEED.
+
+    In a criss-cross graph, the two best common ancestors are both minimal.
+    A correct BFS distance and a deterministic tie-break must produce the same
+    merge base regardless of hash randomization.
+    """
+    tests_dir = Path(__file__).parent
+    repo_root = tests_dir.parent
+    code = "\n".join(
+        [
+            "import os, sys",
+            "sys.path.insert(0, sys.argv[1])",
+            "from test_charlie_work import FakeGitHub",
+            "gh = FakeGitHub()",
+            "gh.commits = {",
+            '    "R": {"parents": []},',
+            '    "A1": {"parents": [{"sha": "R"}]},',
+            '    "B1": {"parents": [{"sha": "R"}]},',
+            '    "A2": {"parents": [{"sha": "A1"}, {"sha": "B1"}]},',
+            '    "B2": {"parents": [{"sha": "B1"}, {"sha": "A1"}]},',
+            "}",
+            'gh.base_head_sha = "A2"',
+            'print(gh._merge_base("A2", "B2"))',
+        ]
+    )
+    results: set[str] = set()
+    for seed in range(5):
+        env = os.environ.copy()
+        env["PYTHONHASHSEED"] = str(seed)
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(tests_dir)],
+            env=env,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        results.add(proc.stdout.strip())
+    assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
 
 
 def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> None:
