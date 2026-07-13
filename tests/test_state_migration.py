@@ -11,10 +11,12 @@ OLD in-repo orchestrators without dropping fields it doesn't know about.
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import shutil
 from pathlib import Path
 
+import charlie_work.state as state_module
 from charlie_work.state import append_event, empty_state, load_state, save_state
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "state_production_redacted.json"
@@ -258,18 +260,23 @@ def test_load_state_tolerates_bom_prefixed_json(tmp_path: Path) -> None:
     assert list(tmp_path.glob("state.json.corrupt-*")) == []
 
 
-def test_load_state_quarantines_genuine_corruption(tmp_path: Path) -> None:
+def test_load_state_quarantines_genuine_corruption(tmp_path: Path, caplog) -> None:
     """Truncated/corrupt JSON must still be quarantined and return empty_state."""
     state_path = tmp_path / "state.json"
     state_path.write_text("{truncated garbage", encoding="utf-8")
 
-    loaded = load_state(state_path)
+    with caplog.at_level(logging.ERROR, logger=state_module.__name__):
+        loaded = load_state(state_path)
 
     assert loaded["issues"] == {}
     assert not state_path.exists()
     quarantined = list(tmp_path.glob("state.json.corrupt-*"))
     assert len(quarantined) == 1
     assert "truncated garbage" in quarantined[0].read_text(encoding="utf-8")
+    assert any(
+        record.levelname == "ERROR" and "unrecoverable" in record.message
+        for record in caplog.records
+    )
 
 
 def test_load_state_retries_transient_oserror(tmp_path: Path, monkeypatch) -> None:
@@ -296,3 +303,65 @@ def test_load_state_retries_transient_oserror(tmp_path: Path, monkeypatch) -> No
     assert len(calls) == 2
     assert loaded["issues"]["1"]["status"] == "ok"
     assert list(tmp_path.glob("state.json.corrupt-*")) == []
+
+
+def test_load_state_quarantines_utf16le_bom(tmp_path: Path, caplog) -> None:
+    """A UTF-16LE+BOM state.json must not crash; it must quarantine and continue."""
+    state_path = tmp_path / "state.json"
+    payload = {
+        "version": 1,
+        "issues": {"1100": {"status": "rework_requested"}},
+    }
+    state_path.write_bytes(b"\xff\xfe" + json.dumps(payload).encode("utf-16-le"))
+
+    with caplog.at_level(logging.ERROR, logger=state_module.__name__):
+        loaded = load_state(state_path)
+
+    assert loaded["issues"] == {}
+    assert loaded["prs"] == {}
+    assert loaded["events"] == []
+    assert not state_path.exists()
+    quarantined = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert "version" in quarantined[0].read_text(encoding="utf-16")
+    assert any(
+        record.levelname == "ERROR" and "unrecoverable" in record.message
+        for record in caplog.records
+    )
+
+
+def test_load_state_quarantines_on_retry_exhausted_oserror(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """OSError on every retry attempt must quarantine, log ERROR, and continue."""
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "issues": {"1": {"status": "ok"}}}),
+        encoding="utf-8",
+    )
+
+    calls: list[pathlib.Path] = []
+    real_open = pathlib.Path.open
+
+    def failing_open(self: pathlib.Path, *args, **kwargs):
+        if self == state_path:
+            calls.append(self)
+            raise OSError("simulated sharing violation")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", failing_open)
+
+    with caplog.at_level(logging.ERROR, logger=state_module.__name__):
+        loaded = load_state(state_path)
+
+    assert len(calls) == state_module._LOAD_RETRY_ATTEMPTS
+    assert loaded["issues"] == {}
+    assert loaded["prs"] == {}
+    assert loaded["events"] == []
+    assert not state_path.exists()
+    quarantined = list(tmp_path.glob("state.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert any(
+        record.levelname == "ERROR" and "unrecoverable" in record.message
+        for record in caplog.records
+    )
