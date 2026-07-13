@@ -95,6 +95,12 @@ def test_default_config_update_open_prs_is_next() -> None:
     assert config.auto_merge.update_open_prs == "next"
 
 
+def test_default_config_require_current_base() -> None:
+    """Default require_current_base is True."""
+    config = load_config()
+    assert config.auto_merge.require_current_base is True
+
+
 def test_default_config_tee_stream_json_disabled() -> None:
     """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
     config = load_config()
@@ -2500,6 +2506,7 @@ class FakeGitHub:
                 "title": "Fix #123: search",
                 "url": "https://example.test/pull/456",
                 "headRefName": "agent/issue-123-fix-search",
+                "baseRefName": "main",
                 "headRefOid": "sha-abc123",
                 "mergeStateStatus": "CLEAN",
                 "body": "Closes #123\n\nTests: regression coverage added.",
@@ -2523,6 +2530,10 @@ class FakeGitHub:
         self.diffs: dict[int, str] = {}
         self.closed_issues: list[int] = []
         self.commits: dict[str, dict[str, Any]] = {}
+        # Default base head and per-(base,head) compare overrides for testing
+        # the merge-base freshness gate.
+        self.base_head_sha = "base-sha"
+        self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -2680,6 +2691,17 @@ class FakeGitHub:
 
     def commit(self, sha: str) -> dict[str, Any] | None:
         return self.commits.get(sha)
+
+    def compare(self, base: str, head: str) -> dict[str, Any] | None:
+        override = self.compare_overrides.get((base, head))
+        if override is not None:
+            return override
+        # Default: assume the PR's merge-base is the current base tip.
+        base_head = self.base_head_sha
+        return {
+            "base_commit": {"sha": base_head},
+            "merge_base_commit": {"sha": base_head},
+        }
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -10261,6 +10283,156 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert result_789.data["can_merge"] is True
     assert result_789.data.get("head_moved") is not True  # Should not trigger head-moved gate
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+
+def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
+    """Issue #316: a PR whose merge-base is not the current base tip is deferred."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",  # disable base-sync so the gate is exercised
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    # Create review decision files for both PRs (approved state)
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps(
+                {"decision": "approved", "reviewed_head_sha": head_sha},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    # Simulate base moving after PR 456 was merged. PR 456 is up-to-date with
+    # the new base tip, but PR 789's merge-base is the old base tip.
+    fake_gh.base_head_sha = "main-after-456-merged"
+    fake_gh.compare_overrides[("main", "sha-def456")] = {
+        "base_commit": {"sha": "main-after-456-merged"},
+        "merge_base_commit": {"sha": "base-sha"},  # stale base
+    }
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.ok is True
+    assert result_456.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.ok is True
+    assert result_789.data["can_merge"] is False
+    assert result_789.data["merged"] is False
+    assert result_789.data.get("stale_base") is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    state = json.loads(paths.state_file.read_text())
+    stale_events = [
+        event for event in state["events"] if event["kind"] == "merge_deferred_stale_base"
+    ]
+    assert len(stale_events) == 1
+    assert stale_events[0]["payload"]["pr_number"] == 789
+    assert stale_events[0]["payload"]["reason"] == "base_stale"
+
+
+def test_merge_ready_require_current_base_false_allows_stale_base(tmp_path: Path) -> None:
+    """Operators may opt out of the merge-base freshness gate."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",
+            require_current_base=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps(
+                {"decision": "approved", "reviewed_head_sha": head_sha},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    fake_gh.base_head_sha = "main-after-456-merged"
+    fake_gh.compare_overrides[("main", "sha-def456")] = {
+        "base_commit": {"sha": "main-after-456-merged"},
+        "merge_base_commit": {"sha": "base-sha"},
+    }
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["can_merge"] is True
+    assert result_789.data["merged"] is True
+    assert result_789.data.get("stale_base") is not True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+    state = json.loads(paths.state_file.read_text())
+    assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
 
 
 def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:

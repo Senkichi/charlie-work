@@ -190,6 +190,12 @@ class AutoMergeConfig:
     # Default "next" preserves the pre-merge combination-testing guarantee
     # while eliminating N-1 wasted CI resets per merge.
     update_open_prs: str | bool = "next"
+    # When True, merge_ready verifies that a PR's merge-base is the current
+    # tip of its base branch before merging. If the base has moved ahead of the
+    # PR (e.g. a prior merge in the same train), the merge is deferred and a
+    # merge_deferred_stale_base event is recorded. Operators may set False to
+    # restore the legacy behavior that trusts mergeStateStatus only.
+    require_current_base: bool = True
 
     def __post_init__(self) -> None:
         value = self.update_open_prs

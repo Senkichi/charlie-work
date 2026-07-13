@@ -2943,6 +2943,23 @@ class OrchestratorApp:
                             sync_failed = True
                     else:
                         sync_failed = True
+            # merge-base freshness gate: mergeStateStatus can lag, so verify
+            # ancestry with the GitHub compare API before merging.
+            if not sync_failed and self.config.auto_merge.require_current_base:
+                base_current = self._is_base_current(pr)
+                if base_current is not True:
+                    base_ref = pr.get("baseRefName")
+                    head_sha = pr.get("headRefOid")
+                    reason = "compare_unavailable" if base_current is None else "base_stale"
+                    return self._merge_deferred_stale_base_result(
+                        pr_number,
+                        issue_number,
+                        decision,
+                        existing_pr_state,
+                        base_ref,
+                        head_sha,
+                        reason,
+                    )
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -3512,6 +3529,63 @@ class OrchestratorApp:
             },
         )
 
+    def _merge_deferred_stale_base_result(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        decision: dict[str, Any],
+        existing_pr_state: dict[str, Any],
+        base_ref: str | None,
+        head_sha: str | None,
+        reason: str = "base_stale",
+    ) -> CommandResult:
+        """Return a non-mergeable result for an approved PR whose base is stale.
+
+        Records a ``merge_deferred_stale_base`` event so operators can see that
+        the merge was deferred because the PR's merge-base is not the current
+        base branch tip.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state = append_event(
+                state,
+                "merge_deferred_stale_base",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "base_ref": base_ref,
+                    "head_sha": head_sha,
+                    "reason": reason,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        return CommandResult(
+            True,
+            f"PR #{pr_number} base is stale; merge deferred until base is current",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "can_merge": False,
+                "auto_merge_enabled": self.config.auto_merge.enabled,
+                "merged": False,
+                "merge_output": None,
+                "branch_deleted": None,
+                "review_decision": decision,
+                "checks": asdict(summarize_checks([], self.config.auto_merge.required_checks)),
+                "checks_unavailable": False,
+                "label_error": None,
+                "update_open_prs_results": None,
+                "cancel_superseded_runs_results": None,
+                "containment_warnings": [],
+                "stale_base": True,
+                "consecutive_failed_merge_attempts": existing_pr_state.get(
+                    "consecutive_failed_merge_attempts", 0
+                ),
+                "merge_attempt_alarm": False,
+                "merge_attempt_warning": None,
+            },
+        )
+
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
         """Return the PR number of the head of the merge-train queue, or None.
 
@@ -3645,6 +3719,30 @@ class OrchestratorApp:
         """
         status = str(pr.get("mergeStateStatus") or "").upper()
         return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+
+    def _is_base_current(self, pr: dict[str, Any]) -> bool | None:
+        """Return True if the PR's merge-base is the current tip of its base.
+
+        Uses the GitHub compare API to derive ancestry rather than timestamps
+        or mergeStateStatus, which can lag. Returns ``None`` when the comparison
+        cannot be completed so callers can decide how to fail-safe.
+        """
+        base_ref = pr.get("baseRefName") or self.config.runners.default_branch
+        head_sha = pr.get("headRefOid")
+        if not base_ref or not head_sha:
+            return None
+        comparison = self.gh.compare(base_ref, head_sha)
+        if not comparison:
+            return None
+        base_commit = comparison.get("base_commit")
+        merge_base_commit = comparison.get("merge_base_commit")
+        if not isinstance(base_commit, dict) or not isinstance(merge_base_commit, dict):
+            return None
+        base_sha = base_commit.get("sha")
+        merge_base_sha = merge_base_commit.get("sha")
+        if not base_sha or not merge_base_sha:
+            return None
+        return bool(base_sha == merge_base_sha)
 
     def _record_review_or_error(
         self,
