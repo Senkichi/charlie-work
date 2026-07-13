@@ -523,7 +523,12 @@ def test_worker_view_reap_sidecar_unknown_adapter(tmp_path: Path) -> None:
 
 def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     """Integration test: _classify_dead_sessions_and_update_throttle_state reaps sidecars for dead sessions (issue #113)."""
-    from charlie_work.config import AutoMergeConfig, DevinConfig, OrchestratorConfig
+    from charlie_work.config import (
+        AutoMergeConfig,
+        DevinConfig,
+        OrchestratorConfig,
+        WatchdogConfig,
+    )
     from charlie_work.devin_shell import SessionRecord
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
     from datetime import UTC, datetime
@@ -538,6 +543,15 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
         ),
+        # Issue #343: the dead-session lane now corroborates a not-alive pid
+        # against real-session activity before reaping (never fail-open on a
+        # merely-inconclusive probe). This test's concern is the reap-on-dead
+        # mechanics (issue #113), not corroboration timing, so pin the
+        # deferral cap to 0 to keep its original immediate-reap assertion --
+        # a bare test environment with no real sessions.db always produces an
+        # inconclusive probe, which would otherwise defer for
+        # max_inconclusive_probe_deferrals passes before reaping.
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0),
     )
 
     # Create a sessions directory with a dead session

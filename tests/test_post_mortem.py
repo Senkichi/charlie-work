@@ -1298,3 +1298,97 @@ def test_real_activity_for_worker_matches_normalized_worktree_path(
 
     assert probe.latest_source == "sessions.db"
     assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 57, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Issue #343: working_directory suffix-match fallback for real fleet shapes
+# ---------------------------------------------------------------------------
+
+
+def test_real_activity_for_worker_matches_real_fleet_working_directory_shape(
+    tmp_path: Path,
+) -> None:
+    """sessions.db corroboration must match a fleet worker session even when
+    the Devin CLI recorded a ``working_directory`` sharing no absolute-prefix
+    relationship at all with the worktree path this process computed.
+
+    Fixture shapes are taken verbatim from a live production post-mortem
+    (issue #343, 2026-07-13, ``issue-203.post-mortem.json``): every sampled
+    distinct ``working_directory`` in the real sessions.db was rooted under
+    an unrelated ``AppData\\Local\\Temp\\...`` tree, never under the fleet
+    worktree's own ``repos\\charlie-work\\.var\\charlie-work\\worktrees\\...``
+    root -- even though the trailing worktrees-dir/issue-slug segments that
+    identify the dispatch are identical. Before the suffix-match fallback,
+    neither the exact nor the normalized full-path comparison in
+    ``_find_matching_session`` could ever match this shape, so sessions.db
+    corroboration was permanently inconclusive for real fleet dispatches.
+
+    MUTATION GATE: reverting ``_find_matching_session``'s suffix-match tier
+    (or ``_working_directory_suffix``) to fall straight from the normalized
+    comparison to "no session found" makes this test fail -- the fixture row's
+    working_directory has a different drive letter AND a completely different
+    directory tree above the shared ``worktrees/<issue-slug>`` tail, so
+    neither the exact-match nor the ``_normalize_working_directory`` tier can
+    find it.
+    """
+    db_path = tmp_path / "sessions.db"
+    real_fleet_worktree_path = (
+        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees"
+        r"\agent-issue-203-redundant-re-dispatch"
+    )
+    # Recorded working_directory shares zero prefix with the worktree path
+    # above -- only the trailing (worktrees-dir, issue-slug) segment pair
+    # matches, exactly like the production sample values.
+    recorded_working_directory = (
+        r"C:\Users\senki\AppData\Local\Temp\claude\some-other-session-root"
+        r"\worktrees\agent-issue-203-redundant-re-dispatch"
+    )
+    _build_sessions_db(
+        db_path,
+        working_directory=recorded_working_directory,
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        real_fleet_worktree_path,
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+    )
+
+    assert probe.latest_source == "sessions.db"
+    assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 57, 0, tzinfo=UTC)
+
+
+def test_find_matching_session_suffix_fallback_rejects_different_issue_slug(
+    tmp_path: Path,
+) -> None:
+    """The suffix-match fallback must not collapse two different issues'
+    worktrees just because they share the same worktrees-dir parent segment.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory=(
+            r"C:\Users\senki\AppData\Local\Temp\other-root"
+            r"\worktrees\agent-issue-999-unrelated"
+        ),
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+    )
+
+    assert probe.latest_timestamp is None
+    db_source = next(s for s in probe.sources if s.name == "sessions.db")
+    assert db_source.error is not None

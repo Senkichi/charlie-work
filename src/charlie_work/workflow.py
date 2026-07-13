@@ -192,16 +192,60 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
     return [int(part) for part in only_issues.replace(" ", "").split(",") if part]
 
 
-def _count_live_sessions(sessions_dir: Path) -> int:
+def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
     """Count the number of currently alive worker sessions across both adapters.
 
     Reads session sidecar files from both devin-shell and claude-code adapters,
     then checks each record's PID liveness using the adapter-specific liveness
     probe. Returns the total count of sessions with alive PIDs.
+
+    When ``state_file`` is given, this also corroborates the sidecar-based
+    count against state.json's own dispatched-issue ``worker_pid``/
+    ``worker_process_start_time`` records (issue #343). A sidecar can go
+    missing for a still-live process -- a "ghost" -- if a reap lane removes
+    it on ambiguous evidence (see ``_classify_dead_sessions_and_update_
+    throttle_state``'s corroboration gate) or through any other path that
+    strands state.json's dispatch record. Because the governor's dispatch
+    cap (``_apply_concurrency_governor``) is built on top of this count, a
+    ghost previously made a live process invisible to concurrency accounting
+    and let the next pass over-dispatch past the configured cap. state.json's
+    worker_pid fields are not touched by sidecar reaping, so any issue still
+    recorded as ``dispatched`` whose worker_pid is alive (pid + start-time,
+    recycling-safe) but has no corresponding live sidecar is counted here
+    too, and printed as a loud reconcile signal rather than silently treated
+    as free capacity.
     """
     from .worker import iter_workers
 
-    return sum(1 for w in iter_workers(sessions_dir) if w.is_alive())
+    live_issue_numbers: set[int] = set()
+    live_count = 0
+    for w in iter_workers(sessions_dir):
+        if w.is_alive():
+            live_count += 1
+            live_issue_numbers.add(w.issue_number)
+
+    if state_file is not None:
+        state = load_state_locked(state_file)
+        for issue_number_str, entry in state.get("issues", {}).items():
+            if not isinstance(entry, dict) or entry.get("status") != "dispatched":
+                continue
+            try:
+                issue_number = int(issue_number_str)
+            except (TypeError, ValueError):
+                continue
+            if issue_number in live_issue_numbers:
+                continue
+            if _worker_pid_alive(entry):
+                live_count += 1
+                print(
+                    f"[reconcile] issue {issue_number}: worker_pid "
+                    f"{entry.get('worker_pid')} is alive with no live session "
+                    "sidecar (ghost) -- counting it against the concurrency "
+                    "governor instead of treating the slot as free",
+                    flush=True,
+                )
+
+    return live_count
 
 
 def _detect_stalled_sessions(
@@ -963,8 +1007,16 @@ def _classify_dead_sessions_and_update_throttle_state(
     from .devin_shell import update_session_record_with_failure_classification
     from .post_mortem import classify_and_record
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
-    from .worker import iter_workers, update_worker_log_stat
+    from .worker import (
+        _next_inconclusive_probe_deferred_count,
+        classify_worker_health,
+        iter_workers,
+        real_activity_probe_for,
+        update_worker_log_stat,
+    )
     from .worktree import WorktreeState
+
+    now_for_health = datetime.now(UTC)
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -1079,6 +1131,43 @@ def _classify_dead_sessions_and_update_throttle_state(
         if w.error is None and not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
+
+            # Issue #343: this lane used to treat "not w.is_alive()" as sufficient
+            # grounds to relabel the issue and reap the sidecar, bypassing the
+            # real-activity corroboration + inconclusive-probe deferral cap that
+            # classify_worker_health already enforces for the sibling stall/kill
+            # lane (_detect_and_handle_stalled_sessions, issues #280/#301/#307/#338).
+            # That let a fail-open reap remove the sidecar of a worker whose
+            # liveness signal was merely ambiguous (or transiently wrong) while the
+            # governor's dispatch cap (_count_live_sessions) counts live sidecars,
+            # not live processes -- a wrongly-reaped sidecar silently frees a slot
+            # for over-cap dispatch even though the underlying process may still be
+            # running. Route through the same single enforcement point here so a
+            # worker is only ever treated as DEAD -- and only ever loses its
+            # sidecar -- once classify_worker_health agrees, with the same
+            # escalation cap (max_inconclusive_probe_deferrals) guaranteeing a
+            # genuinely-dead worker behind a permanently-broken probe still gets
+            # reaped after N deferred passes (never an unconditional "never-reap").
+            #
+            # Only workers with a real pid are corroborated. A pid=None worker
+            # (launch never spawned a process, or the pid was already cleared)
+            # has no liveness signal to second-guess -- is_alive() is trivially
+            # and unambiguously False -- so it keeps the prior immediate-reap
+            # behavior, matching _detect_and_handle_stalled_sessions's existing
+            # "if w.pid is None ...: continue" guard before it ever probes.
+            if w.pid is not None:
+                probe = real_activity_probe_for(w, config, now_for_health)
+                health = classify_worker_health(w, config, now_for_health, probe)
+                new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
+                update_worker_log_stat(
+                    sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
+                )
+                if health is not WorkerHealth.DEAD:
+                    # Corroboration vetoed the DEAD verdict (fresh real-session
+                    # activity) or the probe was inconclusive and the deferral
+                    # cap has not yet been reached -- defer to next pass instead
+                    # of reaping a sidecar we cannot yet prove is safe to remove.
+                    continue
 
             # Inspect the worktree before deciding how to classify and relabel.
             # This is the single enforcement point for issue #252.
@@ -1591,7 +1680,7 @@ class OrchestratorApp:
         if max_concurrent > 0:
             if live_count is None:
                 sessions_dir = self._resolve(self.config.devin.sessions_dir)
-                live_count = _count_live_sessions(sessions_dir)
+                live_count = _count_live_sessions(sessions_dir, self.paths.state_file)
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < dispatch_limit:
                 dispatch_limit = available_slots
@@ -1860,8 +1949,10 @@ class OrchestratorApp:
             sessions_dir, self.paths.state_file, self.config
         )
 
-        # Count live workers after stall handling (stalled workers are killed)
-        live_count = _count_live_sessions(sessions_dir)
+        # Count live workers after stall handling (stalled workers are killed).
+        # Corroborated against state.json (issue #343) so a ghost -- a live
+        # worker_pid whose sidecar was removed -- cannot silently free a slot.
+        live_count = _count_live_sessions(sessions_dir, self.paths.state_file)
 
         # Apply global concurrency governor cap with pre-computed live_count
         gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
