@@ -25,6 +25,9 @@ it, not to implement anything. Do NOT edit any files. Return findings only, to s
    symbols; is any live path left calling a removed/renamed thing?
 4. **Migration / data-loss / schema risks**; Windows/macOS/Linux differences.
 5. **Claimed-safe-without-proof** — any assertion not backed by a test or a verifiable code fact.
+   A stated rationale in the PR body or commit message ("deliberate," "unchanged," "out of
+   scope") is the author grading their own work — it never by itself lowers a finding's
+   severity. Verify the claim against the code; if it doesn't hold, the finding stands.
 6. **Scope creep / unrelated changes** hiding in the diff.
 7. **Test quality** — mocks that stub the real path, shallow asserts, a bug baked into the
    expected value, or a hallucinated/unverified external API contract.
