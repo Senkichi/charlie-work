@@ -8793,12 +8793,23 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     tmp_path: Path,
 ) -> None:
     """Issue #295: a dead/launch-failed rework session with an open PR and a
-    rework prompt on disk must be restored to rework_requested so the next
-    dispatch_rework can re-select it.
+    LIVE request_changes verdict (still matching the PR's current head) must
+    be restored to rework_requested so the next dispatch_rework can re-select
+    it.
 
-    Mutation gate: dropping the rework prompt fallback or the rework_requested
-    status rollback from _classify_dead_sessions_and_update_throttle_state fails
-    this test.
+    Issue #315 review rework: a bare rework-prompt.md on disk is no longer
+    sufficient by itself (see the stale-prompt regression test below) — the
+    prompt file is never deleted, so has_request_changes is now the single
+    signal that gates the restore. This test records a live request_changes
+    decision (matching production: _write_rework_prompt and the
+    decision/reviewed_head_sha state write happen in the same review() call)
+    so it keeps exercising the restore path under the corrected semantics.
+    It also exercises finding 2's window-filtered redispatch_at bookkeeping
+    (previously this lane preserved redispatch_at unchanged and never grew
+    it, which is exactly why the escalation cap could never trip).
+
+    Mutation gate: dropping the request_changes check or the rework_requested
+    status rollback from _reap_restore_rework_requested fails this test.
     """
     import json
     from datetime import UTC, datetime
@@ -8826,8 +8837,12 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     # Issue is stuck in the dispatched state with the rework worker label.
     fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
 
-    # PR state does not include a recorded request_changes decision; the rework
-    # prompt on disk is the only fallback signal.
+    # PR state records a LIVE request_changes decision matching the PR's
+    # current head (fake_gh.prs[0]["headRefOid"] == "sha-abc123" by default) —
+    # the only signal _reap_restore_rework_requested now honors (issue #315
+    # finding 1). The on-disk rework-prompt.md below is still written (it's
+    # what a real request_changes cycle produces) but is a diagnostic
+    # supplement only, not required for the restore.
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -8844,6 +8859,8 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
         state["prs"]["456"] = {
             "number": 456,
             "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
 
@@ -8887,8 +8904,15 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     assert entry is not None
     assert entry.get("status") == "rework_requested"
     assert entry.get("dispatched_at") is None
-    # redispatch_at history must be preserved (not cleared by the reap)
-    assert entry.get("redispatch_at") == ["2020-01-01T00:00:00Z"]
+    # Issue #315 finding 2: the old 2020 entry is outside the redispatch
+    # window (default 240 minutes) and is dropped; a fresh entry is appended
+    # in its place — proof the cap bookkeeping this lane previously skipped
+    # now actually runs, while staying under config.watchdog.max_auto_redispatch
+    # (default 3) so the restore (not escalation) path is taken.
+    redispatch_at = entry.get("redispatch_at")
+    assert redispatch_at is not None
+    assert len(redispatch_at) == 1
+    assert redispatch_at[0] != "2020-01-01T00:00:00Z"
     # Liveness fingerprint preserved for recovery path (issue #282)
     assert entry.get("worker_pid") == 99999
     assert entry.get("worker_process_start_time") == 1234567890.0
@@ -8903,6 +8927,392 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     assert result.data["selected_count"] == 1
     assert result.data["sessions"][0]["issue_number"] == 123
     assert str(result.data["sessions"][0]["prompt_path"]).endswith("rework-prompt.md")
+
+
+def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head(
+    tmp_path: Path,
+) -> None:
+    """Issue #315 review finding 1: a stale rework-prompt.md left over from an
+    earlier cycle must NOT roll a PR whose CURRENT head is already approved
+    back to rework_requested. The prompt file is written once per PR
+    (workflow._write_rework_prompt) and is never deleted, so its mere
+    existence cannot distinguish "still awaiting this cycle's rework" from
+    "leftover from a cycle that has since been approved" the way
+    has_request_changes can (it re-derives from the PR's live review record
+    on every call).
+
+    Mutation gate: reverting _reap_restore_rework_requested's gate from
+    `if not has_request_changes: return` back to
+    `if not has_request_changes and not has_rework_prompt: return` makes this
+    test fail — the stale prompt alone would incorrectly trigger the restore.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # The PR's CURRENT head is approved (a fresh review cycle already ran and
+    # passed) -- not request_changes.
+    fake_gh.prs[0]["headRefOid"] = "sha-approved-head"
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": [],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "approved",
+            "reviewed_head_sha": "sha-approved-head",
+        }
+        save_state(paths.state_file, state)
+
+    # Stale rework-prompt.md left over from an EARLIER cycle (never deleted).
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the old issues", encoding="utf-8")
+
+    # Dead worker that exited normally (no launch error). The worktree is
+    # never created (is_completed=False), isolating this test to finding 1's
+    # has_request_changes fix rather than finding 1's is_completed guard
+    # (covered by test_classify_dead_rework_session_completed_worktree_not_rolled_back).
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),  # never created
+        prompt_path=str(rework_prompt),
+        command=("devin", "--prompt-file", str(rework_prompt)),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(sessions_dir / "issue-123.log"),
+        error=None,  # exited normally
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    # Must NOT be rolled back -- the approved head is live, the prompt is stale.
+    assert entry["status"] != "rework_requested"
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_classify_dead_rework_session_escalates_at_redispatch_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #315 review finding 2a: a dead rework worker must be escalated
+    (not restored to rework_requested) once its redispatch_at history hits
+    config.watchdog.max_auto_redispatch, matching the cap semantics the
+    sibling lanes already enforce (workflow.py's no-open-PR dead-session lane
+    and OrchestratorApp.dispatch_rework's success path both escalate when
+    `len(redispatch_at) > max_auto_redispatch`).
+
+    Mutation gate: dropping the
+    `len(redispatch_at) > config.watchdog.max_auto_redispatch` half of
+    _reap_restore_rework_requested's `should_escalate` check makes this test
+    fail (the issue would be restored to rework_requested indefinitely
+    instead of escalating).
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
+
+    now = datetime.now(UTC)
+    # Three recent redispatches, all inside the default 240-minute window --
+    # max_auto_redispatch defaults to 3, so a fourth entry trips the cap.
+    recent_redispatches = [
+        (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4, 2)
+    ]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": recent_redispatches,
+        }
+        # Live request_changes decision matching the current head, so this
+        # test isolates the cap check rather than finding 1's gate.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Launch-failure sidecar with a non-deterministic failure signature (rate
+    # limit) -- isolates the cap check from finding 2b's deterministic-kind
+    # guard (covered by the worktree_unsafe test below).
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # launch-failure sidecar
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(entry["redispatch_at"]) == 4
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately(
+    tmp_path: Path,
+) -> None:
+    """Issue #315 review finding 2b: a dead rework worker whose failure_kind is
+    confirmed-deterministic (config.DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    e.g. worktree_unsafe) must escalate immediately, bypassing the redispatch
+    cap entirely -- identical to the no-open-PR lane's immediate-escalation
+    block (workflow.py ~line 936). That block is gated on
+    `w.issue_number not in open_prs_by_issue`, so a rework worker (which
+    always has an open PR) bypasses it entirely and would otherwise fall
+    through to the ordinary cap-based path in _reap_restore_rework_requested.
+
+    Mutation gate: dropping the `terminal_failure or` half of
+    _reap_restore_rework_requested's `should_escalate` check makes this test
+    fail (the issue would be restored to rework_requested since the
+    redispatch history is empty and well under the cap).
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": [],  # nowhere near the cap
+        }
+        # Live request_changes decision matching the current head, so this
+        # test isolates the deterministic-kind guard rather than finding 1's
+        # gate.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # Launch failure -- process never started
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
+    tmp_path: Path,
+) -> None:
+    """LOW (issue #315 review): a rework worker that actually finished its
+    work (worktree ahead of base and clean -- is_completed=True) must never be
+    rolled back to rework_requested, even if this reap pass's PR-list
+    snapshot (fetched once, at the top of
+    _classify_dead_sessions_and_update_throttle_state) hasn't caught up to a
+    fresh push yet and still shows the pre-rework head that matches a live
+    request_changes decision. has_request_changes alone cannot catch this --
+    it would look identical to a genuine, never-pushed rework -- so the
+    open-PR branch must ALSO consult is_completed (issue #315 finding 1's
+    second half).
+
+    Mutation gate: removing the `if not is_completed:` guard around the
+    _reap_restore_rework_requested call in the open-PR dead-session branch
+    makes this test fail (the stale PR-list snapshot would incorrectly
+    trigger a rollback to rework_requested).
+    """
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 315)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 315, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 315,
+            "title": "Test issue",
+            "url": "https://example.test/issues/315",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    # Open PR whose PR-list snapshot still shows the STALE pre-rework head --
+    # simulating the race where the worker's fresh push hasn't been reflected
+    # in the PR-list fetched at the top of this reap pass yet.
+    gh.prs = [
+        {
+            "number": 900,
+            "title": "Fix #315",
+            "headRefName": branch,
+            "headRefOid": "sha-stale-snapshot",
+            "isCrossRepository": False,
+            "body": "Closes #315",
+            "labels": [],
+            "state": "OPEN",
+        }
+    ]
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["issues"]["315"] = {
+            "number": 315,
+            "status": "dispatched",
+            "branch_name": branch,
+            "worker_pid": 12345,
+            "worker_process_start_time": 1111111111.0,
+        }
+        # This decision is still "live" against the STALE snapshot head --
+        # exactly what would make has_request_changes incorrectly True if
+        # is_completed weren't consulted.
+        state["prs"]["900"] = {
+            "number": 900,
+            "issue_number": 315,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-stale-snapshot",
+        }
+        save_state(state_file, state)
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    state = load_state(state_file)
+    entry = state["issues"]["315"]
+    assert entry["status"] != "rework_requested"
+    assert (315, config.labels.needs_rework) not in gh.labels_added
 
 
 def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispatch(
@@ -14975,10 +15385,13 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 
 
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
-    """Test that redispatch_at is only written by the two known call sites (issue #165)."""
+    """Test that redispatch_at is only written by the three known call sites (issue #165)."""
     # This test verifies by code inspection that redispatch_at is only written in:
     # 1. dispatch_rework (workflow.py:2440-2472)
     # 2. _classify_dead_sessions_and_update_throttle_state (workflow.py:468-504)
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2: the
+    #    rework lane must consult the same redispatch cap the other two
+    #    sites do, instead of preserving redispatch_at unchanged forever).
     # No other code paths write to redispatch_at.
 
     # Verify the two call sites exist in the code
@@ -14988,18 +15401,15 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     workflow_source = inspect.getsource(workflow_module)
 
     # Count occurrences of redispatch_at assignments to entry
-    # We have 2 assignments in dispatch_rework (normal + escalation) and 3 in
-    # _classify_dead_sessions_and_update_throttle_state: the dead-session normal
-    # and escalation paths, plus (issue #288 follow-up, PR #314) the
-    # launch-failure escalation path, which now appends to prior history
-    # instead of overwriting it with a single-entry list.
-    # Total of 5 assignments is correct.
-    redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    # Should be exactly 5: 2 in dispatch_rework (normal + escalation), 3 in
+    # We have 2 assignments in dispatch_rework (normal + escalation), 3 in
     # _classify_dead_sessions_and_update_throttle_state (launch-failure
-    # escalation + dead-session normal + dead-session escalation).
-    assert redispatch_assignments == 5, (
-        f"Expected 5 redispatch_at assignments, found {redispatch_assignments}"
+    # escalation + dead-session normal + dead-session escalation), and 2 in
+    # _reap_restore_rework_requested (rework escalation + rework restore,
+    # issue #315).
+    # Total of 7 assignments is correct.
+    redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
+    assert redispatch_assignments == 7, (
+        f"Expected 7 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 

@@ -777,17 +777,36 @@ def _reap_restore_rework_requested(
     worker: WorkerView,
     failure_kind: str | None = None,
 ) -> None:
-    """Restore a dead/launch-failed rework worker to ``rework_requested``.
+    """Restore a dead/launch-failed rework worker to ``rework_requested``, or
+    escalate it to a human when the redispatch cap is exhausted or the
+    failure is deterministic.
 
-    Called when a reaped session has an open linked PR. If the PR has a
-    recorded ``request_changes`` verdict and the head hasn't changed, or a
-    rework prompt exists on disk, the issue is returned to ``rework_requested``
-    so ``dispatch_rework`` can re-select it. The stale ``in_progress`` label is
-    replaced with ``needs_rework``.
+    Called when a reaped session has an open linked PR. The PR must have a
+    ``request_changes`` verdict that is still LIVE for the current head
+    (``reviewed_head_sha == live_head_sha``) — ``has_request_changes`` is the
+    single source of truth here. A ``rework-prompt.md`` on disk is only ever
+    a supplement to that signal, never an independent trigger (issue #315
+    finding 1): the prompt file is written once per PR by
+    ``_write_rework_prompt`` and is never deleted, so by itself it cannot
+    distinguish "still awaiting this exact rework cycle" from "stale leftover
+    from an earlier cycle whose head has since been approved or superseded".
+    ``has_request_changes`` already re-derives from the PR's current review
+    record on every call, so gating on it makes the whole check
+    self-invalidating the moment the head advances or gets approved — the
+    same property the prompt-existence check was missing.
 
     Issue #295: this is the rework counterpart to the no-open-PR relabel path.
-    It preserves ``redispatch_at`` and the escalation cap, and does not clear the
-    liveness fingerprint (``worker_pid`` / ``worker_process_start_time``).
+    It preserves the liveness fingerprint (``worker_pid`` /
+    ``worker_process_start_time``) for the recovery probe, matching the
+    no-open-PR dead-session escalation branch (issue #282).
+
+    Issue #315 finding 2: this lane must consult the same redispatch-cap and
+    deterministic-failure-kind escalation rules the no-open-PR lanes already
+    enforce (~line 936 and ~line 1138) — otherwise a rework worker that dies
+    at launch every time (or whose failure_kind is confirmed-deterministic,
+    e.g. ``worktree_unsafe``) loops rework_requested forever instead of
+    escalating to a human. Rework workers always have an open PR, so they
+    never reach those lanes' checks; the equivalent must live here.
     """
     pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
     if pr_data is None:
@@ -814,39 +833,83 @@ def _reap_restore_rework_requested(
             and live_head_sha is not None
             and reviewed_head_sha == live_head_sha
         )
+        # Diagnostic only (issue #315 finding 1) — never gates the restore by
+        # itself; see the docstring above.
         has_rework_prompt = rework_prompt_path.exists()
 
-        if not has_request_changes and not has_rework_prompt:
+        if not has_request_changes:
             return
 
-        entry["status"] = "rework_requested"
-        entry["dispatched_at"] = None
-        # Preserve redispatch_at and worker_pid (issues #165, #282, #295)
-        state["issues"][str(worker.issue_number)] = entry
-        state = append_event(
-            state,
-            "rework_requeued",
-            {
-                "issue_number": worker.issue_number,
-                "pr_number": pr_number,
-                "failure_kind": failure_kind,
-                "previous_status": "dispatched",
-                "reason": "dead_rework_session_recovered",
-                "has_request_changes": has_request_changes,
-                "has_rework_prompt": has_rework_prompt,
-            },
-        )
-        save_state(state_file, state)
+        # Issue #315 finding 2: same window-filtered redispatch_at bookkeeping
+        # the sibling lanes use (~line 950-961, ~4186-4194), so the cap below
+        # is actually consulted instead of silently never growing.
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
+        prior = [
+            t
+            for t in entry.get("redispatch_at", [])
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+        ]
+        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
 
-    # Transition labels to rework_requested (needs_rework), removing the stale
-    # in_progress label from the failed launch.
-    result = transition(gh, config.labels, worker.issue_number, "rework_requested")
+        terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        should_escalate = (
+            terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch
+        )
+
+        if should_escalate:
+            entry["status"] = "escalated"
+            entry["redispatch_at"] = redispatch_at
+            entry["escalation_reason"] = (
+                failure_kind if terminal_failure else "redispatch_cap_exceeded"
+            )
+            # Preserve worker_pid/worker_process_start_time (issue #282): the
+            # recovery probe still needs the fingerprint even after escalation.
+            state["issues"][str(worker.issue_number)] = entry
+            state = append_event(
+                state,
+                "session_failed_escalated",
+                {
+                    "issue_number": worker.issue_number,
+                    "pr_number": pr_number,
+                    "failure_kind": failure_kind,
+                    "previous_status": "dispatched",
+                    "reason": "dead_rework_session_escalated",
+                    "redispatch_count": len(redispatch_at),
+                },
+            )
+            save_state(state_file, state)
+        else:
+            entry["status"] = "rework_requested"
+            entry["dispatched_at"] = None
+            entry["redispatch_at"] = redispatch_at
+            # Preserve worker_pid (issues #165, #282, #295)
+            state["issues"][str(worker.issue_number)] = entry
+            state = append_event(
+                state,
+                "rework_requeued",
+                {
+                    "issue_number": worker.issue_number,
+                    "pr_number": pr_number,
+                    "failure_kind": failure_kind,
+                    "previous_status": "dispatched",
+                    "reason": "dead_rework_session_recovered",
+                    "has_request_changes": has_request_changes,
+                    "has_rework_prompt": has_rework_prompt,
+                },
+            )
+            save_state(state_file, state)
+
+    # Transition labels: escalate to human_needed, or rework_requested
+    # (needs_rework), removing the stale in_progress label from the failed launch.
+    edge = "redispatch_escalated" if should_escalate else "rework_requested"
+    result = transition(gh, config.labels, worker.issue_number, edge)
     if result.outcome != TransitionOutcome.APPLIED:
         with state_lock(state_file):
             state = load_state(state_file)
             entry = state["issues"].get(str(worker.issue_number), {})
             entry["label_error"] = {
-                "edge": "rework_requested",
+                "edge": edge,
                 "outcome": result.outcome.value,
                 "add_failures": result.add_failures,
                 "remove_failures": result.remove_failures,
@@ -1197,9 +1260,19 @@ def _classify_dead_sessions_and_update_throttle_state(
             else:
                 # Issue #295: open PR with request_changes or rework prompt =>
                 # restore to rework_requested for its owning lane.
-                _reap_restore_rework_requested(
-                    state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
-                )
+                #
+                # Issue #315 finding 1: a completed worktree (ahead of base and
+                # clean) proves the worker finished its work — even if this
+                # reap pass's PR-list snapshot (fetched once, at line ~889)
+                # hasn't caught up to a fresh push yet. Never roll a worker
+                # that finished (and, per the open-PR guard above, already has
+                # a PR reflecting or about to reflect that work) back to
+                # rework_requested just because a launch-failure classifier
+                # ran on its now-dead sidecar.
+                if not is_completed:
+                    _reap_restore_rework_requested(
+                        state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
+                    )
 
     return reaped
 
