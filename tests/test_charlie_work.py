@@ -2641,12 +2641,21 @@ class FakeGitHub:
                 old_head = pr.get("headRefOid", "")
                 new_head = f"{old_head}-updated"
                 pr["headRefOid"] = new_head
+                # A real update-branch makes the PR current with its base. Future
+                # compare calls for the new head should see the current base tip.
+                pr["mergeStateStatus"] = "CLEAN"
+                base_ref = pr.get("baseRefName") or "main"
+                base_head = self.base_head_sha
+                self.compare_overrides[(base_ref, new_head)] = {
+                    "base_commit": {"sha": base_head},
+                    "merge_base_commit": {"sha": base_head},
+                }
                 # Record the fake commit metadata so the post-sync verification
                 # helper sees a valid GitHub web-flow merge commit.
                 self.commits[new_head] = {
                     "parents": [
                         {"sha": old_head},
-                        {"sha": "base-sha"},
+                        {"sha": base_head},
                     ],
                     "committer": {"login": "web-flow"},
                     "commit": {"committer": {"name": "GitHub"}},
@@ -2696,8 +2705,32 @@ class FakeGitHub:
         override = self.compare_overrides.get((base, head))
         if override is not None:
             return override
-        # Default: assume the PR's merge-base is the current base tip.
+        # If no override is provided, infer the comparison from the PR's
+        # mergeStateStatus when it is known. Tests can still use compare_overrides
+        # to model the CLEAN-but-stale case where mergeStateStatus lags.
         base_head = self.base_head_sha
+        matching_pr = None
+        for pr in self.prs:
+            if pr.get("headRefOid") == head:
+                matching_pr = pr
+                break
+        if matching_pr is None:
+            for pr_number, pr_head in self.pr_head_shas.items():
+                if pr_head == head:
+                    for pr in self.prs:
+                        if pr.get("number") == pr_number:
+                            matching_pr = pr
+                            break
+                    break
+        if (
+            matching_pr is not None
+            and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND"
+        ):
+            return {
+                "base_commit": {"sha": base_head},
+                "merge_base_commit": {"sha": f"{base_head}-stale"},
+            }
+        # Default: the PR's merge-base is the current base tip.
         return {
             "base_commit": {"sha": base_head},
             "merge_base_commit": {"sha": base_head},
@@ -9814,6 +9847,7 @@ def test_update_open_agent_prs_reports_failure_as_value(tmp_path: Path) -> None:
             "url": "https://example.test/pull/789",
             "headRefName": "agent/issue-124-fix-another",
             "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #124\n\nTests: added.",
             "labels": [],
             "isCrossRepository": False,
@@ -9938,6 +9972,7 @@ def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
             "url": "https://example.test/pull/789",
             "headRefName": "agent/issue-124-fix-another",
             "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #124\n\nTests: added.",
             "labels": [],
             "isCrossRepository": False,
@@ -10009,6 +10044,7 @@ def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Pa
             "url": "https://example.test/pull/789",
             "headRefName": "agent/issue-124-fix-another",
             "headRefOid": "sha-new456",  # Head has moved since approval
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #124\n\nTests: added.",
             "labels": [],
             "isCrossRepository": False,
@@ -10065,6 +10101,7 @@ def test_update_open_agent_prs_skips_prs_with_pending_required_checks(tmp_path: 
             "url": "https://example.test/pull/456",
             "headRefName": "agent/issue-123-fix-search",
             "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
             "isCrossRepository": False,
@@ -10095,6 +10132,7 @@ def test_update_open_agent_prs_skips_prs_with_pending_required_checks(tmp_path: 
             "url": "https://example.test/pull/789",
             "headRefName": "agent/issue-124-fix-another",
             "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #124\n\nTests: added.",
             "labels": [],
             "isCrossRepository": False,
@@ -10160,6 +10198,7 @@ def test_update_open_agent_prs_updates_prs_with_completed_required_checks(tmp_pa
             "url": "https://example.test/pull/456",
             "headRefName": "agent/issue-123-fix-search",
             "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
             "isCrossRepository": False,
@@ -10519,6 +10558,182 @@ def test_merge_ready_next_mode_skips_non_head(tmp_path: Path) -> None:
     assert fake_gh.merged == []
 
 
+def test_merge_ready_clean_stale_base_syncs_and_merges(tmp_path: Path) -> None:
+    """Issue #334: approved PR with mergeStateStatus CLEAN but stale merge-base is synced and merged."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # mergeStateStatus is CLEAN, but the compare API says the merge-base is stale.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "base-sha"},
+        "merge_base_commit": {"sha": "base-sha-old"},
+    }
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # The branch was synced despite mergeStateStatus CLEAN because the base was stale.
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123-updated"
+    # The approved head was updated to match the new base.
+    decision = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text())
+    assert decision["reviewed_head_sha"] == "sha-abc123-updated"
+
+
+def test_merge_ready_current_base_no_sync(tmp_path: Path) -> None:
+    """Issue #334 negative control: an already-current approved PR should not be synced."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # mergeStateStatus CLEAN and the compare API agrees the base is current.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+    # No update-branch should have been attempted.
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123"
+    decision = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text())
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
+    """Issue #334: next-mode update lane syncs a CLEAN-but-stale head candidate."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    # The next candidate is stale even though mergeStateStatus reports CLEAN.
+    fake_gh.compare_overrides[("main", "sha-def456")] = {
+        "base_commit": {"sha": "base-sha"},
+        "merge_base_commit": {"sha": "base-sha-old"},
+    }
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456-updated"
+
+
+def test_update_open_agent_prs_all_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
+    """Issue #334: all-mode update lane syncs a PR with a CLEAN but stale merge-base."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    fake_gh.compare_overrides[("main", "sha-def456")] = {
+        "base_commit": {"sha": "base-sha"},
+        "merge_base_commit": {"sha": "base-sha-old"},
+    }
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is True
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456-updated"
+
+
 def test_update_open_agent_prs_next_mode_syncs_head_of_queue(tmp_path: Path) -> None:
     """In merge-train mode, post-merge only syncs the head of the approved queue."""
     from charlie_work.config import AutoMergeConfig
@@ -10652,6 +10867,151 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
     assert update_results[0]["pr_number"] == 789
     assert update_results[0]["updated"] is False
     assert update_results[0]["skipped_reason"] == "up-to-date"
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_update_open_agent_prs_next_mode_reports_compare_unavailable(tmp_path: Path) -> None:
+    """Issue #337 rework: a None compare() result must not be reported as up-to-date.
+
+    When the GitHub compare API is unavailable, `_is_base_current` returns None
+    and the branch is correctly never synced (fail-closed), but the reported
+    reason must be distinct from a genuinely up-to-date branch — otherwise a
+    compare-API outage silently masquerades as every PR being current.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubCompareUnavailable(FakeGitHub):
+        """compare() returns None only for the given head SHA, simulating a
+        compare-API outage isolated to that candidate (the merged PR's own
+        base-freshness check must still resolve normally).
+        """
+
+        def __init__(self, unavailable_head: str) -> None:
+            super().__init__()
+            self._unavailable_head = unavailable_head
+
+        def compare(self, base: str, head: str) -> dict[str, Any] | None:
+            if head == self._unavailable_head:
+                return None
+            return super().compare(base, head)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCompareUnavailable(unavailable_head="sha-def456")
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is False
+    assert update_results[0]["skipped_reason"] == "compare_unavailable"
+    # No update-branch call should have been made for the compare-unavailable PR.
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_update_open_agent_prs_all_mode_reports_compare_unavailable(tmp_path: Path) -> None:
+    """Issue #337 rework: all-mode update lane distinguishes compare-unavailable too."""
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubCompareUnavailable(FakeGitHub):
+        """compare() returns None only for the given head SHA, simulating a
+        compare-API outage isolated to that candidate.
+        """
+
+        def __init__(self, unavailable_head: str) -> None:
+            super().__init__()
+            self._unavailable_head = unavailable_head
+
+        def compare(self, base: str, head: str) -> dict[str, Any] | None:
+            if head == self._unavailable_head:
+                return None
+            return super().compare(base, head)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCompareUnavailable(unavailable_head="sha-def456")
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "compare_unavailable"
+    # No update-branch call should have been made for the compare-unavailable PR.
     assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
 
 

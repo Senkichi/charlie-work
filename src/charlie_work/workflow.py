@@ -1468,6 +1468,15 @@ def _format_merge_attempt_alarm_message(
     return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
+# Sentinel used to distinguish "no base-current signal was supplied" from
+# an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
+class _BaseCurrentUnset:
+    __slots__ = ()
+
+
+_BASE_CURRENT_UNSET = _BaseCurrentUnset()
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -2907,7 +2916,8 @@ class OrchestratorApp:
             # Head matches the approved SHA. In merge-train mode, only the head
             # of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
-            if self.config.auto_merge.update_open_prs == "next":
+            update_open_prs = self.config.auto_merge.update_open_prs
+            if update_open_prs == "next":
                 if merge_train_head is not None and merge_train_head != pr_number:
                     return self._merge_not_ready_result(
                         pr_number,
@@ -2929,7 +2939,14 @@ class OrchestratorApp:
                                 decision,
                                 existing_pr_state,
                             )
-                if not sync_failed and self._should_update_pr_branch(pr):
+            # Single point of enforcement: derive base freshness from the GitHub
+            # compare API once and use it for both the pre-merge sync decision
+            # and the merge-base gate. mergeStateStatus can lag and report CLEAN
+            # while the branch is actually stale, so it is no longer authoritative.
+            base_current: bool | None = None
+            if not sync_failed and update_open_prs in {"next", "all"}:
+                base_current = self._is_base_current(pr)
+                if self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
@@ -2946,7 +2963,10 @@ class OrchestratorApp:
             # merge-base freshness gate: mergeStateStatus can lag, so verify
             # ancestry with the GitHub compare API before merging.
             if not sync_failed and self.config.auto_merge.require_current_base:
-                base_current = self._is_base_current(pr)
+                if base_current is None and update_open_prs not in {"next", "all"}:
+                    base_current = self._is_base_current(pr)
+                elif pr.get("headRefOid") != live_head_sha:
+                    base_current = self._is_base_current(pr)
                 if base_current is not True:
                     base_ref = pr.get("baseRefName")
                     head_sha = pr.get("headRefOid")
@@ -3354,7 +3374,20 @@ class OrchestratorApp:
 
             # Only the head of the merge-train queue is synced.
             _, pr_number, pr, decision, head = candidates[0]
-            if not self._should_update_pr_branch(pr):
+            base_current = self._is_base_current(pr)
+            if base_current is None:
+                # Compare API unavailable: report distinctly from "up-to-date" so
+                # a GitHub compare-API degradation is visible in telemetry instead
+                # of masquerading as every open PR being current.
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "compare_unavailable",
+                    }
+                ]
+            if not self._should_update_pr_branch(pr, base_current):
                 return [
                     {
                         "pr_number": pr_number,
@@ -3482,6 +3515,34 @@ class OrchestratorApp:
                         }
                     )
                     continue
+
+            # Use the same compare-derived base-current signal as the merge-train
+            # path and merge_ready so "all" mode also skips up-to-date PRs and
+            # syncs stale ones even when mergeStateStatus is CLEAN.
+            base_current = self._is_base_current(pr)
+            if base_current is None:
+                # Compare API unavailable: report distinctly from "up-to-date" so
+                # a GitHub compare-API degradation is visible in telemetry instead
+                # of masquerading as every open PR being current.
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "compare_unavailable",
+                    }
+                )
+                continue
+            if not self._should_update_pr_branch(pr, base_current):
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "up-to-date",
+                    }
+                )
+                continue
 
             # Attempt to update the branch
             success = self.gh.pr_update_branch(pr_number)
@@ -3709,16 +3770,25 @@ class OrchestratorApp:
 
         return new_head_sha
 
-    def _should_update_pr_branch(self, pr: dict[str, Any]) -> bool:
-        """Return True if the PR branch may be behind its base and should be synced.
+    def _should_update_pr_branch(
+        self,
+        pr: dict[str, Any],
+        base_current: bool | None | _BaseCurrentUnset = _BASE_CURRENT_UNSET,
+    ) -> bool:
+        """Return True if the PR branch should be synced against its base.
 
-        mergeStateStatus values that mean "up-to-date or not a base issue" are
-        skipped. All others (including unknown/missing) are attempted: a real
-        `gh pr update-branch` is a no-op when already up-to-date and returns
-        failure on genuine conflicts.
+        When a ``base_current`` signal is supplied, it is authoritative:
+        ``True`` means the branch is already up-to-date and no sync is needed;
+        ``False`` means the branch is stale and should be synced; ``None`` means
+        the compare API is unavailable, so fail-closed and do not sync.
+
+        If no ``base_current`` signal is supplied, fall back to the legacy
+        mergeStateStatus heuristic for backward compatibility.
         """
-        status = str(pr.get("mergeStateStatus") or "").upper()
-        return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+        if isinstance(base_current, _BaseCurrentUnset):
+            status = str(pr.get("mergeStateStatus") or "").upper()
+            return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
+        return base_current is False
 
     def _is_base_current(self, pr: dict[str, Any]) -> bool | None:
         """Return True if the PR's merge-base is the current tip of its base.
