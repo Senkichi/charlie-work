@@ -73,6 +73,44 @@ from charlie_work.devin_shell import SessionRecord
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
+@pytest.fixture(autouse=True)
+def _stub_real_activity_probe_for_for_stalled_tests(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Issue #307: stall-detection tests need a stale real-activity probe.
+
+    Without this fixture, ``real_activity_probe_for`` reaches the host's real
+    ``sessions.db`` and per-PID logs and returns an all-errored probe. Issue #307
+    makes an all-errored probe fail-open (defer), so stall tests that are not
+    about real-activity corroboration would otherwise return HEALTHY. The one
+    test that intentionally exercises a fresh probe is excluded by name.
+    """
+    if (
+        request.node.originalname
+        == "test_status_workers_not_killed_when_real_activity_probe_fresh"
+    ):
+        return
+
+    from datetime import datetime, timedelta, UTC
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    def _stale_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+        now = datetime.now(UTC)
+        timestamp = now - timedelta(minutes=30)
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=timestamp,
+                    staleness_seconds=(now - timestamp).total_seconds(),
+                    error=None,
+                ),
+            )
+        )
+
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_probe)
+
+
 def test_default_config_enables_auto_merge() -> None:
     config = load_config()
 

@@ -871,6 +871,28 @@ def _make_stalled_devin_session(
     return sessions_dir, state_file, log_path
 
 
+def _stale_devin_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+    """Return a probe that is stale (not fresh) and not all-errored.
+
+    Issue #307: a worker with a stale sidecar log and a stale real-session
+    activity signal must still be classified as STALLED. Tests that exercise
+    the rate-limit defer path must not be tripped up by an all-errored probe,
+    which now defers to avoid the fail-open bug in Signal 3.
+    """
+    now = datetime.now(UTC)
+    timestamp = now - timedelta(minutes=30)
+    return RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=timestamp,
+                staleness_seconds=(now - timestamp).total_seconds(),
+                error=None,
+            ),
+        )
+    )
+
+
 def test_stalled_worker_with_rate_limit_signature_is_deferred(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -890,6 +912,7 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(
@@ -987,6 +1010,7 @@ def test_deferred_worker_past_deadline_is_killed(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(
@@ -1032,6 +1056,7 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(

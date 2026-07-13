@@ -405,6 +405,32 @@ def _parse_started_at(value: str) -> datetime | None:
         return None
 
 
+def _real_activity_is_fresh(
+    probe: RealActivityProbe | None, now: datetime, stall_minutes: int
+) -> bool:
+    """Return True when the probe shows real-session activity within the stall window.
+
+    A fresh real-activity signal from any source (sessions.db, per-PID Devin log,
+    or Claude Code events.jsonl) is enough to veto an immediate DEAD/STALLED verdict.
+    """
+    from datetime import timedelta
+
+    if probe is None or probe.latest_timestamp is None:
+        return False
+    return (now - probe.latest_timestamp) <= timedelta(minutes=stall_minutes)
+
+
+def _real_activity_is_inconclusive(probe: RealActivityProbe | None) -> bool:
+    """Return True when every consulted source errored and produced no timestamp.
+
+    An all-errored probe is insufficient evidence of death/stall, so the caller
+    should defer the verdict rather than fail open to STALLED.
+    """
+    if probe is None or not probe.sources:
+        return False
+    return all(source.error is not None for source in probe.sources)
+
+
 def classify_worker_health(
     view: WorkerView,
     config: OrchestratorConfig,
@@ -418,25 +444,29 @@ def classify_worker_health(
     captured this pass, and has no side effects.
 
     Signal → verdict, first-to-fire-wins order:
-    1. liveness → DEAD
-    2. terminal marker → DEAD
-    3. progress staleness → STALLED
+    1. liveness → DEAD (unless a fresh real-session activity signal vetoes it)
+    2. terminal marker → DEAD (unconditional; overrides a fresh probe)
+    3. progress staleness → STALLED (unless a fresh or inconclusive probe vetoes it)
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
     7. (none of the above) → HEALTHY
 
-    Signal 3 (progress staleness) is corroborated against ``real_activity_probe``.
-    If the sidecar log is stale but any real-session activity source (sessions.db,
-    per-PID Devin log, or Claude Code events.jsonl) is fresh, the worker is not
-    classified as STALLED (issues #280, #301).
+    Signals 1 and 3 are corroborated against ``real_activity_probe`` (issues #280,
+    #301, #307). If the tracked process is gone or the sidecar log is stale, but
+    any real-session activity source (sessions.db, per-PID Devin log, or Claude
+    Code events.jsonl) is fresh, the worker is not classified as DEAD/STALLED this
+    pass. If the probe was consulted but every source errored, it is treated as
+    inconclusive and the verdict is deferred rather than failing open to STALLED.
+    Signal 2 (terminal error markers) bypasses corroboration and still returns
+    DEAD immediately.
 
     Args:
         view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
         config: OrchestratorConfig containing watchdog settings
         now: Current datetime for staleness calculation
         real_activity_probe: Optional pre-fetched real-session activity probe.
-            When fresh, it overrides a stale sidecar log mtime.
+            When fresh, it overrides a stale sidecar log mtime or a missing process.
 
     Returns:
         WorkerHealth enum member indicating the worker's health status
@@ -447,7 +477,11 @@ def classify_worker_health(
 
     # Signal 1: liveness
     if not view.is_alive():
-        return WorkerHealth.DEAD
+        # Issue #307: a process that just exited normally (e.g., after publishing a PR)
+        # can still have a fresh real-session activity signal. Defer the DEAD verdict
+        # for one pass instead of reaping it as a stall.
+        if not _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+            return WorkerHealth.DEAD
 
     # Signal 2: terminal marker
     log_path = Path(view.log_path)
@@ -478,17 +512,14 @@ def classify_worker_health(
         is_stalled_by_mtime = age > timedelta(minutes=config.watchdog.stall_minutes)
 
         if is_stalled_by_mtime:
-            # Corroborate against real-session activity before killing (issue #280)
-            if (
-                real_activity_probe is not None
-                and real_activity_probe.latest_timestamp is not None
-            ):
-                real_age = now - real_activity_probe.latest_timestamp
-                if real_age <= timedelta(minutes=config.watchdog.stall_minutes):
-                    # Sidecar log is frozen but the real session is still moving
-                    pass
-                else:
-                    return WorkerHealth.STALLED
+            # Corroborate against real-session activity before killing (issues #280, #307)
+            if _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+                # Sidecar log is frozen but the real session is still moving
+                pass
+            elif _real_activity_is_inconclusive(real_activity_probe):
+                # Probe was consulted but every source errored. That is insufficient
+                # evidence to kill; defer rather than fail open to STALLED.
+                pass
             else:
                 return WorkerHealth.STALLED
 
