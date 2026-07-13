@@ -58,25 +58,11 @@ def try_acquire_byte_range_lock(lock_path: Path) -> ByteRangeFileLock | None:
     """
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        # Write 1 byte on creation so msvcrt.locking(..., 1) has a byte to lock.
-        # touch() creates an empty (0-byte) file; msvcrt locks specific byte ranges
-        # and will raise EACCES on a 0-byte file even for a non-blocking attempt.
-        if not lock_path.exists():
-            lock_path.write_bytes(b"\x00")
-
+        lock_path.touch()
         handle = lock_path.open("r+b", encoding=None)
         if sys.platform == "win32":
             import msvcrt
 
-            # Guard against a pre-existing 0-byte lock file (e.g. left over
-            # from an older touch()-based implementation, or a race with
-            # another process's creation) — the write above only fires when
-            # the file doesn't exist yet, so a stale empty file would still
-            # make msvcrt.locking raise EACCES.
-            if handle.seek(0, 2) == 0:
-                handle.write(b"\x00")
-                handle.flush()
-            handle.seek(0)
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
