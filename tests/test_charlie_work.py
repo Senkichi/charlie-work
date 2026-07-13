@@ -49,7 +49,7 @@ from charlie_work.cross_family import (
     report_body_is_valid,
     run_cross_family_review,
 )
-from charlie_work.github import label_names, linked_issue_number
+from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
@@ -467,6 +467,15 @@ def test_linked_issue_number_ignores_unqualified_body_references() -> None:
         )
         is None
     )
+
+
+def test_issue_numbers_mentioned_by_pr_matches_issue_reference() -> None:
+    pr = {
+        "title": "fix(scope): reap sidecar files on session exit (issue #113)",
+        "body": "This PR addresses issue #113. PR #181 is an unrelated refactor.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {113}
 
 
 def test_summarize_checks_requires_all_configured_checks() -> None:
@@ -2602,6 +2611,9 @@ class FakeGitHub:
     def pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
+    def merged_pr_list(self):
+        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
+
     def pr_view(self, number: int):
         # Return the PR matching the requested number
         for pr in self.prs:
@@ -2846,6 +2858,32 @@ def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     assert not prompt_path.exists()
     assert (123, "agent:queued") not in fake_gh.labels_added
     assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def test_dispatch_skips_ready_issue_with_merged_pr_reference(tmp_path: Path) -> None:
+    """Issue #203: a ready issue whose number appears in a merged PR's title/body
+    must not be dispatched, and the issue should be closed and labeled done."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR #456 is merged and references issue #123 without a closing keyword.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["title"] = "fix(scope): reap sidecar files on session exit (issue #123)"
+    fake_gh.prs[0]["body"] = "This PR addresses issue #123."
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == [123]
+    assert result.data["merged_pr_closed_issue_numbers"] == [123]
+    assert 123 in fake_gh.closed_issues
+    assert (123, "agent:done") in fake_gh.labels_added
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert not prompt_path.exists()
 
 
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ from .github import (
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
     is_infrastructure_failure,
+    issue_numbers_mentioned_by_pr,
     label_names,
     linked_issue_number,
     parse_blockers,
@@ -1885,6 +1886,8 @@ class OrchestratorApp:
             stalled_issues = {entry["issue"] for entry in stalled_entries}
             live_worker_issues = _issues_with_live_workers(sessions_dir)
             prs = self.gh.pr_list()
+            merged_prs = self.gh.merged_pr_list()
+            merged_pr_issue_numbers = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
             pr_by_issue = {}
             for pr in prs:
                 issue_number = linked_issue_number(
@@ -1933,6 +1936,7 @@ class OrchestratorApp:
                 and int(issue["number"]) not in live_dispatched
                 and int(issue["number"]) not in stalled_issues
                 and int(issue["number"]) not in issues_with_open_tracked_prs
+                and int(issue["number"]) not in merged_pr_issue_numbers
             ]
 
             # Apply dependency gate: skip issues with open blockers (dry-run)
@@ -1998,6 +2002,7 @@ class OrchestratorApp:
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
                 "dispatch_results": [],
@@ -2023,6 +2028,8 @@ class OrchestratorApp:
         stalled_issues = {entry["issue"] for entry in stalled_entries}
         live_worker_issues = _issues_with_live_workers(sessions_dir)
         prs = self.gh.pr_list()
+        merged_prs = self.gh.merged_pr_list()
+        merged_pr_issue_numbers = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
         pr_by_issue = {}
         for pr in prs:
             issue_number = linked_issue_number(
@@ -2037,8 +2044,39 @@ class OrchestratorApp:
                 ):
                     pr_by_issue[issue_number] = pr
 
+        # Close any ready issues already fixed by a merged PR.  These are network
+        # calls, so they run outside the state lock; the successful closures are
+        # persisted to state.json inside the lock below, and the issue numbers are
+        # excluded from dispatch candidates regardless of closure success.
+        closed_merged_pr_issues: set[int] = set()
+        for issue_number in merged_pr_issue_numbers:
+            # Best-effort label transition and issue close. A failure here is
+            # non-fatal; the issue is still excluded from dispatch because the
+            # merged PR reference exists, and the next pass will retry.
+            transition(self.gh, self.config.labels, issue_number, "merged")
+            if self.gh.close_issue(issue_number):
+                closed_merged_pr_issues.add(issue_number)
+
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Persist the fact that merged PRs already covered these ready issues.
+            # This keeps state.json consistent with the closed GitHub issue and lets
+            # reconcile skip the active-status-on-closed-issue drift sweep.
+            for issue_number in closed_merged_pr_issues:
+                _issue_key = str(issue_number)
+                _issue_entry = state["issues"].get(_issue_key, {})
+                state["issues"][_issue_key] = {
+                    **_issue_entry,
+                    "number": issue_number,
+                    "status": "closed",
+                }
+            if closed_merged_pr_issues:
+                state = append_event(
+                    state,
+                    "dispatch_merged_pr_references_closed",
+                    {"issue_numbers": sorted(closed_merged_pr_issues)},
+                )
+                save_state(self.paths.state_file, state)
             # Defence-in-depth against double-dispatch: an issue whose state records
             # a live launched worker (status "dispatched") or a fresh pending claim
             # (status "dispatch_pending" not yet stale) is not re-dispatchable even
@@ -2078,6 +2116,7 @@ class OrchestratorApp:
                 and int(issue["number"]) not in live_dispatched
                 and int(issue["number"]) not in stalled_issues
                 and int(issue["number"]) not in issues_with_open_tracked_prs
+                and int(issue["number"]) not in merged_pr_issue_numbers
             ]
 
         # Apply dependency gate: skip issues with open blockers
@@ -2294,6 +2333,8 @@ class OrchestratorApp:
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
                     "deferred_by_concurrency": deferred_by_concurrency,
+                    "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
+                    "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
                 },
             )
             save_state(self.paths.state_file, state)
@@ -2314,6 +2355,8 @@ class OrchestratorApp:
             "live_worker_count": len(live_worker_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
+            "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
+            "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -4539,6 +4582,40 @@ class OrchestratorApp:
             message,
             data,
         )
+
+    def _merged_pr_referenced_issue_numbers(
+        self,
+        issues: list[dict[str, Any]],
+        merged_prs: list[dict[str, Any]],
+    ) -> set[int]:
+        """Return ready issues that are already covered by a merged PR.
+
+        A PR is considered to cover an issue if:
+
+        * ``linked_issue_number`` can bind it by branch or closing keyword, or
+        * the PR title/body contains an explicit ``issue #N`` / ``issues #N``
+          reference and the PR is same-repo (``isCrossRepository`` is False).
+
+        The result is intersected with the set of ready issues so that a stray
+        mention of an issue not in the dispatch queue does not get actioned.
+        """
+        ready_issue_numbers = {int(issue["number"]) for issue in issues}
+        referenced: set[int] = set()
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None and issue_number in ready_issue_numbers:
+                referenced.add(issue_number)
+            if pr.get("isCrossRepository") is False:
+                for mentioned in issue_numbers_mentioned_by_pr(pr):
+                    if mentioned in ready_issue_numbers:
+                        referenced.add(mentioned)
+        return referenced
 
     def _is_dispatchable(self, issue: dict[str, Any]) -> bool:
         names = label_names(issue)

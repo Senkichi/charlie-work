@@ -329,6 +329,22 @@ class GitHub:
             kind="open PRs",
         )
 
+    def merged_pr_list(self) -> list[dict[str, Any]]:
+        return self._list_json(
+            [
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--limit",
+                str(_LIST_LIMIT),
+                "--json",
+                PR_LIST_FIELDS,
+            ],
+            limit=_LIST_LIMIT,
+            kind="merged PRs",
+        )
+
     def pr_view(self, number: int) -> dict[str, Any]:
         result = self.run(
             [
@@ -726,6 +742,27 @@ def linked_issue_number(
         if match:
             return int(match.group(1))
     return None
+
+
+# Explicit issue-reference pattern: the word "issue" or "issues" followed by
+# an optional space and then "#N".  This is deliberately narrower than a bare
+# ``#N`` so a merged PR that mentions a different PR (e.g. "PR #181") is not
+# mistaken for an issue reference.  Closing-keyword binding is handled by
+# ``linked_issue_number``.
+_ISSUE_MENTION_RE = re.compile(r"\b(?:issue|issues)\s*#(\d+)\b", flags=re.IGNORECASE)
+
+
+def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
+    """Return the set of issue numbers explicitly referenced by a PR title/body.
+
+    Matches the literal phrase ``issue #N`` / ``issues #N`` (case-insensitive,
+    with or without a space between the word and the hash).  This is a strict
+    subset of GitHub's issue-reference syntax: it does not treat a bare
+    ``#N`` (which could be a PR number) as an issue reference, and it does not
+    treat closing keywords like ``Fixes #N`` as any more than a reference.
+    """
+    text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
+    return {int(m.group(1)) for m in _ISSUE_MENTION_RE.finditer(text)}
 
 
 def _is_mutating(args: list[str]) -> bool:
