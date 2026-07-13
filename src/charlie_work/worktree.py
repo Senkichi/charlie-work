@@ -24,6 +24,7 @@ from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig
+from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
 from .subprocess_runner import run_captured
@@ -349,6 +350,36 @@ def _worktree_refuse_to_reset_reason(
         return None
 
     return "worktree has local commits not on remote branch"
+
+
+def _worktree_dirty_reason(worktree_path: Path) -> str | None:
+    """Return a reason string if ``worktree_path`` has uncommitted modifications.
+
+    Used by the merged-PR cleanup path (``clean_worktrees``), which decides
+    eligibility by comparing the worktree's local HEAD against the merged PR's
+    ``headRefOid`` rather than by comparing against the (possibly already
+    deleted) remote branch — see ``clean_worktrees`` for why
+    ``_worktree_refuse_to_reset_reason``'s remote-branch comparison does not
+    apply once a PR has been squash-merged with its branch deleted.
+
+    Raises:
+        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
+            fails (index lock, corruption, permissions) — mirrors
+            ``_worktree_refuse_to_reset_reason``'s handling of the same failure
+            mode.
+    """
+    if not worktree_path.is_dir():
+        return None
+    status_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok:
+        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
+    if status_result.stdout.strip():
+        return "worktree has uncommitted modifications"
+    return None
 
 
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
@@ -1432,3 +1463,416 @@ def list_worktrees(repo_root: Path) -> list[dict]:
         worktrees.append(current)
 
     return worktrees
+
+
+def _site_packages_dir(venv_path: Path) -> Path | None:
+    """Locate the ``site-packages`` directory inside a virtualenv.
+
+    Tries Windows and POSIX layouts, then falls back to a recursive search.
+    """
+    candidates = [
+        venv_path / "Lib" / "site-packages",
+        venv_path / "lib" / "site-packages",
+    ]
+    lib_dir = venv_path / "lib"
+    if lib_dir.is_dir():
+        candidates.extend(lib_dir.glob("python*/site-packages"))
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    for found in venv_path.rglob("site-packages"):
+        if found.is_dir():
+            return found
+    return None
+
+
+def _top_level_package_names(repo_root: Path) -> frozenset[str]:
+    """Return the top-level importable package names under ``repo_root/src``.
+
+    Used to identify which ``.pth`` files in the shared venv belong to this
+    project without hardcoding the project name.
+    """
+    src = repo_root / "src"
+    if not src.is_dir():
+        return frozenset()
+    names: set[str] = set()
+    for child in src.iterdir():
+        if child.is_dir() and (child / "__init__.py").is_file():
+            names.add(child.name)
+        elif child.is_file() and child.suffix == ".py":
+            names.add(child.stem)
+    return frozenset(names)
+
+
+def _venv_python(venv_path: Path) -> Path:
+    if os.name == "nt":
+        return venv_path / "Scripts" / "python.exe"
+    return venv_path / "bin" / "python"
+
+
+def _resolve_pth_line(site_packages: Path, line: str) -> Path:
+    """Resolve a single line from a ``.pth`` file.
+
+    Returns an empty path for executable/comment/empty lines. Relative paths
+    are resolved against the ``site-packages`` directory containing the file.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("import"):
+        return Path()
+    p = Path(stripped)
+    if p.is_absolute():
+        return p.resolve()
+    return (site_packages / p).resolve()
+
+
+def _verify_shared_venv_by_import(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
+    """Fallback import-based verification of the shared venv."""
+    python = _venv_python(venv_path)
+    if not python.exists():
+        return False, f"venv python not found at {python} (hint: uv sync --all-extras)"
+    main_src = (repo_root / "src").resolve()
+    script = "import charlie_work, pathlib; print(pathlib.Path(charlie_work.__file__).resolve())"
+    result = run_captured([str(python), "-c", script], cwd=repo_root, timeout_seconds=60)
+    if not result.ok:
+        return False, (
+            f"shared venv cannot import charlie_work: {result.error or result.stderr} "
+            "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+        )
+    try:
+        imported = Path(result.stdout.strip()).resolve()
+    except OSError:
+        return False, (
+            f"shared venv charlie_work __file__ is not a valid path: {result.stdout!r} "
+            "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+        )
+    if not imported.is_relative_to(main_src):
+        return False, (
+            f"shared venv imports charlie_work from {imported}, not main checkout {main_src} "
+            "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+        )
+    return True, "shared venv imports charlie_work from main checkout src"
+
+
+def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
+    """Verify the shared venv's editable ``.pth`` points to the main checkout src.
+
+    Searches ``site-packages`` for ``.pth`` files whose names contain a top-level
+    package name from ``repo_root/src``. For each matching ``.pth``, every path
+    line must resolve to ``repo_root/src``; a path pointing anywhere else is the
+    poisoned-editable-pth case and surfaces the ``--reinstall-package`` recovery
+    hint.
+    """
+    site_packages = _site_packages_dir(venv_path)
+    if not site_packages:
+        return False, "could not locate site-packages in shared venv"
+    main_src = (repo_root / "src").resolve()
+    package_names = _top_level_package_names(repo_root)
+    project_pth_files: list[Path] = []
+    for pth in site_packages.glob("*.pth"):
+        if any(name in pth.name for name in package_names):
+            project_pth_files.append(pth)
+    if not project_pth_files:
+        return _verify_shared_venv_by_import(repo_root, venv_path)
+    for pth in project_pth_files:
+        content = pth.read_text(encoding="utf-8", errors="replace")
+        for raw_line in content.splitlines():
+            target = _resolve_pth_line(site_packages, raw_line)
+            if target == Path() or target == main_src:
+                continue
+            return False, (
+                f"editable .pth {pth.name} points outside main checkout: {target} "
+                "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+            )
+    return True, "shared venv editable .pth points to main checkout src"
+
+
+def _find_linked_pr_number(
+    issue_number: int, issue_state: dict[str, Any], state_prs: dict[str, Any]
+) -> int | None:
+    """Resolve the PR number linked to ``issue_number`` from state.json."""
+    if issue_state.get("pr_number"):
+        return int(issue_state["pr_number"])
+    for pr_key, pr_entry in state_prs.items():
+        if pr_entry.get("issue_number") == issue_number:
+            return int(pr_key)
+    return None
+
+
+@dataclass(frozen=True)
+class WorktreeCleanResult:
+    """Result of a ``clean_worktrees`` run.
+
+    ``data`` carries ``planned``/``removed``/``skipped``/``failed`` (lists of
+    per-worktree dicts) plus ``venv_ok``/``venv_message``. Kept as a dict
+    rather than further nested dataclasses since callers (``CommandResult``)
+    consume it as a JSON-able blob for CLI output.
+    """
+
+    ok: bool
+    message: str
+    data: dict[str, Any]
+
+
+def clean_worktrees(
+    repo_root: Path,
+    worktrees_dir: Path,
+    state: dict[str, Any],
+    config: OrchestratorConfig,
+    gh: GitHub,
+    *,
+    dry_run: bool = False,
+) -> WorktreeCleanResult:
+    """Junction-safe cleanup of worker worktrees for merged PRs.
+
+    Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
+    to a PR number in ``state.json``, then applies a merged-PR-aware
+    eligibility check per worktree:
+
+      1. The PR must be confirmed ``MERGED`` by a *live* ``gh pr view`` call.
+         ``state.json`` claiming "merged" is corroboration only -- it is never
+         sufficient on its own (state.json reliability history: #285/#309/
+         #310), and an unavailable/erroring ``gh`` call fails CLOSED (skip)
+         rather than falling back to trusting state.json.
+      2. No live worker (see ``_probe_recovery_liveness``).
+      3. The worktree's working tree is clean (no uncommitted modifications).
+      4. The worktree's local HEAD equals the merged PR's ``headRefOid``.
+
+    Check 4 is deliberately a standalone comparison rather than a reuse of
+    ``_worktree_refuse_to_reset_reason``'s remote-branch-ahead check. This
+    repo's production ``AutoMergeConfig`` defaults to ``strategy="squash"``
+    with ``delete_branch=True``, so after a real merge the remote branch is
+    gone and the squash commit landed on the base branch is NOT an ancestor of
+    the worker branch's commits. Reusing the remote-branch-ahead helper here
+    would count every legitimately merged worktree's own work as "local
+    commit(s) not on remote branch" and skip it forever (issue #286 rework,
+    PR #340 review finding 1) -- local-ahead-of-a-deleted-remote-branch is the
+    EXPECTED shape for a squash-merged worktree, not a sign of unpushed work.
+    A worktree whose local HEAD does NOT match the merged PR's head (a stray
+    post-merge commit) is skipped with a distinct reason instead of being
+    silently folded into the same "unsafe" bucket.
+
+    Eligible worktrees are removed with ``remove_worktree`` (junction-safe)
+    and the local branch is deleted. After removals, the shared venv is
+    checked for a poisoned editable ``.pth``.
+    """
+    state_issues = state.get("issues", {})
+    state_prs = state.get("prs", {})
+    planned: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for wt in list_worktrees(repo_root):
+        wt_path = wt.get("worktree")
+        if not isinstance(wt_path, Path) or not wt_path.is_relative_to(worktrees_dir):
+            continue
+        raw_branch = str(wt.get("branch", ""))
+        branch = raw_branch.removeprefix("refs/heads/")
+        if not branch.startswith(config.dispatch.branch_prefix):
+            continue
+        issue_number = linked_issue_number(
+            {"headRefName": branch},
+            is_cross_repository=False,
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if issue_number is None:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "reason": "could not parse issue number from branch",
+                }
+            )
+            continue
+        issue_state = state_issues.get(str(issue_number), {})
+        pr_number = _find_linked_pr_number(issue_number, issue_state, state_prs)
+        if not pr_number:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "reason": "no linked PR in state.json",
+                }
+            )
+            continue
+        pr_state = state_prs.get(str(pr_number), {})
+        state_merged = bool(pr_state.get("status") == "merged" or pr_state.get("merged") is True)
+
+        # `allow_failure=True` means this never raises (see GitHub.run): errors
+        # come back as GitHubRunResult(ok=False, error=...), not exceptions.
+        gh_result = gh.run(
+            ["pr", "view", str(pr_number), "--json", PR_VIEW_MERGED_FIELDS],
+            json_output=True,
+            allow_failure=True,
+        )
+        gh_ok = isinstance(gh_result, GitHubRunResult) and gh_result.ok
+        gh_merged = False
+        merged_head_sha: str | None = None
+        if gh_ok and isinstance(gh_result.value, dict):
+            gh_merged = gh_result.value.get("state") == "MERGED"
+            merged_head_sha = gh_result.value.get("headRefOid")
+
+        if not gh_merged:
+            # Fail-closed: only a live `gh pr view` MERGED confirmation may
+            # authorize destructive removal. state.json is corroboration at
+            # best -- never sufficient on its own (state.json reliability
+            # history: #285/#309/#310). An unavailable/erroring `gh` call
+            # falls into this branch too and is DISTINGUISHED from a
+            # confirmed-not-merged PR rather than falling back to trusting
+            # state.json.
+            if not gh_ok:
+                gh_error = gh_result.error if isinstance(gh_result, GitHubRunResult) else "unknown"
+                reason = f"gh pr view unavailable; cannot confirm merge status: {gh_error}"
+            elif state_merged:
+                reason = "state.json says merged but gh pr view did not confirm MERGED"
+            else:
+                reason = "PR not merged"
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": reason,
+                }
+            )
+            continue
+        try:
+            _probe_recovery_liveness(issue_state, wt_path, config, issue_number)
+        except LiveWorkerRedispatchError as exc:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": f"live worker detected: {exc.probe_result}",
+                }
+            )
+            continue
+        try:
+            dirty_reason = _worktree_dirty_reason(wt_path)
+        except WorktreeProbeFailedError as exc:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": f"worktree status probe failed: {exc}",
+                }
+            )
+            continue
+        if dirty_reason:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": dirty_reason,
+                }
+            )
+            continue
+        if not merged_head_sha:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "gh pr view did not return headRefOid for the merged PR",
+                }
+            )
+            continue
+        head_result = run_captured(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not head_result.ok or not head_result.stdout.strip():
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "could not resolve worktree HEAD",
+                }
+            )
+            continue
+        local_head_sha = head_result.stdout.strip()
+        if local_head_sha != merged_head_sha:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": (
+                        f"worktree HEAD ({local_head_sha[:8]}) does not match merged PR head "
+                        f"({merged_head_sha[:8]}); stray post-merge commit(s)"
+                    ),
+                }
+            )
+            continue
+        if dry_run:
+            planned.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                }
+            )
+            continue
+        if not remove_worktree(repo_root, wt_path, force=True, branch=branch):
+            failed.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "remove_worktree failed",
+                }
+            )
+            continue
+        removed.append(
+            {
+                "worktree": str(wt_path),
+                "branch": branch,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+            }
+        )
+
+    venv_source = config.devin.venv_source or config.claude_code.venv_source
+    venv_ok = True
+    venv_message = "no shared venv configured; pth verification skipped"
+    if venv_source:
+        venv_path = repo_root / venv_source
+        if venv_path.is_dir():
+            venv_ok, venv_message = verify_shared_venv(repo_root, venv_path)
+        else:
+            venv_ok = False
+            venv_message = f"shared venv not found: {venv_path}"
+
+    data = {
+        "planned": planned,
+        "removed": removed,
+        "skipped": skipped,
+        "failed": failed,
+        "venv_ok": venv_ok,
+        "venv_message": venv_message,
+    }
+    ok = not failed and venv_ok
+    if dry_run:
+        message = f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped"
+    else:
+        message = (
+            f"worktree-clean: {len(removed)} removed, {len(skipped)} skipped, {len(failed)} failed"
+        )
+    if not venv_ok:
+        message = f"{message}; {venv_message}"
+    return WorktreeCleanResult(ok=ok, message=message, data=data)
