@@ -1294,3 +1294,63 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
 
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar.get("failure_kind") is None
+
+
+def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #329: workflow.py stall-event logging must tolerate a None RealActivityProbe."""
+    from charlie_work import workflow
+
+    issue_number = 329
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text("Working on task...\nLast line\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_path, (time.time(), old_time.timestamp()))
+
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}",
+        worktree_path=str(tmp_path / "worktree"),
+        prompt_path=str(tmp_path / "prompt.md"),
+        command=("devin", "--prompt-file", str(tmp_path / "prompt.md")),
+        pid=99999,
+        started_at=(datetime.now(UTC) - timedelta(minutes=31)).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        last_activity_at=old_time.isoformat().replace("+00:00", "Z"),
+        log_bytes=log_path.stat().st_size,
+        rate_limit_defer_until=None,
+    )
+    _write_json(sidecar_path, record.to_dict())
+
+    killed: list[int] = []
+    monkeypatch.setattr(
+        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
+
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+
+    assert result == [{"issue": issue_number, "pid": 99999}]
+    assert killed == [99999]
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    stalled_events = [e for e in state.get("events", []) if e.get("kind") == "session_stalled"]
+    assert len(stalled_events) == 1
+    payload = stalled_events[0]["payload"]
+    assert payload["latest_real_activity_source"] == "probe unavailable"
+    assert payload["latest_real_activity_at"] is None
+    assert payload["activity_sources"] == []

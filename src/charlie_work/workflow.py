@@ -456,6 +456,16 @@ def _detect_and_handle_stalled_sessions(
             except OSError:
                 pass
 
+            probe_payload = (
+                probe.to_payload()
+                if probe is not None
+                else {
+                    "sources": [],
+                    "latest_timestamp": None,
+                    "latest_source": "probe unavailable",
+                }
+            )
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
@@ -470,9 +480,9 @@ def _detect_and_handle_stalled_sessions(
                         "killed_pids": killed_pids,
                         "orphan_pids": orphan_pids if orphan_pids else None,
                         "failure_kind": resolved_failure_kind,
-                        "activity_sources": probe.to_payload().get("sources", []),
-                        "latest_real_activity_at": probe.to_payload().get("latest_timestamp"),
-                        "latest_real_activity_source": probe.to_payload().get("latest_source"),
+                        "activity_sources": probe_payload.get("sources", []),
+                        "latest_real_activity_at": probe_payload.get("latest_timestamp"),
+                        "latest_real_activity_source": probe_payload.get("latest_source"),
                     },
                 )
                 save_state(state_file, state)

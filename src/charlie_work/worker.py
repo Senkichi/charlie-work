@@ -15,7 +15,6 @@ from pathlib import Path
 
 from .claude_code import (
     ClaudeWorkerRecord,
-    _events_path,
     _sidecar_path as claude_sidecar_path,
     is_worker_alive,
     read_worker_records,
@@ -27,7 +26,11 @@ from .devin_shell import (
     is_session_alive,
     read_session_records,
 )
-from .post_mortem import RealActivityProbe, real_activity_for_worker
+from .post_mortem import (
+    RealActivityProbe,
+    _events_path_from_log,
+    real_activity_for_worker,
+)
 
 
 # Shim marker that indicates successful infra materialization (issue #221)
@@ -558,7 +561,7 @@ def classify_worker_health(
     # Signal 5: loop/no-progress detection (Claude Code only)
     if view.adapter_kind == "claude-code":
         # Check for events.jsonl file (sibling to log_path)
-        events_path = log_path.with_suffix(".events.jsonl")
+        events_path = _events_path_from_log(log_path)
         if events_path.exists():
             last_tool_call_at = _tail_last_tool_call_timestamp(events_path)
             log_stat = view.log_stat()
@@ -592,9 +595,7 @@ def classify_worker_health(
     # Only applies to Claude Code workers (has events.jsonl file)
     # Devin sessions have no structured usage stream, so absence is never unhealthy
     if view.adapter_kind == "claude-code":
-        # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
-        sessions_dir = Path(view.log_path).parent
-        events_path = _events_path(sessions_dir, view.issue_number)
+        events_path = _events_path_from_log(Path(view.log_path))
         usage = parse_cumulative_usage(events_path)
 
         if usage is not None:
