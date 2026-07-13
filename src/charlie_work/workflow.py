@@ -1825,8 +1825,24 @@ class OrchestratorApp:
         )
 
     def dispatch(
-        self, limit: int | None = None, *, only_issues: str | None = None
+        self,
+        limit: int | None = None,
+        *,
+        only_issues: str | None = None,
+        stalled_entries: list[dict[str, int]] | None = None,
     ) -> CommandResult:
+        """Dispatch fresh workers for ready issues.
+
+        ``stalled_entries``: pass the result of an already-completed
+        ``_detect_and_handle_stalled_sessions`` sweep to reuse it instead of
+        re-running the sweep inside this call. ``loop()`` does this because it
+        runs the sweep itself at the top of each pass; the sweep is the sole
+        writer of Signal-1's inconclusive-probe deferral counter, so re-running
+        it here would advance that counter more than once per pass and erode
+        the ``max_inconclusive_probe_deferrals`` grace period (issue #343
+        Finding 2). Standalone callers leave this as None and the sweep runs
+        inside this call as before.
+        """
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -1840,13 +1856,19 @@ class OrchestratorApp:
                     },
                 )
         try:
-            return self._dispatch_impl(limit, only_issues=only_issues)
+            return self._dispatch_impl(
+                limit, only_issues=only_issues, stalled_entries=stalled_entries
+            )
         finally:
             if fleet_lock is not None:
                 fleet_lock.release()
 
     def _dispatch_impl(
-        self, limit: int | None = None, *, only_issues: str | None = None
+        self,
+        limit: int | None = None,
+        *,
+        only_issues: str | None = None,
+        stalled_entries: list[dict[str, int]] | None = None,
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
@@ -1854,11 +1876,17 @@ class OrchestratorApp:
         # Gather sessions_dir for stall detection and live worker counting
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
 
-        # Detect and handle stalled sessions before applying concurrency governor
-        # This must run once per dispatch() call, not twice (was duplicated in governor)
-        stalled_entries = _detect_and_handle_stalled_sessions(
-            sessions_dir, self.paths.state_file, self.config
-        )
+        # Detect and handle stalled sessions before applying concurrency governor.
+        # This must run exactly once per pass, not twice (was duplicated in the
+        # governor). When the caller already ran the sweep this pass (loop()'s
+        # unconditional reaper at the top of its pass), it hands the result down
+        # via ``stalled_entries`` and the sweep is NOT re-run here — see
+        # dispatch()'s docstring for why re-running it corrupts the Signal-1
+        # deferral counter.
+        if stalled_entries is None:
+            stalled_entries = _detect_and_handle_stalled_sessions(
+                sessions_dir, self.paths.state_file, self.config
+            )
 
         # Count live workers after stall handling (stalled workers are killed)
         live_count = _count_live_sessions(sessions_dir)
@@ -3960,7 +3988,15 @@ class OrchestratorApp:
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
-        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
+        # The result is handed down to dispatch_rework()/dispatch() below so the
+        # sweep runs exactly once per pass — it is the sole writer of Signal-1's
+        # inconclusive-probe deferral counter, and re-running it inside each
+        # dispatch lane advanced the counter up to 3x per pass, collapsing the
+        # max_inconclusive_probe_deferrals "N passes of grace" into a single pass
+        # (issue #343 Finding 2).
+        loop_stalled_entries = _detect_and_handle_stalled_sessions(
+            sessions_dir, self.paths.state_file, self.config
+        )
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
         # Rework-first, then fresh fills the remainder
@@ -4012,10 +4048,12 @@ class OrchestratorApp:
             if digest:
                 emit_digest(self.config.notify, digest)
 
-        dispatch_rework = self.dispatch_rework(effective_limit)
+        dispatch_rework = self.dispatch_rework(
+            effective_limit, stalled_entries=loop_stalled_entries
+        )
         rework_count = dispatch_rework.data.get("selected_count", 0)
         fresh_limit = max(0, effective_limit - rework_count)
-        dispatch = self.dispatch(fresh_limit)
+        dispatch = self.dispatch(fresh_limit, stalled_entries=loop_stalled_entries)
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -4190,9 +4228,21 @@ class OrchestratorApp:
         )
 
     def dispatch_rework(
-        self, limit: int | None = None, *, only_issues: str | None = None
+        self,
+        limit: int | None = None,
+        *,
+        only_issues: str | None = None,
+        stalled_entries: list[dict[str, int]] | None = None,
     ) -> CommandResult:
-        """Dispatch rework workers for issues in needs-rework state with open PRs."""
+        """Dispatch rework workers for issues in needs-rework state with open PRs.
+
+        ``stalled_entries``: pass the result of an already-completed
+        ``_detect_and_handle_stalled_sessions`` sweep to skip re-running the
+        sweep inside this call — same contract as ``dispatch()`` (issue #343
+        Finding 2: the sweep writes Signal-1's inconclusive-probe deferral
+        counter, so it must run at most once per pass). Standalone callers
+        leave this as None and the sweep runs inside this call as before.
+        """
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -4207,13 +4257,19 @@ class OrchestratorApp:
                     },
                 )
         try:
-            return self._dispatch_rework_impl(limit, only_issues=only_issues)
+            return self._dispatch_rework_impl(
+                limit, only_issues=only_issues, stalled_entries=stalled_entries
+            )
         finally:
             if fleet_lock is not None:
                 fleet_lock.release()
 
     def _dispatch_rework_impl(
-        self, limit: int | None = None, *, only_issues: str | None = None
+        self,
+        limit: int | None = None,
+        *,
+        only_issues: str | None = None,
+        stalled_entries: list[dict[str, int]] | None = None,
     ) -> CommandResult:
         """Dispatch rework workers for issues in needs-rework state with open PRs.
 
@@ -4232,9 +4288,12 @@ class OrchestratorApp:
             )
 
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        # Unconditional reaper call, matching dispatch()'s :773-775 — previously
-        # this only ran when max_concurrent_sessions > 0 via the governor at :2189.
-        _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
+        # Unconditional reaper call, matching dispatch()'s — previously this
+        # only ran when max_concurrent_sessions > 0 via the governor. Skipped
+        # only when the caller (loop()) already ran the sweep this pass and
+        # handed its result down — see dispatch_rework()'s docstring.
+        if stalled_entries is None:
+            _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
         # This fallback detects dead workers even when session sidecar files are orphaned

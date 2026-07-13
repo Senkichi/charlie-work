@@ -16627,6 +16627,109 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     assert updated_session.get("failure_kind") == "stalled"
 
 
+def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One loop() pass advances the Signal-1 deferral counter at most once per worker.
+
+    Regression test for the issue #343 Finding 2 follow-up: loop() runs the
+    stall lane (_detect_and_handle_stalled_sessions) itself, and dispatch()/
+    dispatch_rework() each used to re-run it internally — three sweeps per
+    pass, each independently incrementing inconclusive_probe_deferred_count
+    for a not-alive worker with an inconclusive real-activity probe. That
+    collapsed max_inconclusive_probe_deferrals' "N passes of grace" into a
+    single pass. loop() now hands its sweep result down to both dispatch
+    lanes so the counter is written exactly once per pass.
+
+    The dead-session lane is neutralized here: pre-PR-#352 it reaps any
+    not-alive worker outright (deleting the sidecar mid-pass), and post-#352
+    it defers with its own counter suppression — either way it is covered by
+    its own tests, and this test pins the stall-lane/dispatch-lane interplay
+    in isolation so it holds on both sides of that merge.
+    """
+    from datetime import UTC, datetime
+    from charlie_work import workflow as workflow_module
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(
+            enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+
+    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "issue-343.json"
+    log_file = sessions_dir / "issue-343.log"
+    # Fresh log so Signal 3 (progress staleness) never fires; the counter is
+    # driven purely by Signal 1 (not alive) + inconclusive probe.
+    log_file.write_text("working on issue\n", encoding="utf-8")
+
+    session_record = SessionRecord(
+        issue_number=343,
+        branch="agent/issue-343-fix",
+        worktree_path=str(tmp_path / "worktrees" / "agent-343"),
+        prompt_path=str(
+            tmp_path / ".var" / "charlie-work" / "issues" / "issue-343" / "worker-prompt.md"
+        ),
+        command=("devin", "--prompt-file", "{prompt_path}"),
+        pid=99999,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+        process_start_time=time.time(),
+    )
+    session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
+
+    def _inconclusive_probe(view: Any, cfg: Any, now: Any) -> RealActivityProbe:
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="message_nodes query failed",
+                ),
+            )
+        )
+
+    # Worker process is gone; the probe cannot corroborate either way.
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
+    # Neutralize the sibling lanes (see docstring) so only the stall-lane
+    # sweeps driven by loop()/dispatch()/dispatch_rework() touch the sidecar.
+    monkeypatch.setattr(
+        workflow_module,
+        "_classify_dead_sessions_and_update_throttle_state",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "_sweep_orphan_processes_for_dead_sessions",
+        lambda *args, **kwargs: None,
+    )
+
+    result = app.loop(limit=0)
+    assert result.ok is True
+
+    sidecar = json.loads(session_file.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+    assert sidecar.get("failure_kind") is None
+
+    # Cross-pass accumulation still works: a second pass advances it once more.
+    result = app.loop(limit=0)
+    assert result.ok is True
+    sidecar = json.loads(session_file.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 2
+    assert sidecar.get("failure_kind") is None
+
+
 def test_dispatch_rework_reaps_unconditionally_when_max_concurrent_zero(tmp_path: Path) -> None:
     """Test that dispatch_rework() has the unconditional reaper call (issue #165)."""
     # Verify by code inspection that dispatch_rework calls _detect_and_handle_stalled_sessions
