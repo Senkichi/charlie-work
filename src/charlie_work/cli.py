@@ -245,7 +245,7 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
         gh,
         dry_run=args.dry_run,
     )
-    return CommandResult(result["ok"], result["message"], result["data"])
+    return CommandResult(result.ok, result.message, result.data)
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:

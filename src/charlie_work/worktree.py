@@ -352,6 +352,36 @@ def _worktree_refuse_to_reset_reason(
     return "worktree has local commits not on remote branch"
 
 
+def _worktree_dirty_reason(worktree_path: Path) -> str | None:
+    """Return a reason string if ``worktree_path`` has uncommitted modifications.
+
+    Used by the merged-PR cleanup path (``clean_worktrees``), which decides
+    eligibility by comparing the worktree's local HEAD against the merged PR's
+    ``headRefOid`` rather than by comparing against the (possibly already
+    deleted) remote branch — see ``clean_worktrees`` for why
+    ``_worktree_refuse_to_reset_reason``'s remote-branch comparison does not
+    apply once a PR has been squash-merged with its branch deleted.
+
+    Raises:
+        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
+            fails (index lock, corruption, permissions) — mirrors
+            ``_worktree_refuse_to_reset_reason``'s handling of the same failure
+            mode.
+    """
+    if not worktree_path.is_dir():
+        return None
+    status_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok:
+        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
+    if status_result.stdout.strip():
+        return "worktree has uncommitted modifications"
+    return None
+
+
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
     """Salvage a worktree with uncommitted changes or unpushed commits.
 
@@ -1568,6 +1598,21 @@ def _find_linked_pr_number(
     return None
 
 
+@dataclass(frozen=True)
+class WorktreeCleanResult:
+    """Result of a ``clean_worktrees`` run.
+
+    ``data`` carries ``planned``/``removed``/``skipped``/``failed`` (lists of
+    per-worktree dicts) plus ``venv_ok``/``venv_message``. Kept as a dict
+    rather than further nested dataclasses since callers (``CommandResult``)
+    consume it as a JSON-able blob for CLI output.
+    """
+
+    ok: bool
+    message: str
+    data: dict[str, Any]
+
+
 def clean_worktrees(
     repo_root: Path,
     worktrees_dir: Path,
@@ -1576,18 +1621,39 @@ def clean_worktrees(
     gh: GitHub,
     *,
     dry_run: bool = False,
-) -> dict[str, Any]:
+) -> WorktreeCleanResult:
     """Junction-safe cleanup of worker worktrees for merged PRs.
 
-    Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR state in
-    ``state.json`` is merged, confirms live state with ``gh pr view``, then skips
-    any worktree with a live worker, dirty tree, or unpushed commits. Eligible
-    worktrees are removed with ``remove_worktree`` (junction-safe) and the local
-    branch is deleted. After removals, the shared venv is checked for a poisoned
-    editable ``.pth``.
+    Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
+    to a PR number in ``state.json``, then applies a merged-PR-aware
+    eligibility check per worktree:
 
-    Returns a dict with ``ok``, ``message``, and ``data`` (planned, removed,
-    skipped, failed, venv_ok, venv_message).
+      1. The PR must be confirmed ``MERGED`` by a *live* ``gh pr view`` call.
+         ``state.json`` claiming "merged" is corroboration only -- it is never
+         sufficient on its own (state.json reliability history: #285/#309/
+         #310), and an unavailable/erroring ``gh`` call fails CLOSED (skip)
+         rather than falling back to trusting state.json.
+      2. No live worker (see ``_probe_recovery_liveness``).
+      3. The worktree's working tree is clean (no uncommitted modifications).
+      4. The worktree's local HEAD equals the merged PR's ``headRefOid``.
+
+    Check 4 is deliberately a standalone comparison rather than a reuse of
+    ``_worktree_refuse_to_reset_reason``'s remote-branch-ahead check. This
+    repo's production ``AutoMergeConfig`` defaults to ``strategy="squash"``
+    with ``delete_branch=True``, so after a real merge the remote branch is
+    gone and the squash commit landed on the base branch is NOT an ancestor of
+    the worker branch's commits. Reusing the remote-branch-ahead helper here
+    would count every legitimately merged worktree's own work as "local
+    commit(s) not on remote branch" and skip it forever (issue #286 rework,
+    PR #340 review finding 1) -- local-ahead-of-a-deleted-remote-branch is the
+    EXPECTED shape for a squash-merged worktree, not a sign of unpushed work.
+    A worktree whose local HEAD does NOT match the merged PR's head (a stray
+    post-merge commit) is skipped with a distinct reason instead of being
+    silently folded into the same "unsafe" bucket.
+
+    Eligible worktrees are removed with ``remove_worktree`` (junction-safe)
+    and the local branch is deleted. After removals, the shared venv is
+    checked for a poisoned editable ``.pth``.
     """
     state_issues = state.get("issues", {})
     state_prs = state.get("prs", {})
@@ -1632,30 +1698,43 @@ def clean_worktrees(
             continue
         pr_state = state_prs.get(str(pr_number), {})
         state_merged = bool(pr_state.get("status") == "merged" or pr_state.get("merged") is True)
+
+        # `allow_failure=True` means this never raises (see GitHub.run): errors
+        # come back as GitHubRunResult(ok=False, error=...), not exceptions.
+        gh_result = gh.run(
+            ["pr", "view", str(pr_number), "--json", PR_VIEW_MERGED_FIELDS],
+            json_output=True,
+            allow_failure=True,
+        )
+        gh_ok = isinstance(gh_result, GitHubRunResult) and gh_result.ok
         gh_merged = False
-        try:
-            result = gh.run(
-                ["pr", "view", str(pr_number), "--json", PR_VIEW_MERGED_FIELDS],
-                json_output=True,
-                allow_failure=True,
-            )
-            if (
-                isinstance(result, GitHubRunResult)
-                and result.ok
-                and isinstance(result.value, dict)
-            ):
-                gh_merged = result.value.get("state") == "MERGED"
-        except Exception:
-            # Treat any gh failure as "not merged" and let the state check decide.
-            gh_merged = False
-        if not state_merged and not gh_merged:
+        merged_head_sha: str | None = None
+        if gh_ok and isinstance(gh_result.value, dict):
+            gh_merged = gh_result.value.get("state") == "MERGED"
+            merged_head_sha = gh_result.value.get("headRefOid")
+
+        if not gh_merged:
+            # Fail-closed: only a live `gh pr view` MERGED confirmation may
+            # authorize destructive removal. state.json is corroboration at
+            # best -- never sufficient on its own (state.json reliability
+            # history: #285/#309/#310). An unavailable/erroring `gh` call
+            # falls into this branch too and is DISTINGUISHED from a
+            # confirmed-not-merged PR rather than falling back to trusting
+            # state.json.
+            if not gh_ok:
+                gh_error = gh_result.error if isinstance(gh_result, GitHubRunResult) else "unknown"
+                reason = f"gh pr view unavailable; cannot confirm merge status: {gh_error}"
+            elif state_merged:
+                reason = "state.json says merged but gh pr view did not confirm MERGED"
+            else:
+                reason = "PR not merged"
             skipped.append(
                 {
                     "worktree": str(wt_path),
                     "branch": branch,
                     "issue_number": issue_number,
                     "pr_number": pr_number,
-                    "reason": "PR not merged",
+                    "reason": reason,
                 }
             )
             continue
@@ -1673,7 +1752,7 @@ def clean_worktrees(
             )
             continue
         try:
-            unsafe_reason = _worktree_refuse_to_reset_reason(repo_root, branch, "", wt_path)
+            dirty_reason = _worktree_dirty_reason(wt_path)
         except WorktreeProbeFailedError as exc:
             skipped.append(
                 {
@@ -1685,14 +1764,56 @@ def clean_worktrees(
                 }
             )
             continue
-        if unsafe_reason:
+        if dirty_reason:
             skipped.append(
                 {
                     "worktree": str(wt_path),
                     "branch": branch,
                     "issue_number": issue_number,
                     "pr_number": pr_number,
-                    "reason": unsafe_reason,
+                    "reason": dirty_reason,
+                }
+            )
+            continue
+        if not merged_head_sha:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "gh pr view did not return headRefOid for the merged PR",
+                }
+            )
+            continue
+        head_result = run_captured(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not head_result.ok or not head_result.stdout.strip():
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "could not resolve worktree HEAD",
+                }
+            )
+            continue
+        local_head_sha = head_result.stdout.strip()
+        if local_head_sha != merged_head_sha:
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": (
+                        f"worktree HEAD ({local_head_sha[:8]}) does not match merged PR head "
+                        f"({merged_head_sha[:8]}); stray post-merge commit(s)"
+                    ),
                 }
             )
             continue
@@ -1754,4 +1875,4 @@ def clean_worktrees(
         )
     if not venv_ok:
         message = f"{message}; {venv_message}"
-    return {"ok": ok, "message": message, "data": data}
+    return WorktreeCleanResult(ok=ok, message=message, data=data)

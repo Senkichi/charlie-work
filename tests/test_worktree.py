@@ -14,6 +14,7 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfi
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
+    WorktreeCleanResult,
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeState,
@@ -2918,22 +2919,51 @@ def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") ->
 
 
 class _FakeGH:
+    """Fake ``GitHub`` for ``clean_worktrees`` tests.
+
+    ``available=False`` simulates ``gh`` itself failing/being unreachable
+    (``GitHubRunResult(ok=False, ...)``), distinct from ``gh`` succeeding but
+    reporting a PR state other than ``MERGED``.
+    """
+
     def __init__(
-        self, pr_state: str = "MERGED", merged_at: str | None = "2026-07-13T01:33:43Z"
+        self,
+        pr_state: str = "MERGED",
+        merged_at: str | None = "2026-07-13T01:33:43Z",
+        head_sha: str | None = None,
+        *,
+        available: bool = True,
+        error: str = "gh: could not resolve to a PullRequest",
     ) -> None:
         self.pr_state = pr_state
         self.merged_at = merged_at
+        self.head_sha = head_sha
+        self.available = available
+        self.error = error
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
     ) -> GitHubRunResult:
         if args[:2] == ["pr", "view"] and json_output and allow_failure:
+            if not self.available:
+                return GitHubRunResult(
+                    ok=False,
+                    returncode=1,
+                    stdout="",
+                    stderr=self.error,
+                    value=None,
+                    error=self.error,
+                )
             return GitHubRunResult(
                 ok=True,
                 returncode=0,
                 stdout="",
                 stderr="",
-                value={"state": self.pr_state, "mergedAt": self.merged_at},
+                value={
+                    "state": self.pr_state,
+                    "mergedAt": self.merged_at,
+                    "headRefOid": self.head_sha,
+                },
                 error=None,
             )
         return GitHubRunResult(
@@ -2998,6 +3028,7 @@ def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
     info = create_worktree(repo_root, "agent/issue-1-merged", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
     worktrees_dir = _default_worktrees_dir(repo_root)
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     state = _make_state(issue_number=1, pr_number=101)
@@ -3007,14 +3038,15 @@ def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=head_sha),
     )
 
-    assert result["ok"] is True
-    assert len(result["data"]["removed"]) == 1
+    assert isinstance(result, WorktreeCleanResult)
+    assert result.ok is True
+    assert len(result.data["removed"]) == 1
     assert not info.path.exists()
-    assert result["data"]["venv_ok"] is True
-    assert "main checkout" in result["data"]["venv_message"]
+    assert result.data["venv_ok"] is True
+    assert "main checkout" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
@@ -3027,6 +3059,7 @@ def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
     info = create_worktree(repo_root, "agent/issue-2-dirty", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
     (info.path / "dirty_file.txt").write_text("local changes", encoding="utf-8")
     worktrees_dir = _default_worktrees_dir(repo_root)
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
@@ -3037,16 +3070,22 @@ def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=head_sha),
     )
 
-    assert result["ok"] is True
-    assert len(result["data"]["skipped"]) == 1
-    assert "uncommitted" in result["data"]["skipped"][0]["reason"]
+    assert result.ok is True
+    assert len(result.data["skipped"]) == 1
+    assert "uncommitted" in result.data["skipped"][0]["reason"]
     assert info.path.exists()
 
 
-def test_clean_worktrees_skips_unpushed_worktree(tmp_path: Path) -> None:
+def test_clean_worktrees_skips_stray_post_merge_commit(tmp_path: Path) -> None:
+    """A worktree HEAD that no longer matches the merged PR's headRefOid (a
+    stray commit made after GitHub recorded the merge) must be skipped with a
+    distinct reason -- it must NOT be silently removed just because the PR
+    state.json/gh say "merged" (review finding 1: eligibility requires HEAD ==
+    merged PR head, not just "PR is merged somewhere").
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     (repo_root / "src" / "charlie_work").mkdir(parents=True)
@@ -3055,12 +3094,15 @@ def test_clean_worktrees_skips_unpushed_worktree(tmp_path: Path) -> None:
     _git(repo_root, "commit", "-m", "add charlie_work")
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
-    info = create_worktree(repo_root, "agent/issue-3-unpushed", base_ref="HEAD")
+    info = create_worktree(repo_root, "agent/issue-3-stray-commit", base_ref="HEAD")
     _git(info.path, "config", "user.email", "test@example.test")
     _git(info.path, "config", "user.name", "Test User")
-    (info.path / "new_file.txt").write_text("unpushed work", encoding="utf-8")
+    # This is the SHA GitHub would report as the merged PR's headRefOid --
+    # captured BEFORE the stray commit below.
+    merged_head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    (info.path / "new_file.txt").write_text("stray post-merge commit", encoding="utf-8")
     _git(info.path, "add", "new_file.txt")
-    _git(info.path, "commit", "-m", "unpushed commit")
+    _git(info.path, "commit", "-m", "stray commit made after the PR was merged")
     worktrees_dir = _default_worktrees_dir(repo_root)
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     state = _make_state(issue_number=3, pr_number=103)
@@ -3070,13 +3112,83 @@ def test_clean_worktrees_skips_unpushed_worktree(tmp_path: Path) -> None:
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=merged_head_sha),
     )
 
-    assert result["ok"] is True
-    assert len(result["data"]["skipped"]) == 1
-    assert "local" in result["data"]["skipped"][0]["reason"].lower()
+    assert result.ok is True
+    assert len(result.data["skipped"]) == 1
+    reason = result.data["skipped"][0]["reason"].lower()
+    assert "stray" in reason or "does not match" in reason
     assert info.path.exists()
+
+
+def test_clean_worktrees_removes_squash_merged_worktree_with_deleted_remote_branch(
+    tmp_path: Path,
+) -> None:
+    """Production-mirroring regression test (review finding 1).
+
+    This repo's ``AutoMergeConfig`` defaults are ``strategy="squash"`` with
+    ``delete_branch=True``. After a real merge: the remote branch is gone, and
+    the squash commit landed on ``main`` is NOT an ancestor of the worker
+    branch's own commit (its tree matches, but it is a distinct commit with a
+    different parent). The old ``_worktree_refuse_to_reset_reason``-based
+    eligibility check counted the worker's own committed work as "local
+    commit(s) not on remote branch" in exactly this shape and refused to clean
+    up, forever. ``clean_worktrees`` must still remove the worktree here
+    because gh confirms MERGED and the worktree's local HEAD equals the
+    merged PR's headRefOid -- local-ahead-of-a-deleted-remote is expected.
+    """
+    remote, repo_root = _init_repo_with_remote(tmp_path)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _git(repo_root, "push", "origin", "main")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    branch_name = "agent/issue-7-squash-merged"
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("real work\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "real work for issue 7")
+    branch_head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    push_ok, push_error = push_branch(repo_root, branch_name, worktree_path=info.path)
+    assert push_ok, push_error
+
+    # Simulate a squash-merge into main: a NEW commit on main whose parent is
+    # main's own tip, not an ancestor of branch_head_sha.
+    _git(repo_root, "merge", "--squash", branch_name)
+    _git(repo_root, "commit", "-m", f"squash merge of {branch_name}")
+    _git(repo_root, "push", "origin", "main")
+    # Simulate delete_branch=True: the remote branch is gone after merge.
+    _git(repo_root, "push", "origin", "--delete", branch_name)
+
+    # Sanity-check the exact regression shape: the squash commit on main is
+    # NOT an ancestor of the branch's own commit.
+    is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", branch_head_sha, "main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert is_ancestor.returncode != 0, "test setup invalid: squash commit must not be an ancestor"
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=7, pr_number=107)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=branch_head_sha),
+    )
+
+    assert len(result.data["skipped"]) == 0, result.data["skipped"]
+    assert len(result.data["removed"]) == 1
+    assert result.ok is True
+    assert not info.path.exists()
 
 
 def test_clean_worktrees_skips_live_worker(tmp_path: Path) -> None:
@@ -3089,6 +3201,7 @@ def test_clean_worktrees_skips_live_worker(tmp_path: Path) -> None:
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
     info = create_worktree(repo_root, "agent/issue-4-live", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
     worktrees_dir = _default_worktrees_dir(repo_root)
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     issue_state = {
@@ -3105,12 +3218,12 @@ def test_clean_worktrees_skips_live_worker(tmp_path: Path) -> None:
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=head_sha),
     )
 
-    assert result["ok"] is True
-    assert len(result["data"]["skipped"]) == 1
-    assert "live" in result["data"]["skipped"][0]["reason"].lower()
+    assert result.ok is True
+    assert len(result.data["skipped"]) == 1
+    assert "live" in result.data["skipped"][0]["reason"].lower()
     assert info.path.exists()
 
 
@@ -3124,6 +3237,7 @@ def test_clean_worktrees_dry_run_reports_plan_and_does_not_remove(tmp_path: Path
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
     info = create_worktree(repo_root, "agent/issue-5-dry-run", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
     worktrees_dir = _default_worktrees_dir(repo_root)
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     state = _make_state(issue_number=5, pr_number=105)
@@ -3133,13 +3247,13 @@ def test_clean_worktrees_dry_run_reports_plan_and_does_not_remove(tmp_path: Path
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=head_sha),
         dry_run=True,
     )
 
-    assert result["ok"] is True
-    assert len(result["data"]["planned"]) == 1
-    assert len(result["data"]["removed"]) == 0
+    assert result.ok is True
+    assert len(result.data["planned"]) == 1
+    assert len(result.data["removed"]) == 0
     assert info.path.exists()
 
 
@@ -3153,6 +3267,7 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     _git(repo_root, "commit", "-m", "add charlie_work")
 
     info = create_worktree(repo_root, "agent/issue-6-poison", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
     _create_shared_venv(repo_root, pth_target=info.path / "src")
 
     worktrees_dir = _default_worktrees_dir(repo_root)
@@ -3164,10 +3279,172 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
         worktrees_dir,
         state,
         config,
-        _FakeGH(),
+        _FakeGH(head_sha=head_sha),
     )
 
-    assert result["ok"] is False
-    assert len(result["data"]["removed"]) == 1
-    assert result["data"]["venv_ok"] is False
-    assert "points outside main checkout" in result["data"]["venv_message"]
+    assert result.ok is False
+    assert len(result.data["removed"]) == 1
+    assert result.data["venv_ok"] is False
+    assert "points outside main checkout" in result.data["venv_message"]
+
+
+def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
+    """Review finding 2: an open-PR worktree must never be removed.
+
+    This is the highest-severity failure mode -- destroying a worktree whose
+    PR is still open and possibly still being worked on.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-8-open", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=8, pr_number=108, status="open")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="OPEN"),
+    )
+
+    assert len(result.data["removed"]) == 0
+    assert len(result.data["skipped"]) == 1
+    assert "not merged" in result.data["skipped"][0]["reason"].lower()
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_unmerged_pr(tmp_path: Path) -> None:
+    """Review finding 2: a closed-but-not-merged PR's worktree must be skipped,
+    not treated as eligible just because the PR is no longer open.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-9-closed", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=9, pr_number=109, status="closed")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED", merged_at=None),
+    )
+
+    assert len(result.data["removed"]) == 0
+    assert len(result.data["skipped"]) == 1
+    assert "not merged" in result.data["skipped"][0]["reason"].lower()
+    assert info.path.exists()
+
+
+def test_clean_worktrees_state_json_merged_alone_is_not_sufficient(tmp_path: Path) -> None:
+    """Review finding 3: state.json claiming "merged" must NOT authorize
+    removal when the live gh pr view disagrees. Mutating the eligibility
+    check to ``state_merged or gh_merged`` (the pre-fix behavior) makes this
+    test fail, since state.json here says "merged" but gh reports OPEN.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-10-stale-state", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    # state.json (stale/wrong) claims the PR is merged.
+    state = _make_state(issue_number=10, pr_number=110, status="merged")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="OPEN"),
+    )
+
+    assert len(result.data["removed"]) == 0
+    assert len(result.data["skipped"]) == 1
+    reason = result.data["skipped"][0]["reason"].lower()
+    assert "state.json" in reason
+    assert "gh pr view" in reason
+    assert info.path.exists()
+
+
+def test_clean_worktrees_gh_unavailable_fails_closed(tmp_path: Path) -> None:
+    """Review finding 3: when gh itself is unavailable/erroring, clean_worktrees
+    must fail CLOSED (skip) rather than falling back to trusting state.json,
+    even though state.json says "merged".
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-11-gh-down", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=11, pr_number=111, status="merged")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(available=False, error="gh: network is unreachable"),
+    )
+
+    assert len(result.data["removed"]) == 0
+    assert len(result.data["skipped"]) == 1
+    reason = result.data["skipped"][0]["reason"]
+    assert "unavailable" in reason.lower() or "cannot confirm" in reason.lower()
+    assert "network is unreachable" in reason
+    assert info.path.exists()
+
+
+def test_clean_worktrees_removes_junctioned_worktree_and_preserves_shared_venv_contents(
+    tmp_path: Path,
+) -> None:
+    """Non-blocking review item: junction safety through the clean_worktrees
+    path itself (not just remove_worktree in isolation). A worktree with a
+    live ``.venv`` junction removed via clean_worktrees must delete only the
+    reparse point, never the shared venv's real contents.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Mirror this repo's own .gitignore (.venv/ is ignored); otherwise the
+    # .venv junction itself shows up as an untracked path under `git status
+    # --porcelain` and the dirty check would (incorrectly, for this test's
+    # purposes) treat every junctioned worktree as dirty.
+    (repo_root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    _git(repo_root, "add", ".gitignore")
+    _git(repo_root, "commit", "-m", "add .gitignore")
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+    marker = venv_source / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    info = create_worktree(
+        repo_root, "agent/issue-12-junction", base_ref="HEAD", venv_source=venv_source
+    )
+    assert is_junction(info.path / ".venv")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    # No devin.venv_source configured here: this test is only about the
+    # removal path's junction safety (remove_worktree), not the separate
+    # post-removal poisoned-.pth check, which has its own dedicated tests.
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=12, pr_number=112)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert len(result.data["removed"]) == 1
+    assert not info.path.exists()
+    # The shared venv itself, and its contents, must survive the junction-safe
+    # removal driven through clean_worktrees.
+    assert venv_source.exists()
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
