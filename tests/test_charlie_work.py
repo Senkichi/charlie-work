@@ -14123,6 +14123,84 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
     assert worker["cost_usd"] is None
 
 
+def test_status_workers_section_claude_code_rework_layout(tmp_path: Path) -> None:
+    """Issue #329 (F1): status()'s _summarize_worker must use the canonical
+    events.jsonl derivation for rework-layout claude-code sessions too.
+
+    A rework claude-code session logs to ``issue-<n>-rework.claude.log``, with
+    its structured events at ``issue-<n>-rework.events.jsonl`` -- not
+    ``issue-<n>.events.jsonl``, which the old rework=False-only
+    ``_events_path(sessions_dir, issue_number)`` derivation would read instead
+    (a stale prior attempt's tool_calls/tokens/cost_usd, or nothing). This
+    test plants both a stale non-rework events.jsonl and the real rework
+    sibling, and asserts the workers section reports the rework sibling's
+    usage, not the stale one's.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithWorkers(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return set()
+
+    fake_gh = FakeGitHubWithWorkers()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    issue_number = 329
+    log_file = sessions_dir / f"issue-{issue_number}-rework.claude.log"
+    log_file.write_text("reworking issue\n", encoding="utf-8")
+
+    # Stale events.jsonl from a prior (non-rework) attempt: different usage.
+    stale_events_file = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    stale_events_file.write_text(
+        '{"type": "tool_call", "tokens": 111, "cost_usd": 0.11}\n',
+        encoding="utf-8",
+    )
+
+    # The real rework events.jsonl sibling: the usage that must be reported.
+    events_file = sessions_dir / f"issue-{issue_number}-rework.events.jsonl"
+    events_file.write_text(
+        '{"type": "tool_call", "tokens": 987654, "cost_usd": 12.34}\n{"type": "tool_call"}\n',
+        encoding="utf-8",
+    )
+
+    record = ClaudeWorkerRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}",
+        worktree_path="/fake/path",
+        prompt_path="/fake/prompt",
+        command=("claude", "-p"),
+        pid=54321,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+    )
+    sidecar = sessions_dir / f"issue-{issue_number}-rework.claude.json"
+    sidecar.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    assert len(result.data["workers"]) == 1
+    worker = result.data["workers"][0]
+    assert worker["issue"] == issue_number
+    assert worker["adapter"] == "claude-code"
+    assert worker["tool_calls"] == 2
+    assert worker["tokens"] == 987654
+    assert worker["cost_usd"] == 12.34
+
+
 @pytest.mark.real_activity_probe_live
 def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path) -> None:
     """Issue #301 status()-path wiring: a claude-code worker whose sidecar log is
