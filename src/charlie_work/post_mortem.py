@@ -602,27 +602,83 @@ def _classify_nodes(
     return None, None, terminal_tool
 
 
+def _events_path_from_log(log_path: Path) -> Path:
+    """Return the events.jsonl sibling path for a worker log path.
+
+    Supports Claude Code's ``issue-<n>.claude.log`` /
+    ``issue-<n>-rework.claude.log`` as well as the devin-shell
+    ``issue-<n>.log`` shape.
+    """
+    name = log_path.name
+    if name.endswith(".claude.log"):
+        return log_path.with_name(name[: -len(".claude.log")] + ".events.jsonl")
+    return log_path.with_suffix(".events.jsonl")
+
+
+def _last_event_timestamp(events_path: Path) -> datetime | None:
+    """Return the latest ISO timestamp found in an events.jsonl file.
+
+    Lines are expected to be JSON objects containing a ``timestamp`` field.
+    Returns None for a missing file, malformed content, or no timestamps.
+    Naive timestamps are treated as UTC.
+    """
+    if not events_path.exists():
+        return None
+
+    latest: datetime | None = None
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                timestamp_str = event.get("timestamp")
+                if not isinstance(timestamp_str, str):
+                    continue
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=UTC)
+                    if latest is None or timestamp > latest:
+                        latest = timestamp
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        return None
+    return latest
+
+
 def real_activity_for_worker(
     pm_config: PostMortemConfig,
     worktree_path: str,
     started_at: str,
     pid: int | None,
     now: datetime,
+    log_path: str | None = None,
 ) -> RealActivityProbe:
     """Build a ``RealActivityProbe`` for a live worker session.
 
-    Corroborates the sidecar log's mtime against two independent, real-session
+    Corroborates the sidecar log's mtime against independent, real-session
     signals that continue to advance even when a shim has frozen the sidecar:
 
     1. The Devin CLI's sessions.db ``message_nodes`` table, matched by the
        worker's ``worktree_path`` and its ``started_at`` window.
     2. The Devin CLI's own per-PID log file(s) for the worker PID, located
        in the ``logs/`` sibling of sessions.db.
+    3. Claude Code's ``events.jsonl`` stream-json sibling to the worker's
+       ``log_path``, using either the last event timestamp or the file's mtime.
 
-    Either source is sufficient to show the worker is healthy. If both are
-    quiet past the threshold, the caller should treat the session as genuinely
-    stalled. Any I/O or schema problem is recorded as a source ``error`` and
-    does not raise — this is best-effort, just like the post-mortem extractor.
+    Any source with a fresh timestamp is sufficient to show the worker is
+    healthy. If every available source is quiet past the threshold, the caller
+    should treat the session as genuinely stalled. Any I/O or schema problem
+    is recorded as a source ``error`` and does not raise — this is best-effort,
+    just like the post-mortem extractor.
     """
     sources: list[ActivitySource] = []
     db_path = _resolve_db_path(pm_config.db_path)
@@ -754,6 +810,35 @@ def real_activity_for_worker(
                 error=None,
             )
         )
+
+    # --- Source 3: Claude Code events.jsonl stream-json sibling
+    if log_path:
+        events_path = _events_path_from_log(Path(log_path))
+        if events_path.exists():
+            try:
+                events_stat = events_path.stat()
+                events_mtime = datetime.fromtimestamp(events_stat.st_mtime, tz=UTC)
+                last_event_ts = _last_event_timestamp(events_path)
+                timestamp = events_mtime
+                if last_event_ts is not None and last_event_ts > timestamp:
+                    timestamp = last_event_ts
+                sources.append(
+                    ActivitySource(
+                        name="claude_events_jsonl",
+                        timestamp=timestamp,
+                        staleness_seconds=(now - timestamp).total_seconds(),
+                        error=None,
+                    )
+                )
+            except OSError as exc:
+                sources.append(
+                    ActivitySource(
+                        name="claude_events_jsonl",
+                        timestamp=None,
+                        staleness_seconds=None,
+                        error=f"events.jsonl read failed: {exc}",
+                    )
+                )
 
     return RealActivityProbe(sources=tuple(sources))
 

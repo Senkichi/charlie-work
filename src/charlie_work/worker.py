@@ -71,8 +71,8 @@ def _log_is_stalled_at_shim(
     1. The shim marker is present in the log
     2. The log file has not been modified within the grace period
     3. The log is small (<= 1KB) - indicating no real progress
-    4. Independent real-session activity (sessions.db or per-PID Devin log)
-       is also quiet past the grace period
+    4. Independent real-session activity (sessions.db, per-PID Devin log, or
+       Claude Code events.jsonl) is also quiet past the grace period
 
     This detects workers that hang immediately after shim materialization
     with error:null, alive PID, and frozen logs, while avoiding false
@@ -427,9 +427,9 @@ def classify_worker_health(
     7. (none of the above) → HEALTHY
 
     Signal 3 (progress staleness) is corroborated against ``real_activity_probe``.
-    If the sidecar log is stale but the real-session activity source (sessions.db
-    or per-PID Devin log) is fresh, the worker is not classified as STALLED
-    (issue #280).
+    If the sidecar log is stale but any real-session activity source (sessions.db,
+    per-PID Devin log, or Claude Code events.jsonl) is fresh, the worker is not
+    classified as STALLED (issues #280, #301).
 
     Args:
         view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
@@ -752,8 +752,8 @@ def real_activity_probe_for(
 
     This is the convenience wrapper that the watchdog callers use; it delegates
     to ``post_mortem.real_activity_for_worker`` with the fields ``view`` already
-    carries (worktree_path, started_at, pid) so the rest of the codebase does
-    not repeat that plumbing.
+    carries (worktree_path, started_at, pid, log_path) so the rest of the
+    codebase does not repeat that plumbing.
     """
     return real_activity_for_worker(
         config.post_mortem,
@@ -761,6 +761,7 @@ def real_activity_probe_for(
         view.started_at,
         view.pid,
         now,
+        view.log_path,
     )
 
 

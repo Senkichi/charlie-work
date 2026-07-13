@@ -7,16 +7,18 @@ from pathlib import Path
 import pytest
 
 import os
+import time
 
 from charlie_work.claude_code import ClaudeWorkerRecord
-from charlie_work.config import OrchestratorConfig, WatchdogConfig
+from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
+from charlie_work.config import OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
     _write_json,
 )
 from charlie_work.post_mortem import ActivitySource, RealActivityProbe
-from charlie_work.worker import WorkerView, _log_is_stalled_at_shim, iter_workers
+from charlie_work.worker import WorkerHealth, WorkerView, _log_is_stalled_at_shim, iter_workers
 
 
 def test_iter_workers_empty_dir(tmp_path: Path) -> None:
@@ -1048,3 +1050,73 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
     )
     assert sidecar["failure_kind"] == "stalled"
     assert sidecar.get("rate_limit_defer_until") is None
+
+
+def test_detect_stalled_sessions_passes_real_activity_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #301: workflow.py stall paths must construct and pass a RealActivityProbe.
+
+    A future edit that drops the probe argument will make this test fail because
+    the spy will receive None instead of a constructed probe.
+    """
+    from charlie_work import workflow
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    issue_number = 301
+
+    log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+    log_path.write_text("Working on task...\nLast line", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_path, (time.time(), old_time.timestamp()))
+
+    events_path = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    fresh_time = datetime.now(UTC) - timedelta(minutes=1)
+    events_path.write_text(
+        f'{{"type": "tool_call", "timestamp": "{fresh_time.isoformat()}"}}\n',
+        encoding="utf-8",
+    )
+    os.utime(events_path, (time.time(), fresh_time.timestamp()))
+
+    sidecar_path = claude_sidecar_path(sessions_dir, issue_number)
+    record = ClaudeWorkerRecord(
+        issue_number=issue_number,
+        branch="agent/issue-301",
+        worktree_path=str(tmp_path / "worktree"),
+        prompt_path=str(tmp_path / "prompt.md"),
+        command=("claude", "prompt.md"),
+        pid=99999,
+        started_at=(datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    captured: list[RealActivityProbe | None] = []
+
+    def spy_classify(
+        view: WorkerView,
+        config: OrchestratorConfig,
+        now: datetime,
+        real_activity_probe: RealActivityProbe | None = None,
+    ) -> WorkerHealth:
+        captured.append(real_activity_probe)
+        return WorkerHealth.HEALTHY
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.classify_worker_health", spy_classify)
+
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
+    )
+    result = workflow._detect_stalled_sessions(sessions_dir, config)
+
+    assert result == []
+    assert len(captured) == 1
+    assert captured[0] is not None
+    assert isinstance(captured[0], RealActivityProbe)
+    assert captured[0].latest_source == "claude_events_jsonl"
