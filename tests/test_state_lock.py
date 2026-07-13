@@ -7,11 +7,15 @@ These target two review findings from PR #248 (supervised-infill-loop):
   ``acquired``, so a timed-out lock leaked the handle for the life of the
   process.
 - finding #8: a pre-existing 0-byte lock file (e.g. left over from an older
-  ``touch()``-based implementation) must not permanently block acquisition --
-  ``msvcrt.locking`` raises ``EACCES`` on a 0-byte file even for a
-  non-blocking attempt.
+  ``touch()``-based implementation) must not permanently block acquisition.
+  Finding #8 originally claimed ``msvcrt.locking`` raises ``EACCES`` on a
+  0-byte file; probing the deployed runtime (Python 3.13.5, Windows 11) in
+  #324/#328 disproved that -- ``LK_NBLCK`` with ``nbytes=1`` succeeds on a
+  genuine 0-byte file, so the write-1-byte guards were removed as dead code
+  and the test below now characterizes lock acquisition on the bare 0-byte
+  file.
 
-Both defects are Windows-specific (``msvcrt`` byte-range locking); these
+Both behaviors are Windows-specific (``msvcrt`` byte-range locking); these
 tests are skipped on non-Windows platforms.
 """
 
@@ -69,15 +73,20 @@ def test_state_lock_timeout_closes_handle(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_state_lock_zero_byte_existing_file_acquires(tmp_path: Path, caplog) -> None:
-    """Regression for finding #8: a pre-existing 0-byte lock file must not
-    permanently block acquisition on the state_lock path either.
+    """Characterization for finding #8: a pre-existing 0-byte lock file must
+    not permanently block acquisition on the state_lock path either.
+
+    Probe on the deployed runtime (Python 3.13.5, Windows 11):
+    ``msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)`` succeeds on a genuine 0-byte
+    file and the file size remains 0, so ``state_lock`` carries no padding
+    guard (#324/#328) and must acquire the bare 0-byte file directly.
 
     ``state_lock`` is best-effort: it yields regardless of whether the lock
     was actually acquired, so a bare ``with state_lock(...): pass`` succeeding
-    proves nothing on its own -- the OLD 0-byte bug would still "succeed"
-    after silently falling through the 30s timeout. Assert the acquire-failed
-    warning is NOT logged, proving the lock was genuinely acquired on first
-    try rather than via the best-effort timeout fallback.
+    proves nothing on its own -- a genuine 0-byte acquisition failure would
+    still "succeed" after silently falling through the 30s timeout. Assert
+    the acquire-failed warning is NOT logged, proving the lock was genuinely
+    acquired on first try rather than via the best-effort timeout fallback.
     """
     import logging
 
@@ -94,3 +103,4 @@ def test_state_lock_zero_byte_existing_file_acquires(tmp_path: Path, caplog) -> 
         "state_lock fell through to the best-effort timeout path instead of "
         "genuinely acquiring the 0-byte lock file on the first try"
     )
+    assert lock_path.stat().st_size == 0, "lock acquisition should not pad the file"

@@ -100,25 +100,17 @@ def state_lock(state_path: Path):
     thread_lock = _thread_lock_for(state_path)
     thread_lock.acquire()
     try:
-        # Create lock file if it doesn't exist.
-        # Write 1 byte so msvcrt.locking(... 1) has a byte-range to lock:
-        # msvcrt locks specific byte ranges and raises EACCES on a 0-byte file.
-        # (Same gap as supervisor.lock — both use LK_NBLCK with nbytes=1.)
-        if not lock_path.exists():
-            lock_path.write_bytes(b"\x00")
+        # Create the lock file if needed. touch() leaves it at 0 bytes, which
+        # is fine: msvcrt.locking(..., LK_NBLCK, 1) succeeds on a 0-byte file
+        # on the deployed runtime (Python 3.13.5, Windows 11) — probed in
+        # #324/#328, which removed the same write-1-byte guards from
+        # file_lock.py as dead code.
+        lock_path.touch()
 
         if sys.platform == "win32":
             import msvcrt
 
             lock_file = lock_path.open("r+b", encoding=None)
-            # Guard against a pre-existing 0-byte lock file (e.g. left over
-            # from an older touch()-based implementation) — the write above
-            # only fires when the file doesn't exist yet, so a stale empty
-            # file would still make msvcrt.locking raise EACCES.
-            if lock_file.seek(0, 2) == 0:
-                lock_file.write(b"\x00")
-                lock_file.flush()
-            lock_file.seek(0)
             # msvcrt.locking mode: 0 = lock, 1 = unlock
             # LK_NBLCK = non-blocking lock, LK_LOCK = blocking lock
             # We use a retry loop with timeout for bounded waiting
