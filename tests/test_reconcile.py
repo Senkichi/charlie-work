@@ -7,7 +7,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.config import OrchestratorConfig
+from _sessions_db_fixtures import make_sessions_db
+from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.github import _LIST_LIMIT as github_list_limit
 from charlie_work.reconcile import (
@@ -1041,61 +1042,25 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
     its unpushed local commits on the next branch reset. It must escalate
     (session_failed_escalated) instead, mirroring workflow.py's
     "redispatch_escalated" edge for the same signal."""
-    import json
-    import sqlite3
-    from datetime import UTC, datetime
-
-    from charlie_work.config import PostMortemConfig
-    from charlie_work.devin_shell import SessionRecord
-
     worktree_path = str(tmp_path / "worktree")
     now = datetime.now(UTC)
 
-    # REAL production sessions.db schema (verified live 2026-07-12 — see
-    # tests/test_post_mortem.py): role/content live inside the chat_message
-    # JSON blob, ordering is by per-session node_id.
     db_path = tmp_path / "sessions.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, "
-            "backend_type TEXT NOT NULL, model TEXT NOT NULL, agent_mode TEXT NOT NULL, "
-            "created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL)"
-        )
-        conn.execute(
-            "CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "session_id TEXT NOT NULL, node_id INTEGER NOT NULL, parent_node_id INTEGER, "
-            "chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT, "
-            "UNIQUE(session_id, node_id))"
-        )
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, "
-            "created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
-            ("sess-1", worktree_path, now.isoformat(), now.isoformat()),
-        )
-        conn.execute(
-            "INSERT INTO message_nodes (session_id, node_id, chat_message, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                "sess-1",
-                1,
-                json.dumps(
-                    {
-                        "message_id": "msg-1",
-                        "role": "tool",
-                        "content": (
-                            'Tool blocked: {"decision": "block", '
-                            '"reason": "push-gate hook rejected"}'
-                        ),
-                        "metadata": None,
-                    }
+    make_sessions_db(
+        db_path,
+        session_id="sess-1",
+        working_directory=worktree_path,
+        created_at=now.isoformat(),
+        rows=[
+            {
+                "role": "tool",
+                "content": (
+                    'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}'
                 ),
-                now.isoformat(),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+                "created_at": now.isoformat(),
+            }
+        ],
+    )
 
     config = OrchestratorConfig(post_mortem=PostMortemConfig(db_path=str(db_path)))
     gh = FakeGitHub(

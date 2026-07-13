@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
@@ -2633,24 +2634,14 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
 
     # Build a fake Devin sessions.db with a recent session/message for this worktree.
     db_path = tmp_path / "sessions.db"
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
-    conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
-    )
     now = datetime.now(UTC).isoformat()
-    conn.execute(
-        "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
-        ("session-1", str(worktree_path), now),
+    make_sessions_db(
+        db_path,
+        session_id="session-1",
+        working_directory=str(worktree_path),
+        created_at=now,
+        rows=[{"role": "tool", "content": "tool result", "created_at": now}],
     )
-    conn.execute(
-        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("session-1", 1, "tool", "tool result", now),
-    )
-    conn.commit()
-    conn.close()
 
     # The per-PID Devin log source must also resolve WITHOUT an error (issue
     # #282 rework: any errored source makes the whole probe inconclusive and
@@ -2714,9 +2705,6 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
 
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (working_directory TEXT, created_at TEXT)")
-    conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
-    )
     conn.commit()
     conn.close()
 
@@ -2868,24 +2856,14 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
 
     db_path = tmp_path / "sessions.db"
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
-    conn.execute(
-        "CREATE TABLE message_nodes (id INTEGER PRIMARY KEY, session_id TEXT, node_id INTEGER, role TEXT, content TEXT, created_at TEXT)"
-    )
     stale_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
-    conn.execute(
-        "INSERT INTO sessions (id, working_directory, created_at) VALUES (?, ?, ?)",
-        ("session-1", str(worktree_path), stale_iso),
+    make_sessions_db(
+        db_path,
+        session_id="session-1",
+        working_directory=str(worktree_path),
+        created_at=stale_iso,
+        rows=[{"role": "tool", "content": "tool result", "created_at": stale_iso}],
     )
-    conn.execute(
-        "INSERT INTO message_nodes (session_id, node_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("session-1", 1, "tool", "tool result", stale_iso),
-    )
-    conn.commit()
-    conn.close()
 
     # Fresh per-PID Devin log (mtime defaults to "now" via write_text).
     logs_dir = db_path.parent / "logs"
