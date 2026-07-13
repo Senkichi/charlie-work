@@ -11357,7 +11357,9 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
@@ -11390,7 +11392,9 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
@@ -11425,7 +11429,9 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeyp
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
