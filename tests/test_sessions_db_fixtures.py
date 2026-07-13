@@ -8,6 +8,8 @@ scattered drift incident across the test suite.
 
 from __future__ import annotations
 
+import ast
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -77,3 +79,81 @@ def test_make_sessions_db_schema_satisfies_post_mortem_queries(tmp_path: Path) -
     )
     assert probe.latest_source == "sessions.db"
     assert probe.latest_timestamp == datetime(2026, 7, 11, 11, 56, 0, tzinfo=UTC)
+
+
+# Match the SQL used to create a message_nodes table, including the
+# IF NOT EXISTS variant. `\s+` already spans newlines, so this catches DDL
+# wrapped across multiple lines inside a single string literal (a case a
+# per-line scan misses entirely). The trailing `\b` avoids false positives
+# on names like `message_nodes_archive`.
+_MESSAGE_NODES_DDL_PATTERN = re.compile(
+    r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+message_nodes\b",
+    re.IGNORECASE,
+)
+
+
+class _StringLiteralCollector(ast.NodeVisitor):
+    """Collects every string constant in a module.
+
+    A plain tree walk over ``ast.Constant`` nodes already reaches f-string
+    literal segments (the non-interpolated parts of an ``ast.JoinedStr``)
+    and docstrings, since both are represented as ``Constant`` nodes in the
+    tree — no special-casing required beyond visiting ``Constant``.
+    """
+
+    def __init__(self) -> None:
+        self.string_nodes: list[ast.Constant] = []
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            self.string_nodes.append(node)
+        self.generic_visit(node)
+
+
+def test_no_hand_rolled_message_nodes_ddl_in_tests() -> None:
+    """Every DDL that creates the ``message_nodes`` table in tests must live
+    in ``_sessions_db_fixtures.py``.
+
+    Hand-rolled SQL that creates a ``message_nodes`` table in test fixtures is
+    the drift class that broke main in incident #316. Use the shared
+    ``make_sessions_db`` helper (or add behavior there) instead of reintroducing
+    a one-off table definition.
+
+    This walks the AST of every test file and matches the DDL pattern against
+    each string literal's *full* value (per the AST-based precedent in
+    ``test_load_state_locked.py``), rather than scanning line-by-line — a
+    per-line scan cannot see DDL that a literal wraps across multiple lines,
+    e.g. ``"CREATE TABLE IF NOT EXISTS\\nmessage_nodes ("``.
+    """
+    tests_dir = Path(__file__).resolve().parent
+
+    offenders: list[str] = []
+    for source_file in sorted(tests_dir.rglob("*.py")):
+        if source_file.name == "_sessions_db_fixtures.py":
+            continue
+
+        try:
+            source_text = source_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            offenders.append(
+                f"{source_file.relative_to(tests_dir.parent)}: "
+                f"could not decode as UTF-8 to scan for hand-rolled DDL ({exc})"
+            )
+            continue
+
+        tree = ast.parse(source_text, filename=str(source_file))
+        collector = _StringLiteralCollector()
+        collector.visit(tree)
+
+        for node in collector.string_nodes:
+            if _MESSAGE_NODES_DDL_PATTERN.search(node.value):
+                rel_path = source_file.relative_to(tests_dir.parent)
+                snippet = " ".join(node.value.split())
+                if len(snippet) > 120:
+                    snippet = snippet[:117] + "..."
+                offenders.append(f"{rel_path}:{node.lineno}: {snippet!r}")
+
+    assert not offenders, (
+        "Hand-rolled message_nodes DDL found in tests. "
+        "Use _sessions_db_fixtures.make_sessions_db instead:\n" + "\n".join(offenders)
+    )
