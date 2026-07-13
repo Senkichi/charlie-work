@@ -3375,6 +3375,18 @@ class OrchestratorApp:
             # Only the head of the merge-train queue is synced.
             _, pr_number, pr, decision, head = candidates[0]
             base_current = self._is_base_current(pr)
+            if base_current is None:
+                # Compare API unavailable: report distinctly from "up-to-date" so
+                # a GitHub compare-API degradation is visible in telemetry instead
+                # of masquerading as every open PR being current.
+                return [
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "compare_unavailable",
+                    }
+                ]
             if not self._should_update_pr_branch(pr, base_current):
                 return [
                     {
@@ -3508,6 +3520,19 @@ class OrchestratorApp:
             # path and merge_ready so "all" mode also skips up-to-date PRs and
             # syncs stale ones even when mergeStateStatus is CLEAN.
             base_current = self._is_base_current(pr)
+            if base_current is None:
+                # Compare API unavailable: report distinctly from "up-to-date" so
+                # a GitHub compare-API degradation is visible in telemetry instead
+                # of masquerading as every open PR being current.
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "compare_unavailable",
+                    }
+                )
+                continue
             if not self._should_update_pr_branch(pr, base_current):
                 results.append(
                     {

@@ -10870,6 +10870,151 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
     assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
 
 
+def test_update_open_agent_prs_next_mode_reports_compare_unavailable(tmp_path: Path) -> None:
+    """Issue #337 rework: a None compare() result must not be reported as up-to-date.
+
+    When the GitHub compare API is unavailable, `_is_base_current` returns None
+    and the branch is correctly never synced (fail-closed), but the reported
+    reason must be distinct from a genuinely up-to-date branch — otherwise a
+    compare-API outage silently masquerades as every PR being current.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubCompareUnavailable(FakeGitHub):
+        """compare() returns None only for the given head SHA, simulating a
+        compare-API outage isolated to that candidate (the merged PR's own
+        base-freshness check must still resolve normally).
+        """
+
+        def __init__(self, unavailable_head: str) -> None:
+            super().__init__()
+            self._unavailable_head = unavailable_head
+
+        def compare(self, base: str, head: str) -> dict[str, Any] | None:
+            if head == self._unavailable_head:
+                return None
+            return super().compare(base, head)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCompareUnavailable(unavailable_head="sha-def456")
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is False
+    assert update_results[0]["skipped_reason"] == "compare_unavailable"
+    # No update-branch call should have been made for the compare-unavailable PR.
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_update_open_agent_prs_all_mode_reports_compare_unavailable(tmp_path: Path) -> None:
+    """Issue #337 rework: all-mode update lane distinguishes compare-unavailable too."""
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubCompareUnavailable(FakeGitHub):
+        """compare() returns None only for the given head SHA, simulating a
+        compare-API outage isolated to that candidate.
+        """
+
+        def __init__(self, unavailable_head: str) -> None:
+            super().__init__()
+            self._unavailable_head = unavailable_head
+
+        def compare(self, base: str, head: str) -> dict[str, Any] | None:
+            if head == self._unavailable_head:
+                return None
+            return super().compare(base, head)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCompareUnavailable(unavailable_head="sha-def456")
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "compare_unavailable"
+    # No update-branch call should have been made for the compare-unavailable PR.
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
 def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) -> None:
     """If pr_view returns a non-qualifying head after update-branch, do not merge.
 
