@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import fleet_dir
 from .github import GitHub, GitHubError
 from .paths import RuntimePaths
@@ -208,44 +208,7 @@ def count_fleet_live_sessions(
     return total_live_count, skipped_repos
 
 
-class FleetLock:
-    """Holds an OS-level non-blocking lock on ``fleet.lock`` for a dispatch window.
-
-    Released in ``__del__`` and explicit ``release()``; also released on process
-    death (OS closes all file handles).
-    """
-
-    def __init__(self, path: Path, handle: object) -> None:
-        self._path = path
-        self._handle = handle
-        self._released = False
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        # Unlock and close are independent failure modes: an msvcrt/fcntl
-        # unlock raising OSError must not skip closing the handle (that would
-        # leak the file descriptor and, on Windows, keep the lock file
-        # undeletable/unlockable by anyone else).
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
-            else:
-                import fcntl
-
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
-        except OSError:
-            pass
-        try:
-            self._handle.close()  # type: ignore[attr-defined]
-        except OSError:
-            pass
-
-    def __del__(self) -> None:
-        self.release()
+FleetLock = ByteRangeFileLock
 
 
 def try_acquire_fleet_lock(fleet_dir_override: str | None) -> FleetLock | None:
@@ -258,39 +221,13 @@ def try_acquire_fleet_lock(fleet_dir_override: str | None) -> FleetLock | None:
     """
     try:
         lock_dir = fleet_dir(override=fleet_dir_override)
-        lock_dir.mkdir(parents=True, exist_ok=True)
         lock_path = lock_dir / "fleet.lock"
-        # Write 1 byte so msvcrt.locking(..., 1) has a byte range to lock.
-        if not lock_path.exists():
-            lock_path.write_bytes(b"\x00")
 
         thread_lock = _fleet_thread_lock_for(lock_path)
         if not thread_lock.acquire(blocking=False):
             return None
         try:
-            handle = lock_path.open("r+b", encoding=None)
-            if sys.platform == "win32":
-                import msvcrt
-
-                # Guard against a pre-existing 0-byte lock file.
-                if handle.seek(0, 2) == 0:
-                    handle.write(b"\x00")
-                    handle.flush()
-                handle.seek(0)
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
-                    handle.close()
-                    return None
-            else:
-                import fcntl
-
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (IOError, BlockingIOError):
-                    handle.close()
-                    return None
-            return FleetLock(lock_path, handle)
+            return try_acquire_byte_range_lock(lock_path)
         finally:
             thread_lock.release()
     except OSError:

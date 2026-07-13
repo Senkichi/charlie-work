@@ -35,36 +35,10 @@ from charlie_work.post_mortem import (
 )
 from charlie_work.worker import WorkerView
 
+from _sessions_db_fixtures import make_sessions_db
+
 
 _NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
-
-# Real production DDL, copied verbatim from a live sessions.db (2026-07-12) —
-# see this module's docstring. Keep in sync with post_mortem.py's docstring.
-_REAL_SESSIONS_DDL = """
-CREATE TABLE sessions (
-  id TEXT PRIMARY KEY,
-  working_directory TEXT NOT NULL,
-  backend_type TEXT NOT NULL,
-  model TEXT NOT NULL,
-  agent_mode TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  last_activity_at INTEGER NOT NULL, title TEXT, main_chain_id INTEGER,
-  shell_last_seen_index INTEGER DEFAULT 0, cogs_json TEXT,
-  workspace_dirs TEXT, hidden INTEGER NOT NULL DEFAULT 0, metadata TEXT)
-"""
-
-_REAL_MESSAGE_NODES_DDL = """
-CREATE TABLE message_nodes (
-  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
-  node_id INTEGER NOT NULL,
-  parent_node_id INTEGER,
-  chat_message TEXT NOT NULL,
-  created_at INTEGER NOT NULL, metadata TEXT,
-  FOREIGN KEY (session_id) REFERENCES sessions(id),
-  UNIQUE(session_id, node_id)
-)
-"""
 
 
 def _make_worker(
@@ -90,6 +64,19 @@ def _make_worker(
     )
 
 
+def _node_to_row(spec: tuple | list) -> dict[str, Any]:
+    """Convert a ``(role, content, created_at)`` or ``(role, content, created_at, extra)``
+    tuple into the row-dict format used by ``make_sessions_db``.
+    """
+    role, content, created_at = spec[0], spec[1], spec[2]
+    row: dict[str, Any] = {"role": role, "content": content, "created_at": created_at}
+    if len(spec) > 3:
+        extra = spec[3]
+        if extra:
+            row["extra"] = extra
+    return row
+
+
 def _build_sessions_db(
     db_path: Path,
     *,
@@ -98,51 +85,20 @@ def _build_sessions_db(
     created_at: str | int = "2026-07-11T11:56:00",
     nodes: tuple[tuple, ...] | list[tuple] = (),
 ) -> None:
-    """Build a fixture sessions.db against the REAL production schema.
-
-    ``created_at`` values are inserted as given: the real columns are
-    declared INTEGER, but SQLite affinity stores a non-numeric ISO string
-    as TEXT — exactly the mixed-shape drift ``_parse_session_created_at``
-    defends against, so tests deliberately pass either shape.
+    """Build a fixture sessions.db using the shared real-schema helper.
 
     ``nodes`` entries are ``(role, content, created_at)`` or
     ``(role, content, created_at, extra)`` where ``extra`` is a dict merged
     into the ``chat_message`` JSON blob (e.g. ``tool_calls`` on an
     assistant node, ``tool_call_id`` on a tool-result node).
     """
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(_REAL_SESSIONS_DDL)
-        conn.execute(_REAL_MESSAGE_NODES_DDL)
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, backend_type, model, "
-            "agent_mode, created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
-            (session_id, working_directory, created_at, created_at),
-        )
-        for node_id, spec in enumerate(nodes, start=1):
-            role, content, node_created_at = spec[0], spec[1], spec[2]
-            extra = spec[3] if len(spec) > 3 else {}
-            chat_message = {
-                "message_id": f"msg-{node_id}",
-                "role": role,
-                "content": content,
-                "metadata": None,
-                **extra,
-            }
-            conn.execute(
-                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, "
-                "chat_message, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    node_id,
-                    node_id - 1 if node_id > 1 else None,
-                    json.dumps(chat_message),
-                    node_created_at,
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    make_sessions_db(
+        db_path,
+        session_id=session_id,
+        working_directory=working_directory,
+        created_at=created_at,
+        rows=[_node_to_row(spec) for spec in nodes],
+    )
 
 
 def _insert_session_row(
@@ -155,39 +111,14 @@ def _insert_session_row(
 ) -> None:
     """Insert an additional session row and its message_nodes into an existing
     fixture sessions.db created by ``_build_sessions_db``.
-
-    Uses the same real-schema shape as ``_build_sessions_db`` (chat_message
-    JSON blob keyed by per-session ``node_id``) — see this module's
-    docstring.
     """
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, backend_type, model, "
-            "agent_mode, created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
-            (session_id, working_directory, created_at, created_at),
-        )
-        for node_id, (role, content, node_created_at) in enumerate(nodes, start=1):
-            chat_message = {
-                "message_id": f"msg-{node_id}",
-                "role": role,
-                "content": content,
-                "metadata": None,
-            }
-            conn.execute(
-                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, "
-                "chat_message, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    node_id,
-                    node_id - 1 if node_id > 1 else None,
-                    json.dumps(chat_message),
-                    node_created_at,
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    make_sessions_db(
+        db_path,
+        session_id=session_id,
+        working_directory=working_directory,
+        created_at=created_at,
+        rows=[_node_to_row(spec) for spec in nodes],
+    )
 
 
 def _config_with_db(db_path: Path, **overrides: object) -> OrchestratorConfig:

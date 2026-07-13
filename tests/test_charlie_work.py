@@ -16,11 +16,13 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from _sessions_db_fixtures import make_sessions_db
 from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import summarize_checks
 from charlie_work.github import is_infrastructure_failure
 from charlie_work.config import (
+    AutoMergeConfig,
     ClaudeCodeConfig,
     ConfigError,
     CrossFamilyConfig,
@@ -9356,64 +9358,25 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     condition at workflow.py's `_classify_dead_sessions_and_update_throttle_state`
     (the `if (worker_blocked or len(redispatch_at) > ...)` check) fails this test.
     """
-    import json
-    import sqlite3
-    from datetime import UTC, datetime
-
-    from charlie_work.config import AutoMergeConfig, DevinConfig, PostMortemConfig
-    from charlie_work.devin_shell import SessionRecord
-    from charlie_work.state import load_state
-
     now = datetime.now(UTC)
     worktree_path = str(tmp_path / "worktree")
 
-    # Build a sessions.db fixture (REAL production schema, verified live
-    # 2026-07-12 — see tests/test_post_mortem.py) with a "Tool blocked:"
-    # message node matching this worker's worktree_path and timing — the same
-    # shape post_mortem.py's classify_and_record looks for to return
-    # "worker_blocked". role/content live inside the chat_message JSON blob.
     db_path = tmp_path / "sessions.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, "
-            "backend_type TEXT NOT NULL, model TEXT NOT NULL, agent_mode TEXT NOT NULL, "
-            "created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL)"
-        )
-        conn.execute(
-            "CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "session_id TEXT NOT NULL, node_id INTEGER NOT NULL, parent_node_id INTEGER, "
-            "chat_message TEXT NOT NULL, created_at INTEGER NOT NULL, metadata TEXT, "
-            "UNIQUE(session_id, node_id))"
-        )
-        conn.execute(
-            "INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, "
-            "created_at, last_activity_at) VALUES (?, ?, '', '', '', ?, ?)",
-            ("sess-1", worktree_path, now.isoformat(), now.isoformat()),
-        )
-        conn.execute(
-            "INSERT INTO message_nodes (session_id, node_id, chat_message, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                "sess-1",
-                1,
-                json.dumps(
-                    {
-                        "message_id": "msg-1",
-                        "role": "tool",
-                        "content": (
-                            'Tool blocked: {"decision": "block", '
-                            '"reason": "push-gate hook rejected"}'
-                        ),
-                        "metadata": None,
-                    }
+    make_sessions_db(
+        db_path,
+        session_id="sess-1",
+        working_directory=worktree_path,
+        created_at=now.isoformat(),
+        rows=[
+            {
+                "role": "tool",
+                "content": (
+                    'Tool blocked: {"decision": "block", "reason": "push-gate hook rejected"}'
                 ),
-                now.isoformat(),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+                "created_at": now.isoformat(),
+            }
+        ],
+    )
 
     # Use command adapter to avoid needing a real devin binary.
     config = OrchestratorConfig(
@@ -11529,7 +11492,9 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
@@ -11562,7 +11527,9 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()
@@ -11597,7 +11564,9 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeyp
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app = OrchestratorApp(
+        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+    )
 
     app.gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch()

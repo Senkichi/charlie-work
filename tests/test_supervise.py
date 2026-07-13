@@ -839,10 +839,11 @@ def test_run_supervised_exception_returns_ok_false_and_releases_lock(tmp_path: P
 
 def test_try_acquire_supervisor_lock_zero_byte_existing_file_succeeds(tmp_path: Path) -> None:
     """Regression for finding #8: a pre-existing 0-byte lock file (e.g. left
-    over from an older touch()-based implementation) must not permanently
-    block acquisition -- msvcrt.locking raises EACCES on a 0-byte file even
-    for a non-blocking attempt, so the acquire path must top up the file
-    before locking, not just on first creation.
+    over from an older touch()-based implementation) must remain acquirable.
+
+    On the deployed runtime (Python 3.13.5, Windows 11), ``msvcrt.locking``
+    with ``LK_NBLCK`` succeeds on a genuine 0-byte file, so the lock helper
+    does not need to pad the file before locking.
     """
     lock_path = tmp_path / "supervisor.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

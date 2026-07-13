@@ -52,6 +52,7 @@ from .state import (
     is_claim_stale,
     is_throttled,
     load_state,
+    load_state_locked,
     save_state,
     set_throttled_until,
     state_lock,
@@ -1590,7 +1591,7 @@ class OrchestratorApp:
     def status(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
-        state = load_state(self.paths.state_file)
+        state = load_state_locked(self.paths.state_file)
         active_issues = [
             issue for issue in issues if label_names(issue) & self.config.labels.active
         ]
@@ -2375,8 +2376,7 @@ class OrchestratorApp:
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
-        # Cheap existence check before acquiring lock
-        state = load_state(self.paths.state_file)
+        state = load_state_locked(self.paths.state_file)
         if str(pr_number) in state.get("prs", {}):
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -3869,7 +3869,7 @@ class OrchestratorApp:
                 # go straight to merge_ready. This prevents a second loop() pass
                 # from rewriting the review packet or re-firing labels for a PR
                 # that's simply waiting on pending checks.
-                state = load_state(self.paths.state_file)
+                state = load_state_locked(self.paths.state_file)
                 pr_state = state["prs"].get(str(pr_number), {})
                 already_approved = pr_state.get("decision") == "approved" and pr_state.get(
                     "status"
