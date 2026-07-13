@@ -4364,6 +4364,16 @@ class OrchestratorApp:
             routed_to_review.append(issue_number)
 
         candidates = filtered_candidates
+        # A content change was detected above, but review() may itself fail to
+        # produce a packet (deterministic janitor gate: conflicting/draft/red
+        # CI — see review()'s early-return before any packet/label write).
+        # Only issues review() actually routed get reported as routed_to_review;
+        # the rest keep their rework_requested status and are retried next pass
+        # (issue #339 finding 1: never report a routing that didn't happen —
+        # doing so desyncs state.json from GitHub labels/PR state with no
+        # automated recovery path).
+        confirmed_routed_to_review: list[int] = []
+        review_blocked_retry: list[int] = []
         for routed_issue_number in routed_to_review:
             routed_pr_number = int(pr_by_issue[routed_issue_number]["number"])
             reviewed_head_sha_before = (
@@ -4371,9 +4381,14 @@ class OrchestratorApp:
                 .get(str(routed_pr_number), {})
                 .get("reviewed_head_sha")
             )
-            self._route_rework_candidate_to_review(
+            routed, _review_result = self._route_rework_candidate_to_review(
                 routed_issue_number, routed_pr_number, reviewed_head_sha_before
             )
+            if routed:
+                confirmed_routed_to_review.append(routed_issue_number)
+            else:
+                review_blocked_retry.append(routed_issue_number)
+        routed_to_review = confirmed_routed_to_review
 
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
@@ -4398,6 +4413,7 @@ class OrchestratorApp:
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
+                "review_blocked_retry": sorted(review_blocked_retry),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4454,6 +4470,7 @@ class OrchestratorApp:
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
+                "review_blocked_retry": sorted(review_blocked_retry),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4527,6 +4544,7 @@ class OrchestratorApp:
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
+                "review_blocked_retry": sorted(review_blocked_retry),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -4692,6 +4710,7 @@ class OrchestratorApp:
             "dispatch_results": result_dicts,
             "routed_to_review": sorted(routed_to_review),
             "skipped_head_indeterminate": sorted(head_indeterminate),
+            "review_blocked_retry": sorted(review_blocked_retry),
         }
         if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
@@ -4730,7 +4749,7 @@ class OrchestratorApp:
         issue_number: int,
         pr_number: int,
         reviewed_head_sha_before: str | None,
-    ) -> CommandResult:
+    ) -> tuple[bool, CommandResult]:
         """Route a rework_requested issue back to the review lane instead of
         relaunching a worker onto a PR whose rework was already pushed
         (issue #339): the PR head moved past the last request_changes verdict,
@@ -4741,26 +4760,44 @@ class OrchestratorApp:
         point — instead of duplicating its janitor/test-adequacy gating and
         label-transition logic here.
 
-        ``review()`` can itself invoke ``record_review`` (the test-adequacy
-        hard gate re-failing on the new head), which already reconciles the
-        issue's status and ``reviewed_head_sha``. This only steps in when
-        ``review()`` left the packet pending (no fresh decision recorded
-        against the new head) — it must never clobber a status
-        ``record_review`` already reconciled to something other than a stale
-        ``rework_requested``.
+        Returns a ``(routed, review_result)`` pair. ``routed`` is True only
+        when ``review()`` actually produced a fresh, undecided packet against
+        the new head. ``review()`` has its own early-returns that leave
+        GitHub/labels untouched — most notably the deterministic janitor gate
+        (conflicting/draft/red-CI), which returns ``ok=False`` *before*
+        writing any packet or firing the ``review_started`` transition, and
+        without touching ``reviewed_head_sha``. Flipping the issue's status
+        to "reviewing" in that case would desync state.json from GitHub
+        reality (labels still say needs-rework, no packet exists) with no
+        automated recovery path, since the issue would silently drop out of
+        dispatch_rework's own candidate pool forever (issue #339 finding 1).
+        So the status flip additionally requires ``review_result.ok`` on top
+        of the pre-existing "no fresh decision recorded" check: ``review()``
+        can itself invoke ``record_review`` (the test-adequacy hard gate
+        re-failing on the new head), which already reconciles the issue's
+        status and ``reviewed_head_sha`` — that path returns ``ok=True`` but
+        must not be re-flipped here either, so both checks are required.
+
+        When ``routed`` is False, the issue's status is left untouched
+        (``rework_requested``), so the next dispatch_rework pass naturally
+        retries — the block is often transient (e.g. a merge-train branch
+        sync resolving a conflict).
         """
         review_result = self.review(pr_number)
+        routed = False
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
             entry = state["issues"].get(str(issue_number), {})
             decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
             if (
-                decision_unchanged
+                review_result.ok
+                and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"
             ):
                 state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
+                routed = True
             state = append_event(
                 state,
                 "rework_already_pushed",
@@ -4768,10 +4805,11 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     "pr_number": pr_number,
                     "review_ok": review_result.ok,
+                    "routed": routed,
                 },
             )
             save_state(self.paths.state_file, state)
-        return review_result
+        return routed, review_result
 
     def _merged_pr_referenced_issue_numbers(
         self,

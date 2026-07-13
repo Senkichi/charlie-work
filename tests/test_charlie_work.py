@@ -12998,6 +12998,204 @@ def test_dispatch_rework_skips_without_stranding_when_head_indeterminate(
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
+def test_dispatch_rework_launches_when_head_moved_by_sync_merge_only(tmp_path: Path) -> None:
+    """Issue #339 acceptance: a sync-merge-only head advance (base merged into
+    the PR branch moves headRefOid, but the PR's own patch content is
+    unchanged) must NOT be treated as "already reworked" — the same patch
+    still needs a genuine rework cycle, so dispatch_rework must still launch.
+
+    Regression coverage for a reviewer-caught gap: mutating away the
+    same-patch-id carve-out (routing to review on ANY head mismatch,
+    regardless of patch-id) left all pre-existing dispatch_rework tests
+    green, because none of them exercised a moved-head/same-patch-id PR —
+    exactly the common case on a fleet where every open PR gets synced with
+    main constantly.
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    diff_text = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = diff_text
+    app.record_review(456, "request_changes", summary="fix A")
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        assert state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+        assert state["prs"]["456"]["reviewed_patch_id"]
+
+    # Simulate a sync-merge: base merged into the branch moves the head SHA
+    # (FakeGitHub.pr_update_branch models this exactly), but the PR's diff
+    # content is unchanged — a real sync merge does not touch the patch.
+    fake_gh.pr_update_branch(456)
+    new_head = fake_gh.prs[0]["headRefOid"]
+    assert new_head != "sha-abc123"
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = diff_text
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["routed_to_review"] == []
+    assert result.data["review_blocked_retry"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+
+
+def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_pass(
+    tmp_path: Path,
+) -> None:
+    """Issue #339 finding 1 (reviewer repro): a candidate whose PR head moved
+    with a real content change gets routed to review() — but if the PR is
+    CONFLICTING, review()'s deterministic janitor gate returns ok=False
+    *before* writing a packet or firing the review_started transition, and
+    without touching reviewed_head_sha. The routing helper must not
+    force-flip the issue's status to "reviewing" in that case: doing so would
+    desync state.json from GitHub reality (labels still say needs-rework, no
+    packet exists) and strand the issue outside dispatch_rework's own
+    candidate pool forever, with no automated recovery path. The issue must
+    stay rework_requested so the next pass retries (the janitor block is
+    often transient, e.g. a merge-train branch sync resolving the conflict).
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Head advances with a real content change (routes to review) AND the PR
+    # is now conflicting (janitor blocks review() before any packet/label write).
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    # Not reported as successfully routed — review() never produced a packet.
+    assert result.data["routed_to_review"] == []
+    assert result.data["review_blocked_retry"] == [123]
+
+    # No label churn at all: neither a launch nor a review_started transition.
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+    assert (123, "agent:needs-rework") not in fake_gh.labels_removed
+
+    # Not stranded: still rework_requested so the next pass retries.
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # PR record shows the janitor block, not a flipped "reviewing" state.
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert any(
+        e["kind"] == "rework_already_pushed" and e["payload"].get("routed") is False
+        for e in state["events"]
+    )
+
+
+def test_dispatch_rework_skips_when_live_head_ref_oid_missing(tmp_path: Path) -> None:
+    """Non-blocking coverage: live_head_sha itself (not just a diff-fetch
+    failure) can be unavailable — pr_list() returning a record with no
+    headRefOid. Must fail closed the same as any other indeterminate case.
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Live head is unavailable from the PR list response.
+    fake_gh.prs[0]["headRefOid"] = None
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["skipped_head_indeterminate"] == [123]
+    assert result.data["routed_to_review"] == []
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
+def test_dispatch_rework_skips_when_reviewed_patch_id_missing(tmp_path: Path) -> None:
+    """Non-blocking coverage: an older/malformed pr_state that recorded
+    reviewed_head_sha without reviewed_patch_id must also fail closed on a
+    head mismatch rather than guessing at content identity.
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+            # reviewed_patch_id deliberately absent (older/malformed record).
+        }
+        save_state(paths.state_file, state)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # Head has moved relative to the recorded reviewed_head_sha.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["skipped_head_indeterminate"] == [123]
+    assert result.data["routed_to_review"] == []
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
 def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path: Path) -> None:
     """Janitor blocks review when head hasn't changed after request_changes (no-op rework).
 
