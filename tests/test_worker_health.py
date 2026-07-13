@@ -1337,6 +1337,116 @@ def test_classify_worker_health_incident_285_routine_exit_not_stalled(
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
 
 
+def test_classify_worker_health_loop_claude_log_layout_runaway(tmp_path: Path) -> None:
+    """Issue #329: Signal 5 must find the real issue-N.events.jsonl sibling for a claude-code log.
+
+    A claude-code log named ``issue-42.claude.log`` has a sibling named
+    ``issue-42.events.jsonl`` (not ``issue-42.claude.events.jsonl``, which the
+    old ``with_suffix('.events.jsonl')`` derivation produced). This regression
+    test uses the real file layout and expects the loop/no-progress tripwire to
+    fire and return RUNAWAY.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    issue_number = 42
+    log_file = sessions_dir / f"issue-{issue_number}.claude.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    # Set log mtime to 5 minutes ago (fresh, within stall_minutes)
+    recent_log_time = datetime.now(UTC) - timedelta(minutes=5)
+    os.utime(log_file, (time.time(), recent_log_time.timestamp()))
+
+    # Create the real events.jsonl sibling with a stale tool call (past 2 * stall_minutes)
+    events_file = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    old_tool_call = datetime.now(UTC) - timedelta(minutes=41)
+    events_file.write_text(
+        f'{{"type": "tool_call", "timestamp": "{old_tool_call.isoformat()}"}}\n',
+        encoding="utf-8",
+    )
+
+    view = WorkerView(
+        adapter_kind="claude-code",
+        issue_number=issue_number,
+        repo_key="",
+        pid=12345,
+        started_at=datetime.now(UTC).isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
+        now = datetime.now(UTC)
+        health = classify_worker_health(view, config, now)
+        assert health == WorkerHealth.RUNAWAY
+
+
+def test_classify_worker_health_budget_tripwire_rework_layout(tmp_path: Path) -> None:
+    """Issue #344: Signal 6 (cost/token budget tripwire) must use the canonical
+    events.jsonl derivation for rework-layout sessions too.
+
+    A rework claude-code log named ``issue-42-rework.claude.log`` has its
+    structured-events sibling at ``issue-42-rework.events.jsonl`` (not
+    ``issue-42.events.jsonl``, which the old rework=False-only
+    ``_events_path(sessions_dir, issue_number)`` derivation would read
+    instead). This test plants a stale, under-budget ``issue-42.events.jsonl``
+    from a prior (non-rework) attempt alongside the real, over-budget
+    ``issue-42-rework.events.jsonl`` sibling. If Signal 6 regresses to the old
+    derivation, it silently reads the stale file and never trips; the
+    canonical derivation must read the rework sibling and fire.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    issue_number = 42
+    log_file = sessions_dir / f"issue-{issue_number}-rework.claude.log"
+    log_file.write_text("Working on rework attempt...", encoding="utf-8")
+
+    # Stale events.jsonl from a prior (non-rework) attempt: under budget.
+    stale_events_file = sessions_dir / f"issue-{issue_number}.events.jsonl"
+    stale_events_file.write_text(
+        '{"type": "tool_call", "tokens": 100, "cost_usd": 0.01}',
+        encoding="utf-8",
+    )
+
+    # Real rework events.jsonl sibling: over the cost budget.
+    events_file = sessions_dir / f"issue-{issue_number}-rework.events.jsonl"
+    events_file.write_text(
+        '{"type": "tool_call", "tokens": 1000, "cost_usd": 10.0}',
+        encoding="utf-8",
+    )
+
+    # Use a recent started_at to avoid triggering the wall-clock/loop tripwires
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+
+    view = WorkerView(
+        adapter_kind="claude-code",
+        issue_number=issue_number,
+        repo_key="",
+        pid=12345,
+        started_at=recent_start.isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        config = OrchestratorConfig(
+            watchdog=WatchdogConfig(cost_budget_usd=5.0, cost_budget_action="kill")
+        )
+        now = datetime.now(UTC)
+        health = classify_worker_health(view, config, now)
+        assert health == WorkerHealth.RUNAWAY
+
+
 def _dead_devin_view(tmp_path: Path, *, inconclusive_probe_deferred_count: int = 0) -> WorkerView:
     """Build a WorkerView for a dead devin worker with a stale sidecar log."""
     log_file = tmp_path / "test.log"

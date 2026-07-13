@@ -463,6 +463,16 @@ def _detect_and_handle_stalled_sessions(
             except OSError:
                 pass
 
+            probe_payload = (
+                probe.to_payload()
+                if probe is not None
+                else {
+                    "sources": [],
+                    "latest_timestamp": None,
+                    "latest_source": "probe unavailable",
+                }
+            )
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
@@ -477,9 +487,9 @@ def _detect_and_handle_stalled_sessions(
                         "killed_pids": killed_pids,
                         "orphan_pids": orphan_pids if orphan_pids else None,
                         "failure_kind": resolved_failure_kind,
-                        "activity_sources": probe.to_payload().get("sources", []),
-                        "latest_real_activity_at": probe.to_payload().get("latest_timestamp"),
-                        "latest_real_activity_source": probe.to_payload().get("latest_source"),
+                        "activity_sources": probe_payload.get("sources", []),
+                        "latest_real_activity_at": probe_payload.get("latest_timestamp"),
+                        "latest_real_activity_source": probe_payload.get("latest_source"),
                     },
                 )
                 save_state(state_file, state)
@@ -4983,7 +4993,8 @@ class OrchestratorApp:
         Returns:
             Dict with worker summary fields for status() JSON output
         """
-        from .claude_code import _events_path, parse_claude_events
+        from .claude_code import parse_claude_events
+        from .post_mortem import _events_path_from_log
 
         # Resolve repo_key: use view.repo_key if present, otherwise fall back to gh.name_with_owner()
         # This handles both fleet mode (repo_key populated by iter_workers) and single-repo mode
@@ -5001,9 +5012,10 @@ class OrchestratorApp:
         cost_usd = None
 
         if view.adapter_kind == "claude-code":
-            # Derive sessions_dir from log_path (log_path is sessions_dir/issue-<n>.log)
-            sessions_dir = Path(view.log_path).parent
-            events_path = _events_path(sessions_dir, view.issue_number)
+            # Canonical derivation (issue #329): supports both plain
+            # issue-<n>.claude.log and rework-layout issue-<n>-rework.claude.log,
+            # matching the events.jsonl sibling that claude_code actually writes.
+            events_path = _events_path_from_log(Path(view.log_path))
             progress = parse_claude_events(events_path)
             if progress is not None:
                 tool_calls = progress.tool_call_count
