@@ -272,6 +272,17 @@ def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     return to_save
 
 
+def load_state_locked(path: Path) -> dict[str, Any]:
+    """Load a state snapshot while holding the advisory lock.
+
+    This is the single point of enforcement for read-only ``load_state`` calls
+    outside an explicit ``state_lock`` context. Callers receive a fresh snapshot
+    and must not mutate it without re-acquiring the lock and saving explicitly.
+    """
+    with state_lock(path):
+        return load_state(path)
+
+
 def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Return a new state dict with the event appended; do not mutate ``data``."""
     events = list(data.get("events", []))
