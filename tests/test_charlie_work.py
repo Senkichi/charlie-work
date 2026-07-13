@@ -2580,6 +2580,22 @@ class FakeGitHub:
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name == "base_head_sha" and hasattr(self, "commits"):
+            if value not in self.commits:
+                self.commits[value] = {"parents": []}
+        elif name == "prs" and hasattr(self, "commits") and hasattr(self, "base_head_sha"):
+            self._record_pr_heads(value)
+
+    def _record_pr_heads(self, prs: list[dict[str, Any]]) -> None:
+        """Index PR head SHAs as commits rooted at the current base tip."""
+        base = self.base_head_sha
+        for pr in prs:
+            head = pr.get("headRefOid")
+            if head and head not in self.commits:
+                self.commits[head] = {"parents": [{"sha": base}]}
+
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
         # Support both old signature (ready_label: str) and new (labels=None, state=None)
@@ -2674,6 +2690,28 @@ class FakeGitHub:
         else:
             self.merged_admin_flags.append(admin)
         self.merged_merge_flags.append(merge_flags)
+
+        # Model the real effect of a merge: the base branch tip advances to a
+        # merge commit whose parents are the previous base tip and the merged PR
+        # head. This lets stale-base tests derive base movement organically from
+        # recorded merges instead of hand-feeding compare_overrides.
+        pr: dict[str, Any] | None = None
+        for candidate in self.prs:
+            if candidate.get("number") == number:
+                pr = candidate
+                break
+        if pr is not None:
+            base_ref = pr.get("baseRefName") or "main"
+            head_sha = pr.get("headRefOid")
+            old_base = self.base_head_sha
+            merge_sha = f"{base_ref}-merged-{head_sha}"
+            self.commits[merge_sha] = {
+                "parents": [{"sha": old_base}, {"sha": head_sha}],
+                "committer": {"login": "web-flow"},
+                "commit": {"committer": {"name": "GitHub"}},
+            }
+            self.base_head_sha = merge_sha
+
         return "merged"
 
     def delete_branch(self, branch: str) -> bool:
@@ -2749,14 +2787,74 @@ class FakeGitHub:
     def commit(self, sha: str) -> dict[str, Any] | None:
         return self.commits.get(sha)
 
+    def _ancestors(self, sha: str) -> set[str]:
+        """Return all ancestors of ``sha`` (including ``sha`` itself)."""
+        seen: set[str] = set()
+        stack = [sha]
+        while stack:
+            current = stack.pop()
+            if current in seen or not current:
+                continue
+            seen.add(current)
+            commit = self.commits.get(current)
+            if not isinstance(commit, dict):
+                continue
+            for parent in commit.get("parents", []):
+                if isinstance(parent, dict):
+                    parent_sha = parent.get("sha")
+                else:
+                    parent_sha = parent
+                if parent_sha:
+                    stack.append(parent_sha)
+        return seen
+
+    def _merge_base(self, base_sha: str, head_sha: str) -> str | None:
+        """Return the best common ancestor of ``base_sha`` and ``head_sha``.
+
+        The best common ancestor is a common ancestor that is not itself an
+        ancestor of another common ancestor. For linear DAGs this is the usual
+        merge-base; the simple filter works for the small graphs in these tests.
+        """
+        base_ancestors = self._ancestors(base_sha)
+        head_ancestors = self._ancestors(head_sha)
+        common = base_ancestors & head_ancestors
+        if not common:
+            return None
+        best = [
+            sha
+            for sha in common
+            if not any(sha in self._ancestors(other) and sha != other for other in common)
+        ]
+        if not best:
+            best = list(common)
+
+        # Deterministic tie-break: prefer the ancestor closest to the base tip.
+        def _distance(source: str, target: str) -> int:
+            if source == target:
+                return 0
+            visited: set[str] = {source}
+            queue: list[tuple[str, int]] = [(source, 0)]
+            while queue:
+                current, dist = queue.pop(0)
+                for parent in self._ancestors(current):
+                    if parent == target:
+                        return dist + 1
+                    if parent not in visited:
+                        visited.add(parent)
+                        queue.append((parent, dist + 1))
+            return len(common)
+
+        best.sort(key=lambda sha: (_distance(base_sha, sha), _distance(head_sha, sha)))
+        return best[0]
+
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         override = self.compare_overrides.get((base, head))
         if override is not None:
             return override
-        # If no override is provided, infer the comparison from the PR's
-        # mergeStateStatus when it is known. Tests can still use compare_overrides
-        # to model the CLEAN-but-stale case where mergeStateStatus lags.
         base_head = self.base_head_sha
+
+        # Find the matching PR so we can honor mergeStateStatus hints when the
+        # graph is not enough or contradicts a BEHIND signal.
         matching_pr = None
         for pr in self.prs:
             if pr.get("headRefOid") == head:
@@ -2770,6 +2868,29 @@ class FakeGitHub:
                             matching_pr = pr
                             break
                     break
+
+        # If we have a commit graph for both the current base tip and the head,
+        # derive the merge base from recorded merges. This is the path that lets
+        # merge tests prove ``merge advances main`` organically.
+        if base_head in self.commits and head in self.commits:
+            merge_base = self._merge_base(base_head, head)
+            base_current = merge_base == base_head
+            if base_current and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND":
+                # A BEHIND mergeStateStatus is a stronger stale signal than the
+                # current graph, so tests can still simulate a stale branch by
+                # setting mergeStateStatus to BEHIND.
+                return {
+                    "base_commit": {"sha": base_head},
+                    "merge_base_commit": {"sha": f"{base_head}-stale"},
+                }
+            return {
+                "base_commit": {"sha": base_head},
+                "merge_base_commit": {"sha": merge_base if merge_base else ""},
+            }
+
+        # If no graph is available, fall back to the PR's mergeStateStatus when
+        # it is known. Tests can still use compare_overrides to model exceptional
+        # cases (e.g. CLEAN-but-stale where mergeStateStatus lags).
         if (
             matching_pr is not None
             and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND"
@@ -10447,13 +10568,9 @@ def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
             encoding="utf-8",
         )
 
-    # Simulate base moving after PR 456 was merged. PR 456 is up-to-date with
-    # the new base tip, but PR 789's merge-base is the old base tip.
-    fake_gh.base_head_sha = "main-after-456-merged"
-    fake_gh.compare_overrides[("main", "sha-def456")] = {
-        "base_commit": {"sha": "main-after-456-merged"},
-        "merge_base_commit": {"sha": "base-sha"},  # stale base
-    }
+    # Merging PR 456 advances the fake base tip. PR 456 is then up-to-date with
+    # the new base tip, but PR 789's merge-base is still the old base tip, so
+    # the merge-base freshness gate defers it organically.
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
@@ -10527,11 +10644,8 @@ def test_merge_ready_require_current_base_false_allows_stale_base(tmp_path: Path
             encoding="utf-8",
         )
 
-    fake_gh.base_head_sha = "main-after-456-merged"
-    fake_gh.compare_overrides[("main", "sha-def456")] = {
-        "base_commit": {"sha": "main-after-456-merged"},
-        "merge_base_commit": {"sha": "base-sha"},
-    }
+    # With require_current_base=False the gate is disabled, so the second PR
+    # ships even though merge_pr(456) has advanced the fake base tip.
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
@@ -10729,11 +10843,8 @@ def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) 
             "isCrossRepository": False,
         },
     ]
-    # The next candidate is stale even though mergeStateStatus reports CLEAN.
-    fake_gh.compare_overrides[("main", "sha-def456")] = {
-        "base_commit": {"sha": "base-sha"},
-        "merge_base_commit": {"sha": "base-sha-old"},
-    }
+    # The next candidate becomes stale organically once PR 456 is merged and
+    # advances the fake base tip, even though mergeStateStatus reports CLEAN.
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
@@ -10794,11 +10905,11 @@ def test_update_open_agent_prs_all_mode_syncs_stale_clean_base(tmp_path: Path) -
             "isCrossRepository": False,
         },
     ]
-    fake_gh.compare_overrides[("main", "sha-def456")] = {
-        "base_commit": {"sha": "base-sha"},
-        "merge_base_commit": {"sha": "base-sha-old"},
-    }
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Merge PR 456 first so the base tip advances and the all-mode update lane
+    # sees PR 789 as stale organically.
+    fake_gh.merge_pr(456, "squash")
 
     results = app._update_open_agent_prs(merged_pr_number=456)
 
@@ -10920,6 +11031,12 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
             "isCrossRepository": False,
         },
     ]
+    # Model 789 as already rebased onto the post-merge base so the next
+    # candidate is genuinely up-to-date and the merge-train skip path is exercised.
+    post_merge_base = "main-merged-sha-abc123"
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": "sha-abc123"}]}
+    fake_gh.commits["sha-def456"] = {"parents": [{"sha": post_merge_base}]}
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
@@ -11087,6 +11204,48 @@ def test_update_open_agent_prs_all_mode_reports_compare_unavailable(tmp_path: Pa
     assert results[0]["skipped_reason"] == "compare_unavailable"
     # No update-branch call should have been made for the compare-unavailable PR.
     assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
+    """Issue #333: a failed compare API returns ``None`` and merge_ready fails closed.
+
+    Mutating the gate to fail-open (treating ``base_current is None`` as current)
+    causes this test to fail because the PR is merged instead of deferred.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubCompareUnavailable(FakeGitHub):
+        """compare() returns None, simulating an unavailable GitHub compare API."""
+
+        def compare(self, base: str, head: str) -> dict[str, Any] | None:
+            return None
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCompareUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert result.data.get("stale_base") is True
+    assert fake_gh.merged == []
+
+    state = json.loads(paths.state_file.read_text())
+    stale_events = [
+        event for event in state["events"] if event["kind"] == "merge_deferred_stale_base"
+    ]
+    assert len(stale_events) == 1
+    assert stale_events[0]["payload"]["pr_number"] == 456
+    assert stale_events[0]["payload"]["reason"] == "compare_unavailable"
 
 
 def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) -> None:
