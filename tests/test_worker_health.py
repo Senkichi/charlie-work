@@ -968,3 +968,34 @@ def test_classify_worker_health_regression_test_suite_pattern(tmp_path: Path) ->
         health = classify_worker_health(view, config, now)
         # Should be HEALTHY (no tripwire fires at defaults for this pattern)
         assert health == WorkerHealth.HEALTHY
+
+
+def test_classify_worker_health_malformed_started_at_claude_no_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """Issue #300: malformed started_at and no tool calls must not raise UnboundLocalError."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\n", encoding="utf-8")
+
+    events_file = tmp_path / "test.events.jsonl"
+    events_file.write_text('{"type": "ping"}\n', encoding="utf-8")
+
+    view = WorkerView(
+        adapter_kind="claude-code",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at="not-a-timestamp",
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path="",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        config = OrchestratorConfig()
+        now = datetime.now(UTC)
+        health = classify_worker_health(view, config, now)
+        assert isinstance(health, WorkerHealth)
