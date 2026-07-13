@@ -147,9 +147,10 @@ class WorkerHealth(Enum):
     signals into a single classification point.
 
     Signal → verdict, first-to-fire-wins order:
-    1. liveness → DEAD
-    2. terminal marker → DEAD
-    3. progress staleness → STALLED
+    1. liveness → DEAD (unless a fresh probe vetoes, or an inconclusive probe
+       defers up to the configured cap)
+    2. terminal marker → DEAD (unconditional; overrides a fresh probe)
+    3. progress staleness → STALLED (unless a fresh or inconclusive probe vetoes it)
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
@@ -262,6 +263,7 @@ class WorkerView:
     rate_limit_defer_until: str | None = (
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
+    inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -287,6 +289,7 @@ class WorkerView:
                 last_activity_at=self.last_activity_at,
                 log_bytes=self.log_bytes,
                 rate_limit_defer_until=self.rate_limit_defer_until,
+                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
             )
             return is_session_alive(record)
         elif self.adapter_kind == "claude-code":
@@ -307,6 +310,7 @@ class WorkerView:
                 last_activity_at=self.last_activity_at,
                 log_bytes=self.log_bytes,
                 rate_limit_defer_until=self.rate_limit_defer_until,
+                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
             )
             return is_worker_alive(record)
         else:
@@ -458,6 +462,25 @@ def _real_activity_is_inconclusive(probe: RealActivityProbe | None) -> bool:
     return probe.latest_timestamp is None
 
 
+def _next_inconclusive_probe_deferred_count(
+    view: WorkerView,
+    probe: RealActivityProbe | None,
+    health: WorkerHealth,
+) -> int:
+    """Compute the next sidecar value for Signal-1's inconclusive-probe deferral counter.
+
+    The counter advances only when a dead worker is classified as HEALTHY because
+    the real-activity probe was inconclusive and the escalation cap had not yet
+    been reached. It is reset to 0 whenever the worker is alive, the probe becomes
+    conclusive, or the cap trips and the worker is reaped as DEAD.
+    """
+    if view.is_alive() or health is WorkerHealth.DEAD:
+        return 0
+    if _real_activity_is_inconclusive(probe) and health is WorkerHealth.HEALTHY:
+        return view.inconclusive_probe_deferred_count + 1
+    return 0
+
+
 def classify_worker_health(
     view: WorkerView,
     config: OrchestratorConfig,
@@ -471,7 +494,8 @@ def classify_worker_health(
     captured this pass, and has no side effects.
 
     Signal → verdict, first-to-fire-wins order:
-    1. liveness → DEAD (unless a fresh real-session activity signal vetoes it)
+    1. liveness → DEAD (unless a fresh real-session activity signal vetoes it,
+       or an inconclusive probe defers up to ``max_inconclusive_probe_deferrals``)
     2. terminal marker → DEAD (unconditional; overrides a fresh probe)
     3. progress staleness → STALLED (unless a fresh or inconclusive probe vetoes it)
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
@@ -480,13 +504,16 @@ def classify_worker_health(
     7. (none of the above) → HEALTHY
 
     Signals 1 and 3 are corroborated against ``real_activity_probe`` (issues #280,
-    #301, #307). If the tracked process is gone or the sidecar log is stale, but
-    any real-session activity source (sessions.db, per-PID Devin log, or Claude
+    #301, #307, #338). If the tracked process is gone or the sidecar log is stale,
+    but any real-session activity source (sessions.db, per-PID Devin log, or Claude
     Code events.jsonl) is fresh, the worker is not classified as DEAD/STALLED this
     pass. If the probe was consulted but every source errored, it is treated as
     inconclusive and the verdict is deferred rather than failing open to STALLED.
-    Signal 2 (terminal error markers) bypasses corroboration and still returns
-    DEAD immediately.
+    Signal 1 uses the same single enforcement point as Signal 3 but also applies an
+    escalation cap so a genuinely-dead worker with a permanently-broken probe is
+    still reaped after ``max_inconclusive_probe_deferrals`` deferred passes (issue
+    #338). Signal 2 (terminal error markers) bypasses corroboration and still
+    returns DEAD immediately.
 
     Args:
         view: WorkerView with pre-fetched worker state (pid, process_start_time, log_path, ...)
@@ -507,7 +534,20 @@ def classify_worker_health(
         # Issue #307: a process that just exited normally (e.g., after publishing a PR)
         # can still have a fresh real-session activity signal. Defer the DEAD verdict
         # for one pass instead of reaping it as a stall.
-        if not _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+        if _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+            pass
+        elif _real_activity_is_inconclusive(real_activity_probe):
+            # Issue #338: an inconclusive probe is not evidence the worker is dead.
+            # Defer the DEAD verdict, but only up to the configured cap so a
+            # genuinely-dead worker with a permanently-broken probe is still reaped.
+            if (
+                view.inconclusive_probe_deferred_count
+                < config.watchdog.max_inconclusive_probe_deferrals
+            ):
+                pass
+            else:
+                return WorkerHealth.DEAD
+        else:
             return WorkerHealth.DEAD
 
     # Signal 2: terminal marker
@@ -641,6 +681,7 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         last_activity_at=record.last_activity_at,
         log_bytes=record.log_bytes,
         rate_limit_defer_until=record.rate_limit_defer_until,
+        inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
     )
 
 
@@ -662,6 +703,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         last_activity_at=record.last_activity_at,
         log_bytes=record.log_bytes,
         rate_limit_defer_until=record.rate_limit_defer_until,
+        inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
     )
 
 
@@ -726,7 +768,11 @@ def _iso_to_timestamp(value: str) -> float | None:
 
 
 def update_worker_log_stat(
-    sessions_dir: Path, worker: WorkerView, *, rate_limit_defer_until: str | None = None
+    sessions_dir: Path,
+    worker: WorkerView,
+    *,
+    rate_limit_defer_until: str | None = None,
+    inconclusive_probe_deferred_count: int | None = None,
 ) -> None:
     """Update last_activity_at and log_bytes fields on a worker's sidecar.
 
@@ -743,6 +789,8 @@ def update_worker_log_stat(
         worker: WorkerView to update (must have valid log_path)
         rate_limit_defer_until: Optional new defer deadline to persist on the
             sidecar. When provided, the defer field is set and not cleared.
+        inconclusive_probe_deferred_count: Optional new Signal-1 deferral counter
+            to persist on the sidecar (issue #338).
     """
     import json
 
@@ -791,6 +839,9 @@ def update_worker_log_stat(
         activity_advanced = _log_activity_advanced(log_stat_result, previous_activity_at)
         if activity_advanced:
             payload["rate_limit_defer_until"] = None
+
+    if inconclusive_probe_deferred_count is not None:
+        payload["inconclusive_probe_deferred_count"] = inconclusive_probe_deferred_count
 
     # Write back atomically using the adapter-specific helper
     if worker.adapter_kind == "devin":
