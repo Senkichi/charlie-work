@@ -60,6 +60,62 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _to_float(value: Any) -> float | None:
+    """Coerce a JSON-deserialized value to a float, or return None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _canonical_started_at(started_at: Any, process_start_time: Any | None = None) -> str:
+    """Coerce ``started_at`` to a canonical ISO-8601 UTC string (Z, no microseconds).
+
+    Accepts ISO-8601 strings (with or without timezone, with ``Z`` or ``+HH:MM``)
+    and numeric Unix timestamps. If ``started_at`` is missing or unparseable, falls
+    back to ``process_start_time`` (a Unix timestamp). Raises ``ValueError`` if no
+    usable timestamp can be produced.
+    """
+    if started_at is None:
+        started_at_str = ""
+    else:
+        started_at_str = str(started_at).strip()
+    if started_at_str in {"", "None", "null"}:
+        started_at_str = ""
+
+    if started_at_str:
+        try:
+            parsed = datetime.fromisoformat(started_at_str)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            parsed = parsed.astimezone(UTC)
+            return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        except (ValueError, TypeError):
+            pass
+
+    # Fall back to the process start time, or a numeric started_at string.
+    fallback_ts = _to_float(process_start_time)
+    if fallback_ts is None and started_at_str:
+        fallback_ts = _to_float(started_at_str)
+    if fallback_ts is not None:
+        try:
+            parsed = datetime.fromtimestamp(fallback_ts, tz=UTC)
+            return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        except (ValueError, OSError, OverflowError):
+            pass
+
+    raise ValueError(
+        f"started_at must be a valid ISO-8601 timestamp or numeric Unix timestamp; "
+        f"got {started_at!r}"
+    )
+
+
 def is_claim_stale(claim_timestamp: str | None) -> bool:
     """Check if a dispatch_pending claim is stale and should be re-dispatchable.
 
