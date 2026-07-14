@@ -2722,6 +2722,42 @@ def test_worker_authored_dirty_normalizes_backslash_in_override(tmp_path: Path) 
     assert _worker_authored_dirty(repo_root, (".devin\\prompts\\worker.md",)) is False
 
 
+def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 follow-up: git collapses a wholly-untracked directory into a
+    single porcelain line (e.g. ``?? .devin/``). When an injected path is
+    nested inside that directory, the collapsed ancestor line must not
+    silently absorb an unrelated, worker-authored sibling file living in the
+    same directory.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling.write_text("real worker output", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+
+
+def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
+    tmp_path: Path,
+) -> None:
+    """Inverse control: a wholly-untracked directory containing ONLY the
+    injected path (no siblings) must still be excused, preserving issue
+    #381's original carve-out.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is False
+
+
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
     """A clean worktree with no commits beyond the base is no_commits."""
     remote, repo = _init_repo_with_remote(tmp_path)

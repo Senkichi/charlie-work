@@ -238,6 +238,55 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     return False
 
 
+def _untracked_dir_contains_only_injected(
+    worktree_path: Path,
+    dir_path: PurePosixPath,
+    injected: list[PurePosixPath],
+) -> bool:
+    """Return True only if every file under the wholly-untracked directory
+    ``dir_path`` is itself an injected path (or nested under one).
+
+    ``git status --porcelain`` (without ``--untracked-files=all``) collapses a
+    wholly-untracked directory into a single line (e.g. ``?? .devin/``)
+    instead of enumerating its contents. When that collapsed line is an
+    ancestor of a configured injected path, we cannot tell from the collapsed
+    line alone whether the directory ALSO holds sibling worker-authored files
+    (e.g. ``.devin/worker-output.txt`` next to ``.devin/prompts/worker.md``).
+    This re-probes git scoped to ``dir_path`` with full enumeration to find
+    out. Any ambiguity (probe failure, or any non-injected file found) fails
+    toward "dirty" — the narrow, exact-match ignoring issue #381 intended.
+    """
+    scoped_result = run_captured(
+        [
+            "git",
+            "-c",
+            "core.quotePath=off",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            str(dir_path),
+        ],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not scoped_result.ok:
+        return False
+    for line in scoped_result.stdout.splitlines():
+        if not line.strip() or len(line) < 4:
+            continue
+        raw_path = line[3:]
+        if " -> " in raw_path:
+            raw_path = raw_path.split(" -> ")[-1]
+        file_path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        if not any(
+            file_path == injected_path or injected_path in file_path.parents
+            for injected_path in injected
+        ):
+            return False
+    return True
+
+
 def _worker_authored_dirty(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
@@ -261,7 +310,10 @@ def _worker_authored_dirty(
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not status_result.ok:
-        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
+        detail = status_result.error or status_result.stderr.strip() or "unknown error"
+        raise WorktreeProbeFailedError(
+            f"worktree status probe failed; treating as dirty: {detail}"
+        )
 
     # Normalize the configured side too, so a Windows-style backslash override
     # still matches git's forward-slash path reporting.
@@ -277,16 +329,23 @@ def _worker_authored_dirty(
         # Renames include "old -> new"; the right-hand side is the current path.
         if len(line) < 4:
             continue
+        status = line[:2]
         raw_path = line[3:]
         if " -> " in raw_path:
             raw_path = raw_path.split(" -> ")[-1]
         # Git may emit backslashes on Windows; normalize for comparison.
         path = PurePosixPath(str(raw_path).replace("\\", "/"))
         if any(
-            path == injected_path or injected_path in path.parents or path in injected_path.parents
-            for injected_path in injected
+            path == injected_path or injected_path in path.parents for injected_path in injected
         ):
             continue
+        if status.strip() == "??" and any(
+            path in injected_path.parents for injected_path in injected
+        ):
+            # A collapsed wholly-untracked ancestor directory of an injected
+            # path. Only excuse it if it holds nothing but injected content.
+            if _untracked_dir_contains_only_injected(worktree_path, path, injected):
+                continue
         return True
     return False
 
