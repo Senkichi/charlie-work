@@ -200,3 +200,65 @@ def test_cli_verdict_isolates_fleet_registry(
         assert not real_fleet_json.exists()
     else:
         assert real_fleet_json.read_text(encoding="utf-8") == real_before
+
+
+def test_cli_spec_review_missing_file_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #363: a missing --file for spec_review exits 1 with an OS error message."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    missing_spec = repo / "missing-spec.md"
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "why-charlie-hate-spec",
+            "--file",
+            str(missing_spec),
+        ]
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "OS error" in captured.out
+    assert "No such file or directory" in captured.out
+    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
+
+
+def test_cli_spec_review_unreadable_file_json_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With --json, an unreadable --file failure is still a machine-parseable non-zero result."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    unreadable = repo / "unreadable.md"
+    unreadable.write_text("secret", encoding="utf-8")
+
+    orig_read_text = Path.read_text
+
+    def _read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == unreadable:
+            raise PermissionError(13, "Permission denied", str(self))
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "--json",
+            "why-charlie-hate-spec",
+            "--file",
+            str(unreadable),
+        ]
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert "OS error" in payload["message"]
+    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
