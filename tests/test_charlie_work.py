@@ -12336,7 +12336,7 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     app.record_review(456, "approved", summary="lgtm")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["status"] = "in_progress"
+        state["issues"]["123"]["status"] = "dispatched"
         save_state(paths.state_file, state)
 
     result = app.merge_ready(456, merge=False)
@@ -12349,7 +12349,7 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert result.message == "PR #456 merge conflict is being resolved by a rework worker"
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == "in_progress"
+    assert state["issues"]["123"]["status"] == "dispatched"
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 

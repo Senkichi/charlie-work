@@ -3332,7 +3332,6 @@ class OrchestratorApp:
                 if issue_status in (
                     "dispatched",
                     "dispatch_pending",
-                    "in_progress",
                     "manifest_written",
                 ):
                     return CommandResult(
