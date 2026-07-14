@@ -1089,7 +1089,7 @@ def test_real_activity_for_worker_worktree_files_mtime_source(tmp_path: Path) ->
     probe = real_activity_for_worker(
         config.post_mortem,
         str(worktree_path),
-        "2026-07-11T11:55:00+00:00",
+        "2026-07-11T11:30:00+00:00",
         None,
         now,
         watchdog_config=watchdog,
@@ -1123,7 +1123,7 @@ def test_real_activity_for_worker_worktree_files_mtime_stale(tmp_path: Path) -> 
     probe = real_activity_for_worker(
         PostMortemConfig(),
         str(worktree_path),
-        "",
+        "2026-07-11T10:00:00+00:00",
         None,
         now,
         watchdog_config=watchdog,
@@ -1133,6 +1133,46 @@ def test_real_activity_for_worker_worktree_files_mtime_stale(tmp_path: Path) -> 
     assert source.timestamp == datetime(2026, 7, 11, 11, 0, 0, tzinfo=UTC)
     assert source.threshold_minutes == 45
     assert probe.is_fresh(20) is False
+
+
+def test_real_activity_for_worker_worktree_files_mtime_checkout_noise_ignored(
+    tmp_path: Path,
+) -> None:
+    """Issue #353: checkout-time mtimes are not treated as post-start activity.
+
+    A freshly-checked-out worktree whose files all date to session start and
+    have not been written to since must not veto a stall verdict.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    source_file = worktree_path / "foo.py"
+    source_file.write_text("# hello", encoding="utf-8")
+
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+    started_at = datetime(2026, 7, 11, 11, 30, 0, tzinfo=UTC)
+    checkout_mtime = started_at.timestamp()
+    os.utime(source_file, (checkout_mtime, checkout_mtime))
+
+    watchdog = WatchdogConfig(
+        worktree_mtime_enabled=True,
+        worktree_mtime_threshold_minutes=45,
+    )
+    probe = real_activity_for_worker(
+        PostMortemConfig(),
+        str(worktree_path),
+        started_at.isoformat(),
+        None,
+        now,
+        watchdog_config=watchdog,
+    )
+
+    source = next(s for s in probe.sources if s.name == "worktree_files_mtime")
+    assert source.error is None
+    assert source.timestamp == started_at
+    assert source.threshold_minutes == 0
+    assert source.staleness_seconds == (now - started_at).total_seconds()
+    assert probe.is_fresh(20) is False
+    assert probe.is_fresh(5) is False
 
 
 def test_real_activity_for_worker_worktree_files_mtime_depth_and_exclude(
@@ -1163,7 +1203,7 @@ def test_real_activity_for_worker_worktree_files_mtime_depth_and_exclude(
     probe = real_activity_for_worker(
         PostMortemConfig(),
         str(worktree_path),
-        "",
+        "2026-07-11T11:30:00+00:00",
         None,
         now,
         watchdog_config=watchdog,

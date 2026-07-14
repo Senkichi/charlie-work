@@ -107,6 +107,7 @@ class ActivitySource:
             "timestamp": self.timestamp.isoformat() if self.timestamp is not None else None,
             "staleness_seconds": self.staleness_seconds,
             "error": self.error,
+            "threshold_minutes": self.threshold_minutes,
         }
 
 
@@ -750,10 +751,14 @@ def _last_event_timestamp(events_path: Path) -> datetime | None:
     return latest
 
 
+_WORKTREE_MTIME_CHECKOUT_BUFFER_SECONDS = 1
+
+
 def _worktree_mtime_source(
     worktree_path: str,
     watchdog_config: WatchdogConfig | None,
     now: datetime,
+    start_baseline: datetime | None = None,
 ) -> ActivitySource | None:
     """Build the worktree file mtime ActivitySource for a worker session.
 
@@ -763,6 +768,12 @@ def _worktree_mtime_source(
     regular file mtime as the activity timestamp, or an errored source when the
     path is missing, empty, or unreadable. Returns None when the source is
     disabled.
+
+    When ``start_baseline`` is provided, only file mtimes strictly newer than
+    ``start_baseline + _WORKTREE_MTIME_CHECKOUT_BUFFER_SECONDS`` are considered
+    real post-start activity. If no files have been modified after that cutoff,
+    the source reports the baseline itself as the timestamp with a threshold of
+    0 minutes, so the source is conclusively stale rather than inconclusive.
     """
     name = "worktree_files_mtime"
     if watchdog_config is None or not watchdog_config.worktree_mtime_enabled:
@@ -798,6 +809,9 @@ def _worktree_mtime_source(
     base_parts = len(path.parts)
     max_mtime: float | None = None
 
+    if start_baseline is not None and start_baseline.tzinfo is None:
+        start_baseline = start_baseline.replace(tzinfo=UTC)
+
     try:
         for root, dirs, files in os.walk(path, topdown=True):
             root_path = Path(root)
@@ -812,6 +826,12 @@ def _worktree_mtime_source(
                     st = os.lstat(file_path)
                     if not stat.S_ISREG(st.st_mode):
                         continue
+                    if start_baseline is not None:
+                        cutoff = start_baseline + timedelta(
+                            seconds=_WORKTREE_MTIME_CHECKOUT_BUFFER_SECONDS
+                        )
+                        if st.st_mtime <= cutoff.timestamp():
+                            continue
                     if max_mtime is None or st.st_mtime > max_mtime:
                         max_mtime = st.st_mtime
                 except OSError:
@@ -824,21 +844,30 @@ def _worktree_mtime_source(
             error=f"worktree walk failed: {exc}",
         )
 
-    if max_mtime is None:
+    if max_mtime is not None:
+        timestamp = datetime.fromtimestamp(max_mtime, tz=UTC)
         return ActivitySource(
             name=name,
-            timestamp=None,
-            staleness_seconds=None,
-            error="no eligible worktree files found",
+            timestamp=timestamp,
+            staleness_seconds=(now - timestamp).total_seconds(),
+            error=None,
+            threshold_minutes=watchdog_config.worktree_mtime_threshold_minutes,
         )
 
-    timestamp = datetime.fromtimestamp(max_mtime, tz=UTC)
+    if start_baseline is not None:
+        return ActivitySource(
+            name=name,
+            timestamp=start_baseline,
+            staleness_seconds=(now - start_baseline).total_seconds(),
+            error=None,
+            threshold_minutes=0,
+        )
+
     return ActivitySource(
         name=name,
-        timestamp=timestamp,
-        staleness_seconds=(now - timestamp).total_seconds(),
-        error=None,
-        threshold_minutes=watchdog_config.worktree_mtime_threshold_minutes,
+        timestamp=None,
+        staleness_seconds=None,
+        error="no eligible worktree files found",
     )
 
 
@@ -875,6 +904,14 @@ def real_activity_for_worker(
     db_path = _resolve_db_path(pm_config.db_path)
     logs_dir = _devin_logs_dir(db_path)
 
+    start_baseline: datetime | None = None
+    try:
+        start_baseline = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if start_baseline.tzinfo is None:
+            start_baseline = start_baseline.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        pass
+
     # --- Source 1: sessions.db last message_nodes row for the matching session
     conn: sqlite3.Connection | None = None
     temp_copy_path: Path | None = None
@@ -890,12 +927,9 @@ def real_activity_for_worker(
             )
         else:
             margin = timedelta(seconds=pm_config.match_window_margin_seconds)
-            try:
-                started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                if started_dt.tzinfo is None:
-                    started_dt = started_dt.replace(tzinfo=UTC)
-                window_start = started_dt - margin
-            except (ValueError, TypeError):
+            if start_baseline is not None:
+                window_start = start_baseline - margin
+            else:
                 lookback = timedelta(seconds=pm_config.unparseable_started_at_lookback_seconds)
                 window_start = now - lookback
             window_end = now + margin
@@ -1032,7 +1066,7 @@ def real_activity_for_worker(
                 )
 
     # --- Source 4: worktree file mtimes (issue #353)
-    worktree_source = _worktree_mtime_source(worktree_path, watchdog_config, now)
+    worktree_source = _worktree_mtime_source(worktree_path, watchdog_config, now, start_baseline)
     if worktree_source is not None:
         sources.append(worktree_source)
 

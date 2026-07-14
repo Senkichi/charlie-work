@@ -940,7 +940,7 @@ def test_log_is_stalled_at_shim_worktree_files_mtime_fresh_beyond_grace(
     probe = real_activity_for_worker(
         PostMortemConfig(),
         str(worktree_path),
-        "",
+        (now - timedelta(minutes=10)).isoformat(),
         None,
         now,
         watchdog_config=watchdog,
@@ -950,6 +950,40 @@ def test_log_is_stalled_at_shim_worktree_files_mtime_fresh_beyond_grace(
     assert not _log_is_stalled_at_shim(
         log_path, grace_minutes=5, now=now, real_activity_probe=probe
     )
+
+
+def test_log_is_stalled_at_shim_worktree_files_mtime_checkout_noise_stalls(
+    tmp_path: Path,
+) -> None:
+    """Issue #353: checkout-time mtimes do not mask a launch stall."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    now = datetime.now(UTC)
+    old_time = now - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    source_file = worktree_path / "foo.py"
+    source_file.write_text("# change", encoding="utf-8")
+    started_at = now - timedelta(minutes=30)
+    os.utime(source_file, (started_at.timestamp(), started_at.timestamp()))
+
+    watchdog = WatchdogConfig(
+        worktree_mtime_enabled=True,
+        worktree_mtime_threshold_minutes=45,
+    )
+    probe = real_activity_for_worker(
+        PostMortemConfig(),
+        str(worktree_path),
+        started_at.isoformat(),
+        None,
+        now,
+        watchdog_config=watchdog,
+    )
+
+    assert _log_is_stalled_at_shim(log_path, grace_minutes=5, now=now, real_activity_probe=probe)
 
 
 # ---------------------------------------------------------------------------
