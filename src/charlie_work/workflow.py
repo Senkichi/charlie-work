@@ -1620,6 +1620,20 @@ def _format_merge_attempt_alarm_message(
     return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
+def _format_stale_base_alarm_message(
+    pr_number: int, attempts: int, reason: str
+) -> str:
+    """Human-readable alarm message for an approved PR whose base is not current."""
+    pass_str = "pass" if attempts == 1 else "passes"
+    if reason == "base_stale":
+        detail = "base is stale"
+    elif reason == "compare_unavailable":
+        detail = "base freshness comparison unavailable"
+    else:
+        detail = f"base is not current (reason: {reason})"
+    return f"PR #{pr_number} approved but {detail} for {attempts} consecutive {pass_str}"
+
+
 # Sentinel used to distinguish "no base-current signal was supplied" from
 # an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
 class _BaseCurrentUnset:
@@ -3166,6 +3180,7 @@ class OrchestratorApp:
                         "reviewed_head_sha": reviewed_head_sha,
                         "live_head_sha": live_head_sha,
                         "consecutive_failed_merge_attempts": 0,
+                        "consecutive_stale_base_deferrals": 0,
                     }
                     if issue_number is not None:
                         _issue_key = str(issue_number)
@@ -3258,7 +3273,6 @@ class OrchestratorApp:
                         pr_number,
                         issue_number,
                         decision,
-                        existing_pr_state,
                         base_ref,
                         head_sha,
                         reason,
@@ -3382,6 +3396,7 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
             new_attempts = 0
+            new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
             if approved and not can_merge and not _is_pending_only(summary):
@@ -3419,6 +3434,7 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "consecutive_failed_merge_attempts": new_attempts,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
             }
             if merge_output:
                 prs_entry["status"] = "merged"
@@ -3451,6 +3467,7 @@ class OrchestratorApp:
             "cancel_superseded_runs_results": cancel_results,
             "containment_warnings": list(containment_warnings),
             "consecutive_failed_merge_attempts": new_attempts,
+            "consecutive_stale_base_deferrals": new_stale_base_deferrals,
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
         }
@@ -3878,7 +3895,6 @@ class OrchestratorApp:
         pr_number: int,
         issue_number: int | None,
         decision: dict[str, Any],
-        existing_pr_state: dict[str, Any],
         base_ref: str | None,
         head_sha: str | None,
         reason: str = "base_stale",
@@ -3891,6 +3907,29 @@ class OrchestratorApp:
         """
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            existing = state["prs"].get(str(pr_number), {})
+            new_stale_base_deferrals = int(existing.get("consecutive_stale_base_deferrals", 0)) + 1
+            threshold = self.config.auto_merge.failed_attempt_alarm
+            stale_base_alarm = threshold > 0 and new_stale_base_deferrals == threshold
+            stale_base_warning: str | None = None
+            if stale_base_alarm:
+                stale_base_warning = _format_stale_base_alarm_message(
+                    pr_number, new_stale_base_deferrals, reason
+                )
+                state = append_event(
+                    state,
+                    "merge_deferred_stale_base_alarm",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "base_ref": base_ref,
+                        "head_sha": head_sha,
+                        "reason": reason,
+                        "attempts": new_stale_base_deferrals,
+                        "threshold": threshold,
+                        "message": stale_base_warning,
+                    },
+                )
             state = append_event(
                 state,
                 "merge_deferred_stale_base",
@@ -3902,6 +3941,12 @@ class OrchestratorApp:
                     "reason": reason,
                 },
             )
+            state["prs"][str(pr_number)] = {
+                **existing,
+                "number": pr_number,
+                "issue_number": issue_number,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
+            }
             save_state(self.paths.state_file, state)
         return CommandResult(
             True,
@@ -3922,11 +3967,12 @@ class OrchestratorApp:
                 "cancel_superseded_runs_results": None,
                 "containment_warnings": [],
                 "stale_base": True,
-                "consecutive_failed_merge_attempts": existing_pr_state.get(
+                "consecutive_failed_merge_attempts": existing.get(
                     "consecutive_failed_merge_attempts", 0
                 ),
-                "merge_attempt_alarm": False,
-                "merge_attempt_warning": None,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
+                "merge_attempt_alarm": stale_base_alarm,
+                "merge_attempt_warning": stale_base_warning,
             },
         )
 

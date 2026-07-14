@@ -216,6 +216,13 @@ class AutoMergeConfig:
                 f"got {type(value).__name__}"
             )
         object.__setattr__(self, "update_open_prs", normalized)
+        if self.require_current_base and self.update_open_prs == "off":
+            raise ConfigError(
+                "config section 'auto_merge': require_current_base=True with "
+                "update_open_prs='off' creates a permanent merge deadlock: the base "
+                "must be current but the branch is never synced. Set "
+                "require_current_base: false, or set update_open_prs to 'next' or 'all'."
+            )
 
 
 @dataclass(frozen=True)
