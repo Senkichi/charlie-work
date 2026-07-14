@@ -2067,7 +2067,12 @@ class OrchestratorApp:
             stalled_issues = {entry["issue"] for entry in stalled_entries}
             live_worker_issues = _issues_with_live_workers(sessions_dir)
             prs = self.gh.pr_list()
-            merged_prs = self.gh.merged_pr_list()
+            # No ready issues means _merged_pr_referenced_issue_numbers() would
+            # return empty sets regardless of what merged_pr_list() returns
+            # (it intersects against the ready-issue-number set) — skip the
+            # expensive listing query entirely rather than fetch-and-discard
+            # (issue #361).
+            merged_prs = self.gh.merged_pr_list() if issues else []
             merged_pr_bound_issue_numbers, merged_pr_mention_only_issue_numbers = (
                 self._merged_pr_referenced_issue_numbers(issues, merged_prs)
             )
@@ -2217,7 +2222,11 @@ class OrchestratorApp:
         stalled_issues = {entry["issue"] for entry in stalled_entries}
         live_worker_issues = _issues_with_live_workers(sessions_dir)
         prs = self.gh.pr_list()
-        merged_prs = self.gh.merged_pr_list()
+        # No ready issues means _merged_pr_referenced_issue_numbers() would
+        # return empty sets regardless of what merged_pr_list() returns (it
+        # intersects against the ready-issue-number set) — skip the expensive
+        # listing query entirely rather than fetch-and-discard (issue #361).
+        merged_prs = self.gh.merged_pr_list() if issues else []
         merged_pr_bound_issue_numbers, merged_pr_mention_only_issue_numbers = (
             self._merged_pr_referenced_issue_numbers(issues, merged_prs)
         )
