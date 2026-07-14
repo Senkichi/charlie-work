@@ -94,6 +94,7 @@ def _canonical_started_at(started_at: Any, process_start_time: Any | None = None
             parsed = datetime.fromisoformat(started_at_str)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=UTC)
+            parsed = parsed.astimezone(UTC)
             return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         except (ValueError, TypeError):
             pass

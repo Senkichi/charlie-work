@@ -430,6 +430,15 @@ def test_claude_worker_record_from_dict_derives_started_at_from_process_start_ti
     assert record.started_at == "2024-03-09T16:00:00Z"
 
 
+def test_canonical_started_at_normalizes_non_utc_offsets_to_utc() -> None:
+    """Issue #354: _canonical_started_at must normalize non-UTC offsets to UTC/Z."""
+    from charlie_work.state import _canonical_started_at
+
+    assert _canonical_started_at("2026-07-13T16:04:45+02:00") == "2026-07-13T14:04:45Z"
+    assert _canonical_started_at("2026-07-13T16:04:45.267596+02:00") == "2026-07-13T14:04:45Z"
+    assert _canonical_started_at("2026-07-13T16:04:45-07:00") == "2026-07-13T23:04:45Z"
+
+
 def test_worker_view_reap_sidecar_devin(tmp_path: Path) -> None:
     """WorkerView.reap_sidecar() deletes the devin-shell sidecar file for a dead session (issue #113)."""
     from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
