@@ -11669,6 +11669,179 @@ def test_merge_ready_current_base_no_sync(tmp_path: Path) -> None:
     assert decision["reviewed_head_sha"] == "sha-abc123"
 
 
+def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #371: an approved PR with a genuine merge conflict is routed to rework.
+
+    A conflict is detected from ``mergeable=CONFLICTING`` and is not retried
+    with ``gh pr update-branch``. Instead, the linked issue moves to
+    ``rework_requested`` and dispatch_rework can select it.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    # The sync step is bypassed: the PR head should not be advanced.
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123"
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["events"][-1]["kind"] == "merge_ready"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["pr_number"] == 456
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+
+    # The rework prompt was written and the issue was labeled for rework.
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    # dispatch_rework can pick the issue up and launch a worker.
+    dispatch = app.dispatch_rework()
+    assert dispatch.data["selected_count"] == 1
+    assert dispatch.data["sessions"][0]["issue_number"] == 123
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+
+def test_merge_ready_stale_base_not_routed_to_rework(tmp_path: Path) -> None:
+    """Issue #371: a stale but fast-forwardable base is deferred, not sent to rework."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",
+            require_current_base=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "MERGEABLE",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is False
+    assert result.data.get("stale_base") is True
+    assert result.data["merge_attempt_alarm"] is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "approved"
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    assert (paths.prs / "pr-456" / "rework-prompt.md").exists() is False
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
+    """Issue #371: a persistent merge conflict deferral produces an honest alarm."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    result1 = app.merge_ready(456, merge=False)
+    assert result1.data["merge_conflict"] is True
+    assert result1.data["merge_attempt_alarm"] is False
+    assert result1.data["merge_attempt_warning"] is None
+
+    result2 = app.merge_ready(456, merge=False)
+    assert result2.data["merge_attempt_alarm"] is False
+
+    result3 = app.merge_ready(456, merge=False)
+    assert result3.data["merge_attempt_alarm"] is True
+    warning = result3.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "PR #456 approved but unmergeable for 3 passes" in warning
+    assert "merge conflict" in warning.lower()
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert "merge conflict" in alarm_events[0]["payload"]["message"].lower()
+
+
 def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
     """Issue #334: next-mode update lane syncs a CLEAN-but-stale head candidate."""
     from charlie_work.config import AutoMergeConfig

@@ -3138,6 +3138,8 @@ class OrchestratorApp:
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
         sync_failed = False
+        merge_conflict = False
+        label_error: dict[str, Any] | None = None
         if approved:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
@@ -3196,6 +3198,43 @@ class OrchestratorApp:
                         "label_error": label_error,
                     },
                 )
+            # Genuine merge conflict: gh pr update-branch cannot resolve this.
+            # Route the linked issue to rework_requested so dispatch_rework
+            # relaunches a worker; the worker's push will move the head and
+            # force a fresh re-review of the approved verdict.
+            if self._is_merge_conflict(pr):
+                state = load_state_locked(self.paths.state_file)
+                issue_state = (
+                    state["issues"].get(str(issue_number), {}) if issue_number is not None else {}
+                )
+                issue_status = issue_state.get("status")
+                if issue_status in (
+                    "dispatched",
+                    "dispatch_pending",
+                    "in_progress",
+                    "manifest_written",
+                ):
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} merge conflict is being resolved by a rework worker",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "merge_conflict": True,
+                            "consecutive_failed_merge_attempts": existing_pr_state.get(
+                                "consecutive_failed_merge_attempts", 0
+                            ),
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
+                merge_conflict = True
+                sync_failed = True
+                if issue_status != "rework_requested" and issue_number is not None:
+                    label_error = self._request_merge_conflict_rework(pr, issue_number, decision)
             # Head matches the approved SHA. In merge-train mode, only the head
             # of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
@@ -3389,9 +3428,16 @@ class OrchestratorApp:
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
                 if merge_attempt_alarm:
-                    merge_attempt_warning = _format_merge_attempt_alarm_message(
-                        pr_number, new_attempts, summary
-                    )
+                    if merge_conflict:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            "merge conflict — rework dispatched"
+                        )
+                    else:
+                        merge_attempt_warning = _format_merge_attempt_alarm_message(
+                            pr_number, new_attempts, summary
+                        )
                     state = append_event(
                         state,
                         "merge_failed_attempt_alarm",
@@ -3453,6 +3499,7 @@ class OrchestratorApp:
             "consecutive_failed_merge_attempts": new_attempts,
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
+            "merge_conflict": merge_conflict,
         }
         message = "merge readiness evaluated"
         if checks_unavailable:
@@ -3869,6 +3916,7 @@ class OrchestratorApp:
                 ),
                 "merge_attempt_alarm": False,
                 "merge_attempt_warning": None,
+                "merge_conflict": False,
             },
         )
 
@@ -3926,8 +3974,82 @@ class OrchestratorApp:
                 ),
                 "merge_attempt_alarm": False,
                 "merge_attempt_warning": None,
+                "merge_conflict": False,
             },
         )
+
+    def _is_merge_conflict(self, pr: dict[str, Any]) -> bool:
+        """Detect a genuine content conflict that gh pr update-branch cannot resolve.
+
+        GitHub exposes this through ``mergeable`` (CONFLICTING) and through
+        ``mergeStateStatus`` (DIRTY). Both are already fetched by ``pr_view``.
+        """
+        return (
+            str(pr.get("mergeable") or "").upper() == "CONFLICTING"
+            or str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
+        )
+
+    def _request_merge_conflict_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR with a genuine merge conflict to rework.
+
+        Writes a rework prompt, transitions the linked issue to
+        ``rework_requested`` (same label set as a non-escalated request_changes),
+        and appends a distinct ``merge_conflict_rework_requested`` state event.
+        The PR's ``review-decision.json`` is intentionally left untouched so the
+        approved verdict is re-confirmed after the worker push moves the head.
+        """
+        pr_number = int(pr["number"])
+        summary = (
+            "The PR branch has a merge conflict with the base branch after a base update. "
+            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
+            "The code changes are already approved; do not re-litigate the review."
+        )
+        self._write_rework_prompt(pr, issue_number, summary)
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            issue_key = str(issue_number)
+            issue_entry = state["issues"].get(issue_key, {})
+            state["issues"][issue_key] = {
+                **issue_entry,
+                "number": issue_number,
+                "status": "rework_requested",
+                "merge_alert": "OK",
+            }
+            pr_entry = state["prs"].get(str(pr_number), {})
+            state["prs"][str(pr_number)] = {
+                **pr_entry,
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "rework_requested",
+            }
+            state = append_event(
+                state,
+                "merge_conflict_rework_requested",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "base_ref": pr.get("baseRefName"),
+                    "head_sha": pr.get("headRefOid"),
+                    "reviewed_head_sha": decision.get("reviewed_head_sha"),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        result = transition(self.gh, self.config.labels, issue_number, "rework_requested")
+        if result.outcome == TransitionOutcome.APPLIED:
+            return None
+        return {
+            "edge": "rework_requested",
+            "outcome": result.outcome.value,
+            "add_failures": result.add_failures,
+            "remove_failures": result.remove_failures,
+        }
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
         """Return the PR number of the head of the merge-train queue, or None.
