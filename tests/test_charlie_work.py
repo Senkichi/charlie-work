@@ -4223,6 +4223,201 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
     assert fake_gh.merged == []
 
 
+def _review_queue_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with FakeGitHub and a default state file."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+
+def _write_review_packet(
+    tmp_path: Path,
+    pr_number: int,
+    packet_head_sha: str,
+    decision: dict[str, Any] | None = None,
+) -> Path:
+    """Create a review packet fixture for a PR."""
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps({"number": pr_number, "headRefOid": packet_head_sha}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text(
+        f"review prompt for PR #{pr_number}",
+        encoding="utf-8",
+    )
+    if decision is not None:
+        (pr_dir / "review-decision.json").write_text(
+            json.dumps(decision),
+            encoding="utf-8",
+        )
+    return pr_dir
+
+
+def test_review_queue_includes_missing_pending_and_stale_decisions(
+    tmp_path: Path,
+) -> None:
+    """Issue #369: review_queue enumerates current packets awaiting a verdict."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10: missing decision",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20: pending decision",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 300,
+            "title": "Fix #30: stale request_changes",
+            "url": "https://example.test/pull/300",
+            "headRefName": "agent/issue-30-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-300-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #30",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 400,
+            "title": "Fix #40: approved on current head",
+            "url": "https://example.test/pull/400",
+            "headRefName": "agent/issue-40-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-400",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #40",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 500,
+            "title": "Fix #50: stale packet",
+            "url": "https://example.test/pull/500",
+            "headRefName": "agent/issue-50-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-500-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #50",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 600,
+            "title": "No linked issue",
+            "url": "https://example.test/pull/600",
+            "headRefName": "feature/unlinked",
+            "baseRefName": "main",
+            "headRefOid": "sha-600",
+            "mergeStateStatus": "CLEAN",
+            "body": "Some feature",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+
+    # PR 100: current packet, no decision -> decision missing
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # PR 200: current packet, pending decision
+    _write_review_packet(tmp_path, 200, "sha-200", {"decision": "pending"})
+    # PR 300: current packet, request_changes from prior head -> stale
+    _write_review_packet(
+        tmp_path,
+        300,
+        "sha-300-new",
+        {"decision": "request_changes", "reviewed_head_sha": "sha-300-old"},
+    )
+    # PR 400: current packet, approved on current head -> excluded
+    _write_review_packet(
+        tmp_path,
+        400,
+        "sha-400",
+        {"decision": "approved", "reviewed_head_sha": "sha-400"},
+    )
+    # PR 500: stale packet (recorded head differs from live head) -> excluded
+    _write_review_packet(tmp_path, 500, "sha-500-old")
+    # PR 600: unlinked PR has no packet, so excluded
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": 100,
+            "issue": 10,
+            "packet_head_sha": "sha-100",
+            "decision": "missing",
+            "reviewed_head_sha": None,
+        },
+        {
+            "pr": 200,
+            "issue": 20,
+            "packet_head_sha": "sha-200",
+            "decision": "pending",
+            "reviewed_head_sha": None,
+        },
+        {
+            "pr": 300,
+            "issue": 30,
+            "packet_head_sha": "sha-300-new",
+            "decision": "stale",
+            "reviewed_head_sha": "sha-300-old",
+        },
+    ]
+
+
+def test_review_queue_is_read_only(tmp_path: Path) -> None:
+    """Issue #369: review_queue must not mutate state.json or PR-directory files."""
+    app = _review_queue_app(tmp_path)
+    _write_review_packet(tmp_path, 456, "sha-abc123")
+    before_state = json.loads(app.paths.state_file.read_text(encoding="utf-8"))
+    pr_json = (app.paths.prs / "pr-456" / "pr.json").read_text(encoding="utf-8")
+    prompt = (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    after_state = json.loads(app.paths.state_file.read_text(encoding="utf-8"))
+    assert after_state == before_state
+    assert (app.paths.prs / "pr-456" / "pr.json").read_text(encoding="utf-8") == pr_json
+    assert (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8") == prompt
+
+
 def test_review_checks_unavailable_blocks_and_preserves_labels(tmp_path: Path) -> None:
     """gh pr checks command failure must block review, leave labels unchanged, and surface checks_unavailable."""
     config = _required_checks_config()
@@ -17401,6 +17596,107 @@ def test_build_parser_fleet_subcommand() -> None:
     assert args_roll_call.command == "roll-call"
 
     parser.parse_args(["doctor"])
+
+    # Test fleet review-queue parsing
+    args_review_queue = parser.parse_args(["fleet", "review-queue"])
+    assert args_review_queue.command == "fleet"
+    assert args_review_queue.fleet_command == "review-queue"
+
+    # Test single-repo review-queue parsing
+    args_single = parser.parse_args(["review-queue"])
+    assert args_single.command == "review-queue"
+
+
+def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
+    """Issue #369: fleet review-queue aggregates per repo and isolates errors."""
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    config_ok = repo_ok / "orchestrator.config.yaml"
+    config_ok.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_ok / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Good repo has one PR with a current packet and no decision
+    prs_dir = repo_ok / ".var" / "charlie-work" / "prs" / "pr-7"
+    prs_dir.mkdir(parents=True)
+    (prs_dir / "pr.json").write_text(
+        json.dumps({"number": 7, "headRefOid": "sha-7"}), encoding="utf-8"
+    )
+    (prs_dir / "review-prompt.md").write_text("packet for PR 7", encoding="utf-8")
+
+    # Create a valid state.json so load_state doesn't fail
+    (repo_ok / ".var" / "charlie-work" / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_ok": {
+                "repo_root": str(repo_ok),
+                "name_with_owner": "owner/repo_ok",
+                "config_path": str(config_ok),
+                "state_dir": str(repo_ok / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    from charlie_work.github import GitHub
+
+    def mock_pr_list(self):
+        return [
+            {
+                "number": 7,
+                "title": "Fix #7: thing",
+                "url": "https://example.test/pull/7",
+                "headRefName": "agent/issue-7-fix",
+                "baseRefName": "main",
+                "headRefOid": "sha-7",
+                "mergeStateStatus": "CLEAN",
+                "body": "Closes #7",
+                "labels": [],
+                "isCrossRepository": False,
+                "state": "OPEN",
+            }
+        ]
+
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+
+    args = cli.build_parser().parse_args(["fleet", "review-queue"])
+    result = cli.run_fleet_review_queue(args)
+
+    assert result.ok is False
+    assert "1 repo(s), 1 error(s)" in result.message
+    assert result.data["repos"]["owner/repo_ok"]["queue"] == [
+        {
+            "pr": 7,
+            "issue": 7,
+            "packet_head_sha": "sha-7",
+            "decision": "missing",
+            "reviewed_head_sha": None,
+        }
+    ]
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
 
 
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
