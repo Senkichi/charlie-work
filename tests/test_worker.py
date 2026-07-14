@@ -17,7 +17,7 @@ from charlie_work.devin_shell import (
     _sidecar_path as devin_sidecar_path,
     _write_json,
 )
-from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+from charlie_work.post_mortem import ActivitySource, RealActivityProbe, real_activity_for_worker
 from charlie_work.worker import WorkerHealth, WorkerView, _log_is_stalled_at_shim, iter_workers
 
 
@@ -910,6 +910,43 @@ def test_log_is_stalled_at_shim_with_no_match_yet_probe_deferred(tmp_path: Path)
         )
     )
 
+    assert not _log_is_stalled_at_shim(
+        log_path, grace_minutes=5, now=now, real_activity_probe=probe
+    )
+
+
+def test_log_is_stalled_at_shim_worktree_files_mtime_fresh_beyond_grace(
+    tmp_path: Path,
+) -> None:
+    """Issue #353: worktree mtime freshness uses its own generous threshold."""
+    log_path = tmp_path / "issue-1.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+
+    now = datetime.now(UTC)
+    old_time = now - timedelta(minutes=10)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    source_file = worktree_path / "foo.py"
+    source_file.write_text("# change", encoding="utf-8")
+    worktree_mtime = now - timedelta(minutes=8)
+    os.utime(source_file, (worktree_mtime.timestamp(), worktree_mtime.timestamp()))
+
+    watchdog = WatchdogConfig(
+        worktree_mtime_enabled=True,
+        worktree_mtime_threshold_minutes=45,
+    )
+    probe = real_activity_for_worker(
+        PostMortemConfig(),
+        str(worktree_path),
+        "",
+        None,
+        now,
+        watchdog_config=watchdog,
+    )
+
+    # 8 minutes is past the 5-minute grace, but within the 45-minute worktree threshold.
     assert not _log_is_stalled_at_shim(
         log_path, grace_minutes=5, now=now, real_activity_probe=probe
     )

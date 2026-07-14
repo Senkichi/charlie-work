@@ -123,10 +123,8 @@ def _log_is_stalled_at_shim(
             return False
 
         # Corroborate against real-session activity before declaring a stall
-        if real_activity_probe is not None and real_activity_probe.latest_timestamp is not None:
-            real_age = now - real_activity_probe.latest_timestamp
-            if real_age <= timedelta(minutes=grace_minutes):
-                return False
+        if real_activity_probe is not None and real_activity_probe.is_fresh(grace_minutes):
+            return False
         elif _real_activity_is_inconclusive(real_activity_probe):
             # Probe was consulted but produced no timestamp evidence either way
             # (issue #307: same single enforcement point as classify_worker_health's
@@ -425,19 +423,17 @@ def _parse_started_at(value: str) -> datetime | None:
         return None
 
 
-def _real_activity_is_fresh(
-    probe: RealActivityProbe | None, now: datetime, stall_minutes: int
-) -> bool:
+def _real_activity_is_fresh(probe: RealActivityProbe | None, stall_minutes: int) -> bool:
     """Return True when the probe shows real-session activity within the stall window.
 
     A fresh real-activity signal from any source (sessions.db, per-PID Devin log,
-    or Claude Code events.jsonl) is enough to veto an immediate DEAD/STALLED verdict.
+    Claude Code events.jsonl, or worktree file mtimes) is enough to veto an
+    immediate DEAD/STALLED verdict. Sources with their own threshold (e.g.
+    worktree file mtimes) override the default ``stall_minutes``.
     """
-    from datetime import timedelta
-
-    if probe is None or probe.latest_timestamp is None:
+    if probe is None:
         return False
-    return (now - probe.latest_timestamp) <= timedelta(minutes=stall_minutes)
+    return probe.is_fresh(stall_minutes)
 
 
 def _real_activity_is_inconclusive(probe: RealActivityProbe | None) -> bool:
@@ -534,7 +530,7 @@ def classify_worker_health(
         # Issue #307: a process that just exited normally (e.g., after publishing a PR)
         # can still have a fresh real-session activity signal. Defer the DEAD verdict
         # for one pass instead of reaping it as a stall.
-        if _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+        if _real_activity_is_fresh(real_activity_probe, config.watchdog.stall_minutes):
             pass
         elif _real_activity_is_inconclusive(real_activity_probe):
             # Issue #338: an inconclusive probe is not evidence the worker is dead.
@@ -580,7 +576,7 @@ def classify_worker_health(
 
         if is_stalled_by_mtime:
             # Corroborate against real-session activity before killing (issues #280, #307)
-            if _real_activity_is_fresh(real_activity_probe, now, config.watchdog.stall_minutes):
+            if _real_activity_is_fresh(real_activity_probe, config.watchdog.stall_minutes):
                 # Sidecar log is frozen but the real session is still moving
                 pass
             elif _real_activity_is_inconclusive(real_activity_probe):
@@ -871,6 +867,7 @@ def real_activity_probe_for(
         view.pid,
         now,
         view.log_path,
+        config.watchdog,
     )
 
 

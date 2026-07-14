@@ -143,6 +143,48 @@ def test_classify_worker_health_stalled_by_mtime_overridden_by_real_activity(
         assert health == WorkerHealth.HEALTHY
 
 
+def test_classify_worker_health_worktree_files_mtime_overrides_stale_log(
+    tmp_path: Path,
+) -> None:
+    """Issue #353: a live worker with a stale sidecar log but recent worktree writes is healthy."""
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    now = datetime.now(UTC)
+    old_time = now - timedelta(minutes=30)
+    os.utime(log_file, (old_time.timestamp(), old_time.timestamp()))
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    source_file = worktree_path / "foo.py"
+    source_file.write_text("# change", encoding="utf-8")
+    worktree_mtime = now - timedelta(minutes=25)
+    os.utime(source_file, (worktree_mtime.timestamp(), worktree_mtime.timestamp()))
+
+    view = WorkerView(
+        adapter_kind="devin",
+        issue_number=1,
+        repo_key="",
+        pid=12345,
+        started_at=(now - timedelta(minutes=10)).isoformat(),
+        process_start_time=1710000000.0,
+        log_path=str(log_file),
+        worktree_path=str(worktree_path),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    with patch("charlie_work.worker.is_session_alive", return_value=True):
+        config = OrchestratorConfig(
+            watchdog=WatchdogConfig(stall_minutes=20, worktree_mtime_threshold_minutes=45),
+            post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+        )
+        probe = real_activity_probe_for(view, config, now)
+        health = classify_worker_health(view, config, now, probe)
+        assert health == WorkerHealth.HEALTHY
+
+
 def test_classify_worker_health_claude_events_override_stale_log(tmp_path: Path) -> None:
     """Issue #301: a claude-code worker with frozen sidecar log but fresh events.jsonl is not stalled."""
     sessions_dir = tmp_path / "sessions"

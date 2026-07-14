@@ -43,13 +43,14 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .config import OrchestratorConfig, PostMortemConfig, SignatureRule
+from .config import OrchestratorConfig, PostMortemConfig, SignatureRule, WatchdogConfig
 
 if TYPE_CHECKING:
     from .attempt_refs import AttemptSnapshot
@@ -87,12 +88,18 @@ def _devin_logs_dir(db_path: Path) -> Path:
 
 @dataclass(frozen=True)
 class ActivitySource:
-    """One real-activity source consulted for a live worker session."""
+    """One real-activity source consulted for a live worker session.
+
+    ``threshold_minutes`` is optional and overrides the caller's default
+    freshness window for sources (like worktree file mtimes) that need a
+    longer grace period than the sidecar stall threshold.
+    """
 
     name: str
     timestamp: datetime | None
     staleness_seconds: float | None
     error: str | None
+    threshold_minutes: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -108,9 +115,10 @@ class RealActivityProbe:
     """Corroboration probe for a live worker session.
 
     Bundles every real-activity source that was consulted (sessions.db last
-    message node, per-PID Devin log mtime) and the freshest timestamp among
-    them. Used by the stall watchdog to avoid false-positive kills when a shim
-    has frozen the sidecar log but the real Devin session is still working.
+    message node, per-PID Devin log mtime, worktree file mtimes) and the
+    freshest timestamp among them. Used by the stall watchdog to avoid
+    false-positive kills when a shim has frozen the sidecar log but the real
+    Devin session is still working.
     """
 
     sources: tuple[ActivitySource, ...]
@@ -127,6 +135,23 @@ class RealActivityProbe:
                     latest_source = source.name
         object.__setattr__(self, "latest_timestamp", latest)
         object.__setattr__(self, "latest_source", latest_source)
+
+    def is_fresh(self, default_threshold_minutes: int) -> bool:
+        """Return True when any source is fresh within its threshold.
+
+        Sources that declare their own ``threshold_minutes`` (e.g. worktree
+        file mtimes) are compared against that value; all other sources use
+        the caller's default threshold.
+        """
+        for source in self.sources:
+            if source.timestamp is None or source.staleness_seconds is None:
+                continue
+            threshold = source.threshold_minutes
+            if threshold is None:
+                threshold = default_threshold_minutes
+            if source.staleness_seconds <= threshold * 60:
+                return True
+        return False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -725,6 +750,98 @@ def _last_event_timestamp(events_path: Path) -> datetime | None:
     return latest
 
 
+def _worktree_mtime_source(
+    worktree_path: str,
+    watchdog_config: WatchdogConfig | None,
+    now: datetime,
+) -> ActivitySource | None:
+    """Build the worktree file mtime ActivitySource for a worker session.
+
+    Walks up to ``watchdog_config.worktree_mtime_max_depth`` directory levels
+    below ``worktree_path`` and skips directories whose basename is in
+    ``watchdog_config.worktree_mtime_exclude_dirs``. Returns the most recent
+    regular file mtime as the activity timestamp, or an errored source when the
+    path is missing, empty, or unreadable. Returns None when the source is
+    disabled.
+    """
+    name = "worktree_files_mtime"
+    if watchdog_config is None or not watchdog_config.worktree_mtime_enabled:
+        return None
+
+    if not worktree_path:
+        return ActivitySource(
+            name=name,
+            timestamp=None,
+            staleness_seconds=None,
+            error="no worktree_path provided",
+        )
+
+    path = Path(worktree_path)
+    try:
+        if not path.is_dir():
+            return ActivitySource(
+                name=name,
+                timestamp=None,
+                staleness_seconds=None,
+                error=f"worktree path is not a directory: {worktree_path}",
+            )
+    except OSError as exc:
+        return ActivitySource(
+            name=name,
+            timestamp=None,
+            staleness_seconds=None,
+            error=f"worktree path stat failed: {exc}",
+        )
+
+    exclude = set(watchdog_config.worktree_mtime_exclude_dirs)
+    max_depth = watchdog_config.worktree_mtime_max_depth
+    base_parts = len(path.parts)
+    max_mtime: float | None = None
+
+    try:
+        for root, dirs, files in os.walk(path, topdown=True):
+            root_path = Path(root)
+            current_depth = len(root_path.parts) - base_parts
+            if current_depth >= max_depth:
+                dirs[:] = []
+            else:
+                dirs[:] = [d for d in dirs if d not in exclude]
+            for filename in files:
+                file_path = root_path / filename
+                try:
+                    st = os.lstat(file_path)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if max_mtime is None or st.st_mtime > max_mtime:
+                        max_mtime = st.st_mtime
+                except OSError:
+                    continue
+    except OSError as exc:
+        return ActivitySource(
+            name=name,
+            timestamp=None,
+            staleness_seconds=None,
+            error=f"worktree walk failed: {exc}",
+        )
+
+    if max_mtime is None:
+        return ActivitySource(
+            name=name,
+            timestamp=None,
+            staleness_seconds=None,
+            error="no eligible worktree files found",
+        )
+
+    timestamp = datetime.fromtimestamp(max_mtime, tz=UTC)
+    return ActivitySource(
+        name=name,
+        timestamp=timestamp,
+        staleness_seconds=(now - timestamp).total_seconds(),
+        error=None,
+        threshold_minutes=watchdog_config.worktree_mtime_threshold_minutes,
+    )
+
+
 def real_activity_for_worker(
     pm_config: PostMortemConfig,
     worktree_path: str,
@@ -732,6 +849,7 @@ def real_activity_for_worker(
     pid: int | None,
     now: datetime,
     log_path: str | None = None,
+    watchdog_config: WatchdogConfig | None = None,
 ) -> RealActivityProbe:
     """Build a ``RealActivityProbe`` for a live worker session.
 
@@ -744,6 +862,8 @@ def real_activity_for_worker(
        in the ``logs/`` sibling of sessions.db.
     3. Claude Code's ``events.jsonl`` stream-json sibling to the worker's
        ``log_path``, using either the last event timestamp or the file's mtime.
+    4. The worker's ``worktree_path`` file mtimes (bounded depth, excluding
+       ``.git`` and ``.venv``), with a generous config-gated threshold.
 
     Any source with a fresh timestamp is sufficient to show the worker is
     healthy. If every available source is quiet past the threshold, the caller
@@ -910,6 +1030,11 @@ def real_activity_for_worker(
                         error=f"events.jsonl read failed: {exc}",
                     )
                 )
+
+    # --- Source 4: worktree file mtimes (issue #353)
+    worktree_source = _worktree_mtime_source(worktree_path, watchdog_config, now)
+    if worktree_source is not None:
+        sources.append(worktree_source)
 
     return RealActivityProbe(sources=tuple(sources))
 
