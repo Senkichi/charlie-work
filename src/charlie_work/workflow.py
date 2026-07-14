@@ -2886,6 +2886,97 @@ class OrchestratorApp:
             },
         )
 
+    def review_queue(self) -> CommandResult:
+        """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
+
+        This is a read-only command: it inspects existing ``review-prompt.md``
+        packets and ``review-decision.json`` verdicts without writing state or
+        PR-directory files.  A PR is queued when:
+
+        - It has a linked issue (same as ``review()``).
+        - ``prs/pr-N/review-prompt.md`` exists and the stored packet head OID
+          matches the PR's live ``headRefOid``.
+        - The recorded decision is ``missing``/``pending`` or a stale
+          ``request_changes``/``blocked``/``approved`` verdict from a prior head.
+
+        Returns:
+            CommandResult with a sorted ``queue`` list keyed by repo.
+        """
+        prs = self.gh.pr_list()
+        queue: list[dict[str, Any]] = []
+
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is None:
+                continue
+
+            pr_number = int(pr["number"])
+            pr_dir = self.paths.prs / f"pr-{pr_number}"
+            prompt_path = pr_dir / "review-prompt.md"
+            if not prompt_path.exists():
+                continue
+
+            packet_head_sha = self._read_packet_head_oid(pr_number)
+            live_head_sha = pr.get("headRefOid")
+            if (
+                packet_head_sha is None
+                or live_head_sha is None
+                or packet_head_sha != live_head_sha
+            ):
+                continue
+
+            decision = self._review_decision(pr_number)
+            decision_value = decision.get("decision")
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+
+            if decision_value == "approved":
+                if reviewed_head_sha == live_head_sha:
+                    continue
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": "stale",
+                        "reviewed_head_sha": reviewed_head_sha,
+                    }
+                )
+            elif decision_value in ("request_changes", "blocked"):
+                if reviewed_head_sha is not None and reviewed_head_sha == live_head_sha:
+                    continue
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": "stale",
+                        "reviewed_head_sha": reviewed_head_sha,
+                    }
+                )
+            elif decision_value in ("pending", "missing", "invalid"):
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": decision_value
+                        if decision_value in ("pending", "missing")
+                        else "missing",
+                        "reviewed_head_sha": None,
+                    }
+                )
+
+        queue.sort(key=lambda entry: entry["pr"])
+        return CommandResult(
+            True,
+            f"review queue: {len(queue)} PR(s) awaiting verdict",
+            {"queue": queue},
+        )
+
     def record_review(
         self,
         pr_number: int,
