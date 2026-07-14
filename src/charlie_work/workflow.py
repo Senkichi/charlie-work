@@ -3351,6 +3351,32 @@ class OrchestratorApp:
                             "merge_attempt_warning": None,
                         },
                     )
+                # The linked issue is in a human-terminal state (escalated to a
+                # human decision, or blocked pending one). Never reroute those
+                # to rework_requested: transition() has no source-state
+                # validation, so doing so would silently strip human_needed
+                # and hand the issue back into the automated pipeline behind
+                # the human's back. Leave the issue and PR alone; a human
+                # must move it out of this state.
+                if issue_status in ("escalated", "blocked"):
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} merge conflict on issue #{issue_number} "
+                        f"awaiting human decision ({issue_status}); not rerouted",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "merge_conflict": True,
+                            "consecutive_failed_merge_attempts": existing_pr_state.get(
+                                "consecutive_failed_merge_attempts", 0
+                            ),
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
                 merge_conflict = True
                 sync_failed = True
                 if issue_status != "rework_requested" and issue_number is not None:

@@ -12353,6 +12353,74 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 
+@pytest.mark.parametrize("terminal_status", ["escalated", "blocked"])
+def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    """Issue #379 rework: a merge conflict whose linked issue is escalated/blocked
+    (human-terminal) must never be rerouted to rework_requested.
+
+    transition() has no source-state validation, so rerouting would silently
+    strip the human_needed label and hand the issue back to automation behind
+    the human's back. The PR and issue must be left untouched.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    # Mark the linked issue as carrying the human_needed label, matching a
+    # real escalated/blocked issue, so a stripped label would be observable.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["status"] = terminal_status
+        save_state(paths.state_file, state)
+
+    labels_removed_before = list(fake_gh.labels_removed)
+    labels_added_before = list(fake_gh.labels_added)
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == terminal_status
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    # No label mutation must have been issued for the linked issue —
+    # human_needed must stay in place.
+    assert fake_gh.labels_removed == labels_removed_before
+    assert fake_gh.labels_added == labels_added_before
+
+
 def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
     """Issue #334: next-mode update lane syncs a CLEAN-but-stale head candidate."""
     from charlie_work.config import AutoMergeConfig
