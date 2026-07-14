@@ -17273,6 +17273,83 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
     assert sidecar.get("failure_kind") is None
 
 
+def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dispatch() and dispatch_rework() called standalone still run the stall lane once.
+
+    Issue #356: loop() hands a pre-computed ``stalled_entries`` result to
+    ``dispatch()`` and ``dispatch_rework()`` so the stall-lane sweep runs exactly
+    once per ``loop()`` pass. Standalone callers (CLI ``work``, fleet
+    ``work_only``) do not receive that result, so each must still run the sweep
+    internally and advance a not-alive, inconclusive-probe worker's
+    ``inconclusive_probe_deferred_count`` exactly once per call.
+    """
+    from datetime import UTC, datetime
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(
+            enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+
+    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_dir / "issue-356.json"
+    log_file = sessions_dir / "issue-356.log"
+    log_file.write_text("working on issue\n", encoding="utf-8")
+
+    session_record = SessionRecord(
+        issue_number=356,
+        branch="agent/issue-356-fix",
+        worktree_path=str(tmp_path / "worktrees" / "agent-356"),
+        prompt_path=str(
+            tmp_path / ".var" / "charlie-work" / "issues" / "issue-356" / "worker-prompt.md"
+        ),
+        command=("devin", "--prompt-file", "{prompt_path}"),
+        pid=99999,
+        started_at=datetime.now(UTC).isoformat(),
+        log_path=str(log_file),
+        process_start_time=time.time(),
+    )
+    session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
+
+    def _inconclusive_probe(_view: Any, _cfg: Any, _now: Any) -> RealActivityProbe:
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="message_nodes query failed",
+                ),
+            )
+        )
+
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
+
+    result = app.dispatch(limit=0)
+    assert result.ok is True
+    sidecar = json.loads(session_file.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+    assert sidecar.get("failure_kind") is None
+
+    result = app.dispatch_rework(limit=0)
+    assert result.ok is True
+    sidecar = json.loads(session_file.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 2
+    assert sidecar.get("failure_kind") is None
+
+
 def test_dispatch_rework_reaps_unconditionally_when_max_concurrent_zero(tmp_path: Path) -> None:
     """Test that dispatch_rework() has the unconditional reaper call (issue #165)."""
     # Verify by code inspection that dispatch_rework calls _detect_and_handle_stalled_sessions
