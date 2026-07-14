@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from charlie_work import cli
+from charlie_work.fleet_paths import fleet_dir
 
 
 class _FakeGitHub:
@@ -145,6 +146,60 @@ def test_cli_verdict_missing_summary_file_json_output(
     assert payload["ok"] is False
     assert "OS error" in payload["message"]
     assert not (repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json").exists()
+
+
+def test_cli_verdict_isolates_fleet_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #362: cli.main must not write to the operator's real fleet registry.
+
+    Even when no ``--fleet-dir`` is supplied, ``build_app`` calls ``touch_repo``,
+    which would otherwise resolve to the global ``%LOCALAPPDATA%`` path. The
+    suite-wide autouse fixture redirects writes to a per-test directory; this
+    test proves the real default registry is untouched.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text("lgtm", encoding="utf-8")
+
+    # Capture the real default fleet path (no env override). The autouse conftest
+    # fixture normally sets CHARLIE_WORK_FLEET_DIR, so temporarily clear it to
+    # resolve the platform default, then restore the isolated override.
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR")
+    real_fleet_json = fleet_dir() / "fleet.json"
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+    real_before = real_fleet_json.read_text(encoding="utf-8") if real_fleet_json.exists() else None
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+
+    # The write must land in the per-test fleet directory, not the real one.
+    isolated_fleet_json = tmp_path / "fleet" / "fleet.json"
+    assert isolated_fleet_json.exists()
+    data = json.loads(isolated_fleet_json.read_text(encoding="utf-8"))
+    assert data["repos"]["owner/repo"]["repo_root"] == str(repo)
+
+    # The operator's real registry must be unchanged (or still absent).
+    if real_before is None:
+        assert not real_fleet_json.exists()
+    else:
+        assert real_fleet_json.read_text(encoding="utf-8") == real_before
 
 
 def test_cli_spec_review_missing_file_exits_nonzero(
