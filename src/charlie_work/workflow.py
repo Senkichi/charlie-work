@@ -2919,12 +2919,26 @@ class OrchestratorApp:
         )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
-        reviewed_head_sha = pr.get("headRefOid") if pr else None
+        # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
+        # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
+        # here at verdict time: a commit landing between packet generation and
+        # verdict recording would otherwise silently reattribute the decision to
+        # a head/diff that was never reviewed. Fall back to a live fetch only
+        # when no packet exists (e.g. a decision recorded without a prior
+        # review() call).
+        packet_head_sha = self._read_packet_head_oid(pr_number)
+        reviewed_head_sha = (
+            packet_head_sha
+            if packet_head_sha is not None
+            else (pr.get("headRefOid") if pr else None)
+        )
         # Calculate patch-id for the PR diff to detect actual content changes
         # (issue #222: base-update merges can advance head SHA without changing diff content)
         reviewed_patch_id = ""
         if pr and decision in {"request_changes", "approved"}:
-            diff = self.gh.pr_diff(pr_number)
+            diff = self._read_packet_diff(pr_number)
+            if diff is None:
+                diff = self.gh.pr_diff(pr_number)
             reviewed_patch_id = _calculate_patch_id(diff)
         decision_payload = {
             "pr_number": pr_number,
@@ -5321,6 +5335,21 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _read_packet_diff(self, pr_number: int) -> str | None:
+        """Return the diff text stored in the existing review packet for
+        ``pr_number``, or ``None`` if no packet exists or it cannot be read.
+
+        Mirrors ``_read_packet_head_oid``: keeps ``reviewed_patch_id`` derived
+        from the diff the reviewer actually saw rather than a live re-fetch.
+        """
+        diff_path = self.paths.prs / f"pr-{pr_number}" / "diff.patch"
+        if not diff_path.exists():
+            return None
+        try:
+            return diff_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
         pr_dir = self.paths.prs / f"pr-{pr_number}"

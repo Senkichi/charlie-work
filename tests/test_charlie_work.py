@@ -8018,6 +8018,39 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     assert result.data["reviewed_head_sha"] == "sha-abc123"
 
 
+def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path: Path) -> None:
+    """A commit landing between review() (packet generation) and record_review()
+    (verdict recording) must not reattribute the approval to a head/diff that
+    was never reviewed: reviewed_head_sha and reviewed_patch_id must come from
+    the packet the reviewer actually read, not a fresh fetch at verdict time.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+packet diff"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    review_result = app.review(456)
+    assert review_result.ok is True
+    packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
+
+    # Simulate a new commit landing after the packet was generated but before
+    # the verdict is recorded.
+    fake_gh.pr_head_shas[456] = "sha-new789"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
+
+    result = app.record_review(456, "approved", summary="lgtm")
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_patch_id"] == packet_patch_id
+    assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+
 # --- Issue #11: reject empty summary for request_changes/blocked decisions ----
 
 
