@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _LIST_LIMIT = 500
+
+# Bounded retry for transient GraphQL gateway failures on read-only listing
+# queries (issue #361): a large `--json` listing occasionally times out at
+# GitHub's gateway (502/503/504) even though the request itself is valid —
+# a plain `gh api graphql -f query='{viewer{login}}'` succeeds at the same
+# time, so this is not an outage or rate-limit exhaustion. Retrying in-pass
+# is cheap insurance; it is not a substitute for keeping the query itself
+# small (see MERGED_PR_LIST_FIELDS below).
+_TRANSIENT_GATEWAY_RE = re.compile(r"\bHTTP (?:502|503|504)\b")
+_LIST_RETRY_ATTEMPTS = 3
+_LIST_RETRY_DELAY_SECONDS = 1.0
 
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
@@ -22,6 +34,14 @@ ISSUE_VIEW_FIELDS = (
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
+# merged_pr_list() only feeds workflow._merged_pr_referenced_issue_numbers(),
+# which (via linked_issue_number()/issue_numbers_mentioned_by_pr()) reads
+# exactly these 6 fields. Deliberately narrower than PR_LIST_FIELDS: merged
+# PRs don't need current CI/review/label state, and `statusCheckRollup` in
+# particular forces gh's GraphQL query to walk each PR's check-run
+# connection — expensive across up to 500 merged PRs and the cause of
+# intermittent gateway 502s on this query (issue #361).
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -242,7 +262,23 @@ class GitHub:
         return result.returncode == 0
 
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
-        result = self.run(args, json_output=True)
+        attempt = 1
+        while True:
+            try:
+                result = self.run(args, json_output=True)
+                break
+            except GitHubError as exc:
+                if attempt >= _LIST_RETRY_ATTEMPTS or not _TRANSIENT_GATEWAY_RE.search(str(exc)):
+                    raise
+                logger.warning(
+                    "Transient GitHub gateway error listing %s (attempt %d/%d): %s; retrying",
+                    kind,
+                    attempt,
+                    _LIST_RETRY_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(_LIST_RETRY_DELAY_SECONDS * attempt)
+                attempt += 1
         items = result if isinstance(result, list) else []
         if len(items) >= limit:
             logger.warning(
@@ -340,7 +376,7 @@ class GitHub:
                 "--limit",
                 str(_LIST_LIMIT),
                 "--json",
-                PR_LIST_FIELDS,
+                MERGED_PR_LIST_FIELDS,
             ],
             limit=_LIST_LIMIT,
             kind="merged PRs",
@@ -484,6 +520,11 @@ class GitHub:
                 "PR_LIST_FIELDS",
                 ["pr", "list", "--state", "open", "--limit", "1", "--json", probe],
                 PR_LIST_FIELDS,
+            ),
+            (
+                "MERGED_PR_LIST_FIELDS",
+                ["pr", "list", "--state", "merged", "--limit", "1", "--json", probe],
+                MERGED_PR_LIST_FIELDS,
             ),
             ("PR_VIEW_FIELDS", ["pr", "view", "0", "--json", probe], PR_VIEW_FIELDS),
             ("PR_CHECKS_FIELDS", ["pr", "checks", "0", "--json", probe], PR_CHECKS_FIELDS),

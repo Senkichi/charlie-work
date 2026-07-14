@@ -2335,8 +2335,8 @@ def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_p
 
     github_module.GitHub(tmp_path).validate_field_lists()
 
-    # Should have probed all 9 field-list constants.
-    assert len(captured) == 9
+    # Should have probed all 10 field-list constants.
+    assert len(captured) == 10
     assert all(c[0] == "gh" for c in captured)
 
 
@@ -2495,6 +2495,132 @@ def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: P
                     f"Flag {flag} appended by merge_pr(strategy={strategy}, admin={admin}) "
                     f"is not in ORCHESTRATOR_MANAGED_MERGE_FLAGS"
                 )
+
+
+# --- Issue #361: merged_pr_list() cost (field scope + transient-gateway retry)
+
+
+def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path) -> None:
+    """merged_pr_list()'s sole consumer (workflow._merged_pr_referenced_issue_numbers,
+    via linked_issue_number()/issue_numbers_mentioned_by_pr()) only reads
+    state/headRefName/title/body/isCrossRepository. It must not request the
+    broader PR_LIST_FIELDS set — in particular not `statusCheckRollup`, which
+    forces gh's GraphQL query to walk each PR's check-run connection and is
+    the root cause of intermittent gateway 502s at ~500-merged-PR scale.
+    """
+    captured_args: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_args.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    gh.merged_pr_list()
+
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    assert args[:5] == ["gh", "pr", "list", "--state", "merged"]
+    fields = args[args.index("--json") + 1].split(",")
+    assert set(fields) == set(github_module.MERGED_PR_LIST_FIELDS.split(","))
+    for unused_field in (
+        "statusCheckRollup",
+        "reviewDecision",
+        "labels",
+        "author",
+        "updatedAt",
+        "url",
+        "baseRefName",
+        "mergeStateStatus",
+        "headRefOid",
+        "isDraft",
+    ):
+        assert unused_field not in fields
+
+
+def test_github_merged_pr_list_retries_on_transient_gateway_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A transient 502/503/504 from the GraphQL-backed listing endpoint retries
+    in-pass (bounded) instead of immediately failing the whole fleet pass for
+    that repo (issue #361). Succeeds on the 2nd attempt here.
+    """
+    call_count = 0
+    sleeps: list[float] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_pr_list()
+
+    assert result == []
+    assert call_count == 2
+    assert len(sleeps) == 1
+
+
+def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path: Path) -> None:
+    """Persistent 502s must eventually raise GitHubError — never hang or retry
+    forever — so the per-repo fleet-pass boundary can still catch it and move
+    on to the next repo.
+    """
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError):
+        gh.merged_pr_list()
+
+    assert call_count == github_module._LIST_RETRY_ATTEMPTS
+
+
+def test_github_merged_pr_list_does_not_retry_non_transient_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A non-gateway error (e.g. bad credentials) must fail immediately rather
+    than be swallowed into the transient-gateway retry loop.
+    """
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError):
+        gh.merged_pr_list()
+
+    assert call_count == 1
 
 
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
@@ -3197,6 +3323,64 @@ def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -
     assert result.data["merged_pr_flagged_issue_numbers"] == []
     assert 123 not in fake_gh.closed_issues
     assert (123, "agent:human-needed") not in fake_gh.labels_added
+
+
+def test_dispatch_skips_merged_pr_list_query_when_no_ready_issues(tmp_path: Path) -> None:
+    """Issue #361: when there are no ready-labeled issues to consider,
+    merged_pr_list() must not be called at all.
+    _merged_pr_referenced_issue_numbers() intersects its scan against the
+    ready-issue-number set, so with zero ready issues it always returns empty
+    sets regardless of what merged_pr_list() would have returned — the query
+    is pure waste on every pass with an empty ready queue, and this is the
+    dominant case the guard is meant to eliminate.
+    """
+
+    class FakeGitHubCountingMergedPrCalls(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_pr_list_calls = 0
+            self.issues = []  # no ready-labeled issues at all
+
+        def merged_pr_list(self):
+            self.merged_pr_list_calls += 1
+            return super().merged_pr_list()
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCountingMergedPrCalls()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert fake_gh.merged_pr_list_calls == 0
+
+
+def test_dispatch_still_queries_merged_pr_list_when_ready_issues_exist(tmp_path: Path) -> None:
+    """Sanity counterpart to the guard above: when a ready issue IS in the
+    queue, merged_pr_list() must still be called — issue #203's guarantee
+    (never re-dispatch an issue a merged PR already covers) depends on it.
+    """
+
+    class FakeGitHubCountingMergedPrCalls(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_pr_list_calls = 0
+
+        def merged_pr_list(self):
+            self.merged_pr_list_calls += 1
+            return super().merged_pr_list()
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubCountingMergedPrCalls()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert fake_gh.merged_pr_list_calls == 1
 
 
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
