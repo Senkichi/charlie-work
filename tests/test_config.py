@@ -99,21 +99,12 @@ watchdog:
     assert config.watchdog.worktree_mtime_exclude_dirs == (".git", ".venv")
 
 
-def test_dispatch_config_injected_paths_derived_from_templates() -> None:
-    """Issue #381: default injected_paths are derived from known prompt filenames."""
-    config = DispatchConfig()
-    assert config.injected_paths == (
-        ".devin/prompts/worker.md",
-        ".devin/prompts/rework.md",
-        ".orchestrator-prompt.md",
-    )
+def test_dispatch_config_injected_paths_default_is_claude_code_prompt() -> None:
+    """Issue #381: default injected_paths only exclude the in-worktree Claude Code prompt file."""
+    from charlie_work.config import CLAUDE_CODE_PROMPT_FILENAME
 
-    custom = DispatchConfig(worker_template="worker_claude_code.md", rework_template="rework.md")
-    assert custom.injected_paths == (
-        ".devin/prompts/worker_claude_code.md",
-        ".devin/prompts/rework.md",
-        ".orchestrator-prompt.md",
-    )
+    config = DispatchConfig()
+    assert config.injected_paths == (CLAUDE_CODE_PROMPT_FILENAME,)
 
 
 def test_claude_code_prompt_filename_in_default_injected_paths() -> None:
@@ -142,3 +133,23 @@ dispatch:
         ".orchestrator-prompt.md",
         ".devin/prompts/custom.md",
     )
+
+
+def test_dispatch_config_injected_paths_normalizes_backslashes() -> None:
+    """Issue #381: backslash separators in an override are normalized to '/'."""
+    config = DispatchConfig(injected_paths=[r".devin\prompts\worker.md"])
+    assert config.injected_paths == (".devin/prompts/worker.md",)
+
+
+def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> None:
+    """Issue #381: YAML override with Windows-style separators is normalized."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        r"""dispatch:
+  injected_paths:
+    - '.devin\prompts\worker.md'
+""",
+    )
+    config = load_config(config_file)
+    assert config.dispatch.injected_paths == (".devin/prompts/worker.md",)

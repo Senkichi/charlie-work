@@ -23,6 +23,7 @@ from charlie_work.worktree import (
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
+    _worker_authored_dirty,
     clean_worktrees,
     create_worktree,
     inspect_worktree_state,
@@ -2653,8 +2654,7 @@ def test_inspect_worktree_state_completed_ignores_tracked_injected_prompts(
     _git(info.path, "commit", "-m", "feature commit")
 
     # Track the injected prompt file, then rewrite it in place without staging.
-    prompt = info.path / ".devin/prompts/worker.md"
-    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt = info.path / config.dispatch.injected_paths[0]
     prompt.write_text("original prompt", encoding="utf-8")
     _git(info.path, "add", str(prompt))
     _git(info.path, "commit", "-m", "track prompt")
@@ -2698,6 +2698,28 @@ def test_inspect_worktree_state_partial_with_worker_changes_and_injected(tmp_pat
     assert inspection.dirty is True
 
     remove_worktree(repo, info.path, branch="agent/issue-381")
+
+
+def test_worker_authored_dirty_ignores_custom_override_path(tmp_path: Path) -> None:
+    """Issue #381: a custom injected_paths override excludes the configured path."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is False
+
+
+def test_worker_authored_dirty_normalizes_backslash_in_override(tmp_path: Path) -> None:
+    """Issue #381: a Windows-style backslash override matches git's forward-slash path."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin\\prompts\\worker.md",)) is False
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:

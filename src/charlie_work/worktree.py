@@ -246,9 +246,10 @@ def _worker_authored_dirty(
     orchestrator-injected prompt files.
 
     ``injected_paths`` are worktree-relative paths (files or directories) that
-    the orchestrator writes into the worktree (e.g. rendered worker/rework
-    prompts). They are excluded from the dirty check so completed worker work
-    is not stranded by prompt-injection noise (issue #381).
+    the orchestrator writes into the worktree (e.g. the Claude Code prompt
+    file, or a custom ``.devin/prompts/...`` convention that the operator has
+    configured). They are excluded from the dirty check so completed worker
+    work is not stranded by prompt-injection noise (issue #381).
 
     Raises:
         WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
@@ -262,7 +263,9 @@ def _worker_authored_dirty(
     if not status_result.ok:
         raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
 
-    injected = [PurePosixPath(str(p)) for p in injected_paths]
+    # Normalize the configured side too, so a Windows-style backslash override
+    # still matches git's forward-slash path reporting.
+    injected = [PurePosixPath(str(p).replace("\\", "/")) for p in injected_paths]
     for line in status_result.stdout.splitlines():
         # splitlines() removes the trailing newline; preserve the two leading
         # status columns (e.g., " M path") so the fixed [3:] slice starts at
