@@ -280,6 +280,7 @@ auto_merge:
         """
 auto_merge:
   update_open_prs: false
+  require_current_base: false
 """
     )
     config = load_config(config_file)
@@ -294,6 +295,7 @@ def test_load_config_update_open_prs_string_values(tmp_path: Path) -> None:
             f"""
 auto_merge:
   update_open_prs: {value}
+  require_current_base: false
 """
         )
         config = load_config(config_file)
@@ -313,6 +315,39 @@ auto_merge:
     )
     with pytest.raises(ConfigError, match="update_open_prs.*'all', 'next', 'off'"):
         load_config(config_file)
+
+
+def test_auto_merge_config_rejects_stale_base_deadlock(tmp_path: Path) -> None:
+    """Issue #368: require_current_base=True + update_open_prs='off' is a silent
+    permanent merge deadlock, so it is rejected at config construction.
+    """
+    from charlie_work.config import AutoMergeConfig, ConfigError, OrchestratorConfig, load_config
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        AutoMergeConfig(require_current_base=True, update_open_prs="off")
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        AutoMergeConfig(require_current_base=True, update_open_prs=False)
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        OrchestratorConfig(
+            auto_merge=AutoMergeConfig(require_current_base=True, update_open_prs="off")
+        )
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: off
+"""
+    )
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        load_config(config_file)
+
+    # Coherent combinations load without error.
+    assert AutoMergeConfig(require_current_base=False, update_open_prs="off")
+    assert AutoMergeConfig(require_current_base=True, update_open_prs="next")
+    assert AutoMergeConfig(require_current_base=True, update_open_prs="all")
 
 
 def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
@@ -4100,6 +4135,7 @@ def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> No
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs=False,
+            require_current_base=False,
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -7258,6 +7294,68 @@ def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Pa
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
     assert len(alarm_events) == 0
+
+
+def test_merge_ready_stale_base_alarm_fires_after_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #368: an operator alarm is emitted after N consecutive base_stale
+    deferrals for the same PR.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # The default base_head_sha is base-sha, which is already the merge-base of
+    # sha-abc123. Advance it to a post-merge tip whose merge-base with sha-abc123
+    # is still base-sha, so the freshness gate sees a stale base.
+    post_merge_base = "main-merged-sha-abc123"
+    fake_gh.base_head_sha = post_merge_base
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": "sha-abc123"}]}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate a base-sync that reports success but does not advance the head.
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    for attempt in range(1, 4):
+        result = app.merge_ready(456, merge=False)
+        assert result.data["can_merge"] is False
+        assert result.data["merged"] is False
+        assert result.data.get("stale_base") is True
+        assert result.data["consecutive_stale_base_deferrals"] == attempt
+        if attempt < 3:
+            assert result.data["merge_attempt_alarm"] is False
+            assert result.data["merge_attempt_warning"] is None
+        else:
+            assert result.data["merge_attempt_alarm"] is True
+            assert result.data["merge_attempt_warning"] is not None
+            assert "base is stale" in result.data["merge_attempt_warning"]
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_stale_base_deferrals"] == 3
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
+    assert len(stale_events) == 3
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["pr_number"] == 456
+    assert alarm_events[0]["payload"]["reason"] == "base_stale"
+    assert alarm_events[0]["payload"]["attempts"] == 3
+    assert alarm_events[0]["payload"]["threshold"] == 3
+
+    # A fourth deferral is still counted but does not re-fire the alarm.
+    result = app.merge_ready(456, merge=False)
+    assert result.data["consecutive_stale_base_deferrals"] == 4
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
 
 
 def test_merge_ready_merge_alert_refires_after_can_merge_recovery(tmp_path: Path) -> None:
@@ -11611,14 +11709,14 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
 
 
-def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
+def test_merge_ready_stale_base_deferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #316: a PR whose merge-base is not the current base tip is deferred."""
     from charlie_work.config import AutoMergeConfig
 
     config = OrchestratorConfig(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-            update_open_prs="off",  # disable base-sync so the gate is exercised
+            update_open_prs="next",
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -11666,12 +11764,16 @@ def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    # Simulate a base-sync that reports success but does not advance the head, so
+    # the merge-base freshness gate still defers the PR after the first PR merges.
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
     result_456 = app.merge_ready(456, merge=True)
     assert result_456.ok is True
     assert result_456.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
 
-    result_789 = app.merge_ready(789, merge=True)
+    result_789 = app.merge_ready(789, merge=True, merge_train_head=789)
     assert result_789.ok is True
     assert result_789.data["can_merge"] is False
     assert result_789.data["merged"] is False
@@ -12315,7 +12417,7 @@ def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-            update_open_prs="off",
+            update_open_prs="next",
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
