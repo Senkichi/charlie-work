@@ -216,6 +216,13 @@ class AutoMergeConfig:
                 f"got {type(value).__name__}"
             )
         object.__setattr__(self, "update_open_prs", normalized)
+        if self.require_current_base and self.update_open_prs == "off":
+            raise ConfigError(
+                "config section 'auto_merge': require_current_base=True with "
+                "update_open_prs='off' creates a permanent merge deadlock: the base "
+                "must be current but the branch is never synced. Set "
+                "require_current_base: false, or set update_open_prs to 'next' or 'all'."
+            )
 
 
 @dataclass(frozen=True)
@@ -389,6 +396,14 @@ class WatchdogConfig:
     # broken probe from pinning a slot indefinitely while still allowing the
     # downstream liveness checks to avoid false reaps.
     max_inconclusive_probe_deferrals: int = 3
+    # Worktree file mtime corroboration (issue #353): a fourth real-activity
+    # source that detects progress by scanning files written in the worker's
+    # checkout. Workers read/plan for a while before writing, so this source uses
+    # its own generous threshold rather than stall_minutes.
+    worktree_mtime_enabled: bool = True
+    worktree_mtime_threshold_minutes: int = 45
+    worktree_mtime_max_depth: int = 4
+    worktree_mtime_exclude_dirs: tuple[str, ...] = (".git", ".venv")
 
 
 @dataclass(frozen=True)
@@ -902,6 +917,36 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'watchdog' key 'max_inconclusive_probe_deferrals' must be an int, "
             f"got {type(max_inconclusive_probe_deferrals).__name__}"
+        )
+    # Validate worktree mtime corroboration config (issue #353)
+    worktree_mtime_enabled = watchdog_data.get("worktree_mtime_enabled")
+    if worktree_mtime_enabled is not None and not isinstance(worktree_mtime_enabled, bool):
+        raise ConfigError(
+            "config section 'watchdog' key 'worktree_mtime_enabled' must be a bool, "
+            f"got {type(worktree_mtime_enabled).__name__}"
+        )
+    for worktree_int_key in ("worktree_mtime_threshold_minutes", "worktree_mtime_max_depth"):
+        worktree_int_value = watchdog_data.get(worktree_int_key)
+        if worktree_int_value is not None and not isinstance(worktree_int_value, int):
+            raise ConfigError(
+                f"config section 'watchdog' key '{worktree_int_key}' must be an int, "
+                f"got {type(worktree_int_value).__name__}"
+            )
+    worktree_mtime_exclude_dirs = watchdog_data.get("worktree_mtime_exclude_dirs")
+    if worktree_mtime_exclude_dirs is not None:
+        if not isinstance(worktree_mtime_exclude_dirs, list):
+            raise ConfigError(
+                "config section 'watchdog' key 'worktree_mtime_exclude_dirs' must be a list of "
+                f"strings, got {type(worktree_mtime_exclude_dirs).__name__}"
+            )
+        for item in worktree_mtime_exclude_dirs:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'watchdog' key 'worktree_mtime_exclude_dirs' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        watchdog_data["worktree_mtime_exclude_dirs"] = tuple(
+            str(item) for item in worktree_mtime_exclude_dirs
         )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
     test_adequacy_data = _section(data, "test_adequacy")

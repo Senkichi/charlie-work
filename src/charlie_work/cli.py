@@ -79,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    subparsers.add_parser("review-queue")
+
     dispatch = subparsers.add_parser("work")
     dispatch.add_argument("--limit", type=int, default=None)
     dispatch.add_argument(
@@ -152,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet = subparsers.add_parser("fleet")
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_sub.add_parser("status")
+    fleet_sub.add_parser("review-queue")
 
     fleet_work = fleet_sub.add_parser("work")
     fleet_work.add_argument("--limit", type=int, default=None)
@@ -339,6 +342,42 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     return CommandResult(
         ok=not errors,
         message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        data={"repos": per_repo, "errors": errors},
+    )
+
+
+def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
+    """Run fleet review-queue aggregation across all registered repos.
+
+    This is a read-only command that:
+    - Loads the fleet registry from fleet.json
+    - For each registered repo, calls OrchestratorApp.review_queue() with dry_run=True
+    - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
+    - Isolates per-repo errors (missing/broken repos) without aborting aggregation
+    """
+    fleet_json_path = fleet_dir() / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    per_repo: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+
+    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+        try:
+            repo_root = Path(entry.get("repo_root"))
+            if not repo_root.exists():
+                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+
+            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
+            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            gh = GitHub(repo_root=repo_root, dry_run=True)
+            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
+            result = app.review_queue()
+            per_repo[repo_key] = result.data
+        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
+            errors.append({"repo_key": repo_key, "error": str(exc)})
+
+    return CommandResult(
+        ok=not errors,
+        message=f"fleet review queue: {len(per_repo)} repo(s), {len(errors)} error(s)",
         data={"repos": per_repo, "errors": errors},
     )
 
@@ -678,10 +717,15 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         return app.reconcile(fix=args.fix)
     if args.command == "work":
         return app.dispatch(args.limit, only_issues=args.issues)
+    if args.command == "review-queue":
+        return app.review_queue()
     if args.command == "why-charlie-hate":
         return app.review(args.pr, cross_family=args.cross_family)
     if args.command == "why-charlie-hate-spec":
-        return app.spec_review(args.spec_file)
+        try:
+            return app.spec_review(args.spec_file)
+        except OSError as exc:
+            return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "verdict":
         try:
             return app.record_review(
@@ -746,6 +790,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "fleet":
             if args.fleet_command == "status":
                 result = run_fleet_status(args)
+            elif args.fleet_command == "review-queue":
+                result = run_fleet_review_queue(args)
             elif args.fleet_command == "work":
                 result = run_fleet_work(args)
             elif args.fleet_command == "bash-rats":

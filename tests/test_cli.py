@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from charlie_work import cli
+from charlie_work.fleet_paths import fleet_dir
 
 
 class _FakeGitHub:
@@ -145,3 +146,119 @@ def test_cli_verdict_missing_summary_file_json_output(
     assert payload["ok"] is False
     assert "OS error" in payload["message"]
     assert not (repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json").exists()
+
+
+def test_cli_verdict_isolates_fleet_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #362: cli.main must not write to the operator's real fleet registry.
+
+    Even when no ``--fleet-dir`` is supplied, ``build_app`` calls ``touch_repo``,
+    which would otherwise resolve to the global ``%LOCALAPPDATA%`` path. The
+    suite-wide autouse fixture redirects writes to a per-test directory; this
+    test proves the real default registry is untouched.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text("lgtm", encoding="utf-8")
+
+    # Capture the real default fleet path (no env override). The autouse conftest
+    # fixture normally sets CHARLIE_WORK_FLEET_DIR, so temporarily clear it to
+    # resolve the platform default, then restore the isolated override.
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR")
+    real_fleet_json = fleet_dir() / "fleet.json"
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+    real_before = real_fleet_json.read_text(encoding="utf-8") if real_fleet_json.exists() else None
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+
+    # The write must land in the per-test fleet directory, not the real one.
+    isolated_fleet_json = tmp_path / "fleet" / "fleet.json"
+    assert isolated_fleet_json.exists()
+    data = json.loads(isolated_fleet_json.read_text(encoding="utf-8"))
+    assert data["repos"]["owner/repo"]["repo_root"] == str(repo)
+
+    # The operator's real registry must be unchanged (or still absent).
+    if real_before is None:
+        assert not real_fleet_json.exists()
+    else:
+        assert real_fleet_json.read_text(encoding="utf-8") == real_before
+
+
+def test_cli_spec_review_missing_file_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #363: a missing --file for spec_review exits 1 with an OS error message."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    missing_spec = repo / "missing-spec.md"
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "why-charlie-hate-spec",
+            "--file",
+            str(missing_spec),
+        ]
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "OS error" in captured.out
+    assert "No such file or directory" in captured.out
+    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
+
+
+def test_cli_spec_review_unreadable_file_json_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With --json, an unreadable --file failure is still a machine-parseable non-zero result."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    unreadable = repo / "unreadable.md"
+    unreadable.write_text("secret", encoding="utf-8")
+
+    orig_read_text = Path.read_text
+
+    def _read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == unreadable:
+            raise PermissionError(13, "Permission denied", str(self))
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "--json",
+            "why-charlie-hate-spec",
+            "--file",
+            str(unreadable),
+        ]
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert "OS error" in payload["message"]
+    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
