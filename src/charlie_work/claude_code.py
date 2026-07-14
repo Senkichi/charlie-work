@@ -33,7 +33,7 @@ from charlie_work.process_utils import parse_proc_stat_starttime
 from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
-from .state import utc_now
+from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
@@ -95,6 +95,12 @@ class ClaudeWorkerRecord:
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
+
+    def __post_init__(self) -> None:
+        """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
+        canonical = _canonical_started_at(self.started_at, self.process_start_time)
+        if canonical != self.started_at:
+            object.__setattr__(self, "started_at", canonical)
 
     @property
     def ok(self) -> bool:
