@@ -2634,6 +2634,44 @@ def test_inspect_worktree_state_completed_ignores_injected_prompts(tmp_path: Pat
     remove_worktree(repo, info.path, branch="agent/issue-381")
 
 
+def test_inspect_worktree_state_completed_ignores_tracked_injected_prompts(
+    tmp_path: Path,
+) -> None:
+    """Issue #381: a tracked injected prompt file modified in place is not dirty.
+
+    This is the root-cause scenario: the orchestrator writes the prompt file,
+    the worker commits it, then rewrites it in place without staging. The
+    porcelain parser must not strip the leading status-column space, which would
+    shift the path and drop its leading dot.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381-tracked", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    # Track the injected prompt file, then rewrite it in place without staging.
+    prompt = info.path / ".devin/prompts/worker.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("original prompt", encoding="utf-8")
+    _git(info.path, "add", str(prompt))
+    _git(info.path, "commit", "-m", "track prompt")
+    prompt.write_text("rewritten prompt", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.COMPLETED
+    assert inspection.ahead_count == 2
+    assert inspection.dirty is False
+
+    remove_worktree(repo, info.path, branch="agent/issue-381-tracked")
+
+
 def test_inspect_worktree_state_partial_with_worker_changes_and_injected(tmp_path: Path) -> None:
     """Issue #381: worker-authored uncommitted changes still block COMPLETED."""
     remote, repo = _init_repo_with_remote(tmp_path)

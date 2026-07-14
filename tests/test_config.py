@@ -100,18 +100,29 @@ watchdog:
 
 
 def test_dispatch_config_injected_paths_derived_from_templates() -> None:
-    """Issue #381: default injected_paths are derived from worker/rework templates."""
+    """Issue #381: default injected_paths are derived from known prompt filenames."""
     config = DispatchConfig()
     assert config.injected_paths == (
         ".devin/prompts/worker.md",
         ".devin/prompts/rework.md",
+        ".orchestrator-prompt.md",
     )
 
     custom = DispatchConfig(worker_template="worker_claude_code.md", rework_template="rework.md")
     assert custom.injected_paths == (
         ".devin/prompts/worker_claude_code.md",
         ".devin/prompts/rework.md",
+        ".orchestrator-prompt.md",
     )
+
+
+def test_claude_code_prompt_filename_in_default_injected_paths() -> None:
+    """Issue #381: the Claude Code prompt file is excluded from dirty checks by default."""
+    from charlie_work.claude_code import PROMPT_FILENAME
+    from charlie_work.config import CLAUDE_CODE_PROMPT_FILENAME
+
+    assert PROMPT_FILENAME is CLAUDE_CODE_PROMPT_FILENAME
+    assert CLAUDE_CODE_PROMPT_FILENAME in DispatchConfig().injected_paths
 
 
 def test_load_config_injected_paths_coerces_list_to_tuple(tmp_path: Path) -> None:

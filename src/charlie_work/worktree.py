@@ -264,8 +264,11 @@ def _worker_authored_dirty(
 
     injected = [PurePosixPath(str(p)) for p in injected_paths]
     for line in status_result.stdout.splitlines():
-        line = line.strip()
-        if not line:
+        # splitlines() removes the trailing newline; preserve the two leading
+        # status columns (e.g., " M path") so the fixed [3:] slice starts at
+        # the path. Stripping first would shift the string and corrupt paths
+        # that begin with a dot, like ".devin/prompts/worker.md".
+        if not line.strip():
             continue
         # Porcelain format: two status chars, a space, then the path.
         # Renames include "old -> new"; the right-hand side is the current path.

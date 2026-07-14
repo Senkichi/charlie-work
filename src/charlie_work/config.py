@@ -11,6 +11,9 @@ from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
+# Root-relative path the Claude Code adapter writes to in each worktree.
+CLAUDE_CODE_PROMPT_FILENAME = ".orchestrator-prompt.md"
+
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worker_blocked", "worktree_unsafe"}
 )
@@ -147,15 +150,16 @@ class DispatchConfig:
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
     launch_stagger_seconds: int = 45
     # Worktree-relative paths owned by the orchestrator and excluded from
-    # "is the worktree dirty?" checks. Derived from worker_template and
-    # rework_template by default so the prompt renderer and the worktree probe
-    # share one source of truth; override explicitly to cover other adapters.
+    # "is the worktree dirty?" checks. Derived from worker_template,
+    # rework_template, and the Claude Code adapter's prompt file by default so
+    # the prompt renderer and the worktree probe share one source of truth;
+    # override explicitly to cover additional adapters.
     injected_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of strings. If the operator did not explicitly set
-        # injected_paths, derive them from the prompt template filenames so a
-        # different worker_template or adapter is covered automatically.
+        # injected_paths, derive them from the known prompt template filenames so
+        # the Devin and Claude Code adapters are covered automatically.
         if self.injected_paths:
             object.__setattr__(self, "injected_paths", tuple(str(p) for p in self.injected_paths))
         else:
@@ -165,6 +169,7 @@ class DispatchConfig:
                 (
                     f".devin/prompts/{self.worker_template}",
                     f".devin/prompts/{self.rework_template}",
+                    CLAUDE_CODE_PROMPT_FILENAME,
                 ),
             )
 
