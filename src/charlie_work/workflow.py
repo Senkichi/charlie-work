@@ -1620,6 +1620,18 @@ def _format_merge_attempt_alarm_message(
     return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
+def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str) -> str:
+    """Human-readable alarm message for an approved PR whose base is not current."""
+    pass_str = "pass" if attempts == 1 else "passes"
+    if reason == "base_stale":
+        detail = "base is stale"
+    elif reason == "compare_unavailable":
+        detail = "base freshness comparison unavailable"
+    else:
+        detail = f"base is not current (reason: {reason})"
+    return f"PR #{pr_number} approved but {detail} for {attempts} consecutive {pass_str}"
+
+
 # Sentinel used to distinguish "no base-current signal was supplied" from
 # an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
 class _BaseCurrentUnset:
@@ -2886,6 +2898,97 @@ class OrchestratorApp:
             },
         )
 
+    def review_queue(self) -> CommandResult:
+        """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
+
+        This is a read-only command: it inspects existing ``review-prompt.md``
+        packets and ``review-decision.json`` verdicts without writing state or
+        PR-directory files.  A PR is queued when:
+
+        - It has a linked issue (same as ``review()``).
+        - ``prs/pr-N/review-prompt.md`` exists and the stored packet head OID
+          matches the PR's live ``headRefOid``.
+        - The recorded decision is ``missing``/``pending`` or a stale
+          ``request_changes``/``blocked``/``approved`` verdict from a prior head.
+
+        Returns:
+            CommandResult with a sorted ``queue`` list keyed by repo.
+        """
+        prs = self.gh.pr_list()
+        queue: list[dict[str, Any]] = []
+
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is None:
+                continue
+
+            pr_number = int(pr["number"])
+            pr_dir = self.paths.prs / f"pr-{pr_number}"
+            prompt_path = pr_dir / "review-prompt.md"
+            if not prompt_path.exists():
+                continue
+
+            packet_head_sha = self._read_packet_head_oid(pr_number)
+            live_head_sha = pr.get("headRefOid")
+            if (
+                packet_head_sha is None
+                or live_head_sha is None
+                or packet_head_sha != live_head_sha
+            ):
+                continue
+
+            decision = self._review_decision(pr_number)
+            decision_value = decision.get("decision")
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+
+            if decision_value == "approved":
+                if reviewed_head_sha == live_head_sha:
+                    continue
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": "stale",
+                        "reviewed_head_sha": reviewed_head_sha,
+                    }
+                )
+            elif decision_value in ("request_changes", "blocked"):
+                if reviewed_head_sha is not None and reviewed_head_sha == live_head_sha:
+                    continue
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": "stale",
+                        "reviewed_head_sha": reviewed_head_sha,
+                    }
+                )
+            elif decision_value in ("pending", "missing", "invalid"):
+                queue.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "packet_head_sha": packet_head_sha,
+                        "decision": decision_value
+                        if decision_value in ("pending", "missing")
+                        else "missing",
+                        "reviewed_head_sha": None,
+                    }
+                )
+
+        queue.sort(key=lambda entry: entry["pr"])
+        return CommandResult(
+            True,
+            f"review queue: {len(queue)} PR(s) awaiting verdict",
+            {"queue": queue},
+        )
+
     def record_review(
         self,
         pr_number: int,
@@ -2919,12 +3022,26 @@ class OrchestratorApp:
         )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
-        reviewed_head_sha = pr.get("headRefOid") if pr else None
+        # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
+        # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
+        # here at verdict time: a commit landing between packet generation and
+        # verdict recording would otherwise silently reattribute the decision to
+        # a head/diff that was never reviewed. Fall back to a live fetch only
+        # when no packet exists (e.g. a decision recorded without a prior
+        # review() call).
+        packet_head_sha = self._read_packet_head_oid(pr_number)
+        reviewed_head_sha = (
+            packet_head_sha
+            if packet_head_sha is not None
+            else (pr.get("headRefOid") if pr else None)
+        )
         # Calculate patch-id for the PR diff to detect actual content changes
         # (issue #222: base-update merges can advance head SHA without changing diff content)
         reviewed_patch_id = ""
         if pr and decision in {"request_changes", "approved"}:
-            diff = self.gh.pr_diff(pr_number)
+            diff = self._read_packet_diff(pr_number)
+            if diff is None:
+                diff = self.gh.pr_diff(pr_number)
             reviewed_patch_id = _calculate_patch_id(diff)
         decision_payload = {
             "pr_number": pr_number,
@@ -3168,6 +3285,7 @@ class OrchestratorApp:
                         "reviewed_head_sha": reviewed_head_sha,
                         "live_head_sha": live_head_sha,
                         "consecutive_failed_merge_attempts": 0,
+                        "consecutive_stale_base_deferrals": 0,
                     }
                     if issue_number is not None:
                         _issue_key = str(issue_number)
@@ -3297,7 +3415,6 @@ class OrchestratorApp:
                         pr_number,
                         issue_number,
                         decision,
-                        existing_pr_state,
                         base_ref,
                         head_sha,
                         reason,
@@ -3421,6 +3538,7 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
             new_attempts = 0
+            new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
             if approved and not can_merge and not _is_pending_only(summary):
@@ -3465,6 +3583,7 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "consecutive_failed_merge_attempts": new_attempts,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
             }
             if merge_output:
                 prs_entry["status"] = "merged"
@@ -3497,6 +3616,7 @@ class OrchestratorApp:
             "cancel_superseded_runs_results": cancel_results,
             "containment_warnings": list(containment_warnings),
             "consecutive_failed_merge_attempts": new_attempts,
+            "consecutive_stale_base_deferrals": new_stale_base_deferrals,
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
             "merge_conflict": merge_conflict,
@@ -3925,7 +4045,6 @@ class OrchestratorApp:
         pr_number: int,
         issue_number: int | None,
         decision: dict[str, Any],
-        existing_pr_state: dict[str, Any],
         base_ref: str | None,
         head_sha: str | None,
         reason: str = "base_stale",
@@ -3938,6 +4057,29 @@ class OrchestratorApp:
         """
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            existing = state["prs"].get(str(pr_number), {})
+            new_stale_base_deferrals = int(existing.get("consecutive_stale_base_deferrals", 0)) + 1
+            threshold = self.config.auto_merge.failed_attempt_alarm
+            stale_base_alarm = threshold > 0 and new_stale_base_deferrals == threshold
+            stale_base_warning: str | None = None
+            if stale_base_alarm:
+                stale_base_warning = _format_stale_base_alarm_message(
+                    pr_number, new_stale_base_deferrals, reason
+                )
+                state = append_event(
+                    state,
+                    "merge_deferred_stale_base_alarm",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "base_ref": base_ref,
+                        "head_sha": head_sha,
+                        "reason": reason,
+                        "attempts": new_stale_base_deferrals,
+                        "threshold": threshold,
+                        "message": stale_base_warning,
+                    },
+                )
             state = append_event(
                 state,
                 "merge_deferred_stale_base",
@@ -3949,6 +4091,12 @@ class OrchestratorApp:
                     "reason": reason,
                 },
             )
+            state["prs"][str(pr_number)] = {
+                **existing,
+                "number": pr_number,
+                "issue_number": issue_number,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
+            }
             save_state(self.paths.state_file, state)
         return CommandResult(
             True,
@@ -3969,11 +4117,12 @@ class OrchestratorApp:
                 "cancel_superseded_runs_results": None,
                 "containment_warnings": [],
                 "stale_base": True,
-                "consecutive_failed_merge_attempts": existing_pr_state.get(
+                "consecutive_failed_merge_attempts": existing.get(
                     "consecutive_failed_merge_attempts", 0
                 ),
-                "merge_attempt_alarm": False,
-                "merge_attempt_warning": None,
+                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
+                "merge_attempt_alarm": stale_base_alarm,
+                "merge_attempt_warning": stale_base_warning,
                 "merge_conflict": False,
             },
         )
@@ -5443,6 +5592,21 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _read_packet_diff(self, pr_number: int) -> str | None:
+        """Return the diff text stored in the existing review packet for
+        ``pr_number``, or ``None`` if no packet exists or it cannot be read.
+
+        Mirrors ``_read_packet_head_oid``: keeps ``reviewed_patch_id`` derived
+        from the diff the reviewer actually saw rather than a live re-fetch.
+        """
+        diff_path = self.paths.prs / f"pr-{pr_number}" / "diff.patch"
+        if not diff_path.exists():
+            return None
+        try:
+            return diff_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
         pr_dir = self.paths.prs / f"pr-{pr_number}"

@@ -280,6 +280,7 @@ auto_merge:
         """
 auto_merge:
   update_open_prs: false
+  require_current_base: false
 """
     )
     config = load_config(config_file)
@@ -294,6 +295,7 @@ def test_load_config_update_open_prs_string_values(tmp_path: Path) -> None:
             f"""
 auto_merge:
   update_open_prs: {value}
+  require_current_base: false
 """
         )
         config = load_config(config_file)
@@ -313,6 +315,39 @@ auto_merge:
     )
     with pytest.raises(ConfigError, match="update_open_prs.*'all', 'next', 'off'"):
         load_config(config_file)
+
+
+def test_auto_merge_config_rejects_stale_base_deadlock(tmp_path: Path) -> None:
+    """Issue #368: require_current_base=True + update_open_prs='off' is a silent
+    permanent merge deadlock, so it is rejected at config construction.
+    """
+    from charlie_work.config import AutoMergeConfig, ConfigError, OrchestratorConfig, load_config
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        AutoMergeConfig(require_current_base=True, update_open_prs="off")
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        AutoMergeConfig(require_current_base=True, update_open_prs=False)
+
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        OrchestratorConfig(
+            auto_merge=AutoMergeConfig(require_current_base=True, update_open_prs="off")
+        )
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  update_open_prs: off
+"""
+    )
+    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+        load_config(config_file)
+
+    # Coherent combinations load without error.
+    assert AutoMergeConfig(require_current_base=False, update_open_prs="off")
+    assert AutoMergeConfig(require_current_base=True, update_open_prs="next")
+    assert AutoMergeConfig(require_current_base=True, update_open_prs="all")
 
 
 def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
@@ -4100,6 +4135,7 @@ def test_merge_ready_update_open_prs_disabled_returns_none(tmp_path: Path) -> No
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs=False,
+            require_current_base=False,
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -4185,6 +4221,201 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert fake_gh.merged == []
+
+
+def _review_queue_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with FakeGitHub and a default state file."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+
+def _write_review_packet(
+    tmp_path: Path,
+    pr_number: int,
+    packet_head_sha: str,
+    decision: dict[str, Any] | None = None,
+) -> Path:
+    """Create a review packet fixture for a PR."""
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps({"number": pr_number, "headRefOid": packet_head_sha}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text(
+        f"review prompt for PR #{pr_number}",
+        encoding="utf-8",
+    )
+    if decision is not None:
+        (pr_dir / "review-decision.json").write_text(
+            json.dumps(decision),
+            encoding="utf-8",
+        )
+    return pr_dir
+
+
+def test_review_queue_includes_missing_pending_and_stale_decisions(
+    tmp_path: Path,
+) -> None:
+    """Issue #369: review_queue enumerates current packets awaiting a verdict."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10: missing decision",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20: pending decision",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 300,
+            "title": "Fix #30: stale request_changes",
+            "url": "https://example.test/pull/300",
+            "headRefName": "agent/issue-30-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-300-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #30",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 400,
+            "title": "Fix #40: approved on current head",
+            "url": "https://example.test/pull/400",
+            "headRefName": "agent/issue-40-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-400",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #40",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 500,
+            "title": "Fix #50: stale packet",
+            "url": "https://example.test/pull/500",
+            "headRefName": "agent/issue-50-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-500-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #50",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 600,
+            "title": "No linked issue",
+            "url": "https://example.test/pull/600",
+            "headRefName": "feature/unlinked",
+            "baseRefName": "main",
+            "headRefOid": "sha-600",
+            "mergeStateStatus": "CLEAN",
+            "body": "Some feature",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+
+    # PR 100: current packet, no decision -> decision missing
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # PR 200: current packet, pending decision
+    _write_review_packet(tmp_path, 200, "sha-200", {"decision": "pending"})
+    # PR 300: current packet, request_changes from prior head -> stale
+    _write_review_packet(
+        tmp_path,
+        300,
+        "sha-300-new",
+        {"decision": "request_changes", "reviewed_head_sha": "sha-300-old"},
+    )
+    # PR 400: current packet, approved on current head -> excluded
+    _write_review_packet(
+        tmp_path,
+        400,
+        "sha-400",
+        {"decision": "approved", "reviewed_head_sha": "sha-400"},
+    )
+    # PR 500: stale packet (recorded head differs from live head) -> excluded
+    _write_review_packet(tmp_path, 500, "sha-500-old")
+    # PR 600: unlinked PR has no packet, so excluded
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": 100,
+            "issue": 10,
+            "packet_head_sha": "sha-100",
+            "decision": "missing",
+            "reviewed_head_sha": None,
+        },
+        {
+            "pr": 200,
+            "issue": 20,
+            "packet_head_sha": "sha-200",
+            "decision": "pending",
+            "reviewed_head_sha": None,
+        },
+        {
+            "pr": 300,
+            "issue": 30,
+            "packet_head_sha": "sha-300-new",
+            "decision": "stale",
+            "reviewed_head_sha": "sha-300-old",
+        },
+    ]
+
+
+def test_review_queue_is_read_only(tmp_path: Path) -> None:
+    """Issue #369: review_queue must not mutate state.json or PR-directory files."""
+    app = _review_queue_app(tmp_path)
+    _write_review_packet(tmp_path, 456, "sha-abc123")
+    before_state = json.loads(app.paths.state_file.read_text(encoding="utf-8"))
+    pr_json = (app.paths.prs / "pr-456" / "pr.json").read_text(encoding="utf-8")
+    prompt = (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    after_state = json.loads(app.paths.state_file.read_text(encoding="utf-8"))
+    assert after_state == before_state
+    assert (app.paths.prs / "pr-456" / "pr.json").read_text(encoding="utf-8") == pr_json
+    assert (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8") == prompt
 
 
 def test_review_checks_unavailable_blocks_and_preserves_labels(tmp_path: Path) -> None:
@@ -7065,6 +7296,68 @@ def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Pa
     assert len(alarm_events) == 0
 
 
+def test_merge_ready_stale_base_alarm_fires_after_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #368: an operator alarm is emitted after N consecutive base_stale
+    deferrals for the same PR.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # The default base_head_sha is base-sha, which is already the merge-base of
+    # sha-abc123. Advance it to a post-merge tip whose merge-base with sha-abc123
+    # is still base-sha, so the freshness gate sees a stale base.
+    post_merge_base = "main-merged-sha-abc123"
+    fake_gh.base_head_sha = post_merge_base
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": "sha-abc123"}]}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Simulate a base-sync that reports success but does not advance the head.
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    for attempt in range(1, 4):
+        result = app.merge_ready(456, merge=False)
+        assert result.data["can_merge"] is False
+        assert result.data["merged"] is False
+        assert result.data.get("stale_base") is True
+        assert result.data["consecutive_stale_base_deferrals"] == attempt
+        if attempt < 3:
+            assert result.data["merge_attempt_alarm"] is False
+            assert result.data["merge_attempt_warning"] is None
+        else:
+            assert result.data["merge_attempt_alarm"] is True
+            assert result.data["merge_attempt_warning"] is not None
+            assert "base is stale" in result.data["merge_attempt_warning"]
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_stale_base_deferrals"] == 3
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
+    assert len(stale_events) == 3
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["pr_number"] == 456
+    assert alarm_events[0]["payload"]["reason"] == "base_stale"
+    assert alarm_events[0]["payload"]["attempts"] == 3
+    assert alarm_events[0]["payload"]["threshold"] == 3
+
+    # A fourth deferral is still counted but does not re-fire the alarm.
+    result = app.merge_ready(456, merge=False)
+    assert result.data["consecutive_stale_base_deferrals"] == 4
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+
+
 def test_merge_ready_merge_alert_refires_after_can_merge_recovery(tmp_path: Path) -> None:
     """Issue #254: merge=False recovery resets merge_alert so a second degradation
     can re-fire the notify digest.
@@ -8014,6 +8307,39 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path: Path) -> None:
+    """A commit landing between review() (packet generation) and record_review()
+    (verdict recording) must not reattribute the approval to a head/diff that
+    was never reviewed: reviewed_head_sha and reviewed_patch_id must come from
+    the packet the reviewer actually read, not a fresh fetch at verdict time.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+packet diff"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    review_result = app.review(456)
+    assert review_result.ok is True
+    packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
+
+    # Simulate a new commit landing after the packet was generated but before
+    # the verdict is recorded.
+    fake_gh.pr_head_shas[456] = "sha-new789"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
+
+    result = app.record_review(456, "approved", summary="lgtm")
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_patch_id"] == packet_patch_id
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
     assert result.data["reviewed_head_sha"] == "sha-abc123"
 
@@ -11383,14 +11709,14 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
 
 
-def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
+def test_merge_ready_stale_base_deferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #316: a PR whose merge-base is not the current base tip is deferred."""
     from charlie_work.config import AutoMergeConfig
 
     config = OrchestratorConfig(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-            update_open_prs="off",  # disable base-sync so the gate is exercised
+            update_open_prs="next",
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -11438,12 +11764,16 @@ def test_merge_ready_stale_base_deferred(tmp_path: Path) -> None:
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    # Simulate a base-sync that reports success but does not advance the head, so
+    # the merge-base freshness gate still defers the PR after the first PR merges.
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
     result_456 = app.merge_ready(456, merge=True)
     assert result_456.ok is True
     assert result_456.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
 
-    result_789 = app.merge_ready(789, merge=True)
+    result_789 = app.merge_ready(789, merge=True, merge_train_head=789)
     assert result_789.ok is True
     assert result_789.data["can_merge"] is False
     assert result_789.data["merged"] is False
@@ -12260,7 +12590,7 @@ def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-            update_open_prs="off",
+            update_open_prs="next",
         )
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -17472,6 +17802,107 @@ def test_build_parser_fleet_subcommand() -> None:
     assert args_roll_call.command == "roll-call"
 
     parser.parse_args(["doctor"])
+
+    # Test fleet review-queue parsing
+    args_review_queue = parser.parse_args(["fleet", "review-queue"])
+    assert args_review_queue.command == "fleet"
+    assert args_review_queue.fleet_command == "review-queue"
+
+    # Test single-repo review-queue parsing
+    args_single = parser.parse_args(["review-queue"])
+    assert args_single.command == "review-queue"
+
+
+def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
+    """Issue #369: fleet review-queue aggregates per repo and isolates errors."""
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    config_ok = repo_ok / "orchestrator.config.yaml"
+    config_ok.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_ok / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Good repo has one PR with a current packet and no decision
+    prs_dir = repo_ok / ".var" / "charlie-work" / "prs" / "pr-7"
+    prs_dir.mkdir(parents=True)
+    (prs_dir / "pr.json").write_text(
+        json.dumps({"number": 7, "headRefOid": "sha-7"}), encoding="utf-8"
+    )
+    (prs_dir / "review-prompt.md").write_text("packet for PR 7", encoding="utf-8")
+
+    # Create a valid state.json so load_state doesn't fail
+    (repo_ok / ".var" / "charlie-work" / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_ok": {
+                "repo_root": str(repo_ok),
+                "name_with_owner": "owner/repo_ok",
+                "config_path": str(config_ok),
+                "state_dir": str(repo_ok / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    from charlie_work.github import GitHub
+
+    def mock_pr_list(self):
+        return [
+            {
+                "number": 7,
+                "title": "Fix #7: thing",
+                "url": "https://example.test/pull/7",
+                "headRefName": "agent/issue-7-fix",
+                "baseRefName": "main",
+                "headRefOid": "sha-7",
+                "mergeStateStatus": "CLEAN",
+                "body": "Closes #7",
+                "labels": [],
+                "isCrossRepository": False,
+                "state": "OPEN",
+            }
+        ]
+
+    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+
+    args = cli.build_parser().parse_args(["fleet", "review-queue"])
+    result = cli.run_fleet_review_queue(args)
+
+    assert result.ok is False
+    assert "1 repo(s), 1 error(s)" in result.message
+    assert result.data["repos"]["owner/repo_ok"]["queue"] == [
+        {
+            "pr": 7,
+            "issue": 7,
+            "packet_head_sha": "sha-7",
+            "decision": "missing",
+            "reviewed_head_sha": None,
+        }
+    ]
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
 
 
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
