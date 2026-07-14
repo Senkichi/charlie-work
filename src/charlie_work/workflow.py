@@ -1620,9 +1620,7 @@ def _format_merge_attempt_alarm_message(
     return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
-def _format_stale_base_alarm_message(
-    pr_number: int, attempts: int, reason: str
-) -> str:
+def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str) -> str:
     """Human-readable alarm message for an approved PR whose base is not current."""
     pass_str = "pass" if attempts == 1 else "passes"
     if reason == "base_stale":

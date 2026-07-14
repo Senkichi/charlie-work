@@ -331,9 +331,7 @@ def test_auto_merge_config_rejects_stale_base_deadlock(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="permanent merge deadlock"):
         OrchestratorConfig(
-            auto_merge=AutoMergeConfig(
-                require_current_base=True, update_open_prs="off"
-            )
+            auto_merge=AutoMergeConfig(require_current_base=True, update_open_prs="off")
         )
 
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -7125,9 +7123,7 @@ def test_merge_ready_stale_base_alarm_fires_after_threshold(
     # is still base-sha, so the freshness gate sees a stale base.
     post_merge_base = "main-merged-sha-abc123"
     fake_gh.base_head_sha = post_merge_base
-    fake_gh.commits[post_merge_base] = {
-        "parents": [{"sha": "base-sha"}, {"sha": "sha-abc123"}]
-    }
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": "sha-abc123"}]}
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Simulate a base-sync that reports success but does not advance the head.
@@ -7151,13 +7147,9 @@ def test_merge_ready_stale_base_alarm_fires_after_threshold(
 
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_stale_base_deferrals"] == 3
-    stale_events = [
-        e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"
-    ]
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
     assert len(stale_events) == 3
-    alarm_events = [
-        e for e in state["events"] if e["kind"] == "merge_deferred_stale_base_alarm"
-    ]
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base_alarm"]
     assert len(alarm_events) == 1
     assert alarm_events[0]["payload"]["pr_number"] == 456
     assert alarm_events[0]["payload"]["reason"] == "base_stale"
@@ -11489,9 +11481,7 @@ def test_merge_ready_two_approved_prs_second_ship_succeeds_after_first_ship(
     assert fake_gh.merged == [(456, "squash"), (789, "squash")]
 
 
-def test_merge_ready_stale_base_deferred(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_merge_ready_stale_base_deferred(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #316: a PR whose merge-base is not the current base tip is deferred."""
     from charlie_work.config import AutoMergeConfig
 
