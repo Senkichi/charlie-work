@@ -3485,15 +3485,14 @@ class OrchestratorApp:
         this command is the pre-execution spec slot and always runs when invoked.
         """
         path = Path(artifact_path)
-        if not path.exists():
-            return CommandResult(False, f"spec artifact not found: {path}", {})
+        artifact_text = path.read_text(encoding="utf-8")
         cfg = self.config.cross_family
         reviews_dir = self.paths.root / "cross-family"
         reviews_dir.mkdir(parents=True, exist_ok=True)
         slug = slugify(path.stem)
         prompt_text = self._render(
             "cross_family_spec_review.md",
-            {"artifact_label": f"`{path}`", "artifact_text": path.read_text(encoding="utf-8")},
+            {"artifact_label": f"`{path}`", "artifact_text": artifact_text},
         )
         result = run_cross_family_review(
             model=cfg.model,
