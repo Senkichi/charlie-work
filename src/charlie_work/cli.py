@@ -722,7 +722,10 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "why-charlie-hate":
         return app.review(args.pr, cross_family=args.cross_family)
     if args.command == "why-charlie-hate-spec":
-        return app.spec_review(args.spec_file)
+        try:
+            return app.spec_review(args.spec_file)
+        except OSError as exc:
+            return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "verdict":
         try:
             return app.record_review(

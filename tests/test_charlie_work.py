@@ -4952,14 +4952,16 @@ def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None
     assert Path(result.data["report_path"]).read_text(encoding="utf-8") == VALID_REPORT
 
 
-def test_spec_review_missing_file_returns_error(tmp_path: Path) -> None:
+def test_spec_review_missing_file_propagates_os_error(tmp_path: Path) -> None:
+    """A missing spec file raises naturally from read_text; the CLI boundary converts."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
-    result = app.spec_review(tmp_path / "nope.md")
+    with pytest.raises(OSError):
+        app.spec_review(tmp_path / "nope.md")
 
-    assert result.ok is False
+    assert not (tmp_path / ".var" / "charlie-work" / "cross-family").exists()
 
 
 # --- Issue #38 regression: transient retry + empty/blocked report guard --------
