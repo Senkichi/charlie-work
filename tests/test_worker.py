@@ -342,6 +342,94 @@ def test_claude_worker_record_log_stat_fields_roundtrip() -> None:
     assert reconstructed.log_bytes == 2048
 
 
+def test_session_record_started_at_canonical_at_construction() -> None:
+    """Issue #354: SessionRecord normalizes a non-canonical started_at to UTC/Z/no-microseconds."""
+    record = SessionRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/worktree-1",
+        prompt_path="/tmp/prompt-1.md",
+        command=("devin",),
+        pid=12345,
+        started_at="2026-07-13T16:04:45.267596+00:00",
+        log_path="/tmp/issue-1.log",
+    )
+    assert record.started_at == "2026-07-13T16:04:45Z"
+
+
+def test_claude_worker_record_started_at_canonical_at_construction() -> None:
+    """Issue #354: ClaudeWorkerRecord normalizes a non-canonical started_at to UTC/Z/no-microseconds."""
+    record = ClaudeWorkerRecord(
+        issue_number=1,
+        branch="agent/issue-1",
+        worktree_path="/tmp/worktree-1",
+        prompt_path="/tmp/prompt-1.md",
+        command=("claude",),
+        pid=12345,
+        started_at="2026-07-13T16:04:45.267596+00:00",
+        log_path="/tmp/issue-1.claude.log",
+    )
+    assert record.started_at == "2026-07-13T16:04:45Z"
+
+
+def test_session_record_from_dict_rejects_missing_started_at() -> None:
+    """Issue #354: a foreign payload (e.g. a post-mortem sidecar) lacks started_at;
+    from_dict must raise instead of producing an unparseable empty string."""
+    payload = {
+        "issue_number": 203,
+        "generated_at": "2026-07-13T19:52:10.811933+00:00",
+        "matched": False,
+        "db_path": "C:/fake/sessions.db",
+    }
+    with pytest.raises(ValueError, match="started_at"):
+        SessionRecord.from_dict(payload)
+
+
+def test_claude_worker_record_from_dict_rejects_missing_started_at() -> None:
+    """Issue #354: a foreign payload lacks started_at; from_dict must raise."""
+    payload = {
+        "issue_number": 203,
+        "generated_at": "2026-07-13T19:52:10.811933+00:00",
+        "matched": False,
+    }
+    with pytest.raises(ValueError, match="started_at"):
+        ClaudeWorkerRecord.from_dict(payload)
+
+
+def test_session_record_from_dict_derives_started_at_from_process_start_time() -> None:
+    """Issue #354: if started_at is missing but process_start_time is present, recover the canonical start timestamp."""
+    payload = {
+        "issue_number": 1,
+        "branch": "agent/issue-1",
+        "worktree_path": "/tmp/worktree-1",
+        "prompt_path": "/tmp/prompt-1.md",
+        "command": ["devin", "prompt.md"],
+        "pid": 12345,
+        "started_at": "",
+        "log_path": "/tmp/issue-1.log",
+        "process_start_time": 1710000000.0,
+    }
+    record = SessionRecord.from_dict(payload)
+    assert record.started_at == "2024-03-09T16:00:00Z"
+
+
+def test_claude_worker_record_from_dict_derives_started_at_from_process_start_time() -> None:
+    """Issue #354: if started_at is missing but process_start_time is present, recover the canonical start timestamp."""
+    payload = {
+        "issue_number": 1,
+        "branch": "agent/issue-1",
+        "worktree_path": "/tmp/worktree-1",
+        "prompt_path": "/tmp/prompt-1.md",
+        "command": ["claude", "prompt.md"],
+        "pid": 12345,
+        "started_at": "",
+        "log_path": "/tmp/issue-1.claude.log",
+        "process_start_time": 1710000000.0,
+    }
+    record = ClaudeWorkerRecord.from_dict(payload)
+    assert record.started_at == "2024-03-09T16:00:00Z"
+
+
 def test_worker_view_reap_sidecar_devin(tmp_path: Path) -> None:
     """WorkerView.reap_sidecar() deletes the devin-shell sidecar file for a dead session (issue #113)."""
     from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
