@@ -683,13 +683,16 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "why-charlie-hate-spec":
         return app.spec_review(args.spec_file)
     if args.command == "verdict":
-        return app.record_review(
-            args.pr,
-            args.decision,
-            summary=args.summary,
-            summary_file=args.summary_file,
-            comment=args.comment,
-        )
+        try:
+            return app.record_review(
+                args.pr,
+                args.decision,
+                summary=args.summary,
+                summary_file=args.summary_file,
+                comment=args.comment,
+            )
+        except OSError as exc:
+            return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "bash-rats":

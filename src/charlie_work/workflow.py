@@ -2889,6 +2889,15 @@ class OrchestratorApp:
             return CommandResult(
                 False, "decision must be approved, request_changes, or blocked", {}
             )
+        summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
+        # Issue #11: reject empty summary for request_changes/blocked decisions
+        # before any state/label mutation
+        if decision in {"request_changes", "blocked"} and not summary_text.strip():
+            return CommandResult(
+                False,
+                f"--summary or --summary-file is required for decision '{decision}'",
+                {},
+            )
         pr = self.gh.pr_view(pr_number)
         issue_number = (
             linked_issue_number(
@@ -2901,15 +2910,6 @@ class OrchestratorApp:
         )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
-        summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
-        # Issue #11: reject empty summary for request_changes/blocked decisions
-        # before any state/label mutation
-        if decision in {"request_changes", "blocked"} and not summary_text.strip():
-            return CommandResult(
-                False,
-                f"--summary or --summary-file is required for decision '{decision}'",
-                {},
-            )
         reviewed_head_sha = pr.get("headRefOid") if pr else None
         # Calculate patch-id for the PR diff to detect actual content changes
         # (issue #222: base-update merges can advance head SHA without changing diff content)
