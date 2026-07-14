@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import ConfigError, load_config
+from charlie_work.config import ConfigError, DispatchConfig, load_config
 
 
 def _write_config(config_file: Path, content: str) -> None:
@@ -97,3 +97,37 @@ watchdog:
     assert config.watchdog.worktree_mtime_threshold_minutes == 45
     assert config.watchdog.worktree_mtime_max_depth == 4
     assert config.watchdog.worktree_mtime_exclude_dirs == (".git", ".venv")
+
+
+def test_dispatch_config_injected_paths_derived_from_templates() -> None:
+    """Issue #381: default injected_paths are derived from worker/rework templates."""
+    config = DispatchConfig()
+    assert config.injected_paths == (
+        ".devin/prompts/worker.md",
+        ".devin/prompts/rework.md",
+    )
+
+    custom = DispatchConfig(worker_template="worker_claude_code.md", rework_template="rework.md")
+    assert custom.injected_paths == (
+        ".devin/prompts/worker_claude_code.md",
+        ".devin/prompts/rework.md",
+    )
+
+
+def test_load_config_injected_paths_coerces_list_to_tuple(tmp_path: Path) -> None:
+    """Issue #381: injected_paths list in YAML becomes a tuple in DispatchConfig."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+dispatch:
+  injected_paths:
+    - .orchestrator-prompt.md
+    - .devin/prompts/custom.md
+""",
+    )
+    config = load_config(config_file)
+    assert config.dispatch.injected_paths == (
+        ".orchestrator-prompt.md",
+        ".devin/prompts/custom.md",
+    )

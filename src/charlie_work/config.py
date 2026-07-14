@@ -120,6 +120,9 @@ class DispatchConfig:
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
     worker_template: str = "worker.md"
+    # Package template rendered for rework prompts. Mirrors worker_template so the
+    # orchestrator has a single source of truth for the rework prompt filename.
+    rework_template: str = "rework.md"
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -143,6 +146,27 @@ class DispatchConfig:
     # Devin's "overall message rate limit" firing when 3 sessions launched
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
     launch_stagger_seconds: int = 45
+    # Worktree-relative paths owned by the orchestrator and excluded from
+    # "is the worktree dirty?" checks. Derived from worker_template and
+    # rework_template by default so the prompt renderer and the worktree probe
+    # share one source of truth; override explicitly to cover other adapters.
+    injected_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Normalize to a tuple of strings. If the operator did not explicitly set
+        # injected_paths, derive them from the prompt template filenames so a
+        # different worker_template or adapter is covered automatically.
+        if self.injected_paths:
+            object.__setattr__(self, "injected_paths", tuple(str(p) for p in self.injected_paths))
+        else:
+            object.__setattr__(
+                self,
+                "injected_paths",
+                (
+                    f".devin/prompts/{self.worker_template}",
+                    f".devin/prompts/{self.rework_template}",
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -725,6 +749,20 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'dispatch' key 'launch_stagger_seconds' must be >= 0, "
             f"got {launch_stagger_seconds}"
         )
+    injected_paths = dispatch_data.get("injected_paths")
+    if injected_paths is not None:
+        if not isinstance(injected_paths, list):
+            raise ConfigError(
+                "config section 'dispatch' key 'injected_paths' must be a list of "
+                f"strings, got {type(injected_paths).__name__}"
+            )
+        for item in injected_paths:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'dispatch' key 'injected_paths' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        dispatch_data["injected_paths"] = tuple(str(item) for item in injected_paths)
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     auto_merge_data = _section(data, "auto_merge")

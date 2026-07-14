@@ -19,7 +19,7 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
@@ -238,11 +238,59 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     return False
 
 
+def _worker_authored_dirty(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+) -> bool:
+    """Return True if the worktree has uncommitted changes that are NOT
+    orchestrator-injected prompt files.
+
+    ``injected_paths`` are worktree-relative paths (files or directories) that
+    the orchestrator writes into the worktree (e.g. rendered worker/rework
+    prompts). They are excluded from the dirty check so completed worker work
+    is not stranded by prompt-injection noise (issue #381).
+
+    Raises:
+        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
+            fails (index lock, corruption, permissions).
+    """
+    status_result = run_captured(
+        ["git", "-c", "core.quotePath=off", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok:
+        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
+
+    injected = [PurePosixPath(str(p)) for p in injected_paths]
+    for line in status_result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Porcelain format: two status chars, a space, then the path.
+        # Renames include "old -> new"; the right-hand side is the current path.
+        if len(line) < 4:
+            continue
+        raw_path = line[3:]
+        if " -> " in raw_path:
+            raw_path = raw_path.split(" -> ")[-1]
+        # Git may emit backslashes on Windows; normalize for comparison.
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        if any(
+            path == injected_path or injected_path in path.parents or path in injected_path.parents
+            for injected_path in injected
+        ):
+            continue
+        return True
+    return False
+
+
 def _worktree_refuse_to_reset_reason(
     repo_root: Path,
     branch: str,
     base_ref: str,
     worktree_path: Path | None = None,
+    injected_paths: tuple[str, ...] = (),
 ) -> str | None:
     """Return a human-readable reason if resetting the branch/worktree would destroy
     local work, otherwise ``None``.
@@ -265,19 +313,7 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        status_result = run_captured(
-            ["git", "status", "--porcelain"],
-            cwd=worktree_path,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        # If the probe fails (index lock, corruption, permissions), we cannot
-        # confirm the worktree is clean. Refuse the reset (safe default), but
-        # raise a distinct exception: this is transient probe contention, not
-        # a confirmed-dirty worktree, and must not be classified the same way
-        # (issue #288 follow-up, PR #314).
-        if not status_result.ok:
-            raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
-        if status_result.stdout.strip():
+        if _worker_authored_dirty(worktree_path, injected_paths):
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "HEAD"],
@@ -352,7 +388,10 @@ def _worktree_refuse_to_reset_reason(
     return "worktree has local commits not on remote branch"
 
 
-def _worktree_dirty_reason(worktree_path: Path) -> str | None:
+def _worktree_dirty_reason(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+) -> str | None:
     """Return a reason string if ``worktree_path`` has uncommitted modifications.
 
     Used by the merged-PR cleanup path (``clean_worktrees``), which decides
@@ -370,14 +409,7 @@ def _worktree_dirty_reason(worktree_path: Path) -> str | None:
     """
     if not worktree_path.is_dir():
         return None
-    status_result = run_captured(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not status_result.ok:
-        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
-    if status_result.stdout.strip():
+    if _worker_authored_dirty(worktree_path, injected_paths):
         return "worktree has uncommitted modifications"
     return None
 
@@ -747,6 +779,10 @@ def create_worktree(
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
 
+    # Worktree-relative paths that the orchestrator injects (e.g. rendered
+    # prompts). These are excluded from "is this worktree dirty?" checks.
+    injected_paths = config.dispatch.injected_paths if config is not None else ()
+
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None
     attempt_snapshot: AttemptSnapshot | None = None
@@ -768,7 +804,9 @@ def create_worktree(
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""
         check_path = target_path or worktree_path
-        reason = _worktree_refuse_to_reset_reason(repo_root, branch, resolved_base_ref, check_path)
+        reason = _worktree_refuse_to_reset_reason(
+            repo_root, branch, resolved_base_ref, check_path, injected_paths
+        )
         if reason:
             raise WorktreeUnsafeError(reason)
 
@@ -880,14 +918,12 @@ def create_worktree(
 
                 # Worktree exists on the correct branch: check if it has commits beyond the merge-base
                 wt_path = Path(existing_wt["worktree"])
-                # Check for dirty working tree
-                dirty_result = run_captured(
-                    ["git", "status", "--porcelain"],
-                    cwd=wt_path,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-                )
-                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
-                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
+                # Check for dirty working tree, ignoring orchestrator-injected files.
+                try:
+                    has_dirty = _worker_authored_dirty(wt_path, injected_paths)
+                except WorktreeProbeFailedError:
+                    # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                    has_dirty = True
 
                 # Check for commits beyond merge-base with resolved_base_ref
                 merge_base_result = run_captured(
@@ -1241,7 +1277,11 @@ def remove_worktree(
     return worktree_removed and branch_deleted
 
 
-def inspect_worktree_state(worktree_path: Path, base_ref: str = "") -> WorktreeInspection:
+def inspect_worktree_state(
+    worktree_path: Path,
+    base_ref: str = "",
+    injected_paths: tuple[str, ...] = (),
+) -> WorktreeInspection:
     """Inspect a worker worktree after the process dies.
 
     Returns a ``WorktreeInspection`` describing whether the worker has:
@@ -1259,18 +1299,13 @@ def inspect_worktree_state(worktree_path: Path, base_ref: str = "") -> WorktreeI
             error=f"worktree path does not exist: {worktree_path}",
         )
 
-    status_result = run_captured(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not status_result.ok:
+    try:
+        dirty = _worker_authored_dirty(worktree_path, injected_paths)
+    except WorktreeProbeFailedError as exc:
         return WorktreeInspection(
             WorktreeState.UNKNOWN,
-            error=status_result.error or status_result.stderr or "git status failed",
+            error=str(exc),
         )
-
-    dirty = bool(status_result.stdout.strip())
 
     if base_ref == "":
         try:
@@ -1752,7 +1787,7 @@ def clean_worktrees(
             )
             continue
         try:
-            dirty_reason = _worktree_dirty_reason(wt_path)
+            dirty_reason = _worktree_dirty_reason(wt_path, config.dispatch.injected_paths)
         except WorktreeProbeFailedError as exc:
             skipped.append(
                 {

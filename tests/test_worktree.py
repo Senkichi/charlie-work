@@ -1166,6 +1166,60 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
     remove_worktree(repo_root, info1.path)
 
 
+def test_fresh_dispatch_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: a stale worktree with dirty orchestrator-injected prompt files
+    but no worker-authored changes can be safely reset and recreated."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-381-injected"
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    # Only orchestrator-injected prompt files are dirty.
+    for injected in config.dispatch.injected_paths:
+        prompt = info1.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    # Fresh dispatch should prune the stale worktree and recreate it.
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+    assert info2.path.exists()
+    assert info2.reclaimed == "pruned"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: worker-authored uncommitted changes still hard-refuse fresh dispatch."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-381-worker-dirty"
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    for injected in config.dispatch.injected_paths:
+        prompt = info1.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    assert info1.path.exists()
+    assert (info1.path / "worker-change.txt").exists()
+
+    remove_worktree(repo_root, info1.path)
+
+
 def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
     """Issue #110: Recovery mode with commits reuses worktree (existing behavior).
 
@@ -2551,6 +2605,63 @@ def test_inspect_worktree_state_partial_dirty(tmp_path: Path) -> None:
     remove_worktree(repo, info.path, branch="agent/issue-2")
 
 
+def test_inspect_worktree_state_completed_ignores_injected_prompts(tmp_path: Path) -> None:
+    """Issue #381: a completed worktree is still COMPLETED if the only dirty
+    files are orchestrator-injected prompt paths from the frozen config."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    # Simulate orchestrator-injected prompt files being modified in the worktree.
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.COMPLETED
+    assert inspection.ahead_count == 1
+    assert inspection.dirty is False
+
+    remove_worktree(repo, info.path, branch="agent/issue-381")
+
+
+def test_inspect_worktree_state_partial_with_worker_changes_and_injected(tmp_path: Path) -> None:
+    """Issue #381: worker-authored uncommitted changes still block COMPLETED."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    (info.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.PARTIAL
+    assert inspection.dirty is True
+
+    remove_worktree(repo, info.path, branch="agent/issue-381")
+
+
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
     """A clean worktree with no commits beyond the base is no_commits."""
     remote, repo = _init_repo_with_remote(tmp_path)
@@ -3077,6 +3188,39 @@ def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
     assert len(result.data["skipped"]) == 1
     assert "uncommitted" in result.data["skipped"][0]["reason"]
     assert info.path.exists()
+
+
+def test_clean_worktrees_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: merged worktree with only injected prompt files dirty should be removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-381-clean", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+    state = _make_state(issue_number=381, pr_number=1381)
+
+    result = clean_worktrees(
+        repo_root,
+        _default_worktrees_dir(repo_root),
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.ok is True
+    assert len(result.data["removed"]) == 1
+    assert result.data["removed"][0]["branch"] == "agent/issue-381-clean"
+    assert not info.path.exists()
 
 
 def test_clean_worktrees_skips_stray_post_merge_commit(tmp_path: Path) -> None:
