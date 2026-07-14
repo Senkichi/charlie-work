@@ -3256,7 +3256,10 @@ class OrchestratorApp:
         approved = decision.get("decision") == "approved"
         sync_failed = False
         merge_conflict = False
+        merge_conflict_routed = False
+        issue_status: str | None = None
         label_error: dict[str, Any] | None = None
+        rework_label_error: dict[str, Any] | None = None
         if approved:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
@@ -3352,7 +3355,10 @@ class OrchestratorApp:
                 merge_conflict = True
                 sync_failed = True
                 if issue_status != "rework_requested" and issue_number is not None:
-                    label_error = self._request_merge_conflict_rework(pr, issue_number, decision)
+                    merge_conflict_routed = True
+                    rework_label_error = self._request_merge_conflict_rework(
+                        pr, issue_number, decision
+                    )
             # Head matches the approved SHA. In merge-train mode, only the head
             # of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
@@ -3473,7 +3479,7 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
-        label_error: dict[str, Any] | None = None
+        label_error = rework_label_error
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         if can_merge and should_merge:
@@ -3548,9 +3554,23 @@ class OrchestratorApp:
                 if merge_attempt_alarm:
                     if merge_conflict:
                         pass_str = "pass" if new_attempts == 1 else "passes"
+                        if issue_number is None:
+                            conflict_detail = "no linked issue, cannot route to rework"
+                        elif merge_conflict_routed:
+                            if rework_label_error:
+                                outcome = rework_label_error.get("outcome", rework_label_error)
+                                conflict_detail = (
+                                    f"rework dispatch attempted (label update failed: {outcome})"
+                                )
+                            else:
+                                conflict_detail = "rework dispatched"
+                        elif issue_status == "rework_requested":
+                            conflict_detail = "rework already requested"
+                        else:
+                            conflict_detail = "rework not routed"
                         merge_attempt_warning = (
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
-                            "merge conflict — rework dispatched"
+                            f"merge conflict — {conflict_detail}"
                         )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
@@ -3624,8 +3644,10 @@ class OrchestratorApp:
         message = "merge readiness evaluated"
         if checks_unavailable:
             message = "checks unavailable (gh failure)"
-        elif label_error:
+        elif merge_output and label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
+        elif label_error:
+            message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(not checks_unavailable, message, data)
 
     def spec_review(self, artifact_path: Path) -> CommandResult:
