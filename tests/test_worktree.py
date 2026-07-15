@@ -1463,8 +1463,13 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
     original_run_captured = charlie_work.worktree.run_captured
 
     def mock_run_captured(*args: object, **kwargs: object) -> object:
-        # If this is a git status --porcelain call, return a failure
-        if isinstance(args[0], list) and "status" in args[0] and "--porcelain" in args[0]:
+        # If this is a git status --porcelain=v2 call, return a failure. Matches
+        # by prefix since the flag carries a mode suffix ("--porcelain=v2").
+        if (
+            isinstance(args[0], list)
+            and "status" in args[0]
+            and any(str(a).startswith("--porcelain") for a in args[0])
+        ):
             from charlie_work.subprocess_runner import RunResult
 
             return RunResult(
@@ -2725,11 +2730,11 @@ def test_worker_authored_dirty_normalizes_backslash_in_override(tmp_path: Path) 
 def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
     tmp_path: Path,
 ) -> None:
-    """Issue #381 follow-up: git collapses a wholly-untracked directory into a
-    single porcelain line (e.g. ``?? .devin/``). When an injected path is
-    nested inside that directory, the collapsed ancestor line must not
-    silently absorb an unrelated, worker-authored sibling file living in the
-    same directory.
+    """Issue #381 follow-up, now structural: ``--untracked-files=all`` means
+    git never collapses a wholly-untracked directory into a single ``??
+    dir/`` line in the first place — every file, including a worker-authored
+    sibling living next to a nested injected path, gets its own record. There
+    is no collapsed line left to special-case or re-probe.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -2745,9 +2750,9 @@ def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
 def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
     tmp_path: Path,
 ) -> None:
-    """Inverse control: a wholly-untracked directory containing ONLY the
-    injected path (no siblings) must still be excused, preserving issue
-    #381's original carve-out.
+    """Inverse control: a directory containing ONLY the injected path (no
+    siblings) must still be excused, preserving issue #381's original
+    carve-out under full per-file enumeration.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -2756,6 +2761,121 @@ def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
     injected.write_text("injected prompt", encoding="utf-8")
 
     assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is False
+
+
+def test_worker_authored_dirty_tracked_leading_dot_path_modified_in_place(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 bug 1 (v1 rework history): the old line-based parser called
+    ``.strip()`` on each porcelain line before a fixed-column ``line[3:]``
+    slice, which corrupted the leading-space status column of an unstaged
+    tracked modification (e.g. ``" M .orchestrator-prompt.md"``) — the strip
+    shifted the string left by one character and dropped the leading dot.
+    ``--porcelain=v2 -z`` has no line-based whitespace to strip in the first
+    place: fields are parsed by splitting the record on single spaces with a
+    bounded maxsplit, never by slicing a stripped string.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompt = repo_root / ".orchestrator-prompt.md"
+    prompt.write_text("original prompt", encoding="utf-8")
+    _git(repo_root, "add", str(prompt))
+    _git(repo_root, "commit", "-m", "track prompt")
+    # Modify in place without staging: unstaged tracked change, XY = ".M".
+    prompt.write_text("rewritten prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".orchestrator-prompt.md",)) is False
+
+    # Control: the same leading-dot tracked-modification shape, but for a path
+    # NOT in injected_paths, must still be detected as dirty.
+    other = repo_root / ".other-tracked.md"
+    other.write_text("original", encoding="utf-8")
+    _git(repo_root, "add", str(other))
+    _git(repo_root, "commit", "-m", "track other")
+    other.write_text("changed", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".orchestrator-prompt.md",)) is True
+
+
+def test_worker_authored_dirty_directory_injected_path_scoped_to_its_own_tree(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 bug 4 (v1 rework history): when an injected_paths entry
+    names a whole directory rather than a specific file (a documented
+    supported convention — see ``DispatchConfig.injected_paths``), the old
+    line-based parser matched it via an exact-match fast path that ran
+    *before*, and bypassed, the collapse-safety re-probe used for the
+    nested-file case (bug 3) — an inconsistency between two code paths meant
+    to answer the same question. ``--untracked-files=all`` removes the
+    re-probe machinery (and the fast-path/re-probe distinction) entirely:
+    every file, whether it matches an injected file or an injected directory,
+    is matched individually by the exact same normalized-path predicate.
+
+    A directory-level injected_paths entry legitimately excuses everything
+    under it (that is the documented, intentional trade-off of naming a
+    whole directory) — but the exclusion must stay scoped to that directory's
+    own subtree and not leak to unrelated content, including a directory that
+    merely shares a string prefix.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling.write_text("real worker output inside the excluded tree", encoding="utf-8")
+
+    # Naming the directory itself excuses everything inside it, by design.
+    assert _worker_authored_dirty(repo_root, (".devin",)) is False
+
+    # An unrelated untracked file OUTSIDE the named directory must still be
+    # detected — the exclusion does not leak beyond its own subtree.
+    unrelated = repo_root / "worker-result.txt"
+    unrelated.write_text("unrelated worker output", encoding="utf-8")
+    assert _worker_authored_dirty(repo_root, (".devin",)) is True
+
+
+def test_worker_authored_dirty_directory_prefix_does_not_collide(tmp_path: Path) -> None:
+    """A directory that merely shares a string prefix with a configured
+    injected directory (e.g. ``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison via ``PurePosixPath.parents``, not substring
+    matching, is what makes this safe.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not injected", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin",)) is True
+
+
+def test_worker_authored_dirty_renamed_tracked_file_not_injected(tmp_path: Path) -> None:
+    """A rename/copy porcelain=v2 record (tag ``2``) carries an extra
+    NUL-delimited ``origPath`` field after the current path. Parsing must
+    consume that extra field so it isn't mistaken for the next record's tag,
+    and the CURRENT (renamed-to) path is what gets matched against
+    injected_paths — mirroring the old parser's ``" -> "`` right-hand-side
+    convention.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    tracked = repo_root / "tracked.txt"
+    tracked.write_text("content\n", encoding="utf-8")
+    _git(repo_root, "add", "tracked.txt")
+    _git(repo_root, "commit", "-m", "add tracked")
+    _git(repo_root, "mv", "tracked.txt", "renamed.txt")
+    # A subsequent untracked file proves the rename record's extra origPath
+    # field was correctly consumed rather than corrupting the next record.
+    (repo_root / "new-worker-file.txt").write_text("also here", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+    # A rename INTO an injected path is excused by the current-path match.
+    _git(repo_root, "reset", "--hard")
+    (repo_root / "new-worker-file.txt").unlink(missing_ok=True)
+    _git(repo_root, "mv", "tracked.txt", "prompt-renamed.md")
+    assert _worker_authored_dirty(repo_root, ("prompt-renamed.md",)) is False
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:

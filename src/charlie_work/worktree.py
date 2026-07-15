@@ -238,53 +238,65 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     return False
 
 
-def _untracked_dir_contains_only_injected(
-    worktree_path: Path,
-    dir_path: PurePosixPath,
-    injected: list[PurePosixPath],
-) -> bool:
-    """Return True only if every file under the wholly-untracked directory
-    ``dir_path`` is itself an injected path (or nested under one).
+def _parse_status_v2_paths(stdout: str) -> list[str]:
+    """Parse ``git status --porcelain=v2 -z`` output into a flat list of
+    worktree-relative paths representing real changes: ordinary tracked
+    changes, renames/copies (current path only), unmerged conflicts, and
+    untracked files. Ignored-file records (``!``, never emitted unless
+    ``--ignored`` is passed) and any unrecognized record type are skipped
+    defensively rather than mis-parsed.
 
-    ``git status --porcelain`` (without ``--untracked-files=all``) collapses a
-    wholly-untracked directory into a single line (e.g. ``?? .devin/``)
-    instead of enumerating its contents. When that collapsed line is an
-    ancestor of a configured injected path, we cannot tell from the collapsed
-    line alone whether the directory ALSO holds sibling worker-authored files
-    (e.g. ``.devin/worker-output.txt`` next to ``.devin/prompts/worker.md``).
-    This re-probes git scoped to ``dir_path`` with full enumeration to find
-    out. Any ambiguity (probe failure, or any non-injected file found) fails
-    toward "dirty" — the narrow, exact-match ignoring issue #381 intended.
+    ``-z`` NUL-terminates every record AND every path field, which is what
+    makes this unambiguous: paths can never contain NUL, so ``-z`` never
+    quotes or escapes them, and there is no line-based whitespace to
+    ``.strip()`` (the v1 fixed-column bug: stripping a leading status-column
+    space before slicing shifted the path left by one character and dropped
+    its first character, e.g. on tracked-but-unstaged-modified files whose
+    path begins with a dot). Each v2 record type has a fixed, documented
+    number of space-separated header fields before the path (see
+    ``git-status(1)`` "Porcelain Format Version 2"); a rename/copy record
+    additionally consumes one extra NUL-delimited field for ``origPath``,
+    which is discarded here since dirty-checking only cares about the
+    current path.
     """
-    scoped_result = run_captured(
-        [
-            "git",
-            "-c",
-            "core.quotePath=off",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            str(dir_path),
-        ],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not scoped_result.ok:
-        return False
-    for line in scoped_result.stdout.splitlines():
-        if not line.strip() or len(line) < 4:
+    paths: list[str] = []
+    fields = stdout.split("\0")
+    i = 0
+    n = len(fields)
+    while i < n:
+        record = fields[i]
+        if not record:
+            i += 1
             continue
-        raw_path = line[3:]
-        if " -> " in raw_path:
-            raw_path = raw_path.split(" -> ")[-1]
-        file_path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        if not any(
-            file_path == injected_path or injected_path in file_path.parents
-            for injected_path in injected
-        ):
-            return False
-    return True
+        tag = record[0]
+        if tag == "1":
+            # Ordinary changed entry: "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>"
+            parts = record.split(" ", 8)
+            if len(parts) == 9:
+                paths.append(parts[8])
+            i += 1
+        elif tag == "2":
+            # Renamed/copied entry: "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>"
+            # followed by a separate NUL-terminated <origPath> field.
+            parts = record.split(" ", 9)
+            if len(parts) == 10:
+                paths.append(parts[9])
+            i += 2  # this record's path field + the trailing origPath field
+        elif tag == "u":
+            # Unmerged entry: "u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
+            parts = record.split(" ", 10)
+            if len(parts) == 11:
+                paths.append(parts[10])
+            i += 1
+        elif tag == "?":
+            # Untracked entry: "? <path>"
+            paths.append(record[2:])
+            i += 1
+        else:
+            # "!" ignored entries (not requested here) or any unrecognized
+            # record type: skip rather than guess at a layout we don't know.
+            i += 1
+    return paths
 
 
 def _worker_authored_dirty(
@@ -300,12 +312,32 @@ def _worker_authored_dirty(
     configured). They are excluded from the dirty check so completed worker
     work is not stranded by prompt-injection noise (issue #381).
 
+    Uses ``git status --porcelain=v2 -z --untracked-files=all``:
+    ``--untracked-files=all`` disables directory collapsing, so every
+    untracked file gets its own record — there is no "does this line
+    represent one file or a whole directory" ambiguity left to special-case
+    (the v1 rework history: a wholly-untracked directory collapsed to a
+    single ``?? dir/`` line could hide a worker-authored sibling file next to
+    a configured injected path or directory, and a probe re-scoped to that
+    directory was needed to tell the two apart). Every entry — whether it
+    matches an injected file or a whole injected directory — is now checked
+    against the same normalized-path predicate below, with no separate
+    collapse-probing code path to keep in sync.
+
     Raises:
-        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
-            fails (index lock, corruption, permissions).
+        WorktreeProbeFailedError: if the ``git status`` probe itself fails
+            (index lock, corruption, permissions).
     """
     status_result = run_captured(
-        ["git", "-c", "core.quotePath=off", "status", "--porcelain"],
+        [
+            "git",
+            "-c",
+            "core.quotePath=off",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        ],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
@@ -318,34 +350,13 @@ def _worker_authored_dirty(
     # Normalize the configured side too, so a Windows-style backslash override
     # still matches git's forward-slash path reporting.
     injected = [PurePosixPath(str(p).replace("\\", "/")) for p in injected_paths]
-    for line in status_result.stdout.splitlines():
-        # splitlines() removes the trailing newline; preserve the two leading
-        # status columns (e.g., " M path") so the fixed [3:] slice starts at
-        # the path. Stripping first would shift the string and corrupt paths
-        # that begin with a dot, like ".devin/prompts/worker.md".
-        if not line.strip():
-            continue
-        # Porcelain format: two status chars, a space, then the path.
-        # Renames include "old -> new"; the right-hand side is the current path.
-        if len(line) < 4:
-            continue
-        status = line[:2]
-        raw_path = line[3:]
-        if " -> " in raw_path:
-            raw_path = raw_path.split(" -> ")[-1]
+    for raw_path in _parse_status_v2_paths(status_result.stdout):
         # Git may emit backslashes on Windows; normalize for comparison.
         path = PurePosixPath(str(raw_path).replace("\\", "/"))
         if any(
             path == injected_path or injected_path in path.parents for injected_path in injected
         ):
             continue
-        if status.strip() == "??" and any(
-            path in injected_path.parents for injected_path in injected
-        ):
-            # A collapsed wholly-untracked ancestor directory of an injected
-            # path. Only excuse it if it holds nothing but injected content.
-            if _untracked_dir_contains_only_injected(worktree_path, path, injected):
-                continue
         return True
     return False
 
