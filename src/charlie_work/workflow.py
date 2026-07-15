@@ -2675,12 +2675,32 @@ class OrchestratorApp:
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
         )
+
+        # Escalation is terminal: once an issue is marked escalated, no further
+        # review packet generation or label transitions should occur until a human
+        # explicitly de-escalates. This prevents a later loop() pass from clobbering
+        # the agent:human-needed label with a review_started transition (issue #384).
+        state = load_state_locked(self.paths.state_file)
+        if issue_number is not None:
+            issue_state = state.get("issues", {}).get(str(issue_number), {})
+            pr_state = state.get("prs", {}).get(str(pr_number), {})
+            if issue_state.get("status") == "escalated" or pr_state.get("status") == "escalated":
+                return CommandResult(
+                    True,
+                    f"issue #{issue_number} is escalated; review skipped",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "skipped": True,
+                        "checks_unavailable": False,
+                    },
+                )
+
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
-        state = load_state_locked(self.paths.state_file)
         if str(pr_number) in state.get("prs", {}):
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
