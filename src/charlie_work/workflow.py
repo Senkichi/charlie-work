@@ -3255,6 +3255,11 @@ class OrchestratorApp:
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
         sync_failed = False
+        merge_conflict = False
+        merge_conflict_routed = False
+        issue_status: str | None = None
+        label_error: dict[str, Any] | None = None
+        rework_label_error: dict[str, Any] | None = None
         if approved:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
@@ -3314,6 +3319,71 @@ class OrchestratorApp:
                         "label_error": label_error,
                     },
                 )
+            # Genuine merge conflict: gh pr update-branch cannot resolve this.
+            # Route the linked issue to rework_requested so dispatch_rework
+            # relaunches a worker; the worker's push will move the head and
+            # force a fresh re-review of the approved verdict.
+            if self._is_merge_conflict(pr):
+                state = load_state_locked(self.paths.state_file)
+                issue_state = (
+                    state["issues"].get(str(issue_number), {}) if issue_number is not None else {}
+                )
+                issue_status = issue_state.get("status")
+                if issue_status in (
+                    "dispatched",
+                    "dispatch_pending",
+                    "manifest_written",
+                ):
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} merge conflict is being resolved by a rework worker",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "merge_conflict": True,
+                            "consecutive_failed_merge_attempts": existing_pr_state.get(
+                                "consecutive_failed_merge_attempts", 0
+                            ),
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
+                # The linked issue is in a human-terminal state (escalated to a
+                # human decision, or blocked pending one). Never reroute those
+                # to rework_requested: transition() has no source-state
+                # validation, so doing so would silently strip human_needed
+                # and hand the issue back into the automated pipeline behind
+                # the human's back. Leave the issue and PR alone; a human
+                # must move it out of this state.
+                if issue_status in ("escalated", "blocked"):
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} merge conflict on issue #{issue_number} "
+                        f"awaiting human decision ({issue_status}); not rerouted",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "merge_conflict": True,
+                            "consecutive_failed_merge_attempts": existing_pr_state.get(
+                                "consecutive_failed_merge_attempts", 0
+                            ),
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
+                merge_conflict = True
+                sync_failed = True
+                if issue_status != "rework_requested" and issue_number is not None:
+                    merge_conflict_routed = True
+                    rework_label_error = self._request_merge_conflict_rework(
+                        pr, issue_number, decision
+                    )
             # Head matches the approved SHA. In merge-train mode, only the head
             # of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
@@ -3434,7 +3504,7 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
-        label_error: dict[str, Any] | None = None
+        label_error = rework_label_error
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         if can_merge and should_merge:
@@ -3507,9 +3577,30 @@ class OrchestratorApp:
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
                 if merge_attempt_alarm:
-                    merge_attempt_warning = _format_merge_attempt_alarm_message(
-                        pr_number, new_attempts, summary
-                    )
+                    if merge_conflict:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        if issue_number is None:
+                            conflict_detail = "no linked issue, cannot route to rework"
+                        elif merge_conflict_routed:
+                            if rework_label_error:
+                                outcome = rework_label_error.get("outcome", rework_label_error)
+                                conflict_detail = (
+                                    f"rework dispatch attempted (label update failed: {outcome})"
+                                )
+                            else:
+                                conflict_detail = "rework dispatched"
+                        elif issue_status == "rework_requested":
+                            conflict_detail = "rework already requested"
+                        else:
+                            conflict_detail = "rework not routed"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            f"merge conflict — {conflict_detail}"
+                        )
+                    else:
+                        merge_attempt_warning = _format_merge_attempt_alarm_message(
+                            pr_number, new_attempts, summary
+                        )
                     state = append_event(
                         state,
                         "merge_failed_attempt_alarm",
@@ -3573,12 +3664,15 @@ class OrchestratorApp:
             "consecutive_stale_base_deferrals": new_stale_base_deferrals,
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
+            "merge_conflict": merge_conflict,
         }
         message = "merge readiness evaluated"
         if checks_unavailable:
             message = "checks unavailable (gh failure)"
-        elif label_error:
+        elif merge_output and label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
+        elif label_error:
+            message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(not checks_unavailable, message, data)
 
     def spec_review(self, artifact_path: Path) -> CommandResult:
@@ -3989,6 +4083,7 @@ class OrchestratorApp:
                 ),
                 "merge_attempt_alarm": False,
                 "merge_attempt_warning": None,
+                "merge_conflict": False,
             },
         )
 
@@ -4075,8 +4170,82 @@ class OrchestratorApp:
                 "consecutive_stale_base_deferrals": new_stale_base_deferrals,
                 "merge_attempt_alarm": stale_base_alarm,
                 "merge_attempt_warning": stale_base_warning,
+                "merge_conflict": False,
             },
         )
+
+    def _is_merge_conflict(self, pr: dict[str, Any]) -> bool:
+        """Detect a genuine content conflict that gh pr update-branch cannot resolve.
+
+        GitHub exposes this through ``mergeable`` (CONFLICTING) and through
+        ``mergeStateStatus`` (DIRTY). Both are already fetched by ``pr_view``.
+        """
+        return (
+            str(pr.get("mergeable") or "").upper() == "CONFLICTING"
+            or str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
+        )
+
+    def _request_merge_conflict_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR with a genuine merge conflict to rework.
+
+        Writes a rework prompt, transitions the linked issue to
+        ``rework_requested`` (same label set as a non-escalated request_changes),
+        and appends a distinct ``merge_conflict_rework_requested`` state event.
+        The PR's ``review-decision.json`` is intentionally left untouched so the
+        approved verdict is re-confirmed after the worker push moves the head.
+        """
+        pr_number = int(pr["number"])
+        summary = (
+            "The PR branch has a merge conflict with the base branch after a base update. "
+            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
+            "The code changes are already approved; do not re-litigate the review."
+        )
+        self._write_rework_prompt(pr, issue_number, summary)
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            issue_key = str(issue_number)
+            issue_entry = state["issues"].get(issue_key, {})
+            state["issues"][issue_key] = {
+                **issue_entry,
+                "number": issue_number,
+                "status": "rework_requested",
+                "merge_alert": "OK",
+            }
+            pr_entry = state["prs"].get(str(pr_number), {})
+            state["prs"][str(pr_number)] = {
+                **pr_entry,
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "rework_requested",
+            }
+            state = append_event(
+                state,
+                "merge_conflict_rework_requested",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "base_ref": pr.get("baseRefName"),
+                    "head_sha": pr.get("headRefOid"),
+                    "reviewed_head_sha": decision.get("reviewed_head_sha"),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        result = transition(self.gh, self.config.labels, issue_number, "rework_requested")
+        if result.outcome == TransitionOutcome.APPLIED:
+            return None
+        return {
+            "edge": "rework_requested",
+            "outcome": result.outcome.value,
+            "add_failures": result.add_failures,
+            "remove_failures": result.remove_failures,
+        }
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
         """Return the PR number of the head of the merge-train queue, or None.
