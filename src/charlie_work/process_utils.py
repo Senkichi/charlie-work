@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+
+from .subprocess_runner import no_console_window_kwargs
 
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
@@ -142,6 +142,7 @@ def _enumerate_child_pids(pid: int) -> list[int]:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    **no_console_window_kwargs(),
                 )
                 # Parse output: extract PIDs (one per line)
                 for line in result.stdout.splitlines():
@@ -156,6 +157,7 @@ def _enumerate_child_pids(pid: int) -> list[int]:
                         capture_output=True,
                         text=True,
                         timeout=5,
+                        **no_console_window_kwargs(),
                     )
                     # Parse output: skip header line, extract PIDs
                     for line in result.stdout.splitlines():
@@ -380,6 +382,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True,
                 text=True,
+                **no_console_window_kwargs(),
             )
             # taskkill returns 0 for success, 1 for "process not found" (which is fine)
             if result.returncode in (0, 1):
@@ -453,6 +456,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
             capture_output=True,
             text=True,
             timeout=10,
+            **no_console_window_kwargs(),
         )
 
         # Parse output: extract PIDs (one per line)
@@ -465,45 +469,3 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
         pass
 
     return orphans
-
-
-def popen_worker(
-    args: Sequence[str],
-    *,
-    cwd: str | os.PathLike[str] | None = None,
-    env: Mapping[str, str] | None = None,
-    **popen_kwargs: Any,
-) -> subprocess.Popen:
-    """Launch a worker process with platform-specific detachment flags.
-
-    This is the single-point-of-enforcement for worker detachment policy:
-
-    - Windows: ``CREATE_NEW_PROCESS_GROUP``.  This gives the child its own
-      process group so a Ctrl+C sent to the orchestrator console does not
-      propagate into an in-flight worker.  It intentionally does *not* use
-      ``DETACHED_PROCESS`` or ``CREATE_BREAKAWAY_FROM_JOB``; those survival
-      semantics are out of scope for issue #360 (see issue thread decision
-      rejecting Policy A).
-    - POSIX: ``start_new_session=True`` makes the child a session leader so a
-      process-group kill does not reach it.
-
-    Callers pass the same arguments they would to ``subprocess.Popen``; the
-    function injects the detachment flags and returns the ``Popen`` object.
-    """
-    if cwd is not None:
-        popen_kwargs["cwd"] = cwd
-    if env is not None:
-        popen_kwargs["env"] = env
-
-    if sys.platform == "win32":
-        # Isolate the worker's process group so Ctrl+C to the orchestrator does
-        # not interrupt an in-flight session.  Do not detach from the console or
-        # break away from Job Objects; that survival policy was rejected for
-        # issue #360.
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        popen_kwargs["creationflags"] = creationflags
-        return subprocess.Popen(args, **popen_kwargs)
-
-    # POSIX: new session isolates the child from the orchestrator's process group.
-    popen_kwargs["start_new_session"] = True
-    return subprocess.Popen(args, **popen_kwargs)

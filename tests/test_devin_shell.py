@@ -2115,17 +2115,17 @@ def test_launch_devin_session_includes_start_new_session_on_posix(
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    # Detachment is now enforced by process_utils.popen_worker.
+    # Detachment is enforced by no_console_window_kwargs + CREATE_NEW_PROCESS_GROUP
+    # directly; Policy A survival flags (DETACHED_PROCESS, CREATE_BREAKAWAY_FROM_JOB)
+    # are out of scope for issue #360.
     if os.name != "nt":
         assert popen_kwargs.get("start_new_session") is True
         assert "creationflags" not in popen_kwargs
     else:
-        # On Windows, start_new_session is not used; the helper sets only
-        # CREATE_NEW_PROCESS_GROUP.  Policy A survival flags (DETACHED_PROCESS,
-        # CREATE_BREAKAWAY_FROM_JOB) are out of scope for issue #360.
         assert "start_new_session" not in popen_kwargs
         flags = popen_kwargs.get("creationflags", 0)
         assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+        assert flags & subprocess.CREATE_NO_WINDOW
         assert not (flags & subprocess.DETACHED_PROCESS)
         assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
 

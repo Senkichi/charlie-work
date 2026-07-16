@@ -29,12 +29,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime
 from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
@@ -63,6 +63,11 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
+
+# Windows-only flag: isolates the worker's process group so a Ctrl+C to the
+# orchestrator doesn't propagate into an in-flight `claude` session. Absent
+# on non-Windows platforms, where Popen simply ignores creationflags=0.
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -505,25 +510,29 @@ def launch_claude_worker(
                 if feed_stdin:
                     prompt_handle = prompt_path.open("r", encoding="utf-8")
                     try:
-                        process = popen_worker(
+                        process = subprocess.Popen(
                             command,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             env=worker_env,
+                            **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
+                            start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                             text=True,  # Ensure text mode for line-by-line processing
                         )
                     finally:
                         prompt_handle.close()
                 else:
-                    process = popen_worker(
+                    process = subprocess.Popen(
                         command,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
+                        **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
+                        start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                         text=True,  # Ensure text mode for line-by-line processing
                     )
             except OSError:
@@ -566,22 +575,26 @@ def launch_claude_worker(
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:
                 if feed_stdin:
                     with prompt_path.open("r", encoding="utf-8") as prompt_handle:
-                        process = popen_worker(
+                        process = subprocess.Popen(
                             command,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=log_handle,
                             stderr=subprocess.STDOUT,
                             env=worker_env,
+                            **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
+                            start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                         )
                 else:
-                    process = popen_worker(
+                    process = subprocess.Popen(
                         command,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
+                        **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
+                        start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
     except OSError as exc:
         remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)

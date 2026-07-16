@@ -5,7 +5,6 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -13,7 +12,6 @@ from charlie_work.process_utils import (
     is_pid_alive,
     is_session_stalled,
     kill_process_tree,
-    popen_worker,
     sweep_orphan_processes,
 )
 
@@ -385,56 +383,6 @@ def test_sweep_orphan_processes_windows_subprocess_error() -> None:
         mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
-def test_popen_worker_uses_start_new_session_on_posix(tmp_path: Path) -> None:
-    """`popen_worker` detaches POSIX workers into a new session."""
-    marker = tmp_path / "marker.txt"
-    script = tmp_path / "worker.py"
-    script.write_text(
-        "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('ok', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    proc = popen_worker(
-        [sys.executable, str(script), str(marker)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        proc.wait(timeout=10)
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
-    assert marker.read_text(encoding="utf-8") == "ok"
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
-def test_popen_worker_sets_process_group_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``popen_worker`` isolates the Windows worker in its own process group only."""
-    captured: dict[str, Any] = {}
-    original_popen = subprocess.Popen
-
-    def capture_popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
-        captured.update(kwargs)
-        return original_popen([sys.executable, "-c", "pass"], **kwargs)
-
-    monkeypatch.setattr(subprocess, "Popen", capture_popen)
-    proc = popen_worker(
-        [sys.executable, "-c", "pass"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    proc.wait(timeout=10)
-
-    flags = captured.get("creationflags", 0)
-    assert "start_new_session" not in captured
-    assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-    assert not (flags & subprocess.DETACHED_PROCESS)
-    assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
 
 
 def test_is_pid_alive_true_for_live_process(tmp_path: Path) -> None:

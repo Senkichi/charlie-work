@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .env_sanitize import sanitize_env
+from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,7 @@ def run_cross_family_review(
                 shell=isinstance(rendered, str),
                 check=False,
                 env=env,
+                **no_console_window_kwargs(),
             )
         except subprocess.TimeoutExpired as exc:
             partial = (

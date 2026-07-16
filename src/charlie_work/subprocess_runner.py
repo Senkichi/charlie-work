@@ -9,8 +9,40 @@ never an encoding crash.
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0)
+
+
+def no_console_window_kwargs(extra_creationflags: int = 0) -> dict[str, int]:
+    """Return the ``creationflags`` kwargs that suppress the transient console
+    window Windows allocates for a spawned child when the parent has no
+    console/window of its own (e.g. an orchestrator running headless or from
+    a service). This is the single point of enforcement for
+    ``CREATE_NO_WINDOW`` — every ``subprocess.run``/``Popen`` call site in
+    this codebase should route its creationflags through this helper rather
+    than hard-coding the flag itself.
+
+    ``extra_creationflags`` composes in whatever flags the call site already
+    needs (e.g. ``CREATE_NEW_PROCESS_GROUP`` so a launched worker can still be
+    killed by process group). ``CREATE_NO_WINDOW`` is never combined with
+    ``DETACHED_PROCESS`` — that combination is invalid/contradictory on
+    Windows, since ``DETACHED_PROCESS`` already fully detaches the child from
+    any console. Callers passing ``DETACHED_PROCESS`` get their flags back
+    unchanged.
+
+    On POSIX platforms (no ``creationflags`` concept), returns an empty dict
+    so callers can unconditionally do
+    ``subprocess.Popen(..., **no_console_window_kwargs(...))`` cross-platform.
+    """
+    if sys.platform != "win32" or not _CREATE_NO_WINDOW:
+        return {}
+    if extra_creationflags & _DETACHED_PROCESS:
+        return {"creationflags": extra_creationflags}
+    return {"creationflags": extra_creationflags | _CREATE_NO_WINDOW}
 
 
 @dataclass(frozen=True)
@@ -52,6 +84,7 @@ def run_captured(
             timeout=timeout_seconds,
             shell=shell,
             check=False,
+            **no_console_window_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         return RunResult(
