@@ -25,6 +25,19 @@ review:
   require_tests_or_rationale: true
   require_issue_link: true
 
+review_dispatch:
+  # Issue #370: launch Claude Code reviewers concurrently for queued PRs that
+  # have a current review packet and no verdict. The reviewer agent makes the
+  # approve/request_changes/blocked decision via `charlie verdict`.
+  enabled: false
+  # Directory for reviewer sidecar JSON + logs. MUST be distinct from
+  # devin.sessions_dir so worker concurrency accounting is not poisoned by
+  # reviewer processes.
+  reviews_dir: .var/charlie-work/dispatches/reviews
+  # Local-only process bound. 0 means unlimited; raise only if local CPU/disk
+  # from concurrent reviewer worktrees becomes a visible bottleneck.
+  max_local_review_processes: 0
+
 auto_merge:
   enabled: true
   strategy: squash

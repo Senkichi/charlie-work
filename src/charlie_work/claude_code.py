@@ -142,19 +142,33 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.claude.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
-    suffix = "-rework.claude.log" if rework else ".claude.log"
+def _log_path(
+    sessions_dir: Path, issue_number: int, *, rework: bool = False, review: bool = False
+) -> Path:
+    if review:
+        suffix = "-review.claude.log"
+    elif rework:
+        suffix = "-rework.claude.log"
+    else:
+        suffix = ".claude.log"
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
-def _events_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+def _events_path(
+    sessions_dir: Path, issue_number: int, *, rework: bool = False, review: bool = False
+) -> Path:
     """Path to the structured events.jsonl file for Claude Code stream-json output.
 
     This file is created only when tee_stream_json is enabled. It contains
     structured JSONL events from Claude Code's --output-format stream-json mode,
     enabling downstream parsing of tool_call_count, turn_count, tokens, and cost_usd.
     """
-    suffix = "-rework.events.jsonl" if rework else ".events.jsonl"
+    if review:
+        suffix = "-review.events.jsonl"
+    elif rework:
+        suffix = "-rework.events.jsonl"
+    else:
+        suffix = ".events.jsonl"
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
@@ -371,6 +385,7 @@ def launch_claude_worker(
     env: dict[str, str] | None = None,
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
+    review: bool = False,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     tee_stream_json: bool = False,
@@ -386,13 +401,17 @@ def launch_claude_worker(
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
 
+    If ``review`` is True, the worktree is also reused/attached to an existing
+    PR branch (like rework mode), but logs/sidecars get a distinct ``-review``
+    suffix so reviewer processes don't mix with worker processes.
+
     If ``recovery`` is provided (a dict with state file dispatch record), this is
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
     leftover worktree/branch and either clean it (no commits) or reuse it (has
     commits/dirty work).
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number, rework=rework)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
 
     try:
         worktree: WorktreeInfo = create_worktree(
@@ -401,7 +420,7 @@ def launch_claude_worker(
             worktrees_dir=worktrees_dir,
             venv_source=venv_source,
             materialize_dirs=materialize_dirs,
-            rework=rework,
+            rework=rework or review,
             recovery=recovery,
             base_ref=base_ref,
             issue_number=issue_number,
@@ -448,7 +467,7 @@ def launch_claude_worker(
     try:
         prompt_path.write_text(prompt_text, encoding="utf-8")
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework or review else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -465,7 +484,7 @@ def launch_claude_worker(
             command_template, prompt_path, issue_number=issue_number, branch=branch
         )
     except (KeyError, IndexError, ValueError) as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework or review else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -482,7 +501,7 @@ def launch_claude_worker(
     events_path = None
     if tee_stream_json:
         command = command + ("--output-format", "stream-json")
-        events_path = _events_path(sessions_dir, issue_number, rework=rework)
+        events_path = _events_path(sessions_dir, issue_number, rework=rework, review=review)
 
     feed_stdin = "{prompt_path}" not in "".join(command_template)
     # Workers inherit the orchestrator's environment, with config-provided
@@ -598,7 +617,7 @@ def launch_claude_worker(
                         start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework or review else branch)
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
