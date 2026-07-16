@@ -4419,7 +4419,9 @@ def test_review_queue_is_read_only(tmp_path: Path) -> None:
     assert (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8") == prompt
 
 
-def _dispatch_reviews_app(tmp_path: Path, *, prs: list[dict[str, Any]] | None = None) -> OrchestratorApp:
+def _dispatch_reviews_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
     """Build an OrchestratorApp with review_dispatch enabled and an empty state file."""
     config = OrchestratorConfig(
         review_dispatch=ReviewDispatchConfig(enabled=True),
@@ -4652,9 +4654,7 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
         "error": None,
         "process_start_time": 1.0,
     }
-    (reviews_dir / "issue-100.claude.json").write_text(
-        json.dumps(sidecar), encoding="utf-8"
-    )
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["100"] = {
@@ -4728,7 +4728,9 @@ def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _write_review_packet(tmp_path, 456, "sha-456")
 
-    def fake_launch(issue_number: int, branch: str, prompt_text: str, **kwargs: Any) -> ClaudeWorkerRecord:
+    def fake_launch(
+        issue_number: int, branch: str, prompt_text: str, **kwargs: Any
+    ) -> ClaudeWorkerRecord:
         # Simulate the reviewer agent writing an approved verdict.
         pr_dir = app.paths.prs / f"pr-{issue_number}"
         decision = {

@@ -795,9 +795,7 @@ def _detect_and_handle_stalled_reviews(
             },
         )
         changed = True
-        stalled.append(
-            {"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at}
-        )
+        stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
 
     # Catch state entries that have no sidecar (launch crashed before sidecar
     # write, or sidecar was deleted) and are past the stale timeout.
@@ -836,9 +834,7 @@ def _detect_and_handle_stalled_reviews(
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
             process_start_time = pr_state.get("reviewer_process_start_time")
-            pid_alive = reviewer_pid is not None and is_pid_alive(
-                reviewer_pid, process_start_time
-            )
+            pid_alive = reviewer_pid is not None and is_pid_alive(reviewer_pid, process_start_time)
             if pid_alive:
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
@@ -3362,9 +3358,7 @@ class OrchestratorApp:
         # Run the orphan/stalled sweep before selection so dead reviewers free
         # their claim/slot. In dry-run mode we skip the sweep to stay read-only.
         if not self.dry_run:
-            _detect_and_handle_stalled_reviews(
-                reviews_dir, self.paths.state_file, self.config
-            )
+            _detect_and_handle_stalled_reviews(reviews_dir, self.paths.state_file, self.config)
 
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
@@ -3383,11 +3377,7 @@ class OrchestratorApp:
         # Filter out PRs that are already claimed or still have a live reviewer.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            dispatchable = [
-                c
-                for c in candidates
-                if _is_review_dispatchable(state, c["pr"], c)
-            ]
+            dispatchable = [c for c in candidates if _is_review_dispatchable(state, c["pr"], c)]
 
         # Apply the local-only cap. max_local_review_processes == 0 means
         # unlimited, mirroring the unlimited-by-default intent of the stage.
@@ -3465,16 +3455,12 @@ class OrchestratorApp:
 
                 pr = self.gh.pr_view(pr_number)
                 if not pr:
-                    failed.append(
-                        {"pr": pr_number, "error": f"PR #{pr_number} not found"}
-                    )
+                    failed.append({"pr": pr_number, "error": f"PR #{pr_number} not found"})
                     continue
 
                 branch = str(pr.get("headRefName", ""))
                 if not branch:
-                    failed.append(
-                        {"pr": pr_number, "error": "PR headRefName missing"}
-                    )
+                    failed.append({"pr": pr_number, "error": "PR headRefName missing"})
                     continue
 
                 # Cross-repo PRs are never linked for lifecycle purposes by
@@ -3541,12 +3527,8 @@ class OrchestratorApp:
             for candidate in selected:
                 pr_number = candidate["pr"]
                 issue_number = candidate["issue"]
-                launch_info = next(
-                    (x for x in launched if x["pr"] == pr_number), None
-                )
-                fail_info = next(
-                    (x for x in failed if x["pr"] == pr_number), None
-                )
+                launch_info = next((x for x in launched if x["pr"] == pr_number), None)
+                fail_info = next((x for x in failed if x["pr"] == pr_number), None)
                 pr_state = state["prs"].get(str(pr_number), {})
                 if launch_info:
                     state["prs"][str(pr_number)] = {
@@ -3558,9 +3540,7 @@ class OrchestratorApp:
                         "review_dispatch_pending_at": None,
                         "review_dispatch_failed_at": None,
                         "reviewer_pid": launch_info["pid"],
-                        "reviewer_process_start_time": launch_info[
-                            "process_start_time"
-                        ],
+                        "reviewer_process_start_time": launch_info["process_start_time"],
                     }
                 else:
                     failed_state = {
@@ -5327,11 +5307,7 @@ class OrchestratorApp:
                 emit_digest(self.config.notify, digest)
 
         ok = (
-            intake.ok
-            and dispatch.ok
-            and dispatch_rework.ok
-            and dispatch_reviews.ok
-            and not errors
+            intake.ok and dispatch.ok and dispatch_rework.ok and dispatch_reviews.ok and not errors
         )
         message = "loop complete"
         if errors:

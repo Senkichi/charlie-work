@@ -836,9 +836,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
             f"got {rd_max_local}"
         )
-    review_dispatch = _build_section(
-        ReviewDispatchConfig, "review_dispatch", review_dispatch_data
-    )
+    review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
