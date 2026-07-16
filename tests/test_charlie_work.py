@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -61,6 +62,7 @@ from charlie_work.state import (
     set_throttled_until,
     state_lock,
 )
+import charlie_work.state as state_module
 from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
@@ -20960,3 +20962,139 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
     assert any(r.data.get("fleet_live_session_count") is not None for r in results), (
         "fleet live count should be reported in dispatch results"
     )
+
+
+@contextlib.contextmanager
+def _hold_state_lock(lock_path: Path) -> Any:
+    """Hold a real, competing byte-range/exclusive lock on the state lock file.
+
+    This is used to force ``state_lock`` to time out without involving another
+    process, while still exercising the real platform locking primitive.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if not lock_path.exists():
+        lock_path.write_bytes(b"\x00")
+    handle = lock_path.open("r+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("status", ()),
+        ("intake", ()),
+        ("dispatch", ()),
+        ("dispatch_rework", ()),
+        ("review", (456,)),
+        ("merge_ready", (456,)),
+    ],
+)
+def test_state_lock_guard_returns_skip_when_lock_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    args: tuple[Any, ...],
+) -> None:
+    """Issue #398: if the state lock is held, public state-writing methods
+    return a clean skip CommandResult and leave state.json untouched.
+    """
+    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    state_path = paths.state_file
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+    initial_mtime = state_path.stat().st_mtime
+    initial_content = state_path.read_text(encoding="utf-8")
+
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with _hold_state_lock(lock_path):
+        result = getattr(app, method_name)(*args)
+
+    assert result.ok is True
+    reason = result.data.get("reason") or result.data.get("deferred_reason")
+    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
+    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert state_path.stat().st_mtime == initial_mtime
+    assert state_path.read_text(encoding="utf-8") == initial_content
+
+
+def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #398: spec_review is also guarded by the state-lock skip pattern."""
+    from charlie_work.cross_family import CrossFamilyResult
+
+    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    spec_path = tmp_path / "spec.md"
+    spec_path.write_text("# spec\n", encoding="utf-8")
+
+    state_path = paths.state_file
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+    initial_mtime = state_path.stat().st_mtime
+    initial_content = state_path.read_text(encoding="utf-8")
+
+    def fake_run_cross_family_review(*args: object, **kwargs: object) -> CrossFamilyResult:
+        return CrossFamilyResult(ok=True, report_path=str(tmp_path / "report.md"), model="test")
+
+    monkeypatch.setattr(
+        "charlie_work.cross_family.run_cross_family_review",
+        fake_run_cross_family_review,
+    )
+
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with _hold_state_lock(lock_path):
+        result = app.spec_review(spec_path)
+
+    assert result.ok is True
+    reason = result.data.get("reason") or result.data.get("deferred_reason")
+    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
+    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert state_path.stat().st_mtime == initial_mtime
+    assert state_path.read_text(encoding="utf-8") == initial_content

@@ -4430,6 +4430,7 @@ class OrchestratorApp:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(not checks_unavailable, message, data)
 
+    @_guard_state_lock
     def spec_review(self, artifact_path: Path) -> CommandResult:
         """Run an explicit cross-family adversarial pass over a spec/plan file.
 

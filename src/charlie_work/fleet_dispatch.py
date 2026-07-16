@@ -306,27 +306,42 @@ def _extract_attention_events(
         )
 
     # Extract lock/deferral skips (state_lock_busy, supervisor_lock_held,
-    # graphql_rate_limit) surfaced by OrchestratorApp public methods.
-    skip_reason = data.get("reason") or data.get("deferred_reason")
-    if (
-        data.get("skipped")
-        or data.get("state_lock_busy")
-        or skip_reason
-        in (
-            "state_lock_busy",
-            "supervisor_lock_held",
-            "graphql_rate_limit",
-        )
-    ):
+    # graphql_rate_limit) surfaced by OrchestratorApp public methods. loop()
+    # nests the per-stage CommandResult data under "intake"/"dispatch"/
+    # "dispatch_rework"/"dispatch_reviews", so we collect skip reasons from
+    # the top-level result as well as those nested sub-results.
+    skip_reasons = _collect_skip_reasons(data)
+    for reason in sorted(skip_reasons):
         events.append(
             {
                 "repo_key": repo_key,
                 "type": "skipped",
-                "reason": skip_reason or "state_lock_busy",
+                "reason": reason,
             }
         )
 
     return events
+
+
+_SKIP_REASONS = frozenset({"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"})
+
+
+def _collect_skip_reasons(data: Any) -> set[str]:
+    """Collect all lock/deferral skip reasons from a result and its nested sub-results."""
+    reasons: set[str] = set()
+    _add_skip_reasons(data, reasons)
+    for sub_key in ("intake", "dispatch", "dispatch_rework", "dispatch_reviews"):
+        sub_data = data.get(sub_key) if isinstance(data, dict) else None
+        if isinstance(sub_data, dict):
+            _add_skip_reasons(sub_data, reasons)
+    return reasons
+
+
+def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
+    """Add any skip reason present in a flat result dict to the set."""
+    skip_reason = data.get("reason") or data.get("deferred_reason")
+    if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
+        reasons.add(skip_reason or "state_lock_busy")
 
 
 def _build_fleet_attention_digest(
