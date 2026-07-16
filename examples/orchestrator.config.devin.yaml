@@ -48,6 +48,11 @@ runtime:
   # Optional repo-local template dir; files here override the package
   # templates by filename (e.g. drop in your own worker.md).
   # prompts_dir: orchestrator-prompts
+  # Bounded retry for transient GitHub API failures (TLS blips, connection
+  # drops, gateway 5xx, secondary rate limits). Mutating commands are only
+  # retried on provable pre-connection errors to preserve at-most-once semantics.
+  # gh_max_retries: 3
+  # gh_retry_base_seconds: 1.0
 
 devin:
   # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,

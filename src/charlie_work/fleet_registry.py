@@ -6,7 +6,7 @@ import os
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import fleet_dir
@@ -14,6 +14,9 @@ from .github import GitHub, GitHubError
 from .paths import RuntimePaths
 from .state import save_state, state_lock
 from .worker import iter_workers
+
+if TYPE_CHECKING:
+    from .config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +239,7 @@ def try_acquire_fleet_lock(fleet_dir_override: str | None) -> FleetLock | None:
 
 def count_fleet_runners(
     fleet_dir_override: str | None,
+    runtime: RuntimeConfig | None = None,
 ) -> tuple[int, int, list[str]]:
     """Count fleet-wide runners across all registered repos.
 
@@ -284,7 +288,7 @@ def count_fleet_runners(
 
         # Create a GitHub client for this repo
         try:
-            repo_gh = GitHub(repo_root=repo_root)
+            repo_gh = GitHub(repo_root=repo_root, runtime=runtime)
         except GitHubError:
             logger.warning(
                 f"Skipping fleet runner-count for {name_with_owner}: failed to create GitHub client"
