@@ -506,8 +506,19 @@ def fleet_loop(
 
                 # Call the appropriate per-repo method
                 if work_only:
-                    # Dispatch-only path (no review/merge)
+                    # Dispatch-only path (worker dispatch + optional review dispatch)
                     result = app.dispatch(limit)
+                    if config.review_dispatch.enabled:
+                        review_dispatch_result = app.dispatch_reviews(limit)
+                        ok = result.ok and review_dispatch_result.ok
+                        message = (
+                            "work-only dispatch: "
+                            f"workers={result.data.get('selected_count', 0)}, "
+                            f"reviews={review_dispatch_result.data.get('selected_count', 0)}"
+                        )
+                        combined_data = dict(result.data)
+                        combined_data["dispatch_reviews"] = review_dispatch_result.data
+                        result = CommandResult(ok, message, combined_data)
                 else:
                     # Full loop (intake -> dispatch -> review -> merge)
                     result = app.loop(limit, merge=merge)

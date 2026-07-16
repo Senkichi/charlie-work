@@ -41,7 +41,9 @@ from .worktree import (
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeUnsafeError,
+    create_review_checkout,
     create_worktree,
+    remove_review_checkout,
     remove_worktree,
 )
 
@@ -71,6 +73,14 @@ _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _WIN_STILL_ACTIVE = 259
+
+# Default command templates. Workers get write access (acceptEdits) since
+# they are expected to commit/push changes. Reviewers get a read-only plan
+# mode by default — a reviewer's judgment stays in its verdict, never in a
+# commit to the PR's real branch (see create_review_checkout's isolation
+# guarantee, which this pairs with: no branch checkout AND no write mode).
+_WORKER_COMMAND_TEMPLATE: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits")
+_REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = ("claude", "-p", "--permission-mode", "plan")
 
 
 @dataclass(frozen=True)
@@ -142,19 +152,33 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
     return sessions_dir / f"issue-{issue_number}.claude.json"
 
 
-def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
-    suffix = "-rework.claude.log" if rework else ".claude.log"
+def _log_path(
+    sessions_dir: Path, issue_number: int, *, rework: bool = False, review: bool = False
+) -> Path:
+    if review:
+        suffix = "-review.claude.log"
+    elif rework:
+        suffix = "-rework.claude.log"
+    else:
+        suffix = ".claude.log"
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
-def _events_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) -> Path:
+def _events_path(
+    sessions_dir: Path, issue_number: int, *, rework: bool = False, review: bool = False
+) -> Path:
     """Path to the structured events.jsonl file for Claude Code stream-json output.
 
     This file is created only when tee_stream_json is enabled. It contains
     structured JSONL events from Claude Code's --output-format stream-json mode,
     enabling downstream parsing of tool_call_count, turn_count, tokens, and cost_usd.
     """
-    suffix = "-rework.events.jsonl" if rework else ".events.jsonl"
+    if review:
+        suffix = "-review.events.jsonl"
+    elif rework:
+        suffix = "-rework.events.jsonl"
+    else:
+        suffix = ".events.jsonl"
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
@@ -341,6 +365,54 @@ def _error_record(
     )
 
 
+def _sanitize_review_command_template(
+    command_template: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Hard-pin the read-only reviewer posture onto ``command_template``.
+
+    A review launch must always carry ``--permission-mode plan`` — this is
+    an invariant, not a default a caller-supplied (or config-forwarded)
+    ``command_template`` can defeat. ``ClaudeCodeConfig.command`` is a single
+    field shared with worker dispatch (workers want ``acceptEdits``); if an
+    operator's worker-tuning override were honored verbatim for reviewers
+    too, it would silently grant write access to reviewer sessions,
+    defeating ``create_review_checkout``'s paired guarantee (no branch
+    checkout AND no write mode). See PR #397 round-2 review.
+
+    Every occurrence of ``--permission-mode`` is stripped from the template
+    first — the bare flag plus its following value token (if any), and any
+    token of the form ``--permission-mode=<value>`` — and a single
+    authoritative ``--permission-mode plan`` is then appended as the final
+    tokens. Removing every occurrence before appending the forced value
+    (rather than patching the first match in place) is the invariant: CLI
+    argument parsers generally apply last-flag-wins semantics, so a template
+    with duplicate ``--permission-mode`` flags (e.g. a caller-supplied
+    override appended after a legitimate one) would otherwise let a later,
+    unsanitized occurrence silently win at runtime even though the first
+    occurrence was "fixed". See PR #397 round-3 review. This only touches
+    the permission-mode flag — it does not discard the rest of the
+    template — so a caller with a legitimate reason to vary the executable
+    or other flags (e.g. a test double standing in for the ``claude``
+    binary) is not blocked, only write access is. A ``None`` template
+    resolves to the standard read-only default.
+    """
+    if command_template is None:
+        return _REVIEW_COMMAND_TEMPLATE
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--permission-mode":
+            skip_next = True
+            continue
+        if token.startswith("--permission-mode="):
+            continue
+        filtered.append(token)
+    return tuple(filtered) + ("--permission-mode", "plan")
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -367,16 +439,19 @@ def launch_claude_worker(
     sessions_dir: Path,
     worktrees_dir: Path | None = None,
     venv_source: Path | None = None,
-    command_template: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits"),
+    command_template: tuple[str, ...] | None = None,
     env: dict[str, str] | None = None,
     materialize_dirs: tuple[str, ...] = (),
     rework: bool = False,
+    review: bool = False,
+    head_sha: str | None = None,
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     tee_stream_json: bool = False,
     config: OrchestratorConfig | None = None,
 ) -> ClaudeWorkerRecord:
-    """Create an isolated worktree and launch a headless Claude Code worker in it.
+    """Create an isolated worktree/checkout and launch a headless Claude Code
+    worker (or reviewer) in it.
 
     Never raises: worktree-creation failures and process-launch (``OSError``)
     failures both come back as an error record. If the worktree was created
@@ -386,27 +461,68 @@ def launch_claude_worker(
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
 
+    If ``review`` is True, this launches a reviewer session in its OWN
+    isolated, detached-HEAD checkout (``worktree.create_review_checkout``),
+    keyed by PR number under ``sessions_dir`` — never the worker's branch-slug
+    worktree under ``worktrees_dir``. ``head_sha`` is required in this mode
+    (the PR's live head SHA the reviewer must check out); a missing value
+    raises ``ValueError``, which — like every other failure in this
+    function — comes back as an error record rather than propagating.
+    In review mode, ``command_template`` always ends up carrying
+    ``--permission-mode plan`` (read-only) — see
+    ``_sanitize_review_command_template``. This is a hard-pinned invariant,
+    not a default: any ``--permission-mode`` value the caller supplies
+    (including one forwarded from ``ClaudeCodeConfig.command``, a field
+    shared with worker dispatch) is overridden to ``"plan"`` before launch,
+    so no config combination can grant a reviewer write access. This closes
+    the gap where an operator customizing worker behavior (e.g. uncommenting
+    the example config's ``acceptEdits`` override) would otherwise silently
+    grant write access to reviewer sessions too, defeating
+    ``create_review_checkout``'s paired guarantee (no branch checkout AND
+    no write mode). See PR #397 round-2 review. Logs/sidecars get a distinct
+    ``-review`` suffix so reviewer processes don't mix with worker processes.
+
     If ``recovery`` is provided (a dict with state file dispatch record), this is
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
     leftover worktree/branch and either clean it (no commits) or reuse it (has
-    commits/dirty work).
+    commits/dirty work). Not applicable to ``review`` mode.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(sessions_dir, issue_number, rework=rework)
+    log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
+    if review:
+        # Hard-pinned, not a default: see _sanitize_review_command_template
+        # and PR #397 round-2 review. No caller-supplied command_template
+        # (including one forwarded from ClaudeCodeConfig.command) can result
+        # in a reviewer session running with write access.
+        command_template = _sanitize_review_command_template(command_template)
+    elif command_template is None:
+        command_template = _WORKER_COMMAND_TEMPLATE
 
     try:
-        worktree: WorktreeInfo = create_worktree(
-            repo_root,
-            branch,
-            worktrees_dir=worktrees_dir,
-            venv_source=venv_source,
-            materialize_dirs=materialize_dirs,
-            rework=rework,
-            recovery=recovery,
-            base_ref=base_ref,
-            issue_number=issue_number,
-            config=config,
-        )
+        if review:
+            if not head_sha:
+                raise ValueError(
+                    f"launch_claude_worker(review=True) requires head_sha for PR #{issue_number}"
+                )
+            worktree: WorktreeInfo = create_review_checkout(
+                repo_root,
+                issue_number,
+                head_sha,
+                reviews_dir=sessions_dir,
+            )
+        else:
+            worktree = create_worktree(
+                repo_root,
+                branch,
+                worktrees_dir=worktrees_dir,
+                venv_source=venv_source,
+                materialize_dirs=materialize_dirs,
+                rework=rework,
+                recovery=recovery,
+                base_ref=base_ref,
+                issue_number=issue_number,
+                config=config,
+            )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         if isinstance(exc, WorktreeProbeFailedError):
             # Transient probe contention (e.g. index lock), not a confirmed-dirty
@@ -444,11 +560,22 @@ def launch_claude_worker(
     if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
         merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
 
+    def _teardown_on_launch_failure() -> None:
+        # Review checkouts live in their own PR-keyed dir, never worktrees_dir,
+        # so they must be torn down via remove_review_checkout — passing them
+        # to remove_worktree would look for the wrong registered worktree path.
+        if review:
+            remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+        else:
+            remove_worktree(
+                repo_root, worktree.path, force=True, branch=None if rework else branch
+            )
+
     prompt_path = worktree.path / PROMPT_FILENAME
     try:
         prompt_path.write_text(prompt_text, encoding="utf-8")
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        _teardown_on_launch_failure()
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -465,7 +592,7 @@ def launch_claude_worker(
             command_template, prompt_path, issue_number=issue_number, branch=branch
         )
     except (KeyError, IndexError, ValueError) as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        _teardown_on_launch_failure()
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
@@ -482,7 +609,7 @@ def launch_claude_worker(
     events_path = None
     if tee_stream_json:
         command = command + ("--output-format", "stream-json")
-        events_path = _events_path(sessions_dir, issue_number, rework=rework)
+        events_path = _events_path(sessions_dir, issue_number, rework=rework, review=review)
 
     feed_stdin = "{prompt_path}" not in "".join(command_template)
     # Workers inherit the orchestrator's environment, with config-provided
@@ -598,7 +725,7 @@ def launch_claude_worker(
                         start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        _teardown_on_launch_failure()
         record = _error_record(
             issue_number=issue_number,
             branch=branch,

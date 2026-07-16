@@ -21,6 +21,7 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     update_worker_record_with_failure_classification,
+    _sanitize_review_command_template,
     _sidecar_path,
 )
 from charlie_work.env_sanitize import sanitize_env
@@ -2448,3 +2449,339 @@ def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
     assert all(handle.closed for handle in opened_handles), (
         "log_handle/events_handle must be closed when Popen fails, not leaked"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review-dispatch isolation (issue #370/#397): launch_claude_worker(review=True)
+# must route through create_review_checkout (a PR-keyed, detached-HEAD
+# checkout), never create_worktree (the worker's branch-slug worktree). These
+# tests exercise the REAL worktree.create_review_checkout/create_worktree
+# code, not a monkeypatched stand-in, so a regression that re-routes review
+# through the shared worker worktree would fail them.
+# ---------------------------------------------------------------------------
+
+
+def _init_real_repo(repo_root: Path) -> None:
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"], cwd=repo_root, check=True, capture_output=True
+    )
+
+
+def _repo_head_sha(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_launch_claude_worker_review_uses_isolated_checkout_not_worker_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A review=True launch must never call create_worktree — only
+    create_review_checkout — and must land in a directory distinct from a
+    live worker's worktree for the very same branch.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    branch = "agent/issue-500-fix"
+    head_sha = _repo_head_sha(repo_root)
+
+    # Simulate a live worker worktree for this branch, using the real
+    # (non-monkeypatched) create_worktree, sitting under a separate dir.
+    from charlie_work.worktree import create_worktree
+
+    worker_info = create_worktree(
+        repo_root, branch, base_ref="HEAD", worktrees_dir=tmp_path / "worktrees"
+    )
+    worker_marker = worker_info.path / "worker-in-progress.txt"
+    worker_marker.write_text("do not touch\n", encoding="utf-8")
+
+    def _forbid_create_worktree(*_args, **_kwargs):
+        raise AssertionError(
+            "review=True must never call create_worktree — it must use "
+            "create_review_checkout instead"
+        )
+
+    monkeypatch.setattr(claude_code, "create_worktree", _forbid_create_worktree)
+
+    record = launch_claude_worker(
+        500,
+        branch,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert record.ok, record.error
+    review_path = Path(record.worktree_path)
+    assert review_path != worker_info.path
+    assert review_path.parent == sessions_dir
+
+    # The worker's worktree is completely untouched by the review launch.
+    assert worker_info.path.exists()
+    assert worker_marker.exists()
+    assert worker_marker.read_text(encoding="utf-8") == "do not touch\n"
+
+
+def test_launch_claude_worker_review_defaults_to_read_only_permission_mode(
+    tmp_path: Path,
+) -> None:
+    """Reviewer sessions default to --permission-mode plan (read-only), not
+    the worker default of acceptEdits."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        501,
+        "agent/issue-501-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "plan"
+    assert "acceptEdits" not in record.command
+
+
+def test_launch_claude_worker_review_ignores_caller_command_template_override(
+    tmp_path: Path,
+) -> None:
+    """Round-2 review (PR #397): a reviewer's read-only posture must not be
+    defeatable by an operator's worker-tuning `claude_code.command` override.
+
+    workflow.dispatch_reviews forwards `command_template` from
+    ClaudeCodeConfig.command only when non-empty (see workflow.py); this test
+    simulates the exact defeat scenario the round-2 verdict describes — an
+    operator who has uncommented the example config's acceptEdits override
+    for worker-tuning reasons — by passing a non-empty, acceptEdits-bearing
+    command_template straight into launch_claude_worker(review=True, ...).
+    The reviewer must still launch with plan mode: the adapter hard-pins the
+    review command template and ignores any caller-supplied override.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    operator_worker_override = ("claude", "-p", "--permission-mode", "acceptEdits")
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        command_template=operator_worker_override,
+    )
+
+    # Matches the sibling default-permission-mode test's convention: assert
+    # on the rendered argv, not on launch success (the `claude` binary need
+    # not be spawnable in every test environment — the command is rendered
+    # and recorded before the process-launch step either way).
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "plan"
+    assert "acceptEdits" not in record.command
+
+
+def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
+    """Round-3 review (PR #397): a template with duplicate space-form
+    `--permission-mode` flags must not let the trailing occurrence survive —
+    CLI parsers apply last-flag-wins semantics, so a naive first-match fix
+    would still launch in acceptEdits mode."""
+    template = (
+        "claude",
+        "-p",
+        "--permission-mode",
+        "plan",
+        "--permission-mode",
+        "acceptEdits",
+    )
+
+    result = _sanitize_review_command_template(template)
+
+    assert result.count("--permission-mode") == 1
+    idx = result.index("--permission-mode")
+    assert result[idx + 1] == "plan"
+    assert idx == len(result) - 2  # positioned last
+
+
+def test_sanitize_review_command_template_strips_equals_joined_flag() -> None:
+    """An equals-joined `--permission-mode=acceptEdits` token must be removed
+    entirely, not merely left in place because the append-based happy path
+    currently makes it look safe by accident."""
+    template = ("claude", "-p", "--permission-mode=acceptEdits")
+
+    result = _sanitize_review_command_template(template)
+
+    assert not any(tok.startswith("--permission-mode=") for tok in result)
+    assert result[-2:] == ("--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_strips_mixed_forms() -> None:
+    """Mixed equals-joined and space-form occurrences are all stripped,
+    leaving a single trailing `--permission-mode plan`."""
+    template = (
+        "claude",
+        "-p",
+        "--permission-mode=acceptEdits",
+        "--permission-mode",
+        "acceptEdits",
+    )
+
+    result = _sanitize_review_command_template(template)
+
+    assert result.count("--permission-mode") == 1
+    assert not any(tok.startswith("--permission-mode=") for tok in result)
+    assert result[-2:] == ("--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_handles_bare_trailing_flag() -> None:
+    """A malformed trailing `--permission-mode` with no value token must not
+    raise (e.g. IndexError) — it is stripped like any other occurrence and
+    the authoritative flag is appended."""
+    template = ("claude", "-p", "--permission-mode")
+
+    result = _sanitize_review_command_template(template)
+
+    assert result == ("claude", "-p", "--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_preserves_lookalike_token() -> None:
+    """A token like `--permission-modex` must not be matched as the flag —
+    only an exact `--permission-mode` token or exact `--permission-mode=`
+    prefix count."""
+    template = ("claude", "-p", "--permission-modex", "plan")
+
+    result = _sanitize_review_command_template(template)
+
+    assert "--permission-modex" in result
+    assert result == ("claude", "-p", "--permission-modex", "plan", "--permission-mode", "plan")
+
+
+def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
+    tmp_path: Path,
+) -> None:
+    """Non-review (worker) launches keep the pre-existing acceptEdits default."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "sessions"
+
+    record = launch_claude_worker(
+        502,
+        "agent/issue-502-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+    )
+
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "acceptEdits"
+
+
+def test_launch_claude_worker_review_missing_head_sha_returns_error_record(
+    tmp_path: Path,
+) -> None:
+    """review=True without head_sha is a caller error (ValueError), surfaced
+    as an error record — launch_claude_worker must never raise."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+
+    record = launch_claude_worker(
+        503,
+        "agent/issue-503-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=None,
+    )
+
+    assert not record.ok
+    assert record.pid is None
+    assert "head_sha" in record.error
+
+
+def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If writing the prompt file fails in review mode, the isolated review
+    checkout — not a worker worktree — is torn down (via
+    remove_review_checkout, keyed by PR number, not remove_worktree)."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    original_write_text = Path.write_text
+
+    def failing_write_text(self, content, encoding=None, errors=None):
+        if self.name == ".orchestrator-prompt.md":
+            raise OSError("Mock prompt write failure")
+        return original_write_text(self, content, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert not record.ok
+    assert "failed to write prompt file" in record.error
+
+    checkout_path = sessions_dir / "pr-504"
+    assert not checkout_path.exists()
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert str(checkout_path) not in result.stdout
