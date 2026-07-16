@@ -660,6 +660,124 @@ def _get_unpushed_commit_info(
         return None
 
 
+def detect_cross_pr_revert(
+    pr: dict[str, Any],
+    repo_root: Path | None,
+    allow_marker: str = "allow-revert",
+) -> str | None:
+    """Return a blocking reason if the PR branch would silently revert a base commit.
+
+    Enumerates non-merge commits on the PR branch that are not reachable from
+    the base. A commit whose subject is ``Revert "<original>"`` and whose
+    inner ``<original>`` subject matches a commit reachable from the base
+    indicates that squashing the branch would undo a change already on the base
+    (the cross-PR revert incident, issue #390). An explicit ``allow-revert``
+    marker in the PR body suppresses the block so legitimate intentional
+    reverts can be merged.
+
+    Returns ``None`` when no revert is detected, the marker is present, or the
+    local git history required to decide is unavailable.
+    """
+    if not repo_root:
+        return None
+
+    repo_root_path = Path(repo_root)
+    if not repo_root_path.is_dir() or not (repo_root_path / ".git").exists():
+        return None
+
+    body = str(pr.get("body") or "")
+    marker_re = re.compile(rf"\b{re.escape(allow_marker)}\b", re.IGNORECASE)
+    if marker_re.search(body):
+        return None
+
+    head_ref = pr.get("headRefName")
+    base_ref = pr.get("baseRefName")
+    if not head_ref or not base_ref:
+        return None
+
+    try:
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", str(head_ref), str(base_ref)],
+            cwd=repo_root_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            return None
+
+        commits = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--no-merges",
+                f"origin/{head_ref}",
+                f"^origin/{base_ref}",
+            ],
+            cwd=repo_root_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commits.returncode != 0:
+            return None
+
+        for sha in commits.stdout.strip().splitlines():
+            if not sha:
+                continue
+            subject_proc = subprocess.run(
+                ["git", "log", "-1", "--format=%s", sha],
+                cwd=repo_root_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if subject_proc.returncode != 0:
+                continue
+            subject = subject_proc.stdout.strip()
+            if subject.startswith('Revert "') and subject.endswith('"'):
+                original = subject[len('Revert "') : -1]
+                match_proc = subprocess.run(
+                    [
+                        "git",
+                        "log",
+                        f"origin/{base_ref}",
+                        "--format=%H",
+                        "--fixed-strings",
+                        "--grep",
+                        original,
+                    ],
+                    cwd=repo_root_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if match_proc.returncode != 0:
+                    continue
+                for base_sha in match_proc.stdout.strip().splitlines():
+                    if not base_sha:
+                        continue
+                    base_subject_proc = subprocess.run(
+                        ["git", "log", "-1", "--format=%s", base_sha],
+                        cwd=repo_root_path,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if base_subject_proc.returncode != 0:
+                        continue
+                    if base_subject_proc.stdout.strip() == original:
+                        return (
+                            f"PR branch contains revert commit {sha[:12]} ({subject}) which "
+                            f"would silently undo base commit {base_sha[:12]}; add an explicit "
+                            f"'{allow_marker}' marker to the PR body to proceed"
+                        )
+    except (OSError, ValueError):
+        return None
+
+    return None
+
+
 def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
     """Split a unified diff into per-file hunk bodies.
 

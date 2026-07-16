@@ -12069,6 +12069,227 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "dispatched"
 
 
+def _init_cross_pr_revert_repo(repo_root: Path) -> tuple[str, str, str]:
+    """Set up a git repo where main has C and an agent branch merges C then reverts C.
+
+    Returns ``(base_sha, feature_sha, agent_sha)`` where ``feature_sha`` is the
+    commit on main that the agent branch silently reverts.
+    """
+    remote = repo_root / "remote"
+    remote.mkdir()
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main"],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Base commit (before the feature that will be reverted)
+    (repo_root / "base.txt").write_text("base", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    # Feature commit C on main
+    (repo_root / "feature.txt").write_text("feature", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.txt"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "feature C"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    feature_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Agent branch merges the feature commit and then reverts it
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-revert", base_sha],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "main", "-m", "Merge main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "revert", "--no-edit", feature_sha],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    agent_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-revert"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    # Leave main checked out in the orchestrator repo
+    subprocess.run(
+        ["git", "checkout", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+
+    return base_sha, feature_sha, agent_sha
+
+
+def test_merge_ready_silent_cross_pr_revert_blocks_and_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #390: a branch that merges a base commit and reverts it must not merge."""
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: revert cross-pr",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-revert",
+            "baseRefName": "main",
+            "headRefOid": agent_sha,
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["cross_pr_revert_detected"] is True
+    assert result.data["cross_pr_revert_routed"] is True
+    assert result.data["merge_conflict"] is False
+    assert "feature C" in result.data.get("cross_pr_revert_reason", "")
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert any(e["kind"] == "cross_pr_revert_rework_requested" for e in state["events"])
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+
+def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
+    tmp_path: Path,
+) -> None:
+    """Issue #390: an explicit allow-revert marker in the PR body suppresses the block."""
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: intentional revert",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-revert",
+            "baseRefName": "main",
+            "headRefOid": agent_sha,
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nallow-revert: intentional revert of feature C",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is True
+    assert result.data["cross_pr_revert_detected"] is False
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+
 def test_merge_ready_stale_base_not_routed_to_rework(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
