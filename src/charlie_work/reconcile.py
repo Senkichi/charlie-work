@@ -337,11 +337,7 @@ def detect_drift(
                     # Issue #252: inspect the worktree before deciding how to classify.
                     # This is the single enforcement point shared with workflow.py.
                     worktree_path = Path(w.worktree_path)
-                    inspection = inspect_worktree_state(
-                        worktree_path,
-                        config.dispatch.base_ref,
-                        config.dispatch.injected_paths,
-                    )
+                    inspection = inspect_worktree_state(worktree_path, config.dispatch.base_ref)
                     is_completed = inspection.state == WorktreeState.COMPLETED
 
                     # Issue #261: post-mortem extraction is intertwined with log-tail

@@ -1218,11 +1218,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Inspect the worktree before deciding how to classify and relabel.
             # This is the single enforcement point for issue #252.
             worktree_path = Path(w.worktree_path)
-            inspection = inspect_worktree_state(
-                worktree_path,
-                config.dispatch.base_ref,
-                config.dispatch.injected_paths,
-            )
+            inspection = inspect_worktree_state(worktree_path, config.dispatch.base_ref)
             is_completed = inspection.state == WorktreeState.COMPLETED
 
             # Post-mortem extraction (issue #261) is intertwined with log-tail
@@ -5629,7 +5625,7 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         prompt_path = pr_dir / "rework-prompt.md"
         prompt = self._render(
-            self.config.dispatch.rework_template,
+            "rework.md",
             {
                 "pr_number": pr_number,
                 "pr_title": pr.get("title", ""),
