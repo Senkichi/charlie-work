@@ -579,8 +579,12 @@ def test_fleet_loop_dry_run_propagates(
         work_only=False,
     )
 
-    # Verify GitHub was constructed with dry_run=True
-    mock_gh_class.assert_called_once_with(repo_root=tmp_path / "repo1", dry_run=True)
+    # Verify GitHub was constructed with dry_run=True and the runtime config
+    mock_gh_class.assert_called_once_with(
+        repo_root=tmp_path / "repo1",
+        runtime=mock_config.runtime,
+        dry_run=True,
+    )
 
     # Verify OrchestratorApp was constructed with dry_run=True
     mock_app_class.assert_called_once()

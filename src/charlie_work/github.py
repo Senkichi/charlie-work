@@ -2,27 +2,29 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
 _LIST_LIMIT = 500
 
-# Bounded retry for transient GraphQL gateway failures on read-only listing
-# queries (issue #361): a large `--json` listing occasionally times out at
-# GitHub's gateway (502/503/504) even though the request itself is valid —
-# a plain `gh api graphql -f query='{viewer{login}}'` succeeds at the same
-# time, so this is not an outage or rate-limit exhaustion. Retrying in-pass
-# is cheap insurance; it is not a substitute for keeping the query itself
-# small (see MERGED_PR_LIST_FIELDS below).
-_TRANSIENT_GATEWAY_RE = re.compile(r"\bHTTP (?:502|503|504)\b")
-_LIST_RETRY_ATTEMPTS = 3
-_LIST_RETRY_DELAY_SECONDS = 1.0
+# Defaults used when GitHub is constructed without a RuntimeConfig (tests and
+# legacy callers). Production code should pass config.runtime so these are
+# configurable via orchestrator.config.yaml.
+_DEFAULT_GH_MAX_RETRIES = 3
+_DEFAULT_GH_RETRY_BASE_SECONDS = 1.0
+
+# Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
+_JITTER_FRACTION = 0.25
 
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
@@ -124,6 +126,17 @@ def _job_id_from_link(link: str | None) -> int | None:
 class GitHub:
     repo_root: Path
     dry_run: bool = False
+    runtime: RuntimeConfig | None = None
+
+    def _max_retries(self) -> int:
+        if self.runtime is not None:
+            return self.runtime.gh_max_retries
+        return _DEFAULT_GH_MAX_RETRIES
+
+    def _retry_base_seconds(self) -> float:
+        if self.runtime is not None:
+            return self.runtime.gh_retry_base_seconds
+        return _DEFAULT_GH_RETRY_BASE_SECONDS
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
@@ -131,54 +144,112 @@ class GitHub:
         command = ["gh", *args]
         if self.dry_run and _is_mutating(args):
             return [] if json_output else "DRY-RUN: " + " ".join(command)
-        try:
-            result = subprocess.run(
-                command,
-                cwd=self.repo_root,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            if allow_failure:
-                return GitHubRunResult(
-                    ok=False,
-                    returncode=0,
-                    stdout="",
-                    stderr="",
-                    value=None,
-                    error="GitHub CLI `gh` is not installed or not on PATH.",
-                )
-            raise GitHubError("GitHub CLI `gh` is not installed or not on PATH.") from exc
 
-        output = result.stdout.strip()
+        is_mutating = _is_mutating(args)
+        max_retries = self._max_retries()
+        base_delay = self._retry_base_seconds()
+        last_result: subprocess.CompletedProcess[str] | None = None
 
-        if not allow_failure:
-            if result.returncode != 0:
-                raise GitHubError(
-                    result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-                )
-            if not json_output:
-                return output
-            if not output:
-                return None
+        for attempt in range(max_retries + 1):
             try:
-                return json.loads(output)
-            except json.JSONDecodeError as exc:
-                raise GitHubError(f"Expected JSON from gh command: {' '.join(command)}") from exc
+                result = subprocess.run(
+                    command,
+                    cwd=self.repo_root,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                if allow_failure:
+                    return GitHubRunResult(
+                        ok=False,
+                        returncode=0,
+                        stdout="",
+                        stderr="",
+                        value=None,
+                        error="GitHub CLI `gh` is not installed or not on PATH.",
+                    )
+                raise GitHubError("GitHub CLI `gh` is not installed or not on PATH.") from exc
 
-        # allow_failure=True: always return a structured result so callers can
-        # distinguish command failure from empty-but-legitimate output.
-        error: str | None = None
-        value: Any | None = None
-        if result.returncode != 0:
+            last_result = result
+            output = result.stdout.strip()
+
+            if result.returncode == 0:
+                # Success path: parse and return exactly as before.
+                if not allow_failure:
+                    if not json_output:
+                        return output
+                    if not output:
+                        return None
+                    try:
+                        return json.loads(output)
+                    except json.JSONDecodeError as exc:
+                        raise GitHubError(
+                            f"Expected JSON from gh command: {' '.join(command)}"
+                        ) from exc
+
+                # allow_failure=True: always return a structured result so callers can
+                # distinguish command failure from empty-but-legitimate output.
+                value: Any | None = None
+                if not json_output:
+                    value = output
+                elif output:
+                    try:
+                        value = json.loads(output)
+                    except json.JSONDecodeError:
+                        return GitHubRunResult(
+                            ok=False,
+                            returncode=result.returncode,
+                            stdout=result.stdout,
+                            stderr=result.stderr,
+                            value=None,
+                            error=f"Expected JSON from gh command: {' '.join(command)}",
+                        )
+                return GitHubRunResult(
+                    ok=True,
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    value=value,
+                    error=None,
+                )
+
+            # Failure path: classify and either retry or surface the error.
             error = (
                 result.stderr.strip() or result.stdout.strip() or f"gh exited {result.returncode}"
             )
+            if attempt >= max_retries or not _should_retry(args, error, is_mutating):
+                break
+
+            delay = base_delay * (2**attempt)
+            jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
+            sleep_seconds = max(0.0, delay + jitter)
+            logger.warning(
+                "Transient GitHub error (attempt %d/%d, %s): %s; retrying in %.2fs",
+                attempt + 1,
+                max_retries + 1,
+                "read/idempotent" if not is_mutating else "mutation pre-connection",
+                error,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+        # Exhausted retries or terminal failure. Reconstruct the original
+        # failure contract so callers see identical behaviour for terminal errors.
+        assert last_result is not None
+        final_error = (
+            last_result.stderr.strip() or last_result.stdout.strip() or str(last_result.returncode)
+        )
+        if not allow_failure:
+            raise GitHubError(final_error)
+
+        value = None
+        error = final_error
+        output = last_result.stdout.strip()
         if not json_output:
-            value = output if result.returncode == 0 else None
+            value = output if last_result.returncode == 0 else None
         elif output:
             try:
                 value = json.loads(output)
@@ -186,10 +257,10 @@ class GitHub:
                 error = f"Expected JSON from gh command: {' '.join(command)}"
                 value = None
         return GitHubRunResult(
-            ok=result.returncode == 0 and error is None,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            ok=False,
+            returncode=last_result.returncode,
+            stdout=last_result.stdout,
+            stderr=last_result.stderr,
             value=value,
             error=error,
         )
@@ -244,41 +315,15 @@ class GitHub:
         — failures are returned as False (allow_failure semantics). Dry-run mode
         returns True (the operation would succeed if not for dry-run).
         """
-        command = ["gh", *args]
         if self.dry_run and _is_mutating(args):
             return True
-        try:
-            result = subprocess.run(
-                command,
-                cwd=self.repo_root,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                check=False,
-            )
-        except FileNotFoundError:
-            return False
-        return result.returncode == 0
+        result = self.run(args, allow_failure=True)
+        return bool(result.ok) if isinstance(result, GitHubRunResult) else result == 0
 
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
-        attempt = 1
-        while True:
-            try:
-                result = self.run(args, json_output=True)
-                break
-            except GitHubError as exc:
-                if attempt >= _LIST_RETRY_ATTEMPTS or not _TRANSIENT_GATEWAY_RE.search(str(exc)):
-                    raise
-                logger.warning(
-                    "Transient GitHub gateway error listing %s (attempt %d/%d): %s; retrying",
-                    kind,
-                    attempt,
-                    _LIST_RETRY_ATTEMPTS,
-                    exc,
-                )
-                time.sleep(_LIST_RETRY_DELAY_SECONDS * attempt)
-                attempt += 1
+        # run() now applies the fleet-wide bounded retry policy for transient
+        # failures, so _list_json no longer needs its own ad-hoc retry loop.
+        result = self.run(args, json_output=True)
         items = result if isinstance(result, list) else []
         if len(items) >= limit:
             logger.warning(
@@ -822,6 +867,97 @@ def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
     text = _FENCED_CODE_BLOCK_RE.sub("", text)
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
     return {int(m.group(1)) for m in _ISSUE_MENTION_RE.finditer(text)}
+
+
+def _is_transient_gh_error(error: str) -> bool:
+    """Classify a gh stderr/stdout string as a transient (retryable) failure.
+
+    Transient signals are an allowlist; anything not explicitly listed is treated
+    as terminal so genuine logic/auth/validation errors still fail fast.
+    """
+    text = error.lower()
+
+    # Terminal signals that must never be retried.
+    if "bad credentials" in text:
+        return False
+    if "could not resolve to a" in text or "not_found" in text:
+        return False
+    if re.search(r"\bhttp 401\b", text):
+        return False
+    # 403 is terminal unless it is a rate-limit/secondary-rate-limit response.
+    if re.search(r"\bhttp 403\b", text) and not (
+        "rate limit" in text
+        or "secondary rate limit" in text
+        or "was submitted too quickly" in text
+    ):
+        return False
+    if re.search(r"\bhttp 422\b", text):
+        return False
+
+    # Transient allowlist.
+    if "tls handshake timeout" in text:
+        return True
+    if "net/http:" in text:
+        return True
+    if "connection reset" in text:
+        return True
+    if "connection refused" in text:
+        return True
+    if "i/o timeout" in text:
+        return True
+    if re.search(r"\beof\b", text):
+        return True
+    if "timeout awaiting response headers" in text:
+        return True
+    if re.search(r"\bhttp (?:502|503|504|429)\b", text):
+        return True
+    if "was submitted too quickly" in text:
+        return True
+    if "you have exceeded a secondary rate limit" in text:
+        return True
+    # Primary and other GitHub rate-limit responses (often HTTP 403 or 429).
+    if "rate limit" in text:
+        return True
+    if "error connecting to" in text:
+        return True
+    if "could not connect" in text:
+        return True
+
+    # Unknown errors are terminal by default.
+    return False
+
+
+def _is_pre_connection_error(error: str) -> bool:
+    """Return True for failures that provably occurred before the request reached GitHub.
+
+    Mutating commands are only retried on these pre-send errors to preserve
+    at-most-once semantics; post-send ambiguous timeouts (i/o timeout, 5xx after
+    headers, etc.) are surfaced immediately.
+    """
+    text = error.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "tls handshake timeout",
+            "connection refused",
+            "could not connect",
+            "error connecting to",
+        )
+    )
+
+
+def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
+    """Decide whether a failed gh invocation should be retried.
+
+    Reads/idempotent commands may retry any transient failure. Mutating commands
+    only retry provable pre-connection failures, avoiding double-application of
+    merges, label edits, comments, etc.
+    """
+    if not _is_transient_gh_error(error):
+        return False
+    if not is_mutating:
+        return True
+    return _is_pre_connection_error(error)
 
 
 def _is_mutating(args: list[str]) -> bool:

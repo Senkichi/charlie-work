@@ -143,7 +143,7 @@ def _run_fleet_autoscale_prologue(
 
     repo_key, repo_root, config = representative_repo
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
     state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
@@ -469,7 +469,7 @@ def fleet_loop(
                 continue
 
             try:
-                gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+                gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
                 app = OrchestratorApp(
                     repo_root,
                     paths,

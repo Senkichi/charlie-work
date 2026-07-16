@@ -206,7 +206,7 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
     return OrchestratorApp(
         repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir
@@ -218,7 +218,7 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     config_path = find_config_path(repo_root, args.config)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
     ok, checks = run_doctor(
         repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe, live=args.live
@@ -238,7 +238,7 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     state = load_state_locked(paths.state_file)
     result = clean_worktrees(
         repo_root,
@@ -332,7 +332,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, dry_run=True)
+            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.status()
             per_repo[repo_key] = result.data
@@ -368,7 +368,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, dry_run=True)
+            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.review_queue()
             per_repo[repo_key] = result.data
@@ -404,7 +404,7 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
             data={},
         )
 
-    gh = GitHub(repo_root=repo_root, dry_run=args.dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
 
     try:
         pool_state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
@@ -522,7 +522,7 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
     # Use subparser-specific dry_run flag if available, otherwise fall back to global
     dry_run = getattr(args, "dry_run", False)
 
-    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     removed_count, errors = scale_down_idle_runners(
         managed_root,
@@ -568,7 +568,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     dry_run = getattr(args, "dry_run", False)
     fleet_wide = getattr(args, "fleet_wide", False)
 
-    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
     state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)

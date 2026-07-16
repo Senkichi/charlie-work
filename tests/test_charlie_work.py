@@ -2627,11 +2627,11 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == github_module._LIST_RETRY_ATTEMPTS
+    assert call_count == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -17431,7 +17431,9 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
             return "owner/repo"
 
     # Monkeypatch GitHub to use our fake
-    def fake_github(repo_root: Path, dry_run: bool = False) -> GitHub:
+    def fake_github(
+        repo_root: Path, dry_run: bool = False, runtime: object | None = None
+    ) -> GitHub:
         return FakeGitHub(repo_root=repo_root, dry_run=dry_run)
 
     monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
