@@ -198,6 +198,21 @@ class ReviewConfig:
 
 
 @dataclass(frozen=True)
+class ReviewDispatchConfig:
+    # Issue #370: concurrent reviewer launcher for queued PRs. This is a
+    # deterministic loop stage, not a provider governor; reviewers use
+    # launch_claude_worker with no concurrency clamp for rate-limit reasons.
+    enabled: bool = False
+    # Per-PR review sidecar + log directory. MUST be distinct from
+    # devin.sessions_dir so worker concurrency accounting is not poisoned by
+    # reviewer processes.
+    reviews_dir: str = ".var/charlie-work/dispatches/reviews"
+    # Local-only process bound. 0 means unlimited; raise this only if local
+    # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
+    max_local_review_processes: int = 0
+
+
+@dataclass(frozen=True)
 class AutoMergeConfig:
     enabled: bool = True
     strategy: str = "squash"
@@ -682,6 +697,7 @@ class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
+    review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -791,6 +807,32 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
+    review_dispatch_data = _section(data, "review_dispatch")
+    for rd_bool_key in ("enabled",):
+        rd_bool_value = review_dispatch_data.get(rd_bool_key)
+        if rd_bool_value is not None and not isinstance(rd_bool_value, bool):
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{rd_bool_key}' must be a bool, "
+                f"got {type(rd_bool_value).__name__}"
+            )
+    rd_reviews_dir = review_dispatch_data.get("reviews_dir")
+    if rd_reviews_dir is not None and not isinstance(rd_reviews_dir, str):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'reviews_dir' must be a string, "
+            f"got {type(rd_reviews_dir).__name__}"
+        )
+    rd_max_local = review_dispatch_data.get("max_local_review_processes")
+    if rd_max_local is not None and not isinstance(rd_max_local, int):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_local_review_processes' must be an int, "
+            f"got {type(rd_max_local).__name__}"
+        )
+    if rd_max_local is not None and rd_max_local < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
+            f"got {rd_max_local}"
+        )
+    review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -1232,6 +1274,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         labels=labels,
         dispatch=dispatch,
         review=review,
+        review_dispatch=review_dispatch,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,

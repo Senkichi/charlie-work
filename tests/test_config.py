@@ -160,3 +160,29 @@ def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> No
     )
     config = load_config(config_file)
     assert config.dispatch.injected_paths == (".devin/prompts/worker.md", WRITER_MARKER_FILENAME)
+
+
+def test_load_config_review_dispatch_defaults() -> None:
+    """ReviewDispatchConfig defaults are safe (disabled, separate dir, no cap)."""
+    config_file = Path("nonexistent.yaml")
+    config = load_config(config_file)
+    assert config.review_dispatch.enabled is False
+    assert config.review_dispatch.reviews_dir == ".var/charlie-work/dispatches/reviews"
+    assert config.review_dispatch.max_local_review_processes == 0
+
+
+def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
+    """review_dispatch keys are read from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  enabled: true
+  reviews_dir: .var/reviews
+  max_local_review_processes: 4
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.enabled is True
+    assert config.review_dispatch.reviews_dir == ".var/reviews"
+    assert config.review_dispatch.max_local_review_processes == 4
