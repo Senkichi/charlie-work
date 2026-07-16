@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -41,7 +42,11 @@ from .worktree import (
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeUnsafeError,
+    _create_junction_or_symlink,
+    _materialize_directory,
+    _slugify,
     create_worktree,
+    is_junction,
     remove_worktree,
 )
 
@@ -63,6 +68,9 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
+
+# Timeout for review worktree git operations (seconds)
+_REVIEW_WORKTREE_TIMEOUT_SECONDS = 120
 
 # Windows-only flag: isolates the worker's process group so a Ctrl+C to the
 # orchestrator doesn't propagate into an in-flight `claude` session. Absent
@@ -358,6 +366,115 @@ def _render_command(
     return tuple(part.format(**values) for part in command_template)
 
 
+def _default_worktrees_dir(repo_root: Path) -> Path:
+    return repo_root / ".var" / "charlie-work" / "worktrees"
+
+
+def _create_review_worktree(
+    repo_root: Path,
+    branch: str,
+    issue_number: int,
+    *,
+    worktrees_dir: Path | None = None,
+    venv_source: Path | None = None,
+    materialize_dirs: tuple[str, ...] = (),
+    config: OrchestratorConfig | None = None,
+) -> WorktreeInfo:
+    """Create a detached, read-only worktree at the PR's head ref.
+
+    Reviewers inspect code outside the diff, so they need a checkout of the PR
+    head -- but unlike workers they never create a new branch. ``branch`` is
+    the PR's ``headRefName``; the worktree is created in detached HEAD at the
+    corresponding origin ref. The path is namespaced under ``worktrees_dir``
+    with a ``review-`` prefix so it cannot collide with worker worktrees.
+    """
+    target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    branch_slug = _slugify(branch) or "review"
+    worktree_path = target_dir / f"review-{issue_number}-{branch_slug}"
+
+    # Ensure the PR head is available locally. If origin exists, fetch it;
+    # otherwise trust that ``branch`` names a local ref.
+    ref = branch
+    if _has_origin_remote(repo_root):
+        fetch_result = run_captured(
+            ["git", "fetch", "origin", branch],
+            cwd=repo_root,
+            timeout_seconds=_REVIEW_WORKTREE_TIMEOUT_SECONDS,
+        )
+        if not fetch_result.ok:
+            raise RuntimeError(
+                f"failed to fetch origin/{branch} for review worktree: "
+                f"{fetch_result.error or fetch_result.stderr}"
+            )
+        ref = f"origin/{branch}"
+
+    # Resolve ref to a SHA so the worktree is deterministically detached at
+    # the PR head, not on a branch that could move.
+    rev_result = run_captured(
+        ["git", "rev-parse", "--verify", ref],
+        cwd=repo_root,
+        timeout_seconds=_REVIEW_WORKTREE_TIMEOUT_SECONDS,
+    )
+    if not rev_result.ok:
+        raise RuntimeError(
+            f"could not resolve review ref {ref!r}: "
+            f"{rev_result.error or rev_result.stderr}"
+        )
+    commit_sha = rev_result.stdout.strip()
+
+    # Remove a stale review worktree for this issue/branch, then create a
+    # fresh detached worktree. ``remove_worktree`` is junction-safe.
+    if worktree_path.exists() or is_junction(worktree_path):
+        if not remove_worktree(repo_root, worktree_path, force=True, branch=None):
+            raise RuntimeError(f"failed to remove stale review worktree {worktree_path}")
+    add_result = run_captured(
+        ["git", "worktree", "add", "--detach", str(worktree_path), commit_sha],
+        cwd=repo_root,
+        timeout_seconds=_REVIEW_WORKTREE_TIMEOUT_SECONDS,
+    )
+    if not add_result.ok:
+        raise RuntimeError(
+            f"git worktree add failed for review ref {ref!r}: "
+            f"{add_result.error or add_result.stderr}"
+        )
+
+    venv_junction: Path | None = None
+    if venv_source is not None:
+        venv_link = worktree_path / ".venv"
+        try:
+            _create_junction_or_symlink(venv_link, venv_source)
+            venv_junction = venv_link
+        except (OSError, RuntimeError):
+            remove_worktree(repo_root, worktree_path, force=True, branch=None)
+            raise
+
+    # Materialize git-excluded directories (e.g. .devin) into the worktree.
+    for dir_path in materialize_dirs:
+        try:
+            _materialize_directory(repo_root, worktree_path, dir_path)
+        except OSError as exc:
+            remove_worktree(repo_root, worktree_path, force=True, branch=None)
+            raise RuntimeError(f"failed to materialize {dir_path}: {exc}") from exc
+
+    return WorktreeInfo(
+        path=worktree_path,
+        branch=branch,
+        venv_junction=venv_junction,
+        reclaimed=None,
+        attempt_snapshot=None,
+    )
+
+
+def _has_origin_remote(repo_root: Path) -> bool:
+    result = run_captured(
+        ["git", "remote", "get-url", "origin"],
+        cwd=repo_root,
+        timeout_seconds=_REVIEW_WORKTREE_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def launch_claude_worker(
     issue_number: int,
     branch: str,
@@ -375,6 +492,7 @@ def launch_claude_worker(
     base_ref: str = "",
     tee_stream_json: bool = False,
     config: OrchestratorConfig | None = None,
+    review_mode: bool = False,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree and launch a headless Claude Code worker in it.
 
@@ -386,6 +504,10 @@ def launch_claude_worker(
     If ``rework`` is True, the worktree is created in rework mode (reuse existing
     worktree or attach to existing branch instead of creating a new branch).
 
+    If ``review_mode`` is True, the worktree is created in detached HEAD at the
+    PR's existing head ref; no new branch is created. This is mutually exclusive
+    with ``rework`` and ``recovery``.
+
     If ``recovery`` is provided (a dict with state file dispatch record), this is
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
     leftover worktree/branch and either clean it (no commits) or reuse it (has
@@ -395,18 +517,29 @@ def launch_claude_worker(
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
 
     try:
-        worktree: WorktreeInfo = create_worktree(
-            repo_root,
-            branch,
-            worktrees_dir=worktrees_dir,
-            venv_source=venv_source,
-            materialize_dirs=materialize_dirs,
-            rework=rework,
-            recovery=recovery,
-            base_ref=base_ref,
-            issue_number=issue_number,
-            config=config,
-        )
+        if review_mode:
+            worktree: WorktreeInfo = _create_review_worktree(
+                repo_root,
+                branch,
+                issue_number,
+                worktrees_dir=worktrees_dir,
+                venv_source=venv_source,
+                materialize_dirs=materialize_dirs,
+                config=config,
+            )
+        else:
+            worktree = create_worktree(
+                repo_root,
+                branch,
+                worktrees_dir=worktrees_dir,
+                venv_source=venv_source,
+                materialize_dirs=materialize_dirs,
+                rework=rework,
+                recovery=recovery,
+                base_ref=base_ref,
+                issue_number=issue_number,
+                config=config,
+            )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         if isinstance(exc, WorktreeProbeFailedError):
             # Transient probe contention (e.g. index lock), not a confirmed-dirty

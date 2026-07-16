@@ -25,6 +25,14 @@ review:
   require_tests_or_rationale: true
   require_issue_link: true
 
+review_dispatch:
+  # Launch claude-code reviewers automatically for queued PRs (#370).
+  # enabled: false
+  # reviews_dir: .var/charlie-work/dispatches/reviews
+  # max_local_review_processes is a local-process cap only, NOT a provider
+  # rate-limit governor. 0 = unlimited.
+  # max_local_review_processes: 0
+
 auto_merge:
   enabled: true
   strategy: squash

@@ -48,6 +48,7 @@ from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
 from .worktree import inspect_worktree_state, push_branch, resolve_base_branch_name
+from .claude_code import is_worker_alive, launch_claude_worker, read_worker_records
 from .state import (
     append_event,
     is_claim_stale,
@@ -759,6 +760,132 @@ def _detect_and_handle_orphaned_workers(
 
         state = _append_sweep_events(state, sweep_events)
         save_state(state_file, state)
+
+
+def _count_live_reviews(reviews_dir: Path, state_file: Path | None = None) -> int:
+    """Count the number of currently alive reviewer sessions.
+
+    Reads claude-code sidecar files from ``reviews_dir`` (the separate
+    review-dispatch accounting directory) and checks each record's PID
+    liveness. Returns the total count of reviewers with alive PIDs.
+
+    When ``state_file`` is given, this also corroborates the sidecar-based
+    count against state.json's ``reviewer_pid`` records, mirroring
+    ``_count_live_sessions``. A sidecar can go missing for a still-live
+    process; state.json's dispatch record is not touched by sidecar reaping,
+    so any PR still recorded as ``review_dispatched`` whose reviewer_pid is
+    alive is counted too.
+    """
+    live_pr_numbers: set[int] = set()
+    live_count = 0
+    for record in read_worker_records(reviews_dir):
+        if record.error is None and is_worker_alive(record):
+            live_count += 1
+            live_pr_numbers.add(record.issue_number)
+
+    if state_file is not None:
+        state = load_state_locked(state_file)
+        for pr_number_str, entry in state.get("prs", {}).items():
+            if not isinstance(entry, dict) or entry.get("review_dispatch_status") != "review_dispatched":
+                continue
+            try:
+                pr_number = int(pr_number_str)
+            except (TypeError, ValueError):
+                continue
+            if pr_number in live_pr_numbers:
+                continue
+            if _worker_pid_alive(entry):
+                live_count += 1
+
+    return live_count
+
+
+def _detect_and_handle_stalled_reviews(
+    reviews_dir: Path, state_file: Path, config: OrchestratorConfig
+) -> list[dict[str, Any]]:
+    """Detect review-dispatch claims/sidecars that are stale or have dead reviewers.
+
+    A reviewer claim is stale when its recorded timestamp is older than
+    ``is_claim_stale``'s threshold (30 minutes). Pending claims that were
+    never upgraded to dispatched are freed. Dispatched reviewers are checked
+    for liveness: if the claim is stale and the reviewer is dead, the dispatch
+    claim fields are removed so the PR is re-dispatchable on the next pass.
+
+    This reuses ``is_claim_stale`` (the worker-dispatch two-phase-lock
+    timeout) instead of inventing a parallel mechanism.
+    """
+    if not config.review_dispatch.enabled:
+        return []
+
+    records_by_issue: dict[int, Any] = {}
+    for record in read_worker_records(reviews_dir):
+        records_by_issue[record.issue_number] = record
+
+    stale_entries: list[dict[str, Any]] = []
+    with state_lock(state_file):
+        state = load_state(state_file)
+        sweep_events: list[tuple[str, dict[str, Any]]] = []
+        for pr_number_str, entry in state.get("prs", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            status = entry.get("review_dispatch_status")
+            if status not in ("review_dispatch_pending", "review_dispatched"):
+                continue
+            pr_number = int(pr_number_str)
+            claim_time = entry.get("review_dispatch_pending_at") or entry.get(
+                "review_dispatched_at"
+            )
+            if not is_claim_stale(claim_time):
+                continue
+
+            alive = False
+            if status == "review_dispatched":
+                alive = _worker_pid_alive(entry)
+                if not alive:
+                    record = records_by_issue.get(entry.get("reviewer_issue_number") or 0)
+                    if record is not None:
+                        alive = is_worker_alive(record)
+
+            if alive:
+                continue
+
+            # Free the claim: remove all review-dispatch bookkeeping fields so the
+            # PR is eligible for re-dispatch. Other PR state (decision, labels)
+            # is preserved.
+            entry = {
+                k: v
+                for k, v in entry.items()
+                if k
+                not in {
+                    "review_dispatch_status",
+                    "review_dispatch_pending_at",
+                    "review_dispatched_at",
+                    "reviewer_pid",
+                    "reviewer_process_start_time",
+                    "reviewer_started_at",
+                    "reviewer_issue_number",
+                    "review_dispatch_failed_at",
+                    "review_dispatch_error",
+                }
+            }
+            state["prs"][str(pr_number)] = entry
+            sweep_events.append(
+                (
+                    "review_dispatch_stale",
+                    {
+                        "pr_number": pr_number,
+                        "previous_status": status,
+                        "claim_time": claim_time,
+                    },
+                )
+            )
+            stale_entries.append({"pr": pr_number, "status": status})
+
+        if sweep_events:
+            state = _append_sweep_events(state, sweep_events)
+            save_state(state_file, state)
+
+    return stale_entries
 
 
 def _sweep_orphan_processes_for_dead_sessions(
@@ -2654,6 +2781,266 @@ class OrchestratorApp:
             data,
         )
 
+    def _apply_local_review_cap(
+        self,
+        candidates: list[dict[str, Any]],
+        live_count: int,
+    ) -> tuple[list[dict[str, Any]], list[int]]:
+        """Trim review candidates by the repo-local process cap only.
+
+        ``max_local_review_processes`` is a local-resource bound, NOT a
+        provider rate-limit governor. 0 means unlimited. Returns
+        (selected, deferred_pr_numbers).
+        """
+        max_local = self.config.review_dispatch.max_local_review_processes
+        if max_local <= 0:
+            return candidates, []
+        available = max(0, max_local - live_count)
+        selected = candidates[:available]
+        deferred = [int(c["pr"]) for c in candidates[available:]]
+        return selected, deferred
+
+    def _read_review_pr_data(self, pr_number: int) -> dict[str, Any] | None:
+        """Read the PR metadata stored in the review packet directory."""
+        pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+        if not pr_json_path.exists():
+            return None
+        try:
+            with pr_json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _reviewer_dispatch_prompt(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        prompt_text: str,
+    ) -> str:
+        """Append auto-dispatch output instructions to the review packet prompt."""
+        pr_dir = self.paths.prs / f"pr-{pr_number}"
+        repo_root = self.repo_root
+        python = sys.executable
+        instructions = f"""
+## Auto-dispatched reviewer output
+
+This review was launched automatically from the parent repository:
+  {repo_root}
+
+Record your verdict in that repository, NOT in this worktree, so the
+orchestrator can read it on the next pass. The PR directory is:
+  {pr_dir}
+
+Option A (preferred if `charlie` is on PATH in this worktree):
+  charlie --repo {repo_root} verdict --pr {pr_number} --decision <approved|request_changes|blocked> --summary-file <path>
+
+Option B (if `charlie` is not on PATH but this worktree has the package):
+  {python} -m charlie_work.cli --repo {repo_root} verdict --pr {pr_number} --decision <approved|request_changes|blocked> --summary-file <path>
+
+Option C (write the JSON directly):
+  Write `{pr_dir / "review-decision.json"}` with the same fields the
+  `verdict` command would produce.
+"""
+        return prompt_text + instructions
+
+    def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
+        """Launch reviewers for queued PRs concurrently and non-blocking.
+
+        Takes #369's ``review_queue()`` and launches a claude-code reviewer for
+        every candidate each pass. There is no provider-rate-limit governor;
+        ``max_local_review_processes`` is an optional local-process cap only.
+
+        Two-phase claim keyed on ``state["prs"][pr_number]`` prevents double-
+        dispatch of a reviewer for the same PR across overlapping passes.
+        """
+        if not self.config.review_dispatch.enabled:
+            return CommandResult(
+                True,
+                "review dispatch disabled",
+                {"selected_count": 0, "attempted_count": 0, "failed_count": 0, "dispatched": []},
+            )
+
+        reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+
+        # Free stale claims/slots before selecting candidates (skip in dry-run:
+        # that mode is read-only and only reports who would be selected).
+        if not self.dry_run:
+            _detect_and_handle_stalled_reviews(reviews_dir, self.paths.state_file, self.config)
+
+        queue_result = self.review_queue()
+        candidates: list[dict[str, Any]] = list(queue_result.data.get("queue", []))
+
+        # Apply the optional local-process cap
+        live_count = _count_live_reviews(reviews_dir, self.paths.state_file)
+        selected, deferred_by_local_cap = self._apply_local_review_cap(candidates, live_count)
+
+        # Apply explicit limit
+        if limit is not None and limit >= 0:
+            deferred_by_local_cap = deferred_by_local_cap + [
+                int(c["pr"]) for c in selected[limit:]
+            ]
+            selected = selected[:limit]
+
+        if self.dry_run:
+            return CommandResult(
+                True,
+                f"review dispatch dry-run: {len(selected)} PR(s) would be selected",
+                {
+                    "selected_count": len(selected),
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "deferred_by_local_cap": deferred_by_local_cap,
+                    "dispatched": [],
+                    "failed": [],
+                },
+            )
+
+        # Phase 1: claim selected PRs
+        claimed: list[dict[str, Any]] = []
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for candidate in selected:
+                pr_number = int(candidate["pr"])
+                pr_entry = state["prs"].get(str(pr_number), {})
+                status = pr_entry.get("review_dispatch_status")
+                if status in ("review_dispatch_pending", "review_dispatched"):
+                    continue
+                if status == "review_dispatch_failed":
+                    # Reclaim a previously failed dispatch only after the same
+                    # stale-claim timeout has elapsed, so transient launch
+                    # failures don't tight-loop every pass.
+                    if not is_claim_stale(pr_entry.get("review_dispatch_failed_at")):
+                        continue
+                pr_entry = {
+                    **pr_entry,
+                    "number": pr_number,
+                    "issue_number": candidate.get("issue"),
+                    "review_dispatch_status": "review_dispatch_pending",
+                    "review_dispatch_pending_at": utc_now(),
+                }
+                state["prs"][str(pr_number)] = pr_entry
+                claimed.append(candidate)
+            save_state(self.paths.state_file, state)
+
+        # Phase 2: launch reviewers outside the lock
+        launched_records: list[ClaudeWorkerRecord] = []
+        failed_results: list[dict[str, Any]] = []
+        for candidate in claimed:
+            pr_number = int(candidate["pr"])
+            issue_number = candidate.get("issue")
+            pr_data = self._read_review_pr_data(pr_number)
+            if not pr_data:
+                failed_results.append(
+                    {"pr": pr_number, "issue": issue_number, "error": "review packet pr.json missing"}
+                )
+                continue
+            branch = pr_data.get("headRefName", "")
+            if not branch:
+                failed_results.append(
+                    {"pr": pr_number, "issue": issue_number, "error": "headRefName missing in pr.json"}
+                )
+                continue
+
+            pr_dir = self.paths.prs / f"pr-{pr_number}"
+            prompt_path = pr_dir / "review-prompt.md"
+            try:
+                prompt_text = prompt_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                failed_results.append(
+                    {"pr": pr_number, "issue": issue_number, "error": f"failed to read review prompt: {exc}"}
+                )
+                continue
+
+            prompt_text = self._reviewer_dispatch_prompt(pr_number, issue_number, prompt_text)
+            worktrees_dir = reviews_dir / "worktrees"
+            venv_source = (
+                self._resolve(self.config.claude_code.venv_source)
+                if self.config.claude_code.venv_source
+                else None
+            )
+            env = {
+                "CHARLIE_WORK_REPO_ROOT": str(self.repo_root),
+                "CHARLIE_WORK_REVIEW_PR": str(pr_number),
+                "CHARLIE_WORK_REVIEW_ISSUE": str(issue_number) if issue_number is not None else "",
+                "CHARLIE_WORK_REVIEW_PR_DIR": str(pr_dir),
+            }
+
+            record = launch_claude_worker(
+                issue_number=issue_number if issue_number is not None else pr_number,
+                branch=branch,
+                prompt_text=prompt_text,
+                repo_root=self.repo_root,
+                sessions_dir=reviews_dir,
+                worktrees_dir=worktrees_dir,
+                venv_source=venv_source,
+                materialize_dirs=self.config.dispatch.materialize_dirs,
+                env=env,
+                config=self.config,
+                review_mode=True,
+            )
+
+            if record.ok:
+                launched_records.append(record)
+            else:
+                failed_results.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "error": record.error or "launch failed",
+                        "failure_kind": record.failure_kind,
+                    }
+                )
+
+        # Phase 3: upgrade claims based on launch outcome
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for record in launched_records:
+                pr_entry = state["prs"].get(str(record.issue_number), {})
+                pr_entry = {
+                    **pr_entry,
+                    "review_dispatch_status": "review_dispatched",
+                    "review_dispatched_at": utc_now(),
+                    "reviewer_pid": record.pid,
+                    "reviewer_process_start_time": record.process_start_time,
+                    "reviewer_started_at": record.started_at,
+                    "reviewer_issue_number": record.issue_number,
+                }
+                state["prs"][str(record.issue_number)] = pr_entry
+            for result in failed_results:
+                pr_number = result["pr"]
+                pr_entry = state["prs"].get(str(pr_number), {})
+                pr_entry = {
+                    **pr_entry,
+                    "review_dispatch_status": "review_dispatch_failed",
+                    "review_dispatch_failed_at": utc_now(),
+                    "review_dispatch_error": result.get("error"),
+                }
+                state["prs"][str(pr_number)] = pr_entry
+            save_state(self.paths.state_file, state)
+
+        dispatched = [record.to_dict() for record in launched_records]
+        ok = not failed_results
+        message = f"review dispatch complete: {len(launched_records)} launched"
+        if failed_results:
+            message = f"review dispatch complete: {len(launched_records)} launched, {len(failed_results)} failed"
+        if deferred_by_local_cap:
+            message += f" (deferred by local cap: {deferred_by_local_cap})"
+
+        return CommandResult(
+            ok,
+            message,
+            {
+                "selected_count": len(launched_records),
+                "attempted_count": len(claimed),
+                "failed_count": len(failed_results),
+                "deferred_by_local_cap": deferred_by_local_cap,
+                "dispatched": dispatched,
+                "failed": failed_results,
+            },
+        )
+
     def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
         """Generate a review packet for a PR.
 
@@ -4529,6 +4916,7 @@ class OrchestratorApp:
         rework_count = dispatch_rework.data.get("selected_count", 0)
         fresh_limit = max(0, effective_limit - rework_count)
         dispatch = self.dispatch(fresh_limit, stalled_entries=loop_stalled_entries)
+        dispatch_reviews = self.dispatch_reviews()
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -4659,7 +5047,13 @@ class OrchestratorApp:
             if digest:
                 emit_digest(self.config.notify, digest)
 
-        ok = intake.ok and dispatch.ok and dispatch_rework.ok and not errors
+        ok = (
+            intake.ok
+            and dispatch.ok
+            and dispatch_rework.ok
+            and dispatch_reviews.ok
+            and not errors
+        )
         message = "loop complete"
         if errors:
             message = f"loop completed with {len(errors)} PR error(s)"
@@ -4669,10 +5063,13 @@ class OrchestratorApp:
             message = "loop completed with dispatch failures"
         elif not dispatch_rework.ok:
             message = "loop completed with rework dispatch failures"
+        elif not dispatch_reviews.ok:
+            message = "loop completed with review dispatch failures"
         data = {
             "intake": intake.data,
             "dispatch": dispatch.data,
             "dispatch_rework": dispatch_rework.data,
+            "dispatch_reviews": dispatch_reviews.data,
             "reviews": reviews,
             "merges": merges,
             "errors": errors,

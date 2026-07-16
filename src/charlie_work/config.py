@@ -202,6 +202,16 @@ class ReviewConfig:
 
 
 @dataclass(frozen=True)
+class ReviewDispatchConfig:
+    enabled: bool = False
+    reviews_dir: str = ".var/charlie-work/dispatches/reviews"
+    # LOCAL resource bound only — NOT a provider rate limit. 0 = unlimited.
+    # Only raise this off 0 if concurrent reviewer worktree checkouts/processes
+    # are visibly thrashing local CPU/disk on the operator's machine.
+    max_local_review_processes: int = 0
+
+
+@dataclass(frozen=True)
 class AutoMergeConfig:
     enabled: bool = True
     strategy: str = "squash"
@@ -680,6 +690,7 @@ class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
+    review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -789,6 +800,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
+    review_dispatch = _build_section(
+        ReviewDispatchConfig, "review_dispatch", _section(data, "review_dispatch")
+    )
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -1218,6 +1232,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         labels=labels,
         dispatch=dispatch,
         review=review,
+        review_dispatch=review_dispatch,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
