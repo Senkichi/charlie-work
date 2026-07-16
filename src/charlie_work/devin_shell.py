@@ -30,12 +30,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime
+from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
 from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
-from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
+from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
@@ -419,32 +419,25 @@ def launch_devin_session(
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record
 
-    kwargs: dict[str, Any] = {}
-    kwargs.update(no_console_window_kwargs(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)))
-    # POSIX: detach worker into its own session to prevent killpg from killing the orchestrator
-    if os.name != "nt":
-        kwargs["start_new_session"] = True
-
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS)
     worker_env_dict = {
         **sanitize_env(worktree.path),
         **{str(k): str(v) for k, v in (worker_env or {}).items()},
     }
-    kwargs["env"] = worker_env_dict
 
     pid: int | None = None
     error: str | None = None
     process_start_time: float | None = None
     try:
         with log_path.open("w", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
+            process = popen_worker(
                 list(command),
                 cwd=str(worktree.path),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                **kwargs,
+                env=worker_env_dict,
             )
         pid = process.pid
         # Capture process creation time immediately after spawn to verify identity later

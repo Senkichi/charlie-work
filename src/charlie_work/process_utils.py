@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .subprocess_runner import no_console_window_kwargs
 
@@ -469,3 +471,37 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
         pass
 
     return orphans
+
+
+def popen_worker(
+    args: Sequence[str] | str,
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    **popen_kwargs: Any,
+) -> subprocess.Popen[Any]:
+    """Launch a worker process as the single point for creationflags/process-group composition.
+
+    Injects the worker detachment policy into the ``subprocess.Popen`` call:
+    - ``creationflags`` are composed through ``no_console_window_kwargs()`` so
+      ``CREATE_NO_WINDOW`` is combined with ``CREATE_NEW_PROCESS_GROUP`` on
+      Windows; on POSIX it is a no-op.
+    - ``start_new_session`` defaults to ``True`` on POSIX and is omitted on
+      Windows; callers may override by passing it explicitly.
+
+    All other ``Popen`` keyword arguments are passed through. The helper returns
+    the ``Popen`` object immediately and never waits or communicates.
+    """
+    if cwd is not None:
+        popen_kwargs["cwd"] = cwd
+    if env is not None:
+        popen_kwargs["env"] = env
+
+    if "start_new_session" not in popen_kwargs and os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+
+    extra_flags = popen_kwargs.pop("creationflags", 0)
+    process_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    popen_kwargs.update(no_console_window_kwargs(extra_flags | process_group_flag))
+
+    return subprocess.Popen(args, **popen_kwargs)
