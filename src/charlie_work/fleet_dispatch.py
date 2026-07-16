@@ -104,15 +104,9 @@ def _run_fleet_autoscale_prologue(
         logger.info("Fleet autoscale prologue: runner_scaling not enabled, skipping")
         return events
 
-    # Load fleet-wide runner totals
-    total_runners, total_busy_runners, skipped_repos = count_fleet_runners(fleet_dir_override)
-    fleet_totals = FleetTotals(
-        total_runners=total_runners,
-        total_busy_runners=total_busy_runners,
-    )
-
-    # For fleet-wide autoscale, we need to pick a representative repo to observe state
-    # We'll use the first repo in the registry that has runner_scaling enabled
+    # Pick a representative repo with runner_scaling enabled. Its runtime config
+    # is used for the fleet-wide runner count (all repos share the same retry
+    # knobs) and for the subsequent autoscale observation/actions.
     fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
     registry = _load_registry(fleet_json_path)
     repos_map = registry.get("repos", {})
@@ -142,8 +136,18 @@ def _run_fleet_autoscale_prologue(
         return events
 
     repo_key, repo_root, config = representative_repo
+
+    # Load fleet-wide runner totals using the representative repo's runtime config
+    total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
+        fleet_dir_override, runtime=config.runtime
+    )
+    fleet_totals = FleetTotals(
+        total_runners=total_runners,
+        total_busy_runners=total_busy_runners,
+    )
+
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
     state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
@@ -469,7 +473,7 @@ def fleet_loop(
                 continue
 
             try:
-                gh = GitHub(repo_root=repo_root, dry_run=dry_run)
+                gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
                 app = OrchestratorApp(
                     repo_root,
                     paths,
