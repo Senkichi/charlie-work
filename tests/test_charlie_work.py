@@ -19,8 +19,8 @@ import yaml
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work import cli
 from charlie_work import github as github_module
-from charlie_work.checks import summarize_checks
-from charlie_work.github import is_infrastructure_failure
+from charlie_work.checks import _run_id_from_link, summarize_checks
+from charlie_work.github import _job_id_from_link, is_infrastructure_failure
 from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
@@ -2310,7 +2310,14 @@ def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) ->
     checks = github_module.GitHub(tmp_path).pr_checks(123)
 
     assert checks == [
-        {"name": "Tests", "state": "FAILURE", "bucket": "fail", "link": "", "databaseId": None}
+        {
+            "name": "Tests",
+            "state": "FAILURE",
+            "bucket": "fail",
+            "link": "",
+            "databaseId": None,
+            "runId": None,
+        }
     ]
 
 
@@ -3115,7 +3122,16 @@ class FakeGitHubWithChecks(FakeGitHub):
         self.checks = checks if checks is not None else []
 
     def pr_checks(self, number: int) -> list[dict[str, Any]]:
-        return self.checks
+        # Mirror production GitHub.pr_checks: inject databaseId/runId from the
+        # check link, but only when not already provided by the test.
+        return [
+            {
+                **check,
+                "databaseId": check.get("databaseId", _job_id_from_link(check.get("link"))),
+                "runId": check.get("runId", _run_id_from_link(check.get("link"))),
+            }
+            for check in self.checks
+        ]
 
 
 class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
@@ -6137,6 +6153,121 @@ def test_janitor_required_check_failure_noop_does_not_reroute(tmp_path: Path) ->
     assert state["prs"]["456"]["request_changes_count"] == request_count
     assert fake_gh.labels_added.count((123, config.labels.needs_rework)) == needs_rework_count
     assert any("unchanged" in f.lower() for f in result2.data["janitor_failures"])
+
+
+class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
+    """FakeGitHub that captures gh run rerun calls and can simulate failures."""
+
+    def __init__(
+        self, checks: list[dict[str, Any]] | None = None, *, rerun_ok: bool = True
+    ) -> None:
+        super().__init__(checks)
+        self.rerun_ok = rerun_ok
+        self.rerun_calls: list[list[str]] = []
+
+    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
+        if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
+            self.rerun_calls.append(list(args))
+            if self.rerun_ok:
+                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
+            return github_module.GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="rate limit exceeded",
+                value=None,
+                error="rate limit exceeded",
+            )
+        return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+
+def test_janitor_required_check_first_failure_triggers_rerun(tmp_path: Path) -> None:
+    """Issue #391: first required-check failure triggers one auto-rerun and defers rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+    assert fake_gh.rerun_calls[0][:3] == ["run", "rerun", "12345"]
+    assert "--failed" in fake_gh.rerun_calls[0]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["check_rerun_attempts"] == {"sha-abc123": {"Tests passed": [12345]}}
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    assert "123" not in state.get("issues", {})
+
+
+def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #391: the same check failing again on the same head is definitive and routes to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is False
+    assert result1.data.get("rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+
+    result2 = app.review(456)
+    assert result2.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    # No additional rerun was triggered on the second pass.
+    assert len(fake_gh.rerun_calls) == 1
+
+
+def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path: Path) -> None:
+    """Issue #391: a rerun API error surfaces as an event and falls through to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        rerun_ok=False,
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    # The rerun attempt was not persisted because the API call failed.
+    assert "check_rerun_attempts" not in state["prs"]["456"]
+    assert any(event["kind"] == "flake_rerun_failed" for event in state.get("events", []))
 
 
 def test_render_test_adequacy_section_unit() -> None:

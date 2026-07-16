@@ -85,7 +85,9 @@ def _green_checks() -> list[dict]:
 def test_fully_green_pr_yields_ok_with_empty_tuples() -> None:
     verdict = run_janitor(_green_pr(), _green_checks(), _config(), repo_root=Path.cwd())
 
-    assert verdict == JanitorVerdict(ok=True, failures=(), warnings=())
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
 
 
 def test_draft_pr_fails() -> None:
@@ -198,6 +200,33 @@ def test_no_required_checks_configured_skips_check_gate() -> None:
     verdict = run_janitor(_green_pr(), [], _config(required_checks=()))
 
     assert verdict.ok is True
+
+
+def test_required_check_first_failure_returns_rerun_run_id() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE", "runId": 100},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.is_check_failure_block is True
+    assert verdict.rerun_run_ids == (100,)
+    assert verdict.check_rerun_attempts == {"abc123": {"Tests passed": [100]}}
+
+
+def test_required_check_second_failure_returns_no_rerun() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE", "runId": 100},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+    pr_state = {"check_rerun_attempts": {"abc123": {"Tests passed": [100]}}}
+    verdict = run_janitor(_green_pr(), checks, _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.is_check_failure_block is True
+    assert verdict.rerun_run_ids == ()
+    assert verdict.failed_required_checks == ("Tests passed",)
 
 
 def test_missing_linked_issue_fails_when_required() -> None:

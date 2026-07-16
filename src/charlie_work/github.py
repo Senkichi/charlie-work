@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .config import RuntimeConfig
 
+from .checks import _run_id_from_link
+
 logger = logging.getLogger(__name__)
 
 _LIST_LIMIT = 500
@@ -468,10 +470,18 @@ class GitHub:
         else:
             # Legacy pre-result-object fallback
             checks = result if isinstance(result, list) else []
-        # gh pr checks --json has no databaseId field; derive the GitHub Actions
-        # job id from "link" and inject it so downstream consumers (workflow.py)
-        # keep reading check.get("databaseId") unchanged.
-        return [{**check, "databaseId": _job_id_from_link(check.get("link"))} for check in checks]
+        # gh pr checks --json has no databaseId/runId fields; derive both the
+        # GitHub Actions job id and the workflow run id from "link" and inject
+        # them so downstream consumers keep reading check.get("databaseId") and
+        # check.get("runId") unchanged.
+        return [
+            {
+                **check,
+                "databaseId": _job_id_from_link(check.get("link")),
+                "runId": _run_id_from_link(check.get("link")),
+            }
+            for check in checks
+        ]
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         """Fetch a single GitHub Actions job by ID.
