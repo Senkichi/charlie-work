@@ -379,23 +379,38 @@ def _sanitize_review_command_template(
     defeating ``create_review_checkout``'s paired guarantee (no branch
     checkout AND no write mode). See PR #397 round-2 review.
 
-    If the template already names ``--permission-mode``, its value is
-    forced to ``"plan"`` regardless of what was supplied; otherwise the flag
-    is appended. This only touches the permission-mode value — it does not
-    discard the rest of the template — so a caller with a legitimate reason
-    to vary the executable or other flags (e.g. a test double standing in
-    for the ``claude`` binary) is not blocked, only write access is. A
-    ``None`` template resolves to the standard read-only default.
+    Every occurrence of ``--permission-mode`` is stripped from the template
+    first — the bare flag plus its following value token (if any), and any
+    token of the form ``--permission-mode=<value>`` — and a single
+    authoritative ``--permission-mode plan`` is then appended as the final
+    tokens. Removing every occurrence before appending the forced value
+    (rather than patching the first match in place) is the invariant: CLI
+    argument parsers generally apply last-flag-wins semantics, so a template
+    with duplicate ``--permission-mode`` flags (e.g. a caller-supplied
+    override appended after a legitimate one) would otherwise let a later,
+    unsanitized occurrence silently win at runtime even though the first
+    occurrence was "fixed". See PR #397 round-3 review. This only touches
+    the permission-mode flag — it does not discard the rest of the
+    template — so a caller with a legitimate reason to vary the executable
+    or other flags (e.g. a test double standing in for the ``claude``
+    binary) is not blocked, only write access is. A ``None`` template
+    resolves to the standard read-only default.
     """
     if command_template is None:
         return _REVIEW_COMMAND_TEMPLATE
-    if "--permission-mode" in command_template:
-        idx = command_template.index("--permission-mode")
-        if idx + 1 < len(command_template):
-            return command_template[: idx + 1] + ("plan",) + command_template[idx + 2 :]
-        # Trailing flag with no value (malformed) — append the forced value.
-        return command_template + ("plan",)
-    return command_template + ("--permission-mode", "plan")
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--permission-mode":
+            skip_next = True
+            continue
+        if token.startswith("--permission-mode="):
+            continue
+        filtered.append(token)
+    return tuple(filtered) + ("--permission-mode", "plan")
 
 
 def _render_command(

@@ -21,6 +21,7 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     update_worker_record_with_failure_classification,
+    _sanitize_review_command_template,
     _sidecar_path,
 )
 from charlie_work.env_sanitize import sanitize_env
@@ -2618,6 +2619,81 @@ def test_launch_claude_worker_review_ignores_caller_command_template_override(
     mode_index = record.command.index("--permission-mode")
     assert record.command[mode_index + 1] == "plan"
     assert "acceptEdits" not in record.command
+
+
+def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
+    """Round-3 review (PR #397): a template with duplicate space-form
+    `--permission-mode` flags must not let the trailing occurrence survive —
+    CLI parsers apply last-flag-wins semantics, so a naive first-match fix
+    would still launch in acceptEdits mode."""
+    template = (
+        "claude",
+        "-p",
+        "--permission-mode",
+        "plan",
+        "--permission-mode",
+        "acceptEdits",
+    )
+
+    result = _sanitize_review_command_template(template)
+
+    assert result.count("--permission-mode") == 1
+    idx = result.index("--permission-mode")
+    assert result[idx + 1] == "plan"
+    assert idx == len(result) - 2  # positioned last
+
+
+def test_sanitize_review_command_template_strips_equals_joined_flag() -> None:
+    """An equals-joined `--permission-mode=acceptEdits` token must be removed
+    entirely, not merely left in place because the append-based happy path
+    currently makes it look safe by accident."""
+    template = ("claude", "-p", "--permission-mode=acceptEdits")
+
+    result = _sanitize_review_command_template(template)
+
+    assert not any(tok.startswith("--permission-mode=") for tok in result)
+    assert result[-2:] == ("--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_strips_mixed_forms() -> None:
+    """Mixed equals-joined and space-form occurrences are all stripped,
+    leaving a single trailing `--permission-mode plan`."""
+    template = (
+        "claude",
+        "-p",
+        "--permission-mode=acceptEdits",
+        "--permission-mode",
+        "acceptEdits",
+    )
+
+    result = _sanitize_review_command_template(template)
+
+    assert result.count("--permission-mode") == 1
+    assert not any(tok.startswith("--permission-mode=") for tok in result)
+    assert result[-2:] == ("--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_handles_bare_trailing_flag() -> None:
+    """A malformed trailing `--permission-mode` with no value token must not
+    raise (e.g. IndexError) — it is stripped like any other occurrence and
+    the authoritative flag is appended."""
+    template = ("claude", "-p", "--permission-mode")
+
+    result = _sanitize_review_command_template(template)
+
+    assert result == ("claude", "-p", "--permission-mode", "plan")
+
+
+def test_sanitize_review_command_template_preserves_lookalike_token() -> None:
+    """A token like `--permission-modex` must not be matched as the flag —
+    only an exact `--permission-mode` token or exact `--permission-mode=`
+    prefix count."""
+    template = ("claude", "-p", "--permission-modex", "plan")
+
+    result = _sanitize_review_command_template(template)
+
+    assert "--permission-modex" in result
+    assert result == ("claude", "-p", "--permission-modex", "plan", "--permission-mode", "plan")
 
 
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
