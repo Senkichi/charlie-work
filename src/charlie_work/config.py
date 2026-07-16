@@ -299,6 +299,11 @@ class RuntimeConfig:
     # a frozen value object with no mutable state.
     gh_max_retries: int = 3
     gh_retry_base_seconds: float = 1.0
+    # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
+    # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
+    # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
+    # least this value. Set to 0 to disable the guard.
+    graphql_rate_limit_threshold: int = 1500
 
 
 @dataclass(frozen=True)
@@ -861,6 +866,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
             f"got {type(gh_retry_base_seconds).__name__}"
         )
+    graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
+    if graphql_rate_limit_threshold is not None:
+        if not isinstance(graphql_rate_limit_threshold, int):
+            raise ConfigError(
+                "config section 'runtime' key 'graphql_rate_limit_threshold' must be an int, "
+                f"got {type(graphql_rate_limit_threshold).__name__}"
+            )
+        if graphql_rate_limit_threshold < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
+                f"got {graphql_rate_limit_threshold}"
+            )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):

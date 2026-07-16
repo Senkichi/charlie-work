@@ -53,6 +53,10 @@ runtime:
   # retried on provable pre-connection errors to preserve at-most-once semantics.
   # gh_max_retries: 3
   # gh_retry_base_seconds: 1.0
+  # Pre-emptive GraphQL rate-limit guard for quota-heavy phases (mop-up sweeps,
+  # merged-PR listings). Quota-heavy phases are deferred when remaining points
+  # fall below this threshold. Set to 0 to disable the guard.
+  # graphql_rate_limit_threshold: 1500
 
 devin:
   # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,

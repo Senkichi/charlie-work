@@ -30,6 +30,7 @@ from typing import Any
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHub,
+    GraphQLBudgetError,
     _LIST_LIMIT,
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
@@ -128,6 +129,11 @@ def detect_drift(
     If ``repo_root`` is provided, also checks for dead sessions and classifies
     their failures to update the provider throttle state.
     """
+    threshold = config.runtime.graphql_rate_limit_threshold
+    sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold)
+    if not sufficient:
+        raise GraphQLBudgetError(remaining, reset_at, threshold)
+
     labels_cfg = config.labels
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)

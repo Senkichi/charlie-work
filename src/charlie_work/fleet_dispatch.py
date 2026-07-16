@@ -305,6 +305,27 @@ def _extract_attention_events(
             }
         )
 
+    # Extract lock/deferral skips (state_lock_busy, supervisor_lock_held,
+    # graphql_rate_limit) surfaced by OrchestratorApp public methods.
+    skip_reason = data.get("reason") or data.get("deferred_reason")
+    if (
+        data.get("skipped")
+        or data.get("state_lock_busy")
+        or skip_reason
+        in (
+            "state_lock_busy",
+            "supervisor_lock_held",
+            "graphql_rate_limit",
+        )
+    ):
+        events.append(
+            {
+                "repo_key": repo_key,
+                "type": "skipped",
+                "reason": skip_reason or "state_lock_busy",
+            }
+        )
+
     return events
 
 
