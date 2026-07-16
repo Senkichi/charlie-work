@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .config import RuntimeConfig
 
 from .checks import _run_id_from_link
+from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ class GitHub:
                     errors="replace",
                     capture_output=True,
                     check=False,
+                    **no_console_window_kwargs(),
                 )
             except FileNotFoundError as exc:
                 if allow_failure:
@@ -611,6 +613,7 @@ class GitHub:
                     errors="replace",
                     capture_output=True,
                     check=False,
+                    **no_console_window_kwargs(),
                 )
             except FileNotFoundError as exc:
                 raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc

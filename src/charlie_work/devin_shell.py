@@ -35,7 +35,7 @@ from .config import OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
@@ -421,8 +421,7 @@ def launch_devin_session(
         return record
 
     kwargs: dict[str, Any] = {}
-    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    kwargs.update(no_console_window_kwargs(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)))
     # POSIX: detach worker into its own session to prevent killpg from killing the orchestrator
     if os.name != "nt":
         kwargs["start_new_session"] = True

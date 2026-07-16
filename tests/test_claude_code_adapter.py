@@ -2145,6 +2145,56 @@ def test_launch_claude_worker_includes_start_new_session_on_posix(
         assert popen_kwargs.get("start_new_session") is False
 
 
+def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwargs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """launch_claude_worker must obtain its Popen creationflags via
+    ``no_console_window_kwargs`` (issue #393) rather than hard-coding
+    ``CREATE_NEW_PROCESS_GROUP`` -- the single point of enforcement for
+    suppressing spurious console-window flashes on Windows.
+
+    Note: patching ``subprocess.Popen`` globally also intercepts the
+    internal ``Popen`` calls that ``subprocess.run`` makes under the hood
+    (e.g. from any incidental git cleanup on the error path), so we record
+    kwargs *per call* and assert on the first one -- the actual worker
+    launch -- rather than a merged/overwritten dict.
+    """
+    from unittest.mock import patch
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    popen_calls: list[dict] = []
+    original_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        popen_calls.append(kwargs)
+        return original_popen([sys.executable, "-c", "pass"], **kwargs)
+
+    sentinel_kwargs = {"creationflags": 0xDEADBEEF}
+    with (
+        patch("subprocess.Popen", side_effect=capture_popen),
+        patch(
+            "charlie_work.claude_code.no_console_window_kwargs",
+            return_value=sentinel_kwargs,
+        ) as mock_helper,
+    ):
+        launch_claude_worker(
+            998,
+            "agent/issue-998-no-window",
+            "prompt",
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=(sys.executable, "-c", "pass"),
+        )
+
+    mock_helper.assert_called_once_with(claude_code._CREATE_NEW_PROCESS_GROUP)
+    assert popen_calls, "expected at least one Popen call from the worker launch"
+    assert popen_calls[0].get("creationflags") == 0xDEADBEEF
+
+
 # ---------------------------------------------------------------------------
 # Tests for parse_claude_events (issue #160)
 # ---------------------------------------------------------------------------

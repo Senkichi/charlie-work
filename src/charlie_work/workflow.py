@@ -16,6 +16,7 @@ from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -314,6 +315,7 @@ def _kill_orphan_pid(pid: int) -> None:
                 ["taskkill", "/F", "/PID", str(pid)],
                 capture_output=True,
                 text=True,
+                **no_console_window_kwargs(),
             )
         else:
             os.kill(pid, signal.SIGKILL)
