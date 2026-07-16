@@ -4089,11 +4089,11 @@ class OrchestratorApp:
                     rework_label_error = self._request_merge_conflict_rework(
                         pr, issue_number, decision
                     )
-            # Head matches the approved SHA. In merge-train mode, only the head
-            # of the approved queue is allowed to proceed, and it must be
+            # Head matches the approved SHA. In front-of-train mode, only the
+            # head of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
-            update_open_prs = self.config.auto_merge.update_open_prs
-            if update_open_prs == "next":
+            update_branch_strategy = self.config.auto_merge.update_branch_strategy
+            if update_branch_strategy == "front_of_train":
                 if merge_train_head is not None and merge_train_head != pr_number:
                     return self._merge_not_ready_result(
                         pr_number,
@@ -4120,7 +4120,7 @@ class OrchestratorApp:
             # and the merge-base gate. mergeStateStatus can lag and report CLEAN
             # while the branch is actually stale, so it is no longer authoritative.
             base_current: bool | None = None
-            if not sync_failed and update_open_prs in {"next", "all"}:
+            if not sync_failed and update_branch_strategy in {"front_of_train", "broadcast"}:
                 base_current = self._is_base_current(pr)
                 if self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
@@ -4139,7 +4139,10 @@ class OrchestratorApp:
             # merge-base freshness gate: mergeStateStatus can lag, so verify
             # ancestry with the GitHub compare API before merging.
             if not sync_failed and self.config.auto_merge.require_current_base:
-                if base_current is None and update_open_prs not in {"next", "all"}:
+                if base_current is None and update_branch_strategy not in {
+                    "front_of_train",
+                    "broadcast",
+                }:
                     base_current = self._is_base_current(pr)
                 elif pr.get("headRefOid") != live_head_sha:
                     base_current = self._is_base_current(pr)
@@ -4261,7 +4264,7 @@ class OrchestratorApp:
                 head_ref = str(pr.get("headRefName") or "")
                 branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
             # Update remaining open agent PRs after successful merge (if configured)
-            if self.config.auto_merge.update_open_prs in {"all", "next"}:
+            if self.config.auto_merge.update_branch_strategy in {"broadcast", "front_of_train"}:
                 update_results = self._update_open_agent_prs(pr_number)
             # Cancel superseded queued runs on default branch after successful merge (if configured)
             if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
@@ -4547,12 +4550,15 @@ class OrchestratorApp:
     def _update_open_agent_prs(self, merged_pr_number: int) -> list[dict[str, Any]]:
         """Update remaining open agent PRs after a successful merge.
 
-        Behavior is controlled by ``auto_merge.update_open_prs``:
+        Behavior is controlled by ``auto_merge.update_branch_strategy``:
 
-        - "all" (legacy): update every open tracked PR that is not approved-pending-ship
-          and has no required checks currently in-flight.
-        - "next" (merge-train): update only the head of the approved queue, so a single
-          merge only causes one CI reset (the next candidate) instead of N-1.
+        - "front_of_train" (default): update only the head of the approved
+          queue, so a single merge step causes at most one CI reset on a
+          single-runner merge train.
+        - "broadcast": update every eligible open tracked PR that is not
+          approved-pending-ship and has no required checks in-flight. Intended
+          for multi-runner setups. PRs whose current review decision is
+          ``request_changes``, escalated, or blocked are skipped.
         - "off": do nothing.
 
         Per-PR failures (conflicts, network errors) are reported as values and
@@ -4560,11 +4566,11 @@ class OrchestratorApp:
         reported as a value and never propagates.
         """
         results: list[dict[str, Any]] = []
-        mode = self.config.auto_merge.update_open_prs
+        mode = self.config.auto_merge.update_branch_strategy
         if mode == "off":
             return results
 
-        if mode == "next":
+        if mode == "front_of_train":
             try:
                 candidates = self._merge_train_candidates(exclude_pr_number=merged_pr_number)
             except GitHubError as exc:
@@ -4639,7 +4645,7 @@ class OrchestratorApp:
                 }
             ]
 
-        # mode == "all": legacy behavior — update every qualifying PR.
+        # mode == "broadcast": update every eligible PR.
         try:
             prs = self.gh.pr_list()
         except GitHubError as exc:
@@ -4662,11 +4668,27 @@ class OrchestratorApp:
             if not head.startswith(branch_prefix):
                 continue
 
-            # Skip approved-pending-ship PRs to avoid invalidating their approvals
-            # These will get base-updated when they themselves are merged (GitHub merges
-            # handle base freshness) or by a later pass after they merge.
+            # Derive eligibility from the recorded review decision. Never
+            # update-branch a PR whose current decision is request_changes,
+            # escalated, or blocked — rework or human intervention will replace
+            # the head, so the CI run would be guaranteed-wasted time.
             decision = self._review_decision(pr_number)
-            if decision.get("decision") == "approved":
+            decision_value = decision.get("decision")
+            if decision_value in {"request_changes", "blocked"} or decision.get("escalated"):
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "not_approved",
+                    }
+                )
+                continue
+
+            # Skip approved-pending-ship PRs to avoid invalidating their approvals.
+            # These will get base-updated when they themselves are merged (GitHub
+            # merges handle base freshness) or by a later pass after they merge.
+            if decision_value == "approved":
                 reviewed_head_sha = decision.get("reviewed_head_sha")
                 live_head_sha = pr.get("headRefOid")
                 if reviewed_head_sha is not None and live_head_sha == reviewed_head_sha:
@@ -4717,8 +4739,8 @@ class OrchestratorApp:
                     )
                     continue
 
-            # Use the same compare-derived base-current signal as the merge-train
-            # path and merge_ready so "all" mode also skips up-to-date PRs and
+            # Use the same compare-derived base-current signal as the front-of-train
+            # path and merge_ready so broadcast mode also skips up-to-date PRs and
             # syncs stale ones even when mergeStateStatus is CLEAN.
             base_current = self._is_base_current(pr)
             if base_current is None:
@@ -5245,7 +5267,7 @@ class OrchestratorApp:
         prs = self.gh.pr_list()
         merge_train_head = (
             self._merge_train_head(prs)
-            if self.config.auto_merge.update_open_prs == "next"
+            if self.config.auto_merge.update_branch_strategy == "front_of_train"
             else None
         )
         for pr in prs:
