@@ -2727,12 +2727,18 @@ class OrchestratorApp:
 
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
-        # must cost zero review tokens. Failures don't move labels — they are
-        # the worker's/CI's to fix, not a review decision.
+        # must cost zero review tokens. Most failures don't move labels — they
+        # are the worker's/CI's to fix. A definitive required-check failure on
+        # a linked-issue PR is routed to rework so the worker can push a fix.
         verdict = run_janitor(
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            if issue_number is not None and verdict.is_check_failure_block:
+                transition(self.gh, self.config.labels, issue_number, "review_started")
+                summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
+                return self.record_review(pr_number, "request_changes", summary=summary)
+
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {

@@ -5979,6 +5979,166 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     assert state["prs"]["456"]["janitor_warnings"]
 
 
+def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["status"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "CI failed on Tests passed; push a fix" in prompt_text
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["summary"] == "CI failed on Tests passed; push a fix"
+
+
+def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    """Issue #376: a check-failure PR with no linked issue still dead-ends at the janitor gate."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    # Remove every issue reference so linked_issue_number returns None.
+    fake_gh.prs[0]["headRefName"] = "misc/fix-search"
+    fake_gh.prs[0]["title"] = "fix search"
+    fake_gh.prs[0]["body"] = "No issue reference here."
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert "123" not in state.get("issues", {})
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> None:
+    """Issue #376: an infrastructure check failure (CANCELLED) is not routed to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
+    """Issue #376: repeated check-failure reworks escalate to human_needed via the request_changes cap."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix1"
+    )
+    result2 = app.review(456)
+    assert result2.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["request_changes_count"] == 2
+
+    fake_gh.pr_head_shas[456] = "sha-3"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix2"
+    )
+    result3 = app.review(456)
+    assert result3.ok is True
+    assert result3.data["escalated"] is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_janitor_required_check_failure_noop_does_not_reroute(tmp_path: Path) -> None:
+    """Issue #376: a check-failure rework that produced no new content is not re-reviewed."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    diff_text = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = diff_text
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    request_count = state["prs"]["456"]["request_changes_count"]
+    needs_rework_count = fake_gh.labels_added.count((123, config.labels.needs_rework))
+
+    result2 = app.review(456)
+    assert result2.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["prs"]["456"]["request_changes_count"] == request_count
+    assert fake_gh.labels_added.count((123, config.labels.needs_rework)) == needs_rework_count
+    assert any("unchanged" in f.lower() for f in result2.data["janitor_failures"])
+
+
 def test_render_test_adequacy_section_unit() -> None:
     """Unit test for render_test_adequacy_section (issue #180)."""
     from charlie_work.janitor import TestAdequacyFacts
