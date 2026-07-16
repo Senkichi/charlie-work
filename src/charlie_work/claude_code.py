@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import parse_proc_stat_starttime
-from .config import OrchestratorConfig
+from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
@@ -45,7 +45,7 @@ from .worktree import (
     remove_worktree,
 )
 
-PROMPT_FILENAME = ".orchestrator-prompt.md"
+PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 # Provider throttle signatures — matched against session log tails to classify
 # failure kinds. The defaults are sourced from RuntimeConfig so there is a single
