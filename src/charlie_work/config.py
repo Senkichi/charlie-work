@@ -293,6 +293,12 @@ class RuntimeConfig:
         "rate limit",
         "too many requests",
     )
+    # Bounded retry for transient GitHub API failures (TLS blips, connection
+    # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
+    # These knobs apply fleet-wide; keep them in RuntimeConfig so GitHub stays
+    # a frozen value object with no mutable state.
+    gh_max_retries: int = 3
+    gh_retry_base_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -843,6 +849,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                     f"strings, got element of type {type(item).__name__}"
                 )
         runtime_data["throttle_error_markers"] = tuple(throttle_error_markers)
+    gh_max_retries = runtime_data.get("gh_max_retries")
+    if gh_max_retries is not None and not isinstance(gh_max_retries, int):
+        raise ConfigError(
+            "config section 'runtime' key 'gh_max_retries' must be an int, "
+            f"got {type(gh_max_retries).__name__}"
+        )
+    gh_retry_base_seconds = runtime_data.get("gh_retry_base_seconds")
+    if gh_retry_base_seconds is not None and not isinstance(gh_retry_base_seconds, (int, float)):
+        raise ConfigError(
+            "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
+            f"got {type(gh_retry_base_seconds).__name__}"
+        )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):
