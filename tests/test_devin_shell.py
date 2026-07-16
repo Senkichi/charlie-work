@@ -962,13 +962,17 @@ def test_posix_stat_parse_with_embedded_paren_in_comm(
     assert starttime_ticks == 100, f"Expected starttime to be 100, got {starttime_ticks}"
 
 
-def test_is_session_alive_probe_none_with_start_time_returns_dead(
+def test_is_session_alive_probe_none_treats_indeterminate_as_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When _get_process_start_time returns None mid-check with pid alive and record has start time, return dead.
+    """Issue #360 criterion #1: a start-time probe failure is not a definitive dead signal.
 
-    This pins the fail-direction: if the probe fails during a liveness check, we treat the worker as dead.
+    When ``get_process_start_time`` returns ``None`` for a live PID, ``is_session_alive``
+    treats the liveness signal as indeterminate and returns ``True`` rather than
+    reaping a potentially-live worker.
     """
+    import charlie_work.process_utils as process_utils
+
     # Spawn a short-lived process to get a valid PID
     script = tmp_path / "sleep.py"
     script.write_text("import time; time.sleep(2)", encoding="utf-8")
@@ -980,8 +984,8 @@ def test_is_session_alive_probe_none_with_start_time_returns_dead(
     )
 
     try:
-        # Monkeypatch _get_process_start_time to return None (simulating probe failure)
-        monkeypatch.setattr(devin_shell, "_get_process_start_time", lambda pid: None)
+        # Simulate a start-time probe failure while the process is still alive.
+        monkeypatch.setattr(process_utils, "get_process_start_time", lambda pid: None)
 
         record = SessionRecord(
             issue_number=1,
@@ -995,8 +999,8 @@ def test_is_session_alive_probe_none_with_start_time_returns_dead(
             process_start_time=123.456,  # Record has a start time
         )
 
-        # Should return False because probe returned None
-        assert is_session_alive(record) is False
+        # Should return True because the probe was indeterminate, not definitive dead.
+        assert is_session_alive(record) is True
     finally:
         process.kill()
         process.wait(timeout=5)
@@ -2116,13 +2120,14 @@ def test_launch_devin_session_includes_start_new_session_on_posix(
         assert popen_kwargs.get("start_new_session") is True
         assert "creationflags" not in popen_kwargs
     else:
-        # On Windows, start_new_session is not used; the helper sets
-        # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP + CREATE_BREAKAWAY_FROM_JOB.
+        # On Windows, start_new_session is not used; the helper sets only
+        # CREATE_NEW_PROCESS_GROUP.  Policy A survival flags (DETACHED_PROCESS,
+        # CREATE_BREAKAWAY_FROM_JOB) are out of scope for issue #360.
         assert "start_new_session" not in popen_kwargs
         flags = popen_kwargs.get("creationflags", 0)
-        assert flags & subprocess.DETACHED_PROCESS
         assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-        assert flags & subprocess.CREATE_BREAKAWAY_FROM_JOB
+        assert not (flags & subprocess.DETACHED_PROCESS)
+        assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
 
 
 # ---------------------------------------------------------------------------

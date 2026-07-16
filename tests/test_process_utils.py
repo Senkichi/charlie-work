@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +10,7 @@ from typing import Any
 import pytest
 
 from charlie_work.process_utils import (
+    is_pid_alive,
     is_session_stalled,
     kill_process_tree,
     popen_worker,
@@ -412,10 +411,10 @@ def test_popen_worker_uses_start_new_session_on_posix(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
-def test_popen_worker_sets_detached_flags_on_windows(
+def test_popen_worker_sets_process_group_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``popen_worker`` sets the full Windows detachment flag set."""
+    """``popen_worker`` isolates the Windows worker in its own process group only."""
     captured: dict[str, Any] = {}
     original_popen = subprocess.Popen
 
@@ -433,145 +432,78 @@ def test_popen_worker_sets_detached_flags_on_windows(
 
     flags = captured.get("creationflags", 0)
     assert "start_new_session" not in captured
-    assert flags & subprocess.DETACHED_PROCESS
     assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-    assert flags & subprocess.CREATE_BREAKAWAY_FROM_JOB
+    assert not (flags & subprocess.DETACHED_PROCESS)
+    assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
-def test_popen_worker_falls_back_when_breakaway_denied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If the current job forbids breakaway, ``popen_worker`` retries without it."""
-    calls: list[int] = []
-    real_popen = subprocess.Popen
+def test_is_pid_alive_true_for_live_process(tmp_path: Path) -> None:
+    """``is_pid_alive`` returns True for a running process with a matching start time."""
+    from charlie_work.process_utils import get_process_start_time
 
-    def fake_popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
-        flags = kwargs.get("creationflags", 0)
-        calls.append(flags)
-        if flags & subprocess.CREATE_BREAKAWAY_FROM_JOB:
-            exc = PermissionError(5, "Access is denied")
-            exc.winerror = 5
-            raise exc
-        return real_popen(
-            [sys.executable, "-c", "pass"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        start_time = get_process_start_time(proc.pid)
+        assert start_time is not None
+        assert is_pid_alive(proc.pid, start_time) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    proc = popen_worker(
+
+def test_is_pid_alive_false_for_dead_process() -> None:
+    """``is_pid_alive`` returns False for a process that has already exited."""
+    proc = subprocess.Popen(
         [sys.executable, "-c", "pass"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    proc.wait(timeout=10)
-
-    assert len(calls) == 2
-    assert calls[0] & subprocess.CREATE_BREAKAWAY_FROM_JOB
-    assert not (calls[1] & subprocess.CREATE_BREAKAWAY_FROM_JOB)
-    assert calls[1] & subprocess.DETACHED_PROCESS
-    assert calls[1] & subprocess.CREATE_NEW_PROCESS_GROUP
+    proc.wait(timeout=5)
+    assert is_pid_alive(proc.pid) is False
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
-def test_popen_worker_survives_forceful_job_tree_kill(tmp_path: Path) -> None:
-    """A worker launched by ``popen_worker`` survives a forceful Job Object tree kill.
+def test_is_pid_alive_false_for_mismatched_start_time(tmp_path: Path) -> None:
+    """``is_pid_alive`` returns False when the start time does not match (PID recycled)."""
+    from charlie_work.process_utils import get_process_start_time
 
-    This simulates an orchestrator that is running inside a Job Object with
-    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. When the job handle is closed the
-    orchestrator (the mock parent) is killed, but the worker must escape the
-    job via ``CREATE_BREAKAWAY_FROM_JOB`` and keep running.
-    """
-    marker = tmp_path / "worker.marker"
-    info_file = tmp_path / "info.json"
-    child_script = tmp_path / "child.py"
-    child_script.write_text(
-        "from pathlib import Path\nimport sys, time\nmarker = Path(sys.argv[1])\n"
-        "marker.write_text('start\\n', encoding='utf-8')\n"
-        "for i in range(120):\n"
-        "    time.sleep(0.1)\n"
-        "    with marker.open('a', encoding='utf-8') as f:\n"
-        "        f.write(f'tick {i}\\n')\n",
-        encoding="utf-8",
-    )
-    parent_script = tmp_path / "parent.py"
-    parent_script.write_text(
-        "import ctypes, json, os, subprocess, sys, time\n"
-        "from pathlib import Path\n"
-        "sys.path.insert(0, str(Path.cwd() / 'src'))\n"
-        "from charlie_work.process_utils import popen_worker\n"
-        "\n"
-        "kernel32 = ctypes.windll.kernel32\n"
-        "kernel32.CreateJobObjectW.restype = ctypes.c_void_p\n"
-        "kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]\n"
-        "kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]\n"
-        "kernel32.SetInformationJobObject.restype = ctypes.c_int\n"
-        "kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]\n"
-        "kernel32.AssignProcessToJobObject.restype = ctypes.c_int\n"
-        "kernel32.CloseHandle.argtypes = [ctypes.c_void_p]\n"
-        "kernel32.GetCurrentProcess.restype = ctypes.c_void_p\n"
-        "\n"
-        "class IO_COUNTERS(ctypes.Structure):\n"
-        "    _fields_ = [('ReadOperationCount', ctypes.c_uint64), ('WriteOperationCount', ctypes.c_uint64), ('OtherOperationCount', ctypes.c_uint64), ('ReadTransferCount', ctypes.c_uint64), ('WriteTransferCount', ctypes.c_uint64), ('OtherTransferCount', ctypes.c_uint64)]\n"
-        "class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):\n"
-        "    _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64), ('LimitFlags', ctypes.c_uint32), ('MinimumWorkingSetSize', ctypes.c_void_p), ('MaximumWorkingSetSize', ctypes.c_void_p), ('ActiveProcessLimit', ctypes.c_uint32), ('Affinity', ctypes.c_void_p), ('PriorityClass', ctypes.c_uint32), ('SchedulingClass', ctypes.c_uint32)]\n"
-        "class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):\n"
-        "    _fields_ = [('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION), ('IoInfo', IO_COUNTERS), ('ProcessMemoryLimit', ctypes.c_void_p), ('JobMemoryLimit', ctypes.c_void_p), ('PeakProcessMemoryUsed', ctypes.c_void_p), ('PeakJobMemoryUsed', ctypes.c_void_p)]\n"
-        "\n"
-        "JobObjectExtendedLimitInformation = 9\n"
-        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000\n"
-        "JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800\n"
-        "\n"
-        "hJob = kernel32.CreateJobObjectW(None, None)\n"
-        "info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()\n"
-        "info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK\n"
-        "kernel32.SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info))\n"
-        "if not kernel32.AssignProcessToJobObject(hJob, kernel32.GetCurrentProcess()):\n"
-        "    sys.exit(1)\n"
-        "\n"
-        f"marker = Path({str(marker)!r})\n"
-        f"info = Path({str(info_file)!r})\n"
-        f"child = Path({str(child_script)!r})\n"
-        "proc = popen_worker([sys.executable, str(child), str(marker)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        "info.write_text(json.dumps({'child': proc.pid}), encoding='utf-8')\n"
-        "# Closing the job handle kills every process still in the job.\n"
-        "# The worker should have broken away and survive.\n"
-        "kernel32.CloseHandle(hJob)\n"
-        "time.sleep(10)\n",
-        encoding="utf-8",
-    )
-
-    parent = subprocess.Popen(
-        [sys.executable, str(parent_script)],
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
     )
     try:
-        deadline = time.time() + 10
-        while not info_file.exists() and time.time() < deadline:
-            time.sleep(0.1)
-        assert info_file.exists(), "mock orchestrator did not start"
-        child_pid = json.loads(info_file.read_text(encoding="utf-8"))["child"]
-
-        # The parent is being killed by the job close; wait for that to happen.
-        time.sleep(1.5)
-
-        # The child should still be alive and continuing to write.
-        before = marker.read_text(encoding="utf-8")
-        assert "tick" in before
-        time.sleep(1.5)
-        after = marker.read_text(encoding="utf-8")
-        assert len(after) > len(before), "worker was killed by forceful Job Object tree kill"
+        start_time = get_process_start_time(proc.pid)
+        assert start_time is not None
+        assert is_pid_alive(proc.pid, start_time - 600) is False
     finally:
-        # Best-effort cleanup of the survivor.
-        if info_file.exists():
-            child_pid = json.loads(info_file.read_text(encoding="utf-8")).get("child")
-            if child_pid:
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(child_pid)],
-                    capture_output=True,
-                )
-        if parent.poll() is None:
-            parent.terminate()
-            parent.wait(timeout=5)
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_is_pid_alive_treats_start_time_none_as_indeterminate(tmp_path: Path) -> None:
+    """Issue #360 criterion #1: a start-time probe failure is not a definitive dead signal.
+
+    When ``get_process_start_time`` returns ``None`` for a process that is still
+    alive, ``is_pid_alive`` must return ``True`` (indeterminate) rather than
+    treating the worker as dead.
+    """
+    from unittest.mock import patch
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        with patch("charlie_work.process_utils.get_process_start_time", return_value=None):
+            assert is_pid_alive(proc.pid, 123.456) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)

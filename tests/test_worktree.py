@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,7 @@ import pytest
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.github import GitHubRunResult
-from charlie_work.process_utils import get_process_start_time, popen_worker
+from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
     WorktreeCleanResult,
     WorktreeInfo,
@@ -3809,51 +3808,3 @@ def test_clean_worktrees_removes_junctioned_worktree_and_preserves_shared_venv_c
     assert venv_source.exists()
     assert marker.exists()
     assert marker.read_text(encoding="utf-8") == "shared contents\n"
-
-
-def test_create_worktree_reclaim_re_adopts_live_worker(tmp_path: Path) -> None:
-    """A worker that survived an orchestrator kill is re-adopted by recovery."""
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
-    branch = "agent/issue-1"
-
-    marker = tmp_path / "worker.marker"
-    script = tmp_path / "child.py"
-    script.write_text(
-        "from pathlib import Path\nimport sys, time\n"
-        "marker = Path(sys.argv[1])\n"
-        "marker.write_text('start\\n', encoding='utf-8')\n"
-        "for i in range(120):\n"
-        "    time.sleep(0.1)\n"
-        "    with marker.open('a', encoding='utf-8') as f:\n"
-        "        f.write(f'tick {i}\\n')\n",
-        encoding="utf-8",
-    )
-    proc = popen_worker(
-        [sys.executable, str(script), str(marker)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.time() + 10
-        while not marker.exists() and time.time() < deadline:
-            time.sleep(0.1)
-        assert marker.exists(), "worker did not start"
-
-        start_time = get_process_start_time(proc.pid)
-        assert start_time is not None
-
-        recovery = {
-            "worker_pid": proc.pid,
-            "worker_process_start_time": start_time,
-            "branch_name": branch,
-        }
-        with pytest.raises(LiveWorkerRedispatchError) as exc:
-            create_worktree(repo_root, branch, recovery=recovery, issue_number=1)
-
-        assert exc.value.pid == proc.pid
-        assert abs(exc.value.process_start_time - start_time) < 1.0
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)

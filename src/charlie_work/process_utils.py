@@ -268,6 +268,13 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
     uses ``os.kill(pid, 0)``. When ``expected_start_time`` is provided, the
     current process start time is also fetched and compared against the stored
     fingerprint, returning False if the PID has been recycled.
+
+    Indeterminate probes (e.g. a transient ``OpenProcess`` failure or a
+    start-time query that returns ``None`` while the PID still appears to exist)
+    are treated as ``True``.  Reaping a live worker on a false-negative liveness
+    signal is far worse than delaying a reap by one pass, so this function only
+    returns ``False`` when it can prove the process is dead or has been
+    recycled.
     """
     if pid <= 0:
         return False
@@ -278,14 +285,21 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
 
         _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         _WIN_STILL_ACTIVE = 259
+        _ERROR_ACCESS_DENIED = 5
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return False
+            # ``OpenProcess`` can fail because the PID does not exist (definitive
+            # dead signal) or because the process exists but we are denied access
+            # (indeterminate).  Treat access-denied as alive; all other open
+            # failures are treated as not running.
+            return kernel32.GetLastError() == _ERROR_ACCESS_DENIED
         try:
             exit_code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
+                # Could not read the exit code; we cannot prove the process is
+                # dead, so treat it as indeterminate rather than failing open.
+                return True
             if exit_code.value != _WIN_STILL_ACTIVE:
                 return False
         finally:
@@ -293,14 +307,23 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
     else:
         try:
             os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but we cannot signal it; treat as indeterminate.
+            return True
         except (OSError, ValueError):
             return False
 
     if expected_start_time is not None:
         current_start_time = get_process_start_time(pid)
         if current_start_time is None:
-            return False
+            # Could not verify identity.  Treat as indeterminate (alive) rather
+            # than reaping a worker whose liveness probe merely failed
+            # (issue #360 criterion #1 / issue #343).
+            return True
         if abs(current_start_time - expected_start_time) > 1.0:
+            # Start time mismatch - PID has been recycled
             return False
 
     return True
@@ -455,12 +478,12 @@ def popen_worker(
 
     This is the single-point-of-enforcement for worker detachment policy:
 
-    - Windows: ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB``.
-      ``DETACHED_PROCESS`` removes the console so the child is not killed by a
-      ``taskkill /T`` of the orchestrator; ``CREATE_BREAKAWAY_FROM_JOB`` escapes
-      any Job Object the parent is in. If the current job forbids breakaway, the
-      call falls back to ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`` so launch
-      still works (the child may remain tied to the job in that environment).
+    - Windows: ``CREATE_NEW_PROCESS_GROUP``.  This gives the child its own
+      process group so a Ctrl+C sent to the orchestrator console does not
+      propagate into an in-flight worker.  It intentionally does *not* use
+      ``DETACHED_PROCESS`` or ``CREATE_BREAKAWAY_FROM_JOB``; those survival
+      semantics are out of scope for issue #360 (see issue thread decision
+      rejecting Policy A).
     - POSIX: ``start_new_session=True`` makes the child a session leader so a
       process-group kill does not reach it.
 
@@ -473,31 +496,13 @@ def popen_worker(
         popen_kwargs["env"] = env
 
     if sys.platform == "win32":
-        # Hide any console window and detach from the orchestrator's console.
-        startupinfo = subprocess.STARTUPINFO()  # type: ignore
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore
-        startupinfo.wShowWindow = subprocess.SW_HIDE  # type: ignore
-        popen_kwargs["startupinfo"] = startupinfo
-
-        creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-        )
+        # Isolate the worker's process group so Ctrl+C to the orchestrator does
+        # not interrupt an in-flight session.  Do not detach from the console or
+        # break away from Job Objects; that survival policy was rejected for
+        # issue #360.
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         popen_kwargs["creationflags"] = creationflags
-
-        try:
-            return subprocess.Popen(args, **popen_kwargs)
-        except PermissionError as exc:
-            # ``CREATE_BREAKAWAY_FROM_JOB`` is denied when the parent is in a job
-            # that does not allow breakaway. Retry without it; the worker may still
-            # be tied to the job, but launch succeeds.
-            if exc.winerror != 5:  # ERROR_ACCESS_DENIED
-                raise
-            popen_kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            ) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            return subprocess.Popen(args, **popen_kwargs)
+        return subprocess.Popen(args, **popen_kwargs)
 
     # POSIX: new session isolates the child from the orchestrator's process group.
     popen_kwargs["start_new_session"] = True

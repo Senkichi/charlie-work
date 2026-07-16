@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
 from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
@@ -65,7 +65,6 @@ _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_WIN_STILL_ACTIVE = 259
 
 
 @dataclass(frozen=True)
@@ -720,84 +719,25 @@ def _get_process_start_time(pid: int) -> float | None:
             return None
 
 
-def _win_is_alive(pid: int) -> bool:
-    """Windows PID liveness via ``OpenProcess`` + ``GetExitCodeProcess``.
-
-    ``os.kill(pid, 0)`` is NOT usable for this on Windows: CPython's Windows
-    implementation of signal 0 does not probe the process at all (there is no
-    real "probe" signal in the Win32 API) — it was empirically verified
-    (see ``test_is_session_alive_reflects_real_process``) to keep reporting a
-    long-dead, already-``wait()``-ed PID as alive indefinitely. Instead, open
-    a limited-info handle and ask the kernel for the actual exit code:
-    ``STILL_ACTIVE`` (259) means running, anything else (or a failed
-    ``OpenProcess``, e.g. the PID never existed or was already reused) means
-    not running.
-    """
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return False
-    try:
-        exit_code = wintypes.DWORD()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-            return False
-        return exit_code.value == _WIN_STILL_ACTIVE
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def _posix_is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return False
-    return True
-
-
 def is_worker_alive(record: ClaudeWorkerRecord) -> bool:
     """Check whether the process behind ``record`` is still running.
 
-    Dispatches to a platform-appropriate liveness probe: ``OpenProcess`` +
-    ``GetExitCodeProcess`` on Windows, ``os.kill(pid, 0)`` on POSIX (where it
-    is the standard, reliable idiom). This avoids a hard `psutil` dependency
-    and the slow `tasklist` subprocess round trip.
+    Delegates to ``charlie_work.process_utils.is_pid_alive`` so liveness
+    semantics are enforced in a single place.  This avoids a hard `psutil`
+    dependency and the slow `tasklist` subprocess round trip.
 
-    Additionally verifies process identity by checking that the current process
-    start time matches the recorded start time (captured at spawn). This prevents
-    false positives from PID recycling: if the OS has reused the PID for a different
-    process, the start time will not match and the session is treated as dead.
+    Process identity is verified by checking that the current process start time
+    matches the recorded start time (captured at spawn).  A start-time probe
+    that returns ``None`` is treated as indeterminate and returns ``True`` rather
+    than reaping a potentially-live worker on a transient probe failure
+    (issue #360 criterion #1 / issue #343).
 
-    Legacy records without process_start_time fall back to pid-only liveness
+    Legacy records without ``process_start_time`` fall back to pid-only liveness
     (vulnerable to recycling but preserves backward compatibility).
     """
     if record.pid is None or record.pid <= 0:
         return False
-
-    # Check basic PID liveness
-    if sys.platform == "win32":
-        pid_alive = _win_is_alive(record.pid)
-    else:
-        pid_alive = _posix_is_alive(record.pid)
-
-    if not pid_alive:
-        return False
-
-    # Verify process identity via start time if available
-    if record.process_start_time is not None:
-        current_start_time = _get_process_start_time(record.pid)
-        if current_start_time is None:
-            # Failed to get current start time - conservatively treat as dead
-            return False
-        # Allow 1-second tolerance for unit conversion differences
-        if abs(current_start_time - record.process_start_time) > 1.0:
-            # Start time mismatch - PID has been recycled
-            return False
-
-    # Legacy record without process_start_time: pid-only fallback
-    return True
+    return is_pid_alive(record.pid, record.process_start_time)
 
 
 def update_worker_record_with_failure_classification(
