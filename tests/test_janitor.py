@@ -156,6 +156,44 @@ def test_required_check_pending_warns_not_fails() -> None:
     assert any("pending" in w.lower() and "Tests passed" in w for w in verdict.warnings)
 
 
+def test_required_check_failure_exposes_failed_required_checks() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.failed_required_checks == ("Tests passed",)
+    assert verdict.is_check_failure_block is True
+    assert any("Tests passed" in f for f in verdict.failures)
+
+
+def test_required_check_failure_with_other_blocker_is_not_check_failure_block() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+
+    verdict = run_janitor(_green_pr(isDraft=True), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.failed_required_checks == ("Tests passed",)
+    assert verdict.is_check_failure_block is False
+
+
+def test_required_check_infra_failed_is_not_check_failure_block() -> None:
+    checks = [{"name": "Tests passed", "state": "CANCELLED"}]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.failed_required_checks == ()
+    assert verdict.is_check_failure_block is False
+    assert any("infrastructure" in f.lower() for f in verdict.failures)
+
+
 def test_no_required_checks_configured_skips_check_gate() -> None:
     verdict = run_janitor(_green_pr(), [], _config(required_checks=()))
 
