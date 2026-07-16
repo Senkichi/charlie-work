@@ -6697,6 +6697,180 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     assert len(label_error["add_failures"]) > 0
 
 
+def test_merge_ready_carries_forward_approved_verdict_on_clean_rebase(tmp_path: Path) -> None:
+    """Issue #375: a clean rebase with unchanged cumulative patch-id carries the
+    approved verdict forward and lets the PR merge once CI/base checks pass."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    original_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..456 78910\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(original_diff)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "reviewed_patch_id": patch_id,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Simulate a rebase-style head move: the new head is not a 2-parent web-flow
+    # merge commit, so _verify_synced_head would reject it. The cumulative diff
+    # is unchanged, so patch-id carry-forward should keep the approval valid.
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = original_diff
+    fake_gh.compare_overrides[("main", new_head)] = {
+        "base_commit": {"sha": fake_gh.base_head_sha},
+        "merge_base_commit": {"sha": fake_gh.base_head_sha},
+    }
+    fake_gh.commits[new_head] = {
+        "parents": [{"sha": old_head}],
+        "committer": {"login": "someone"},
+        "commit": {"committer": {"name": "Not GitHub"}},
+    }
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is True
+    assert result.data.get("head_moved") is not True
+    assert fake_gh.merged == [(456, "squash")]
+
+    decision = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["reviewed_patch_id"] == patch_id
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    assert pr_state["reviewed_head_sha"] == new_head
+    # The approval was carried forward (not reset to "reviewing") and the PR
+    # proceeded to merge on the same poll.
+    assert pr_state["status"] != "reviewing"
+
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_clean_rebase"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["patch_id"] == patch_id
+
+    # No review_started transition should fire for a clean rebase.
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+def test_merge_ready_changed_patch_id_resets_to_pending(tmp_path: Path) -> None:
+    """Issue #375: if the cumulative diff changes, the approval is voided."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    original_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+original\n"
+    )
+    changed_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+changed\n"
+    )
+    patch_id = _calculate_patch_id(original_diff)
+    old_head = "sha-abc123"
+    new_head = "sha-new-head"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "reviewed_patch_id": patch_id,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = changed_diff
+
+    result = app.merge_ready(456)
+
+    assert result.ok is False
+    assert result.data["head_moved"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "reviewing"
+    assert not any(e["kind"] == "verdict_carried_forward_clean_rebase" for e in state["events"])
+
+
+def test_merge_ready_missing_patch_id_falls_back_to_pending(tmp_path: Path) -> None:
+    """Issue #375: an old approved decision without reviewed_patch_id falls back to
+    the legacy head-SHA reset."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    old_head = "sha-abc123"
+    new_head = "sha-new-head"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+
+    result = app.merge_ready(456)
+
+    assert result.ok is False
+    assert result.data["head_moved"] is True
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
+
+
 def test_review_started_clears_needs_rework() -> None:
     # Re-review after a rework must not stack reviewing on top of needs-rework.
     from charlie_work.labels import transition, TransitionOutcome
