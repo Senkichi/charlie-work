@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from .subprocess_runner import no_console_window_kwargs
+
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
     """Parse /proc/<pid>/stat to extract the starttime field.
@@ -140,6 +142,7 @@ def _enumerate_child_pids(pid: int) -> list[int]:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    **no_console_window_kwargs(),
                 )
                 # Parse output: extract PIDs (one per line)
                 for line in result.stdout.splitlines():
@@ -154,6 +157,7 @@ def _enumerate_child_pids(pid: int) -> list[int]:
                         capture_output=True,
                         text=True,
                         timeout=5,
+                        **no_console_window_kwargs(),
                     )
                     # Parse output: skip header line, extract PIDs
                     for line in result.stdout.splitlines():
@@ -355,6 +359,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True,
                 text=True,
+                **no_console_window_kwargs(),
             )
             # taskkill returns 0 for success, 1 for "process not found" (which is fine)
             if result.returncode in (0, 1):
@@ -428,6 +433,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
             capture_output=True,
             text=True,
             timeout=10,
+            **no_console_window_kwargs(),
         )
 
         # Parse output: extract PIDs (one per line)

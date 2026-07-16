@@ -22,7 +22,7 @@ from typing import Any
 
 from .config import RunnerScalingConfig
 from .github import GitHub
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 
 
 # Marker file name that identifies charlie-managed runner directories
@@ -439,6 +439,7 @@ def remove_runner(
             capture_output=True,
             text=True,
             timeout=60,
+            **no_console_window_kwargs(),
         )
         if result.returncode != 0:
             return False, f"config.cmd remove failed: {result.stderr}"
@@ -901,7 +902,9 @@ def ensure_runner_running(
                 cwd=runner_dir.path,
                 env=env,
                 startupinfo=startupinfo,  # type: ignore
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore
+                **no_console_window_kwargs(  # type: ignore
+                    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                ),
             )
         else:
             # Unix: use double-fork to daemonize
@@ -913,6 +916,7 @@ def ensure_runner_running(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **no_console_window_kwargs(),
             )
 
         return True, f"Launched runner {runner_dir.name} with PID {proc.pid}"
@@ -1334,6 +1338,7 @@ def _launch_runner(runner_dir: Path) -> RunResult:
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **no_console_window_kwargs(),
         )
         return RunResult(returncode=0, stdout="", stderr="", error=None)
     except Exception as exc:
