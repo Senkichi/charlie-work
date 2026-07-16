@@ -2448,3 +2448,221 @@ def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
     assert all(handle.closed for handle in opened_handles), (
         "log_handle/events_handle must be closed when Popen fails, not leaked"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review-dispatch isolation (issue #370/#397): launch_claude_worker(review=True)
+# must route through create_review_checkout (a PR-keyed, detached-HEAD
+# checkout), never create_worktree (the worker's branch-slug worktree). These
+# tests exercise the REAL worktree.create_review_checkout/create_worktree
+# code, not a monkeypatched stand-in, so a regression that re-routes review
+# through the shared worker worktree would fail them.
+# ---------------------------------------------------------------------------
+
+
+def _init_real_repo(repo_root: Path) -> None:
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"], cwd=repo_root, check=True, capture_output=True
+    )
+
+
+def _repo_head_sha(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_launch_claude_worker_review_uses_isolated_checkout_not_worker_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A review=True launch must never call create_worktree — only
+    create_review_checkout — and must land in a directory distinct from a
+    live worker's worktree for the very same branch.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    branch = "agent/issue-500-fix"
+    head_sha = _repo_head_sha(repo_root)
+
+    # Simulate a live worker worktree for this branch, using the real
+    # (non-monkeypatched) create_worktree, sitting under a separate dir.
+    from charlie_work.worktree import create_worktree
+
+    worker_info = create_worktree(
+        repo_root, branch, base_ref="HEAD", worktrees_dir=tmp_path / "worktrees"
+    )
+    worker_marker = worker_info.path / "worker-in-progress.txt"
+    worker_marker.write_text("do not touch\n", encoding="utf-8")
+
+    def _forbid_create_worktree(*_args, **_kwargs):
+        raise AssertionError(
+            "review=True must never call create_worktree — it must use "
+            "create_review_checkout instead"
+        )
+
+    monkeypatch.setattr(claude_code, "create_worktree", _forbid_create_worktree)
+
+    record = launch_claude_worker(
+        500,
+        branch,
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert record.ok, record.error
+    review_path = Path(record.worktree_path)
+    assert review_path != worker_info.path
+    assert review_path.parent == sessions_dir
+
+    # The worker's worktree is completely untouched by the review launch.
+    assert worker_info.path.exists()
+    assert worker_marker.exists()
+    assert worker_marker.read_text(encoding="utf-8") == "do not touch\n"
+
+
+def test_launch_claude_worker_review_defaults_to_read_only_permission_mode(
+    tmp_path: Path,
+) -> None:
+    """Reviewer sessions default to --permission-mode plan (read-only), not
+    the worker default of acceptEdits."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        501,
+        "agent/issue-501-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "plan"
+    assert "acceptEdits" not in record.command
+
+
+def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
+    tmp_path: Path,
+) -> None:
+    """Non-review (worker) launches keep the pre-existing acceptEdits default."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "sessions"
+
+    record = launch_claude_worker(
+        502,
+        "agent/issue-502-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+    )
+
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "acceptEdits"
+
+
+def test_launch_claude_worker_review_missing_head_sha_returns_error_record(
+    tmp_path: Path,
+) -> None:
+    """review=True without head_sha is a caller error (ValueError), surfaced
+    as an error record — launch_claude_worker must never raise."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+
+    record = launch_claude_worker(
+        503,
+        "agent/issue-503-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=None,
+    )
+
+    assert not record.ok
+    assert record.pid is None
+    assert "head_sha" in record.error
+
+
+def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If writing the prompt file fails in review mode, the isolated review
+    checkout — not a worker worktree — is torn down (via
+    remove_review_checkout, keyed by PR number, not remove_worktree)."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    original_write_text = Path.write_text
+
+    def failing_write_text(self, content, encoding=None, errors=None):
+        if self.name == ".orchestrator-prompt.md":
+            raise OSError("Mock prompt write failure")
+        return original_write_text(self, content, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert not record.ok
+    assert "failed to write prompt file" in record.error
+
+    checkout_path = sessions_dir / "pr-504"
+    assert not checkout_path.exists()
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert str(checkout_path) not in result.stdout

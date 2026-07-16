@@ -4689,6 +4689,203 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     assert state["prs"]["100"]["reviewer_pid"] == 12345
 
 
+def _init_git_repo(repo_root: Path) -> None:
+    import subprocess
+
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Path) -> None:
+    """Issue #397: a reaped stale-claim review must tear down that PR's
+    isolated review checkout, not just free the state.json claim."""
+    from datetime import timedelta
+
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 100, head_sha, reviews_dir=reviews_dir)
+    assert checkout.path.exists()
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_dispatched,
+            "reviewer_pid": 999999999,  # not a real live pid
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(entry.get("pr") == 100 for entry in stalled)
+    assert not checkout.path.exists()
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert str(checkout.path) not in result.stdout
+
+
+def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
+    tmp_path: Path,
+) -> None:
+    """Issue #397: once record_review has recorded a verdict
+    (review_dispatch_completed) and the reviewer's own sidecar process is no
+    longer alive, the isolated review checkout is reaped. Liveness must be
+    checked via the sidecar in reviews_dir (iter_workers), since record_review
+    already cleared state.json's reviewer_pid by this point."""
+    from datetime import timedelta
+
+    from charlie_work.workflow import _reap_completed_review_checkouts
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 200, head_sha, reviews_dir=reviews_dir)
+    assert checkout.path.exists()
+
+    # A sidecar recording a definitely-dead pid (record_review does not
+    # delete the sidecar itself, only clears state.json's own pid fields).
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = {
+        "issue_number": 200,
+        "branch": "agent/issue-20-fix",
+        "worktree_path": str(checkout.path),
+        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-200.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-200.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {},
+                "prs": {
+                    "200": {
+                        "number": 200,
+                        "review_dispatch_status": "review_dispatch_completed",
+                        "reviewer_pid": None,
+                        "reviewer_process_start_time": None,
+                    }
+                },
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
+
+    assert reaped == [200]
+    assert not checkout.path.exists()
+
+
+def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
+    tmp_path: Path,
+) -> None:
+    """A completed-verdict PR whose reviewer sidecar is still alive must NOT
+    have its checkout removed out from under the exiting process.
+
+    Uses this test process's own PID/start-time as the sidecar's recorded
+    identity, so the real (non-monkeypatched) claude_code.is_worker_alive
+    liveness+identity check reports it genuinely alive — matching how
+    test_count_live_sessions_ghost_worker_pid_corroborated_by_state (same
+    file) proves a "ghost" liveness case elsewhere in this suite.
+    """
+    from charlie_work.claude_code import _get_process_start_time
+    from charlie_work.workflow import _reap_completed_review_checkouts
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 201, head_sha, reviews_dir=reviews_dir)
+
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+    sidecar = {
+        "issue_number": 201,
+        "branch": "agent/issue-21-fix",
+        "worktree_path": str(checkout.path),
+        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": current_pid,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-201.claude.log"),
+        "error": None,
+        "process_start_time": _get_process_start_time(current_pid),
+    }
+    (reviews_dir / "issue-201.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {},
+                "prs": {
+                    "201": {
+                        "number": 201,
+                        "review_dispatch_status": "review_dispatch_completed",
+                        "reviewer_pid": None,
+                        "reviewer_process_start_time": None,
+                    }
+                },
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
+
+    assert reaped == []
+    assert checkout.path.exists()
+
+
 def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
     """Issue #370: loop() runs dispatch_reviews() and the per-PR merge lane uses the verdict."""
     config = OrchestratorConfig(

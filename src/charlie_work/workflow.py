@@ -49,7 +49,12 @@ from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
-from .worktree import inspect_worktree_state, push_branch, resolve_base_branch_name
+from .worktree import (
+    inspect_worktree_state,
+    push_branch,
+    remove_review_checkout,
+    resolve_base_branch_name,
+)
 from .state import (
     append_event,
     is_claim_stale,
@@ -736,6 +741,7 @@ def _detect_and_handle_stalled_reviews(
     reviews_dir: Path,
     state_file: Path,
     config: OrchestratorConfig,
+    repo_root: Path,
 ) -> list[dict[str, Any]]:
     """Detect reviewer processes that died without a verdict and free their claims.
 
@@ -745,7 +751,9 @@ def _detect_and_handle_stalled_reviews(
     ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
     stale timestamp as ``review_dispatch_failed_at``. The next
     ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
-    timeout elapses.
+    timeout elapses. Every reap path also tears down that PR's isolated review
+    checkout (``worktree.remove_review_checkout``) so a dead reviewer never
+    leaks its detached-HEAD checkout directory.
 
     This is intentionally simpler than ``_detect_and_handle_stalled_sessions``:
     review dispatch has no provider-rate-limit throttle logic and the reviewer
@@ -796,6 +804,7 @@ def _detect_and_handle_stalled_reviews(
         )
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
+        remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
 
     # Catch state entries that have no sidecar (launch crashed before sidecar
     # write, or sidecar was deleted) and are past the stale timeout.
@@ -831,6 +840,8 @@ def _detect_and_handle_stalled_reviews(
                         "pending_at": pending_at,
                     }
                 )
+                if pr_key.isdigit():
+                    remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
             process_start_time = pr_state.get("reviewer_process_start_time")
@@ -863,11 +874,52 @@ def _detect_and_handle_stalled_reviews(
                         "dispatched_at": dispatched_at,
                     }
                 )
+                if pr_key.isdigit():
+                    remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
 
     if changed:
         save_state(state_file, state)
 
     return stalled
+
+
+def _reap_completed_review_checkouts(
+    repo_root: Path,
+    reviews_dir: Path,
+    state_file: Path,
+) -> list[int]:
+    """Remove isolated review checkouts for PRs whose reviewer already
+    recorded a verdict, once the reviewer process itself has exited.
+
+    ``record_review`` (the CLI command a reviewer session runs to record its
+    verdict) sets ``review_dispatch_status = "review_dispatch_completed"`` and
+    clears ``reviewer_pid``/``reviewer_process_start_time`` on state.json as
+    part of recording the verdict — so by the time this sweep can see
+    "completed", state.json itself no longer carries a PID to check liveness
+    against. The claude-code sidecar in ``reviews_dir`` still does (it isn't
+    touched by ``record_review``), so liveness is checked via ``iter_workers``
+    instead. This avoids removing the checkout while the reviewer session
+    that just wrote the verdict is still in the process of exiting.
+    """
+    state = load_state_locked(state_file)
+    completed_prs = {
+        int(pr_key)
+        for pr_key, entry in state.get("prs", {}).items()
+        if isinstance(entry, dict)
+        and entry.get("review_dispatch_status") == "review_dispatch_completed"
+        and pr_key.isdigit()
+    }
+    if not completed_prs:
+        return []
+
+    alive_pr_numbers = {w.issue_number for w in iter_workers(reviews_dir) if w.is_alive()}
+    reaped: list[int] = []
+    for pr_number in sorted(completed_prs):
+        if pr_number in alive_pr_numbers:
+            continue
+        if remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir):
+            reaped.append(pr_number)
+    return reaped
 
 
 def _append_sweep_events(
@@ -3356,9 +3408,14 @@ class OrchestratorApp:
         reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
 
         # Run the orphan/stalled sweep before selection so dead reviewers free
-        # their claim/slot. In dry-run mode we skip the sweep to stay read-only.
+        # their claim/slot, and reap isolated review checkouts for both the
+        # stale-claim and completed-verdict cases. In dry-run mode we skip
+        # both sweeps to stay read-only.
         if not self.dry_run:
-            _detect_and_handle_stalled_reviews(reviews_dir, self.paths.state_file, self.config)
+            _detect_and_handle_stalled_reviews(
+                reviews_dir, self.paths.state_file, self.config, self.repo_root
+            )
+            _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
 
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
@@ -3463,6 +3520,11 @@ class OrchestratorApp:
                     failed.append({"pr": pr_number, "error": "PR headRefName missing"})
                     continue
 
+                head_sha = pr.get("headRefOid")
+                if not head_sha:
+                    failed.append({"pr": pr_number, "error": "PR headRefOid missing"})
+                    continue
+
                 # Cross-repo PRs are never linked for lifecycle purposes by
                 # linked_issue_number, so the only way we see one here is an
                 # unexpected state; strip an owner prefix defensively.
@@ -3471,22 +3533,18 @@ class OrchestratorApp:
 
                 prompt_text = prompt_path.read_text(encoding="utf-8")
                 claude_cfg = self.config.claude_code
+                # Reviewers never use worktrees_dir/venv_source — those key
+                # the worker's branch-slug worktree, which create_review_checkout
+                # (routed to via review=True + head_sha) never touches. Only
+                # repo_root/sessions_dir/env/materialize_dirs/review/head_sha
+                # are meaningful for a reviewer launch.
                 launch_kwargs: dict[str, Any] = {
                     "repo_root": self.repo_root,
                     "sessions_dir": reviews_dir,
-                    "worktrees_dir": (
-                        self._resolve(claude_cfg.worktrees_dir)
-                        if claude_cfg.worktrees_dir
-                        else None
-                    ),
-                    "venv_source": (
-                        self._resolve(claude_cfg.venv_source)
-                        if claude_cfg.venv_source is not None
-                        else None
-                    ),
                     "env": claude_cfg.worker_env,
                     "materialize_dirs": self.config.dispatch.materialize_dirs,
                     "review": True,
+                    "head_sha": head_sha,
                 }
                 if claude_cfg.command:
                     launch_kwargs["command_template"] = claude_cfg.command
