@@ -1218,11 +1218,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Inspect the worktree before deciding how to classify and relabel.
             # This is the single enforcement point for issue #252.
             worktree_path = Path(w.worktree_path)
-            inspection = inspect_worktree_state(
-                worktree_path,
-                config.dispatch.base_ref,
-                config.dispatch.injected_paths,
-            )
+            inspection = inspect_worktree_state(worktree_path, config.dispatch.base_ref)
             is_completed = inspection.state == WorktreeState.COMPLETED
 
             # Post-mortem extraction (issue #261) is intertwined with log-tail
@@ -2679,12 +2675,43 @@ class OrchestratorApp:
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
         )
+
+        # Escalation is terminal: once a PR or its linked issue is marked
+        # escalated, no further review packet generation or label transitions should
+        # occur until a human explicitly de-escalates. This prevents a later loop()
+        # pass from clobbering the agent:human-needed label with a review_started
+        # transition (issue #384), and it protects PRs that have no resolvable linked
+        # issue (cross-repo/fork PRs or branches outside the configured prefix) from
+        # falling through to the janitor gate and losing their escalated marker.
+        state = load_state_locked(self.paths.state_file)
+        pr_state = state.get("prs", {}).get(str(pr_number), {})
+        pr_escalated = pr_state.get("status") == "escalated"
+        issue_escalated = False
+        if issue_number is not None:
+            issue_state = state.get("issues", {}).get(str(issue_number), {})
+            issue_escalated = issue_state.get("status") == "escalated"
+        if pr_escalated or issue_escalated:
+            reason = (
+                f"issue #{issue_number} is escalated; review skipped"
+                if issue_number is not None and issue_escalated
+                else f"PR #{pr_number} is escalated; review skipped"
+            )
+            return CommandResult(
+                True,
+                reason,
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "skipped": True,
+                    "checks_unavailable": False,
+                },
+            )
+
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
-        state = load_state_locked(self.paths.state_file)
         if str(pr_number) in state.get("prs", {}):
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -5598,7 +5625,7 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         prompt_path = pr_dir / "rework-prompt.md"
         prompt = self._render(
-            self.config.dispatch.rework_template,
+            "rework.md",
             {
                 "pr_number": pr_number,
                 "pr_title": pr.get("title", ""),
