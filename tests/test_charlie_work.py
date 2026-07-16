@@ -2627,11 +2627,11 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == github_module._LIST_RETRY_ATTEMPTS
+    assert call_count == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -5979,6 +5979,166 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     assert state["prs"]["456"]["janitor_warnings"]
 
 
+def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["status"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "CI failed on Tests passed; push a fix" in prompt_text
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["summary"] == "CI failed on Tests passed; push a fix"
+
+
+def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    """Issue #376: a check-failure PR with no linked issue still dead-ends at the janitor gate."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    # Remove every issue reference so linked_issue_number returns None.
+    fake_gh.prs[0]["headRefName"] = "misc/fix-search"
+    fake_gh.prs[0]["title"] = "fix search"
+    fake_gh.prs[0]["body"] = "No issue reference here."
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert "123" not in state.get("issues", {})
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> None:
+    """Issue #376: an infrastructure check failure (CANCELLED) is not routed to rework."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
+    """Issue #376: repeated check-failure reworks escalate to human_needed via the request_changes cap."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix1"
+    )
+    result2 = app.review(456)
+    assert result2.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["request_changes_count"] == 2
+
+    fake_gh.pr_head_shas[456] = "sha-3"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix2"
+    )
+    result3 = app.review(456)
+    assert result3.ok is True
+    assert result3.data["escalated"] is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_janitor_required_check_failure_noop_does_not_reroute(tmp_path: Path) -> None:
+    """Issue #376: a check-failure rework that produced no new content is not re-reviewed."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    diff_text = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = diff_text
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    request_count = state["prs"]["456"]["request_changes_count"]
+    needs_rework_count = fake_gh.labels_added.count((123, config.labels.needs_rework))
+
+    result2 = app.review(456)
+    assert result2.ok is False
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["prs"]["456"]["request_changes_count"] == request_count
+    assert fake_gh.labels_added.count((123, config.labels.needs_rework)) == needs_rework_count
+    assert any("unchanged" in f.lower() for f in result2.data["janitor_failures"])
+
+
 def test_render_test_adequacy_section_unit() -> None:
     """Unit test for render_test_adequacy_section (issue #180)."""
     from charlie_work.janitor import TestAdequacyFacts
@@ -6695,6 +6855,180 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     assert label_error["edge"] == "review_started"
     assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
     assert len(label_error["add_failures"]) > 0
+
+
+def test_merge_ready_carries_forward_approved_verdict_on_clean_rebase(tmp_path: Path) -> None:
+    """Issue #375: a clean rebase with unchanged cumulative patch-id carries the
+    approved verdict forward and lets the PR merge once CI/base checks pass."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    original_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..456 78910\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(original_diff)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "reviewed_patch_id": patch_id,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Simulate a rebase-style head move: the new head is not a 2-parent web-flow
+    # merge commit, so _verify_synced_head would reject it. The cumulative diff
+    # is unchanged, so patch-id carry-forward should keep the approval valid.
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = original_diff
+    fake_gh.compare_overrides[("main", new_head)] = {
+        "base_commit": {"sha": fake_gh.base_head_sha},
+        "merge_base_commit": {"sha": fake_gh.base_head_sha},
+    }
+    fake_gh.commits[new_head] = {
+        "parents": [{"sha": old_head}],
+        "committer": {"login": "someone"},
+        "commit": {"committer": {"name": "Not GitHub"}},
+    }
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is True
+    assert result.data.get("head_moved") is not True
+    assert fake_gh.merged == [(456, "squash")]
+
+    decision = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["reviewed_patch_id"] == patch_id
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    assert pr_state["reviewed_head_sha"] == new_head
+    # The approval was carried forward (not reset to "reviewing") and the PR
+    # proceeded to merge on the same poll.
+    assert pr_state["status"] != "reviewing"
+
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_clean_rebase"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["patch_id"] == patch_id
+
+    # No review_started transition should fire for a clean rebase.
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+
+
+def test_merge_ready_changed_patch_id_resets_to_pending(tmp_path: Path) -> None:
+    """Issue #375: if the cumulative diff changes, the approval is voided."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    original_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+original\n"
+    )
+    changed_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+changed\n"
+    )
+    patch_id = _calculate_patch_id(original_diff)
+    old_head = "sha-abc123"
+    new_head = "sha-new-head"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "reviewed_patch_id": patch_id,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = changed_diff
+
+    result = app.merge_ready(456)
+
+    assert result.ok is False
+    assert result.data["head_moved"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    assert (123, "agent:reviewing") in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "reviewing"
+    assert not any(e["kind"] == "verdict_carried_forward_clean_rebase" for e in state["events"])
+
+
+def test_merge_ready_missing_patch_id_falls_back_to_pending(tmp_path: Path) -> None:
+    """Issue #375: an old approved decision without reviewed_patch_id falls back to
+    the legacy head-SHA reset."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    old_head = "sha-abc123"
+    new_head = "sha-new-head"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+
+    result = app.merge_ready(456)
+
+    assert result.ok is False
+    assert result.data["head_moved"] is True
+    assert result.data["can_merge"] is False
+    assert fake_gh.merged == []
 
 
 def test_review_started_clears_needs_rework() -> None:
@@ -17431,7 +17765,9 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
             return "owner/repo"
 
     # Monkeypatch GitHub to use our fake
-    def fake_github(repo_root: Path, dry_run: bool = False) -> GitHub:
+    def fake_github(
+        repo_root: Path, dry_run: bool = False, runtime: object | None = None
+    ) -> GitHub:
         return FakeGitHub(repo_root=repo_root, dry_run=dry_run)
 
     monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
