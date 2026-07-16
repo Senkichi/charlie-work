@@ -11,6 +11,21 @@ from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
+# Root-relative path the Claude Code adapter writes to in each worktree.
+CLAUDE_CODE_PROMPT_FILENAME = ".orchestrator-prompt.md"
+
+
+def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Return path strings with Windows backslash separators normalized to '/'.
+
+    Git reports worktree paths with forward slashes even on Windows hosts, while
+    YAML/config overrides may contain backslashes if the operator writes them
+    unquoted. Normalizing once at the config boundary makes matching in
+    ``_worker_authored_dirty`` independent of how the separator was encoded.
+    """
+    return tuple(str(p).replace("\\", "/") for p in paths)
+
+
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worker_blocked", "worktree_unsafe"}
 )
@@ -120,6 +135,9 @@ class DispatchConfig:
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
     worker_template: str = "worker.md"
+    # Package template rendered for rework prompts. Mirrors worker_template so the
+    # orchestrator has a single source of truth for the rework prompt filename.
+    rework_template: str = "rework.md"
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -143,6 +161,34 @@ class DispatchConfig:
     # Devin's "overall message rate limit" firing when 3 sessions launched
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
     launch_stagger_seconds: int = 45
+    # Worktree-relative paths owned by the orchestrator and excluded from
+    # "is the worktree dirty?" checks. By default only the Claude Code adapter's
+    # in-worktree prompt file is excluded (it is written into each worktree by
+    # ``launch_claude_worker``). The Devin shell adapter writes rendered prompts
+    # outside the worktree, and no orchestrator code copies them into
+    # ``.devin/prompts/...`` by default; operators whose config materializes such
+    # a directory or whose worker writes prompt files back into the worktree must
+    # set ``injected_paths`` explicitly. Paths are normalized to forward slashes
+    # so Windows-style backslash separators in config still match git-reported
+    # paths.
+    injected_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Normalize to a tuple of forward-slash strings. If the operator did not
+        # explicitly set injected_paths, only the verified Claude Code in-worktree
+        # prompt file is excluded; other adapters must be opted in explicitly.
+        if self.injected_paths:
+            object.__setattr__(
+                self,
+                "injected_paths",
+                _normalize_injected_paths(tuple(str(p) for p in self.injected_paths)),
+            )
+        else:
+            object.__setattr__(
+                self,
+                "injected_paths",
+                _normalize_injected_paths((CLAUDE_CODE_PROMPT_FILENAME,)),
+            )
 
 
 @dataclass(frozen=True)
@@ -724,6 +770,22 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'dispatch' key 'launch_stagger_seconds' must be >= 0, "
             f"got {launch_stagger_seconds}"
+        )
+    injected_paths = dispatch_data.get("injected_paths")
+    if injected_paths is not None:
+        if not isinstance(injected_paths, list):
+            raise ConfigError(
+                "config section 'dispatch' key 'injected_paths' must be a list of "
+                f"strings, got {type(injected_paths).__name__}"
+            )
+        for item in injected_paths:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'dispatch' key 'injected_paths' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        dispatch_data["injected_paths"] = _normalize_injected_paths(
+            tuple(str(item) for item in injected_paths)
         )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
