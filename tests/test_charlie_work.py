@@ -14851,6 +14851,72 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     assert state["prs"]["456"]["status"] == "escalated"
 
 
+def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
+    """Issue #384: PR-level escalation is terminal even without a linked issue.
+
+    Cross-repo PRs (or same-repo branches that don't match the configured
+    prefix) fail closed: ``linked_issue_number`` returns ``None``.
+    ``record_review`` still sets the PR's own state status to ``"escalated"``
+    after ``max_rework_cycles``. A later ``review()`` pass must short-circuit on
+    that PR-level status and must not fall through to the janitor gate, which
+    would overwrite ``status`` with ``"janitor_blocked"``.
+    """
+    config = OrchestratorConfig()  # max_rework_cycles = 2, require_issue_link = True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Cross-repo PRs never resolve to a linked issue for lifecycle purposes.
+    fake_gh.prs[0]["isCrossRepository"] = True
+
+    # First request_changes (count = 1, head = "sha-1")
+    fake_gh.pr_head_shas[456] = "sha-1"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Second request_changes (count = 2, head = "sha-2")
+    fake_gh.pr_head_shas[456] = "sha-2"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
+    app.record_review(456, "request_changes", summary="fix B")
+
+    # Third request_changes (escalated, head = "sha-3")
+    fake_gh.pr_head_shas[456] = "sha-3"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
+    result = app.record_review(456, "request_changes", summary="fix C")
+    assert result.data["escalated"] is True
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "escalated"
+    # No issue entry should exist for an issue-less PR.
+    assert "123" not in state.get("issues", {})
+    # Label transitions are gated on issue_number, so no labels should fire.
+    assert not fake_gh.labels_added
+    assert not fake_gh.labels_removed
+
+    # Clear label tracking to isolate the review() call.
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    # Simulate a later loop/review pass with a new head and new diff.
+    fake_gh.pr_head_shas[456] = "sha-new"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+new change"
+    review_result = app.review(456)
+
+    # review() must short-circuit and must not touch anything.
+    assert review_result.ok is True
+    assert review_result.data.get("skipped") is True
+    assert not fake_gh.labels_added
+    assert not fake_gh.labels_removed
+
+    # No review packet/decision should be (re)written on the short-circuited call.
+    pr_dir = paths.prs / "pr-456"
+    assert not (pr_dir / "review-prompt.md").exists()
+
+    # The PR state must remain escalated, not be clobbered to janitor_blocked.
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "escalated"
+
+
 def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     """Review_started transition should fire when there's no prior verdict."""
     config = OrchestratorConfig()

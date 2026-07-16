@@ -2676,25 +2676,36 @@ class OrchestratorApp:
             branch_prefix=self.config.dispatch.branch_prefix,
         )
 
-        # Escalation is terminal: once an issue is marked escalated, no further
-        # review packet generation or label transitions should occur until a human
-        # explicitly de-escalates. This prevents a later loop() pass from clobbering
-        # the agent:human-needed label with a review_started transition (issue #384).
+        # Escalation is terminal: once a PR or its linked issue is marked
+        # escalated, no further review packet generation or label transitions should
+        # occur until a human explicitly de-escalates. This prevents a later loop()
+        # pass from clobbering the agent:human-needed label with a review_started
+        # transition (issue #384), and it protects PRs that have no resolvable linked
+        # issue (cross-repo/fork PRs or branches outside the configured prefix) from
+        # falling through to the janitor gate and losing their escalated marker.
         state = load_state_locked(self.paths.state_file)
+        pr_state = state.get("prs", {}).get(str(pr_number), {})
+        pr_escalated = pr_state.get("status") == "escalated"
+        issue_escalated = False
         if issue_number is not None:
             issue_state = state.get("issues", {}).get(str(issue_number), {})
-            pr_state = state.get("prs", {}).get(str(pr_number), {})
-            if issue_state.get("status") == "escalated" or pr_state.get("status") == "escalated":
-                return CommandResult(
-                    True,
-                    f"issue #{issue_number} is escalated; review skipped",
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "skipped": True,
-                        "checks_unavailable": False,
-                    },
-                )
+            issue_escalated = issue_state.get("status") == "escalated"
+        if pr_escalated or issue_escalated:
+            reason = (
+                f"issue #{issue_number} is escalated; review skipped"
+                if issue_number is not None and issue_escalated
+                else f"PR #{pr_number} is escalated; review skipped"
+            )
+            return CommandResult(
+                True,
+                reason,
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "skipped": True,
+                    "checks_unavailable": False,
+                },
+            )
 
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
