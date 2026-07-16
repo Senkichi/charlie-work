@@ -133,6 +133,94 @@ def is_claim_stale(claim_timestamp: str | None) -> bool:
         return True
 
 
+def _operator_claim_timestamp(entry: Any) -> str | None:
+    """Return the operator_claimed_at timestamp for an issue entry, if any."""
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("operator_claimed_at") or None
+
+
+def is_operator_claimed(entry: Any) -> bool:
+    """Return True when an issue entry carries a live operator claim.
+
+    Operator claims are intentionally not auto-expired: only an explicit
+    ``--release`` removes the claim. This prevents an operator from being
+    silently displaced while working in a worktree.
+    """
+    return _operator_claim_timestamp(entry) is not None
+
+
+def operator_claimed_issues(data: dict[str, Any]) -> set[int]:
+    """Return the set of issue numbers currently under an operator claim."""
+    claimed: set[int] = set()
+    for issue_number_str, entry in data.get("issues", {}).items():
+        if is_operator_claimed(entry):
+            try:
+                claimed.add(int(issue_number_str))
+            except (ValueError, TypeError):
+                continue
+    return claimed
+
+
+def stale_operator_claims(
+    data: dict[str, Any], threshold_minutes: int = _STALE_CLAIM_TIMEOUT_MINUTES
+) -> set[int]:
+    """Return issue numbers whose operator claim is older than ``threshold_minutes``.
+
+    Used for digest warnings; stale claims still block dispatch until released.
+    """
+    now = datetime.now(UTC)
+    stale: set[int] = set()
+    for issue_number_str, entry in data.get("issues", {}).items():
+        timestamp = _operator_claim_timestamp(entry)
+        if not timestamp:
+            continue
+        try:
+            claim_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if (now - claim_time) > timedelta(minutes=threshold_minutes):
+                stale.add(int(issue_number_str))
+        except (ValueError, TypeError):
+            # Malformed timestamp — treat as stale to be safe
+            stale.add(int(issue_number_str))
+    return stale
+
+
+def set_operator_claimed(
+    data: dict[str, Any], issue_number: int, timestamp: str | None = None
+) -> dict[str, Any]:
+    """Return a new state dict with ``operator_claimed_at`` set for ``issue_number``.
+
+    Does not mutate ``data``.
+    """
+    timestamp = timestamp or utc_now()
+    issue_key = str(issue_number)
+    entry = {
+        **data.get("issues", {}).get(issue_key, {}),
+        "number": issue_number,
+        "operator_claimed_at": timestamp,
+    }
+    return {**data, "issues": {**data.get("issues", {}), issue_key: entry}}
+
+
+def release_operator_claimed(data: dict[str, Any], issue_number: int) -> dict[str, Any]:
+    """Return a new state dict with the operator claim removed.
+
+    Does not mutate ``data``. Removes the issue entry if it becomes empty
+    (after preserving ``number``).
+    """
+    issue_key = str(issue_number)
+    entry = {
+        k: v
+        for k, v in data.get("issues", {}).get(issue_key, {}).items()
+        if k != "operator_claimed_at"
+    }
+    if not entry:
+        issues = {k: v for k, v in data.get("issues", {}).items() if k != issue_key}
+    else:
+        issues = {**data.get("issues", {}), issue_key: entry}
+    return {**data, "issues": issues}
+
+
 @contextmanager
 def state_lock(state_path: Path):
     """Cross-process advisory lock for state.json read-modify-write cycles.

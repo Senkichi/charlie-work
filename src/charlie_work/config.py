@@ -14,6 +14,9 @@ DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 # Root-relative path the Claude Code adapter writes to in each worktree.
 CLAUDE_CODE_PROMPT_FILENAME = ".orchestrator-prompt.md"
 
+# Worktree writer marker used to enforce single-writer-per-branch (issue #400).
+WRITER_MARKER_FILENAME = ".charlie-writer.json"
+
 
 def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Return path strings with Windows backslash separators normalized to '/'.
@@ -162,33 +165,26 @@ class DispatchConfig:
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
     launch_stagger_seconds: int = 45
     # Worktree-relative paths owned by the orchestrator and excluded from
-    # "is the worktree dirty?" checks. By default only the Claude Code adapter's
-    # in-worktree prompt file is excluded (it is written into each worktree by
-    # ``launch_claude_worker``). The Devin shell adapter writes rendered prompts
-    # outside the worktree, and no orchestrator code copies them into
-    # ``.devin/prompts/...`` by default; operators whose config materializes such
-    # a directory or whose worker writes prompt files back into the worktree must
-    # set ``injected_paths`` explicitly. Paths are normalized to forward slashes
-    # so Windows-style backslash separators in config still match git-reported
-    # paths.
+    # "is the worktree dirty?" checks. By default the Claude Code adapter's
+    # in-worktree prompt file and the per-worktree writer marker are excluded.
+    # The Devin shell adapter writes rendered prompts outside the worktree, and no
+    # orchestrator code copies them into ``.devin/prompts/...`` by default;
+    # operators whose config materializes such a directory or whose worker
+    # writes prompt files back into the worktree must set ``injected_paths``
+    # explicitly. Paths are normalized to forward slashes so Windows-style
+    # backslash separators in config still match git-reported paths.
     injected_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        # Normalize to a tuple of forward-slash strings. If the operator did not
-        # explicitly set injected_paths, only the verified Claude Code in-worktree
-        # prompt file is excluded; other adapters must be opted in explicitly.
+        # Normalize to a tuple of forward-slash strings. The writer marker is
+        # always excluded so it can never be mistaken for worker-authored work.
         if self.injected_paths:
-            object.__setattr__(
-                self,
-                "injected_paths",
-                _normalize_injected_paths(tuple(str(p) for p in self.injected_paths)),
-            )
+            base = list(self.injected_paths)
         else:
-            object.__setattr__(
-                self,
-                "injected_paths",
-                _normalize_injected_paths((CLAUDE_CODE_PROMPT_FILENAME,)),
-            )
+            base = [CLAUDE_CODE_PROMPT_FILENAME]
+        if WRITER_MARKER_FILENAME not in base:
+            base.append(WRITER_MARKER_FILENAME)
+        object.__setattr__(self, "injected_paths", _normalize_injected_paths(base))
 
 
 @dataclass(frozen=True)
