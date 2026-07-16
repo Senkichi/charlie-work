@@ -725,6 +725,7 @@ def detect_cross_pr_revert(
             capture_output=True,
             text=True,
             check=False,
+            **no_console_window_kwargs(),
         )
         if fetch.returncode != 0:
             return None
@@ -741,6 +742,7 @@ def detect_cross_pr_revert(
             capture_output=True,
             text=True,
             check=False,
+            **no_console_window_kwargs(),
         )
         if commits.returncode != 0:
             return None
@@ -754,6 +756,7 @@ def detect_cross_pr_revert(
                 capture_output=True,
                 text=True,
                 check=False,
+                **no_console_window_kwargs(),
             )
             if subject_proc.returncode != 0:
                 continue
@@ -774,6 +777,7 @@ def detect_cross_pr_revert(
                     capture_output=True,
                     text=True,
                     check=False,
+                    **no_console_window_kwargs(),
                 )
                 if match_proc.returncode != 0:
                     continue
@@ -786,6 +790,7 @@ def detect_cross_pr_revert(
                         capture_output=True,
                         text=True,
                         check=False,
+                        **no_console_window_kwargs(),
                     )
                     if base_subject_proc.returncode != 0:
                         continue
