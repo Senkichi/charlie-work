@@ -3537,7 +3537,12 @@ class OrchestratorApp:
                 # the worker's branch-slug worktree, which create_review_checkout
                 # (routed to via review=True + head_sha) never touches. Only
                 # repo_root/sessions_dir/env/materialize_dirs/review/head_sha
-                # are meaningful for a reviewer launch.
+                # are meaningful for a reviewer launch. `claude_cfg.command`
+                # is deliberately NOT forwarded here: it is a worker-tuning
+                # field, and launch_claude_worker(review=True, ...) hard-pins
+                # the read-only command template regardless of what is passed
+                # for command_template, so passing it through would be
+                # misleading dead code (PR #397 round-2 review).
                 launch_kwargs: dict[str, Any] = {
                     "repo_root": self.repo_root,
                     "sessions_dir": reviews_dir,
@@ -3546,8 +3551,6 @@ class OrchestratorApp:
                     "review": True,
                     "head_sha": head_sha,
                 }
-                if claude_cfg.command:
-                    launch_kwargs["command_template"] = claude_cfg.command
                 if claude_cfg.tee_stream_json:
                     launch_kwargs["tee_stream_json"] = True
 

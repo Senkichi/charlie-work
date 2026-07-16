@@ -2577,6 +2577,49 @@ def test_launch_claude_worker_review_defaults_to_read_only_permission_mode(
     assert "acceptEdits" not in record.command
 
 
+def test_launch_claude_worker_review_ignores_caller_command_template_override(
+    tmp_path: Path,
+) -> None:
+    """Round-2 review (PR #397): a reviewer's read-only posture must not be
+    defeatable by an operator's worker-tuning `claude_code.command` override.
+
+    workflow.dispatch_reviews forwards `command_template` from
+    ClaudeCodeConfig.command only when non-empty (see workflow.py); this test
+    simulates the exact defeat scenario the round-2 verdict describes — an
+    operator who has uncommented the example config's acceptEdits override
+    for worker-tuning reasons — by passing a non-empty, acceptEdits-bearing
+    command_template straight into launch_claude_worker(review=True, ...).
+    The reviewer must still launch with plan mode: the adapter hard-pins the
+    review command template and ignores any caller-supplied override.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    operator_worker_override = ("claude", "-p", "--permission-mode", "acceptEdits")
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        command_template=operator_worker_override,
+    )
+
+    # Matches the sibling default-permission-mode test's convention: assert
+    # on the rendered argv, not on launch success (the `claude` binary need
+    # not be spawnable in every test environment — the command is rendered
+    # and recorded before the process-launch step either way).
+    assert "--permission-mode" in record.command
+    mode_index = record.command.index("--permission-mode")
+    assert record.command[mode_index + 1] == "plan"
+    assert "acceptEdits" not in record.command
+
+
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
     tmp_path: Path,
 ) -> None:

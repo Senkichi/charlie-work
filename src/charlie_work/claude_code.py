@@ -365,6 +365,39 @@ def _error_record(
     )
 
 
+def _sanitize_review_command_template(
+    command_template: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Hard-pin the read-only reviewer posture onto ``command_template``.
+
+    A review launch must always carry ``--permission-mode plan`` — this is
+    an invariant, not a default a caller-supplied (or config-forwarded)
+    ``command_template`` can defeat. ``ClaudeCodeConfig.command`` is a single
+    field shared with worker dispatch (workers want ``acceptEdits``); if an
+    operator's worker-tuning override were honored verbatim for reviewers
+    too, it would silently grant write access to reviewer sessions,
+    defeating ``create_review_checkout``'s paired guarantee (no branch
+    checkout AND no write mode). See PR #397 round-2 review.
+
+    If the template already names ``--permission-mode``, its value is
+    forced to ``"plan"`` regardless of what was supplied; otherwise the flag
+    is appended. This only touches the permission-mode value — it does not
+    discard the rest of the template — so a caller with a legitimate reason
+    to vary the executable or other flags (e.g. a test double standing in
+    for the ``claude`` binary) is not blocked, only write access is. A
+    ``None`` template resolves to the standard read-only default.
+    """
+    if command_template is None:
+        return _REVIEW_COMMAND_TEMPLATE
+    if "--permission-mode" in command_template:
+        idx = command_template.index("--permission-mode")
+        if idx + 1 < len(command_template):
+            return command_template[: idx + 1] + ("plan",) + command_template[idx + 2 :]
+        # Trailing flag with no value (malformed) — append the forced value.
+        return command_template + ("plan",)
+    return command_template + ("--permission-mode", "plan")
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -420,10 +453,19 @@ def launch_claude_worker(
     (the PR's live head SHA the reviewer must check out); a missing value
     raises ``ValueError``, which — like every other failure in this
     function — comes back as an error record rather than propagating.
-    ``command_template`` defaults to a read-only ``--permission-mode plan``
-    in review mode (vs ``acceptEdits`` for workers), matching the reviewer's
-    read-only mandate. Logs/sidecars get a distinct ``-review`` suffix so
-    reviewer processes don't mix with worker processes.
+    In review mode, ``command_template`` always ends up carrying
+    ``--permission-mode plan`` (read-only) — see
+    ``_sanitize_review_command_template``. This is a hard-pinned invariant,
+    not a default: any ``--permission-mode`` value the caller supplies
+    (including one forwarded from ``ClaudeCodeConfig.command``, a field
+    shared with worker dispatch) is overridden to ``"plan"`` before launch,
+    so no config combination can grant a reviewer write access. This closes
+    the gap where an operator customizing worker behavior (e.g. uncommenting
+    the example config's ``acceptEdits`` override) would otherwise silently
+    grant write access to reviewer sessions too, defeating
+    ``create_review_checkout``'s paired guarantee (no branch checkout AND
+    no write mode). See PR #397 round-2 review. Logs/sidecars get a distinct
+    ``-review`` suffix so reviewer processes don't mix with worker processes.
 
     If ``recovery`` is provided (a dict with state file dispatch record), this is
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
@@ -432,8 +474,14 @@ def launch_claude_worker(
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
-    if command_template is None:
-        command_template = _REVIEW_COMMAND_TEMPLATE if review else _WORKER_COMMAND_TEMPLATE
+    if review:
+        # Hard-pinned, not a default: see _sanitize_review_command_template
+        # and PR #397 round-2 review. No caller-supplied command_template
+        # (including one forwarded from ClaudeCodeConfig.command) can result
+        # in a reviewer session running with write access.
+        command_template = _sanitize_review_command_template(command_template)
+    elif command_template is None:
+        command_template = _WORKER_COMMAND_TEMPLATE
 
     try:
         if review:

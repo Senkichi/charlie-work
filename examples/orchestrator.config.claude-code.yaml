@@ -85,6 +85,10 @@ devin:
 claude_code:
   # Launch command; empty uses the built-in default shown here. The rendered
   # worker prompt is fed via stdin unless the command names {prompt_path}.
+  # This field applies to WORKER dispatch only. Reviewer sessions
+  # (dispatch_reviews) always launch with --permission-mode plan,
+  # hard-pinned in launch_claude_worker(review=True, ...) — this override
+  # cannot grant a reviewer write access, no matter what is set here.
   # command: [claude, -p, --permission-mode, acceptEdits]
   # Worktrees live under .var/charlie-work/worktrees unless overridden.
   # worktrees_dir: .var/charlie-work/worktrees
