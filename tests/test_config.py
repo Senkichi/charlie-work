@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import ConfigError, load_config
+from charlie_work.config import ConfigError, DispatchConfig, load_config
 
 
 def _write_config(config_file: Path, content: str) -> None:
@@ -97,3 +97,59 @@ watchdog:
     assert config.watchdog.worktree_mtime_threshold_minutes == 45
     assert config.watchdog.worktree_mtime_max_depth == 4
     assert config.watchdog.worktree_mtime_exclude_dirs == (".git", ".venv")
+
+
+def test_dispatch_config_injected_paths_default_is_claude_code_prompt() -> None:
+    """Issue #381: default injected_paths only exclude the in-worktree Claude Code prompt file."""
+    from charlie_work.config import CLAUDE_CODE_PROMPT_FILENAME
+
+    config = DispatchConfig()
+    assert config.injected_paths == (CLAUDE_CODE_PROMPT_FILENAME,)
+
+
+def test_claude_code_prompt_filename_in_default_injected_paths() -> None:
+    """Issue #381: the Claude Code prompt file is excluded from dirty checks by default."""
+    from charlie_work.claude_code import PROMPT_FILENAME
+    from charlie_work.config import CLAUDE_CODE_PROMPT_FILENAME
+
+    assert PROMPT_FILENAME is CLAUDE_CODE_PROMPT_FILENAME
+    assert CLAUDE_CODE_PROMPT_FILENAME in DispatchConfig().injected_paths
+
+
+def test_load_config_injected_paths_coerces_list_to_tuple(tmp_path: Path) -> None:
+    """Issue #381: injected_paths list in YAML becomes a tuple in DispatchConfig."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+dispatch:
+  injected_paths:
+    - .orchestrator-prompt.md
+    - .devin/prompts/custom.md
+""",
+    )
+    config = load_config(config_file)
+    assert config.dispatch.injected_paths == (
+        ".orchestrator-prompt.md",
+        ".devin/prompts/custom.md",
+    )
+
+
+def test_dispatch_config_injected_paths_normalizes_backslashes() -> None:
+    """Issue #381: backslash separators in an override are normalized to '/'."""
+    config = DispatchConfig(injected_paths=[r".devin\prompts\worker.md"])
+    assert config.injected_paths == (".devin/prompts/worker.md",)
+
+
+def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> None:
+    """Issue #381: YAML override with Windows-style separators is normalized."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        r"""dispatch:
+  injected_paths:
+    - '.devin\prompts\worker.md'
+""",
+    )
+    config = load_config(config_file)
+    assert config.dispatch.injected_paths == (".devin/prompts/worker.md",)

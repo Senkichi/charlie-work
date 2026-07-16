@@ -23,6 +23,7 @@ from charlie_work.worktree import (
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
+    _worker_authored_dirty,
     clean_worktrees,
     create_worktree,
     inspect_worktree_state,
@@ -1166,6 +1167,60 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
     remove_worktree(repo_root, info1.path)
 
 
+def test_fresh_dispatch_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: a stale worktree with dirty orchestrator-injected prompt files
+    but no worker-authored changes can be safely reset and recreated."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-381-injected"
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    # Only orchestrator-injected prompt files are dirty.
+    for injected in config.dispatch.injected_paths:
+        prompt = info1.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    # Fresh dispatch should prune the stale worktree and recreate it.
+    info2 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+    assert info2.path.exists()
+    assert info2.reclaimed == "pruned"
+
+    # Clean up
+    remove_worktree(repo_root, info2.path)
+
+
+def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: worker-authored uncommitted changes still hard-refuse fresh dispatch."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-381-worker-dirty"
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    for injected in config.dispatch.injected_paths:
+        prompt = info1.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
+
+    assert info1.path.exists()
+    assert (info1.path / "worker-change.txt").exists()
+
+    remove_worktree(repo_root, info1.path)
+
+
 def test_recovery_with_commits_reuses_worktree(tmp_path: Path) -> None:
     """Issue #110: Recovery mode with commits reuses worktree (existing behavior).
 
@@ -1408,8 +1463,13 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
     original_run_captured = charlie_work.worktree.run_captured
 
     def mock_run_captured(*args: object, **kwargs: object) -> object:
-        # If this is a git status --porcelain call, return a failure
-        if isinstance(args[0], list) and "status" in args[0] and "--porcelain" in args[0]:
+        # If this is a git status --porcelain=v2 call, return a failure. Matches
+        # by prefix since the flag carries a mode suffix ("--porcelain=v2").
+        if (
+            isinstance(args[0], list)
+            and "status" in args[0]
+            and any(str(a).startswith("--porcelain") for a in args[0])
+        ):
             from charlie_work.subprocess_runner import RunResult
 
             return RunResult(
@@ -2551,6 +2611,273 @@ def test_inspect_worktree_state_partial_dirty(tmp_path: Path) -> None:
     remove_worktree(repo, info.path, branch="agent/issue-2")
 
 
+def test_inspect_worktree_state_completed_ignores_injected_prompts(tmp_path: Path) -> None:
+    """Issue #381: a completed worktree is still COMPLETED if the only dirty
+    files are orchestrator-injected prompt paths from the frozen config."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    # Simulate orchestrator-injected prompt files being modified in the worktree.
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.COMPLETED
+    assert inspection.ahead_count == 1
+    assert inspection.dirty is False
+
+    remove_worktree(repo, info.path, branch="agent/issue-381")
+
+
+def test_inspect_worktree_state_completed_ignores_tracked_injected_prompts(
+    tmp_path: Path,
+) -> None:
+    """Issue #381: a tracked injected prompt file modified in place is not dirty.
+
+    This is the root-cause scenario: the orchestrator writes the prompt file,
+    the worker commits it, then rewrites it in place without staging. The
+    porcelain parser must not strip the leading status-column space, which would
+    shift the path and drop its leading dot.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381-tracked", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    # Track the injected prompt file, then rewrite it in place without staging.
+    prompt = info.path / config.dispatch.injected_paths[0]
+    prompt.write_text("original prompt", encoding="utf-8")
+    _git(info.path, "add", str(prompt))
+    _git(info.path, "commit", "-m", "track prompt")
+    prompt.write_text("rewritten prompt", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.COMPLETED
+    assert inspection.ahead_count == 2
+    assert inspection.dirty is False
+
+    remove_worktree(repo, info.path, branch="agent/issue-381-tracked")
+
+
+def test_inspect_worktree_state_partial_with_worker_changes_and_injected(tmp_path: Path) -> None:
+    """Issue #381: worker-authored uncommitted changes still block COMPLETED."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    config = OrchestratorConfig()
+    info = create_worktree(repo, "agent/issue-381", base_ref="origin/main", config=config)
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+
+    (info.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
+
+    inspection = inspect_worktree_state(
+        info.path,
+        base_ref="origin/main",
+        injected_paths=config.dispatch.injected_paths,
+    )
+    assert inspection.state == WorktreeState.PARTIAL
+    assert inspection.dirty is True
+
+    remove_worktree(repo, info.path, branch="agent/issue-381")
+
+
+def test_worker_authored_dirty_ignores_custom_override_path(tmp_path: Path) -> None:
+    """Issue #381: a custom injected_paths override excludes the configured path."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is False
+
+
+def test_worker_authored_dirty_normalizes_backslash_in_override(tmp_path: Path) -> None:
+    """Issue #381: a Windows-style backslash override matches git's forward-slash path."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin\\prompts\\worker.md",)) is False
+
+
+def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 follow-up, now structural: ``--untracked-files=all`` means
+    git never collapses a wholly-untracked directory into a single ``??
+    dir/`` line in the first place — every file, including a worker-authored
+    sibling living next to a nested injected path, gets its own record. There
+    is no collapsed line left to special-case or re-probe.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling.write_text("real worker output", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+
+
+def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
+    tmp_path: Path,
+) -> None:
+    """Inverse control: a directory containing ONLY the injected path (no
+    siblings) must still be excused, preserving issue #381's original
+    carve-out under full per-file enumeration.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is False
+
+
+def test_worker_authored_dirty_tracked_leading_dot_path_modified_in_place(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 bug 1 (v1 rework history): the old line-based parser called
+    ``.strip()`` on each porcelain line before a fixed-column ``line[3:]``
+    slice, which corrupted the leading-space status column of an unstaged
+    tracked modification (e.g. ``" M .orchestrator-prompt.md"``) — the strip
+    shifted the string left by one character and dropped the leading dot.
+    ``--porcelain=v2 -z`` has no line-based whitespace to strip in the first
+    place: fields are parsed by splitting the record on single spaces with a
+    bounded maxsplit, never by slicing a stripped string.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompt = repo_root / ".orchestrator-prompt.md"
+    prompt.write_text("original prompt", encoding="utf-8")
+    _git(repo_root, "add", str(prompt))
+    _git(repo_root, "commit", "-m", "track prompt")
+    # Modify in place without staging: unstaged tracked change, XY = ".M".
+    prompt.write_text("rewritten prompt", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".orchestrator-prompt.md",)) is False
+
+    # Control: the same leading-dot tracked-modification shape, but for a path
+    # NOT in injected_paths, must still be detected as dirty.
+    other = repo_root / ".other-tracked.md"
+    other.write_text("original", encoding="utf-8")
+    _git(repo_root, "add", str(other))
+    _git(repo_root, "commit", "-m", "track other")
+    other.write_text("changed", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".orchestrator-prompt.md",)) is True
+
+
+def test_worker_authored_dirty_directory_injected_path_scoped_to_its_own_tree(
+    tmp_path: Path,
+) -> None:
+    """Issue #381 bug 4 (v1 rework history): when an injected_paths entry
+    names a whole directory rather than a specific file (a documented
+    supported convention — see ``DispatchConfig.injected_paths``), the old
+    line-based parser matched it via an exact-match fast path that ran
+    *before*, and bypassed, the collapse-safety re-probe used for the
+    nested-file case (bug 3) — an inconsistency between two code paths meant
+    to answer the same question. ``--untracked-files=all`` removes the
+    re-probe machinery (and the fast-path/re-probe distinction) entirely:
+    every file, whether it matches an injected file or an injected directory,
+    is matched individually by the exact same normalized-path predicate.
+
+    A directory-level injected_paths entry legitimately excuses everything
+    under it (that is the documented, intentional trade-off of naming a
+    whole directory) — but the exclusion must stay scoped to that directory's
+    own subtree and not leak to unrelated content, including a directory that
+    merely shares a string prefix.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected.parent.mkdir(parents=True)
+    injected.write_text("injected prompt", encoding="utf-8")
+    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling.write_text("real worker output inside the excluded tree", encoding="utf-8")
+
+    # Naming the directory itself excuses everything inside it, by design.
+    assert _worker_authored_dirty(repo_root, (".devin",)) is False
+
+    # An unrelated untracked file OUTSIDE the named directory must still be
+    # detected — the exclusion does not leak beyond its own subtree.
+    unrelated = repo_root / "worker-result.txt"
+    unrelated.write_text("unrelated worker output", encoding="utf-8")
+    assert _worker_authored_dirty(repo_root, (".devin",)) is True
+
+
+def test_worker_authored_dirty_directory_prefix_does_not_collide(tmp_path: Path) -> None:
+    """A directory that merely shares a string prefix with a configured
+    injected directory (e.g. ``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison via ``PurePosixPath.parents``, not substring
+    matching, is what makes this safe.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not injected", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (".devin",)) is True
+
+
+def test_worker_authored_dirty_renamed_tracked_file_not_injected(tmp_path: Path) -> None:
+    """A rename/copy porcelain=v2 record (tag ``2``) carries an extra
+    NUL-delimited ``origPath`` field after the current path. Parsing must
+    consume that extra field so it isn't mistaken for the next record's tag,
+    and the CURRENT (renamed-to) path is what gets matched against
+    injected_paths — mirroring the old parser's ``" -> "`` right-hand-side
+    convention.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    tracked = repo_root / "tracked.txt"
+    tracked.write_text("content\n", encoding="utf-8")
+    _git(repo_root, "add", "tracked.txt")
+    _git(repo_root, "commit", "-m", "add tracked")
+    _git(repo_root, "mv", "tracked.txt", "renamed.txt")
+    # A subsequent untracked file proves the rename record's extra origPath
+    # field was correctly consumed rather than corrupting the next record.
+    (repo_root / "new-worker-file.txt").write_text("also here", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+    # A rename INTO an injected path is excused by the current-path match.
+    _git(repo_root, "reset", "--hard")
+    (repo_root / "new-worker-file.txt").unlink(missing_ok=True)
+    _git(repo_root, "mv", "tracked.txt", "prompt-renamed.md")
+    assert _worker_authored_dirty(repo_root, ("prompt-renamed.md",)) is False
+
+
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
     """A clean worktree with no commits beyond the base is no_commits."""
     remote, repo = _init_repo_with_remote(tmp_path)
@@ -3077,6 +3404,39 @@ def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
     assert len(result.data["skipped"]) == 1
     assert "uncommitted" in result.data["skipped"][0]["reason"]
     assert info.path.exists()
+
+
+def test_clean_worktrees_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
+    """Issue #381: merged worktree with only injected prompt files dirty should be removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-381-clean", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    for injected in config.dispatch.injected_paths:
+        prompt = info.path / injected
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("injected prompt", encoding="utf-8")
+    state = _make_state(issue_number=381, pr_number=1381)
+
+    result = clean_worktrees(
+        repo_root,
+        _default_worktrees_dir(repo_root),
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.ok is True
+    assert len(result.data["removed"]) == 1
+    assert result.data["removed"][0]["branch"] == "agent/issue-381-clean"
+    assert not info.path.exists()
 
 
 def test_clean_worktrees_skips_stray_post_merge_commit(tmp_path: Path) -> None:
