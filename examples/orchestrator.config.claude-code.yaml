@@ -52,6 +52,11 @@ runtime:
   # a tracked dir holding your specialized worker prompt (repo invariants,
   # canonical commands) — see the empericus setup for the pattern.
   # prompts_dir: orchestrator-prompts
+  # Bounded retry for transient GitHub API failures (TLS blips, connection
+  # drops, gateway 5xx, secondary rate limits). Mutating commands are only
+  # retried on provable pre-connection errors to preserve at-most-once semantics.
+  # gh_max_retries: 3
+  # gh_retry_base_seconds: 1.0
 
 devin:
   # claude-code launches each worker headless in an isolated git worktree.

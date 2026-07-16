@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .subprocess_runner import no_console_window_kwargs
+
 
 @dataclass(frozen=True)
 class NotifyResult:
@@ -135,6 +137,7 @@ def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **no_console_window_kwargs(),
             )
             if result.returncode == 0:
                 return NotifyResult(ok=True)
@@ -146,6 +149,7 @@ def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    **no_console_window_kwargs(),
                 )
                 # msg.exe returns 0 on success even if no active session, treat as ok
                 return NotifyResult(ok=True)
@@ -159,6 +163,7 @@ def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **no_console_window_kwargs(),
             )
             if result.returncode == 0:
                 return NotifyResult(ok=True)
@@ -209,6 +214,7 @@ def _shell_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
             text=True,
             timeout=30,
             check=False,
+            **no_console_window_kwargs(),
         )
 
         if result.returncode == 0:

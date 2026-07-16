@@ -16,6 +16,7 @@ from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
@@ -314,6 +315,7 @@ def _kill_orphan_pid(pid: int) -> None:
                 ["taskkill", "/F", "/PID", str(pid)],
                 capture_output=True,
                 text=True,
+                **no_console_window_kwargs(),
             )
         else:
             os.kill(pid, signal.SIGKILL)
@@ -2728,12 +2730,18 @@ class OrchestratorApp:
 
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
-        # must cost zero review tokens. Failures don't move labels — they are
-        # the worker's/CI's to fix, not a review decision.
+        # must cost zero review tokens. Most failures don't move labels — they
+        # are the worker's/CI's to fix. A definitive required-check failure on
+        # a linked-issue PR is routed to rework so the worker can push a fix.
         verdict = run_janitor(
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            if issue_number is not None and verdict.is_check_failure_block:
+                transition(self.gh, self.config.labels, issue_number, "review_started")
+                summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
+                return self.record_review(pr_number, "request_changes", summary=summary)
+
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
@@ -3302,7 +3310,48 @@ class OrchestratorApp:
         if approved:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
-            if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
+            head_moved = reviewed_head_sha is None or live_head_sha != reviewed_head_sha
+            carried_forward = False
+            if head_moved:
+                reviewed_patch_id = decision.get("reviewed_patch_id")
+                if reviewed_patch_id and live_head_sha:
+                    live_diff = self.gh.pr_diff(pr_number)
+                    if live_diff:
+                        live_patch_id = _calculate_patch_id(live_diff)
+                        if live_patch_id == reviewed_patch_id:
+                            old_reviewed_head_sha = reviewed_head_sha
+                            self._update_approval_head(pr_number, decision, live_head_sha)
+                            pr = self.gh.pr_view(pr_number) or pr
+                            decision = self._review_decision(pr_number)
+                            reviewed_head_sha = decision.get("reviewed_head_sha")
+                            live_head_sha = pr.get("headRefOid")
+                            with state_lock(self.paths.state_file):
+                                state = load_state(self.paths.state_file)
+                                state["prs"][str(pr_number)] = {
+                                    **state["prs"].get(str(pr_number), {}),
+                                    "number": pr_number,
+                                    "issue_number": issue_number,
+                                    "status": "approved",
+                                    "head_moved": False,
+                                    "reviewed_head_sha": reviewed_head_sha,
+                                    "live_head_sha": live_head_sha,
+                                    "consecutive_failed_merge_attempts": 0,
+                                    "consecutive_stale_base_deferrals": 0,
+                                }
+                                state = append_event(
+                                    state,
+                                    "verdict_carried_forward_clean_rebase",
+                                    {
+                                        "pr_number": pr_number,
+                                        "issue_number": issue_number,
+                                        "old_reviewed_head_sha": old_reviewed_head_sha,
+                                        "new_head_sha": live_head_sha,
+                                        "patch_id": reviewed_patch_id,
+                                    },
+                                )
+                                save_state(self.paths.state_file, state)
+                            carried_forward = True
+            if head_moved and not carried_forward:
                 message = "PR head moved since approval — re-review required"
                 label_error: dict[str, Any] | None = None
                 if issue_number is not None:

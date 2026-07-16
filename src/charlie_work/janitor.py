@@ -30,8 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from charlie_work.checks import summarize_checks
+from charlie_work.checks import CheckSummary, summarize_checks
 from charlie_work.github import linked_issue_number
+from charlie_work.subprocess_runner import no_console_window_kwargs
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -136,6 +137,8 @@ class JanitorVerdict:
     ok: bool
     failures: tuple[str, ...]
     warnings: tuple[str, ...]
+    failed_required_checks: tuple[str, ...] = ()
+    is_check_failure_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -232,11 +235,17 @@ def run_janitor(
     """
     failures: list[str] = []
     warnings: list[str] = []
+    failed_required_checks: tuple[str, ...] = ()
+
+    required = config.auto_merge.required_checks
+    summary: CheckSummary | None = summarize_checks(checks, required) if required else None
+    if summary is not None:
+        failed_required_checks = summary.failed
 
     _check_draft(pr, failures)
     _check_state(pr, failures)
     _check_mergeable(pr, failures)
-    _check_required_checks(checks, config, failures, warnings)
+    _check_required_checks(summary, failures, warnings)
     _check_linked_issue(pr, config, failures)
     _check_body(pr, config, failures)
     _check_title_conventional(pr, warnings)
@@ -253,7 +262,17 @@ def run_janitor(
     if repo_root is not None:
         _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
-    return JanitorVerdict(ok=not failures, failures=tuple(failures), warnings=tuple(warnings))
+    is_check_failure_block = bool(failed_required_checks) and not failures
+    if failed_required_checks:
+        failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
+
+    return JanitorVerdict(
+        ok=not failures,
+        failures=tuple(failures),
+        warnings=tuple(warnings),
+        failed_required_checks=failed_required_checks,
+        is_check_failure_block=is_check_failure_block,
+    )
 
 
 def _check_draft(pr: dict[str, Any], failures: list[str]) -> None:
@@ -279,19 +298,14 @@ def _check_mergeable(pr: dict[str, Any], failures: list[str]) -> None:
 
 
 def _check_required_checks(
-    checks: list[dict[str, Any]] | None,
-    config: OrchestratorConfig,
+    summary: CheckSummary | None,
     failures: list[str],
     warnings: list[str],
 ) -> None:
-    required = config.auto_merge.required_checks
-    if not required:
+    if summary is None or not summary.required:
         return
-    summary = summarize_checks(checks, required)
     if summary.unavailable:
         failures.append(f"Checks unavailable (gh failure): {', '.join(summary.unavailable)}")
-    if summary.failed:
-        failures.append(f"Required check(s) failed: {', '.join(summary.failed)}")
     if summary.infra_failed:
         failures.append(
             f"CI never ran (infrastructure failure): {', '.join(summary.infra_failed)}"
@@ -557,6 +571,7 @@ def _check_no_op_rework(
             capture_output=True,
             check=True,
             text=True,
+            **no_console_window_kwargs(),
         )
         # Count non-merge commits since the reviewed head, excluding base-reachable commits
         # The ^ syntax excludes commits reachable from the given refs
@@ -575,6 +590,7 @@ def _check_no_op_rework(
             capture_output=True,
             check=True,
             text=True,
+            **no_console_window_kwargs(),
         )
         non_merge_count = int(result.stdout.strip())
 
@@ -620,6 +636,7 @@ def _get_unpushed_commit_info(
             capture_output=True,
             check=True,
             text=True,
+            **no_console_window_kwargs(),
         )
 
         # Parse worktree list to find the worktree for this branch
@@ -645,6 +662,7 @@ def _get_unpushed_commit_info(
             capture_output=True,
             check=True,
             text=True,
+            **no_console_window_kwargs(),
         )
 
         unpushed_count = int(result.stdout.strip())
@@ -1340,6 +1358,7 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
             capture_output=True,
             text=True,
             check=True,
+            **no_console_window_kwargs(),
         )
         dirty_output = result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -1355,6 +1374,7 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
             capture_output=True,
             text=True,
             check=True,
+            **no_console_window_kwargs(),
         )
         all_status_output = result.stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -1445,6 +1465,7 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
                 capture_output=True,
                 text=True,
                 check=True,
+                **no_console_window_kwargs(),
             )
             working_tree_diff = result.stdout
         except (subprocess.CalledProcessError, FileNotFoundError):

@@ -34,7 +34,7 @@ from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
@@ -518,7 +518,7 @@ def launch_claude_worker(
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             env=worker_env,
-                            creationflags=_CREATE_NEW_PROCESS_GROUP,
+                            **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
                             start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                             text=True,  # Ensure text mode for line-by-line processing
                         )
@@ -532,7 +532,7 @@ def launch_claude_worker(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
-                        creationflags=_CREATE_NEW_PROCESS_GROUP,
+                        **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
                         start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                         text=True,  # Ensure text mode for line-by-line processing
                     )
@@ -583,7 +583,7 @@ def launch_claude_worker(
                             stdout=log_handle,
                             stderr=subprocess.STDOUT,
                             env=worker_env,
-                            creationflags=_CREATE_NEW_PROCESS_GROUP,
+                            **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
                             start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                         )
                 else:
@@ -594,7 +594,7 @@ def launch_claude_worker(
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
-                        creationflags=_CREATE_NEW_PROCESS_GROUP,
+                        **no_console_window_kwargs(_CREATE_NEW_PROCESS_GROUP),
                         start_new_session=(os.name != "nt"),  # POSIX: detach into own session
                     )
     except OSError as exc:
