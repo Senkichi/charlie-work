@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
@@ -440,3 +442,63 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
         pass
 
     return orphans
+
+
+def popen_worker(
+    args: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    **popen_kwargs: Any,
+) -> subprocess.Popen:
+    """Launch a worker process with platform-specific detachment flags.
+
+    This is the single-point-of-enforcement for worker detachment policy:
+
+    - Windows: ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB``.
+      ``DETACHED_PROCESS`` removes the console so the child is not killed by a
+      ``taskkill /T`` of the orchestrator; ``CREATE_BREAKAWAY_FROM_JOB`` escapes
+      any Job Object the parent is in. If the current job forbids breakaway, the
+      call falls back to ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`` so launch
+      still works (the child may remain tied to the job in that environment).
+    - POSIX: ``start_new_session=True`` makes the child a session leader so a
+      process-group kill does not reach it.
+
+    Callers pass the same arguments they would to ``subprocess.Popen``; the
+    function injects the detachment flags and returns the ``Popen`` object.
+    """
+    if cwd is not None:
+        popen_kwargs["cwd"] = cwd
+    if env is not None:
+        popen_kwargs["env"] = env
+
+    if sys.platform == "win32":
+        # Hide any console window and detach from the orchestrator's console.
+        startupinfo = subprocess.STARTUPINFO()  # type: ignore
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore
+        startupinfo.wShowWindow = subprocess.SW_HIDE  # type: ignore
+        popen_kwargs["startupinfo"] = startupinfo
+
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        )
+        popen_kwargs["creationflags"] = creationflags
+
+        try:
+            return subprocess.Popen(args, **popen_kwargs)
+        except PermissionError as exc:
+            # ``CREATE_BREAKAWAY_FROM_JOB`` is denied when the parent is in a job
+            # that does not allow breakaway. Retry without it; the worker may still
+            # be tied to the job, but launch succeeds.
+            if exc.winerror != 5:  # ERROR_ACCESS_DENIED
+                raise
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            ) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            return subprocess.Popen(args, **popen_kwargs)
+
+    # POSIX: new session isolates the child from the orchestrator's process group.
+    popen_kwargs["start_new_session"] = True
+    return subprocess.Popen(args, **popen_kwargs)

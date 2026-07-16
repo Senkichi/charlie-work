@@ -2137,12 +2137,18 @@ def test_launch_claude_worker_includes_start_new_session_on_posix(
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    # On POSIX, start_new_session should be True
+    # Detachment is now enforced by process_utils.popen_worker.
     if os.name != "nt":
         assert popen_kwargs.get("start_new_session") is True
+        assert "creationflags" not in popen_kwargs
     else:
-        # On Windows, start_new_session should be False (passed explicitly)
-        assert popen_kwargs.get("start_new_session") is False
+        # On Windows, start_new_session is not used; the helper sets
+        # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP + CREATE_BREAKAWAY_FROM_JOB.
+        assert "start_new_session" not in popen_kwargs
+        flags = popen_kwargs.get("creationflags", 0)
+        assert flags & subprocess.DETACHED_PROCESS
+        assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+        assert flags & subprocess.CREATE_BREAKAWAY_FROM_JOB
 
 
 # ---------------------------------------------------------------------------
