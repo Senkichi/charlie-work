@@ -318,7 +318,7 @@ class GitHub:
         if self.dry_run and _is_mutating(args):
             return True
         result = self.run(args, allow_failure=True)
-        return bool(result.ok) if isinstance(result, GitHubRunResult) else result == 0
+        return result.ok
 
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
         # run() now applies the fleet-wide bounded retry policy for transient

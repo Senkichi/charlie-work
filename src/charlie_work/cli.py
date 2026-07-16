@@ -576,7 +576,9 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     # Load fleet-wide totals if requested
     fleet_totals: FleetTotals | None = None
     if fleet_wide:
-        total_runners, total_busy_runners, skipped_repos = count_fleet_runners(args.fleet_dir)
+        total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
+            args.fleet_dir, runtime=config.runtime
+        )
         fleet_totals = FleetTotals(
             total_runners=total_runners,
             total_busy_runners=total_busy_runners,

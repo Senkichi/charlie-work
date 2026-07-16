@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.fleet_dispatch import _extract_attention_events, _select_repos, fleet_loop
+from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
 
@@ -888,3 +889,38 @@ def test_fleet_loop_work_only_skips_locked_repo(
     assert repo_data["ok"] is True
     assert repo_data["skipped"] is True
     assert repo_data["reason"] == "supervisor_lock_held"
+
+
+@patch("charlie_work.fleet_registry._load_registry")
+@patch("charlie_work.fleet_registry.GitHub")
+def test_count_fleet_runners_propagates_runtime_config(
+    mock_gh_class: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """count_fleet_runners passes the caller's RuntimeConfig to every GitHub client."""
+    repo_root = tmp_path / "repo1"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo_root),
+                "config_path": str(repo_root / "orchestrator.config.yaml"),
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    mock_gh = MagicMock()
+    mock_gh.run.return_value = {"runners": [{"busy": False}, {"busy": True}]}
+    mock_gh_class.return_value = mock_gh
+
+    runtime = RuntimeConfig(gh_max_retries=7, gh_retry_base_seconds=0.5)
+    total, busy, skipped = count_fleet_runners(str(tmp_path / "fleet"), runtime=runtime)
+
+    assert total == 2
+    assert busy == 1
+    assert skipped == []
+    mock_gh_class.assert_called_once_with(repo_root=repo_root, runtime=runtime)
