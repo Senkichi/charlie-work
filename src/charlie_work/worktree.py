@@ -19,7 +19,7 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
@@ -238,11 +238,135 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     return False
 
 
+def _parse_status_v2_paths(stdout: str) -> list[str]:
+    """Parse ``git status --porcelain=v2 -z`` output into a flat list of
+    worktree-relative paths representing real changes: ordinary tracked
+    changes, renames/copies (current path only), unmerged conflicts, and
+    untracked files. Ignored-file records (``!``, never emitted unless
+    ``--ignored`` is passed) and any unrecognized record type are skipped
+    defensively rather than mis-parsed.
+
+    ``-z`` NUL-terminates every record AND every path field, which is what
+    makes this unambiguous: paths can never contain NUL, so ``-z`` never
+    quotes or escapes them, and there is no line-based whitespace to
+    ``.strip()`` (the v1 fixed-column bug: stripping a leading status-column
+    space before slicing shifted the path left by one character and dropped
+    its first character, e.g. on tracked-but-unstaged-modified files whose
+    path begins with a dot). Each v2 record type has a fixed, documented
+    number of space-separated header fields before the path (see
+    ``git-status(1)`` "Porcelain Format Version 2"); a rename/copy record
+    additionally consumes one extra NUL-delimited field for ``origPath``,
+    which is discarded here since dirty-checking only cares about the
+    current path.
+    """
+    paths: list[str] = []
+    fields = stdout.split("\0")
+    i = 0
+    n = len(fields)
+    while i < n:
+        record = fields[i]
+        if not record:
+            i += 1
+            continue
+        tag = record[0]
+        if tag == "1":
+            # Ordinary changed entry: "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>"
+            parts = record.split(" ", 8)
+            if len(parts) == 9:
+                paths.append(parts[8])
+            i += 1
+        elif tag == "2":
+            # Renamed/copied entry: "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>"
+            # followed by a separate NUL-terminated <origPath> field.
+            parts = record.split(" ", 9)
+            if len(parts) == 10:
+                paths.append(parts[9])
+            i += 2  # this record's path field + the trailing origPath field
+        elif tag == "u":
+            # Unmerged entry: "u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
+            parts = record.split(" ", 10)
+            if len(parts) == 11:
+                paths.append(parts[10])
+            i += 1
+        elif tag == "?":
+            # Untracked entry: "? <path>"
+            paths.append(record[2:])
+            i += 1
+        else:
+            # "!" ignored entries (not requested here) or any unrecognized
+            # record type: skip rather than guess at a layout we don't know.
+            i += 1
+    return paths
+
+
+def _worker_authored_dirty(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+) -> bool:
+    """Return True if the worktree has uncommitted changes that are NOT
+    orchestrator-injected prompt files.
+
+    ``injected_paths`` are worktree-relative paths (files or directories) that
+    the orchestrator writes into the worktree (e.g. the Claude Code prompt
+    file, or a custom ``.devin/prompts/...`` convention that the operator has
+    configured). They are excluded from the dirty check so completed worker
+    work is not stranded by prompt-injection noise (issue #381).
+
+    Uses ``git status --porcelain=v2 -z --untracked-files=all``:
+    ``--untracked-files=all`` disables directory collapsing, so every
+    untracked file gets its own record — there is no "does this line
+    represent one file or a whole directory" ambiguity left to special-case
+    (the v1 rework history: a wholly-untracked directory collapsed to a
+    single ``?? dir/`` line could hide a worker-authored sibling file next to
+    a configured injected path or directory, and a probe re-scoped to that
+    directory was needed to tell the two apart). Every entry — whether it
+    matches an injected file or a whole injected directory — is now checked
+    against the same normalized-path predicate below, with no separate
+    collapse-probing code path to keep in sync.
+
+    Raises:
+        WorktreeProbeFailedError: if the ``git status`` probe itself fails
+            (index lock, corruption, permissions).
+    """
+    status_result = run_captured(
+        [
+            "git",
+            "-c",
+            "core.quotePath=off",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        ],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok:
+        detail = status_result.error or status_result.stderr.strip() or "unknown error"
+        raise WorktreeProbeFailedError(
+            f"worktree status probe failed; treating as dirty: {detail}"
+        )
+
+    # Normalize the configured side too, so a Windows-style backslash override
+    # still matches git's forward-slash path reporting.
+    injected = [PurePosixPath(str(p).replace("\\", "/")) for p in injected_paths]
+    for raw_path in _parse_status_v2_paths(status_result.stdout):
+        # Git may emit backslashes on Windows; normalize for comparison.
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        if any(
+            path == injected_path or injected_path in path.parents for injected_path in injected
+        ):
+            continue
+        return True
+    return False
+
+
 def _worktree_refuse_to_reset_reason(
     repo_root: Path,
     branch: str,
     base_ref: str,
     worktree_path: Path | None = None,
+    injected_paths: tuple[str, ...] = (),
 ) -> str | None:
     """Return a human-readable reason if resetting the branch/worktree would destroy
     local work, otherwise ``None``.
@@ -265,19 +389,7 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        status_result = run_captured(
-            ["git", "status", "--porcelain"],
-            cwd=worktree_path,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        # If the probe fails (index lock, corruption, permissions), we cannot
-        # confirm the worktree is clean. Refuse the reset (safe default), but
-        # raise a distinct exception: this is transient probe contention, not
-        # a confirmed-dirty worktree, and must not be classified the same way
-        # (issue #288 follow-up, PR #314).
-        if not status_result.ok:
-            raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
-        if status_result.stdout.strip():
+        if _worker_authored_dirty(worktree_path, injected_paths):
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "HEAD"],
@@ -352,7 +464,10 @@ def _worktree_refuse_to_reset_reason(
     return "worktree has local commits not on remote branch"
 
 
-def _worktree_dirty_reason(worktree_path: Path) -> str | None:
+def _worktree_dirty_reason(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+) -> str | None:
     """Return a reason string if ``worktree_path`` has uncommitted modifications.
 
     Used by the merged-PR cleanup path (``clean_worktrees``), which decides
@@ -370,14 +485,7 @@ def _worktree_dirty_reason(worktree_path: Path) -> str | None:
     """
     if not worktree_path.is_dir():
         return None
-    status_result = run_captured(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not status_result.ok:
-        raise WorktreeProbeFailedError("worktree status probe failed; treating as dirty")
-    if status_result.stdout.strip():
+    if _worker_authored_dirty(worktree_path, injected_paths):
         return "worktree has uncommitted modifications"
     return None
 
@@ -747,6 +855,10 @@ def create_worktree(
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
 
+    # Worktree-relative paths that the orchestrator injects (e.g. rendered
+    # prompts). These are excluded from "is this worktree dirty?" checks.
+    injected_paths = config.dispatch.injected_paths if config is not None else ()
+
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None
     attempt_snapshot: AttemptSnapshot | None = None
@@ -768,7 +880,9 @@ def create_worktree(
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""
         check_path = target_path or worktree_path
-        reason = _worktree_refuse_to_reset_reason(repo_root, branch, resolved_base_ref, check_path)
+        reason = _worktree_refuse_to_reset_reason(
+            repo_root, branch, resolved_base_ref, check_path, injected_paths
+        )
         if reason:
             raise WorktreeUnsafeError(reason)
 
@@ -880,14 +994,12 @@ def create_worktree(
 
                 # Worktree exists on the correct branch: check if it has commits beyond the merge-base
                 wt_path = Path(existing_wt["worktree"])
-                # Check for dirty working tree
-                dirty_result = run_captured(
-                    ["git", "status", "--porcelain"],
-                    cwd=wt_path,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-                )
-                # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
-                has_dirty = not dirty_result.ok or bool(dirty_result.stdout.strip())
+                # Check for dirty working tree, ignoring orchestrator-injected files.
+                try:
+                    has_dirty = _worker_authored_dirty(wt_path, injected_paths)
+                except WorktreeProbeFailedError:
+                    # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
+                    has_dirty = True
 
                 # Check for commits beyond merge-base with resolved_base_ref
                 merge_base_result = run_captured(
@@ -1241,7 +1353,11 @@ def remove_worktree(
     return worktree_removed and branch_deleted
 
 
-def inspect_worktree_state(worktree_path: Path, base_ref: str = "") -> WorktreeInspection:
+def inspect_worktree_state(
+    worktree_path: Path,
+    base_ref: str = "",
+    injected_paths: tuple[str, ...] = (),
+) -> WorktreeInspection:
     """Inspect a worker worktree after the process dies.
 
     Returns a ``WorktreeInspection`` describing whether the worker has:
@@ -1259,18 +1375,13 @@ def inspect_worktree_state(worktree_path: Path, base_ref: str = "") -> WorktreeI
             error=f"worktree path does not exist: {worktree_path}",
         )
 
-    status_result = run_captured(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not status_result.ok:
+    try:
+        dirty = _worker_authored_dirty(worktree_path, injected_paths)
+    except WorktreeProbeFailedError as exc:
         return WorktreeInspection(
             WorktreeState.UNKNOWN,
-            error=status_result.error or status_result.stderr or "git status failed",
+            error=str(exc),
         )
-
-    dirty = bool(status_result.stdout.strip())
 
     if base_ref == "":
         try:
@@ -1752,7 +1863,7 @@ def clean_worktrees(
             )
             continue
         try:
-            dirty_reason = _worktree_dirty_reason(wt_path)
+            dirty_reason = _worktree_dirty_reason(wt_path, config.dispatch.injected_paths)
         except WorktreeProbeFailedError as exc:
             skipped.append(
                 {
