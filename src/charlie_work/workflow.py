@@ -4409,8 +4409,8 @@ class OrchestratorApp:
         """Route an approved PR whose branch silently reverts a base commit to rework."""
         summary = (
             f"{reason}. Remove the revert commit (or the merge+revert pair) from the PR "
-            "history, or add an explicit 'allow-revert' marker to the PR body if the revert "
-            "is intentional. Then push the corrected branch and re-request review."
+            "history, or add an explicit 'allow-revert: <reason>' line to the PR body if the "
+            "revert is intentional. Then push the corrected branch and re-request review."
         )
         return self._route_to_rework(
             pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"

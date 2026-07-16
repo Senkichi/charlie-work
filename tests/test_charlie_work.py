@@ -12584,7 +12584,7 @@ def test_merge_ready_silent_cross_pr_revert_blocks_and_routes_to_rework(
 def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
     tmp_path: Path,
 ) -> None:
-    """Issue #390: an explicit allow-revert marker in the PR body suppresses the block."""
+    """Issue #390: an explicit 'allow-revert:' marker line in the PR body suppresses the block."""
     from charlie_work.config import AutoMergeConfig, DevinConfig
 
     _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
@@ -12622,6 +12622,54 @@ def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
     assert result.data["cross_pr_revert_detected"] is False
     assert result.data["merged"] is True
     assert fake_gh.merged == [(456, "squash")]
+
+
+def test_merge_ready_silent_cross_pr_revert_prompt_echo_does_not_bypass(
+    tmp_path: Path,
+) -> None:
+    """Issue #390: a bare 'allow-revert' word (e.g. quoting the rework prompt) must not bypass the gate."""
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: revert cross-pr",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-revert",
+            "baseRefName": "main",
+            "headRefOid": agent_sha,
+            "mergeStateStatus": "CLEAN",
+            "body": (
+                "Closes #123\n\n"
+                "...or add an explicit 'allow-revert' marker to the PR body if the revert "
+                "is intentional. Then push the corrected branch and re-request review."
+            ),
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["cross_pr_revert_detected"] is True
+    assert result.data["cross_pr_revert_routed"] is True
+    assert result.data["merge_conflict"] is False
+    assert "feature C" in result.data.get("cross_pr_revert_reason", "")
 
 
 def test_merge_ready_stale_base_not_routed_to_rework(

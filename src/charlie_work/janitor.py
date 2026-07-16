@@ -689,12 +689,12 @@ def detect_cross_pr_revert(
     the base. A commit whose subject is ``Revert "<original>"`` and whose
     inner ``<original>`` subject matches a commit reachable from the base
     indicates that squashing the branch would undo a change already on the base
-    (the cross-PR revert incident, issue #390). An explicit ``allow-revert``
-    marker in the PR body suppresses the block so legitimate intentional
+    (the cross-PR revert incident, issue #390). An explicit ``allow-revert:``
+    marker line in the PR body suppresses the block so legitimate intentional
     reverts can be merged.
 
-    Returns ``None`` when no revert is detected, the marker is present, or the
-    local git history required to decide is unavailable.
+    Returns ``None`` when no revert is detected, an ``allow-revert:`` marker
+    line is present, or the local git history required to decide is unavailable.
     """
     if not repo_root:
         return None
@@ -704,7 +704,12 @@ def detect_cross_pr_revert(
         return None
 
     body = str(pr.get("body") or "")
-    marker_re = re.compile(rf"\b{re.escape(allow_marker)}\b", re.IGNORECASE)
+    # Require a structural marker line: "allow-revert:" followed by a reason.
+    # A bare word/substring (e.g. quoting this guidance) must not bypass the gate.
+    marker_re = re.compile(
+        rf"^{re.escape(allow_marker)}:\s*\S",
+        re.IGNORECASE | re.MULTILINE,
+    )
     if marker_re.search(body):
         return None
 
@@ -788,7 +793,7 @@ def detect_cross_pr_revert(
                         return (
                             f"PR branch contains revert commit {sha[:12]} ({subject}) which "
                             f"would silently undo base commit {base_sha[:12]}; add an explicit "
-                            f"'{allow_marker}' marker to the PR body to proceed"
+                            f"'{allow_marker}: <reason>' line to the PR body to proceed"
                         )
     except (OSError, ValueError):
         return None
