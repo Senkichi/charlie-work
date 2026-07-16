@@ -33,6 +33,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     PostMortemConfig,
     ReviewConfig,
+    ReviewDispatchConfig,
     RuntimeConfig,
     SignatureRule,
     SupervisorConfig,
@@ -4416,6 +4417,541 @@ def test_review_queue_is_read_only(tmp_path: Path) -> None:
     assert after_state == before_state
     assert (app.paths.prs / "pr-456" / "pr.json").read_text(encoding="utf-8") == pr_json
     assert (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8") == prompt
+
+
+def _dispatch_reviews_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with review_dispatch enabled and an empty state file."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+
+def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecord:
+    """Return a successful Claude worker record for monkeypatched launches."""
+    return ClaudeWorkerRecord(
+        issue_number=pr_number,
+        branch=branch,
+        worktree_path="/fake/worktree",
+        prompt_path="/fake/prompt.md",
+        command=("claude", "-p"),
+        pid=12345,
+        started_at="2026-07-06T12:00:00Z",
+        log_path="/fake/log.log",
+        error=None,
+        process_start_time=1.0,
+    )
+
+
+def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Path) -> None:
+    """Issue #370: dispatch_reviews launches a Claude reviewer for every queued PR."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 2
+    assert result.data["failed_count"] == 0
+    assert result.data["selected_count"] == 2
+    assert len(launched) == 2
+    for _args, kwargs in launched:
+        assert kwargs.get("review") is True
+        assert "reviews" in str(kwargs.get("sessions_dir", ""))
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert state["prs"]["100"]["reviewer_pid"] == 12345
+    assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
+    """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    def fake_is_pid_alive(pid: int, *_args: Any, **_kwargs: Any) -> bool:
+        # Pretend the fake reviewer PID is still alive.
+        return pid == 12345
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", fake_is_pid_alive)
+
+    first = app.dispatch_reviews()
+    assert first.data["launched_count"] == 1
+    assert len(launched) == 1
+
+    second = app.dispatch_reviews()
+    assert second.data["launched_count"] == 0
+    assert len(launched) == 1
+    assert second.data["deferred_count"] == 1
+
+
+def test_dispatch_reviews_respects_local_process_cap(monkeypatch, tmp_path: Path) -> None:
+    """Issue #370: max_local_review_processes caps concurrent reviewer launches."""
+    prs = [
+        {
+            "number": i,
+            "title": f"Fix #{i}",
+            "url": f"https://example.test/pull/{i}",
+            "headRefName": f"agent/issue-{i}-fix",
+            "baseRefName": "main",
+            "headRefOid": f"sha-{i}",
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{i}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+        for i in range(300, 303)
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, max_local_review_processes=2),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    for pr in prs:
+        _write_review_packet(tmp_path, pr["number"], pr["headRefOid"])
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 2
+    assert result.data["selected_count"] == 2
+    assert result.data["skipped_count"] == 1
+    assert result.data["max_local_review_processes"] == 2
+    assert len(launched) == 2
+
+
+def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Path) -> None:
+    """Issue #370: a dead/stale reviewer claim is reaped and the PR re-dispatched."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Seed a stale reviewer sidecar + state claim.
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    old_dispatched = old_started
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 99999,
+        "started_at": old_started,
+        "log_path": str(tmp_path / "log.log"),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_dispatched,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    def fake_is_worker_alive(record: ClaudeWorkerRecord, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", fake_is_worker_alive)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    assert launched == [100]
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert state["prs"]["100"]["reviewer_pid"] == 12345
+
+
+def _init_git_repo(repo_root: Path) -> None:
+    import subprocess
+
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Path) -> None:
+    """Issue #397: a reaped stale-claim review must tear down that PR's
+    isolated review checkout, not just free the state.json claim."""
+    from datetime import timedelta
+
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 100, head_sha, reviews_dir=reviews_dir)
+    assert checkout.path.exists()
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_dispatched,
+            "reviewer_pid": 999999999,  # not a real live pid
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(entry.get("pr") == 100 for entry in stalled)
+    assert not checkout.path.exists()
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert str(checkout.path) not in result.stdout
+
+
+def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
+    tmp_path: Path,
+) -> None:
+    """Issue #397: once record_review has recorded a verdict
+    (review_dispatch_completed) and the reviewer's own sidecar process is no
+    longer alive, the isolated review checkout is reaped. Liveness must be
+    checked via the sidecar in reviews_dir (iter_workers), since record_review
+    already cleared state.json's reviewer_pid by this point."""
+    from datetime import timedelta
+
+    from charlie_work.workflow import _reap_completed_review_checkouts
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 200, head_sha, reviews_dir=reviews_dir)
+    assert checkout.path.exists()
+
+    # A sidecar recording a definitely-dead pid (record_review does not
+    # delete the sidecar itself, only clears state.json's own pid fields).
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = {
+        "issue_number": 200,
+        "branch": "agent/issue-20-fix",
+        "worktree_path": str(checkout.path),
+        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-200.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-200.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {},
+                "prs": {
+                    "200": {
+                        "number": 200,
+                        "review_dispatch_status": "review_dispatch_completed",
+                        "reviewer_pid": None,
+                        "reviewer_process_start_time": None,
+                    }
+                },
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
+
+    assert reaped == [200]
+    assert not checkout.path.exists()
+
+
+def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
+    tmp_path: Path,
+) -> None:
+    """A completed-verdict PR whose reviewer sidecar is still alive must NOT
+    have its checkout removed out from under the exiting process.
+
+    Uses this test process's own PID/start-time as the sidecar's recorded
+    identity, so the real (non-monkeypatched) claude_code.is_worker_alive
+    liveness+identity check reports it genuinely alive — matching how
+    test_count_live_sessions_ghost_worker_pid_corroborated_by_state (same
+    file) proves a "ghost" liveness case elsewhere in this suite.
+    """
+    from charlie_work.claude_code import _get_process_start_time
+    from charlie_work.workflow import _reap_completed_review_checkouts
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 201, head_sha, reviews_dir=reviews_dir)
+
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+    sidecar = {
+        "issue_number": 201,
+        "branch": "agent/issue-21-fix",
+        "worktree_path": str(checkout.path),
+        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": current_pid,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-201.claude.log"),
+        "error": None,
+        "process_start_time": _get_process_start_time(current_pid),
+    }
+    (reviews_dir / "issue-201.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {},
+                "prs": {
+                    "201": {
+                        "number": 201,
+                        "review_dispatch_status": "review_dispatch_completed",
+                        "reviewer_pid": None,
+                        "reviewer_process_start_time": None,
+                    }
+                },
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
+
+    assert reaped == []
+    assert checkout.path.exists()
+
+
+def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
+    """Issue #370: loop() runs dispatch_reviews() and the per-PR merge lane uses the verdict."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+        auto_merge=AutoMergeConfig(
+            enabled=True,
+            strategy="squash",
+            delete_branch=True,
+            require_approved_review=True,
+            required_checks=(),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    prs = [
+        {
+            "number": 456,
+            "title": "Fix #456",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-456-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #456",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(tmp_path, 456, "sha-456")
+
+    def fake_launch(
+        issue_number: int, branch: str, prompt_text: str, **kwargs: Any
+    ) -> ClaudeWorkerRecord:
+        # Simulate the reviewer agent writing an approved verdict.
+        pr_dir = app.paths.prs / f"pr-{issue_number}"
+        decision = {
+            "decision": "approved",
+            "summary": "lgtm",
+            "required_changes": [],
+            "reviewed_head_sha": "sha-456",
+            "reviewed_patch_id": "",
+            "reviewed_at": "2026-07-06T12:00:00Z",
+            "pr_number": issue_number,
+            "issue_number": 456,
+            "escalated": False,
+        }
+        (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+        return _fake_claude_worker_record(issue_number, branch)
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.loop(merge=False)
+
+    assert result.ok is True
+    assert result.data["dispatch_reviews"]["launched_count"] == 1
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["can_merge"] is True
 
 
 def test_review_checks_unavailable_blocks_and_preserves_labels(tmp_path: Path) -> None:
