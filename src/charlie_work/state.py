@@ -27,6 +27,15 @@ _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
+
+class StateLockBusy(RuntimeError):
+    """Raised when the advisory state lock cannot be acquired within its budget.
+
+    A state writer that cannot acquire the lock must fail that unit of work as
+    a value (skip + event log), never write unlocked.
+    """
+
+
 # Intra-process serialization for state_lock.
 #
 # The file lock below (msvcrt.locking / fcntl.flock) serializes across
@@ -141,9 +150,10 @@ def state_lock(state_path: Path):
     on a lockfile alongside state.json. The lock is advisory and time-bounded to
     prevent wedging on stale locks.
 
-    Best-effort: if locking fails, the context manager still yields — the orchestrator
-    prefers forward progress over perfect serialization, and atomic writes already
-    prevent torn files.
+    Deterministic: if the lock cannot be acquired within ``_LOCK_TIMEOUT_SECONDS``,
+    the context manager raises ``StateLockBusy``. A state writer that cannot acquire
+    the lock must fail that unit of work as a value (skip + event log), never write
+    unlocked.
 
     A per-path threading.Lock is held around the whole critical section so that
     concurrent THREADS in this process are serialized too (the file lock only
@@ -183,10 +193,13 @@ def state_lock(state_path: Path):
                     # Lock held, wait and retry
                     time.sleep(0.1)
             else:
-                # Timeout — proceed anyway (best-effort)
+                # Timeout — the lock is held by another writer. Fail this unit
+                # of work as a value rather than degrading integrity.
                 logger.warning(
-                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s "
-                    f"— proceeding without lock"
+                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s"
+                )
+                raise StateLockBusy(
+                    f"Could not acquire state lock at {lock_path} within {_LOCK_TIMEOUT_SECONDS}s"
                 )
         else:
             import fcntl
@@ -203,20 +216,22 @@ def state_lock(state_path: Path):
                     # Lock held, wait and retry
                     time.sleep(0.1)
             else:
-                # Timeout — proceed anyway (best-effort)
+                # Timeout — the lock is held by another writer. Fail this unit
+                # of work as a value rather than degrading integrity.
                 logger.warning(
-                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s "
-                    f"— proceeding without lock"
+                    f"Failed to acquire lock on {lock_path} after {_LOCK_TIMEOUT_SECONDS}s"
+                )
+                raise StateLockBusy(
+                    f"Could not acquire state lock at {lock_path} within {_LOCK_TIMEOUT_SECONDS}s"
                 )
 
         yield
     finally:
         # Close whenever the handle was opened, regardless of whether the
-        # lock was acquired — on the 30s timeout path (acquired=False) the
-        # handle was still opened above and must not leak. Unlock only when
-        # acquired=True (nothing to unlock otherwise). The two operations are
-        # independent failure modes: an unlock raising OSError must not skip
-        # the close.
+        # lock was acquired — on the timeout path the handle was still opened
+        # above and must not leak. Unlock only when acquired=True (nothing to
+        # unlock otherwise). The two operations are independent failure modes:
+        # an unlock raising OSError must not skip the close.
         if lock_file is not None:
             if acquired:
                 try:
