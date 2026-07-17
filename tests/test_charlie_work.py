@@ -22213,6 +22213,12 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     redispatch_at already has one entry, and the GitHub issue still carries
     the stale active label alongside the ready label that was never removed
     from the original dispatch.
+
+    Also covers the non-blocking follow-up: `status` deliberately never
+    advances away from "dispatched" (matching the sidecar-based lane's own
+    issue #282 fingerprint preservation), so a second pass would otherwise
+    re-discover this same entry and emit a spurious orphaned_worker_drift for
+    an issue that is already fully fixed. It must not.
     """
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
@@ -22278,6 +22284,26 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     # that the reclaim fully succeeded.
     drift_events = [e for e in state["events"] if e["kind"] == "orphaned_worker_drift"]
     assert drift_events == []
+
+    # Second pass: status.json still shows status="dispatched" with the same
+    # dead worker_pid (nothing advanced it). FakeGitHub's remove/add_issue_label
+    # only record calls -- unlike real GitHub, they don't mutate self.issues --
+    # so simulate pass 1's successful label swap actually landing: in_progress
+    # is gone, ready (already present) is unchanged. With labels now fully
+    # correct (no active label, ready present) this must be a quiet no-op, not
+    # a second "session_failed_relabeled" event or a fresh "orphaned_worker_drift"
+    # for an issue that no longer needs anything.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
+    fake_gh.labels_added = []
+    fake_gh.labels_removed = []
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+    state = load_state(paths.state_file)
+    assert len([e for e in state["events"] if e["kind"] == "session_failed_relabeled"]) == 1
+    assert [e for e in state["events"] if e["kind"] == "orphaned_worker_drift"] == []
 
 
 def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path: Path) -> None:
@@ -22442,6 +22468,150 @@ def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
     )
 
     # The sidecar must be reaped once the reclaim fully succeeds.
+    assert not sidecar_path.exists()
+
+
+def test_orphaned_worker_no_open_pr_terminal_label_only_is_left_alone(tmp_path: Path) -> None:
+    """Issue #417 regression: an issue in a legitimate terminal state (only
+    agent:human-needed -- no active label, no ready) that ALSO happens to
+    have a stale dispatched/dead-worker/no-PR state.json entry must be LEFT
+    ALONE by the ground-truth label reclaim. A prior revision's early-exit
+    gate (`if not active_labels and not needs_ready: continue`) proceeded
+    whenever EITHER half was false, so a terminal-only issue (active_labels
+    empty, needs_ready true) wrongly got `automated-ready` added back --
+    producing a contradictory human-needed + automated-ready label pair and
+    polluting the audit trail with a spurious `added_ready: True`. This test
+    must fail against a head that regresses to that gate.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["500"] = {
+        "status": "dispatched",
+        "dispatched_at": "2026-07-01T00:00:00Z",
+        "worker_pid": 12345,
+        "worker_process_start_time": 1700000000.0,
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 500,
+            "title": "needs a human",
+            "url": "https://example.test/issues/500",
+            "body": "",
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # No GitHub label call at all -- not even a redundant re-add of a label
+    # that was already there.
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+
+    state = load_state(paths.state_file)
+    assert [e for e in state["events"] if e["kind"] == "session_failed_relabeled"] == []
+    # state.json bookkeeping for this issue must be untouched by the reclaim
+    # (the pre-existing orphaned_worker_drift diagnostic fallback may still
+    # flag it -- that part of the behavior predates issue #417 and is not
+    # this test's concern).
+    entry = state["issues"]["500"]
+    assert entry.get("worker_pid") == 12345
+    assert "redispatch_at" not in entry
+
+
+def test_classify_dead_sessions_terminal_label_only_is_left_alone(tmp_path: Path) -> None:
+    """Issue #417 regression: same bug as the orphaned-worker sweep's, but
+    for the sidecar-based reap lane -- a dead session whose issue carries
+    ONLY a terminal label must be left alone: no labels touched, and no
+    redispatch_at bump (which would otherwise spend down the
+    max_auto_redispatch escalation cap for an issue that needs no automatic
+    recovery at all). This test must fail against a head that regresses to
+    the `if not active_labels and not needs_ready: continue` gate.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig as DevinCfg
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinCfg(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 501,
+            "title": "needs a human too",
+            "url": "https://example.test/issues/501",
+            "body": "",
+            "labels": [{"name": config.labels.human_needed}],
+        }
+    ]
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-501.log"
+    log_path.write_text("Some work done, then the process died.\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-501.json"
+    record = SessionRecord(
+        issue_number=501,
+        branch="agent/issue-501-x",
+        worktree_path="/tmp/worktree-501",
+        prompt_path="/tmp/prompt-501.md",
+        command=("devin", "--prompt-file", "/tmp/prompt-501.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+
+    state = load_state(paths.state_file)
+    assert [e for e in state["events"] if e["kind"] == "session_failed_relabeled"] == []
+    # No redispatch_at bookkeeping should have been written at all for this
+    # issue -- the escalation-cap counter must not spend down on an issue
+    # that needed no automatic recovery.
+    entry = state["issues"].get("501", {})
+    assert entry.get("redispatch_at") is None
+
+    # The sidecar is still reaped -- issue #113 phantom-session protection is
+    # unrelated to whether there was anything to relabel.
     assert not sidecar_path.exists()
 
 

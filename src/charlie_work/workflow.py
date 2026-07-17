@@ -1107,12 +1107,20 @@ def _detect_and_handle_orphaned_workers(
                 continue
             issue_labels = label_names(issue)
             active_labels = issue_labels & config.labels.active
-            needs_ready = config.labels.ready not in issue_labels
-            if not active_labels and not needs_ready:
-                # Already fully reconciled (e.g. the sidecar-based lane
-                # already succeeded this same pass, or a previous pass of
-                # this sweep already finished the job) -- nothing to do.
+            # Gate the WHOLE reclaim on an active label actually being
+            # present, matching reconcile.py's issue_active_label_no_open_pr
+            # pattern (~536-580) so all three sites agree. An issue with no
+            # active label -- e.g. one carrying only a terminal label like
+            # agent:human-needed/agent:done/agent:blocked -- has nothing here
+            # to reclaim. A prior `if not active_labels and not needs_ready`
+            # gate proceeded whenever EITHER half was false, which wrongly
+            # added `ready` back onto a terminal-only issue that also had a
+            # stale dispatched/dead-worker/no-PR state.json entry (already
+            # fully reconciled issues, or terminal-only ones, both correctly
+            # fall through here without any GitHub call).
+            if not active_labels:
                 continue
+            needs_ready = config.labels.ready not in issue_labels
             label_write_ok = True
             for label in sorted(active_labels):
                 if not gh.remove_issue_label(issue_number, label):
@@ -1224,7 +1232,18 @@ def _detect_and_handle_orphaned_workers(
                     )
                     if reclaim["label_write_ok"]:
                         # Fully reclaimed: labels are correct, nothing left to
-                        # flag as unresolved drift.
+                        # flag as unresolved drift. `status` deliberately stays
+                        # "dispatched" here (matching the sidecar-based lane's
+                        # own issue #282 fingerprint-preservation choice), so
+                        # this same entry would otherwise be re-discovered by
+                        # this sweep's very next pass and, having no more
+                        # labels left to touch, fall through to the
+                        # orphan_flagged_at diagnostic below and emit a
+                        # spurious orphaned_worker_drift for an issue that is
+                        # already fixed. Mark it flagged now so that never
+                        # happens -- this lane's reclaim retry above never
+                        # gates on this flag, only the diagnostic does.
+                        entry["orphan_flagged_at"] = utc_now()
                         state["issues"][str(issue_number)] = entry
                         continue
 
@@ -1805,16 +1824,25 @@ def _classify_dead_sessions_and_update_throttle_state(
                     continue
                 issue_labels = label_names(issue)
                 active_labels = issue_labels & config.labels.active
-                # Issue #417: also check whether the ready label is missing.
-                # The original guard here only checked active_labels, so a
-                # prior pass that removed the active label but then failed to
-                # add ready back (partial label-swap failure) would make this
-                # lane bail out on every subsequent pass forever, believing
-                # there was "nothing to do" -- even though the issue was left
-                # with no dispatch-eligible label at all.
-                needs_ready = config.labels.ready not in issue_labels
-                if not active_labels and not needs_ready:
+                # Gate the WHOLE reclaim on an active label actually being
+                # present, matching reconcile.py's issue_active_label_no_open_pr
+                # pattern (~536-580) so all three sites agree. An issue with
+                # no active label -- e.g. one carrying only a terminal label
+                # like agent:human-needed/agent:done/agent:blocked -- has
+                # nothing here to reclaim; it must never get `ready` added
+                # back just because it also has a stale
+                # dispatched/dead-worker/no-PR state.json entry. (A prior
+                # revision gated on "not active_labels and not needs_ready" to
+                # also repair a remove-succeeded-but-add-failed partial
+                # failure once the active label was already gone -- but that
+                # made this lane indistinguishable from "issue is legitimately
+                # terminal-only", which is the regression this gate now
+                # avoids. `needs_ready` is still honored below whenever an
+                # active label IS present, so the common
+                # remove-and-add-together case is unaffected.)
+                if not active_labels:
                     continue
+                needs_ready = config.labels.ready not in issue_labels
 
                 # Issue #252: completed-but-unpublished work takes the salvage
                 # path (push + PR) instead of re-dispatching.
