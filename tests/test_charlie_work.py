@@ -4579,6 +4579,9 @@ def test_review_queue_carries_forward_approved_on_identical_patch_id(tmp_path: P
     )
     assert decision["reviewed_head_sha"] == new_head
     assert decision["reviewed_patch_id"] == patch_id
+    # Issue #414 (d): the tier-1 fast path is unchanged and tags its own
+    # carry-forwards distinctly from tier 2.
+    assert decision["carry_forward_tier"] == "patch-id"
     assert old_head in decision["carried_forward_from"]
 
     state = load_state(app.paths.state_file)
@@ -4864,6 +4867,468 @@ def test_review_queue_dry_run_skips_carry_forward_write_but_not_stale_check(
         encoding="utf-8"
     ) == before_decision
     assert app.paths.state_file.read_text(encoding="utf-8") == before_state
+
+
+def test_review_queue_carries_forward_on_tier2_line_content_after_main_advance(
+    tmp_path: Path,
+) -> None:
+    """Issue #414: patch-id is unstable across every main advance because the
+    merge-base moves, which can shift a hunk's CONTEXT lines even when the
+    PR's own +/- content is untouched. Tier 2 recognizes this via the
+    ordered +/- line stream and changed-file set, ignoring context drift."""
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    # Reviewed diff: the PR added "+gamma" between unchanged "beta"/"delta".
+    reviewed_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " alpha\n"
+        " beta\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    # Live diff: main advanced and changed the *context* line "beta" ->
+    # "beta-updated" between the old and new merge-base. The PR's own
+    # "+gamma" contribution is byte-identical and in the same position, but
+    # git patch-id --stable hashes context text too, so the cumulative
+    # patch-id differs even though nothing the PR authored changed.
+    live_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " alpha\n"
+        " beta-updated\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert reviewed_patch_id != live_patch_id, "test fixture must reproduce patch-id drift"
+
+    reviewed_signature = _diff_content_signature(reviewed_diff)
+    live_signature = _diff_content_signature(live_diff)
+    assert reviewed_signature == live_signature, "tier-2 signature must ignore context drift"
+
+    old_head = "sha-old-head"
+    new_head = "sha-new-head-after-main-advance"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["carry_forward_tier"] == "line-content"
+    assert decision["reviewed_patch_id"] == live_patch_id
+    assert old_head in decision["carried_forward_from"]
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["reviewed_head_sha"] == new_head
+    assert state["prs"][str(pr_number)]["carry_forward_tier"] == "line-content"
+    assert state["prs"][str(pr_number)]["carried_forward_from"] == [old_head]
+
+
+def test_review_queue_reports_stale_on_reordered_changed_lines(tmp_path: Path) -> None:
+    """Issue #414: the same +/- lines in a different ORDER is a real semantic
+    change and must not carry forward via tier 2 (ordered, not sorted)."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+first\n"
+        "+second\n"
+        " delta\n"
+    )
+    live_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+second\n"
+        "+first\n"
+        " delta\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": ["+first", "+second"],
+            "reviewed_changed_files": ["file"],
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+    assert "carry_forward_tier" not in decision
+
+
+def test_review_queue_reports_stale_on_changed_file_set(tmp_path: Path) -> None:
+    """Issue #414: an identical line stream but a different set of changed
+    files (a file added/removed) is a real change and must not carry
+    forward via tier 2."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    live_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+        "diff --git a/other b/other\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/other\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+extra file\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": ["+gamma"],
+            "reviewed_changed_files": ["file"],
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+
+
+def test_review_queue_git_failure_in_tier2_falls_back_to_stale(tmp_path: Path) -> None:
+    """Issue #414: if the live diff cannot be fetched at all (gh/git failure),
+    tier 2 must fail closed to stale even when a tier-2 baseline is recorded
+    — never carry forward on uncertainty."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    class FakeGitHubEmptyDiff(FakeGitHub):
+        """Simulates a gh/git failure: pr_diff always returns empty."""
+
+        def pr_diff(self, number: int) -> str:
+            return ""
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHubEmptyDiff()
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": ["+gamma"],
+            "reviewed_changed_files": ["file"],
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+
+
+def test_merge_ready_carries_forward_approved_verdict_on_tier2_line_content(
+    tmp_path: Path,
+) -> None:
+    """Issue #414: the ship-it merge gate also carries forward via tier 2
+    when patch-ids differ due to main-advance context drift but the ordered
+    +/- lines and changed-file set are identical."""
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..456 78910\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " alpha\n"
+        " beta\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    live_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..789 78910\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " alpha\n"
+        " beta-updated\n"
+        "+gamma\n"
+        " delta\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert reviewed_patch_id != live_patch_id, "test fixture must reproduce patch-id drift"
+    reviewed_signature = _diff_content_signature(reviewed_diff)
+
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": old_head,
+                "reviewed_patch_id": reviewed_patch_id,
+                "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+                "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+                "summary": "lgtm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Simulate a rebase-style head move (not a 2-parent web-flow merge commit,
+    # so _verify_synced_head would reject it) with genuine patch-id drift
+    # from an intervening main advance, but content-identical +/- lines.
+    fake_gh.pr_head_shas[456] = new_head
+    fake_gh.diffs[456] = live_diff
+    fake_gh.compare_overrides[("main", new_head)] = {
+        "base_commit": {"sha": fake_gh.base_head_sha},
+        "merge_base_commit": {"sha": fake_gh.base_head_sha},
+    }
+    fake_gh.commits[new_head] = {
+        "parents": [{"sha": old_head}],
+        "committer": {"login": "someone"},
+        "commit": {"committer": {"name": "Not GitHub"}},
+    }
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is True
+    assert result.data.get("head_moved") is not True
+    assert fake_gh.merged == [(456, "squash")]
+
+    decision = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["carry_forward_tier"] == "line-content"
+    assert decision["reviewed_patch_id"] == live_patch_id
+    assert decision["carried_forward_from"] == [old_head]
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    assert pr_state["reviewed_head_sha"] == new_head
+    assert pr_state["carry_forward_tier"] == "line-content"
+    assert pr_state["carried_forward_from"] == [old_head]
+    assert pr_state["status"] != "reviewing"
+
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_line_content"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["patch_id"] == live_patch_id
+    assert payload["carry_forward_tier"] == "line-content"
+    assert payload["carried_forward_from"] == [old_head]
+
+    # No review_started transition should fire for a tier-2 carry-forward.
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
 def _dispatch_reviews_app(
@@ -8020,11 +8485,15 @@ def test_merge_ready_carries_forward_approved_verdict_on_clean_rebase(tmp_path: 
     decision = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == new_head
     assert decision["reviewed_patch_id"] == patch_id
+    # Issue #414 (d): the tier-1 fast path is unchanged and tags its own
+    # carry-forwards distinctly from tier 2.
+    assert decision["carry_forward_tier"] == "patch-id"
     assert decision["carried_forward_from"] == [old_head]
 
     state = load_state(paths.state_file)
     pr_state = state["prs"]["456"]
     assert pr_state["reviewed_head_sha"] == new_head
+    assert pr_state["carry_forward_tier"] == "patch-id"
     assert pr_state["carried_forward_from"] == [old_head]
     # The approval was carried forward (not reset to "reviewing") and the PR
     # proceeded to merge on the same poll.
