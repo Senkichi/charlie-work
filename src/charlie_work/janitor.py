@@ -25,11 +25,11 @@ import fnmatch
 import re
 import subprocess
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from charlie_work.checks import CheckSummary, summarize_checks
+from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
 from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
 
@@ -138,6 +138,8 @@ class JanitorVerdict:
     warnings: tuple[str, ...]
     failed_required_checks: tuple[str, ...] = ()
     is_check_failure_block: bool = False
+    rerun_run_ids: tuple[int, ...] = ()
+    check_rerun_attempts: dict[str, Any] = field(default_factory=dict)
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -243,6 +245,25 @@ def run_janitor(
         _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
     is_check_failure_block = bool(failed_required_checks) and not failures
+
+    # Flake-aware debounce (issue #391): if the only blocker is failed required
+    # checks, decide which runs get a one-time auto-rerun vs which are already
+    # retried and therefore definitive. The actual gh run rerun call lives in
+    # workflow.review; run_janitor stays pure and just returns the classification.
+    rerun_run_ids: tuple[int, ...] = ()
+    check_rerun_attempts: dict[str, Any] = {}
+    if summary is not None:
+        head_sha = str(pr.get("headRefOid") or "") or None
+        debounce = classify_check_failures(
+            checks,
+            required,
+            pr_state,
+            head_sha,
+            record_attempts=is_check_failure_block,
+        )
+        rerun_run_ids = debounce.rerun_run_ids
+        check_rerun_attempts = debounce.check_rerun_attempts
+
     if failed_required_checks:
         failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
 
@@ -252,6 +273,8 @@ def run_janitor(
         warnings=tuple(warnings),
         failed_required_checks=failed_required_checks,
         is_check_failure_block=is_check_failure_block,
+        rerun_run_ids=rerun_run_ids,
+        check_rerun_attempts=check_rerun_attempts,
     )
 
 

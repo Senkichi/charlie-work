@@ -30,6 +30,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubRunResult,
     GraphQLBudgetError,
     cancel_superseded_runs,
     detect_prose_only_dependencies,
@@ -3127,6 +3128,78 @@ class OrchestratorApp:
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            # Flake-aware debounce (issue #391): if the only blocker is a failed
+            # required check and we have not yet retried the Actions run for this
+            # head, trigger one automatic `gh run rerun --failed` and defer rework
+            # routing until the next poll. Any rerun-API error is surfaced as an
+            # event and we fall through to the existing rework/janitor-block path.
+            if verdict.rerun_run_ids:
+                rerun_errors: list[str] = []
+                triggered_run_ids: list[int] = []
+                for run_id in verdict.rerun_run_ids:
+                    result = self.gh.run(
+                        ["run", "rerun", str(run_id), "--failed"], allow_failure=True
+                    )
+                    if isinstance(result, GitHubRunResult):
+                        if result.ok:
+                            triggered_run_ids.append(run_id)
+                        else:
+                            rerun_errors.append(
+                                result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                            )
+                    elif isinstance(result, str):
+                        # Dry-run returns a descriptive string; treat as success.
+                        triggered_run_ids.append(run_id)
+                    else:
+                        rerun_errors.append(
+                            f"unexpected result from gh run rerun {run_id}: {result!r}"
+                        )
+
+                if triggered_run_ids and not rerun_errors:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "check_rerun_attempts": verdict.check_rerun_attempts,
+                        }
+                        state = append_event(
+                            state,
+                            "flake_rerun_triggered",
+                            {
+                                "pr_number": pr_number,
+                                "run_ids": triggered_run_ids,
+                                "head_sha": pr.get("headRefOid"),
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"flake rerun triggered for PR #{pr_number}: run(s) "
+                        + ", ".join(str(rid) for rid in triggered_run_ids),
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "rerun_run_ids": triggered_run_ids,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
+                # Rerun API error: record it, but do not consume the attempt.
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "flake_rerun_failed",
+                        {
+                            "pr_number": pr_number,
+                            "run_ids": list(verdict.rerun_run_ids),
+                            "errors": rerun_errors,
+                        },
+                    )
+                    save_state(self.paths.state_file, state)
+
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
@@ -3141,6 +3214,7 @@ class OrchestratorApp:
                     "status": "janitor_blocked",
                     "janitor_ok": False,
                     "janitor_failures": list(verdict.failures),
+                    "check_rerun_attempts": verdict.check_rerun_attempts,
                 }
                 state = append_event(
                     state,
@@ -3261,6 +3335,7 @@ class OrchestratorApp:
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
                 "consecutive_failed_merge_attempts": 0,
+                "check_rerun_attempts": verdict.check_rerun_attempts,
             }
             if issue_number is not None:
                 _issue_key = str(issue_number)
