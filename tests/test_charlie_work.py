@@ -4445,9 +4445,12 @@ def test_review_queue_is_read_only(tmp_path: Path) -> None:
 
 
 def _review_queue_carry_forward_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
 ) -> OrchestratorApp:
-    """Build a non-dry-run OrchestratorApp for carry-forward tests."""
+    """Build an OrchestratorApp for carry-forward tests."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -4458,7 +4461,7 @@ def _review_queue_carry_forward_app(
     fake_gh = FakeGitHub()
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def test_review_queue_carries_forward_approved_on_identical_patch_id(tmp_path: Path) -> None:
@@ -4740,6 +4743,75 @@ def test_review_queue_git_failure_falls_back_to_stale(
             "reviewed_head_sha": old_head,
         }
     ]
+
+
+def test_review_queue_dry_run_skips_carry_forward_write_but_not_stale_check(
+    tmp_path: Path,
+) -> None:
+    """Issue #411: dry-run review-queue must not write but still hide stale verdicts
+    when the cumulative patch-id is unchanged."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs, dry_run=True)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+    before_decision = (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(
+        encoding="utf-8"
+    )
+    before_state = app.paths.state_file.read_text(encoding="utf-8")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+    assert (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(
+        encoding="utf-8"
+    ) == before_decision
+    assert app.paths.state_file.read_text(encoding="utf-8") == before_state
 
 
 def _dispatch_reviews_app(

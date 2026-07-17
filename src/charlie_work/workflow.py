@@ -3391,22 +3391,22 @@ class OrchestratorApp:
                 live_diff = self.gh.pr_diff(pr_number) or ""
                 live_patch_id = _calculate_patch_id(live_diff)
 
-                carry_forward = (
-                    reviewed_patch_id
-                    and live_patch_id
-                    and live_patch_id == reviewed_patch_id
-                    and not self.dry_run
+                patch_ids_match = (
+                    reviewed_patch_id and live_patch_id and live_patch_id == reviewed_patch_id
                 )
-                if carry_forward:
-                    try:
-                        self._update_approval_head(
-                            pr_number, decision, live_head_sha, old_head=reviewed_head_sha
-                        )
-                    except StateLockBusy:
-                        # Could not mirror the carry-forward into state.json,
-                        # but the decision-file update is the durable source
-                        # of truth; proceed as carried-forward.
-                        pass
+                if patch_ids_match:
+                    # In dry-run mode we still run the content check so the queue
+                    # reflects real changes, but we skip the durable head update.
+                    if not self.dry_run:
+                        try:
+                            self._update_approval_head(
+                                pr_number, decision, live_head_sha, old_head=reviewed_head_sha
+                            )
+                        except StateLockBusy:
+                            # Could not mirror the carry-forward into state.json,
+                            # but the decision-file update is the durable source
+                            # of truth; proceed as carried-forward.
+                            pass
                     continue
 
                 # If the packet is stale, we cannot dispatch a new reviewer from
