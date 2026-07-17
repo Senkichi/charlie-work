@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .subprocess_runner import no_console_window_kwargs
@@ -28,6 +30,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GraphQLBudgetError,
     cancel_superseded_runs,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
@@ -56,6 +59,7 @@ from .worktree import (
     resolve_base_branch_name,
 )
 from .state import (
+    StateLockBusy,
     append_event,
     is_claim_stale,
     is_throttled,
@@ -75,6 +79,29 @@ class CommandResult:
     ok: bool
     message: str
     data: dict[str, Any]
+
+
+def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
+    data: dict[str, Any] = {
+        "skipped": True,
+        "reason": "state_lock_busy",
+        "state_lock_busy": True,
+    }
+    data.update(extra)
+    return CommandResult(True, message, data)
+
+
+def _guard_state_lock(func: Any) -> Any:
+    """Decorator that turns StateLockBusy into a skipped CommandResult."""
+
+    @functools.wraps(func)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> CommandResult:
+        try:
+            return func(self, *args, **kwargs)
+        except StateLockBusy:
+            return _state_lock_busy_result("state lock held, skipped")
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -2110,6 +2137,7 @@ class OrchestratorApp:
             fleet_max=fleet_max,
         )
 
+    @_guard_state_lock
     def status(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
@@ -2228,6 +2256,7 @@ class OrchestratorApp:
             True, "labels ensured", {"labels": self.config.labels.all, "missing": []}
         )
 
+    @_guard_state_lock
     def intake(self) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         written: list[dict[str, Any]] = []
@@ -2354,6 +2383,24 @@ class OrchestratorApp:
         try:
             return self._dispatch_impl(
                 limit, only_issues=only_issues, stalled_entries=stalled_entries
+            )
+        except StateLockBusy:
+            return _state_lock_busy_result(
+                "dispatch deferred: state lock held",
+                selected_count=0,
+                deferred_reason="state_lock_busy",
+            )
+        except GraphQLBudgetError as exc:
+            return CommandResult(
+                True,
+                "dispatch deferred: GraphQL rate limit below threshold",
+                {
+                    "selected_count": 0,
+                    "deferred_reason": "graphql_rate_limit",
+                    "graphql_remaining": exc.remaining,
+                    "graphql_reset": exc.reset_at,
+                    "graphql_threshold": exc.threshold,
+                },
             )
         finally:
             if fleet_lock is not None:
@@ -2999,6 +3046,7 @@ class OrchestratorApp:
             data,
         )
 
+    @_guard_state_lock
     def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
         """Generate a review packet for a PR.
 
@@ -3375,6 +3423,7 @@ class OrchestratorApp:
             {"queue": queue},
         )
 
+    @_guard_state_lock
     def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
         """Launch Claude Code reviewer sessions concurrently for queued PRs.
 
@@ -3712,7 +3761,6 @@ class OrchestratorApp:
             "reviewed_at": utc_now(),
         }
         decision_path = pr_dir / "review-decision.json"
-        self._write_json(decision_path, decision_payload)
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
         # durable decision/counter from what actually happened.
@@ -3741,6 +3789,7 @@ class OrchestratorApp:
                 if not escalated:
                     rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
             decision_payload["escalated"] = escalated
+            self._write_json(decision_path, decision_payload)
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,
@@ -3875,6 +3924,7 @@ class OrchestratorApp:
             },
         )
 
+    @_guard_state_lock
     def merge_ready(
         self,
         pr_number: int,
@@ -4383,6 +4433,7 @@ class OrchestratorApp:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(not checks_unavailable, message, data)
 
+    @_guard_state_lock
     def spec_review(self, artifact_path: Path) -> CommandResult:
         """Run an explicit cross-family adversarial pass over a spec/plan file.
 
@@ -4497,45 +4548,105 @@ class OrchestratorApp:
         """Detect (and optionally repair) drift between GitHub reality and the
         orchestrator's labels/state — e.g. a PR merged by hand outside
         merge-ready leaving `agent:in-progress` stale forever. Read-only unless
-        ``fix`` is passed."""
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            drift = detect_drift(self.gh, state, self.config, repo_root=self.repo_root)
-            fixed = False
-            post_fix_drift: list[DriftItem] = []
-            if fix and drift:
-                new_state = apply_drift_fixes(self.gh, state, drift, self.config)
-                save_state(self.paths.state_file, new_state)
-                # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
-                # for failed adds/removes, and apply_fixes records the outcome in the
-                # reconcile event. Re-detect against the new state to verify the repairs
-                # actually landed before reporting success.
-                post_fix_drift = detect_drift(
-                    self.gh, new_state, self.config, repo_root=self.repo_root
+        ``fix`` is passed.
+
+        ``mop-up --fix`` is a state writer and must be mutually exclusive with
+        a supervised ``bash-rats``/fleet pass on the same repo. It acquires the
+        same ``supervisor.lock`` used by fleet/supervise. If either the
+        supervisor lock or the state lock is held, the call returns a skipped
+        value result rather than blocking or writing unlocked.
+        """
+        supervisor_lock = None
+        if fix:
+            supervisor_lock = try_acquire_byte_range_lock(self.paths.root / "supervisor.lock")
+            if supervisor_lock is None:
+                return CommandResult(
+                    True,
+                    "reconcile deferred: supervisor lock held",
+                    {"skipped": True, "reason": "supervisor_lock_held"},
                 )
-                fixed = len(post_fix_drift) == 0
-        message = f"found {len(drift)} drift item(s)"
-        if fixed:
-            message += " — fixed"
-        elif drift:
-            if fix and post_fix_drift:
-                message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
-            else:
-                message += " (read-only; pass --fix to repair)"
-        # ok=False when drift is present and not fixed: scripts and CI can gate
-        # on exit code to detect unresolved drift, matching how `doctor` gates.
-        ok = not drift or fixed
-        return CommandResult(
-            ok,
-            message,
-            {
-                "drift": [asdict(item) for item in drift],
-                "fixed": fixed,
-                "drift_before": len(drift),
-                "drift_after": len(post_fix_drift),
-                "remaining_drift": [asdict(item) for item in post_fix_drift],
-            },
-        )
+        try:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                threshold = self.config.runtime.graphql_rate_limit_threshold
+                sufficient, remaining, reset_at = self.gh.check_graphql_rate_limit(threshold)
+                if not sufficient:
+                    state = append_event(
+                        state,
+                        "graphql_rate_limit_deferred",
+                        {
+                            "remaining": remaining,
+                            "reset": reset_at,
+                            "threshold": threshold,
+                            "phase": "reconcile",
+                        },
+                    )
+                    save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        True,
+                        "reconcile deferred: GraphQL rate limit below threshold",
+                        {
+                            "deferred": True,
+                            "deferred_reason": "graphql_rate_limit",
+                            "graphql_remaining": remaining,
+                            "graphql_reset": reset_at,
+                            "graphql_threshold": threshold,
+                        },
+                    )
+                drift = detect_drift(self.gh, state, self.config, repo_root=self.repo_root)
+                fixed = False
+                post_fix_drift: list[DriftItem] = []
+                if fix and drift:
+                    new_state = apply_drift_fixes(self.gh, state, drift, self.config)
+                    save_state(self.paths.state_file, new_state)
+                    # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
+                    # for failed adds/removes, and apply_fixes records the outcome in the
+                    # reconcile event. Re-detect against the new state to verify the repairs
+                    # actually landed before reporting success.
+                    post_fix_drift = detect_drift(
+                        self.gh, new_state, self.config, repo_root=self.repo_root
+                    )
+                    fixed = len(post_fix_drift) == 0
+            message = f"found {len(drift)} drift item(s)"
+            if fixed:
+                message += " — fixed"
+            elif drift:
+                if fix and post_fix_drift:
+                    message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
+                else:
+                    message += " (read-only; pass --fix to repair)"
+            # ok=False when drift is present and not fixed: scripts and CI can gate
+            # on exit code to detect unresolved drift, matching how `doctor` gates.
+            ok = not drift or fixed
+            return CommandResult(
+                ok,
+                message,
+                {
+                    "drift": [asdict(item) for item in drift],
+                    "fixed": fixed,
+                    "drift_before": len(drift),
+                    "drift_after": len(post_fix_drift),
+                    "remaining_drift": [asdict(item) for item in post_fix_drift],
+                },
+            )
+        except GraphQLBudgetError as exc:
+            # Defensive: detect_drift re-checks the budget and may raise.
+            return CommandResult(
+                True,
+                "reconcile deferred: GraphQL rate limit below threshold",
+                {
+                    "deferred": True,
+                    "deferred_reason": "graphql_rate_limit",
+                    "graphql_remaining": exc.remaining,
+                    "graphql_reset": exc.reset_at,
+                    "graphql_threshold": exc.threshold,
+                },
+            )
+        except StateLockBusy:
+            return _state_lock_busy_result("reconcile deferred: state lock held")
+        finally:
+            if supervisor_lock is not None:
+                supervisor_lock.release()
 
     @staticmethod
     def _cross_family_section(report_path: str | Path) -> str:
@@ -5170,6 +5281,7 @@ class OrchestratorApp:
         else:
             merges.append(merge_result.data)
 
+    @_guard_state_lock
     def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
@@ -5469,6 +5581,13 @@ class OrchestratorApp:
         try:
             return self._dispatch_rework_impl(
                 limit, only_issues=only_issues, stalled_entries=stalled_entries
+            )
+        except StateLockBusy:
+            return _state_lock_busy_result(
+                "rework dispatch deferred: state lock held",
+                adapter=self.config.devin.adapter,
+                selected_count=0,
+                deferred_reason="state_lock_busy",
             )
         finally:
             if fleet_lock is not None:

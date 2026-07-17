@@ -67,6 +67,9 @@ class FakeGitHub:
     def pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+        return (True, 10000, 0)
+
     def run(self, args, *, json_output=False, allow_failure=False):
         return [] if json_output else ""
 

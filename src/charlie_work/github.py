@@ -24,6 +24,7 @@ _LIST_LIMIT = 500
 # configurable via orchestrator.config.yaml.
 _DEFAULT_GH_MAX_RETRIES = 3
 _DEFAULT_GH_RETRY_BASE_SECONDS = 1.0
+_DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
 
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
@@ -81,6 +82,25 @@ ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
 
 class GitHubError(RuntimeError):
     pass
+
+
+class GraphQLBudgetError(GitHubError):
+    """Raised when the GitHub GraphQL rate-limit budget is too low to start a
+    quota-heavy phase safely.
+
+    Carries the remaining quota, the unix timestamp when the quota resets, and
+    the configured threshold that was not met so callers can surface them in
+    skip events and digests.
+    """
+
+    def __init__(self, remaining: int, reset_at: int | None, threshold: int) -> None:
+        self.remaining = remaining
+        self.reset_at = reset_at
+        self.threshold = threshold
+        super().__init__(
+            f"GraphQL rate limit remaining ({remaining}) is below configured "
+            f"threshold ({threshold}); reset at {reset_at}"
+        )
 
 
 @dataclass(frozen=True)
@@ -323,6 +343,45 @@ class GitHub:
         result = self.run(args, allow_failure=True)
         return result.ok
 
+    def check_graphql_rate_limit(
+        self, threshold: int = _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
+    ) -> tuple[bool, int, int | None]:
+        """Return (sufficient, remaining, reset_at) from ``gh api rate_limit``.
+
+        Uses the REST ``rate_limit`` endpoint to inspect
+        ``resources.graphql.remaining`` before starting a quota-heavy phase.
+        If the endpoint cannot be reached or the response is malformed, the
+        guard defaults to ``sufficient=True`` so a transient check failure does
+        not wedge the fleet; callers that need strict enforcement raise
+        ``GraphQLBudgetError`` when this returns ``sufficient=False``.
+        """
+        result = self.run(["api", "rate_limit"], json_output=True, allow_failure=True)
+        data: dict[str, Any] | None = None
+        if isinstance(result, GitHubRunResult):
+            if not result.ok or not isinstance(result.value, dict):
+                return (True, 0, None)
+            data = result.value
+        elif isinstance(result, dict):
+            data = result
+        else:
+            return (True, 0, None)
+
+        resources = data.get("resources")
+        if not isinstance(resources, dict):
+            return (True, 0, None)
+        graphql = resources.get("graphql")
+        if not isinstance(graphql, dict):
+            return (True, 0, None)
+
+        try:
+            remaining = int(graphql.get("remaining", 0))
+            reset_at = graphql.get("reset")
+            reset_at = int(reset_at) if reset_at is not None else None
+        except (TypeError, ValueError):
+            return (True, 0, None)
+
+        return (remaining >= threshold, remaining, reset_at)
+
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
         # run() now applies the fleet-wide bounded retry policy for transient
         # failures, so _list_json no longer needs its own ad-hoc retry loop.
@@ -415,6 +474,14 @@ class GitHub:
         )
 
     def merged_pr_list(self) -> list[dict[str, Any]]:
+        threshold = (
+            self.runtime.graphql_rate_limit_threshold
+            if self.runtime is not None
+            else _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
+        )
+        sufficient, remaining, reset_at = self.check_graphql_rate_limit(threshold)
+        if not sufficient:
+            raise GraphQLBudgetError(remaining, reset_at, threshold)
         return self._list_json(
             [
                 "pr",
