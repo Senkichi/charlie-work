@@ -45,6 +45,7 @@ from .janitor import (
     _calculate_patch_id,
     check_operator_containment,
     check_test_adequacy,
+    detect_cross_pr_revert,
     run_janitor,
     TestAdequacyFacts,
     TestAdequacyVerdict,
@@ -4072,6 +4073,9 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         merge_conflict_routed = False
+        cross_pr_revert_detected = False
+        cross_pr_revert_routed = False
+        cross_pr_revert_reason: str | None = None
         issue_status: str | None = None
         label_error: dict[str, Any] | None = None
         rework_label_error: dict[str, Any] | None = None
@@ -4320,6 +4324,32 @@ class OrchestratorApp:
                         head_sha,
                         reason,
                     )
+
+            # Cross-PR revert gate: a branch that merges a base commit and then
+            # reverts it has a clean PR diff but would silently undo the base
+            # change when squash-merged. Detect by enumerating branch commits not
+            # on base and matching `Revert "..."` subjects against base commits.
+            if not sync_failed:
+                cross_pr_revert_reason = detect_cross_pr_revert(pr, self.repo_root)
+                if cross_pr_revert_reason:
+                    cross_pr_revert_detected = True
+                    sync_failed = True
+                    if issue_number is not None:
+                        state = load_state_locked(self.paths.state_file)
+                        issue_state = state["issues"].get(str(issue_number), {})
+                        issue_status = issue_state.get("status")
+                        if issue_status not in (
+                            "escalated",
+                            "blocked",
+                            "dispatched",
+                            "dispatch_pending",
+                            "manifest_written",
+                        ):
+                            if issue_status != "rework_requested":
+                                cross_pr_revert_routed = True
+                                rework_label_error = self._request_cross_pr_revert_rework(
+                                    pr, issue_number, decision, cross_pr_revert_reason
+                                )
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -4467,6 +4497,26 @@ class OrchestratorApp:
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
                             f"merge conflict — {conflict_detail}"
                         )
+                    elif cross_pr_revert_detected:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        if issue_number is None:
+                            revert_detail = "no linked issue, cannot route to rework"
+                        elif cross_pr_revert_routed:
+                            if rework_label_error:
+                                outcome = rework_label_error.get("outcome", rework_label_error)
+                                revert_detail = (
+                                    f"rework dispatch attempted (label update failed: {outcome})"
+                                )
+                            else:
+                                revert_detail = "rework dispatched"
+                        elif issue_status == "rework_requested":
+                            revert_detail = "rework already requested"
+                        else:
+                            revert_detail = "rework not routed"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            f"cross-PR revert — {revert_detail}"
+                        )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
                             pr_number, new_attempts, summary
@@ -4535,9 +4585,14 @@ class OrchestratorApp:
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
             "merge_conflict": merge_conflict,
+            "cross_pr_revert_detected": cross_pr_revert_detected,
+            "cross_pr_revert_reason": cross_pr_revert_reason,
+            "cross_pr_revert_routed": cross_pr_revert_routed,
         }
         message = "merge readiness evaluated"
-        if checks_unavailable:
+        if cross_pr_revert_detected:
+            message = f"cross-PR revert detected: {cross_pr_revert_reason}"
+        elif checks_unavailable:
             message = "checks unavailable (gh failure)"
         elif merge_output and label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
@@ -5135,26 +5190,23 @@ class OrchestratorApp:
             or str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
         )
 
-    def _request_merge_conflict_rework(
+    def _route_to_rework(
         self,
         pr: dict[str, Any],
         issue_number: int,
         decision: dict[str, Any],
+        summary: str,
+        event_kind: str,
     ) -> dict[str, Any] | None:
-        """Route an approved PR with a genuine merge conflict to rework.
+        """Route an approved PR to rework with a custom summary and event kind.
 
         Writes a rework prompt, transitions the linked issue to
         ``rework_requested`` (same label set as a non-escalated request_changes),
-        and appends a distinct ``merge_conflict_rework_requested`` state event.
-        The PR's ``review-decision.json`` is intentionally left untouched so the
-        approved verdict is re-confirmed after the worker push moves the head.
+        and appends the requested state event. The PR's ``review-decision.json``
+        is intentionally left untouched so the approved verdict is re-confirmed
+        after the worker push moves the head.
         """
         pr_number = int(pr["number"])
-        summary = (
-            "The PR branch has a merge conflict with the base branch after a base update. "
-            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
-            "The code changes are already approved; do not re-litigate the review."
-        )
         self._write_rework_prompt(pr, issue_number, summary)
 
         with state_lock(self.paths.state_file):
@@ -5176,7 +5228,7 @@ class OrchestratorApp:
             }
             state = append_event(
                 state,
-                "merge_conflict_rework_requested",
+                event_kind,
                 {
                     "pr_number": pr_number,
                     "issue_number": issue_number,
@@ -5196,6 +5248,39 @@ class OrchestratorApp:
             "add_failures": result.add_failures,
             "remove_failures": result.remove_failures,
         }
+
+    def _request_merge_conflict_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR with a genuine merge conflict to rework."""
+        summary = (
+            "The PR branch has a merge conflict with the base branch after a base update. "
+            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
+            "The code changes are already approved; do not re-litigate the review."
+        )
+        return self._route_to_rework(
+            pr, issue_number, decision, summary, "merge_conflict_rework_requested"
+        )
+
+    def _request_cross_pr_revert_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Route an approved PR whose branch silently reverts a base commit to rework."""
+        summary = (
+            f"{reason}. Remove the revert commit (or the merge+revert pair) from the PR "
+            "history, or add an explicit 'allow-revert: <reason>' line to the PR body if the "
+            "revert is intentional. Then push the corrected branch and re-request review."
+        )
+        return self._route_to_rework(
+            pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"
+        )
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
         """Return the PR number of the head of the merge-train queue, or None.
