@@ -4605,7 +4605,19 @@ class OrchestratorApp:
             base_current: bool | None = None
             if not sync_failed and update_branch_strategy in {"front_of_train", "broadcast"}:
                 base_current = self._is_base_current(pr)
-                if self._should_update_pr_branch(pr, base_current):
+                # Aviator MergeQueue handoff (task #10): once this PR has
+                # already been parked in Aviator's queue (state status
+                # "mergequeue" from a prior merge_ready pass), Aviator owns
+                # rebasing it. Calling pr_update_branch here on every
+                # subsequent poll would race Aviator's own rebase as a second
+                # writer on the same ref — this repo's live config is
+                # broadcast, so every poll would otherwise attempt it. The
+                # base-freshness *read* above still runs (it only feeds the
+                # require_current_base gate below); only the write is
+                # skipped. See the merge-train exclusion in
+                # _merge_train_candidates for the sibling half of this fix.
+                already_in_mergequeue = existing_pr_state.get("status") == "mergequeue"
+                if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
@@ -4726,64 +4738,120 @@ class OrchestratorApp:
         label_error = rework_label_error
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
+        mergequeue_label_applied: bool | None = None
         if can_merge and should_merge:
-            # Merge, then labels, then best-effort branch deletion — in that
-            # order. merge_pr is the irreversible step: persist status="merged"
-            # to state IMMEDIATELY after it succeeds and BEFORE the label
-            # transition, so a transition failure or Ctrl+C can't leave GitHub
-            # merged while state.json still shows "reviewing" — which made
-            # reconcile false-positive on every clean auto-merge and lost the
-            # merged fact entirely on a crash between merge and save.
-            merge_output = self.gh.merge_pr(
-                pr_number,
-                self.config.auto_merge.strategy,
-                admin=self.config.auto_merge.admin,
-                merge_flags=self.config.auto_merge.merge_flags,
-            )
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                state["prs"][str(pr_number)] = {
-                    **state["prs"].get(str(pr_number), {}),
-                    "number": pr_number,
-                    "issue_number": issue_number,
-                    "status": "merged",
-                    "merged": True,
-                    "consecutive_failed_merge_attempts": 0,
-                }
-                if issue_number is not None:
-                    _issue_key = str(issue_number)
-                    _issue_entry = state["issues"].get(_issue_key, {})
-                    state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
-                save_state(self.paths.state_file, state)
-            # Label + branch cleanup are best-effort; the merged fact is already
-            # durable. A branch-deletion failure (head branch checked out in a
-            # worktree) or label failure must never un-record the merge.
-            if issue_number is not None:
-                result = transition(self.gh, self.config.labels, issue_number, "merged")
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": "merged",
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                # Close the linked issue explicitly — idempotent if already closed
-                # via GitHub's keyword automation. This ensures the dependency gate
-                # sees the closure immediately, avoiding the agent:done+OPEN state.
-                self.gh.close_issue(issue_number)
-            if self.config.auto_merge.delete_branch:
-                head_ref = str(pr.get("headRefName") or "")
-                branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
-            # Update remaining open agent PRs after successful merge (if configured)
-            if self.config.auto_merge.update_branch_strategy in {"broadcast", "front_of_train"}:
-                update_results = self._update_open_agent_prs(pr_number)
-            # Cancel superseded queued runs on default branch after successful merge (if configured)
-            if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
-                cancel_results = cancel_superseded_runs(
-                    self.gh,
-                    self.config.runners.default_branch,
-                    self.config.runners.workflow_name,
+            mergequeue_label = self.config.auto_merge.mergequeue_label
+            if mergequeue_label:
+                # Aviator MergeQueue handoff (task #10): apply the trigger
+                # label instead of self-merging. add_pr_label is PR-scoped
+                # (issue_number may be None for cross-repo PRs) and idempotent.
+                # State records status="mergequeue" (never "merged"), so the
+                # idempotency short-circuit at the top of this method does not
+                # fire — a re-run of `ship-it` while the queue merge is still
+                # pending safely re-applies the (no-op) label. Aviator does
+                # its own queue rebase (replacing _update_open_agent_prs) and
+                # GitHub auto-closes the linked issue via the PR's "Closes #N"
+                # body; branch deletion is configured on the Aviator side.
+                # cancel_superseded_runs is the one accepted residual gap (see
+                # PR description). Once GitHub reports the PR merged,
+                # reconcile.py's merged_outside_orchestrator drift path
+                # reconciles status to "merged" and runs the "merged" label
+                # transition — no new post-merge bookkeeping is added here.
+                mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
+                if mergequeue_label_applied:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "mergequeue",
+                            "consecutive_failed_merge_attempts": 0,
+                        }
+                        if issue_number is not None:
+                            _issue_key = str(issue_number)
+                            _issue_entry = state["issues"].get(_issue_key, {})
+                            state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        save_state(self.paths.state_file, state)
+                # else: add_pr_label failed. The label IS the handoff, so a
+                # failure here must not advance status to "mergequeue" —
+                # treating a failed label add as success would silently
+                # orphan the PR (never self-merged, never picked up by
+                # Aviator, and nothing would ever look wrong to state). Leave
+                # status/counters untouched; the shared failed-attempt-alarm
+                # block below (mergequeue_handoff_failed) increments
+                # consecutive_failed_merge_attempts on every retry and can
+                # escalate exactly like an unmergeable approved PR.
+            else:
+                # Merge, then labels, then best-effort branch deletion — in that
+                # order. merge_pr is the irreversible step: persist status="merged"
+                # to state IMMEDIATELY after it succeeds and BEFORE the label
+                # transition, so a transition failure or Ctrl+C can't leave GitHub
+                # merged while state.json still shows "reviewing" — which made
+                # reconcile false-positive on every clean auto-merge and lost the
+                # merged fact entirely on a crash between merge and save.
+                merge_output = self.gh.merge_pr(
+                    pr_number,
+                    self.config.auto_merge.strategy,
+                    admin=self.config.auto_merge.admin,
+                    merge_flags=self.config.auto_merge.merge_flags,
                 )
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state["prs"][str(pr_number)] = {
+                        **state["prs"].get(str(pr_number), {}),
+                        "number": pr_number,
+                        "issue_number": issue_number,
+                        "status": "merged",
+                        "merged": True,
+                        "consecutive_failed_merge_attempts": 0,
+                    }
+                    if issue_number is not None:
+                        _issue_key = str(issue_number)
+                        _issue_entry = state["issues"].get(_issue_key, {})
+                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                    save_state(self.paths.state_file, state)
+                # Label + branch cleanup are best-effort; the merged fact is already
+                # durable. A branch-deletion failure (head branch checked out in a
+                # worktree) or label failure must never un-record the merge.
+                if issue_number is not None:
+                    result = transition(self.gh, self.config.labels, issue_number, "merged")
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        label_error = {
+                            "edge": "merged",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
+                    # Close the linked issue explicitly — idempotent if already closed
+                    # via GitHub's keyword automation. This ensures the dependency gate
+                    # sees the closure immediately, avoiding the agent:done+OPEN state.
+                    self.gh.close_issue(issue_number)
+                if self.config.auto_merge.delete_branch:
+                    head_ref = str(pr.get("headRefName") or "")
+                    branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
+                # Update remaining open agent PRs after successful merge (if configured)
+                if self.config.auto_merge.update_branch_strategy in {
+                    "broadcast",
+                    "front_of_train",
+                }:
+                    update_results = self._update_open_agent_prs(pr_number)
+                # Cancel superseded queued runs on default branch after successful merge (if configured)
+                if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
+                    cancel_results = cancel_superseded_runs(
+                        self.gh,
+                        self.config.runners.default_branch,
+                        self.config.runners.workflow_name,
+                    )
+        # Aviator MergeQueue handoff (task #10): the label add IS the handoff
+        # — a failed add_pr_label must be treated as a genuine unmergeable
+        # pass (like an unmet check or a merge conflict), not silently
+        # swallowed as best-effort cleanup. can_merge is True here (checks
+        # green, approved), so the "approved and not can_merge" alarm gate
+        # below would otherwise never fire for this failure mode.
+        mergequeue_handoff_failed = bool(
+            self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
+        )
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
@@ -4791,7 +4859,9 @@ class OrchestratorApp:
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
-            if approved and not can_merge and not _is_pending_only(summary):
+            if (
+                approved and not can_merge and not _is_pending_only(summary)
+            ) or mergequeue_handoff_failed:
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
@@ -4836,6 +4906,14 @@ class OrchestratorApp:
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
                             f"cross-PR revert — {revert_detail}"
                         )
+                    elif mergequeue_handoff_failed:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved and checks green but the mergequeue "
+                            f"label {self.config.auto_merge.mergequeue_label!r} failed to "
+                            f"apply for {new_attempts} {pass_str} — never handed off to "
+                            "Aviator"
+                        )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
                             pr_number, new_attempts, summary
@@ -4852,11 +4930,13 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            if approved and can_merge and merge_output is None:
+            if approved and can_merge and merge_output is None and not mergequeue_handoff_failed:
                 # merge=False / auto_merge.enabled=False: can_merge recovered but no
                 # merge was attempted. Clear the merge alert so a subsequent
                 # degradation can re-fire the digest (last_health == current_health
-                # dedup would otherwise drop it).
+                # dedup would otherwise drop it). Excluded when the mergequeue
+                # handoff itself failed — that is a genuine problem, not a
+                # benign evaluation-only pass, and must not be masked as OK.
                 if issue_number is not None:
                     _issue_key = str(issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
@@ -4907,12 +4987,22 @@ class OrchestratorApp:
             "cross_pr_revert_detected": cross_pr_revert_detected,
             "cross_pr_revert_reason": cross_pr_revert_reason,
             "cross_pr_revert_routed": cross_pr_revert_routed,
+            "mergequeue_label_applied": mergequeue_label_applied,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif mergequeue_label_applied is False:
+            message += (
+                f" (mergequeue label {self.config.auto_merge.mergequeue_label!r} FAILED to "
+                f"apply — not handed off to Aviator; will retry, attempt {new_attempts})"
+            )
+        elif mergequeue_label_applied is True:
+            message += (
+                f" (handed off to mergequeue label {self.config.auto_merge.mergequeue_label!r})"
+            )
         elif merge_output and label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
         elif label_error:
@@ -5624,6 +5714,14 @@ class OrchestratorApp:
             prs = self.gh.pr_list()
 
         branch_prefix = self.config.dispatch.branch_prefix
+        # Aviator MergeQueue handoff (task #10): a PR already parked in
+        # Aviator's queue (state status "mergequeue") must never occupy
+        # charlie's merge-train head — Aviator now owns serialization for it.
+        # Without this exclusion the parked PR keeps winning "earliest
+        # reviewed" on every poll until GitHub reports it merged, so under
+        # front_of_train no other approved PR is ever attempted while Aviator
+        # is still processing it.
+        state_prs = load_state_locked(self.paths.state_file).get("prs", {})
         candidates: list[tuple[str, int, dict[str, Any], dict[str, Any], str]] = []
         for pr in prs:
             pr_number = int(pr.get("number", 0))
@@ -5633,6 +5731,8 @@ class OrchestratorApp:
                 continue
             head = str(pr.get("headRefName") or "")
             if not head.startswith(branch_prefix):
+                continue
+            if (state_prs.get(str(pr_number)) or {}).get("status") == "mergequeue":
                 continue
             decision = self._review_decision(pr_number)
             if decision.get("decision") != "approved":
