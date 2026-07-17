@@ -549,6 +549,21 @@ def detect_drift(
             and issue_number not in live_session_issue_numbers
             and _issue_state(issue) == "OPEN"
         ):
+            # Issue #417: this is the only re-entrant, sidecar-independent
+            # path capable of ever revisiting a session that was already
+            # reaped before this drift check ran. Removing the stale active
+            # label without also ensuring `ready` is present left the issue
+            # with no dispatch-eligible label at all -- fixed here to mirror
+            # the sibling `session_failed_relabeled` kind below.
+            needs_ready = labels_cfg.ready not in issue_labels
+            fix_actions = [
+                f"remove label '{label}' from issue #{issue_number}"
+                for label in sorted(active_present)
+            ]
+            add_labels: tuple[str, ...] = ()
+            if needs_ready:
+                fix_actions.append(f"add label '{labels_cfg.ready}' to issue #{issue_number}")
+                add_labels = (labels_cfg.ready,)
             drift.append(
                 DriftItem(
                     kind="issue_active_label_no_open_pr",
@@ -558,11 +573,9 @@ def detect_drift(
                         f"issue #{issue_number} carries active labels "
                         f"{sorted(active_present)} but no PR links to it"
                     ),
-                    fix_actions=tuple(
-                        f"remove label '{label}' from issue #{issue_number}"
-                        for label in sorted(active_present)
-                    ),
+                    fix_actions=tuple(fix_actions),
                     remove_labels=tuple(sorted(active_present)),
+                    add_labels=add_labels,
                 )
             )
 
@@ -745,6 +758,13 @@ def apply_fixes(
                 label_ok = True
                 for label in item.remove_labels:
                     if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                # Issue #417: issue_active_label_no_open_pr now carries
+                # add_labels=(ready,) when the ready label is missing --
+                # done_label_with_active_labels never sets add_labels, so this
+                # loop is a no-op for that sibling kind.
+                for label in item.add_labels:
+                    if not gh.add_issue_label(item.issue_number, label):
                         label_ok = False
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
