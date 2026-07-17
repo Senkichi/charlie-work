@@ -134,6 +134,12 @@ def test_default_config_update_open_prs_is_next() -> None:
     assert config.auto_merge.update_open_prs == "next"
 
 
+def test_default_config_update_branch_strategy_is_front_of_train() -> None:
+    """Issue #404: default update_branch_strategy is front-of-train."""
+    config = load_config()
+    assert config.auto_merge.update_branch_strategy == "front_of_train"
+
+
 def test_default_config_require_current_base() -> None:
     """Default require_current_base is True."""
     config = load_config()
@@ -317,6 +323,34 @@ auto_merge:
 """
     )
     with pytest.raises(ConfigError, match="update_open_prs.*'all', 'next', 'off'"):
+        load_config(config_file)
+
+
+def test_load_config_update_branch_strategy_values(tmp_path: Path) -> None:
+    """Issue #404: update_branch_strategy accepts front_of_train/broadcast/off."""
+    from charlie_work.config import ConfigError, load_config
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    for value in ("front_of_train", "broadcast", "off"):
+        config_file.write_text(
+            f"""
+auto_merge:
+  update_branch_strategy: {value}
+  require_current_base: false
+"""
+        )
+        config = load_config(config_file)
+        assert config.auto_merge.update_branch_strategy == value
+
+    config_file.write_text(
+        """
+auto_merge:
+  update_branch_strategy: sometimes
+"""
+    )
+    with pytest.raises(
+        ConfigError, match="update_branch_strategy.*'front_of_train', 'broadcast', or 'off'"
+    ):
         load_config(config_file)
 
 
@@ -2777,6 +2811,7 @@ class FakeGitHub:
         self.deleted_branches: list[str] = []
         self.delete_branch_ok = True
         self.update_branch_ok = True
+        self.pr_update_branch_calls: list[int] = []
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
         self.closed_issues: list[int] = []
@@ -2929,6 +2964,7 @@ class FakeGitHub:
         return self.delete_branch_ok
 
     def pr_update_branch(self, pr_number: int) -> bool:
+        self.pr_update_branch_calls.append(pr_number)
         # Simulate a base update by moving the PR's head to a new SHA
         # This reproduces the churn that the fix prevents
         for pr in self.prs:
@@ -12280,8 +12316,12 @@ def test_update_open_agent_prs_skips_approved_pending_ship_prs(tmp_path: Path) -
     assert fake_gh.update_branch_ok is True  # Should still be True (never called)
 
 
-def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
-    """Test that PRs without approved decisions are still updated normally."""
+def test_update_open_agent_prs_skips_request_changes_and_blocked(tmp_path: Path) -> None:
+    """Issue #404: broadcast mode must not update-branch request_changes or blocked PRs.
+
+    Rework or human intervention will replace the head, so the CI run would be
+    guaranteed-wasted runner time.
+    """
     from charlie_work.config import AutoMergeConfig
 
     config = OrchestratorConfig(
@@ -12293,7 +12333,6 @@ def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
 
-    # Set up two PRs, one approved, one not
     fake_gh.prs = [
         {
             "number": 456,
@@ -12316,9 +12355,20 @@ def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
             "labels": [],
             "isCrossRepository": False,
         },
+        {
+            "number": 101,
+            "title": "Fix #125: blocked",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-blocked",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
     ]
 
-    # Only create review decision for PR 456 (approved)
+    # PR 456 approved and merged
     pr_456_decision_dir = paths.prs / "pr-456"
     pr_456_decision_dir.mkdir(parents=True, exist_ok=True)
     (pr_456_decision_dir / "review-decision.json").write_text(
@@ -12329,7 +12379,7 @@ def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # PR 789 has no decision file (or a non-approved decision)
+    # PR 789 in rework (request_changes)
     pr_789_decision_dir = paths.prs / "pr-789"
     pr_789_decision_dir.mkdir(parents=True, exist_ok=True)
     (pr_789_decision_dir / "review-decision.json").write_text(
@@ -12337,16 +12387,23 @@ def test_update_open_agent_prs_updates_non_approved_prs(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+    # PR 101 blocked
+    pr_101_decision_dir = paths.prs / "pr-101"
+    pr_101_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_101_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "blocked"}, indent=2),
+        encoding="utf-8",
+    )
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Simulate merging PR 456: update remaining open PRs
     results = app._update_open_agent_prs(merged_pr_number=456)
 
-    # PR 789 should be updated (not approved)
-    assert len(results) == 1
-    assert results[0]["pr_number"] == 789
-    assert results[0]["updated"] is True
-    assert "skipped_reason" not in results[0]
+    assert len(results) == 2
+    assert all(r["updated"] is False for r in results)
+    assert {r["pr_number"] for r in results} == {789, 101}
+    assert all(r["skipped_reason"] == "not_approved" for r in results)
+    assert fake_gh.pr_update_branch_calls == []
 
 
 def test_update_open_agent_prs_updates_approved_prs_with_moved_head(tmp_path: Path) -> None:
@@ -13774,6 +13831,229 @@ def test_update_open_agent_prs_all_mode_reports_compare_unavailable(tmp_path: Pa
     assert results[0]["skipped_reason"] == "compare_unavailable"
     # No update-branch call should have been made for the compare-unavailable PR.
     assert fake_gh.prs[1]["headRefOid"] == "sha-def456"
+
+
+def test_front_of_train_only_updates_next_candidate(tmp_path: Path) -> None:
+    """Issue #404: a single merge step updates only the new front candidate."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="front_of_train",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 101,
+            "title": "Fix #125: third",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-third",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    for pr_number in (456, 789, 101):
+        app.record_review(pr_number, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789, 101)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # Exactly one post-merge update-branch, on the new front candidate (789).
+    assert fake_gh.pr_update_branch_calls == [789]
+    assert fake_gh.prs[1]["headRefOid"] == "sha-def456-updated"
+    # The third PR stays behind-base until it reaches the front.
+    assert fake_gh.prs[2]["headRefOid"] == "sha-ghi789"
+
+
+def test_front_of_train_carries_forward_approved_verdict_end_to_end(tmp_path: Path) -> None:
+    """Issue #404: non-front approved PRs carry their verdict forward when they reach the front.
+
+    After each merge, the front-of-train update rewrites the approved PR's
+    reviewed_head_sha while preserving the patch-id-based verdict, so the next
+    merge step can proceed without a re-review.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            update_branch_strategy="front_of_train",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 101,
+            "title": "Fix #125: third",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-third",
+            "baseRefName": "main",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    for pr_number in (456, 789, 101):
+        app.record_review(pr_number, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789, 101)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    # First merge: PR 456 is current, PR 789 is the new front and gets updated.
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+    fake_gh.prs[0]["state"] = "MERGED"
+
+    decision_789 = json.loads((paths.prs / "pr-789" / "review-decision.json").read_text())
+    assert decision_789["decision"] == "approved"
+    assert decision_789["reviewed_head_sha"] == "sha-def456-updated"
+
+    # Second merge: PR 789's carried-forward verdict lets it merge without re-review.
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["merged"] is True
+    fake_gh.prs[1]["state"] = "MERGED"
+
+    decision_101 = json.loads((paths.prs / "pr-101" / "review-decision.json").read_text())
+    assert decision_101["decision"] == "approved"
+    assert decision_101["reviewed_head_sha"] == "sha-ghi789-updated"
+
+    # Exactly two update-branch calls: one for each new front candidate.
+    assert fake_gh.pr_update_branch_calls == [789, 101]
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+
+def test_front_of_train_skips_request_changes_and_blocked(tmp_path: Path) -> None:
+    """Issue #404: front-of-train mode skips request_changes/blocked PRs and
+    updates the next approved candidate instead."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="front_of_train",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 101,
+            "title": "Fix #125: third",
+            "url": "https://example.test/pull/101",
+            "headRefName": "agent/issue-125-third",
+            "headRefOid": "sha-ghi789",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #125\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "request_changes", summary="needs work")
+    app.record_review(101, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789, 101)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+    # The request_changes PR is not the front; the next approved candidate is updated.
+    assert fake_gh.pr_update_branch_calls == [101]
 
 
 def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
