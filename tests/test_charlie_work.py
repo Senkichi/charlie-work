@@ -9362,6 +9362,29 @@ def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> No
     assert app._review_decision(456)["escalated"] is True
 
 
+def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
+    """Issue #407: merge_ready (via _review_decision and merge-train
+    eligibility) must see the escalated flag from the persisted decision file.
+    """
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=1))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First request_changes is not escalated (count 0 -> 1).
+    fake_gh.pr_head_shas[456] = "sha-1"
+    app.record_review(456, "request_changes", summary="fix A")
+    # Second request_changes hits the max_rework_cycles cap and escalates.
+    fake_gh.pr_head_shas[456] = "sha-2"
+    app.record_review(456, "request_changes", summary="fix B")
+
+    result = app.merge_ready(456)
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["review_decision"]["decision"] == "request_changes"
+    assert result.data["review_decision"]["escalated"] is True
+
+
 def test_record_review_request_changes_updates_issue_status_to_rework_requested(
     tmp_path: Path,
 ) -> None:
