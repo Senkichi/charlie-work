@@ -233,20 +233,24 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
-    # After a successful ship-it merge, update remaining open agent PRs
-    # (same-repo + configured branch prefix) to rebase them against the
-    # new base.
+    # Strategy controlling which open agent PRs are rebased after a
+    # successful ship-it merge.
     #
-    # Supported values:
-    # - "all": update every open tracked PR branch (legacy behavior)
-    # - "next": merge-train mode — only update the head of the approved queue
-    # - "off": never update open PR branches
-    #
-    # Boolean aliases are accepted for backward compatibility:
-    #   true -> "all", false -> "off"
-    # Default "next" preserves the pre-merge combination-testing guarantee
-    # while eliminating N-1 wasted CI resets per merge.
-    update_open_prs: str | bool = "next"
+    # - "front_of_train" (default): merge-train mode — only update the head
+    #   of the approved queue, so a single merge step causes at most one CI
+    #   reset on a single-runner train.
+    # - "broadcast": update every eligible open tracked PR branch. Intended for
+    #   multi-runner setups where parallel CI runs are available. PRs whose
+    #   current review decision is request_changes, escalated, or blocked are
+    #   still skipped.
+    # - "off": never update open PR branches.
+    update_branch_strategy: str = "front_of_train"
+    # Legacy alias for update_branch_strategy. Kept for backward compatibility.
+    # When set, it is normalized and mapped to update_branch_strategy.
+    #   true / "all"  -> "broadcast"
+    #   "next"        -> "front_of_train"
+    #   false / "off" -> "off"
+    update_open_prs: str | bool | None = None
     # When True, merge_ready verifies that a PR's merge-base is the current
     # tip of its base branch before merging. If the base has moved ahead of the
     # PR (e.g. a prior merge in the same train), the merge is deferred and a
@@ -255,30 +259,64 @@ class AutoMergeConfig:
     require_current_base: bool = True
 
     def __post_init__(self) -> None:
-        value = self.update_open_prs
-        if isinstance(value, bool):
-            normalized = "all" if value else "off"
-        elif isinstance(value, str):
-            normalized = value.lower()
-            if normalized not in {"all", "next", "off"}:
+        legacy_to_strategy = {
+            "next": "front_of_train",
+            "all": "broadcast",
+            "off": "off",
+        }
+        strategy_to_legacy = {
+            "front_of_train": "next",
+            "broadcast": "all",
+            "off": "off",
+        }
+
+        # If the legacy alias is set, normalize it and derive the canonical
+        # strategy from it. This preserves existing config files and tests.
+        raw_legacy = self.update_open_prs
+        if raw_legacy is not None:
+            if isinstance(raw_legacy, bool):
+                legacy_value = "all" if raw_legacy else "off"
+            elif isinstance(raw_legacy, str):
+                legacy_value = raw_legacy.lower()
+                if legacy_value not in legacy_to_strategy:
+                    raise ConfigError(
+                        "config section 'auto_merge' key 'update_open_prs' must be "
+                        "'all', 'next', 'off', or a boolean, "
+                        f"got {raw_legacy!r}"
+                    )
+            else:
                 raise ConfigError(
                     "config section 'auto_merge' key 'update_open_prs' must be "
-                    "'all', 'next', 'off', or a boolean, "
-                    f"got {value!r}"
+                    "a string or boolean, "
+                    f"got {type(raw_legacy).__name__}"
                 )
+            object.__setattr__(self, "update_open_prs", legacy_value)
+            object.__setattr__(self, "update_branch_strategy", legacy_to_strategy[legacy_value])
         else:
-            raise ConfigError(
-                "config section 'auto_merge' key 'update_open_prs' must be "
-                "a string or boolean, "
-                f"got {type(value).__name__}"
-            )
-        object.__setattr__(self, "update_open_prs", normalized)
-        if self.require_current_base and self.update_open_prs == "off":
+            raw_strategy = self.update_branch_strategy
+            if isinstance(raw_strategy, bool):
+                strategy = "broadcast" if raw_strategy else "off"
+            elif isinstance(raw_strategy, str):
+                strategy = raw_strategy.lower()
+            else:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'update_branch_strategy' must be "
+                    f"a string or boolean, got {type(raw_strategy).__name__}"
+                )
+            if strategy not in strategy_to_legacy:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'update_branch_strategy' must be "
+                    f"'front_of_train', 'broadcast', or 'off', got {self.update_branch_strategy!r}"
+                )
+            object.__setattr__(self, "update_branch_strategy", strategy)
+            object.__setattr__(self, "update_open_prs", strategy_to_legacy[strategy])
+
+        if self.require_current_base and self.update_branch_strategy == "off":
             raise ConfigError(
                 "config section 'auto_merge': require_current_base=True with "
-                "update_open_prs='off' creates a permanent merge deadlock: the base "
+                "update_branch_strategy='off' creates a permanent merge deadlock: the base "
                 "must be current but the branch is never synced. Set "
-                "require_current_base: false, or set update_open_prs to 'next' or 'all'."
+                "require_current_base: false, or set update_branch_strategy to 'front_of_train' or 'broadcast'."
             )
 
 
