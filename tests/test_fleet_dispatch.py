@@ -195,6 +195,31 @@ def test_extract_attention_events_empty() -> None:
     assert events == []
 
 
+def test_extract_attention_events_nested_loop_skip() -> None:
+    """Nested loop() sub-results (intake/dispatch/rework/reviews) carry their
+    own skip signals, so extraction must recurse one level and surface them.
+    """
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "intake": {"skipped": True, "reason": "state_lock_busy"},
+            "dispatch": {"state_lock_busy": True, "reason": "state_lock_busy"},
+            "dispatch_rework": {"deferred_reason": "graphql_rate_limit"},
+            "dispatch_reviews": {"skipped": True, "reason": "state_lock_busy"},
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    assert all(event["repo_key"] == "owner/repo1" for event in events)
+    assert all(event["type"] == "skipped" for event in events)
+    assert {event["reason"] for event in events} == {"state_lock_busy", "graphql_rate_limit"}
+    assert len(events) == 2
+
+
 @patch("charlie_work.fleet_dispatch._load_registry")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
