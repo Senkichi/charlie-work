@@ -4651,6 +4651,74 @@ def test_review_queue_carries_forward_request_changes_on_identical_patch_id(
     assert decision["carried_forward_from"] == [old_head]
 
 
+def test_review_queue_carries_forward_blocked_on_identical_patch_id(tmp_path: Path) -> None:
+    """Issue #413: a blocked verdict whose cumulative patch-id is unchanged
+    should be carried forward to the new head and not reported as stale."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 blocked\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-old-head"
+    new_head = "sha-sync-merge-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "blocked",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["carried_forward_from"] == [old_head]
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["reviewed_head_sha"] == new_head
+    assert state["prs"][str(pr_number)]["carried_forward_from"] == [old_head]
+
+
 def test_review_queue_reports_stale_on_different_patch_id(tmp_path: Path) -> None:
     """Issue #411: a head move that changes the cumulative diff is still stale."""
     from charlie_work.janitor import _calculate_patch_id
@@ -9776,6 +9844,40 @@ def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path:
     assert decision["reviewed_head_sha"] == "sha-abc123"
     assert decision["reviewed_patch_id"] == packet_patch_id
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+
+def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> None:
+    """Issue #413: blocked decisions must persist reviewed_patch_id so the
+    review-queue enumerator can carry them forward on content-identical heads."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 blocked\n"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    review_result = app.review(456)
+    assert review_result.ok is True
+    packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
+
+    result = app.record_review(456, "blocked", summary="security concern")
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["decision"] == "blocked"
+    assert decision["reviewed_patch_id"] == packet_patch_id
+    assert load_state(paths.state_file)["prs"]["456"]["reviewed_patch_id"] == packet_patch_id
     assert result.data["reviewed_head_sha"] == "sha-abc123"
 
 
