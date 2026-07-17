@@ -3980,9 +3980,11 @@ class OrchestratorApp:
             else (pr.get("headRefOid") if pr else None)
         )
         # Calculate patch-id for the PR diff to detect actual content changes
-        # (issue #222: base-update merges can advance head SHA without changing diff content)
+        # (issue #222: base-update merges can advance head SHA without changing diff content).
+        # All terminal decisions (approved/request_changes/blocked) persist reviewed_patch_id
+        # so the review-queue enumerator can carry them forward on content-identical heads.
         reviewed_patch_id = ""
-        if pr and decision in {"request_changes", "approved"}:
+        if pr:
             diff = self._read_packet_diff(pr_number)
             if diff is None:
                 diff = self.gh.pr_diff(pr_number)
