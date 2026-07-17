@@ -3335,15 +3335,23 @@ class OrchestratorApp:
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
-        This is a read-only command: it inspects existing ``review-prompt.md``
-        packets and ``review-decision.json`` verdicts without writing state or
-        PR-directory files.  A PR is queued when:
+        When a recorded verdict (``approved``, ``request_changes``, or
+        ``blocked``) was made against an older head, this method computes the
+        live head's stable patch-id. If it matches the recorded
+        ``reviewed_patch_id``, the verdict is carried forward to the new head
+        (atomic decision-file + state update) and the PR is not queued as
+        stale. In dry-run mode the carry-forward write is skipped; the patch-id
+        check still runs so the queue reflects real content changes.
+
+        A PR is queued when:
 
         - It has a linked issue (same as ``review()``).
-        - ``prs/pr-N/review-prompt.md`` exists and the stored packet head OID
-          matches the PR's live ``headRefOid``.
-        - The recorded decision is ``missing``/``pending`` or a stale
-          ``request_changes``/``blocked``/``approved`` verdict from a prior head.
+        - ``prs/pr-N/review-prompt.md`` exists.
+        - The recorded decision is ``missing``/``pending`` and the stored packet
+          head OID matches the PR's live ``headRefOid``.
+        - The recorded decision is a stale ``request_changes``/``blocked``/
+          ``approved`` verdict whose patch-id genuinely differs from the live
+          head and the packet head is still current.
 
         Returns:
             CommandResult with a sorted ``queue`` list keyed by repo.
@@ -3368,32 +3376,45 @@ class OrchestratorApp:
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
             live_head_sha = pr.get("headRefOid")
-            if (
-                packet_head_sha is None
-                or live_head_sha is None
-                or packet_head_sha != live_head_sha
-            ):
+            if live_head_sha is None:
                 continue
 
             decision = self._review_decision(pr_number)
             decision_value = decision.get("decision")
             reviewed_head_sha = decision.get("reviewed_head_sha")
 
-            if decision_value == "approved":
+            if decision_value in ("approved", "request_changes", "blocked"):
                 if reviewed_head_sha == live_head_sha:
                     continue
-                queue.append(
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "packet_head_sha": packet_head_sha,
-                        "decision": "stale",
-                        "reviewed_head_sha": reviewed_head_sha,
-                    }
+
+                reviewed_patch_id = decision.get("reviewed_patch_id") or ""
+                live_diff = self.gh.pr_diff(pr_number) or ""
+                live_patch_id = _calculate_patch_id(live_diff)
+
+                carry_forward = (
+                    reviewed_patch_id
+                    and live_patch_id
+                    and live_patch_id == reviewed_patch_id
+                    and not self.dry_run
                 )
-            elif decision_value in ("request_changes", "blocked"):
-                if reviewed_head_sha is not None and reviewed_head_sha == live_head_sha:
+                if carry_forward:
+                    try:
+                        self._update_approval_head(
+                            pr_number, decision, live_head_sha, old_head=reviewed_head_sha
+                        )
+                    except StateLockBusy:
+                        # Could not mirror the carry-forward into state.json,
+                        # but the decision-file update is the durable source
+                        # of truth; proceed as carried-forward.
+                        pass
                     continue
+
+                # If the packet is stale, we cannot dispatch a new reviewer from
+                # it; the merge gate will route the issue to re-review. Only
+                # surface as stale when the packet head is still current.
+                if packet_head_sha is None or packet_head_sha != live_head_sha:
+                    continue
+
                 queue.append(
                     {
                         "pr": pr_number,
@@ -3404,6 +3425,9 @@ class OrchestratorApp:
                     }
                 )
             elif decision_value in ("pending", "missing", "invalid"):
+                if packet_head_sha is None or packet_head_sha != live_head_sha:
+                    continue
+
                 queue.append(
                     {
                         "pr": pr_number,
@@ -3758,6 +3782,7 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_patch_id": reviewed_patch_id,
+            "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
         decision_path = pr_dir / "review-decision.json"
@@ -3798,6 +3823,7 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "reviewed_head_sha": reviewed_head_sha,
                 "reviewed_patch_id": reviewed_patch_id,
+                "carried_forward_from": [],
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
                 "consecutive_failed_merge_attempts": 0,
@@ -3987,7 +4013,9 @@ class OrchestratorApp:
                         live_patch_id = _calculate_patch_id(live_diff)
                         if live_patch_id == reviewed_patch_id:
                             old_reviewed_head_sha = reviewed_head_sha
-                            self._update_approval_head(pr_number, decision, live_head_sha)
+                            self._update_approval_head(
+                                pr_number, decision, live_head_sha, old_head=old_reviewed_head_sha
+                            )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
                             reviewed_head_sha = decision.get("reviewed_head_sha")
@@ -4001,6 +4029,10 @@ class OrchestratorApp:
                                     "status": "approved",
                                     "head_moved": False,
                                     "reviewed_head_sha": reviewed_head_sha,
+                                    "reviewed_patch_id": reviewed_patch_id,
+                                    "carried_forward_from": decision.get(
+                                        "carried_forward_from", []
+                                    ),
                                     "live_head_sha": live_head_sha,
                                     "consecutive_failed_merge_attempts": 0,
                                     "consecutive_stale_base_deferrals": 0,
@@ -4014,6 +4046,9 @@ class OrchestratorApp:
                                         "old_reviewed_head_sha": old_reviewed_head_sha,
                                         "new_head_sha": live_head_sha,
                                         "patch_id": reviewed_patch_id,
+                                        "carried_forward_from": decision.get(
+                                            "carried_forward_from", []
+                                        ),
                                     },
                                 )
                                 save_state(self.paths.state_file, state)
@@ -4176,7 +4211,9 @@ class OrchestratorApp:
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
-                            self._update_approval_head(pr_number, decision, new_head)
+                            self._update_approval_head(
+                                pr_number, decision, new_head, old_head=live_head_sha
+                            )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
                         elif new_head == live_head_sha:
@@ -4740,7 +4777,7 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(pr_number, decision, new_head)
+            self._update_approval_head(pr_number, decision, new_head, old_head=old_head)
             return [
                 {
                     "pr_number": pr_number,
@@ -5114,15 +5151,21 @@ class OrchestratorApp:
         pr_number: int,
         decision: dict[str, Any],
         new_head: str,
+        old_head: str | None = None,
     ) -> None:
         """Persist an updated review head for a PR whose branch was synced.
 
-        Keeps the approval valid when the branch was base-updated without
-        content changes. Updates both review-decision.json and state.json.
+        Keeps the verdict valid when the branch was base-updated or rebased
+        without content changes. Updates both review-decision.json and
+        state.json, appending the old head to ``carried_forward_from`` for audit.
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         updated_decision = dict(decision)
         updated_decision["reviewed_head_sha"] = new_head
+        carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
+        if old_head is not None and old_head != new_head and old_head not in carried_forward:
+            carried_forward.append(old_head)
+        updated_decision["carried_forward_from"] = carried_forward
         self._write_json(decision_path, updated_decision)
 
         with state_lock(self.paths.state_file):
@@ -5137,6 +5180,7 @@ class OrchestratorApp:
                 "reviewed_patch_id": pr_state.get("reviewed_patch_id")
                 or decision.get("reviewed_patch_id")
                 or "",
+                "carried_forward_from": carried_forward,
             }
             save_state(self.paths.state_file, state)
 

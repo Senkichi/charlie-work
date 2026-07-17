@@ -4444,6 +4444,304 @@ def test_review_queue_is_read_only(tmp_path: Path) -> None:
     assert (app.paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8") == prompt
 
 
+def _review_queue_carry_forward_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    """Build a non-dry-run OrchestratorApp for carry-forward tests."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+
+
+def test_review_queue_carries_forward_approved_on_identical_patch_id(tmp_path: Path) -> None:
+    """Issue #411: an approved verdict whose cumulative patch-id is unchanged
+    should be carried forward to the new head and not reported as stale."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["reviewed_patch_id"] == patch_id
+    assert old_head in decision["carried_forward_from"]
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["reviewed_head_sha"] == new_head
+    assert state["prs"][str(pr_number)]["carried_forward_from"] == [old_head]
+
+
+def test_review_queue_carries_forward_request_changes_on_identical_patch_id(
+    tmp_path: Path,
+) -> None:
+    """Issue #411: a request_changes verdict is also valid when the patch is identical."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 modified\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-old-head"
+    new_head = "sha-sync-merge-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["carried_forward_from"] == [old_head]
+
+
+def test_review_queue_reports_stale_on_different_patch_id(tmp_path: Path) -> None:
+    """Issue #411: a head move that changes the cumulative diff is still stale."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    old_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 old\n"
+    )
+    new_diff = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 new\n"
+    )
+    old_patch_id = _calculate_patch_id(old_diff)
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = new_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": "sha-old-head",
+            "reviewed_patch_id": old_patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": "sha-old-head",
+        }
+    ]
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-old-head"
+
+
+def test_review_queue_git_failure_falls_back_to_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #411: if git patch-id computation fails, treat the verdict as stale."""
+    from charlie_work import workflow as workflow_module
+
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,2 +1,2 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2 new\n"
+    )
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": "known-patch-id",
+            "carried_forward_from": [],
+        },
+    )
+
+    monkeypatch.setattr(workflow_module, "_calculate_patch_id", lambda _diff: "")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+
+
 def _dispatch_reviews_app(
     tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
 ) -> OrchestratorApp:
@@ -7483,10 +7781,12 @@ def test_merge_ready_carries_forward_approved_verdict_on_clean_rebase(tmp_path: 
     decision = json.loads((decision_dir / "review-decision.json").read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == new_head
     assert decision["reviewed_patch_id"] == patch_id
+    assert decision["carried_forward_from"] == [old_head]
 
     state = load_state(paths.state_file)
     pr_state = state["prs"]["456"]
     assert pr_state["reviewed_head_sha"] == new_head
+    assert pr_state["carried_forward_from"] == [old_head]
     # The approval was carried forward (not reset to "reviewing") and the PR
     # proceeded to merge on the same poll.
     assert pr_state["status"] != "reviewing"
@@ -7501,6 +7801,7 @@ def test_merge_ready_carries_forward_approved_verdict_on_clean_rebase(tmp_path: 
     assert payload["old_reviewed_head_sha"] == old_head
     assert payload["new_head_sha"] == new_head
     assert payload["patch_id"] == patch_id
+    assert payload["carried_forward_from"] == [old_head]
 
     # No review_started transition should fire for a clean rebase.
     assert (123, "agent:reviewing") not in fake_gh.labels_added
