@@ -3786,7 +3786,6 @@ class OrchestratorApp:
             "reviewed_at": utc_now(),
         }
         decision_path = pr_dir / "review-decision.json"
-        self._write_json(decision_path, decision_payload)
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
         # durable decision/counter from what actually happened.
@@ -3815,6 +3814,7 @@ class OrchestratorApp:
                 if not escalated:
                     rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
             decision_payload["escalated"] = escalated
+            self._write_json(decision_path, decision_payload)
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,

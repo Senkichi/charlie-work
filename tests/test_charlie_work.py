@@ -9699,6 +9699,65 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     assert decision["required_changes"] == []
 
 
+def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:
+    """Issue #407: review-decision.json must include the correct escalated value.
+
+    The decision payload is fully built before the single atomic write, so
+    re-reading the persisted file returns the same escalated flag as the
+    in-memory result. Non-escalated request_changes and escalated
+    request_changes must both persist the correct value.
+    """
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=2))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    fake_gh.pr_head_shas[456] = "sha-1"
+    app.record_review(456, "request_changes", summary="fix A")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "escalated" in decision
+    assert decision["escalated"] is False
+    assert app._review_decision(456)["escalated"] is False
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    app.record_review(456, "request_changes", summary="fix B")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["escalated"] is False
+
+    fake_gh.pr_head_shas[456] = "sha-3"
+    app.record_review(456, "request_changes", summary="fix C")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["escalated"] is True
+    # _review_decision is the reader used by merge_ready and merge-train
+    # eligibility; it must see the persisted escalated value.
+    assert app._review_decision(456)["escalated"] is True
+
+
+def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
+    """Issue #407: merge_ready (via _review_decision and merge-train
+    eligibility) must see the escalated flag from the persisted decision file.
+    """
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=1))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First request_changes is not escalated (count 0 -> 1).
+    fake_gh.pr_head_shas[456] = "sha-1"
+    app.record_review(456, "request_changes", summary="fix A")
+    # Second request_changes hits the max_rework_cycles cap and escalates.
+    fake_gh.pr_head_shas[456] = "sha-2"
+    app.record_review(456, "request_changes", summary="fix B")
+
+    result = app.merge_ready(456)
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["review_decision"]["decision"] == "request_changes"
+    assert result.data["review_decision"]["escalated"] is True
+
+
 def test_record_review_request_changes_updates_issue_status_to_rework_requested(
     tmp_path: Path,
 ) -> None:
