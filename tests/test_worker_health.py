@@ -406,6 +406,68 @@ def test_classify_worker_health_legacy_none_start_time(tmp_path: Path) -> None:
         assert health == WorkerHealth.HEALTHY
 
 
+def test_classify_worker_health_indeterminate_liveness_does_not_bypass_deferral(
+    tmp_path: Path,
+) -> None:
+    """Issue #360 criterion #1: an indeterminate liveness probe is not a definitive dead signal.
+
+    When ``get_process_start_time`` returns ``None`` for a live PID,
+    ``is_session_alive`` returns ``True`` (indeterminate).  A stale sidecar log
+    should still classify as ``STALLED`` (not ``DEAD``), because the liveness
+    signal was not definitive and the deferral cap must not be bypassed for an
+    indeterminate probe.
+    """
+    import subprocess
+    import sys
+    import charlie_work.process_utils as process_utils
+
+    log_file = tmp_path / "test.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+
+    # Set log mtime to 30 minutes ago
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    os.utime(log_file, (time.time(), old_time.timestamp()))
+
+    recent_start = datetime.now(UTC) - timedelta(minutes=10)
+
+    # Spawn a real short-lived process
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        view = WorkerView(
+            adapter_kind="devin",
+            issue_number=1,
+            repo_key="",
+            pid=proc.pid,
+            started_at=recent_start.isoformat(),
+            process_start_time=123.456,
+            log_path=str(log_file),
+            worktree_path="",
+            error=None,
+            failure_kind=None,
+            reclaimed=None,
+        )
+
+        # Simulate an indeterminate start-time probe while the process is alive.
+        with patch.object(process_utils, "get_process_start_time", return_value=None):
+            config = OrchestratorConfig()
+            now = datetime.now(UTC)
+            health = classify_worker_health(view, config, now)
+
+        # Indeterminate liveness must not be treated as DEAD (bypassing the
+        # deferral cap).  With a stale log and no corroborating real activity,
+        # the worker is classified as STALLED.
+        assert health != WorkerHealth.DEAD
+        assert health == WorkerHealth.STALLED
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_classify_worker_health_custom_terminal_marker(tmp_path: Path) -> None:
     """A custom terminal_error_markers config changes classification for a log ending in that marker."""
     log_file = tmp_path / "test.log"
