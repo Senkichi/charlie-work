@@ -435,6 +435,22 @@ auto_merge:
     assert config.auto_merge.mergequeue_label == "mergequeue"
 
 
+def test_load_config_strips_mergequeue_label_whitespace(tmp_path: Path) -> None:
+    """Adversarial review finding #3: mergequeue_label.strip() is used only to
+    validate truthiness, but the unstripped value must not thread verbatim
+    into `gh pr edit --add-label` — surrounding whitespace is not a valid (or
+    intended) part of a GitHub label name."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_label: "  mergequeue  "
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_label == "mergequeue"
+
+
 def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
     """RuntimeConfig.throttle_error_markers is configurable from YAML."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -2859,6 +2875,7 @@ class FakeGitHub:
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_created: list[tuple[str, str, str]] = []
         self.pr_labels_added: list[tuple[int, str]] = []
+        self.add_pr_label_ok = True
         self.prs_created: list[dict[str, Any]] = []
         self.pr_create_return: int | None = None
         self.merged: list[tuple[int, str]] = []
@@ -2969,7 +2986,7 @@ class FakeGitHub:
 
     def add_pr_label(self, number: int, label: str) -> bool:
         self.pr_labels_added.append((number, label))
-        return True
+        return self.add_pr_label_ok
 
     def close_issue(self, number: int) -> bool:
         """Track issue closure for testing. Idempotent — returns True even if already closed."""
@@ -8607,6 +8624,171 @@ def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -
     assert fake_gh.pr_labels_added == []
     assert fake_gh.merged == []
     assert result.data.get("mergequeue_label_applied") is None
+
+
+def _second_mergequeue_pr(fake_gh) -> None:
+    """Add a second approved-candidate issue/PR pair (124/789) to a FakeGitHub
+    fixture, reviewed after the default 123/456 pair."""
+    fake_gh.issues.append(
+        {
+            "number": 124,
+            "title": "Fix parsing",
+            "url": "https://example.test/issues/124",
+            "body": "Parsing is broken",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        }
+    )
+    fake_gh.prs.append(
+        {
+            "number": 789,
+            "title": "Fix #124: parsing",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-parsing",
+            "baseRefName": "main",
+            "headRefOid": "sha-def789",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    )
+
+
+def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
+    tmp_path: Path,
+) -> None:
+    """Adversarial review finding #1a: once PR #456 is parked in Aviator's
+    queue (state status 'mergequeue'), it must not keep winning
+    front-of-train's merge-train head on every subsequent poll — Aviator now
+    owns its serialization. Without excluding 'mergequeue'-status PRs from
+    _merge_train_candidates, #456 (reviewed first, still approved, still
+    head-SHA-matching) would win merge-train head forever and PR #789 would
+    never be attempted, even though #789 is independently approved and green."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    _second_mergequeue_pr(fake_gh)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+    app.record_review(789, "approved", summary="ok")
+
+    # First poll: 456 was reviewed first (and sorts first on a tie), so it
+    # wins merge-train head and gets parked into the mergequeue.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["can_merge"] is True
+    assert first.data["mergequeue_label_applied"] is True
+    assert (456, "mergequeue") in fake_gh.pr_labels_added
+
+    # Second poll: 789 must now become merge-train head. Before the fix, 456
+    # (still "approved" + head-SHA-matching from _merge_train_candidates'
+    # point of view) keeps winning head, so 789 gets bounced as "not the
+    # head of the merge-train queue" (can_merge False) forever.
+    second = app.merge_ready(789, merge=True)
+    assert second.data["can_merge"] is True
+    assert second.data["mergequeue_label_applied"] is True
+    assert (789, "mergequeue") in fake_gh.pr_labels_added
+
+
+def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
+    tmp_path: Path,
+) -> None:
+    """Adversarial review finding #1b: once a PR is parked in Aviator's queue
+    (state status 'mergequeue'), charlie must stop calling pr_update_branch
+    for it on every subsequent poll — Aviator now owns rebasing queued PRs.
+    This repo's live orchestrator.config.yaml sets update_open_prs: true
+    (broadcast), so without this fix charlie would race Aviator's own rebase
+    as a second writer on the same ref on every poll while the base is stale."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    # First poll parks the PR.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # Simulate main having advanced past this PR's merge-base — a stale base,
+    # exactly as would happen once Aviator (or anything else) merges another
+    # PR into main while #456 sits in the queue.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "new-main-tip"},
+        "merge_base_commit": {"sha": "stale-ancestor"},
+    }
+
+    second = app.merge_ready(456, merge=True)
+
+    assert second.data["can_merge"] is False
+    assert fake_gh.pr_update_branch_calls == []
+
+
+def test_merge_ready_mergequeue_label_add_failure_does_not_advance_status(
+    tmp_path: Path,
+) -> None:
+    """Adversarial review finding #2: add_pr_label IS the entire handoff. A
+    failed label add must not be silently treated like a best-effort cleanup
+    step — it must not advance state to 'mergequeue' (that would orphan the
+    PR: never self-merged, never picked up by Aviator, and nothing would ever
+    look wrong to state). It must instead increment
+    consecutive_failed_merge_attempts (so the failure retries and can
+    escalate) and surface the failure in the result message."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.add_pr_label_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["mergequeue_label_applied"] is False
+    assert (456, "mergequeue") in fake_gh.pr_labels_added  # attempted
+    assert fake_gh.merged == []
+    assert "FAILED to apply" in result.message
+    persisted = load_state(paths.state_file)["prs"]["456"]
+    assert persisted["status"] == "approved"
+    assert persisted["status"] != "mergequeue"
+    assert persisted["consecutive_failed_merge_attempts"] == 1
+
+
+def test_merge_ready_mergequeue_label_add_failure_alarm_fires_at_threshold(
+    tmp_path: Path,
+) -> None:
+    """The failed-attempt alarm must be able to fire for a handoff-label
+    failure too. Before this fix, can_merge is True whenever checks are green
+    and the PR is approved (that is the whole point of reaching the
+    mergequeue branch), so the pre-existing 'approved and not can_merge'
+    alarm gate could never trigger for a persistently failing label add — a
+    typo'd label or a missing repo label would retry forever with zero
+    escalation."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            mergequeue_label="mergequeue",
+            failed_attempt_alarm=2,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.add_pr_label_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    first = app.merge_ready(456, merge=True)
+    assert first.data["merge_attempt_alarm"] is False
+    assert first.data["consecutive_failed_merge_attempts"] == 1
+
+    second = app.merge_ready(456, merge=True)
+    assert second.data["merge_attempt_alarm"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 2
+    assert "mergequeue" in (second.data["merge_attempt_warning"] or "")
 
 
 def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:

@@ -931,10 +931,15 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 "config section 'auto_merge' key 'mergequeue_label' must be a string, "
                 f"got {type(mergequeue_label).__name__}"
             )
-        if not mergequeue_label.strip():
+        stripped_mergequeue_label = mergequeue_label.strip()
+        if not stripped_mergequeue_label:
             raise ConfigError(
                 "config section 'auto_merge' key 'mergequeue_label' must not be empty"
             )
+        # Store the stripped value: this threads verbatim into
+        # `gh pr edit --add-label <label>`, so surrounding whitespace must
+        # not survive into the actual GitHub label name.
+        auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
