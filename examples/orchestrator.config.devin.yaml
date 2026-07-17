@@ -41,6 +41,11 @@ auto_merge:
   # merge/label sequence. Safe to keep true even with local worktree checkouts.
   delete_branch: true
   require_approved_review: true
+  # Post-merge update strategy: "front_of_train" updates only the head of the
+  # approved merge-train queue (default, avoids O(N^2) CI fan-out on a single
+  # runner); "broadcast" updates all eligible open PRs for multi-runner setups;
+  # "off" disables update-branch entirely.
+  # update_branch_strategy: front_of_train
   # MUST match the check-run names GitHub reports for your CI
   # (see the job `name:` fields in .github/workflows/*.yml).
   # `charlie doctor` verifies these against your workflows.
