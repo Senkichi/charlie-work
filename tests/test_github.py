@@ -237,6 +237,33 @@ def test_run_add_issue_label_retries_pre_connection_then_succeeds(
     assert call_count == 2
 
 
+def test_pr_checks_injects_run_id(monkeypatch, tmp_path: Path) -> None:
+    """Issue #391: pr_checks derives the GitHub Actions workflow run id from link."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout='[{"name":"Tests passed","state":"FAILURE","link":"https://github.com/owner/repo/actions/runs/29525590823/job/87713099471"}]',
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    checks = gh.pr_checks(456)
+
+    assert checks == [
+        {
+            "name": "Tests passed",
+            "state": "FAILURE",
+            "link": "https://github.com/owner/repo/actions/runs/29525590823/job/87713099471",
+            "databaseId": 87713099471,
+            "runId": 29525590823,
+        }
+    ]
+
+
 _FIXTURES = Path(__file__).parent / "fixtures"
 
 

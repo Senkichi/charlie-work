@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from charlie_work.process_utils import (
+    is_pid_alive,
     is_session_stalled,
     kill_process_tree,
     popen_worker,
@@ -384,6 +385,78 @@ def test_sweep_orphan_processes_windows_subprocess_error() -> None:
         mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
+
+
+def test_is_pid_alive_true_for_live_process(tmp_path: Path) -> None:
+    """``is_pid_alive`` returns True for a running process with a matching start time."""
+    from charlie_work.process_utils import get_process_start_time
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        start_time = get_process_start_time(proc.pid)
+        assert start_time is not None
+        assert is_pid_alive(proc.pid, start_time) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_is_pid_alive_false_for_dead_process() -> None:
+    """``is_pid_alive`` returns False for a process that has already exited."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait(timeout=5)
+    assert is_pid_alive(proc.pid) is False
+
+
+def test_is_pid_alive_false_for_mismatched_start_time(tmp_path: Path) -> None:
+    """``is_pid_alive`` returns False when the start time does not match (PID recycled)."""
+    from charlie_work.process_utils import get_process_start_time
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        start_time = get_process_start_time(proc.pid)
+        assert start_time is not None
+        assert is_pid_alive(proc.pid, start_time - 600) is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_is_pid_alive_treats_start_time_none_as_indeterminate(tmp_path: Path) -> None:
+    """Issue #360 criterion #1: a start-time probe failure is not a definitive dead signal.
+
+    When ``get_process_start_time`` returns ``None`` for a process that is still
+    alive, ``is_pid_alive`` must return ``True`` (indeterminate) rather than
+    treating the worker as dead.
+    """
+    from unittest.mock import patch
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        with patch("charlie_work.process_utils.get_process_start_time", return_value=None):
+            assert is_pid_alive(proc.pid, 123.456) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def _capture_popen_call(monkeypatch: pytest.MonkeyPatch) -> MagicMock:

@@ -89,3 +89,24 @@ class TestRunCapturedUsesHelper:
         mock_kwargs.assert_called_once_with()
         _, call_kwargs = mock_run.call_args
         assert call_kwargs["creationflags"] == 0x08000000
+
+    def test_run_captured_passes_stdin_to_subprocess_run(self, tmp_path):
+        sentinel = {"creationflags": 0x08000000}
+        fake_completed = subprocess.CompletedProcess(
+            args=["cat"], returncode=0, stdout="hello\n", stderr=""
+        )
+        with (
+            patch(
+                "charlie_work.subprocess_runner.no_console_window_kwargs",
+                return_value=sentinel,
+            ),
+            patch(
+                "charlie_work.subprocess_runner.subprocess.run", return_value=fake_completed
+            ) as mock_run,
+        ):
+            result = run_captured(["cat"], cwd=tmp_path, timeout_seconds=5, stdin="hello\n")
+
+        assert result.ok
+        assert result.stdout == "hello\n"
+        _, call_kwargs = mock_run.call_args
+        assert call_kwargs["input"] == "hello\n"
