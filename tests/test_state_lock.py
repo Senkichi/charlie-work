@@ -5,7 +5,8 @@ These target two review findings from PR #248 (supervised-infill-loop):
 - finding #4: on the 30s timeout path (lock never acquired), the opened lock
   file handle must still be closed -- previously ``close()`` was gated on
   ``acquired``, so a timed-out lock leaked the handle for the life of the
-  process.
+  process. After issue #398 the timeout path raises ``StateLockBusy`` instead
+  of proceeding unlocked, but the handle-closing requirement still holds.
 - finding #8: a pre-existing 0-byte lock file (e.g. left over from an older
   ``touch()``-based implementation) must not permanently block acquisition.
   Finding #8 originally claimed ``msvcrt.locking`` raises ``EACCES`` on a
@@ -35,8 +36,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_state_lock_timeout_closes_handle(tmp_path: Path, monkeypatch) -> None:
-    """Regression for finding #4: the timeout path (acquired=False) must
-    still close the handle it opened, not just skip unlocking.
+    """Regression for finding #4: the timeout path must raise StateLockBusy
+    and still close the handle it opened, not just skip unlocking.
     """
     import msvcrt
 
@@ -45,7 +46,7 @@ def test_state_lock_timeout_closes_handle(tmp_path: Path, monkeypatch) -> None:
     lock_path.write_bytes(b"\x00")
 
     # Hold a real competing lock on the same file so every retry inside
-    # state_lock fails and the timeout branch (acquired=False) is exercised.
+    # state_lock fails and the timeout branch is exercised.
     blocker = lock_path.open("r+b")
     msvcrt.locking(blocker.fileno(), msvcrt.LK_NBLCK, 1)
 
@@ -62,8 +63,9 @@ def test_state_lock_timeout_closes_handle(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
 
     try:
-        with state_module.state_lock(state_path):
-            pass
+        with pytest.raises(state_module.StateLockBusy):
+            with state_module.state_lock(state_path):
+                pass
     finally:
         msvcrt.locking(blocker.fileno(), msvcrt.LK_UNLCK, 1)
         blocker.close()
@@ -81,12 +83,10 @@ def test_state_lock_zero_byte_existing_file_acquires(tmp_path: Path, caplog) -> 
     file and the file size remains 0, so ``state_lock`` carries no padding
     guard (#324/#328) and must acquire the bare 0-byte file directly.
 
-    ``state_lock`` is best-effort: it yields regardless of whether the lock
-    was actually acquired, so a bare ``with state_lock(...): pass`` succeeding
-    proves nothing on its own -- a genuine 0-byte acquisition failure would
-    still "succeed" after silently falling through the 30s timeout. Assert
-    the acquire-failed warning is NOT logged, proving the lock was genuinely
-    acquired on first try rather than via the best-effort timeout fallback.
+    ``state_lock`` now raises ``StateLockBusy`` on timeout, so a bare
+    ``with state_lock(...): pass`` would fail loudly if the lock could not be
+    acquired. Assert the acquire-failed warning is NOT logged, proving the lock
+    was genuinely acquired on the first try rather than via the timeout path.
     """
     import logging
 
@@ -100,7 +100,7 @@ def test_state_lock_zero_byte_existing_file_acquires(tmp_path: Path, caplog) -> 
             pass
 
     assert not any("Failed to acquire lock" in record.message for record in caplog.records), (
-        "state_lock fell through to the best-effort timeout path instead of "
+        "state_lock fell through to the timeout path instead of "
         "genuinely acquiring the 0-byte lock file on the first try"
     )
     assert lock_path.stat().st_size == 0, "lock acquisition should not pad the file"

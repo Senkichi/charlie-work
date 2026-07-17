@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -261,3 +262,116 @@ def test_pr_checks_injects_run_id(monkeypatch, tmp_path: Path) -> None:
             "runId": 29525590823,
         }
     ]
+
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _read_fixture(name: str) -> str:
+    return (_FIXTURES / name).read_text(encoding="utf-8")
+
+
+def test_check_graphql_rate_limit_parses_live_payload(monkeypatch, tmp_path: Path) -> None:
+    """Issue #398: the rate-limit guard must parse a live ``gh api rate_limit`` payload."""
+    rate_limit_json = _read_fixture("gh_rate_limit.json")
+
+    def fake_run(cmd, *args, **kwargs):
+        assert cmd[:3] == ["gh", "api", "rate_limit"]
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=1500)
+
+    # Fixture has graphql.remaining == 4114, reset is a unix timestamp.
+    assert sufficient is True
+    assert remaining == 4114
+    assert isinstance(reset_at, int)
+
+
+def test_check_graphql_rate_limit_below_threshold_returns_insufficient(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #398: when remaining points are below the threshold the guard reports insufficient."""
+    rate_limit_json = _read_fixture("gh_rate_limit.json")
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=5000)
+
+    assert sufficient is False
+    assert remaining == 4114
+    assert isinstance(reset_at, int)
+
+
+def test_merged_pr_list_defers_when_graphql_rate_limit_below_threshold(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #398: merged_pr_list() must not start a quota-heavy listing when the
+    GraphQL budget is below the configured threshold.
+    """
+    rate_limit_json = _read_fixture("gh_rate_limit.json")
+    call_log: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        call_log.append(cmd)
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(graphql_rate_limit_threshold=5000))
+    with pytest.raises(github_module.GraphQLBudgetError) as exc_info:
+        gh.merged_pr_list()
+
+    assert exc_info.value.remaining == 4114
+    assert exc_info.value.threshold == 5000
+    assert all(c[:3] == ["gh", "api", "rate_limit"] for c in call_log)
+
+
+def test_merged_pr_list_runs_when_graphql_rate_limit_sufficient(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #398: merged_pr_list() proceeds normally when the GraphQL budget is sufficient."""
+    rate_limit_json = _read_fixture("gh_rate_limit.json")
+    merged_prs = [
+        {
+            "number": 1,
+            "title": "x",
+            "body": "",
+            "headRefName": "agent/issue-1-x",
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+    call_log: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        call_log.append(cmd)
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=json.dumps(merged_prs), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(graphql_rate_limit_threshold=1500))
+    result = gh.merged_pr_list()
+
+    assert result == merged_prs
+    assert any(c[:2] == ["gh", "pr"] and "merged" in c for c in call_log)

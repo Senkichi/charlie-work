@@ -17,7 +17,7 @@ from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
-from .state import load_state_locked
+from .state import StateLockBusy, load_state_locked
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -826,6 +826,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except OSError as exc:
         print(f"OS error: {exc}", file=sys.stderr)
+        return 2
+    except StateLockBusy as exc:
+        print(f"state lock busy: {exc}", file=sys.stderr)
         return 2
     except (ConfigError, ValueError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
