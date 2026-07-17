@@ -1038,6 +1038,21 @@ def _detect_and_handle_orphaned_workers(
     - Otherwise, surface as drift for human triage
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
+
+    Issue #417: for the no-open-PR case, this is the ONE lane that revisits a
+    dead session's GitHub labels independent of its sidecar file -- it is
+    keyed entirely off state.json (``status == "dispatched"`` + a dead
+    ``worker_pid``), so it runs every pass whether or not a sidecar exists.
+    ``_classify_dead_sessions_and_update_throttle_state``'s own no-open-PR
+    reclaim (the "issue #118" lane) is a single best-effort attempt per dead
+    session: if it is interrupted (process crash/reboot) between writing
+    ``redispatch_at`` and swapping the GitHub labels, or if the label API
+    calls themselves fail, the sidecar is already reaped and that lane has no
+    way to revisit the issue. This sweep closes that gap by re-deriving
+    "does this issue still need its labels fixed" from GitHub's *live* label
+    state every pass (not from any one-shot flag), so a half-finished reclaim
+    -- or one stranded before this fix ever existed -- gets completed here
+    without a human needing to notice.
     """
     if not config.watchdog.enabled:
         return
@@ -1069,6 +1084,47 @@ def _detect_and_handle_orphaned_workers(
         )
         if linked is not None:
             pr_by_issue[linked] = pr
+
+    # Issue #417: ground-truth label reclaim for the no-open-PR orphans, done
+    # OUTSIDE the state lock (network I/O) and with a single bulk issue-list
+    # call rather than one gh.issue_view per orphan -- this sweep's GitHub
+    # cost must stay bounded regardless of how many stale "dispatched" entries
+    # have accumulated in state.json over time.
+    no_pr_orphans = [n for n in orphaned_issues if n not in pr_by_issue]
+    reclaim_results: dict[int, dict[str, Any]] = {}
+    if no_pr_orphans:
+        issues_by_number: dict[int, dict[str, Any]] = {}
+        for issue in gh.issue_list(state="open"):
+            number = issue.get("number")
+            if number is not None:
+                issues_by_number[int(number)] = issue
+        for issue_number in no_pr_orphans:
+            issue = issues_by_number.get(issue_number)
+            if issue is None:
+                # Issue not found in the open snapshot (closed, deleted, or
+                # inaccessible) -- nothing safe to reclaim; leave it to the
+                # existing diagnostic drift path below.
+                continue
+            issue_labels = label_names(issue)
+            active_labels = issue_labels & config.labels.active
+            needs_ready = config.labels.ready not in issue_labels
+            if not active_labels and not needs_ready:
+                # Already fully reconciled (e.g. the sidecar-based lane
+                # already succeeded this same pass, or a previous pass of
+                # this sweep already finished the job) -- nothing to do.
+                continue
+            label_write_ok = True
+            for label in sorted(active_labels):
+                if not gh.remove_issue_label(issue_number, label):
+                    label_write_ok = False
+            if needs_ready:
+                if not gh.add_issue_label(issue_number, config.labels.ready):
+                    label_write_ok = False
+            reclaim_results[issue_number] = {
+                "removed_labels": sorted(active_labels),
+                "added_ready": needs_ready,
+                "label_write_ok": label_write_ok,
+            }
 
     # Handle orphaned workers
     with state_lock(state_file):
@@ -1146,8 +1202,36 @@ def _detect_and_handle_orphaned_workers(
                         )
                     )
             else:
-                # No open PR - emit drift event, leave recovery to mop-up
-                # Mop-up will handle label transition back to ready (issue #118)
+                # Issue #417: report (and, on success, resolve) the ground-truth
+                # label reclaim computed above before falling back to the
+                # unresolved-drift diagnostic. This is what makes the reap
+                # convergent -- an interrupted or partially-failed attempt by
+                # the sidecar-based lane is finished here, and a genuinely
+                # failed label write is retried again next pass (this reclaim
+                # never gates on orphan_flagged_at, only the diagnostic below
+                # does).
+                reclaim = reclaim_results.get(issue_number)
+                if reclaim is not None:
+                    sweep_events.append(
+                        (
+                            "session_failed_relabeled",
+                            {
+                                "issue_number": issue_number,
+                                "reason": "dead_worker_no_open_pr_orphan_sweep",
+                                **reclaim,
+                            },
+                        )
+                    )
+                    if reclaim["label_write_ok"]:
+                        # Fully reclaimed: labels are correct, nothing left to
+                        # flag as unresolved drift.
+                        state["issues"][str(issue_number)] = entry
+                        continue
+
+                # No open PR - emit drift event, leave (further) recovery to
+                # this same sweep's next pass, which re-attempts the ground-
+                # truth label reclaim above unconditionally regardless of the
+                # flag set here (issue #118 mop-up remains a manual fallback).
                 # Issue #259: mark the entry so it is not re-flagged every pass.
                 # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
                 # paths must run regardless of the flag.
@@ -1721,7 +1805,15 @@ def _classify_dead_sessions_and_update_throttle_state(
                     continue
                 issue_labels = label_names(issue)
                 active_labels = issue_labels & config.labels.active
-                if not active_labels:
+                # Issue #417: also check whether the ready label is missing.
+                # The original guard here only checked active_labels, so a
+                # prior pass that removed the active label but then failed to
+                # add ready back (partial label-swap failure) would make this
+                # lane bail out on every subsequent pass forever, believing
+                # there was "nothing to do" -- even though the issue was left
+                # with no dispatch-eligible label at all.
+                needs_ready = config.labels.ready not in issue_labels
+                if not active_labels and not needs_ready:
                     continue
 
                 # Issue #252: completed-but-unpublished work takes the salvage
@@ -1800,12 +1892,23 @@ def _classify_dead_sessions_and_update_throttle_state(
                         entry["redispatch_at"] = redispatch_at
                         state["issues"][str(w.issue_number)] = entry
                         save_state(state_file, state)
-                # Remove all active labels (error-as-value)
+                # Remove all active labels and ensure ready label is present.
+                # Issue #417: check (and record) the bool return values instead
+                # of silently discarding them. A False here means this pass's
+                # label swap did not fully land -- the issue remains eligible
+                # for _detect_and_handle_orphaned_workers' no-open-PR sweep to
+                # finish the reclaim on a later pass, since that lane
+                # re-derives "does this still need fixing" from GitHub's live
+                # label state every pass rather than from any flag written
+                # here (and never touches redispatch_at, so a retry there
+                # cannot double-count this as a second redispatch event).
+                label_write_ok = True
                 for label in sorted(active_labels):
-                    gh.remove_issue_label(w.issue_number, label)
-                # Ensure ready label is present (error-as-value)
-                if config.labels.ready not in issue_labels:
-                    gh.add_issue_label(w.issue_number, config.labels.ready)
+                    if not gh.remove_issue_label(w.issue_number, label):
+                        label_write_ok = False
+                if needs_ready:
+                    if not gh.add_issue_label(w.issue_number, config.labels.ready):
+                        label_write_ok = False
                 # Record the relabel event
                 with state_lock(state_file):
                     state = load_state(state_file)
@@ -1819,7 +1922,8 @@ def _classify_dead_sessions_and_update_throttle_state(
                             "issue_number": w.issue_number,
                             "failure_kind": failure_kind,
                             "removed_labels": sorted(active_labels),
-                            "added_ready": config.labels.ready not in issue_labels,
+                            "added_ready": needs_ready,
+                            "label_write_ok": label_write_ok,
                             "salvage_failed": is_completed,
                             "salvage_error": salvage_error,
                         },

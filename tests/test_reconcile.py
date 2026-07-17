@@ -220,6 +220,11 @@ def test_detect_drift_finds_state_pr_missing_on_github() -> None:
 
 
 def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> None:
+    """Issue #417: this fix path must also add the ready label back, not just
+    remove the stale active one -- otherwise a --fix run leaves the issue with
+    no dispatch-eligible label at all (mirrors the sibling
+    session_failed_relabeled kind).
+    """
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[_issue(30, [config.labels.in_progress])])
     state = empty_state()
@@ -238,8 +243,41 @@ def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> Non
     assert matches[0].issue_number == 30
     assert matches[0].fix_actions == (
         f"remove label '{config.labels.in_progress}' from issue #30",
+        f"add label '{config.labels.ready}' to issue #30",
     )
     assert matches[0].remove_labels == (config.labels.in_progress,)
+    assert matches[0].add_labels == (config.labels.ready,)
+
+
+def test_apply_fixes_issue_active_label_no_open_pr_adds_ready_label(tmp_path: Path) -> None:
+    """Issue #417 AC(b): mop-up --fix must add the ready label back, not only
+    remove the stale active one, so the issue actually becomes dispatchable
+    again instead of being left with no state-machine label at all.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(30, [config.labels.in_progress])])
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    if sessions_dir.exists():
+        import shutil
+
+        shutil.rmtree(sessions_dir.parent.parent.parent)
+
+    drift = detect_drift(gh, state, config)
+    matches = [item for item in drift if item.kind == "issue_active_label_no_open_pr"]
+    assert matches
+
+    new_state = apply_fixes(gh, state, matches, config)
+
+    assert (30, config.labels.in_progress) in gh.labels_removed
+    assert (30, config.labels.ready) in gh.labels_added
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert all(
+        "label_write_failed" not in a
+        for e in reconcile_events
+        for a in e["payload"]["fix_actions"]
+    )
 
 
 def test_detect_drift_issue_active_label_with_open_pr_is_not_drift() -> None:

@@ -22200,6 +22200,252 @@ def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Issue #417: dead-session reclaim must be idempotent and resumable, not a
+# one-shot handoff that permanently strands an issue if interrupted mid-way.
+# ---------------------------------------------------------------------------
+
+
+def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path) -> None:
+    """Issue #417: a reclaim interrupted between the redispatch_at state.json
+    write and the GitHub label swap (e.g. by a crash/reboot) must self-heal on
+    the very next orphaned-worker sweep -- reproducing job-cannon #1172/#1176's
+    exact fingerprint: status still "dispatched", worker_pid dead,
+    redispatch_at already has one entry, and the GitHub issue still carries
+    the stale active label alongside the ready label that was never removed
+    from the original dispatch.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1172"] = {
+        "status": "dispatched",
+        "dispatched_at": "2026-07-14T16:14:40Z",
+        "redispatch_at": ["2026-07-14T16:17:20.606175Z"],
+        "worker_pid": 40680,
+        "worker_process_start_time": 1784045680.2843266,
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 1172,
+            "title": "some bug",
+            "url": "https://example.test/issues/1172",
+            "body": "",
+            "labels": [
+                {"name": config.labels.in_progress},
+                {"name": config.labels.ready},
+            ],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []  # dead worker never opened a PR
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # The stale active label must have been removed -- this is exactly what
+    # _is_dispatchable requires (ready present, no active label) for the
+    # issue to become dispatchable again.
+    assert (1172, config.labels.in_progress) in fake_gh.labels_removed
+    # ready was already present, so it must NOT be redundantly re-added.
+    assert (1172, config.labels.ready) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1172"]
+    # This lane must never touch the sidecar-based lane's own bookkeeping --
+    # a retry here must not inflate the escalation-cap counter.
+    assert entry["redispatch_at"] == ["2026-07-14T16:17:20.606175Z"]
+    assert entry["worker_pid"] == 40680
+
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == 1172
+    assert events[0]["payload"]["label_write_ok"] is True
+    assert events[0]["payload"]["removed_labels"] == [config.labels.in_progress]
+
+    # A once-stranded issue must not ALSO be flagged as unresolved drift now
+    # that the reclaim fully succeeded.
+    drift_events = [e for e in state["events"] if e["kind"] == "orphaned_worker_drift"]
+    assert drift_events == []
+
+
+def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path: Path) -> None:
+    """Issue #417: if the label swap itself fails (gh API error), the reclaim
+    must not lose state.json bookkeeping or the sidecar-independent tracking,
+    and a later pass -- once the API recovers -- must complete the reclaim.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1176"] = {
+        "status": "dispatched",
+        "dispatched_at": "2026-07-14T17:24:55Z",
+        "redispatch_at": ["2026-07-14T17:29:56.087825Z"],
+        "worker_pid": 29236,
+        "worker_process_start_time": 1784049895.281971,
+    }
+    save_state(paths.state_file, state)
+
+    class FlakyLabelGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_remove = True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            self.labels_removed.append((number, label))
+            return not self.fail_remove
+
+    fake_gh = FlakyLabelGitHub()
+    fake_gh.issues = [
+        {
+            "number": 1176,
+            "title": "some other bug",
+            "url": "https://example.test/issues/1176",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        # Pass 1: the gh API call fails.
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1176"]
+    # Nothing lost: bookkeeping and the liveness fingerprint survive intact.
+    assert entry["redispatch_at"] == ["2026-07-14T17:29:56.087825Z"]
+    assert entry["worker_pid"] == 29236
+
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"]["label_write_ok"] is False
+    assert (1176, config.labels.in_progress) in fake_gh.labels_removed
+
+    # Pass 2: the API recovers.
+    fake_gh.fail_remove = False
+    fake_gh.labels_removed = []
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    assert (1176, config.labels.in_progress) in fake_gh.labels_removed
+    assert (1176, config.labels.ready) in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 2
+    assert events[1]["payload"]["label_write_ok"] is True
+    # The redispatch_at bookkeeping must never have been touched by retries of
+    # this sidecar-independent lane -- only the sidecar-based reap lane
+    # (_classify_dead_sessions_and_update_throttle_state) owns that counter.
+    assert state["issues"]["1176"]["redispatch_at"] == ["2026-07-14T17:29:56.087825Z"]
+
+
+def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
+    tmp_path: Path,
+) -> None:
+    """Issue #417: the fully-clean happy path (no interruption, no API
+    failure) must still fully reclaim a dead session -- with no open PR -- in
+    a single pass of the sidecar-based reap lane, and now records
+    label_write_ok=True so a genuine future failure is distinguishable from
+    success.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig as DevinCfg
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinCfg(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 99,
+            "title": "Fix thing",
+            "url": "https://example.test/issues/99",
+            "body": "Broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-99.log"
+    log_path.write_text("Some work done, then the process died.\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-99.json"
+    record = SessionRecord(
+        issue_number=99,
+        branch="agent/issue-99-x",
+        worktree_path="/tmp/worktree-99",
+        prompt_path="/tmp/prompt-99.md",
+        command=("devin", "--prompt-file", "/tmp/prompt-99.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    import json
+
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    assert (99, config.labels.in_progress) in fake_gh.labels_removed
+    assert (99, config.labels.ready) in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"]["label_write_ok"] is True
+    assert events[0]["payload"]["added_ready"] is True
+    assert (
+        state["issues"]["99"]["redispatch_at"] and len(state["issues"]["99"]["redispatch_at"]) == 1
+    )
+
+    # The sidecar must be reaped once the reclaim fully succeeds.
+    assert not sidecar_path.exists()
+
+
+# ---------------------------------------------------------------------------
 # SupervisorConfig tests
 # ---------------------------------------------------------------------------
 
