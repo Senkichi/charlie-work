@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -61,6 +62,7 @@ from charlie_work.state import (
     set_throttled_until,
     state_lock,
 )
+import charlie_work.state as state_module
 from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
@@ -2545,9 +2547,14 @@ def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path
     the root cause of intermittent gateway 502s at ~500-merged-PR scale.
     """
     captured_args: list[list[str]] = []
+    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         captured_args.append(cmd)
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
+            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
@@ -2555,8 +2562,8 @@ def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path
     gh = github_module.GitHub(tmp_path)
     gh.merged_pr_list()
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
+    assert len(captured_args) == 2
+    args = captured_args[1]
     assert args[:5] == ["gh", "pr", "list", "--state", "merged"]
     fields = args[args.index("--json") + 1].split(",")
     assert set(fields) == set(github_module.MERGED_PR_LIST_FIELDS.split(","))
@@ -2584,11 +2591,16 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     """
     call_count = 0
     sleeps: list[float] = []
+    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
+            )
+        if call_count == 2:
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=1,
@@ -2604,7 +2616,7 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     result = gh.merged_pr_list()
 
     assert result == []
-    assert call_count == 2
+    assert call_count == 3
     assert len(sleeps) == 1
 
 
@@ -2614,10 +2626,15 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     on to the next repo.
     """
     call_count = 0
+    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
+            )
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=1,
@@ -2632,7 +2649,7 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 3
+    assert call_count == 4
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -2642,10 +2659,15 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     than be swallowed into the transient-gateway retry loop.
     """
     call_count = 0
+    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
+            )
         return subprocess.CompletedProcess(
             args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
         )
@@ -2656,7 +2678,7 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 1
+    assert call_count == 2
 
 
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
@@ -2780,6 +2802,9 @@ class FakeGitHub:
             head = pr.get("headRefOid")
             if head and head not in self.commits:
                 self.commits[head] = {"parents": [{"sha": base}]}
+
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+        return (True, 10000, 0)
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -9299,6 +9324,65 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
     assert decision["required_changes"] == []
+
+
+def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:
+    """Issue #407: review-decision.json must include the correct escalated value.
+
+    The decision payload is fully built before the single atomic write, so
+    re-reading the persisted file returns the same escalated flag as the
+    in-memory result. Non-escalated request_changes and escalated
+    request_changes must both persist the correct value.
+    """
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=2))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    fake_gh.pr_head_shas[456] = "sha-1"
+    app.record_review(456, "request_changes", summary="fix A")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "escalated" in decision
+    assert decision["escalated"] is False
+    assert app._review_decision(456)["escalated"] is False
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    app.record_review(456, "request_changes", summary="fix B")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["escalated"] is False
+
+    fake_gh.pr_head_shas[456] = "sha-3"
+    app.record_review(456, "request_changes", summary="fix C")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["escalated"] is True
+    # _review_decision is the reader used by merge_ready and merge-train
+    # eligibility; it must see the persisted escalated value.
+    assert app._review_decision(456)["escalated"] is True
+
+
+def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
+    """Issue #407: merge_ready (via _review_decision and merge-train
+    eligibility) must see the escalated flag from the persisted decision file.
+    """
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=1))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First request_changes is not escalated (count 0 -> 1).
+    fake_gh.pr_head_shas[456] = "sha-1"
+    app.record_review(456, "request_changes", summary="fix A")
+    # Second request_changes hits the max_rework_cycles cap and escalates.
+    fake_gh.pr_head_shas[456] = "sha-2"
+    app.record_review(456, "request_changes", summary="fix B")
+
+    result = app.merge_ready(456)
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["review_decision"]["decision"] == "request_changes"
+    assert result.data["review_decision"]["escalated"] is True
 
 
 def test_record_review_request_changes_updates_issue_status_to_rework_requested(
@@ -20937,3 +21021,139 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
     assert any(r.data.get("fleet_live_session_count") is not None for r in results), (
         "fleet live count should be reported in dispatch results"
     )
+
+
+@contextlib.contextmanager
+def _hold_state_lock(lock_path: Path) -> Any:
+    """Hold a real, competing byte-range/exclusive lock on the state lock file.
+
+    This is used to force ``state_lock`` to time out without involving another
+    process, while still exercising the real platform locking primitive.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if not lock_path.exists():
+        lock_path.write_bytes(b"\x00")
+    handle = lock_path.open("r+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("status", ()),
+        ("intake", ()),
+        ("dispatch", ()),
+        ("dispatch_rework", ()),
+        ("review", (456,)),
+        ("merge_ready", (456,)),
+    ],
+)
+def test_state_lock_guard_returns_skip_when_lock_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    args: tuple[Any, ...],
+) -> None:
+    """Issue #398: if the state lock is held, public state-writing methods
+    return a clean skip CommandResult and leave state.json untouched.
+    """
+    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    state_path = paths.state_file
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+    initial_mtime = state_path.stat().st_mtime
+    initial_content = state_path.read_text(encoding="utf-8")
+
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with _hold_state_lock(lock_path):
+        result = getattr(app, method_name)(*args)
+
+    assert result.ok is True
+    reason = result.data.get("reason") or result.data.get("deferred_reason")
+    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
+    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert state_path.stat().st_mtime == initial_mtime
+    assert state_path.read_text(encoding="utf-8") == initial_content
+
+
+def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #398: spec_review is also guarded by the state-lock skip pattern."""
+    from charlie_work.cross_family import CrossFamilyResult
+
+    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    spec_path = tmp_path / "spec.md"
+    spec_path.write_text("# spec\n", encoding="utf-8")
+
+    state_path = paths.state_file
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_state = {
+        "version": 1,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "issues": {},
+        "prs": {},
+        "events": [],
+    }
+    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+    initial_mtime = state_path.stat().st_mtime
+    initial_content = state_path.read_text(encoding="utf-8")
+
+    def fake_run_cross_family_review(*args: object, **kwargs: object) -> CrossFamilyResult:
+        return CrossFamilyResult(ok=True, report_path=str(tmp_path / "report.md"), model="test")
+
+    monkeypatch.setattr(
+        "charlie_work.cross_family.run_cross_family_review",
+        fake_run_cross_family_review,
+    )
+
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with _hold_state_lock(lock_path):
+        result = app.spec_review(spec_path)
+
+    assert result.ok is True
+    reason = result.data.get("reason") or result.data.get("deferred_reason")
+    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
+    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert state_path.stat().st_mtime == initial_mtime
+    assert state_path.read_text(encoding="utf-8") == initial_content

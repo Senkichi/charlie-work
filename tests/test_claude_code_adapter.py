@@ -2189,7 +2189,7 @@ def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwa
     with (
         patch("subprocess.Popen", side_effect=capture_popen),
         patch(
-            "charlie_work.claude_code.no_console_window_kwargs",
+            "charlie_work.process_utils.no_console_window_kwargs",
             return_value=sentinel_kwargs,
         ) as mock_helper,
     ):
@@ -2202,7 +2202,8 @@ def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwa
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    mock_helper.assert_called_once_with(claude_code._CREATE_NEW_PROCESS_GROUP)
+    expected_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    mock_helper.assert_called_once_with(expected_group_flag)
     assert popen_calls, "expected at least one Popen call from the worker launch"
     assert popen_calls[0].get("creationflags") == 0xDEADBEEF
 

@@ -7,18 +7,23 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
-from charlie_work.github import _LIST_LIMIT as github_list_limit
+from charlie_work.file_lock import try_acquire_byte_range_lock
+from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
+from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import (
     DriftItem,
     _LIST_LIMIT as reconcile_list_limit,
     apply_fixes,
     detect_drift,
 )
-from charlie_work.state import empty_state, is_claim_stale
+from charlie_work.state import empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
+from charlie_work.workflow import OrchestratorApp
 
 
 class FakeGitHub:
@@ -33,6 +38,9 @@ class FakeGitHub:
         fail_remove_labels: set[tuple[int, str]] | None = None,
         repo_root: Any = None,
         pr_create_return: int | None = None,
+        rate_limit_sufficient: bool = True,
+        rate_limit_remaining: int = 10000,
+        rate_limit_reset: int = 0,
     ) -> None:
         self._prs = prs
         self._issues = issues
@@ -44,6 +52,9 @@ class FakeGitHub:
         self.repo_root = repo_root
         self.prs_created: list[dict[str, Any]] = []
         self.pr_create_return = pr_create_return
+        self._rate_limit_sufficient = rate_limit_sufficient
+        self._rate_limit_remaining = rate_limit_remaining
+        self._rate_limit_reset = rate_limit_reset
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         self.run_calls.append(args)
@@ -64,6 +75,13 @@ class FakeGitHub:
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
         return self.pr_create_return
+
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+        return (
+            self._rate_limit_sufficient,
+            self._rate_limit_remaining,
+            self._rate_limit_reset,
+        )
 
 
 def _pr(
@@ -2101,3 +2119,82 @@ def test_apply_fixes_salvage_push_failure_fallback(tmp_path: Path) -> None:
     events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
     assert events[-1]["payload"]["kind"] == "session_failed_relabeled"
     assert any("salvage_failed" in action for action in events[-1]["payload"]["fix_actions"])
+
+
+def test_detect_drift_defers_when_graphql_rate_limit_below_threshold() -> None:
+    """Issue #398: detect_drift must refuse to start a quota-heavy sweep when the
+    GraphQL budget is below the configured threshold.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(1, "OPEN", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress])],
+        rate_limit_sufficient=False,
+        rate_limit_remaining=100,
+        rate_limit_reset=1234567890,
+    )
+
+    with pytest.raises(GraphQLBudgetError) as exc_info:
+        detect_drift(gh, empty_state(), config)
+
+    assert exc_info.value.remaining == 100
+    assert exc_info.value.reset_at == 1234567890
+    assert exc_info.value.threshold == config.runtime.graphql_rate_limit_threshold
+
+
+def test_reconcile_deferred_when_graphql_rate_limit_below_threshold(
+    tmp_path: Path,
+) -> None:
+    """Issue #398: reconcile() writes a deferred event and returns a skip result
+    when the GraphQL budget is too low, without issuing any pr/issue list calls.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[_pr(1, "OPEN", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress])],
+        rate_limit_sufficient=False,
+        rate_limit_remaining=100,
+        rate_limit_reset=1234567890,
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.reconcile()
+
+    assert result.ok is True
+    assert result.data["deferred_reason"] == "graphql_rate_limit"
+    assert result.data["graphql_remaining"] == 100
+    assert result.data["graphql_reset"] == 1234567890
+    # No list calls were made because the guard stopped the sweep.
+    assert not any(c[:2] == ["pr", "list"] for c in gh.run_calls)
+    assert not any(c[:2] == ["issue", "list"] for c in gh.run_calls)
+    # A deferred event was persisted to state.json.
+    state = load_state(paths.state_file)
+    events = [e for e in state.get("events", []) if e["kind"] == "graphql_rate_limit_deferred"]
+    assert len(events) == 1
+    assert events[0]["payload"]["remaining"] == 100
+
+
+def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> None:
+    """Issue #398: mop-up --fix must be mutually exclusive with a supervised/fleet
+    pass on the same repo. If the supervisor.lock is held, reconcile returns a skip.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[_pr(1, "OPEN", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress])],
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    supervisor_lock_path = paths.root / "supervisor.lock"
+    supervisor_lock = try_acquire_byte_range_lock(supervisor_lock_path)
+    assert supervisor_lock is not None, "test setup could not acquire supervisor lock"
+    try:
+        result = app.reconcile(fix=True)
+    finally:
+        supervisor_lock.release()
+
+    assert result.ok is True
+    assert result.data.get("skipped") is True
+    assert result.data.get("reason") == "supervisor_lock_held"
