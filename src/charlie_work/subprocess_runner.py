@@ -70,6 +70,7 @@ def run_captured(
     cwd: Path | str,
     timeout_seconds: int,
     shell: bool = False,
+    stdin: str | None = None,
 ) -> RunResult:
     """Run ``command`` and capture output. Never raises for runtime failures —
     timeouts, missing binaries, and non-zero exits all come back as a result."""
@@ -84,6 +85,7 @@ def run_captured(
             timeout=timeout_seconds,
             shell=shell,
             check=False,
+            input=stdin,
             **no_console_window_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:

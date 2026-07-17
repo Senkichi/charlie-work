@@ -4,6 +4,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from charlie_work.config import (
     AutoMergeConfig,
     OrchestratorConfig,
@@ -452,7 +454,7 @@ index 1234567..abcdef0 100644
     patch_id1 = _calculate_patch_id(diff)
     patch_id2 = _calculate_patch_id(diff)
     assert patch_id1 == patch_id2
-    assert len(patch_id1) == 64  # SHA256 hex string
+    assert len(patch_id1) == 40  # SHA-1 hex string from git patch-id --stable
 
 
 def test_calculate_patch_id_different_for_different_diffs() -> None:
@@ -550,9 +552,37 @@ index aaaaaaa..bbbbbbb 100644
     id_shifted = _calculate_patch_id(diff_shifted)
     assert id_original == id_shifted, (
         f"Hunk-offset shift changed patch-id: {id_original!r} != {id_shifted!r}. "
-        "Did someone remove the @@ skip from _calculate_patch_id?"
+        "Did git patch-id --stable stop ignoring hunk headers?"
     )
-    assert len(id_original) == 64  # SHA256 hex
+    assert len(id_original) == 40  # SHA-1 hex string from git patch-id --stable
+
+
+def test_calculate_patch_id_returns_empty_for_diff_without_hunks() -> None:
+    """A diff with no hunk header is not a real patch and cannot be compared."""
+    assert _calculate_patch_id("diff --git a/file b/file\n") == ""
+
+
+def test_calculate_patch_id_returns_empty_when_git_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Git failures during patch-id computation must fail closed (empty string)."""
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+
+    def _fake_run_captured(*_args, **_kwargs):
+        from charlie_work.subprocess_runner import RunResult
+
+        return RunResult(returncode=1, stdout="", stderr="git failed", error="git failed")
+
+    monkeypatch.setattr(janitor_module, "run_captured", _fake_run_captured)
+    assert _calculate_patch_id(diff) == ""
 
 
 def test_no_op_rework_offset_shift_still_blocks(tmp_path: Path) -> None:

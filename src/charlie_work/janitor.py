@@ -22,7 +22,6 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
-import hashlib
 import re
 import subprocess
 from collections.abc import Iterator
@@ -32,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
-from charlie_work.subprocess_runner import no_console_window_kwargs
+from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -146,55 +145,36 @@ class JanitorVerdict:
 def _calculate_patch_id(diff: str) -> str:
     """Calculate a stable patch-id from a diff.
 
-    This function computes a SHA256 hash of the normalized diff content,
-    which serves as a stable identifier for the actual changes regardless
-    of base SHA changes (e.g., from base-update merges).
-
-    The normalization strips metadata that varies between runs (hashes,
-    timestamps, line offsets) while preserving the actual code changes.
-    Specifically, it mirrors what ``git patch-id`` does: hunk headers
-    (lines starting with ``@@``) are dropped so that base-update merges
-    that shift line numbers in a PR's files do not change the patch-id
-    even when the content lines are identical.
+    Feeds the unified diff to ``git patch-id --stable`` and returns the
+    resulting SHA-1. This is the canonical plumbing for content-identical
+    detection: it ignores metadata (index hashes, file modes) and hunk
+    line-number offsets that change on base-update merges but do not affect
+    the actual content.
 
     Args:
         diff: The unified diff string (e.g., from `git diff` or `gh pr diff`)
 
     Returns:
-        A SHA256 hash of the normalized diff content, or empty string for empty/whitespace-only diffs
+        A stable patch-id string, or empty string when the diff contains no
+        real hunks, is empty/whitespace-only, or when ``git patch-id`` fails.
     """
-    if not diff or not diff.strip():
+    if not diff or not diff.strip() or "@@" not in diff:
         return ""
 
-    # Normalize the diff by stripping metadata lines that vary
-    lines = diff.splitlines()
-    normalized = []
-    for line in lines:
-        # Skip header lines that vary between runs
-        if (
-            line.startswith("diff --git")
-            or line.startswith("index ")
-            or line.startswith("--- ")
-            or line.startswith("+++ ")
-        ):
-            continue
-        # Skip hunk headers (e.g. "@@ -10,5 +10,6 @@"): line-offset numbers change
-        # on base-update merges even when content is identical. git patch-id ignores
-        # these for the same reason.
-        if line.startswith("@@"):
-            continue
-        # Skip diff metadata lines
-        if line.startswith("\\"):
-            continue
-        normalized.append(line)
-
-    # If after normalization we have no content, return empty string
-    if not normalized or not any(line.strip() for line in normalized):
+    result = run_captured(
+        ["git", "patch-id", "--stable"],
+        cwd=Path.cwd(),
+        timeout_seconds=30,
+        stdin=diff,
+    )
+    if not result.ok:
         return ""
 
-    # Calculate SHA256 of the normalized diff
-    content = "\n".join(normalized)
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line.split()[0]
+    return ""
 
 
 @dataclass(frozen=True)
