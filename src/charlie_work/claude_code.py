@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,6 +39,7 @@ from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
+    WorktreeForeignWriterError,
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeUnsafeError,
@@ -45,6 +47,7 @@ from .worktree import (
     create_worktree,
     remove_review_checkout,
     remove_worktree,
+    write_worktree_marker,
 )
 
 PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
@@ -99,6 +102,7 @@ class ClaudeWorkerRecord:
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
+    session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
 
     def __post_init__(self) -> None:
         """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
@@ -139,6 +143,7 @@ class ClaudeWorkerRecord:
             inconclusive_probe_deferred_count=int(
                 payload.get("inconclusive_probe_deferred_count") or 0
             ),
+            session_id=payload.get("session_id"),
         )
 
 
@@ -343,6 +348,7 @@ def _error_record(
     failure_kind: str | None = None,
     pid: int | None = None,
     process_start_time: float | None = None,
+    session_id: str | None = None,
 ) -> ClaudeWorkerRecord:
     return ClaudeWorkerRecord(
         issue_number=issue_number,
@@ -356,6 +362,7 @@ def _error_record(
         error=error,
         failure_kind=failure_kind,
         process_start_time=process_start_time,
+        session_id=session_id,
     )
 
 
@@ -483,6 +490,7 @@ def launch_claude_worker(
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
+    session_id = str(uuid.uuid4())
     if review:
         # Hard-pinned, not a default: see _sanitize_review_command_template
         # and PR #397 round-2 review. No caller-supplied command_template
@@ -516,6 +524,7 @@ def launch_claude_worker(
                 base_ref=base_ref,
                 issue_number=issue_number,
                 config=config,
+                sessions_dir=sessions_dir,
             )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         if isinstance(exc, WorktreeProbeFailedError):
@@ -525,6 +534,8 @@ def launch_claude_worker(
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
             failure_kind = "worktree_unsafe"
+        elif isinstance(exc, WorktreeForeignWriterError):
+            failure_kind = "worktree_foreign_writer"
         elif isinstance(exc, LiveWorkerRedispatchError):
             failure_kind = "live_worker_redispatch_averted"
         else:
@@ -532,18 +543,23 @@ def launch_claude_worker(
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
-            worktree_path="",
+            worktree_path=getattr(exc, "worktree_path", "")
+            if isinstance(exc, WorktreeForeignWriterError)
+            else "",
             prompt_path="",
             command=command_template,
             log_path=str(log_path),
             error=str(exc)
-            if isinstance(exc, LiveWorkerRedispatchError)
+            if isinstance(exc, (LiveWorkerRedispatchError, WorktreeForeignWriterError))
             else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
-            pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
+            pid=exc.pid
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else getattr(exc, "pid", None),
             process_start_time=exc.process_start_time
             if isinstance(exc, LiveWorkerRedispatchError)
             else None,
+            session_id=session_id,
         )
         return _write_record(sessions_dir, record)
 
@@ -730,6 +746,12 @@ def launch_claude_worker(
     # Capture process creation time immediately after spawn to verify identity later
     process_start_time = _get_process_start_time(process.pid)
 
+    try:
+        write_worktree_marker(worktree.path, process.pid, session_id)
+    except OSError:
+        # Best-effort marker write must not derail a successful launch.
+        pass
+
     record = ClaudeWorkerRecord(
         issue_number=issue_number,
         branch=branch,
@@ -746,6 +768,7 @@ def launch_claude_worker(
         attempt_ahead_of_main=(
             worktree.attempt_snapshot.ahead_of_main_count if worktree.attempt_snapshot else None
         ),
+        session_id=session_id,
     )
     return _write_record(sessions_dir, record)
 

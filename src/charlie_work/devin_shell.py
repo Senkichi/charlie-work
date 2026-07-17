@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -39,11 +40,13 @@ from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
+    WorktreeForeignWriterError,
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeUnsafeError,
     create_worktree,
     remove_worktree,
+    write_worktree_marker,
 )
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -104,6 +107,7 @@ class SessionRecord:
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
+    session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
 
     def __post_init__(self) -> None:
         """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
@@ -140,6 +144,7 @@ class SessionRecord:
             inconclusive_probe_deferred_count=int(
                 payload.get("inconclusive_probe_deferred_count") or 0
             ),
+            session_id=payload.get("session_id"),
         )
 
 
@@ -340,6 +345,7 @@ def launch_devin_session(
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
+    session_id = str(uuid.uuid4())
 
     # --- worktree creation ---------------------------------------------------
     try:
@@ -354,6 +360,7 @@ def launch_devin_session(
             base_ref=base_ref,
             issue_number=issue_number,
             config=config,
+            sessions_dir=sessions_dir,
         )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         if isinstance(exc, WorktreeProbeFailedError):
@@ -363,6 +370,8 @@ def launch_devin_session(
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
             failure_kind = "worktree_unsafe"
+        elif isinstance(exc, WorktreeForeignWriterError):
+            failure_kind = "worktree_foreign_writer"
         elif isinstance(exc, LiveWorkerRedispatchError):
             failure_kind = "live_worker_redispatch_averted"
         else:
@@ -370,14 +379,18 @@ def launch_devin_session(
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
-            worktree_path="",
+            worktree_path=getattr(exc, "worktree_path", "")
+            if isinstance(exc, WorktreeForeignWriterError)
+            else "",
             prompt_path=str(prompt_path),
             command=command_template,
-            pid=exc.pid if isinstance(exc, LiveWorkerRedispatchError) else None,
+            pid=exc.pid
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else getattr(exc, "pid", None),
             started_at=utc_now(),
             log_path=str(log_path),
             error=str(exc)
-            if isinstance(exc, LiveWorkerRedispatchError)
+            if isinstance(exc, (LiveWorkerRedispatchError, WorktreeForeignWriterError))
             else f"worktree creation failed: {exc}",
             failure_kind=failure_kind,
             process_start_time=exc.process_start_time
@@ -446,6 +459,15 @@ def launch_devin_session(
         remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
         error = f"failed to launch devin: {exc}"
 
+    if pid is not None and error is None:
+        # Write the worktree writer marker so this process is recorded as the
+        # legitimate occupant of the worktree (issue #400).
+        try:
+            write_worktree_marker(worktree.path, pid, session_id)
+        except OSError:
+            # Best-effort marker write must not derail a successful launch.
+            pass
+
     record = SessionRecord(
         issue_number=issue_number,
         branch=branch,
@@ -462,6 +484,7 @@ def launch_devin_session(
         attempt_ahead_of_main=(
             worktree.attempt_snapshot.ahead_of_main_count if worktree.attempt_snapshot else None
         ),
+        session_id=session_id,
     )
     _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
     return record

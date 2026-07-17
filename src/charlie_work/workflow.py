@@ -55,10 +55,15 @@ from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
 from .worktree import (
+    OPERATOR_MARKER_KIND,
+    OPERATOR_MARKER_SESSION_ID,
     inspect_worktree_state,
     push_branch,
     remove_review_checkout,
+    remove_worktree_marker,
     resolve_base_branch_name,
+    worktree_path_for_branch,
+    write_worktree_marker,
 )
 from .state import (
     StateLockBusy,
@@ -67,8 +72,12 @@ from .state import (
     is_throttled,
     load_state,
     load_state_locked,
+    operator_claimed_issues,
+    release_operator_claimed,
     save_state,
+    set_operator_claimed,
     set_throttled_until,
+    stale_operator_claims,
     state_lock,
     utc_now,
 )
@@ -2144,10 +2153,14 @@ class OrchestratorApp:
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
+        operator_claimed = operator_claimed_issues(state)
+        stale_claims = stale_operator_claims(state)
         active_issues = [
             issue for issue in issues if label_names(issue) & self.config.labels.active
         ]
-        available_issues = [issue for issue in issues if self._is_dispatchable(issue)]
+        available_issues = [
+            issue for issue in issues if self._is_dispatchable(issue, operator_claimed)
+        ]
 
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues = self._filter_blocked_issues(available_issues)
@@ -2208,6 +2221,8 @@ class OrchestratorApp:
             ],
             "stalled": stalled_entries,
             "workers": workers,
+            "operator_claimed": sorted(operator_claimed),
+            "stale_claims": sorted(stale_claims),
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -2215,6 +2230,89 @@ class OrchestratorApp:
             data["runners"] = runners_data
 
         return CommandResult(True, "status complete", data)
+
+    def claim(self, issue_number: int, release: bool = False) -> CommandResult:
+        """Record or release an operator claim on an issue.
+
+        A claimed issue is excluded from fresh dispatch and rework dispatch
+        regardless of its labels. When a worktree for the issue already
+        exists, a ``.charlie-writer.json`` marker is written or removed so the
+        protection is mutual: the orchestrator refuses to dispatch into a
+        worktree with a live foreign writer marker.
+        """
+        try:
+            issue = self.gh.issue_view(issue_number)
+        except GitHubError as exc:
+            return CommandResult(
+                False, f"issue #{issue_number} not found: {exc}", {"issue_number": issue_number}
+            )
+
+        branch_name = self._branch_name(issue)
+        worktrees_dir = (
+            self._resolve(self.config.claude_code.worktrees_dir)
+            if self.config.claude_code.worktrees_dir
+            else None
+        )
+        worktree_path = worktree_path_for_branch(self.repo_root, branch_name, worktrees_dir)
+
+        marker_written = False
+        if not release and worktree_path.is_dir():
+            # Operator markers intentionally do not encode the CLI's transient
+            # PID; liveness is keyed off operator_claimed_at in state.json.
+            try:
+                write_worktree_marker(
+                    worktree_path,
+                    0,
+                    OPERATOR_MARKER_SESSION_ID,
+                    kind=OPERATOR_MARKER_KIND,
+                )
+                marker_written = True
+            except OSError:
+                # Marker write failure is not fatal, but record it in the result.
+                pass
+        elif release:
+            # Best-effort marker removal; state release is what matters. Only
+            # remove a marker that belongs to this operator claim, never a
+            # worker marker from an active session.
+            try:
+                remove_worktree_marker(worktree_path, session_id=OPERATOR_MARKER_SESSION_ID)
+            except OSError:
+                pass
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            if release:
+                state = release_operator_claimed(state, issue_number)
+            else:
+                state = set_operator_claimed(state, issue_number)
+            state = append_event(
+                state,
+                "operator_claim_released" if release else "operator_claim",
+                {
+                    "issue_number": issue_number,
+                    "branch_name": branch_name,
+                    "worktree_path": str(worktree_path),
+                    "marker_written": marker_written,
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        message = (
+            f"operator claim released for issue #{issue_number}"
+            if release
+            else f"operator claim recorded for issue #{issue_number}"
+        )
+        return CommandResult(
+            True,
+            message,
+            {
+                "issue_number": issue_number,
+                "branch_name": branch_name,
+                "worktree_path": str(worktree_path),
+                "released": release,
+                "marker_written": marker_written,
+            },
+        )
 
     def bootstrap_labels(self) -> CommandResult:
         descriptions = {
@@ -2417,6 +2515,7 @@ class OrchestratorApp:
     ) -> CommandResult:
         issues = self.gh.issue_list(self.config.labels.ready)
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
+        operator_claimed_ready: list[int] = []
 
         # Gather sessions_dir for stall detection and live worker counting
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
@@ -2754,16 +2853,26 @@ class OrchestratorApp:
                         or issue_number in pr_by_issue
                     ):
                         live_dispatched.add(issue_number)
+            operator_claimed = operator_claimed_issues(state)
+            ready_issue_numbers = {int(issue["number"]) for issue in issues}
+            operator_claimed_ready = sorted(operator_claimed & ready_issue_numbers)
             issues_with_open_tracked_prs = set(pr_by_issue.keys())
             candidates = [
                 issue
                 for issue in issues
-                if self._is_dispatchable(issue)
+                if self._is_dispatchable(issue, operator_claimed)
                 and int(issue["number"]) not in live_dispatched
                 and int(issue["number"]) not in stalled_issues
                 and int(issue["number"]) not in issues_with_open_tracked_prs
                 and int(issue["number"]) not in merged_pr_issue_numbers
             ]
+            if operator_claimed_ready:
+                state = append_event(
+                    state,
+                    "dispatch_skip_operator_claimed",
+                    {"issue_numbers": operator_claimed_ready},
+                )
+                save_state(self.paths.state_file, state)
 
         # Apply dependency gate: skip issues with open blockers
         # Done outside the lock to avoid holding it during GitHub API calls
@@ -2877,6 +2986,11 @@ class OrchestratorApp:
             for result in dispatch_results
             if not result.ok and result.issue_number not in live_worker_issue_numbers
         }
+        foreign_writer_issue_numbers = {
+            result.issue_number
+            for result in dispatch_results
+            if not result.ok and result.failure_kind == "worktree_foreign_writer"
+        }
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         manual = self.config.devin.adapter == "manual"
         label_errors: list[int] = []
@@ -2969,6 +3083,26 @@ class OrchestratorApp:
                             },
                         )
                         save_state(self.paths.state_file, state)
+
+            for issue_number in foreign_writer_issue_numbers:
+                result = next(
+                    (r for r in dispatch_results if r.issue_number == issue_number), None
+                )
+                branch_name = next(
+                    (r.branch_name for r in session_requests if r.issue_number == issue_number),
+                    None,
+                )
+                state = append_event(
+                    state,
+                    "worktree_foreign_writer",
+                    {
+                        "issue_number": issue_number,
+                        "branch_name": branch_name,
+                        "pid": result.pid if result else None,
+                        "probe_result": result.error if result else None,
+                    },
+                )
+                save_state(self.paths.state_file, state)
             state = append_event(
                 state,
                 "dispatch",
@@ -2976,6 +3110,7 @@ class OrchestratorApp:
                     "issue_numbers": sorted(successful_issue_numbers),
                     "live_worker_issue_numbers": sorted(live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
+                    "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
                     "deferred_by_concurrency": deferred_by_concurrency,
@@ -3002,6 +3137,7 @@ class OrchestratorApp:
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
             "live_worker_count": len(live_worker_issue_numbers),
+            "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
@@ -3017,6 +3153,7 @@ class OrchestratorApp:
                 {"issue": issue_number, "blockers": blockers}
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
+            "operator_claimed_ready": sorted(operator_claimed_ready),
         }
         if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
@@ -5838,15 +5975,22 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
 
+        operator_claimed = operator_claimed_issues(state)
+        operator_claimed_skipped: list[int] = []
+
         # Find issues with rework_requested status
         rework_issues = []
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
                 continue
             if entry.get("status") == "rework_requested":
+                issue_number = int(number)
+                # Issue #400: operator-claimed issues are not rework-dispatchable.
+                if issue_number in operator_claimed:
+                    operator_claimed_skipped.append(issue_number)
+                    continue
                 # Fetch the full issue from GitHub to get labels and other metadata
                 try:
-                    issue_number = int(number)
                     full_issue = self.gh.issue_view(issue_number)
                     rework_issues.append(full_issue)
                 except GitHubError:
@@ -6006,6 +6150,7 @@ class OrchestratorApp:
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
+                "operator_claimed_skipped": sorted(operator_claimed_skipped),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -6127,6 +6272,7 @@ class OrchestratorApp:
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
                         "deferred_by_concurrency": deferred_by_concurrency,
                         "label_errors": [],
+                        "operator_claimed_skipped": sorted(operator_claimed_skipped),
                     },
                 )
                 save_state(self.paths.state_file, state)
@@ -6137,6 +6283,7 @@ class OrchestratorApp:
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
+                "operator_claimed_skipped": sorted(operator_claimed_skipped),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -6280,6 +6427,7 @@ class OrchestratorApp:
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "label_errors": sorted(label_errors),
+                    "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 },
             )
             save_state(self.paths.state_file, state)
@@ -6303,6 +6451,7 @@ class OrchestratorApp:
             "routed_to_review": sorted(routed_to_review),
             "skipped_head_indeterminate": sorted(head_indeterminate),
             "review_blocked_retry": sorted(review_blocked_retry),
+            "operator_claimed_skipped": sorted(operator_claimed_skipped),
         }
         if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())
@@ -6457,13 +6606,22 @@ class OrchestratorApp:
         mention_only -= bound
         return bound, mention_only
 
-    def _is_dispatchable(self, issue: dict[str, Any]) -> bool:
+    def _is_dispatchable(
+        self,
+        issue: dict[str, Any],
+        operator_claimed: set[int] | None = None,
+    ) -> bool:
         names = label_names(issue)
         if self.config.labels.ready not in names:
             return False
         if names & self.config.labels.terminal:
             return False
-        return not names & self.config.labels.active
+        if names & self.config.labels.active:
+            return False
+        if operator_claimed is None:
+            state = load_state_locked(self.paths.state_file)
+            operator_claimed = operator_claimed_issues(state)
+        return int(issue["number"]) not in operator_claimed
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
