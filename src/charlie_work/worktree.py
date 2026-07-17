@@ -26,11 +26,19 @@ from typing import Any
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
 from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
 from .subprocess_runner import run_captured
+from . import state as _state
 
 _DEFAULT_TIMEOUT_SECONDS = 60
+
+# Sentinel values for operator claim markers. The operator marker intentionally
+# does not encode the CLI invocation's transient PID; liveness is derived from
+# the ``operator_claimed_at`` field in state.json.
+OPERATOR_MARKER_SESSION_ID = "operator-claim"
+OPERATOR_MARKER_KIND = "operator"
 
 
 class WorktreeUnsafeError(RuntimeError):
@@ -179,18 +187,22 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
-def write_worktree_marker(worktree_path: Path, pid: int, session_id: str) -> None:
+def write_worktree_marker(
+    worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
+) -> None:
     """Write a ``.charlie-writer.json`` marker into the worktree root.
 
     Records the process id and a session identifier so the orchestrator can
     detect a live foreign writer before dispatching a second one into the
-    same worktree.
+    same worktree. ``kind`` distinguishes long-lived operator claim markers
+    (``pid`` is a sentinel) from ordinary worker session markers.
     """
     marker_path = worktree_path / WRITER_MARKER_FILENAME
     marker = {
         "pid": pid,
         "session_id": session_id,
         "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "kind": kind,
     }
     _write_json_atomic(marker_path, marker)
 
@@ -251,19 +263,65 @@ def _own_live_session_pids(sessions_dir: Path) -> dict[str, int]:
     return live
 
 
-def _check_worktree_writer_marker(worktree_path: Path, sessions_dir: Path) -> None:
+def _operator_marker_is_live(
+    marker: dict[str, Any], state_file: Path | None, issue_number: int | None
+) -> bool:
+    """Return True when an operator marker corresponds to a live operator claim.
+
+    Operator markers intentionally do not encode a real process id (the CLI
+    that wrote them exits immediately). Liveness is derived from
+    ``operator_claimed_at`` in state.json for the matching issue.
+    """
+    if state_file is None or issue_number is None:
+        return False
+    try:
+        data = _state.load_state(state_file)
+        entry = data.get("issues", {}).get(str(issue_number))
+        return _state.is_operator_claimed(entry)
+    except (OSError, ValueError, TypeError):
+        # Treat unreadable or malformed state as "no live claim" so a stale
+        # marker does not permanently block dispatch.
+        return False
+
+
+def _check_worktree_writer_marker(
+    worktree_path: Path,
+    sessions_dir: Path,
+    issue_number: int | None = None,
+    state_file: Path | None = None,
+) -> None:
     """Refuse to enter a worktree that is currently occupied by a foreign writer.
 
     A marker with a dead pid is cleaned and the worktree is usable. A marker
     whose session id matches a live recorded session is considered an owned
     worker and is ignored here (dispatch/rework state guards prevent double
     dispatch). Any other live marker is treated as a foreign writer.
+
+    Operator claim markers (``kind == "operator"`` or legacy ``operator-*``
+    session ids) are live while state.json says the issue is operator-claimed,
+    independent of PID.
     """
     marker = read_worktree_marker(worktree_path)
     if marker is None:
         return
+
     pid = marker.get("pid")
     session_id = marker.get("session_id")
+    kind = marker.get("kind")
+
+    if kind == OPERATOR_MARKER_KIND or (
+        isinstance(session_id, str) and session_id.startswith("operator-")
+    ):
+        if _operator_marker_is_live(marker, state_file, issue_number):
+            raise WorktreeForeignWriterError(
+                worktree_path=worktree_path, pid=pid, session_id=session_id
+            )
+        # Claim released or state unavailable: clean the marker and proceed.
+        remove_worktree_marker(
+            worktree_path, session_id=session_id if isinstance(session_id, str) else None
+        )
+        return
+
     if not isinstance(pid, int) or pid <= 0 or not is_pid_alive(pid, None):
         # Marker is stale — clean it and proceed.
         remove_worktree_marker(worktree_path)
@@ -971,9 +1029,10 @@ def create_worktree(
 
     ``sessions_dir``, when given, enables the foreign-writer marker guard
     (issue #400): the worktree is checked for a ``.charlie-writer.json``
-    marker with a live pid that does not belong to a recorded session. Pass
-    ``None`` to skip the guard (e.g. unit tests that focus on worktree git
-    mechanics).
+    marker. Worker markers with a live pid that does not belong to a recorded
+    session are refused; operator markers are live while state.json reports an
+    active ``operator_claimed_at`` for ``issue_number``. Pass ``None`` to skip
+    the guard (e.g. unit tests that focus on worktree git mechanics).
     """
     # Resolve base_ref: empty string means auto-resolve to origin/<default>
     resolved_base_ref = base_ref
@@ -1007,8 +1066,13 @@ def create_worktree(
     # Issue #400: refuse to enter a worktree that is currently occupied by a
     # live foreign writer. The marker check is independent of the recovery
     # liveness probe so an operator's claim is honored before any git reset.
+    state_file: Path | None = None
+    if config is not None:
+        state_file = runtime_paths(repo_root, config.runtime.state_dir).state_file
     if sessions_dir is not None:
-        _check_worktree_writer_marker(worktree_path, sessions_dir)
+        _check_worktree_writer_marker(
+            worktree_path, sessions_dir, issue_number=issue_number, state_file=state_file
+        )
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None

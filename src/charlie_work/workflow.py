@@ -53,6 +53,8 @@ from .paths import RuntimePaths
 from .prompts import render_prompt
 from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
 from .worktree import (
+    OPERATOR_MARKER_KIND,
+    OPERATOR_MARKER_SESSION_ID,
     inspect_worktree_state,
     push_branch,
     remove_review_checkout,
@@ -2253,17 +2255,25 @@ class OrchestratorApp:
 
         marker_written = False
         if not release and worktree_path.is_dir():
-            marker_session_id = f"operator-{os.getpid()}"
+            # Operator markers intentionally do not encode the CLI's transient
+            # PID; liveness is keyed off operator_claimed_at in state.json.
             try:
-                write_worktree_marker(worktree_path, os.getpid(), marker_session_id)
+                write_worktree_marker(
+                    worktree_path,
+                    0,
+                    OPERATOR_MARKER_SESSION_ID,
+                    kind=OPERATOR_MARKER_KIND,
+                )
                 marker_written = True
             except OSError:
                 # Marker write failure is not fatal, but record it in the result.
                 pass
         elif release:
-            # Best-effort marker removal; state release is what matters.
+            # Best-effort marker removal; state release is what matters. Only
+            # remove a marker that belongs to this operator claim, never a
+            # worker marker from an active session.
             try:
-                remove_worktree_marker(worktree_path)
+                remove_worktree_marker(worktree_path, session_id=OPERATOR_MARKER_SESSION_ID)
             except OSError:
                 pass
 
