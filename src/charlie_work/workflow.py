@@ -30,6 +30,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubRunResult,
     GraphQLBudgetError,
     cancel_superseded_runs,
     detect_prose_only_dependencies,
@@ -44,6 +45,7 @@ from .janitor import (
     _calculate_patch_id,
     check_operator_containment,
     check_test_adequacy,
+    detect_cross_pr_revert,
     run_janitor,
     TestAdequacyFacts,
     TestAdequacyVerdict,
@@ -3264,6 +3266,78 @@ class OrchestratorApp:
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            # Flake-aware debounce (issue #391): if the only blocker is a failed
+            # required check and we have not yet retried the Actions run for this
+            # head, trigger one automatic `gh run rerun --failed` and defer rework
+            # routing until the next poll. Any rerun-API error is surfaced as an
+            # event and we fall through to the existing rework/janitor-block path.
+            if verdict.rerun_run_ids:
+                rerun_errors: list[str] = []
+                triggered_run_ids: list[int] = []
+                for run_id in verdict.rerun_run_ids:
+                    result = self.gh.run(
+                        ["run", "rerun", str(run_id), "--failed"], allow_failure=True
+                    )
+                    if isinstance(result, GitHubRunResult):
+                        if result.ok:
+                            triggered_run_ids.append(run_id)
+                        else:
+                            rerun_errors.append(
+                                result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                            )
+                    elif isinstance(result, str):
+                        # Dry-run returns a descriptive string; treat as success.
+                        triggered_run_ids.append(run_id)
+                    else:
+                        rerun_errors.append(
+                            f"unexpected result from gh run rerun {run_id}: {result!r}"
+                        )
+
+                if triggered_run_ids and not rerun_errors:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "check_rerun_attempts": verdict.check_rerun_attempts,
+                        }
+                        state = append_event(
+                            state,
+                            "flake_rerun_triggered",
+                            {
+                                "pr_number": pr_number,
+                                "run_ids": triggered_run_ids,
+                                "head_sha": pr.get("headRefOid"),
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"flake rerun triggered for PR #{pr_number}: run(s) "
+                        + ", ".join(str(rid) for rid in triggered_run_ids),
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "rerun_run_ids": triggered_run_ids,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
+                # Rerun API error: record it, but do not consume the attempt.
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "flake_rerun_failed",
+                        {
+                            "pr_number": pr_number,
+                            "run_ids": list(verdict.rerun_run_ids),
+                            "errors": rerun_errors,
+                        },
+                    )
+                    save_state(self.paths.state_file, state)
+
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
@@ -3278,6 +3352,7 @@ class OrchestratorApp:
                     "status": "janitor_blocked",
                     "janitor_ok": False,
                     "janitor_failures": list(verdict.failures),
+                    "check_rerun_attempts": verdict.check_rerun_attempts,
                 }
                 state = append_event(
                     state,
@@ -3398,6 +3473,7 @@ class OrchestratorApp:
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
                 "consecutive_failed_merge_attempts": 0,
+                "check_rerun_attempts": verdict.check_rerun_attempts,
             }
             if issue_number is not None:
                 _issue_key = str(issue_number)
@@ -3472,15 +3548,23 @@ class OrchestratorApp:
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
-        This is a read-only command: it inspects existing ``review-prompt.md``
-        packets and ``review-decision.json`` verdicts without writing state or
-        PR-directory files.  A PR is queued when:
+        When a recorded verdict (``approved``, ``request_changes``, or
+        ``blocked``) was made against an older head, this method computes the
+        live head's stable patch-id. If it matches the recorded
+        ``reviewed_patch_id``, the verdict is carried forward to the new head
+        (atomic decision-file + state update) and the PR is not queued as
+        stale. In dry-run mode the carry-forward write is skipped; the patch-id
+        check still runs so the queue reflects real content changes.
+
+        A PR is queued when:
 
         - It has a linked issue (same as ``review()``).
-        - ``prs/pr-N/review-prompt.md`` exists and the stored packet head OID
-          matches the PR's live ``headRefOid``.
-        - The recorded decision is ``missing``/``pending`` or a stale
-          ``request_changes``/``blocked``/``approved`` verdict from a prior head.
+        - ``prs/pr-N/review-prompt.md`` exists.
+        - The recorded decision is ``missing``/``pending`` and the stored packet
+          head OID matches the PR's live ``headRefOid``.
+        - The recorded decision is a stale ``request_changes``/``blocked``/
+          ``approved`` verdict whose patch-id genuinely differs from the live
+          head and the packet head is still current.
 
         Returns:
             CommandResult with a sorted ``queue`` list keyed by repo.
@@ -3505,32 +3589,45 @@ class OrchestratorApp:
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
             live_head_sha = pr.get("headRefOid")
-            if (
-                packet_head_sha is None
-                or live_head_sha is None
-                or packet_head_sha != live_head_sha
-            ):
+            if live_head_sha is None:
                 continue
 
             decision = self._review_decision(pr_number)
             decision_value = decision.get("decision")
             reviewed_head_sha = decision.get("reviewed_head_sha")
 
-            if decision_value == "approved":
+            if decision_value in ("approved", "request_changes", "blocked"):
                 if reviewed_head_sha == live_head_sha:
                     continue
-                queue.append(
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "packet_head_sha": packet_head_sha,
-                        "decision": "stale",
-                        "reviewed_head_sha": reviewed_head_sha,
-                    }
+
+                reviewed_patch_id = decision.get("reviewed_patch_id") or ""
+                live_diff = self.gh.pr_diff(pr_number) or ""
+                live_patch_id = _calculate_patch_id(live_diff)
+
+                patch_ids_match = (
+                    reviewed_patch_id and live_patch_id and live_patch_id == reviewed_patch_id
                 )
-            elif decision_value in ("request_changes", "blocked"):
-                if reviewed_head_sha is not None and reviewed_head_sha == live_head_sha:
+                if patch_ids_match:
+                    # In dry-run mode we still run the content check so the queue
+                    # reflects real changes, but we skip the durable head update.
+                    if not self.dry_run:
+                        try:
+                            self._update_approval_head(
+                                pr_number, decision, live_head_sha, old_head=reviewed_head_sha
+                            )
+                        except StateLockBusy:
+                            # Could not mirror the carry-forward into state.json,
+                            # but the decision-file update is the durable source
+                            # of truth; proceed as carried-forward.
+                            pass
                     continue
+
+                # If the packet is stale, we cannot dispatch a new reviewer from
+                # it; the merge gate will route the issue to re-review. Only
+                # surface as stale when the packet head is still current.
+                if packet_head_sha is None or packet_head_sha != live_head_sha:
+                    continue
+
                 queue.append(
                     {
                         "pr": pr_number,
@@ -3541,6 +3638,9 @@ class OrchestratorApp:
                     }
                 )
             elif decision_value in ("pending", "missing", "invalid"):
+                if packet_head_sha is None or packet_head_sha != live_head_sha:
+                    continue
+
                 queue.append(
                     {
                         "pr": pr_number,
@@ -3895,6 +3995,7 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_patch_id": reviewed_patch_id,
+            "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
         decision_path = pr_dir / "review-decision.json"
@@ -3935,6 +4036,7 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "reviewed_head_sha": reviewed_head_sha,
                 "reviewed_patch_id": reviewed_patch_id,
+                "carried_forward_from": [],
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
                 "consecutive_failed_merge_attempts": 0,
@@ -4108,6 +4210,9 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         merge_conflict_routed = False
+        cross_pr_revert_detected = False
+        cross_pr_revert_routed = False
+        cross_pr_revert_reason: str | None = None
         issue_status: str | None = None
         label_error: dict[str, Any] | None = None
         rework_label_error: dict[str, Any] | None = None
@@ -4124,7 +4229,9 @@ class OrchestratorApp:
                         live_patch_id = _calculate_patch_id(live_diff)
                         if live_patch_id == reviewed_patch_id:
                             old_reviewed_head_sha = reviewed_head_sha
-                            self._update_approval_head(pr_number, decision, live_head_sha)
+                            self._update_approval_head(
+                                pr_number, decision, live_head_sha, old_head=old_reviewed_head_sha
+                            )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
                             reviewed_head_sha = decision.get("reviewed_head_sha")
@@ -4138,6 +4245,10 @@ class OrchestratorApp:
                                     "status": "approved",
                                     "head_moved": False,
                                     "reviewed_head_sha": reviewed_head_sha,
+                                    "reviewed_patch_id": reviewed_patch_id,
+                                    "carried_forward_from": decision.get(
+                                        "carried_forward_from", []
+                                    ),
                                     "live_head_sha": live_head_sha,
                                     "consecutive_failed_merge_attempts": 0,
                                     "consecutive_stale_base_deferrals": 0,
@@ -4151,6 +4262,9 @@ class OrchestratorApp:
                                         "old_reviewed_head_sha": old_reviewed_head_sha,
                                         "new_head_sha": live_head_sha,
                                         "patch_id": reviewed_patch_id,
+                                        "carried_forward_from": decision.get(
+                                            "carried_forward_from", []
+                                        ),
                                     },
                                 )
                                 save_state(self.paths.state_file, state)
@@ -4313,7 +4427,9 @@ class OrchestratorApp:
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
-                            self._update_approval_head(pr_number, decision, new_head)
+                            self._update_approval_head(
+                                pr_number, decision, new_head, old_head=live_head_sha
+                            )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
                         elif new_head == live_head_sha:
@@ -4345,6 +4461,32 @@ class OrchestratorApp:
                         head_sha,
                         reason,
                     )
+
+            # Cross-PR revert gate: a branch that merges a base commit and then
+            # reverts it has a clean PR diff but would silently undo the base
+            # change when squash-merged. Detect by enumerating branch commits not
+            # on base and matching `Revert "..."` subjects against base commits.
+            if not sync_failed:
+                cross_pr_revert_reason = detect_cross_pr_revert(pr, self.repo_root)
+                if cross_pr_revert_reason:
+                    cross_pr_revert_detected = True
+                    sync_failed = True
+                    if issue_number is not None:
+                        state = load_state_locked(self.paths.state_file)
+                        issue_state = state["issues"].get(str(issue_number), {})
+                        issue_status = issue_state.get("status")
+                        if issue_status not in (
+                            "escalated",
+                            "blocked",
+                            "dispatched",
+                            "dispatch_pending",
+                            "manifest_written",
+                        ):
+                            if issue_status != "rework_requested":
+                                cross_pr_revert_routed = True
+                                rework_label_error = self._request_cross_pr_revert_rework(
+                                    pr, issue_number, decision, cross_pr_revert_reason
+                                )
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -4492,6 +4634,26 @@ class OrchestratorApp:
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
                             f"merge conflict — {conflict_detail}"
                         )
+                    elif cross_pr_revert_detected:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        if issue_number is None:
+                            revert_detail = "no linked issue, cannot route to rework"
+                        elif cross_pr_revert_routed:
+                            if rework_label_error:
+                                outcome = rework_label_error.get("outcome", rework_label_error)
+                                revert_detail = (
+                                    f"rework dispatch attempted (label update failed: {outcome})"
+                                )
+                            else:
+                                revert_detail = "rework dispatched"
+                        elif issue_status == "rework_requested":
+                            revert_detail = "rework already requested"
+                        else:
+                            revert_detail = "rework not routed"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            f"cross-PR revert — {revert_detail}"
+                        )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
                             pr_number, new_attempts, summary
@@ -4560,9 +4722,14 @@ class OrchestratorApp:
             "merge_attempt_alarm": merge_attempt_alarm,
             "merge_attempt_warning": merge_attempt_warning,
             "merge_conflict": merge_conflict,
+            "cross_pr_revert_detected": cross_pr_revert_detected,
+            "cross_pr_revert_reason": cross_pr_revert_reason,
+            "cross_pr_revert_routed": cross_pr_revert_routed,
         }
         message = "merge readiness evaluated"
-        if checks_unavailable:
+        if cross_pr_revert_detected:
+            message = f"cross-PR revert detected: {cross_pr_revert_reason}"
+        elif checks_unavailable:
             message = "checks unavailable (gh failure)"
         elif merge_output and label_error:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
@@ -4883,7 +5050,7 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(pr_number, decision, new_head)
+            self._update_approval_head(pr_number, decision, new_head, old_head=old_head)
             return [
                 {
                     "pr_number": pr_number,
@@ -5160,26 +5327,23 @@ class OrchestratorApp:
             or str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
         )
 
-    def _request_merge_conflict_rework(
+    def _route_to_rework(
         self,
         pr: dict[str, Any],
         issue_number: int,
         decision: dict[str, Any],
+        summary: str,
+        event_kind: str,
     ) -> dict[str, Any] | None:
-        """Route an approved PR with a genuine merge conflict to rework.
+        """Route an approved PR to rework with a custom summary and event kind.
 
         Writes a rework prompt, transitions the linked issue to
         ``rework_requested`` (same label set as a non-escalated request_changes),
-        and appends a distinct ``merge_conflict_rework_requested`` state event.
-        The PR's ``review-decision.json`` is intentionally left untouched so the
-        approved verdict is re-confirmed after the worker push moves the head.
+        and appends the requested state event. The PR's ``review-decision.json``
+        is intentionally left untouched so the approved verdict is re-confirmed
+        after the worker push moves the head.
         """
         pr_number = int(pr["number"])
-        summary = (
-            "The PR branch has a merge conflict with the base branch after a base update. "
-            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
-            "The code changes are already approved; do not re-litigate the review."
-        )
         self._write_rework_prompt(pr, issue_number, summary)
 
         with state_lock(self.paths.state_file):
@@ -5201,7 +5365,7 @@ class OrchestratorApp:
             }
             state = append_event(
                 state,
-                "merge_conflict_rework_requested",
+                event_kind,
                 {
                     "pr_number": pr_number,
                     "issue_number": issue_number,
@@ -5221,6 +5385,39 @@ class OrchestratorApp:
             "add_failures": result.add_failures,
             "remove_failures": result.remove_failures,
         }
+
+    def _request_merge_conflict_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR with a genuine merge conflict to rework."""
+        summary = (
+            "The PR branch has a merge conflict with the base branch after a base update. "
+            "Merge the base branch into the PR branch, resolve the conflicts, and push. "
+            "The code changes are already approved; do not re-litigate the review."
+        )
+        return self._route_to_rework(
+            pr, issue_number, decision, summary, "merge_conflict_rework_requested"
+        )
+
+    def _request_cross_pr_revert_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Route an approved PR whose branch silently reverts a base commit to rework."""
+        summary = (
+            f"{reason}. Remove the revert commit (or the merge+revert pair) from the PR "
+            "history, or add an explicit 'allow-revert: <reason>' line to the PR body if the "
+            "revert is intentional. Then push the corrected branch and re-request review."
+        )
+        return self._route_to_rework(
+            pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"
+        )
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
         """Return the PR number of the head of the merge-train queue, or None.
@@ -5273,15 +5470,21 @@ class OrchestratorApp:
         pr_number: int,
         decision: dict[str, Any],
         new_head: str,
+        old_head: str | None = None,
     ) -> None:
         """Persist an updated review head for a PR whose branch was synced.
 
-        Keeps the approval valid when the branch was base-updated without
-        content changes. Updates both review-decision.json and state.json.
+        Keeps the verdict valid when the branch was base-updated or rebased
+        without content changes. Updates both review-decision.json and
+        state.json, appending the old head to ``carried_forward_from`` for audit.
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         updated_decision = dict(decision)
         updated_decision["reviewed_head_sha"] = new_head
+        carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
+        if old_head is not None and old_head != new_head and old_head not in carried_forward:
+            carried_forward.append(old_head)
+        updated_decision["carried_forward_from"] = carried_forward
         self._write_json(decision_path, updated_decision)
 
         with state_lock(self.paths.state_file):
@@ -5296,6 +5499,7 @@ class OrchestratorApp:
                 "reviewed_patch_id": pr_state.get("reviewed_patch_id")
                 or decision.get("reviewed_patch_id")
                 or "",
+                "carried_forward_from": carried_forward,
             }
             save_state(self.paths.state_file, state)
 

@@ -22,17 +22,16 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
-import hashlib
 import re
 import subprocess
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from charlie_work.checks import CheckSummary, summarize_checks
+from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
-from charlie_work.subprocess_runner import no_console_window_kwargs
+from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -139,60 +138,43 @@ class JanitorVerdict:
     warnings: tuple[str, ...]
     failed_required_checks: tuple[str, ...] = ()
     is_check_failure_block: bool = False
+    rerun_run_ids: tuple[int, ...] = ()
+    check_rerun_attempts: dict[str, Any] = field(default_factory=dict)
 
 
 def _calculate_patch_id(diff: str) -> str:
     """Calculate a stable patch-id from a diff.
 
-    This function computes a SHA256 hash of the normalized diff content,
-    which serves as a stable identifier for the actual changes regardless
-    of base SHA changes (e.g., from base-update merges).
-
-    The normalization strips metadata that varies between runs (hashes,
-    timestamps, line offsets) while preserving the actual code changes.
-    Specifically, it mirrors what ``git patch-id`` does: hunk headers
-    (lines starting with ``@@``) are dropped so that base-update merges
-    that shift line numbers in a PR's files do not change the patch-id
-    even when the content lines are identical.
+    Feeds the unified diff to ``git patch-id --stable`` and returns the
+    resulting SHA-1. This is the canonical plumbing for content-identical
+    detection: it ignores metadata (index hashes, file modes) and hunk
+    line-number offsets that change on base-update merges but do not affect
+    the actual content.
 
     Args:
         diff: The unified diff string (e.g., from `git diff` or `gh pr diff`)
 
     Returns:
-        A SHA256 hash of the normalized diff content, or empty string for empty/whitespace-only diffs
+        A stable patch-id string, or empty string when the diff contains no
+        real hunks, is empty/whitespace-only, or when ``git patch-id`` fails.
     """
-    if not diff or not diff.strip():
+    if not diff or not diff.strip() or "@@" not in diff:
         return ""
 
-    # Normalize the diff by stripping metadata lines that vary
-    lines = diff.splitlines()
-    normalized = []
-    for line in lines:
-        # Skip header lines that vary between runs
-        if (
-            line.startswith("diff --git")
-            or line.startswith("index ")
-            or line.startswith("--- ")
-            or line.startswith("+++ ")
-        ):
-            continue
-        # Skip hunk headers (e.g. "@@ -10,5 +10,6 @@"): line-offset numbers change
-        # on base-update merges even when content is identical. git patch-id ignores
-        # these for the same reason.
-        if line.startswith("@@"):
-            continue
-        # Skip diff metadata lines
-        if line.startswith("\\"):
-            continue
-        normalized.append(line)
-
-    # If after normalization we have no content, return empty string
-    if not normalized or not any(line.strip() for line in normalized):
+    result = run_captured(
+        ["git", "patch-id", "--stable"],
+        cwd=Path.cwd(),
+        timeout_seconds=30,
+        stdin=diff,
+    )
+    if not result.ok:
         return ""
 
-    # Calculate SHA256 of the normalized diff
-    content = "\n".join(normalized)
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line.split()[0]
+    return ""
 
 
 @dataclass(frozen=True)
@@ -263,6 +245,25 @@ def run_janitor(
         _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
     is_check_failure_block = bool(failed_required_checks) and not failures
+
+    # Flake-aware debounce (issue #391): if the only blocker is failed required
+    # checks, decide which runs get a one-time auto-rerun vs which are already
+    # retried and therefore definitive. The actual gh run rerun call lives in
+    # workflow.review; run_janitor stays pure and just returns the classification.
+    rerun_run_ids: tuple[int, ...] = ()
+    check_rerun_attempts: dict[str, Any] = {}
+    if summary is not None:
+        head_sha = str(pr.get("headRefOid") or "") or None
+        debounce = classify_check_failures(
+            checks,
+            required,
+            pr_state,
+            head_sha,
+            record_attempts=is_check_failure_block,
+        )
+        rerun_run_ids = debounce.rerun_run_ids
+        check_rerun_attempts = debounce.check_rerun_attempts
+
     if failed_required_checks:
         failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
 
@@ -272,6 +273,8 @@ def run_janitor(
         warnings=tuple(warnings),
         failed_required_checks=failed_required_checks,
         is_check_failure_block=is_check_failure_block,
+        rerun_run_ids=rerun_run_ids,
+        check_rerun_attempts=check_rerun_attempts,
     )
 
 
@@ -676,6 +679,134 @@ def _get_unpushed_commit_info(
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         # Git failed or worktree not found; skip enrichment
         return None
+
+
+def detect_cross_pr_revert(
+    pr: dict[str, Any],
+    repo_root: Path | None,
+    allow_marker: str = "allow-revert",
+) -> str | None:
+    """Return a blocking reason if the PR branch would silently revert a base commit.
+
+    Enumerates non-merge commits on the PR branch that are not reachable from
+    the base. A commit whose subject is ``Revert "<original>"`` and whose
+    inner ``<original>`` subject matches a commit reachable from the base
+    indicates that squashing the branch would undo a change already on the base
+    (the cross-PR revert incident, issue #390). An explicit ``allow-revert:``
+    marker line in the PR body suppresses the block so legitimate intentional
+    reverts can be merged.
+
+    Returns ``None`` when no revert is detected, an ``allow-revert:`` marker
+    line is present, or the local git history required to decide is unavailable.
+    """
+    if not repo_root:
+        return None
+
+    repo_root_path = Path(repo_root)
+    if not repo_root_path.is_dir() or not (repo_root_path / ".git").exists():
+        return None
+
+    body = str(pr.get("body") or "")
+    # Require a structural marker line: "allow-revert:" followed by a reason.
+    # A bare word/substring (e.g. quoting this guidance) must not bypass the gate.
+    marker_re = re.compile(
+        rf"^{re.escape(allow_marker)}:\s*\S",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if marker_re.search(body):
+        return None
+
+    head_ref = pr.get("headRefName")
+    base_ref = pr.get("baseRefName")
+    if not head_ref or not base_ref:
+        return None
+
+    try:
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", str(head_ref), str(base_ref)],
+            cwd=repo_root_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            **no_console_window_kwargs(),
+        )
+        if fetch.returncode != 0:
+            return None
+
+        commits = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--no-merges",
+                f"origin/{head_ref}",
+                f"^origin/{base_ref}",
+            ],
+            cwd=repo_root_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            **no_console_window_kwargs(),
+        )
+        if commits.returncode != 0:
+            return None
+
+        for sha in commits.stdout.strip().splitlines():
+            if not sha:
+                continue
+            subject_proc = subprocess.run(
+                ["git", "log", "-1", "--format=%s", sha],
+                cwd=repo_root_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                **no_console_window_kwargs(),
+            )
+            if subject_proc.returncode != 0:
+                continue
+            subject = subject_proc.stdout.strip()
+            if subject.startswith('Revert "') and subject.endswith('"'):
+                original = subject[len('Revert "') : -1]
+                match_proc = subprocess.run(
+                    [
+                        "git",
+                        "log",
+                        f"origin/{base_ref}",
+                        "--format=%H",
+                        "--fixed-strings",
+                        "--grep",
+                        original,
+                    ],
+                    cwd=repo_root_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    **no_console_window_kwargs(),
+                )
+                if match_proc.returncode != 0:
+                    continue
+                for base_sha in match_proc.stdout.strip().splitlines():
+                    if not base_sha:
+                        continue
+                    base_subject_proc = subprocess.run(
+                        ["git", "log", "-1", "--format=%s", base_sha],
+                        cwd=repo_root_path,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        **no_console_window_kwargs(),
+                    )
+                    if base_subject_proc.returncode != 0:
+                        continue
+                    if base_subject_proc.stdout.strip() == original:
+                        return (
+                            f"PR branch contains revert commit {sha[:12]} ({subject}) which "
+                            f"would silently undo base commit {base_sha[:12]}; add an explicit "
+                            f"'{allow_marker}: <reason>' line to the PR body to proceed"
+                        )
+    except (OSError, ValueError):
+        return None
+
+    return None
 
 
 def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:

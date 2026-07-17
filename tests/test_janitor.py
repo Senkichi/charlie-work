@@ -4,6 +4,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from charlie_work.config import (
     AutoMergeConfig,
     OrchestratorConfig,
@@ -85,7 +87,9 @@ def _green_checks() -> list[dict]:
 def test_fully_green_pr_yields_ok_with_empty_tuples() -> None:
     verdict = run_janitor(_green_pr(), _green_checks(), _config(), repo_root=Path.cwd())
 
-    assert verdict == JanitorVerdict(ok=True, failures=(), warnings=())
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
 
 
 def test_draft_pr_fails() -> None:
@@ -198,6 +202,33 @@ def test_no_required_checks_configured_skips_check_gate() -> None:
     verdict = run_janitor(_green_pr(), [], _config(required_checks=()))
 
     assert verdict.ok is True
+
+
+def test_required_check_first_failure_returns_rerun_run_id() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE", "runId": 100},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.is_check_failure_block is True
+    assert verdict.rerun_run_ids == (100,)
+    assert verdict.check_rerun_attempts == {"abc123": {"Tests passed": [100]}}
+
+
+def test_required_check_second_failure_returns_no_rerun() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE", "runId": 100},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+    pr_state = {"check_rerun_attempts": {"abc123": {"Tests passed": [100]}}}
+    verdict = run_janitor(_green_pr(), checks, _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.is_check_failure_block is True
+    assert verdict.rerun_run_ids == ()
+    assert verdict.failed_required_checks == ("Tests passed",)
 
 
 def test_missing_linked_issue_fails_when_required() -> None:
@@ -423,7 +454,7 @@ index 1234567..abcdef0 100644
     patch_id1 = _calculate_patch_id(diff)
     patch_id2 = _calculate_patch_id(diff)
     assert patch_id1 == patch_id2
-    assert len(patch_id1) == 64  # SHA256 hex string
+    assert len(patch_id1) == 40  # SHA-1 hex string from git patch-id --stable
 
 
 def test_calculate_patch_id_different_for_different_diffs() -> None:
@@ -521,9 +552,37 @@ index aaaaaaa..bbbbbbb 100644
     id_shifted = _calculate_patch_id(diff_shifted)
     assert id_original == id_shifted, (
         f"Hunk-offset shift changed patch-id: {id_original!r} != {id_shifted!r}. "
-        "Did someone remove the @@ skip from _calculate_patch_id?"
+        "Did git patch-id --stable stop ignoring hunk headers?"
     )
-    assert len(id_original) == 64  # SHA256 hex
+    assert len(id_original) == 40  # SHA-1 hex string from git patch-id --stable
+
+
+def test_calculate_patch_id_returns_empty_for_diff_without_hunks() -> None:
+    """A diff with no hunk header is not a real patch and cannot be compared."""
+    assert _calculate_patch_id("diff --git a/file b/file\n") == ""
+
+
+def test_calculate_patch_id_returns_empty_when_git_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Git failures during patch-id computation must fail closed (empty string)."""
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+
+    def _fake_run_captured(*_args, **_kwargs):
+        from charlie_work.subprocess_runner import RunResult
+
+        return RunResult(returncode=1, stdout="", stderr="git failed", error="git failed")
+
+    monkeypatch.setattr(janitor_module, "run_captured", _fake_run_captured)
+    assert _calculate_patch_id(diff) == ""
 
 
 def test_no_op_rework_offset_shift_still_blocks(tmp_path: Path) -> None:
