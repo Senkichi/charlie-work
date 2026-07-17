@@ -19,7 +19,7 @@ from .claude_code import (
     is_worker_alive,
     read_worker_records,
 )
-from .config import OrchestratorConfig
+from .config import WRITER_MARKER_FILENAME, OrchestratorConfig
 from .devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
@@ -262,6 +262,7 @@ class WorkerView:
         None  # ISO timestamp when the stall kill is deferred (issue #247)
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
+    session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -288,6 +289,7 @@ class WorkerView:
                 log_bytes=self.log_bytes,
                 rate_limit_defer_until=self.rate_limit_defer_until,
                 inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
+                session_id=self.session_id,
             )
             return is_session_alive(record)
         elif self.adapter_kind == "claude-code":
@@ -309,6 +311,7 @@ class WorkerView:
                 log_bytes=self.log_bytes,
                 rate_limit_defer_until=self.rate_limit_defer_until,
                 inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
+                session_id=self.session_id,
             )
             return is_worker_alive(record)
         else:
@@ -326,13 +329,32 @@ class WorkerView:
         except OSError:
             return None
 
+    def _remove_writer_marker(self) -> None:
+        """Remove this worker's in-worktree writer marker when the sidecar is reaped.
+
+        Uses ``session_id`` to avoid wiping an unrelated operator-claim marker.
+        """
+        if not self.worktree_path or not self.session_id:
+            return
+        marker_path = Path(self.worktree_path) / WRITER_MARKER_FILENAME
+        try:
+            if not marker_path.exists():
+                return
+            with marker_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict) and data.get("session_id") == self.session_id:
+                marker_path.unlink()
+        except (OSError, json.JSONDecodeError):
+            pass
+
     def reap_sidecar(self, sessions_dir: Path) -> None:
         """Delete the sidecar file for this worker to prevent phantom sessions.
 
         Dispatches to the adapter-specific sidecar path function based on adapter_kind.
         Best-effort cleanup: OSError is swallowed to avoid failing the entire dead-session
         classification loop if a single unlink fails (the sidecar will be reaped on the
-        next cycle).
+        next cycle). Also removes the in-worktree writer marker when it matches this
+        worker's session id.
 
         This is called after a session is detected as dead and classified to prevent
         phantom sessions from PID recycling (issue #113).
@@ -350,6 +372,8 @@ class WorkerView:
         except OSError:
             # Best-effort cleanup - don't fail if unlink fails
             pass
+
+        self._remove_writer_marker()
 
     def runtime_seconds(self) -> float:
         """Calculate runtime in seconds from started_at to now.
@@ -678,6 +702,7 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
         log_bytes=record.log_bytes,
         rate_limit_defer_until=record.rate_limit_defer_until,
         inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
+        session_id=record.session_id,
     )
 
 
@@ -700,6 +725,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         log_bytes=record.log_bytes,
         rate_limit_defer_until=record.rate_limit_defer_until,
         inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
+        session_id=record.session_id,
     )
 
 

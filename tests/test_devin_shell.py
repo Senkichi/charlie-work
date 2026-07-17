@@ -87,6 +87,7 @@ def _install_fake_create_worktree(
         recovery=None,
         issue_number=None,
         config=None,
+        sessions_dir=None,
     ):
         if calls is not None:
             calls.append(
@@ -100,6 +101,7 @@ def _install_fake_create_worktree(
                     "recovery": recovery,
                     "issue_number": issue_number,
                     "config": config,
+                    "sessions_dir": sessions_dir,
                 }
             )
         if with_venv:

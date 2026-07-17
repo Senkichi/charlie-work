@@ -12,6 +12,7 @@ unlinked (never the target it points at) before the worktree is removed.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -23,13 +24,21 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
-from .config import OrchestratorConfig
+from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
 from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
 from .subprocess_runner import run_captured
+from . import state as _state
 
 _DEFAULT_TIMEOUT_SECONDS = 60
+
+# Sentinel values for operator claim markers. The operator marker intentionally
+# does not encode the CLI invocation's transient PID; liveness is derived from
+# the ``operator_claimed_at`` field in state.json.
+OPERATOR_MARKER_SESSION_ID = "operator-claim"
+OPERATOR_MARKER_KIND = "operator"
 
 
 class WorktreeUnsafeError(RuntimeError):
@@ -85,6 +94,30 @@ class LiveWorkerRedispatchError(RuntimeError):
         super().__init__(probe_result)
 
 
+class WorktreeForeignWriterError(RuntimeError):
+    """Raised when ``create_worktree`` is about to use a worktree that has a
+    live writer marker belonging to a session the orchestrator does not own
+    (e.g. an operator's editor or an out-of-band agent). The launch shim
+    surfaces this as ``failure_kind="worktree_foreign_writer"`` so the issue
+    stays queued and the dispatch event log records the conflict.
+    """
+
+    def __init__(
+        self,
+        *,
+        worktree_path: Path,
+        pid: int | None,
+        session_id: str | None,
+    ) -> None:
+        self.worktree_path = worktree_path
+        self.pid = pid
+        self.session_id = session_id
+        super().__init__(
+            f"worktree {worktree_path} has a live foreign writer "
+            f"(pid={pid}, session_id={session_id})"
+        )
+
+
 # Known porcelain flag keys that may appear as space-less lines (value=True)
 # These are the only keys that map to True in git worktree --porcelain output
 KNOWN_FLAG_KEYS = frozenset({"bare", "detached", "locked", "prunable"})
@@ -135,6 +168,169 @@ def _slugify(value: str, *, max_length: int = 80) -> str:
 
 def _default_worktrees_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "worktrees"
+
+
+def worktree_path_for_branch(
+    repo_root: Path, branch: str, worktrees_dir: Path | None = None
+) -> Path:
+    """Return the filesystem path for the worktree that serves ``branch``."""
+    target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
+    return target_dir / _slugify(branch)
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Write JSON atomically using a temp file + rename (issue #400)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp.replace(path)
+
+
+def write_worktree_marker(
+    worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
+) -> None:
+    """Write a ``.charlie-writer.json`` marker into the worktree root.
+
+    Records the process id and a session identifier so the orchestrator can
+    detect a live foreign writer before dispatching a second one into the
+    same worktree. ``kind`` distinguishes long-lived operator claim markers
+    (``pid`` is a sentinel) from ordinary worker session markers.
+    """
+    marker_path = worktree_path / WRITER_MARKER_FILENAME
+    marker = {
+        "pid": pid,
+        "session_id": session_id,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "kind": kind,
+    }
+    _write_json_atomic(marker_path, marker)
+
+
+def read_worktree_marker(worktree_path: Path) -> dict[str, Any] | None:
+    """Read the writer marker for ``worktree_path``, if any."""
+    marker_path = worktree_path / WRITER_MARKER_FILENAME
+    if not marker_path.exists():
+        return None
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def remove_worktree_marker(worktree_path: Path, session_id: str | None = None) -> bool:
+    """Remove the writer marker for ``worktree_path``.
+
+    If ``session_id`` is provided, only removes the marker when its
+    ``session_id`` matches, preventing an operator-claim marker from being
+    wiped by a worker reap.
+    """
+    marker_path = worktree_path / WRITER_MARKER_FILENAME
+    if not marker_path.exists():
+        return False
+    if session_id is not None:
+        marker = read_worktree_marker(worktree_path)
+        if marker is None or marker.get("session_id") != session_id:
+            return False
+    try:
+        marker_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _own_live_session_pids(sessions_dir: Path) -> dict[str, int]:
+    """Map live recorded session ids to their pids from sidecar files."""
+    live: dict[str, int] = {}
+    if not sessions_dir.is_dir():
+        return live
+    for path in sessions_dir.glob("*.json"):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        session_id = payload.get("session_id")
+        pid = payload.get("pid")
+        if not session_id or not isinstance(pid, int) or pid <= 0:
+            continue
+        if is_pid_alive(pid, payload.get("process_start_time")):
+            live[str(session_id)] = pid
+    return live
+
+
+def _operator_marker_is_live(
+    marker: dict[str, Any], state_file: Path | None, issue_number: int | None
+) -> bool:
+    """Return True when an operator marker corresponds to a live operator claim.
+
+    Operator markers intentionally do not encode a real process id (the CLI
+    that wrote them exits immediately). Liveness is derived from
+    ``operator_claimed_at`` in state.json for the matching issue.
+    """
+    if state_file is None or issue_number is None:
+        return False
+    try:
+        data = _state.load_state(state_file)
+        entry = data.get("issues", {}).get(str(issue_number))
+        return _state.is_operator_claimed(entry)
+    except (OSError, ValueError, TypeError):
+        # Treat unreadable or malformed state as "no live claim" so a stale
+        # marker does not permanently block dispatch.
+        return False
+
+
+def _check_worktree_writer_marker(
+    worktree_path: Path,
+    sessions_dir: Path,
+    issue_number: int | None = None,
+    state_file: Path | None = None,
+) -> None:
+    """Refuse to enter a worktree that is currently occupied by a foreign writer.
+
+    A marker with a dead pid is cleaned and the worktree is usable. A marker
+    whose session id matches a live recorded session is considered an owned
+    worker and is ignored here (dispatch/rework state guards prevent double
+    dispatch). Any other live marker is treated as a foreign writer.
+
+    Operator claim markers (``kind == "operator"`` or legacy ``operator-*``
+    session ids) are live while state.json says the issue is operator-claimed,
+    independent of PID.
+    """
+    marker = read_worktree_marker(worktree_path)
+    if marker is None:
+        return
+
+    pid = marker.get("pid")
+    session_id = marker.get("session_id")
+    kind = marker.get("kind")
+
+    if kind == OPERATOR_MARKER_KIND or (
+        isinstance(session_id, str) and session_id.startswith("operator-")
+    ):
+        if _operator_marker_is_live(marker, state_file, issue_number):
+            raise WorktreeForeignWriterError(
+                worktree_path=worktree_path, pid=pid, session_id=session_id
+            )
+        # Claim released or state unavailable: clean the marker and proceed.
+        remove_worktree_marker(
+            worktree_path, session_id=session_id if isinstance(session_id, str) else None
+        )
+        return
+
+    if not isinstance(pid, int) or pid <= 0 or not is_pid_alive(pid, None):
+        # Marker is stale — clean it and proceed.
+        remove_worktree_marker(worktree_path)
+        return
+    own = _own_live_session_pids(sessions_dir)
+    if session_id and own.get(session_id) == pid:
+        # Marker belongs to a live session we already know about.
+        return
+    raise WorktreeForeignWriterError(worktree_path=worktree_path, pid=pid, session_id=session_id)
 
 
 def _read_origin_head_symref(repo_root: Path) -> str | None:
@@ -782,6 +978,7 @@ def create_worktree(
     recovery: dict[str, Any] | None = None,
     issue_number: int | None = None,
     config: OrchestratorConfig | None = None,
+    sessions_dir: Path | None = None,
 ) -> WorktreeInfo:
     """Create a git worktree for ``branch`` (a new branch) off ``base_ref``.
 
@@ -829,6 +1026,13 @@ def create_worktree(
     ``WorktreeInfo.attempt_snapshot``. Best-effort — a snapshot failure never
     blocks the branch reset. When ``issue_number`` is None, no snapshot is
     attempted (existing callers/tests are unaffected).
+
+    ``sessions_dir``, when given, enables the foreign-writer marker guard
+    (issue #400): the worktree is checked for a ``.charlie-writer.json``
+    marker. Worker markers with a live pid that does not belong to a recorded
+    session are refused; operator markers are live while state.json reports an
+    active ``operator_claimed_at`` for ``issue_number``. Pass ``None`` to skip
+    the guard (e.g. unit tests that focus on worktree git mechanics).
     """
     # Resolve base_ref: empty string means auto-resolve to origin/<default>
     resolved_base_ref = base_ref
@@ -858,6 +1062,17 @@ def create_worktree(
     # Worktree-relative paths that the orchestrator injects (e.g. rendered
     # prompts). These are excluded from "is this worktree dirty?" checks.
     injected_paths = config.dispatch.injected_paths if config is not None else ()
+
+    # Issue #400: refuse to enter a worktree that is currently occupied by a
+    # live foreign writer. The marker check is independent of the recovery
+    # liveness probe so an operator's claim is honored before any git reset.
+    state_file: Path | None = None
+    if config is not None:
+        state_file = runtime_paths(repo_root, config.runtime.state_dir).state_file
+    if sessions_dir is not None:
+        _check_worktree_writer_marker(
+            worktree_path, sessions_dir, issue_number=issue_number, state_file=state_file
+        )
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None

@@ -69,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
+    claim = subparsers.add_parser("claim")
+    claim.add_argument("issue", type=int, help="Issue number to claim or release")
+    claim.add_argument(
+        "--release",
+        action="store_true",
+        help="Release an existing operator claim instead of recording one",
+    )
+
     reconcile = subparsers.add_parser("mop-up")
     reconcile.add_argument(
         "--fix",
@@ -715,6 +723,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         return app.bootstrap_labels()
     if args.command == "intake":
         return app.intake()
+    if args.command == "claim":
+        return app.claim(args.issue, release=args.release)
     if args.command == "mop-up":
         return app.reconcile(fix=args.fix)
     if args.command == "work":
