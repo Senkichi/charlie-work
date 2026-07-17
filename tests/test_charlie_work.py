@@ -387,6 +387,54 @@ auto_merge:
     assert AutoMergeConfig(require_current_base=True, update_open_prs="all")
 
 
+def test_auto_merge_config_mergequeue_label_defaults_to_none(tmp_path: Path) -> None:
+    """Aviator MergeQueue handoff (task #10) is off by default: the default
+    AutoMergeConfig() must preserve today's self-merge behavior byte-for-byte."""
+    from charlie_work.config import AutoMergeConfig
+
+    assert AutoMergeConfig().mergequeue_label is None
+
+
+def test_load_config_rejects_non_string_mergequeue_label(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_label: 123
+"""
+    )
+    with pytest.raises(ConfigError, match="mergequeue_label.*must be a string"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_empty_mergequeue_label(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_label: "   "
+"""
+    )
+    with pytest.raises(ConfigError, match="mergequeue_label.*must not be empty"):
+        load_config(config_file)
+
+
+def test_load_config_accepts_valid_mergequeue_label(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_label: mergequeue
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_label == "mergequeue"
+
+
 def test_load_config_runtime_throttle_error_markers(tmp_path: Path) -> None:
     """RuntimeConfig.throttle_error_markers is configurable from YAML."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -2810,6 +2858,7 @@ class FakeGitHub:
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_created: list[tuple[str, str, str]] = []
+        self.pr_labels_added: list[tuple[int, str]] = []
         self.prs_created: list[dict[str, Any]] = []
         self.pr_create_return: int | None = None
         self.merged: list[tuple[int, str]] = []
@@ -2916,6 +2965,10 @@ class FakeGitHub:
 
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
+        return True
+
+    def add_pr_label(self, number: int, label: str) -> bool:
+        self.pr_labels_added.append((number, label))
         return True
 
     def close_issue(self, number: int) -> bool:
@@ -8503,6 +8556,57 @@ def _approved_automerge():
     # No required checks -> the check gate is vacuously satisfied, isolating the
     # approved-decision path for merge tests.
     return AutoMergeConfig(required_checks=(), require_approved_review=True)
+
+
+def _mergequeue_automerge(label: str = "mergequeue"):
+    from charlie_work.config import AutoMergeConfig
+
+    # No required checks -> the check gate is vacuously satisfied, isolating the
+    # approved-decision path for Aviator MergeQueue handoff tests (task #10).
+    return AutoMergeConfig(
+        required_checks=(), require_approved_review=True, mergequeue_label=label
+    )
+
+
+def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -> None:
+    """Aviator MergeQueue handoff (task #10): when auto_merge.mergequeue_label
+    is set, an approved+green PR is labeled for the queue INSTEAD of being
+    self-merged, and state records a distinct 'mergequeue' status — never
+    'merged', so the merge_ready idempotency short-circuit does not fire while
+    Aviator's async merge is still pending."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert (456, "mergequeue") in fake_gh.pr_labels_added
+    assert fake_gh.merged == []
+    assert result.data["merged"] is False
+    assert result.data["mergequeue_label_applied"] is True
+    persisted = load_state(paths.state_file)["prs"]["456"]
+    assert persisted["status"] == "mergequeue"
+    assert persisted["status"] != "merged"
+
+
+def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
+    """An unapproved PR must never be labeled for the merge queue — the
+    approval gate (can_merge) is upstream of the mergequeue branch, exactly as
+    it is upstream of the self-merge branch today."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert result.data.get("mergequeue_label_applied") is None
 
 
 def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:

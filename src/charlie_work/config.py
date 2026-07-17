@@ -257,6 +257,16 @@ class AutoMergeConfig:
     # merge_deferred_stale_base event is recorded. Operators may set False to
     # restore the legacy behavior that trusts mergeStateStatus only.
     require_current_base: bool = True
+    # Aviator MergeQueue handoff (task #10). When set, an approved+green PR is
+    # labeled with this string INSTEAD of being self-merged by the
+    # orchestrator; Aviator's queue picks up the label and merges
+    # asynchronously. State records status="mergequeue" (never "merged") so
+    # the merge_ready idempotency short-circuit does not fire; the existing
+    # reconcile.py merged_outside_orchestrator drift path already reconciles
+    # status to "merged" (+ label transition) once GitHub reports the PR
+    # merged, so no new post-merge bookkeeping is added here. Default None
+    # preserves today's self-merge behavior byte-for-byte.
+    mergequeue_label: str | None = None
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -914,6 +924,17 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
             f"got {type(failed_attempt_alarm).__name__}"
         )
+    mergequeue_label = auto_merge_data.get("mergequeue_label")
+    if mergequeue_label is not None:
+        if not isinstance(mergequeue_label, str):
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_label' must be a string, "
+                f"got {type(mergequeue_label).__name__}"
+            )
+        if not mergequeue_label.strip():
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_label' must not be empty"
+            )
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")

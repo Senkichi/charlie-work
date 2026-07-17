@@ -713,6 +713,16 @@ class GitHub:
     def remove_issue_label(self, number: int, label: str) -> bool:
         return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
 
+    def add_pr_label(self, number: int, label: str) -> bool:
+        """Add a label to a PR (PR-scoped, not the linked issue).
+
+        Used for the Aviator MergeQueue handoff (task #10): the trigger label
+        must land on the PR itself, and issue_number may be None for
+        cross-repository PRs. Idempotent (gh's addLabels is a no-op if the
+        label is already present) and never raises — see ``_run_bool``.
+        """
+        return self._run_bool(["pr", "edit", str(number), "--add-label", label])
+
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
 
