@@ -195,10 +195,21 @@ class DiffContentSignature:
     ``changed_lines`` is ORDERED and compared with ``==``: a reordering of
     hunks/lines is a real semantic change and must not compare equal.
     ``changed_files`` is a set: file order in the diff is not meaningful.
+
+    ``has_binary`` flags whether any file's diff body was a binary section
+    (``Binary files ... differ`` or ``GIT binary patch``). A binary payload
+    emits no ``+``/``-`` content lines at all, so two diffs touching the
+    SAME path with genuinely DIFFERENT binary content would otherwise
+    produce an identical ``changed_lines``/``changed_files`` signature —
+    the signature is blind to content it never saw. Callers must treat
+    ``has_binary`` as an eligibility gate (fail closed to stale whenever
+    set on either side of a comparison), not fold it into the ``==``
+    content check.
     """
 
     changed_lines: tuple[str, ...]
     changed_files: frozenset[str]
+    has_binary: bool = False
 
 
 def _diff_content_signature(diff: str) -> DiffContentSignature:
@@ -206,16 +217,20 @@ def _diff_content_signature(diff: str) -> DiffContentSignature:
 
     Pure string parsing — no subprocess, no git required — so this never
     fails; an empty or unparseable diff simply yields an empty signature
-    (``changed_lines=()``, ``changed_files=frozenset()``), which compares
-    equal only to another empty signature.
+    (``changed_lines=()``, ``changed_files=frozenset()``, ``has_binary=False``),
+    which compares equal only to another empty signature.
     """
     changed_lines: list[str] = []
     changed_files: set[str] = set()
+    has_binary = False
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             _, sep, b_path = line[len("diff --git ") :].partition(" b/")
             if sep:
                 changed_files.add(b_path)
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            has_binary = True
             continue
         if line.startswith("+++") or line.startswith("---"):
             continue
@@ -224,7 +239,9 @@ def _diff_content_signature(diff: str) -> DiffContentSignature:
         if line.startswith("+") or line.startswith("-"):
             changed_lines.append(line)
     return DiffContentSignature(
-        changed_lines=tuple(changed_lines), changed_files=frozenset(changed_files)
+        changed_lines=tuple(changed_lines),
+        changed_files=frozenset(changed_files),
+        has_binary=has_binary,
     )
 
 

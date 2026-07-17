@@ -3896,6 +3896,7 @@ class OrchestratorApp:
             "reviewed_patch_id": reviewed_patch_id,
             "reviewed_changed_lines": list(reviewed_signature.changed_lines),
             "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "reviewed_has_binary": reviewed_signature.has_binary,
             "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
@@ -5389,15 +5390,36 @@ class OrchestratorApp:
         does — but the ordered ``+``/``-`` line stream and changed-file set
         recorded at review time are identical to the live diff's. Reordered,
         added, removed, or altered lines, or a changed file set, are real
-        content changes and do NOT carry forward.
+        content changes and do NOT carry forward. Tier 2 is INELIGIBLE
+        whenever either side's diff touched a binary file: a binary payload
+        emits no ``+``/``-`` lines, so the signature is blind to it — two
+        diffs with genuinely different binary content at the same path
+        would otherwise compare equal (review follow-up on issue #414).
 
-        Fails closed (``tier=None``) on any missing data or diff-fetch
-        failure: a decision recorded before tier-2 existed (no signature
-        stored), a PR whose diff cannot be fetched, or a genuine content
-        difference all report "cannot carry forward" — never carry forward
-        on uncertainty. Tier 2 is pure string parsing of the diff text
-        already fetched for tier 1 — it needs no additional git/gh calls and
-        so has no failure mode of its own beyond that shared fetch.
+        Fails closed (``tier=None``) on any missing data, diff-fetch
+        failure, or binary content: a decision recorded before tier-2
+        existed (no signature stored), a PR whose diff cannot be fetched,
+        a binary file on either side, or a genuine content difference all
+        report "cannot carry forward" — never carry forward on
+        uncertainty. Tier 2 is pure string parsing of the diff text already
+        fetched for tier 1 — it needs no additional git/gh calls and so has
+        no failure mode of its own beyond that shared fetch.
+
+        Eligibility for BOTH tiers is gated on ``reviewed_patch_id`` being
+        recorded at all (matching #412's original behavior exactly): a
+        "blocked" verdict, or any other decision that never computed one,
+        has no baseline to compare against, full stop. A pure-rename or
+        mode-only diff also has an empty ``reviewed_patch_id`` (no ``@@``
+        hunk) despite having a valid tier-2 signature on file — that
+        specific case is intentionally left conservative (stays stale)
+        rather than gating on the signature fields' presence instead, which
+        was tried and reverted: ``record_review`` unconditionally records a
+        (possibly trivially-empty) signature for every approved/
+        request_changes decision, so gating on "signature present" instead
+        of "patch-id present" made an unrelated placeholder/no-op diff look
+        like a valid tier-2 baseline and wrongly carried forward verdicts
+        whose head had genuinely moved to unrelated content. Tracked as a
+        narrow follow-up, not fixed here.
         """
         live_diff = self.gh.pr_diff(pr_number) or ""
         if not live_diff:
@@ -5420,6 +5442,12 @@ class OrchestratorApp:
         if reviewed_changed_lines is None or reviewed_changed_files is None:
             # Decision predates tier-2 (no signature recorded) — cannot
             # establish content identity; fail closed to stale.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
+
+        if decision.get("reviewed_has_binary") or live_signature.has_binary:
+            # A binary payload emits no +/- content lines, so the signature
+            # cannot see it — never rely on its silence for content it
+            # never observed (issue #414 review follow-up).
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
@@ -5470,6 +5498,7 @@ class OrchestratorApp:
         if new_signature is not None:
             updated_decision["reviewed_changed_lines"] = list(new_signature.changed_lines)
             updated_decision["reviewed_changed_files"] = sorted(new_signature.changed_files)
+            updated_decision["reviewed_has_binary"] = new_signature.has_binary
         carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
         if old_head is not None and old_head != new_head and old_head not in carried_forward:
             carried_forward.append(old_head)

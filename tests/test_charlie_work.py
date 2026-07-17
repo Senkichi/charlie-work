@@ -5331,6 +5331,338 @@ def test_merge_ready_carries_forward_approved_verdict_on_tier2_line_content(
     assert (123, "agent:reviewing") not in fake_gh.labels_added
 
 
+def test_review_queue_reports_stale_on_mixed_binary_content_change(tmp_path: Path) -> None:
+    """Issue #414 (review follow-up): a binary file's payload emits no +/-
+    lines, so a text hunk that's byte-identical alongside a binary asset
+    whose content genuinely changed (different git index blob hashes) must
+    NOT carry forward via tier 2 — the signature can't see binary content
+    and must fail closed instead of silently ignoring it."""
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    reviewed_diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+        "diff --git a/logo.png b/logo.png\n"
+        "index aaa1111..bbb2222 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    live_diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+        "diff --git a/logo.png b/logo.png\n"
+        "index ccc3333..ddd4444 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert reviewed_patch_id != live_patch_id, "test fixture must have differing patch-ids"
+    reviewed_signature = _diff_content_signature(reviewed_diff)
+    live_signature = _diff_content_signature(live_diff)
+    # The bug this test guards against: without the has_binary gate, these
+    # signatures compare equal despite genuinely different binary content.
+    assert reviewed_signature.changed_lines == live_signature.changed_lines
+    assert reviewed_signature.changed_files == live_signature.changed_files
+    assert reviewed_signature.has_binary is True
+    assert live_signature.has_binary is True
+
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "reviewed_has_binary": reviewed_signature.has_binary,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+    assert "carry_forward_tier" not in decision
+
+
+def test_review_queue_reports_stale_on_binary_only_content_change(tmp_path: Path) -> None:
+    """Issue #414 (review follow-up): a pure binary-only diff (no hunks at
+    all, so patch-id is empty on both sides) whose binary content genuinely
+    changed must still report stale, not silently carry forward through the
+    tier-2 signature fields (which never had any content to compare)."""
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    reviewed_diff = (
+        "diff --git a/logo.png b/logo.png\n"
+        "index aaa1111..bbb2222 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    live_diff = (
+        "diff --git a/logo.png b/logo.png\n"
+        "index ccc3333..ddd4444 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    assert reviewed_patch_id == "", "a hunk-less binary diff must not produce a patch-id"
+    reviewed_signature = _diff_content_signature(reviewed_diff)
+
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "reviewed_has_binary": reviewed_signature.has_binary,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+
+
+def test_review_queue_carries_forward_identical_mixed_binary_and_text_via_tier1(
+    tmp_path: Path,
+) -> None:
+    """Issue #414 (review follow-up): a byte-identical mixed text+binary diff
+    (same index hash, same text) still carries forward — via tier 1's
+    patch-id match, since tier 2 is never reached when tier 1 already
+    succeeds. Confirms the has_binary gate does not regress the ordinary
+    identical-content case."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " alpha\n"
+        "+gamma\n"
+        " delta\n"
+        "diff --git a/logo.png b/logo.png\n"
+        "index aaa1111..bbb2222 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["carry_forward_tier"] == "patch-id"
+
+
+def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
+    tmp_path: Path,
+) -> None:
+    """Issue #414 (review follow-up, deliberately NOT fixed): a pure-rename
+    (100% similarity, no hunk) diff has no patch-id at all, even though it
+    has a valid tier-2 signature on file. Eligibility for both tiers gates
+    on ``reviewed_patch_id`` being recorded (matching #412 exactly) — an
+    earlier attempt to gate on the signature fields' presence instead was
+    reverted because ``record_review`` unconditionally records a signature
+    (possibly trivially empty) for every approved/request_changes decision,
+    which made unrelated no-op/placeholder diffs look like valid tier-2
+    baselines and wrongly carried forward verdicts whose head had actually
+    moved to different content (test_merge_ready_refuses_when_head_moved_
+    after_approval and siblings). This case stays conservatively stale;
+    tracked as a narrow follow-up rather than fixed here."""
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    rename_diff = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 100%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+    reviewed_patch_id = _calculate_patch_id(rename_diff)
+    assert reviewed_patch_id == "", "a hunk-less rename diff must not produce a patch-id"
+    reviewed_signature = _diff_content_signature(rename_diff)
+    assert reviewed_signature.changed_files == frozenset({"new.py"})
+
+    old_head = "sha-old-head"
+    new_head = "sha-new-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = rename_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "reviewed_has_binary": reviewed_signature.has_binary,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+    assert "carry_forward_tier" not in decision
+
+
 def _dispatch_reviews_app(
     tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
 ) -> OrchestratorApp:
