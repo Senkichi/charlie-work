@@ -178,6 +178,74 @@ def _calculate_patch_id(diff: str) -> str:
 
 
 @dataclass(frozen=True)
+class DiffContentSignature:
+    """Normalized content signature of a unified diff (issue #414, tier 2).
+
+    ``git patch-id --stable`` hashes hunk content INCLUDING context lines, so
+    it is unstable whenever the merge-base moves — which happens on every
+    ordinary main advance, not just sibling-PR hunk drift. This signature is
+    the tier-2 fallback: it captures only the ordered ``+``/``-`` content
+    lines (excluding the ``+++``/``---`` file-marker lines and the
+    ``@@ ... @@`` hunk headers, both of which carry line-number offsets that
+    shift on every rebase without the actual change moving) plus the set of
+    changed file paths (from ``diff --git`` headers, which never carry line
+    numbers). Two diffs with an identical signature carried the same actual
+    change regardless of where main had advanced to when either was taken.
+
+    ``changed_lines`` is ORDERED and compared with ``==``: a reordering of
+    hunks/lines is a real semantic change and must not compare equal.
+    ``changed_files`` is a set: file order in the diff is not meaningful.
+
+    ``has_binary`` flags whether any file's diff body was a binary section
+    (``Binary files ... differ`` or ``GIT binary patch``). A binary payload
+    emits no ``+``/``-`` content lines at all, so two diffs touching the
+    SAME path with genuinely DIFFERENT binary content would otherwise
+    produce an identical ``changed_lines``/``changed_files`` signature —
+    the signature is blind to content it never saw. Callers must treat
+    ``has_binary`` as an eligibility gate (fail closed to stale whenever
+    set on either side of a comparison), not fold it into the ``==``
+    content check.
+    """
+
+    changed_lines: tuple[str, ...]
+    changed_files: frozenset[str]
+    has_binary: bool = False
+
+
+def _diff_content_signature(diff: str) -> DiffContentSignature:
+    """Derive a :class:`DiffContentSignature` from a unified diff string.
+
+    Pure string parsing — no subprocess, no git required — so this never
+    fails; an empty or unparseable diff simply yields an empty signature
+    (``changed_lines=()``, ``changed_files=frozenset()``, ``has_binary=False``),
+    which compares equal only to another empty signature.
+    """
+    changed_lines: list[str] = []
+    changed_files: set[str] = set()
+    has_binary = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            _, sep, b_path = line[len("diff --git ") :].partition(" b/")
+            if sep:
+                changed_files.add(b_path)
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            has_binary = True
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            changed_lines.append(line)
+    return DiffContentSignature(
+        changed_lines=tuple(changed_lines),
+        changed_files=frozenset(changed_files),
+        has_binary=has_binary,
+    )
+
+
+@dataclass(frozen=True)
 class TestAdequacyFacts:
     __test__ = False  # Prevent pytest from collecting this as a test class
 

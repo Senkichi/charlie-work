@@ -43,10 +43,12 @@ from .github import (
 )
 from .janitor import (
     _calculate_patch_id,
+    _diff_content_signature,
     check_operator_containment,
     check_test_adequacy,
     detect_cross_pr_revert,
     run_janitor,
+    DiffContentSignature,
     TestAdequacyFacts,
     TestAdequacyVerdict,
 )
@@ -178,6 +180,32 @@ class LocalReviewCapResult:
             "live_review_count": self.live_count,
             "available_review_slots": self.available_slots,
         }
+
+
+@dataclass(frozen=True)
+class CarryForwardCheck:
+    """Result of comparing a recorded review verdict's content against the
+    live PR diff (issues #411/#412 tier 1, #414 tier 2).
+
+    ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
+    the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
+    ``"line-content"`` when the patch-ids differed — which happens on every
+    ordinary main advance, since the merge-base moves — but the ordered
+    ``+``/``-`` line stream and changed-file set are identical to what was
+    recorded at review time (issue #414), or ``None`` when neither tier
+    establishes content identity: the caller must treat the verdict as
+    stale. ``live_patch_id``/``live_signature`` are always populated (when
+    the live diff was fetched) so a carrying-forward caller can persist the
+    freshly computed baseline against the new head without recomputing it.
+    """
+
+    tier: str | None
+    live_patch_id: str
+    live_signature: DiffContentSignature
+
+    @property
+    def carry_forward(self) -> bool:
+        return self.tier is not None
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -3600,20 +3628,20 @@ class OrchestratorApp:
                 if reviewed_head_sha == live_head_sha:
                     continue
 
-                reviewed_patch_id = decision.get("reviewed_patch_id") or ""
-                live_diff = self.gh.pr_diff(pr_number) or ""
-                live_patch_id = _calculate_patch_id(live_diff)
-
-                patch_ids_match = (
-                    reviewed_patch_id and live_patch_id and live_patch_id == reviewed_patch_id
-                )
-                if patch_ids_match:
+                check = self._check_carry_forward(pr_number, decision)
+                if check.carry_forward:
                     # In dry-run mode we still run the content check so the queue
                     # reflects real changes, but we skip the durable head update.
                     if not self.dry_run:
                         try:
                             self._update_approval_head(
-                                pr_number, decision, live_head_sha, old_head=reviewed_head_sha
+                                pr_number,
+                                decision,
+                                live_head_sha,
+                                old_head=reviewed_head_sha,
+                                tier=check.tier or "patch-id",
+                                new_patch_id=check.live_patch_id,
+                                new_signature=check.live_signature,
                             )
                         except StateLockBusy:
                             # Could not mirror the carry-forward into state.json,
@@ -3983,12 +4011,20 @@ class OrchestratorApp:
         # (issue #222: base-update merges can advance head SHA without changing diff content).
         # All terminal decisions (approved/request_changes/blocked) persist reviewed_patch_id
         # so the review-queue enumerator can carry them forward on content-identical heads.
+        # Also record the tier-2 content signature (issue #414): patch-id is
+        # unstable across every main advance (the merge-base moves), so the
+        # ordered +/- line stream and changed-file set are persisted here,
+        # at the moment the diff is freshly known, so a later carry-forward
+        # check never needs to reconstruct this historical diff.
         reviewed_patch_id = ""
+        reviewed_signature = DiffContentSignature((), frozenset())
         if pr:
             diff = self._read_packet_diff(pr_number)
             if diff is None:
                 diff = self.gh.pr_diff(pr_number)
             reviewed_patch_id = _calculate_patch_id(diff)
+            if diff:
+                reviewed_signature = _diff_content_signature(diff)
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
@@ -3997,6 +4033,9 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_signature.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_signature.changed_files),
+            "reviewed_has_binary": reviewed_signature.has_binary,
             "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
@@ -4223,54 +4262,63 @@ class OrchestratorApp:
             live_head_sha = pr.get("headRefOid")
             head_moved = reviewed_head_sha is None or live_head_sha != reviewed_head_sha
             carried_forward = False
-            if head_moved:
-                reviewed_patch_id = decision.get("reviewed_patch_id")
-                if reviewed_patch_id and live_head_sha:
-                    live_diff = self.gh.pr_diff(pr_number)
-                    if live_diff:
-                        live_patch_id = _calculate_patch_id(live_diff)
-                        if live_patch_id == reviewed_patch_id:
-                            old_reviewed_head_sha = reviewed_head_sha
-                            self._update_approval_head(
-                                pr_number, decision, live_head_sha, old_head=old_reviewed_head_sha
-                            )
-                            pr = self.gh.pr_view(pr_number) or pr
-                            decision = self._review_decision(pr_number)
-                            reviewed_head_sha = decision.get("reviewed_head_sha")
-                            live_head_sha = pr.get("headRefOid")
-                            with state_lock(self.paths.state_file):
-                                state = load_state(self.paths.state_file)
-                                state["prs"][str(pr_number)] = {
-                                    **state["prs"].get(str(pr_number), {}),
-                                    "number": pr_number,
-                                    "issue_number": issue_number,
-                                    "status": "approved",
-                                    "head_moved": False,
-                                    "reviewed_head_sha": reviewed_head_sha,
-                                    "reviewed_patch_id": reviewed_patch_id,
-                                    "carried_forward_from": decision.get(
-                                        "carried_forward_from", []
-                                    ),
-                                    "live_head_sha": live_head_sha,
-                                    "consecutive_failed_merge_attempts": 0,
-                                    "consecutive_stale_base_deferrals": 0,
-                                }
-                                state = append_event(
-                                    state,
-                                    "verdict_carried_forward_clean_rebase",
-                                    {
-                                        "pr_number": pr_number,
-                                        "issue_number": issue_number,
-                                        "old_reviewed_head_sha": old_reviewed_head_sha,
-                                        "new_head_sha": live_head_sha,
-                                        "patch_id": reviewed_patch_id,
-                                        "carried_forward_from": decision.get(
-                                            "carried_forward_from", []
-                                        ),
-                                    },
-                                )
-                                save_state(self.paths.state_file, state)
-                            carried_forward = True
+            if head_moved and live_head_sha:
+                old_reviewed_head_sha = reviewed_head_sha
+                check = self._check_carry_forward(pr_number, decision)
+                if check.carry_forward:
+                    self._update_approval_head(
+                        pr_number,
+                        decision,
+                        live_head_sha,
+                        old_head=old_reviewed_head_sha,
+                        tier=check.tier or "patch-id",
+                        new_patch_id=check.live_patch_id,
+                        new_signature=check.live_signature,
+                    )
+                    pr = self.gh.pr_view(pr_number) or pr
+                    decision = self._review_decision(pr_number)
+                    reviewed_head_sha = decision.get("reviewed_head_sha")
+                    live_head_sha = pr.get("headRefOid")
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "approved",
+                            "head_moved": False,
+                            "reviewed_head_sha": reviewed_head_sha,
+                            "reviewed_patch_id": check.live_patch_id,
+                            "carry_forward_tier": check.tier,
+                            "carried_forward_from": decision.get("carried_forward_from", []),
+                            "live_head_sha": live_head_sha,
+                            "consecutive_failed_merge_attempts": 0,
+                            "consecutive_stale_base_deferrals": 0,
+                        }
+                        # Tier 1 keeps its original event kind/payload shape
+                        # (issue #375/#412); tier 2 (issue #414) gets its own
+                        # distinct kind so the two mechanisms stay separately
+                        # auditable in the events log.
+                        event_kind = (
+                            "verdict_carried_forward_clean_rebase"
+                            if check.tier == "patch-id"
+                            else "verdict_carried_forward_line_content"
+                        )
+                        state = append_event(
+                            state,
+                            event_kind,
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "old_reviewed_head_sha": old_reviewed_head_sha,
+                                "new_head_sha": live_head_sha,
+                                "patch_id": check.live_patch_id,
+                                "carry_forward_tier": check.tier,
+                                "carried_forward_from": decision.get("carried_forward_from", []),
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
+                    carried_forward = True
             if head_moved and not carried_forward:
                 message = "PR head moved since approval — re-review required"
                 label_error: dict[str, Any] | None = None
@@ -5467,22 +5515,129 @@ class OrchestratorApp:
         candidates.sort(key=lambda item: (item[0], item[1]))
         return candidates
 
+    def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
+        """Determine whether ``decision``'s verdict can carry forward to the
+        PR's live head, and via which tier (issues #411/#412, #414).
+
+        Tier 1 (fast path): the live diff's stable patch-id equals the
+        recorded ``reviewed_patch_id`` — the effective content is provably
+        identical modulo hunk-context.
+
+        Tier 2 (line-content, issue #414): patch-ids differ — which happens
+        on every ordinary main advance, since ``git patch-id --stable``
+        hashes hunk-boundary context and the merge-base moves whenever main
+        does — but the ordered ``+``/``-`` line stream and changed-file set
+        recorded at review time are identical to the live diff's. Reordered,
+        added, removed, or altered lines, or a changed file set, are real
+        content changes and do NOT carry forward. Tier 2 is INELIGIBLE
+        whenever either side's diff touched a binary file: a binary payload
+        emits no ``+``/``-`` lines, so the signature is blind to it — two
+        diffs with genuinely different binary content at the same path
+        would otherwise compare equal (review follow-up on issue #414).
+
+        Fails closed (``tier=None``) on any missing data, diff-fetch
+        failure, or binary content: a decision recorded before tier-2
+        existed (no signature stored), a PR whose diff cannot be fetched,
+        a binary file on either side, or a genuine content difference all
+        report "cannot carry forward" — never carry forward on
+        uncertainty. Tier 2 is pure string parsing of the diff text already
+        fetched for tier 1 — it needs no additional git/gh calls and so has
+        no failure mode of its own beyond that shared fetch.
+
+        Eligibility for BOTH tiers is gated on ``reviewed_patch_id`` being
+        recorded at all (matching #412's original behavior exactly): a
+        "blocked" verdict, or any other decision that never computed one,
+        has no baseline to compare against, full stop. A pure-rename or
+        mode-only diff also has an empty ``reviewed_patch_id`` (no ``@@``
+        hunk) despite having a valid tier-2 signature on file — that
+        specific case is intentionally left conservative (stays stale)
+        rather than gating on the signature fields' presence instead, which
+        was tried and reverted: ``record_review`` unconditionally records a
+        (possibly trivially-empty) signature for every approved/
+        request_changes decision, so gating on "signature present" instead
+        of "patch-id present" made an unrelated placeholder/no-op diff look
+        like a valid tier-2 baseline and wrongly carried forward verdicts
+        whose head had genuinely moved to unrelated content. Tracked as a
+        narrow follow-up, not fixed here.
+        """
+        live_diff = self.gh.pr_diff(pr_number) or ""
+        if not live_diff:
+            return CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
+
+        live_patch_id = _calculate_patch_id(live_diff)
+        live_signature = _diff_content_signature(live_diff)
+
+        reviewed_patch_id = decision.get("reviewed_patch_id") or ""
+        if not reviewed_patch_id:
+            # No baseline recorded at all (e.g. a "blocked" verdict never
+            # computes a patch-id) — nothing to compare against.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
+
+        if live_patch_id and live_patch_id == reviewed_patch_id:
+            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+
+        reviewed_changed_lines = decision.get("reviewed_changed_lines")
+        reviewed_changed_files = decision.get("reviewed_changed_files")
+        if reviewed_changed_lines is None or reviewed_changed_files is None:
+            # Decision predates tier-2 (no signature recorded) — cannot
+            # establish content identity; fail closed to stale.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
+
+        if decision.get("reviewed_has_binary") or live_signature.has_binary:
+            # A binary payload emits no +/- content lines, so the signature
+            # cannot see it — never rely on its silence for content it
+            # never observed (issue #414 review follow-up).
+            return CarryForwardCheck(None, live_patch_id, live_signature)
+
+        lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
+        files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
+        if lines_match and files_match:
+            return CarryForwardCheck("line-content", live_patch_id, live_signature)
+
+        return CarryForwardCheck(None, live_patch_id, live_signature)
+
     def _update_approval_head(
         self,
         pr_number: int,
         decision: dict[str, Any],
         new_head: str,
         old_head: str | None = None,
+        *,
+        tier: str = "verified-sync",
+        new_patch_id: str | None = None,
+        new_signature: DiffContentSignature | None = None,
     ) -> None:
         """Persist an updated review head for a PR whose branch was synced.
 
         Keeps the verdict valid when the branch was base-updated or rebased
         without content changes. Updates both review-decision.json and
         state.json, appending the old head to ``carried_forward_from`` for audit.
+
+        ``tier`` records which mechanism justified the update, for audit:
+        ``"patch-id"``/``"line-content"`` from :meth:`_check_carry_forward`
+        (issues #412/#414), or the default ``"verified-sync"`` for the
+        structurally-verified (``_verify_synced_head``) front-of-train/
+        broadcast sync callers, which never compared patch-ids at all.
+
+        When ``new_patch_id``/``new_signature`` are supplied — they are
+        already computed as part of the tier check that led here — they
+        replace the stored baseline so ``reviewed_head_sha`` and the
+        patch-id/content-signature fields always describe the SAME head
+        consistently. Leaving a patch-id recorded against a stale head would
+        pointlessly defeat that head's own future tier-1 fast path: patch-id
+        is unstable across every main advance, not just the one just
+        carried past.
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         updated_decision = dict(decision)
         updated_decision["reviewed_head_sha"] = new_head
+        updated_decision["carry_forward_tier"] = tier
+        if new_patch_id is not None:
+            updated_decision["reviewed_patch_id"] = new_patch_id
+        if new_signature is not None:
+            updated_decision["reviewed_changed_lines"] = list(new_signature.changed_lines)
+            updated_decision["reviewed_changed_files"] = sorted(new_signature.changed_files)
+            updated_decision["reviewed_has_binary"] = new_signature.has_binary
         carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
         if old_head is not None and old_head != new_head and old_head not in carried_forward:
             carried_forward.append(old_head)
@@ -5498,9 +5653,12 @@ class OrchestratorApp:
                 "decision": pr_state.get("decision") or decision.get("decision") or "approved",
                 "status": pr_state.get("status") or decision.get("decision") or "approved",
                 "reviewed_head_sha": new_head,
-                "reviewed_patch_id": pr_state.get("reviewed_patch_id")
-                or decision.get("reviewed_patch_id")
-                or "",
+                "reviewed_patch_id": new_patch_id
+                if new_patch_id is not None
+                else (
+                    pr_state.get("reviewed_patch_id") or decision.get("reviewed_patch_id") or ""
+                ),
+                "carry_forward_tier": tier,
                 "carried_forward_from": carried_forward,
             }
             save_state(self.paths.state_file, state)
