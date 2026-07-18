@@ -14,7 +14,13 @@ from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
-from .supervise import LocalSnapshot, self_deploy, take_snapshot, try_acquire_supervisor_lock
+from .supervise import (
+    LocalSnapshot,
+    orchestrator_root,
+    self_deploy,
+    take_snapshot,
+    try_acquire_supervisor_lock,
+)
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -744,10 +750,6 @@ def run_fleet_supervise(
     full_pass_interval = cfg.full_pass_interval_seconds
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
-    # The running orchestrator's own source tree (editable install).  This is
-    # where ``git pull`` must land so the next pass uses the latest orchestrator
-    # code / dependency lock.
-    orchestrator_root = Path(__file__).resolve().parents[2]
 
     try:
         while True:
@@ -776,7 +778,7 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(orchestrator_root)
+            deploy = self_deploy(orchestrator_root(), fleet_dir_override=fleet_dir_override)
             if deploy.synced:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif not deploy.ok:

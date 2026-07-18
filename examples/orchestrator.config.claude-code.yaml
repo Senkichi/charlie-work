@@ -12,6 +12,9 @@ dispatch:
   # suite's `-n` (don't let it inherit `-n auto`). See RUNBOOK.md
   # "Local host saturation ceiling (claude-code adapter)".
   default_limit: 3
+  # Per-pass cap for merge-finalization of merged-PR-referenced closed issues
+  # (stale ready-label cleanup). 0 disables finalization.
+  finalize_limit: 25
   branch_prefix: agent/issue
   worker_model_tier: capable
   # Claude Code workers use the direct-shell loop (no Devin session skills).

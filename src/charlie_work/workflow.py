@@ -1679,7 +1679,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
             )
             continue
-        if w.error is None and not w.is_alive():
+        if not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
 
@@ -1700,12 +1700,16 @@ def _classify_dead_sessions_and_update_throttle_state(
             # genuinely-dead worker behind a permanently-broken probe still gets
             # reaped after N deferred passes (never an unconditional "never-reap").
             #
-            # Only workers with a real pid are corroborated. A pid=None worker
-            # (launch never spawned a process, or the pid was already cleared)
-            # has no liveness signal to second-guess -- is_alive() is trivially
-            # and unambiguously False -- so it keeps the prior immediate-reap
-            # behavior, matching _detect_and_handle_stalled_sessions's existing
-            # "if w.pid is None ...: continue" guard before it ever probes.
+            # Issue #426: the launch-failure lane above handles ``pid is None``
+            # sidecars. Sidecars that carry a real (dead) pid *and* a stale
+            # ``error`` string (e.g. ``live_worker_redispatch_averted``) must not
+            # be invisible to the confirmed-dead lane. Removing the ``w.error is
+            # None`` gate lets classify_worker_health decide, with the same
+            # max_inconclusive_probe_deferrals cap, instead of leaving them stuck
+            # forever. The stall lane skips ``w.error is not None`` workers, so
+            # the dead lane must persist the Signal-1 counter for those workers
+            # even when loop() asks it not to double-write for ``w.error is None``
+            # workers.
             if w.pid is not None:
                 probe = real_activity_probe_for(w, config, now_for_health)
                 health = classify_worker_health(w, config, now_for_health, probe)
@@ -1717,7 +1721,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # it. Every other caller (including every existing unit test)
                 # leaves this at its default True, so this lane remains fully
                 # self-sufficient when called on its own.
-                if persist_inconclusive_probe_counter:
+                #
+                # Issue #426: the stall lane unconditionally skips
+                # ``w.error is not None`` workers, so for those sidecars this
+                # dead lane is the only writer of the counter. Persist it even
+                # when loop() passes False.
+                if persist_inconclusive_probe_counter or w.error is not None:
                     new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
                     update_worker_log_stat(
                         sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
@@ -2609,6 +2618,169 @@ class OrchestratorApp:
             },
         )
 
+    def _finalize_externally_merged_issues(
+        self,
+        ready_issues: list[dict[str, Any]] | None = None,
+    ) -> tuple[set[int], list[dict[str, Any]]]:
+        """Finalize closed ready-labeled issues whose linked PR merged externally,
+        and strip the ready/active labels from closed ready issues that have no
+        merged PR binding them (issue #429/#433).
+
+        Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
+        throttle) so a pass that defers new work still drains the backlog of
+        externally-merged issues (e.g. Aviator MergeQueue handoffs).  It first
+        binds candidates against the cheap most-recent-500 ``merged_pr_list()``;
+        only issues whose merged PR falls outside that window incur a per-issue
+        ``gh pr list --search`` lookup.
+
+        Per-issue lookups are capped at ``dispatch.finalize_limit`` and processed
+        oldest-first (by ``createdAt``, then issue number). A consecutive-failure
+        circuit breaker stops the pass after 3 failed lookups so a transient
+        Search API rate limit does not monopolize the shared token.
+        """
+        if ready_issues is None:
+            ready_issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        closed_ready = [
+            issue
+            for issue in ready_issues
+            if str(issue.get("state") or "OPEN").upper() == "CLOSED"
+        ]
+        if not closed_ready:
+            return set(), ready_issues
+
+        finalize_limit = self.config.dispatch.finalize_limit
+        if finalize_limit <= 0:
+            return set(), ready_issues
+
+        # Try the cheap 500-window binding first; if the GraphQL-budget guard
+        # refuses the call, fall back to per-issue search for all candidates.
+        bound_issue_numbers: set[int] = set()
+        mention_only_issue_numbers: set[int] = set()
+        try:
+            merged_prs = self.gh.merged_pr_list()
+        except GitHubError:
+            merged_prs = []
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if bound is not None:
+                bound_issue_numbers.add(bound)
+            # isCrossRepository describes the PR's own head-branch provenance
+            # (fork vs. same-repo). It cannot fully guard a cross-repo mention
+            # collision, but it does guard the common case of a fork PR's text
+            # being trusted at all.
+            if pr.get("isCrossRepository") is False:
+                for mentioned in issue_numbers_mentioned_by_pr(pr):
+                    mention_only_issue_numbers.add(mentioned)
+
+        # Mention-only references are advisory; they are not a binding, but
+        # they also must not be stripped as "unmerged" — dispatch() will flag
+        # them for a human decision.
+        mention_only_issue_numbers -= bound_issue_numbers
+
+        # Only unbound closed issues are candidates for per-issue search or strip.
+        unbound_issues = [
+            issue for issue in closed_ready if int(issue["number"]) not in bound_issue_numbers
+        ]
+
+        def _finalization_order(issue: dict[str, Any]) -> tuple[str, int]:
+            return (str(issue.get("createdAt") or ""), int(issue["number"]))
+
+        # Slice BEFORE any per-issue lookup so a large backlog cannot exhaust
+        # the GitHub Search API bucket in a single pass.
+        candidates = sorted(unbound_issues, key=_finalization_order)[:finalize_limit]
+
+        issue_pr_map: dict[int, list[dict[str, Any]]] = {}
+        closed_unmerged_ready_issues: set[int] = set()
+        consecutive_failures = 0
+        for issue in candidates:
+            if consecutive_failures >= 3:
+                break
+            issue_number = int(issue["number"])
+            merged_prs = self.gh.merged_prs_for_issue(
+                issue_number,
+                self.config.dispatch.branch_prefix,
+            )
+            if not getattr(merged_prs, "ok", True):
+                consecutive_failures += 1
+                continue
+            consecutive_failures = 0
+            if merged_prs:
+                issue_pr_map[issue_number] = list(merged_prs)
+            elif issue_number not in mention_only_issue_numbers:
+                # Confirmed closed ready issue with no merged PR binding it.
+                closed_unmerged_ready_issues.add(issue_number)
+
+        # Persist state first, then apply labels outside the lock.
+        if issue_pr_map or closed_unmerged_ready_issues:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number, prs in issue_pr_map.items():
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
+                    }
+                    for pr in prs:
+                        pr_number = int(pr["number"])
+                        pr_key = str(pr_number)
+                        pr_entry = state["prs"].get(pr_key, {})
+                        state["prs"][pr_key] = {
+                            **pr_entry,
+                            "number": pr_number,
+                            "status": "merged",
+                            "merged": True,
+                            "issue_number": issue_number,
+                        }
+                if issue_pr_map:
+                    state = append_event(
+                        state,
+                        "finalize_externally_merged",
+                        {
+                            "issue_numbers": sorted(issue_pr_map.keys()),
+                            "pr_numbers": sorted(
+                                {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
+                            ),
+                        },
+                    )
+                for issue_number in closed_unmerged_ready_issues:
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
+                    }
+                if closed_unmerged_ready_issues:
+                    state = append_event(
+                        state,
+                        "dispatch_closed_unmerged_ready_stripped",
+                        {"issue_numbers": sorted(closed_unmerged_ready_issues)},
+                    )
+                save_state(self.paths.state_file, state)
+
+        for issue_number in issue_pr_map:
+            transition(self.gh, self.config.labels, issue_number, "merged")
+            self.gh.close_issue(issue_number)
+
+        for issue_number in closed_unmerged_ready_issues:
+            transition(self.gh, self.config.labels, issue_number, "closed_unmerged")
+
+        finalized: set[int] = set(issue_pr_map.keys())
+        removed = finalized | closed_unmerged_ready_issues
+        remaining = [issue for issue in ready_issues if int(issue["number"]) not in removed]
+        return finalized, remaining
+
     def dispatch(
         self,
         limit: int | None = None,
@@ -2628,6 +2800,19 @@ class OrchestratorApp:
         Finding 2). Standalone callers leave this as None and the sweep runs
         inside this call as before.
         """
+        # Finalize closed ready-labeled issues whose linked PR merged externally.
+        # This runs before fleet lock / GraphQL budget / provider throttle guards
+        # so a pass that defers new dispatch still drains the Aviator-merge backlog.
+        finalized: set[int] = set()
+        try:
+            finalized, ready_issues = self._finalize_externally_merged_issues()
+        except StateLockBusy:
+            return _state_lock_busy_result(
+                "dispatch deferred: state lock held",
+                selected_count=0,
+                deferred_reason="state_lock_busy",
+            )
+
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -2638,17 +2823,33 @@ class OrchestratorApp:
                     {
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
+                        "merged_pr_closed_issue_numbers": sorted(finalized),
+                        "merged_pr_referenced_issue_numbers": sorted(finalized),
                     },
                 )
         try:
-            return self._dispatch_impl(
-                limit, only_issues=only_issues, stalled_entries=stalled_entries
+            result = self._dispatch_impl(
+                limit,
+                only_issues=only_issues,
+                stalled_entries=stalled_entries,
+                ready_issues=ready_issues,
             )
+            data = dict(result.data)
+            if finalized:
+                data["merged_pr_closed_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_closed_issue_numbers", [])) | finalized
+                )
+                data["merged_pr_referenced_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_referenced_issue_numbers", [])) | finalized
+                )
+            return CommandResult(result.ok, result.message, data)
         except StateLockBusy:
             return _state_lock_busy_result(
                 "dispatch deferred: state lock held",
                 selected_count=0,
                 deferred_reason="state_lock_busy",
+                merged_pr_closed_issue_numbers=sorted(finalized),
+                merged_pr_referenced_issue_numbers=sorted(finalized),
             )
         except GraphQLBudgetError as exc:
             return CommandResult(
@@ -2660,6 +2861,8 @@ class OrchestratorApp:
                     "graphql_remaining": exc.remaining,
                     "graphql_reset": exc.reset_at,
                     "graphql_threshold": exc.threshold,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
         finally:
@@ -2672,13 +2875,17 @@ class OrchestratorApp:
         *,
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
+        ready_issues: list[dict[str, Any]] | None = None,
     ) -> CommandResult:
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
-        issues = self.gh.issue_list(
-            labels=[self.config.labels.ready],
-            state="all",
-        )
+        if ready_issues is None:
+            issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        else:
+            issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
 
@@ -2911,6 +3118,26 @@ class OrchestratorApp:
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
         )
+
+        # Issue #432: cap merge-finalization per pass so a large backlog cannot
+        # monopolize the pass budget. Oldest first (by creation date, then issue
+        # number) drains the backlog deterministically.
+        issue_by_number = {int(issue["number"]): issue for issue in issues}
+        finalize_limit = self.config.dispatch.finalize_limit
+
+        def _finalization_order(issue_numbers: set[int]) -> list[int]:
+            return sorted(
+                issue_numbers,
+                key=lambda n: (issue_by_number.get(n, {}).get("createdAt", ""), n),
+            )
+
+        finalizable_bound_issue_numbers = _finalization_order(merged_pr_bound_issue_numbers)[
+            :finalize_limit
+        ]
+        finalizable_mention_issue_numbers = _finalization_order(
+            merged_pr_mention_only_issue_numbers
+        )[:finalize_limit]
+
         pr_by_issue = {}
         for pr in prs:
             issue_number = linked_issue_number(
@@ -2932,9 +3159,11 @@ class OrchestratorApp:
         # yet. These are network calls, so they run outside the state lock;
         # the successful closures are persisted to state.json inside the lock
         # below, and the issue numbers are excluded from dispatch candidates
-        # regardless of closure success.
+        # regardless of closure success. Issue #432: only the oldest
+        # finalize_limit issues are processed per pass, so a one-time backlog
+        # cannot monopolize the pass budget.
         closed_merged_pr_issues: set[int] = set()
-        for issue_number in merged_pr_bound_issue_numbers:
+        for issue_number in finalizable_bound_issue_numbers:
             # Best-effort label transition and issue close. A failure here is
             # non-fatal; the issue is still excluded from dispatch because the
             # merged PR reference exists, and the next pass will retry.
@@ -2948,30 +3177,13 @@ class OrchestratorApp:
         # issue is excluded from this pass's candidates (via
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
-        # redispatch it.
-        for issue_number in merged_pr_mention_only_issue_numbers:
+        # redispatch it. Issue #432: capped to finalize_limit per pass.
+        for issue_number in finalizable_mention_issue_numbers:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
-        # Issue #429: a closed ready issue with no merged PR binding it is stale
-        # (e.g. human-closed not-planned/duplicate). Strip the ready marker and
-        # any active labels so it drops out of future --state all fetches.
-        closed_unmerged_ready_issues: set[int] = set()
-        for issue in issues:
-            if (
-                str(issue.get("state") or "OPEN").upper() == "CLOSED"
-                and int(issue["number"]) not in merged_pr_issue_numbers
-            ):
-                result = transition(
-                    self.gh,
-                    self.config.labels,
-                    int(issue["number"]),
-                    "closed_unmerged",
-                )
-                if result.outcome in (
-                    TransitionOutcome.APPLIED,
-                    TransitionOutcome.NOTHING_CHANGED,
-                ):
-                    closed_unmerged_ready_issues.add(int(issue["number"]))
+        # Issue #429/#433: closed-unmerged stripping is handled by
+        # _finalize_externally_merged_issues, which already performs the
+        # capped per-issue merged-PR lookup and removes stale ready/active labels.
 
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -3010,7 +3222,7 @@ class OrchestratorApp:
             # check) can surface mention-only coverage without re-deriving
             # the mention scan. "status" is deliberately untouched — the
             # issue stays open and its normal state machine intact.
-            for issue_number in merged_pr_mention_only_issue_numbers:
+            for issue_number in finalizable_mention_issue_numbers:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -3018,28 +3230,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if merged_pr_mention_only_issue_numbers:
+            if finalizable_mention_issue_numbers:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": sorted(merged_pr_mention_only_issue_numbers)},
-                )
-                save_state(self.paths.state_file, state)
-            # Issue #429: reconcile state.json entries for closed unmerged issues
-            # that had their ready/active labels stripped.
-            for issue_number in closed_unmerged_ready_issues:
-                _issue_key = str(issue_number)
-                _issue_entry = state["issues"].get(_issue_key, {})
-                state["issues"][_issue_key] = {
-                    **_issue_entry,
-                    "number": issue_number,
-                    "status": "closed",
-                }
-            if closed_unmerged_ready_issues:
-                state = append_event(
-                    state,
-                    "dispatch_closed_unmerged_ready_stripped",
-                    {"issue_numbers": sorted(closed_unmerged_ready_issues)},
+                    {"issue_numbers": finalizable_mention_issue_numbers},
                 )
                 save_state(self.paths.state_file, state)
             # Defence-in-depth against double-dispatch: an issue whose state records
@@ -3336,9 +3531,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-                    "merged_pr_flagged_issue_numbers": sorted(
-                        merged_pr_mention_only_issue_numbers
-                    ),
+                    "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
                 },
             )
             save_state(self.paths.state_file, state)
@@ -3362,7 +3555,7 @@ class OrchestratorApp:
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-            "merged_pr_flagged_issue_numbers": sorted(merged_pr_mention_only_issue_numbers),
+            "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),

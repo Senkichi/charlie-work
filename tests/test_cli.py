@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from charlie_work import cli
 from charlie_work.fleet_paths import fleet_dir
+from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
 
 
@@ -310,3 +312,72 @@ def test_cli_fleet_supervise_command_runs_and_returns_ok(
     assert rc == 0
     assert captured["kwargs"]["limit"] == 3
     assert captured["kwargs"]["max_runtime_override"] == 120
+
+
+def test_run_fleet_bash_rats_self_deploys_before_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`charlie fleet bash-rats` calls self_deploy on the orchestrator root first."""
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=True,
+            from_sha="abc123",
+            to_sha="def456",
+            message="updated: def456",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: None)
+
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", "custom-fleet", "fleet", "bash-rats", "--limit", "2"]
+    )
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    deploy_mock.assert_called_once()
+    orchestrator_root = deploy_mock.call_args[0][0]
+    assert isinstance(orchestrator_root, Path)
+    assert (orchestrator_root / "pyproject.toml").exists()
+    assert deploy_mock.call_args.kwargs.get("fleet_dir_override") == "custom-fleet"
+    assert fleet_loop_mock.called is True
+    assert fleet_loop_mock.call_args.kwargs.get("fleet_dir_override") == "custom-fleet"
+
+    out = capsys.readouterr().out
+    assert "self-deploy: updated: def456" in out
+
+
+def test_run_fleet_bash_rats_self_deploy_failure_is_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed self_deploy does not abort a `charlie fleet bash-rats` pass."""
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="diverged or dirty tree",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: None)
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert fleet_loop_mock.called is True
+    out = capsys.readouterr().out
+    assert "self-deploy skipped: diverged or dirty tree" in out
