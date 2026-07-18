@@ -2682,7 +2682,12 @@ class OrchestratorApp:
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
     ) -> CommandResult:
-        issues = self.gh.issue_list(self.config.labels.ready)
+        # Issue #427: include closed ready-labeled issues so externally-merged PRs
+        # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
+        issues = self.gh.issue_list(
+            labels=[self.config.labels.ready],
+            state="all",
+        )
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
 
@@ -2751,9 +2756,11 @@ class OrchestratorApp:
             # expensive listing query entirely rather than fetch-and-discard
             # (issue #361).
             merged_prs = self.gh.merged_pr_list() if issues else []
-            merged_pr_bound_issue_numbers, merged_pr_mention_only_issue_numbers = (
-                self._merged_pr_referenced_issue_numbers(issues, merged_prs)
-            )
+            (
+                merged_pr_bound_issue_numbers,
+                merged_pr_mention_only_issue_numbers,
+                _,
+            ) = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
             merged_pr_issue_numbers = (
                 merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
             )
@@ -2905,9 +2912,11 @@ class OrchestratorApp:
         # intersects against the ready-issue-number set) — skip the expensive
         # listing query entirely rather than fetch-and-discard (issue #361).
         merged_prs = self.gh.merged_pr_list() if issues else []
-        merged_pr_bound_issue_numbers, merged_pr_mention_only_issue_numbers = (
-            self._merged_pr_referenced_issue_numbers(issues, merged_prs)
-        )
+        (
+            merged_pr_bound_issue_numbers,
+            merged_pr_mention_only_issue_numbers,
+            merged_pr_bound_pr_numbers,
+        ) = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
         )
@@ -2971,6 +2980,19 @@ class OrchestratorApp:
                     "dispatch_merged_pr_references_closed",
                     {"issue_numbers": sorted(closed_merged_pr_issues)},
                 )
+                save_state(self.paths.state_file, state)
+            # Issue #427: finalize state.json entries for the merged PRs so
+            # externally-merged PRs (Aviator mergequeue handoff) do not leave
+            # stale prs[...].status == "mergequeue" behind.
+            for pr_number in merged_pr_bound_pr_numbers:
+                _pr_key = str(pr_number)
+                _pr_entry = state["prs"].get(_pr_key, {})
+                state["prs"][_pr_key] = {
+                    **_pr_entry,
+                    "status": "merged",
+                    "merged": True,
+                }
+            if merged_pr_bound_pr_numbers:
                 save_state(self.paths.state_file, state)
             # Record a flag timestamp so operators/tooling (e.g. a doctor
             # check) can surface mention-only coverage without re-deriving
@@ -6962,10 +6984,10 @@ class OrchestratorApp:
         self,
         issues: list[dict[str, Any]],
         merged_prs: list[dict[str, Any]],
-    ) -> tuple[set[int], set[int]]:
+    ) -> tuple[set[int], set[int], set[int]]:
         """Return ready issues already covered by a merged PR, split by trust level.
 
-        Returns a ``(bound, mention_only)`` pair:
+        Returns a ``(bound, mention_only, bound_pr_numbers)`` triple:
 
         * ``bound`` — ``linked_issue_number`` binds the PR to the issue by a
           hijack-safe signal (same-repo branch-prefix or closing-action verb).
@@ -6982,14 +7004,18 @@ class OrchestratorApp:
           contract: issue #203 never authorized closing an issue on a bare
           mention. Callers MUST exclude these from dispatch and flag them for
           a human — never close the issue or transition it toward "merged".
+        * ``bound_pr_numbers`` — the PR numbers that bound to a managed issue.
+          Used to finalize state.json ``prs`` entries for externally-merged PRs
+          (issue #427: Aviator mergequeue handoff).
 
-        Both sets are intersected with the set of ready issues so a stray
-        mention of an issue not in the dispatch queue does not get actioned.
-        ``bound`` takes precedence: an issue bound by one merged PR but only
-        mentioned by another is reported solely in ``bound``.
+        The bound/mention sets are intersected with the supplied issue set so a
+        stray mention of an issue not in the dispatch queue does not get
+        actioned. ``bound`` takes precedence: an issue bound by one merged PR
+        but only mentioned by another is reported solely in ``bound``.
         """
         ready_issue_numbers = {int(issue["number"]) for issue in issues}
         bound: set[int] = set()
+        bound_pr_numbers: set[int] = set()
         mention_only: set[int] = set()
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
@@ -7001,6 +7027,7 @@ class OrchestratorApp:
             )
             if issue_number is not None and issue_number in ready_issue_numbers:
                 bound.add(issue_number)
+                bound_pr_numbers.add(int(pr["number"]))
             # isCrossRepository describes the PR's own head-branch provenance
             # (fork vs. same-repo), not which repo a free-text "#N" refers to.
             # It cannot fully guard a cross-repo mention collision, but it does
@@ -7010,13 +7037,16 @@ class OrchestratorApp:
                     if mentioned in ready_issue_numbers:
                         mention_only.add(mentioned)
         mention_only -= bound
-        return bound, mention_only
+        return bound, mention_only, bound_pr_numbers
 
     def _is_dispatchable(
         self,
         issue: dict[str, Any],
         operator_claimed: set[int] | None = None,
     ) -> bool:
+        # Closed issues are never dispatchable, regardless of labels.
+        if str(issue.get("state") or "OPEN").upper() != "OPEN":
+            return False
         names = label_names(issue)
         if self.config.labels.ready not in names:
             return False

@@ -35,10 +35,22 @@ This matters for the following invariants:
    results into an attention digest.
 3. Exit.
 
-The fleet command does **not** use the supervised loop.  It is designed for
-scheduled invocation by Task Scheduler / cron — the scheduler provides the
-repeat cadence, and the lock in each repo's `supervisor.lock` prevents
-concurrent single-repo `bash-rats` runs from overlapping with a fleet sweep.
+For continuous fleet operation use `charlie fleet supervise`.  It runs the same
+multi-repo sweep in a poll/sleep loop inside the Python process, using the same
+`supervisor` config section as the per-repo `bash-rats` loop:
+`poll_interval_seconds`, `active_cooldown_seconds`, `max_runtime_minutes`, and
+`full_pass_interval_seconds`.  Between full passes it polls an aggregate
+`FleetLocalSnapshot` of every registered repo's sidecar and verdict mtimes
+(`_take_fleet_snapshot()` / `_has_fleet_delta()`); a full pass fires only when
+a local delta is detected or `full_pass_interval_seconds` has elapsed since the
+last full pass.  This keeps idle fleet polling cheap and avoids GitHub rate-limit
+exhaustion at fleet scale.
+A `fleet-supervisor.lock` in the fleet directory prevents overlapping
+`fleet supervise` invocations.
+
+Scheduled one-shot `fleet bash-rats` invocation by Task Scheduler / cron is
+still supported, but no longer required: `fleet supervise` needs no external
+scheduler or shell launcher.
 
 ## Supervisor design details
 
