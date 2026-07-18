@@ -336,7 +336,9 @@ def test_run_fleet_bash_rats_self_deploys_before_pass(
     monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
     monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: None)
 
-    args = cli.build_parser().parse_args(["fleet", "bash-rats", "--limit", "2"])
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", "custom-fleet", "fleet", "bash-rats", "--limit", "2"]
+    )
     result = cli.run_fleet_bash_rats(args)
 
     assert result.ok is True
@@ -344,7 +346,9 @@ def test_run_fleet_bash_rats_self_deploys_before_pass(
     orchestrator_root = deploy_mock.call_args[0][0]
     assert isinstance(orchestrator_root, Path)
     assert (orchestrator_root / "pyproject.toml").exists()
+    assert deploy_mock.call_args.kwargs.get("fleet_dir_override") == "custom-fleet"
     assert fleet_loop_mock.called is True
+    assert fleet_loop_mock.call_args.kwargs.get("fleet_dir_override") == "custom-fleet"
 
     out = capsys.readouterr().out
     assert "self-deploy: updated: def456" in out

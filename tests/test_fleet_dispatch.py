@@ -41,7 +41,7 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> None:
     """Self-deploy hits the real git/uv CLI; keep fleet supervisor unit tests hermetic."""
     monkeypatch.setattr(
         "charlie_work.fleet_dispatch.self_deploy",
-        lambda _repo_root: SelfDeployResult(
+        lambda _repo_root, **_kwargs: SelfDeployResult(
             ok=True,
             pulled=False,
             changed=False,
