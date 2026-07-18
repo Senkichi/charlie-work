@@ -121,6 +121,19 @@ class GitHubRunResult:
     error: str | None = None
 
 
+class _MergedPRSearchResult(list):
+    """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
+
+    Behaves like a normal list so existing list-consuming callers keep working,
+    but exposes ``ok`` so callers can distinguish a successful empty search from
+    a failed ``gh pr list --search`` call (rate limit, search error, etc.).
+    """
+
+    def __init__(self, items: list[Any], ok: bool = True) -> None:
+        super().__init__(items)
+        self.ok = ok
+
+
 # Matches the job-id segment of a GitHub Actions check link, e.g.
 # https://github.com/OWNER/REPO/actions/runs/RUN_ID/job/JOB_ID (optionally
 # followed by a query string or #fragment, e.g. "?check_suite_focus=true").
@@ -497,6 +510,66 @@ class GitHub:
             limit=_LIST_LIMIT,
             kind="merged PRs",
         )
+
+    def merged_prs_for_issue(
+        self,
+        issue_number: int,
+        branch_prefix: str,
+    ) -> _MergedPRSearchResult:
+        """Return merged PRs that hijack-safely bind to ``issue_number``.
+
+        Uses ``gh pr list --state merged --search`` so PRs merged long ago
+        (outside the most-recent 500 window used by ``merged_pr_list``) are
+        still discoverable.  The search is scoped to the issue number, so a
+        single merged PR outside the global window can be finalized without
+        fetching every merged PR.
+
+        Returns a list-like object because multiple merged PRs can reference the
+        same issue; callers treat any returned PR as evidence the issue is done.
+        The returned object's ``ok`` flag is False when the search call itself
+        failed (e.g. rate limit), allowing callers to implement circuit breakers.
+        """
+        query = f'"#{issue_number}"'
+        result = self.run(
+            [
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--search",
+                query,
+                "--limit",
+                "20",
+                "--json",
+                MERGED_PR_LIST_FIELDS,
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            if not result.ok:
+                logger.warning(
+                    "Failed to search merged PRs for issue #%d: %s",
+                    issue_number,
+                    result.error,
+                )
+                return _MergedPRSearchResult([], ok=False)
+            items = result.value if isinstance(result.value, list) else []
+        else:
+            items = result if isinstance(result, list) else []
+
+        matched: list[dict[str, Any]] = []
+        for pr in items:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=branch_prefix,
+            )
+            if bound == issue_number:
+                matched.append(pr)
+        return _MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int) -> dict[str, Any]:
         result = self.run(

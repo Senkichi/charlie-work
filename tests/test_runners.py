@@ -1380,6 +1380,8 @@ def test_provision_runner_dry_run(tmp_path: Path) -> None:
         runner_dir_prefix="jc-",
         runner_name_template="jc-{n}",
         package_zip=str(package_zip),
+        ram_per_job_gb=0.0,
+        min_free_ram_gb=0.0,
     )
 
     result = provision_runner(gh, config, busy_jobs=0, dry_run=True)
@@ -1414,6 +1416,8 @@ def test_provision_runner_dry_run_no_mutation(tmp_path: Path) -> None:
         runner_dir_prefix="jc-",
         runner_name_template="jc-{n}",
         package_zip=str(package_zip),
+        ram_per_job_gb=0.0,
+        min_free_ram_gb=0.0,
     )
 
     # Snapshot the directory contents before dry-run
@@ -1446,6 +1450,8 @@ def test_provision_runner_dry_run_missing_package_no_duplicate_actions(tmp_path:
         runner_dir_prefix="jc-",
         runner_name_template="jc-{n}",
         package_zip=str(missing_package),
+        ram_per_job_gb=0.0,
+        min_free_ram_gb=0.0,
     )
 
     result = provision_runner(gh, config, busy_jobs=0, dry_run=True)
@@ -1483,6 +1489,8 @@ def test_provision_runner_config_failure_cleans_orphan_dir(tmp_path: Path) -> No
         runner_dir_prefix="jc-",
         runner_name_template="jc-{n}",
         package_zip=str(package_zip),
+        ram_per_job_gb=0.0,
+        min_free_ram_gb=0.0,
     )
 
     # Mock _configure_runner to fail
