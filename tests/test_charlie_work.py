@@ -10294,6 +10294,61 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
     assert issue_state.get("dispatch_pending_at") is None
 
 
+def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None:
+    """Issue #448: failed rework dispatch must record the per-issue reason in the event payload."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    assert result.message.startswith("rework dispatch failures:")
+    assert "#123" in result.message
+
+    state = load_state(paths.state_file)
+    rework_events = [e for e in state["events"] if e["kind"] == "dispatch_rework"]
+    assert rework_events, "dispatch_rework event must be emitted"
+    payload = rework_events[-1]["payload"]
+    assert payload["failed_issue_numbers"] == [123]
+    assert "123" in payload["failures"]
+    assert "command exited 1" in payload["failures"]["123"]
+    assert result.data["failures"][123] == payload["failures"]["123"]
+
+
 def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     config = OrchestratorConfig(auto_merge=_approved_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
