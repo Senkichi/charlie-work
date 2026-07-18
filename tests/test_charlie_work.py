@@ -2948,6 +2948,20 @@ class FakeGitHub:
     def merged_pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
 
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+        matched = []
+        for pr in self.prs:
+            if pr.get("state", "OPEN").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=branch_prefix,
+            )
+            if bound == issue_number:
+                matched.append(pr)
+        return matched
+
     def pr_view(self, number: int):
         # Return the PR matching the requested number
         for pr in self.prs:
@@ -3446,6 +3460,63 @@ def test_dispatch_finalizes_closed_issue_for_aviator_merge(tmp_path: Path) -> No
     save_state(paths.state_file, seed)
 
     # Aviator merged the PR; GitHub auto-closed the issue.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["labels"] = [{"name": "mergequeue"}]
+    fake_gh.issues[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.pr_open},
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == [123]
+    assert result.data["merged_pr_closed_issue_numbers"] == [123]
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    assert (123, config.labels.done) in fake_gh.labels_added
+    assert (123, config.labels.pr_open) in fake_gh.labels_removed
+    assert (123, config.labels.ready) in fake_gh.labels_removed
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "merged"
+    assert state["prs"]["456"]["merged"] is True
+    assert state["issues"]["123"]["status"] == "closed"
+
+
+def test_dispatch_finalizes_closed_issue_with_pr_outside_merged_pr_list_window(
+    tmp_path: Path,
+) -> None:
+    """Issue #433: a closed ready-labeled issue whose merged PR is older than the
+    most-recent-500 window of ``merged_pr_list()`` must still be finalized.
+
+    This simulates a repo with 1250+ merged PRs where the global list cannot see
+    the linked PR, but a per-issue ``gh pr list --search`` lookup finds it.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubOutsideWindow(FakeGitHub):
+        def issue_list(self, labels=None, state=None):
+            issues = super().issue_list(labels=labels, state=state)
+            if state is None:
+                state = "OPEN"
+            if state.upper() == "ALL":
+                return issues
+            return [i for i in issues if (i.get("state") or "OPEN").upper() == state.upper()]
+
+        def merged_pr_list(self):
+            # Simulate the 500-window truncation: the real merged PR is not visible.
+            return []
+
+    fake_gh = FakeGitHubOutsideWindow()
+
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {"status": "mergequeue", "issue_number": 123}
+    seed["issues"]["123"] = {"status": "reviewing", "number": 123}
+    save_state(paths.state_file, seed)
+
     fake_gh.prs[0]["state"] = "MERGED"
     fake_gh.prs[0]["labels"] = [{"name": "mergequeue"}]
     fake_gh.issues[0]["state"] = "CLOSED"

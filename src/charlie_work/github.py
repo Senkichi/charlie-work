@@ -498,6 +498,64 @@ class GitHub:
             kind="merged PRs",
         )
 
+    def merged_prs_for_issue(
+        self,
+        issue_number: int,
+        branch_prefix: str,
+    ) -> list[dict[str, Any]]:
+        """Return merged PRs that hijack-safely bind to ``issue_number``.
+
+        Uses ``gh pr list --state merged --search`` so PRs merged long ago
+        (outside the most-recent 500 window used by ``merged_pr_list``) are
+        still discoverable.  The search is scoped to the issue number, so a
+        single merged PR outside the global window can be finalized without
+        fetching every merged PR.
+
+        Returns a list because multiple merged PRs can reference the same issue;
+        callers treat any returned PR as evidence the issue is done.
+        """
+        query = f'"#{issue_number}"'
+        result = self.run(
+            [
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--search",
+                query,
+                "--limit",
+                "20",
+                "--json",
+                MERGED_PR_LIST_FIELDS,
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            if not result.ok:
+                logger.warning(
+                    "Failed to search merged PRs for issue #%d: %s",
+                    issue_number,
+                    result.error,
+                )
+                return []
+            items = result.value if isinstance(result.value, list) else []
+        else:
+            items = result if isinstance(result, list) else []
+
+        matched: list[dict[str, Any]] = []
+        for pr in items:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=branch_prefix,
+            )
+            if bound == issue_number:
+                matched.append(pr)
+        return matched
+
     def pr_view(self, number: int) -> dict[str, Any]:
         result = self.run(
             [

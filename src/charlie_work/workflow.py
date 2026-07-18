@@ -2609,6 +2609,86 @@ class OrchestratorApp:
             },
         )
 
+    def _finalize_externally_merged_issues(
+        self,
+        ready_issues: list[dict[str, Any]] | None = None,
+    ) -> tuple[set[int], list[dict[str, Any]]]:
+        """Finalize closed ready-labeled issues whose linked PR merged externally.
+
+        Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
+        throttle) so a pass that defers new work still drains the backlog of
+        externally-merged issues (e.g. Aviator MergeQueue handoffs).  Instead of
+        intersecting against the global most-recent-500 ``merged_pr_list()``, it
+        looks up the linked merged PR for each closed ready issue directly.
+        """
+        if ready_issues is None:
+            ready_issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        closed_ready = [
+            issue
+            for issue in ready_issues
+            if str(issue.get("state") or "OPEN").upper() == "CLOSED"
+        ]
+        if not closed_ready:
+            return set(), ready_issues
+
+        issue_pr_map: dict[int, list[dict[str, Any]]] = {}
+        for issue in closed_ready:
+            issue_number = int(issue["number"])
+            merged_prs = self.gh.merged_prs_for_issue(
+                issue_number,
+                self.config.dispatch.branch_prefix,
+            )
+            if merged_prs:
+                issue_pr_map[issue_number] = merged_prs
+
+        if not issue_pr_map:
+            return set(), ready_issues
+
+        # Persist state first, then apply labels outside the lock.
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for issue_number, prs in issue_pr_map.items():
+                issue_key = str(issue_number)
+                issue_entry = state["issues"].get(issue_key, {})
+                state["issues"][issue_key] = {
+                    **issue_entry,
+                    "number": issue_number,
+                    "status": "closed",
+                }
+                for pr in prs:
+                    pr_number = int(pr["number"])
+                    pr_key = str(pr_number)
+                    pr_entry = state["prs"].get(pr_key, {})
+                    state["prs"][pr_key] = {
+                        **pr_entry,
+                        "number": pr_number,
+                        "status": "merged",
+                        "merged": True,
+                        "issue_number": issue_number,
+                    }
+            state = append_event(
+                state,
+                "finalize_externally_merged",
+                {
+                    "issue_numbers": sorted(issue_pr_map.keys()),
+                    "pr_numbers": sorted(
+                        {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
+                    ),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        for issue_number in issue_pr_map:
+            transition(self.gh, self.config.labels, issue_number, "merged")
+            self.gh.close_issue(issue_number)
+
+        finalized: set[int] = set(issue_pr_map.keys())
+        remaining = [issue for issue in ready_issues if int(issue["number"]) not in finalized]
+        return finalized, remaining
+
     def dispatch(
         self,
         limit: int | None = None,
@@ -2628,6 +2708,19 @@ class OrchestratorApp:
         Finding 2). Standalone callers leave this as None and the sweep runs
         inside this call as before.
         """
+        # Finalize closed ready-labeled issues whose linked PR merged externally.
+        # This runs before fleet lock / GraphQL budget / provider throttle guards
+        # so a pass that defers new dispatch still drains the Aviator-merge backlog.
+        finalized: set[int] = set()
+        try:
+            finalized, ready_issues = self._finalize_externally_merged_issues()
+        except StateLockBusy:
+            return _state_lock_busy_result(
+                "dispatch deferred: state lock held",
+                selected_count=0,
+                deferred_reason="state_lock_busy",
+            )
+
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -2638,17 +2731,33 @@ class OrchestratorApp:
                     {
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
+                        "merged_pr_closed_issue_numbers": sorted(finalized),
+                        "merged_pr_referenced_issue_numbers": sorted(finalized),
                     },
                 )
         try:
-            return self._dispatch_impl(
-                limit, only_issues=only_issues, stalled_entries=stalled_entries
+            result = self._dispatch_impl(
+                limit,
+                only_issues=only_issues,
+                stalled_entries=stalled_entries,
+                ready_issues=ready_issues,
             )
+            data = dict(result.data)
+            if finalized:
+                data["merged_pr_closed_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_closed_issue_numbers", [])) | finalized
+                )
+                data["merged_pr_referenced_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_referenced_issue_numbers", [])) | finalized
+                )
+            return CommandResult(result.ok, result.message, data)
         except StateLockBusy:
             return _state_lock_busy_result(
                 "dispatch deferred: state lock held",
                 selected_count=0,
                 deferred_reason="state_lock_busy",
+                merged_pr_closed_issue_numbers=sorted(finalized),
+                merged_pr_referenced_issue_numbers=sorted(finalized),
             )
         except GraphQLBudgetError as exc:
             return CommandResult(
@@ -2660,6 +2769,8 @@ class OrchestratorApp:
                     "graphql_remaining": exc.remaining,
                     "graphql_reset": exc.reset_at,
                     "graphql_threshold": exc.threshold,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
         finally:
@@ -2672,13 +2783,17 @@ class OrchestratorApp:
         *,
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
+        ready_issues: list[dict[str, Any]] | None = None,
     ) -> CommandResult:
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
-        issues = self.gh.issue_list(
-            labels=[self.config.labels.ready],
-            state="all",
-        )
+        if ready_issues is None:
+            issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        else:
+            issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
 
