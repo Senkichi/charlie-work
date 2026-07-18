@@ -163,6 +163,25 @@ def _log_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> int:
+    """Read the existing claude sidecar's Signal-1 deferral counter, if any."""
+    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    raw = payload.get("inconclusive_probe_deferred_count")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _events_path(
     sessions_dir: Path, issue_number: int, *, rework: bool = False, review: bool = False
 ) -> Path:
@@ -348,6 +367,7 @@ def _error_record(
     failure_kind: str | None = None,
     pid: int | None = None,
     process_start_time: float | None = None,
+    inconclusive_probe_deferred_count: int = 0,
     session_id: str | None = None,
 ) -> ClaudeWorkerRecord:
     return ClaudeWorkerRecord(
@@ -362,6 +382,7 @@ def _error_record(
         error=error,
         failure_kind=failure_kind,
         process_start_time=process_start_time,
+        inconclusive_probe_deferred_count=inconclusive_probe_deferred_count,
         session_id=session_id,
     )
 
@@ -491,6 +512,17 @@ def launch_claude_worker(
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
     session_id = str(uuid.uuid4())
+
+    # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
+    # the recovery dict from the existing sidecar (if any) so consecutive
+    # recovery attempts observe the same counter the reaper does.
+    if not review and recovery is not None:
+        recovery = dict(recovery)
+        recovery.setdefault(
+            "inconclusive_probe_deferred_count",
+            _read_sidecar_inconclusive_count(sessions_dir, issue_number),
+        )
+
     if review:
         # Hard-pinned, not a default: see _sanitize_review_command_template
         # and PR #397 round-2 review. No caller-supplied command_template
@@ -559,6 +591,9 @@ def launch_claude_worker(
             process_start_time=exc.process_start_time
             if isinstance(exc, LiveWorkerRedispatchError)
             else None,
+            inconclusive_probe_deferred_count=exc.inconclusive_probe_deferred_count
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else 0,
             session_id=session_id,
         )
         return _write_record(sessions_dir, record)
