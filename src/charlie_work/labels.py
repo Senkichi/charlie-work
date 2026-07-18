@@ -69,6 +69,13 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
             (labels.done,),
             _compute_remove((labels.done,), extra_remove=(labels.ready,)),
         ),
+        # Issue #429: a closed ready issue with no merged PR binding it is stale
+        # (e.g. human-closed not-planned/duplicate). Strip the ready marker and
+        # any active labels so it drops out of future --state all fetches.
+        "closed_unmerged": (
+            (),
+            tuple(sorted(labels.active | {labels.ready})),
+        ),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
         # Issue #203: a merged PR only *mentions* the issue in free text, with

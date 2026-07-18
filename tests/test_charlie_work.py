@@ -3471,6 +3471,43 @@ def test_dispatch_finalizes_closed_issue_for_aviator_merge(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "closed"
 
 
+def test_dispatch_strips_ready_from_closed_unmerged_issue(tmp_path: Path) -> None:
+    """Issue #429: a ready issue closed by a human (not-planned/duplicate) with
+    no merged PR binding it must have its ready marker and any active labels
+    stripped and its state.json entry reconciled so it drops out of future
+    --state all fetches.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Issue #123 is closed without a merged PR; only the ready marker is present.
+    fake_gh.issues[0]["state"] = "CLOSED"
+    assert fake_gh.issues[0]["labels"] == [{"name": config.labels.ready}]
+    assert fake_gh.prs[0]["state"] == "OPEN"
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == []
+    assert result.data["merged_pr_closed_issue_numbers"] == []
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    assert 123 not in fake_gh.closed_issues
+    assert (123, config.labels.ready) in fake_gh.labels_removed
+    assert fake_gh.labels_added == []
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "closed"
+    stripped_events = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "dispatch_closed_unmerged_ready_stripped"
+    ]
+    assert len(stripped_events) == 1
+    assert stripped_events[0]["payload"]["issue_numbers"] == [123]
+
+
 def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
     tmp_path: Path,
 ) -> None:

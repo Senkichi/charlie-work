@@ -2952,6 +2952,27 @@ class OrchestratorApp:
         for issue_number in merged_pr_mention_only_issue_numbers:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
+        # Issue #429: a closed ready issue with no merged PR binding it is stale
+        # (e.g. human-closed not-planned/duplicate). Strip the ready marker and
+        # any active labels so it drops out of future --state all fetches.
+        closed_unmerged_ready_issues: set[int] = set()
+        for issue in issues:
+            if (
+                str(issue.get("state") or "OPEN").upper() == "CLOSED"
+                and int(issue["number"]) not in merged_pr_issue_numbers
+            ):
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    int(issue["number"]),
+                    "closed_unmerged",
+                )
+                if result.outcome in (
+                    TransitionOutcome.APPLIED,
+                    TransitionOutcome.NOTHING_CHANGED,
+                ):
+                    closed_unmerged_ready_issues.add(int(issue["number"]))
+
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Persist the fact that merged PRs already covered these ready issues.
@@ -3002,6 +3023,23 @@ class OrchestratorApp:
                     state,
                     "dispatch_merged_pr_mention_flagged",
                     {"issue_numbers": sorted(merged_pr_mention_only_issue_numbers)},
+                )
+                save_state(self.paths.state_file, state)
+            # Issue #429: reconcile state.json entries for closed unmerged issues
+            # that had their ready/active labels stripped.
+            for issue_number in closed_unmerged_ready_issues:
+                _issue_key = str(issue_number)
+                _issue_entry = state["issues"].get(_issue_key, {})
+                state["issues"][_issue_key] = {
+                    **_issue_entry,
+                    "number": issue_number,
+                    "status": "closed",
+                }
+            if closed_unmerged_ready_issues:
+                state = append_event(
+                    state,
+                    "dispatch_closed_unmerged_ready_stripped",
+                    {"issue_numbers": sorted(closed_unmerged_ready_issues)},
                 )
                 save_state(self.paths.state_file, state)
             # Defence-in-depth against double-dispatch: an issue whose state records
