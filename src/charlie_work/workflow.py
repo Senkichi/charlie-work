@@ -5720,8 +5720,13 @@ class OrchestratorApp:
         # Without this exclusion the parked PR keeps winning "earliest
         # reviewed" on every poll until GitHub reports it merged, so under
         # front_of_train no other approved PR is ever attempted while Aviator
-        # is still processing it.
-        state_prs = load_state_locked(self.paths.state_file).get("prs", {})
+        # is still processing it. Reading state is only necessary when the
+        # mergequeue handoff feature is actually configured.
+        state_prs = (
+            load_state_locked(self.paths.state_file).get("prs", {})
+            if self.config.auto_merge.mergequeue_label
+            else {}
+        )
         candidates: list[tuple[str, int, dict[str, Any], dict[str, Any], str]] = []
         for pr in prs:
             pr_number = int(pr.get("number", 0))

@@ -8691,6 +8691,32 @@ def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     assert (789, "mergequeue") in fake_gh.pr_labels_added
 
 
+def test_merge_train_candidates_no_state_read_when_mergequeue_label_unset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Issue #421: when auto_merge.mergequeue_label is None (the default),
+    _merge_train_candidates must not call load_state_locked. The mergequeue
+    handoff feature is disabled, so no PR can have status 'mergequeue' and the
+    state read is pure hot-path overhead that widens the StateLockBusy window.
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("load_state_locked called with mergequeue_label unset")
+
+    monkeypatch.setattr("charlie_work.workflow.load_state_locked", _fail_if_called)
+
+    candidates = app._merge_train_candidates(prs=fake_gh.prs)
+
+    pr_numbers = [pr_number for _sort_key, pr_number, _pr, _decision, _head in candidates]
+    assert 456 in pr_numbers
+
+
 def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
     tmp_path: Path,
 ) -> None:
