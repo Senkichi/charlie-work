@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
+from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
 
 if TYPE_CHECKING:
@@ -154,6 +155,169 @@ def try_acquire_supervisor_lock(lock_path: Path) -> _SupervisorLock | None:
     it (second-instance rejection).  Never raises.
     """
     return try_acquire_byte_range_lock(lock_path)
+
+
+# ---------------------------------------------------------------------------
+# Self-deploy (FF-pull origin/main + uv sync on dependency changes)
+# ---------------------------------------------------------------------------
+
+
+_DEP_LOCK_FILES: frozenset[str] = frozenset({"pyproject.toml", "uv.lock"})
+
+
+@dataclass(frozen=True)
+class SelfDeployResult:
+    """Result of a self-deploy attempt.
+
+    ``pulled`` is True when ``git pull`` reported success (including the
+    already-up-to-date case).  ``changed`` is True when HEAD moved.  ``synced``
+    is True when ``uv sync`` ran and succeeded.  ``ok`` is False whenever any
+    step reported an error; callers must treat this as non-fatal and continue
+    the pass.
+    """
+
+    ok: bool
+    pulled: bool
+    changed: bool
+    synced: bool
+    from_sha: str | None = None
+    to_sha: str | None = None
+    message: str = ""
+    error: str | None = None
+
+
+def self_deploy(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult] = run_captured,
+    pull_timeout: int = 60,
+    sync_timeout: int = 300,
+) -> SelfDeployResult:
+    """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
+
+    Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
+    touched ``pyproject.toml`` or ``uv.lock``.  All subprocess errors are
+    returned as values (non-fatal); the function never raises.
+    """
+    try:
+        before_res = run_command(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+        )
+        if not before_res.ok:
+            return SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                error=before_res.error or before_res.stderr or "failed to read HEAD",
+            )
+        before_sha = before_res.stdout.strip()
+
+        pull_res = run_command(
+            ["git", "pull", "--ff-only", "origin", "main"],
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+        )
+        if not pull_res.ok:
+            return SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                from_sha=before_sha,
+                error=pull_res.error or pull_res.stderr or "pull failed",
+            )
+
+        after_res = run_command(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+        )
+        if not after_res.ok:
+            return SelfDeployResult(
+                ok=False,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha=before_sha,
+                error=after_res.error or after_res.stderr or "failed to read HEAD after pull",
+            )
+        after_sha = after_res.stdout.strip()
+
+        if before_sha == after_sha:
+            return SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha=before_sha,
+                to_sha=after_sha,
+                message="already up to date",
+            )
+
+        diff_res = run_command(
+            ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"],
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+        )
+        if not diff_res.ok:
+            return SelfDeployResult(
+                ok=False,
+                pulled=True,
+                changed=True,
+                synced=False,
+                from_sha=before_sha,
+                to_sha=after_sha,
+                error=diff_res.error or diff_res.stderr or "diff failed",
+            )
+
+        changed_files = {line.strip() for line in diff_res.stdout.splitlines() if line.strip()}
+        if not (changed_files & _DEP_LOCK_FILES):
+            return SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=True,
+                synced=False,
+                from_sha=before_sha,
+                to_sha=after_sha,
+                message=f"code-only update: {after_sha}",
+            )
+
+        sync_res = run_command(
+            ["uv", "sync"],
+            cwd=repo_root,
+            timeout_seconds=sync_timeout,
+        )
+        if not sync_res.ok:
+            return SelfDeployResult(
+                ok=False,
+                pulled=True,
+                changed=True,
+                synced=False,
+                from_sha=before_sha,
+                to_sha=after_sha,
+                error=sync_res.error or sync_res.stderr or "uv sync failed",
+            )
+
+        return SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=True,
+            from_sha=before_sha,
+            to_sha=after_sha,
+            message=f"updated and synced: {after_sha}",
+        )
+    except Exception as exc:
+        return SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error=f"self_deploy crashed: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------
