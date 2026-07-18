@@ -18,6 +18,7 @@ from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .state import StateLockBusy, load_state_locked
+from .supervise import orchestrator_root, self_deploy
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -340,6 +341,15 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
     except (ConfigError, RepoNotFoundError):
         global_config = None
+
+    # Self-deploy before running the pass: FF-pull origin/main and sync
+    # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
+    # diverged or dirty tree.
+    deploy = self_deploy(orchestrator_root())
+    if deploy.synced:
+        print(f"self-deploy: {deploy.message}", flush=True)
+    elif not deploy.ok:
+        print(f"self-deploy skipped: {deploy.error}", flush=True)
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,

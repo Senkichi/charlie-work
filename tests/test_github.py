@@ -474,3 +474,4 @@ def test_merged_prs_for_issue_returns_empty_on_gh_failure(monkeypatch, tmp_path:
     result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
 
     assert result == []
+    assert result.ok is False

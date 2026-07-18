@@ -121,6 +121,19 @@ class GitHubRunResult:
     error: str | None = None
 
 
+class _MergedPRSearchResult(list):
+    """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
+
+    Behaves like a normal list so existing list-consuming callers keep working,
+    but exposes ``ok`` so callers can distinguish a successful empty search from
+    a failed ``gh pr list --search`` call (rate limit, search error, etc.).
+    """
+
+    def __init__(self, items: list[Any], ok: bool = True) -> None:
+        super().__init__(items)
+        self.ok = ok
+
+
 # Matches the job-id segment of a GitHub Actions check link, e.g.
 # https://github.com/OWNER/REPO/actions/runs/RUN_ID/job/JOB_ID (optionally
 # followed by a query string or #fragment, e.g. "?check_suite_focus=true").
@@ -502,7 +515,7 @@ class GitHub:
         self,
         issue_number: int,
         branch_prefix: str,
-    ) -> list[dict[str, Any]]:
+    ) -> _MergedPRSearchResult:
         """Return merged PRs that hijack-safely bind to ``issue_number``.
 
         Uses ``gh pr list --state merged --search`` so PRs merged long ago
@@ -511,8 +524,10 @@ class GitHub:
         single merged PR outside the global window can be finalized without
         fetching every merged PR.
 
-        Returns a list because multiple merged PRs can reference the same issue;
-        callers treat any returned PR as evidence the issue is done.
+        Returns a list-like object because multiple merged PRs can reference the
+        same issue; callers treat any returned PR as evidence the issue is done.
+        The returned object's ``ok`` flag is False when the search call itself
+        failed (e.g. rate limit), allowing callers to implement circuit breakers.
         """
         query = f'"#{issue_number}"'
         result = self.run(
@@ -538,7 +553,7 @@ class GitHub:
                     issue_number,
                     result.error,
                 )
-                return []
+                return _MergedPRSearchResult([], ok=False)
             items = result.value if isinstance(result.value, list) else []
         else:
             items = result if isinstance(result, list) else []
@@ -554,7 +569,7 @@ class GitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return matched
+        return _MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int) -> dict[str, Any]:
         result = self.run(
