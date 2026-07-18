@@ -3418,6 +3418,59 @@ def test_dispatch_skips_ready_issue_with_merged_pr_reference(tmp_path: Path) -> 
     assert not prompt_path.exists()
 
 
+def test_dispatch_finalizes_closed_issue_for_aviator_merge(tmp_path: Path) -> None:
+    """Issue #427: an Aviator-mergequeue merged PR closes its linked issue via
+    GitHub's 'Closes #N'. The issue may already be CLOSED while still carrying
+    stale automated-ready and agent:pr-open labels. dispatch() must scan
+    merged PRs regardless of the issue's open/closed state, run the merged
+    label transition, and clean up state.json.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubRespectingState(FakeGitHub):
+        def issue_list(self, labels=None, state=None):
+            issues = super().issue_list(labels=labels, state=state)
+            if state is None:
+                state = "OPEN"
+            if state.upper() == "ALL":
+                return issues
+            return [i for i in issues if (i.get("state") or "OPEN").upper() == state.upper()]
+
+    fake_gh = FakeGitHubRespectingState()
+
+    # Seed state as if merge_ready handed the PR off to Aviator.
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {"status": "mergequeue", "issue_number": 123}
+    seed["issues"]["123"] = {"status": "reviewing", "number": 123}
+    save_state(paths.state_file, seed)
+
+    # Aviator merged the PR; GitHub auto-closed the issue.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["labels"] = [{"name": "mergequeue"}]
+    fake_gh.issues[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.pr_open},
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["merged_pr_referenced_issue_numbers"] == [123]
+    assert result.data["merged_pr_closed_issue_numbers"] == [123]
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    assert (123, config.labels.done) in fake_gh.labels_added
+    assert (123, config.labels.pr_open) in fake_gh.labels_removed
+    assert (123, config.labels.ready) in fake_gh.labels_removed
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "merged"
+    assert state["prs"]["456"]["merged"] is True
+    assert state["issues"]["123"]["status"] == "closed"
+
+
 def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
     tmp_path: Path,
 ) -> None:
