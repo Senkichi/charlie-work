@@ -16,6 +16,7 @@ from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
     has_delta,
+    orchestrator_root,
     run_supervised,
     self_deploy,
     should_exit,
@@ -1047,3 +1048,11 @@ def test_self_deploy_uv_sync_failure_is_non_fatal(tmp_path: Path) -> None:
     assert result.synced is False
     assert result.to_sha == "def456"
     assert "failed to install" in (result.error or "")
+
+
+def test_orchestrator_root_contains_pyproject_toml() -> None:
+    """orchestrator_root() resolves to the orchestrator source tree root."""
+    root = orchestrator_root()
+    assert (root / "pyproject.toml").is_file()
+    # It should be the directory that holds the source tree, not a subpackage.
+    assert (root / "src" / "charlie_work" / "supervise.py").is_file()

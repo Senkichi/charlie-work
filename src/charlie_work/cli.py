@@ -18,7 +18,7 @@ from .global_config import load_layered_config
 from .github import GitHub, GitHubError
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .state import StateLockBusy, load_state_locked
-from .supervise import self_deploy
+from .supervise import orchestrator_root, self_deploy
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -345,8 +345,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
-    orchestrator_root = Path(__file__).resolve().parents[2]
-    deploy = self_deploy(orchestrator_root)
+    deploy = self_deploy(orchestrator_root())
     if deploy.synced:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif not deploy.ok:

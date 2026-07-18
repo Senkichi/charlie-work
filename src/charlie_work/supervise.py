@@ -164,6 +164,21 @@ def try_acquire_supervisor_lock(lock_path: Path) -> _SupervisorLock | None:
 
 _DEP_LOCK_FILES: frozenset[str] = frozenset({"pyproject.toml", "uv.lock"})
 
+#: Orchestrator source tree root (directory containing ``pyproject.toml``).
+#: Derived once at import so every consumer sees the same path.
+_ORCHESTRATOR_ROOT: Path = Path(__file__).resolve().parents[2]
+
+
+def orchestrator_root() -> Path:
+    """Return the orchestrator source tree root.
+
+    This is the directory that contains ``pyproject.toml`` and is the target
+    for ``self_deploy``'s ``git pull`` / ``uv sync``.  It is derived from this
+    module's location (``src/charlie_work/supervise.py``) instead of being
+    recomputed at every call site so file moves cannot silently break one copy.
+    """
+    return _ORCHESTRATOR_ROOT
+
 
 @dataclass(frozen=True)
 class SelfDeployResult:
