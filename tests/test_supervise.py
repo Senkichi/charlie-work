@@ -8,6 +8,7 @@ Injected sleep/clock: record sleep args; monotonically advancing fake clock.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +18,9 @@ from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
+    _pending_sync_marker_path,
     has_delta,
+    orchestrator_root,
     run_supervised,
     self_deploy,
     should_exit,
@@ -1105,6 +1108,11 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
         ["git", "diff", "--name-only", "abc123..def456"],
     ]
 
+    marker_path = _pending_sync_marker_path(tmp_path)
+    assert marker_path.exists()
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker == {"from_sha": "abc123", "to_sha": "def456"}
+
 
 def test_self_deploy_proceeds_when_zero_fleet_runners(
     tmp_path: Path, no_fleet_live_sessions: None
@@ -1129,3 +1137,105 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
     assert calls[-1][0] == ["uv", "sync"]
+    assert not _pending_sync_marker_path(tmp_path).exists()
+
+
+def test_self_deploy_retries_sync_after_deferral(
+    tmp_path: Path, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A deferred dependency sync is retried on the next pass once runners are idle.
+
+    Regression for the pass-after-deferral convergence bug: the original code
+    returned "already up to date" on the next pass (because HEAD did not move)
+    before checking the deferred sync, so uv sync never ran.
+    """
+    live_counts = iter([2, 0])
+
+    def _fake_count(_fleet_dir_override: str | None) -> tuple[int, list[str]]:
+        return next(live_counts), []
+
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_sessions", _fake_count)
+
+    # Pass N: dependency-changing pull, two active runners -> defer and write marker.
+    first_runner, first_calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
+            RunResult(0, "", ""),  # uv sync (not reached)
+        ]
+    )
+
+    first = self_deploy(tmp_path, run_command=first_runner)
+    assert first.synced is False
+    assert first.message == "sync deferred: 2 runners active"
+
+    marker_path = _pending_sync_marker_path(tmp_path)
+    assert marker_path.exists()
+
+    # Pass N+1: no new commits, runners now idle -> sync from marker and clear it.
+    second_runner, second_calls = _make_fake_runner(
+        [
+            RunResult(0, "def456\n", ""),  # before HEAD
+            RunResult(0, "Already up to date.\n", ""),  # pull
+            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "", ""),  # uv sync ok
+        ]
+    )
+
+    second = self_deploy(tmp_path, run_command=second_runner)
+    assert second == SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=True,
+        synced=True,
+        from_sha="abc123",
+        to_sha="def456",
+        message="updated and synced: def456",
+    )
+    assert second_calls[-1][0] == ["uv", "sync"]
+    assert not marker_path.exists()
+
+
+def test_self_deploy_loud_warning_on_repeated_deferral(
+    tmp_path: Path, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When a pending-sync marker survives repeated passes, a warning is printed."""
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (3, []),
+    )
+
+    # Create marker from a previous deferral.
+    marker_path = _pending_sync_marker_path(tmp_path)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps({"from_sha": "abc123", "to_sha": "def456"}), encoding="utf-8"
+    )
+
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "def456\n", ""),  # before HEAD
+            RunResult(0, "Already up to date.\n", ""),  # pull
+            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "", ""),  # uv sync (not reached)
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.synced is False
+    assert "3 runners active" in result.message
+
+    out = capsys.readouterr().out
+    assert "WARNING: pending dependency sync still deferred" in out
+    assert "3 runners active" in out
+    assert "abc123..def456" in out
+
+
+def test_orchestrator_root_contains_pyproject_toml() -> None:
+    """orchestrator_root() resolves to the orchestrator source tree root."""
+    root = orchestrator_root()
+    assert (root / "pyproject.toml").is_file()
+    # It should be the directory that holds the source tree, not a subpackage.
+    assert (root / "src" / "charlie_work" / "supervise.py").is_file()
