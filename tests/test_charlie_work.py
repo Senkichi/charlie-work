@@ -3913,6 +3913,164 @@ def test_dispatch_circuit_breaker_stops_externally_merged_issue_lookups(
     assert result2.data["merged_pr_closed_issue_numbers"] == []
 
 
+def test_dispatch_merged_pr_list_called_once_per_pass(tmp_path: Path) -> None:
+    """Issue #446: merged_pr_list() is listed once per dispatch pass even when
+    both finalization and the dispatch binding step need it.
+    """
+    config = OrchestratorConfig(dispatch=DispatchConfig(default_limit=1))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    ready = config.labels.ready
+
+    class CountingFakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_pr_list_calls = 0
+
+        def merged_pr_list(self):
+            self.merged_pr_list_calls += 1
+            return super().merged_pr_list()
+
+    fake_gh = CountingFakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 101,
+            "title": "Closed issue",
+            "url": "https://example.test/issues/101",
+            "body": "body one",
+            "labels": [{"name": ready}],
+            "state": "CLOSED",
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 102,
+            "title": "Open issue",
+            "url": "https://example.test/issues/102",
+            "body": "body two",
+            "labels": [{"name": ready}],
+            "state": "OPEN",
+            "createdAt": "2026-01-02T00:00:00Z",
+        },
+    ]
+    fake_gh.prs = [
+        {
+            "number": 201,
+            "title": "Fix #101",
+            "url": "https://example.test/pull/201",
+            "headRefName": "agent/issue-101-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-101",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #101",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch()
+
+    assert result.ok is True
+    assert fake_gh.merged_pr_list_calls == 1
+    assert result.data["merged_pr_closed_issue_numbers"] == [101]
+    assert result.data["selected_count"] == 1
+
+
+def test_dispatch_circuit_breaker_resets_on_interleaved_success(tmp_path: Path) -> None:
+    """Issue #446: the consecutive-failure circuit breaker resets on success.
+
+    Sequence fail, fail, success, fail, fail, fail must not trip at the third
+    candidate (the success resets the counter) and must trip after the final
+    three consecutive failures, leaving the next candidate untouched.
+    """
+    config = OrchestratorConfig(dispatch=DispatchConfig(finalize_limit=10))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    ready = config.labels.ready
+
+    class FakeGitHubWithInterleavedSearch(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_prs_for_issue_calls: list[int] = []
+
+        def merged_pr_list(self):
+            return []
+
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            self.merged_prs_for_issue_calls.append(issue_number)
+            if issue_number == 103:
+                return github_module._MergedPRSearchResult(
+                    [
+                        {
+                            "number": 203,
+                            "title": "Fix #103",
+                            "url": "https://example.test/pull/203",
+                            "headRefName": "agent/issue-103-fix",
+                            "baseRefName": "main",
+                            "headRefOid": "sha-103",
+                            "mergeStateStatus": "CLEAN",
+                            "body": "Closes #103",
+                            "labels": [],
+                            "isCrossRepository": False,
+                            "state": "MERGED",
+                        }
+                    ],
+                    ok=True,
+                )
+            if issue_number in {101, 102, 104, 105, 106}:
+                return github_module._MergedPRSearchResult([], ok=False)
+            if issue_number == 107:
+                return github_module._MergedPRSearchResult(
+                    [
+                        {
+                            "number": 207,
+                            "title": "Fix #107",
+                            "url": "https://example.test/pull/207",
+                            "headRefName": "agent/issue-107-fix",
+                            "baseRefName": "main",
+                            "headRefOid": "sha-107",
+                            "mergeStateStatus": "CLEAN",
+                            "body": "Closes #107",
+                            "labels": [],
+                            "isCrossRepository": False,
+                            "state": "MERGED",
+                        }
+                    ],
+                    ok=True,
+                )
+            return github_module._MergedPRSearchResult(
+                super().merged_prs_for_issue(issue_number, branch_prefix), ok=True
+            )
+
+    fake_gh = FakeGitHubWithInterleavedSearch()
+    fake_gh.issues = [
+        {
+            "number": n,
+            "title": f"Issue {n}",
+            "url": f"https://example.test/issues/{n}",
+            "body": f"body {n}",
+            "labels": [{"name": ready}],
+            "state": "CLOSED",
+            "createdAt": f"2026-01-{i:02d}T00:00:00Z",
+        }
+        for i, n in enumerate(range(101, 108), start=1)
+    ]
+    fake_gh.prs = []
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert fake_gh.merged_prs_for_issue_calls == [101, 102, 103, 104, 105, 106]
+    assert 107 not in fake_gh.merged_prs_for_issue_calls
+    assert result.data["merged_pr_closed_issue_numbers"] == [103]
+    assert 103 in fake_gh.closed_issues
+    assert 107 not in fake_gh.closed_issues
+    state = load_state(paths.state_file)
+    assert state["issues"]["103"]["status"] == "closed"
+    assert "107" not in state["issues"]
+
+
 def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
     tmp_path: Path,
 ) -> None:
