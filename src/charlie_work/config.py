@@ -164,6 +164,10 @@ class DispatchConfig:
     # Devin's "overall message rate limit" firing when 3 sessions launched
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
     launch_stagger_seconds: int = 45
+    # Per-pass cap for merge-finalization of merged-PR-referenced ready issues
+    # (label transition + close). A large backlog of closed issues carrying a
+    # stale ready marker cannot monopolize a pass. 0 disables finalization.
+    finalize_limit: int = 25
     # Worktree-relative paths owned by the orchestrator and excluded from
     # "is the worktree dirty?" checks. By default the Claude Code adapter's
     # in-worktree prompt file and the per-worktree writer marker are excluded.
@@ -841,6 +845,16 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'dispatch' key 'launch_stagger_seconds' must be >= 0, "
             f"got {launch_stagger_seconds}"
+        )
+    finalize_limit = dispatch_data.get("finalize_limit")
+    if finalize_limit is not None and not isinstance(finalize_limit, int):
+        raise ConfigError(
+            "config section 'dispatch' key 'finalize_limit' must be an int, "
+            f"got {type(finalize_limit).__name__}"
+        )
+    if finalize_limit is not None and finalize_limit < 0:
+        raise ConfigError(
+            f"config section 'dispatch' key 'finalize_limit' must be >= 0, got {finalize_limit}"
         )
     injected_paths = dispatch_data.get("injected_paths")
     if injected_paths is not None:
