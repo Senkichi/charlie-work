@@ -24740,3 +24740,155 @@ def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> 
     assert prompt_path.exists()
     prompt_text = prompt_path.read_text(encoding="utf-8").lower()
     assert "no ci checks" in prompt_text
+
+
+def test_dispatch_label_error_reason_in_event_payload(tmp_path: Path) -> None:
+    """Issue #453: dispatch label transition failures must carry a reason in the failures map."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            return False
+
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.gh.prs[0]["state"] = "CLOSED"
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert 123 in result.data["label_errors"]
+    assert 123 in result.data["failures"]
+    reason = result.data["failures"][123]
+    assert "label transition" in reason
+    assert "dispatched" in reason
+    assert "partial_failure" in reason
+
+    state = load_state(paths.state_file)
+    dispatch_events = [e for e in state["events"] if e["kind"] == "dispatch"]
+    assert dispatch_events
+    payload = dispatch_events[-1]["payload"]
+    assert "123" in payload["failures"]
+    assert payload["failures"]["123"] == reason
+
+
+def test_dispatch_rework_label_error_reason_in_event_payload(tmp_path: Path) -> None:
+    """Issue #453: rework dispatch label transition failures must carry a reason in the failures map."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkLabelFailGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            return False
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkLabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert 123 in result.data["label_errors"]
+    assert 123 in result.data["failures"]
+    reason = result.data["failures"][123]
+    assert "label transition" in reason
+    assert "rework_dispatched" in reason
+    assert "partial_failure" in reason
+
+    state = load_state(paths.state_file)
+    rework_events = [e for e in state["events"] if e["kind"] == "dispatch_rework"]
+    assert rework_events
+    payload = rework_events[-1]["payload"]
+    assert "123" in payload["failures"]
+    assert payload["failures"]["123"] == reason
+
+
+def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) -> None:
+    """Issue #453: missing rework prompt skips must carry a reason in the failures map."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Intentionally do not create rework-prompt.md
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert 123 in result.data["failures"]
+    reason = result.data["failures"][123]
+    assert "missing rework prompt" in reason
+
+    state = load_state(paths.state_file)
+    rework_events = [e for e in state["events"] if e["kind"] == "dispatch_rework"]
+    assert rework_events
+    payload = rework_events[-1]["payload"]
+    assert "123" in payload["failures"]
+    assert payload["failures"]["123"] == reason
