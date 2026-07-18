@@ -6,7 +6,7 @@ import os
 import re
 import signal
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2514,19 +2514,11 @@ class _BaseCurrentUnset:
 _BASE_CURRENT_UNSET = _BaseCurrentUnset()
 
 
+@dataclass(frozen=True)
 class _MergedPRListOutcome:
-    __slots__ = ("called", "items", "error")
-
-    def __init__(
-        self,
-        items: list[dict[str, Any]] | None = None,
-        error: GitHubError | None = None,
-        *,
-        called: bool = False,
-    ) -> None:
-        self.called = called
-        self.items: list[dict[str, Any]] = items if items is not None else []
-        self.error: GitHubError | None = error
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False
 
 
 class OrchestratorApp:
