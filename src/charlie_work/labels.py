@@ -35,10 +35,12 @@ class TransitionResult:
 def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
     # Helper to compute removal set: all workflow labels except the ones being added
     # This ensures label transitions are exclusive (single-state by design)
-    def _compute_remove(add_labels: tuple[str, ...]) -> tuple[str, ...]:
+    def _compute_remove(
+        add_labels: tuple[str, ...], extra_remove: tuple[str, ...] = ()
+    ) -> tuple[str, ...]:
         if not add_labels:
             return ()
-        to_remove = labels.workflow_labels - set(add_labels)
+        to_remove = (labels.workflow_labels - set(add_labels)) | set(extra_remove)
         return tuple(sorted(to_remove))
 
     return {
@@ -61,7 +63,12 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         # rework cap exhausted or reviewer blocked — a human decision is needed
         "escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
         "blocked": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
-        "merged": ((labels.done,), _compute_remove((labels.done,))),
+        # Issue #427: finalization must also drop the ready marker; a closed
+        # issue with a stale automated-ready label pollutes roll-call/metrics.
+        "merged": (
+            (labels.done,),
+            _compute_remove((labels.done,), extra_remove=(labels.ready,)),
+        ),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
         # Issue #203: a merged PR only *mentions* the issue in free text, with
