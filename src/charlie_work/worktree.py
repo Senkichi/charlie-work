@@ -77,6 +77,11 @@ class LiveWorkerRedispatchError(RuntimeError):
     but the recorded worker process is still alive (or sessions.db shows fresh
     activity). Carries the probe result so the orchestrator can restore labels
     and emit a diagnostic event.
+
+    ``inconclusive_probe_deferred_count`` mirrors the Signal-1 deferral counter
+    used by the stall/dead lanes (issue #338). It is reset to 0 when a live
+    signal is detected and incremented when the probe is inconclusive, so a
+    structurally permanent no-match does not block recovery forever (issue #426).
     """
 
     def __init__(
@@ -86,11 +91,13 @@ class LiveWorkerRedispatchError(RuntimeError):
         pid: int | None,
         process_start_time: float | None,
         probe_result: str,
+        inconclusive_probe_deferred_count: int = 0,
     ) -> None:
         self.issue_number = issue_number
         self.pid = pid
         self.process_start_time = process_start_time
         self.probe_result = probe_result
+        self.inconclusive_probe_deferred_count = inconclusive_probe_deferred_count
         super().__init__(probe_result)
 
 
@@ -869,6 +876,30 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     shutil.copytree(source, target)
 
 
+_PERMANENT_NO_MATCH_ERROR_PREFIXES = (
+    "no session found matching working_directory",
+    "no pid",
+    "per-PID log directory not found",
+    "no per-PID log found",
+    "no worktree_path provided",
+    "worktree path is not a directory",
+    "no eligible worktree files found",
+)
+
+
+def _is_permanent_no_match_error(error: str | None) -> bool:
+    """Return True when a probe error indicates the source has no record at all.
+
+    A missing sessions.db row, a missing per-PID log, or a missing worktree are
+    structurally permanent for a worker that never registered. Transient errors
+    (locked/corrupt DB, schema drift, I/O failures) are *not* permanent and
+    remain fail-closed: they do not count toward the deferral cap.
+    """
+    if not error:
+        return False
+    return any(error.startswith(prefix) for prefix in _PERMANENT_NO_MATCH_ERROR_PREFIXES)
+
+
 def _probe_recovery_liveness(
     recovery: dict[str, Any],
     worktree_path: Path,
@@ -890,13 +921,22 @@ def _probe_recovery_liveness(
     INCONCLUSIVE result, not a confirmed-dead one — treating it as "no
     activity" would fail OPEN into the same destructive reset issue #282 exists
     to prevent (this reintroduced that exact shape once already; see the
-    review that required this fix). So any source with a non-null ``error``
-    aborts recovery just as certainly as confirmed fresh activity does.
+    review that required this fix). So an errored source aborts recovery unless
+    every errored source is a structurally permanent no-match and the same
+    ``max_inconclusive_probe_deferrals`` cap used by the stall/dead lanes has
+    been reached (issue #426).
 
     Raises ``LiveWorkerRedispatchError`` when a live signal is detected, or
-    when liveness could not be determined.
+    when liveness could not be determined and the deferral cap has not yet
+    been reached.
     """
     resolved_config = config or OrchestratorConfig()
+
+    raw_deferred_count = recovery.get("inconclusive_probe_deferred_count", 0)
+    try:
+        current_deferred_count = int(raw_deferred_count) if raw_deferred_count is not None else 0
+    except (TypeError, ValueError):
+        current_deferred_count = 0
 
     worker_pid = recovery.get("worker_pid")
     worker_process_start_time = recovery.get("worker_process_start_time")
@@ -915,6 +955,7 @@ def _probe_recovery_liveness(
             pid=worker_pid,
             process_start_time=worker_process_start_time,
             probe_result="pid_alive",
+            inconclusive_probe_deferred_count=0,
         )
 
     # For devin-shell sessions, the real-activity probe (sessions.db +
@@ -938,15 +979,31 @@ def _probe_recovery_liveness(
 
         # Any errored source means liveness is UNKNOWN for that signal, not
         # confirmed dead — never let an inconclusive probe fall through to a
-        # destructive reset (issue #282 rework).
-        for source in probe.sources:
-            if source.error is not None:
-                raise LiveWorkerRedispatchError(
-                    issue_number=issue_number,
-                    pid=worker_pid,
-                    process_start_time=worker_process_start_time,
-                    probe_result="probe_error",
-                )
+        # destructive reset (issue #282 rework). However, if every errored
+        # source is a structurally permanent absence-of-record, apply the same
+        # max_inconclusive_probe_deferrals cap used by the stall/dead lanes so
+        # a worker whose probe is permanently broken is not stuck forever
+        # (issue #426).
+        errored_sources = [source for source in probe.sources if source.error is not None]
+        if errored_sources:
+            all_permanent = all(
+                _is_permanent_no_match_error(source.error) for source in errored_sources
+            )
+            max_deferrals = resolved_config.watchdog.max_inconclusive_probe_deferrals
+            if all_permanent and current_deferred_count >= max_deferrals:
+                # Probe has been inconclusive for N consecutive passes and every
+                # failure is a permanent absence-of-record. Allow the destructive
+                # reset rather than leaving the issue stuck indefinitely.
+                return
+
+            new_deferred_count = current_deferred_count + 1
+            raise LiveWorkerRedispatchError(
+                issue_number=issue_number,
+                pid=worker_pid,
+                process_start_time=worker_process_start_time,
+                probe_result="probe_error",
+                inconclusive_probe_deferred_count=new_deferred_count,
+            )
 
         # Consult BOTH activity sources via the probe's own freshest-signal
         # aggregation (the same corroboration classify_worker_health uses for
@@ -963,6 +1020,7 @@ def _probe_recovery_liveness(
                     pid=worker_pid,
                     process_start_time=worker_process_start_time,
                     probe_result=f"{source_label}_activity",
+                    inconclusive_probe_deferred_count=0,
                 )
 
 

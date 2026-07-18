@@ -1134,6 +1134,51 @@ def _detect_and_handle_orphaned_workers(
                 "label_write_ok": label_write_ok,
             }
 
+    # Issue #439: route dead workers with stuck pre-review PRs to rework before
+    # the state-update sweep. PR views are fetched outside the state lock; the
+    # route helper updates state/labels in its own critical section. The second
+    # lock below will then skip issues that have already moved to
+    # rework_requested/escalated.
+    pre_review_routed: set[int] = set()
+    state_snapshot = state
+    now = datetime.now(UTC)
+    for issue_number in orphaned_issues:
+        pr_data = pr_by_issue.get(issue_number)
+        if not pr_data:
+            continue
+        pr_number = int(pr_data["number"])
+        pr_state = state_snapshot.get("prs", {}).get(str(pr_number), {})
+        last_decision = pr_state.get("decision")
+        reviewed_head_sha = pr_state.get("reviewed_head_sha")
+        live_head_sha = pr_data.get("headRefOid")
+        if (
+            last_decision == "request_changes"
+            and reviewed_head_sha
+            and live_head_sha
+            and reviewed_head_sha == live_head_sha
+        ):
+            # Let the second-lock request_changes restoration path handle this;
+            # do not overwrite an existing review feedback prompt.
+            continue
+        try:
+            pr_view = gh.pr_view(pr_number)
+        except Exception:
+            pr_view = None
+        enriched = pr_view if pr_view else pr_data
+        is_candidate, reason = _is_pre_review_rework_candidate(enriched, config, now)
+        if is_candidate:
+            route_result = _route_dead_worker_to_pre_review_rework(
+                state_file,
+                gh,
+                config,
+                enriched,
+                issue_number,
+                reason,
+                failure_kind=None,
+            )
+            if route_result is not None:
+                pre_review_routed.add(issue_number)
+
     # Handle orphaned workers
     with state_lock(state_file):
         state = load_state(state_file)
@@ -1506,6 +1551,242 @@ def _reap_restore_rework_requested(
             save_state(state_file, state)
 
 
+def _rework_prompt_search_dirs(
+    config: OrchestratorConfig, repo_root: Path | None = None
+) -> tuple[Path, ...]:
+    """Resolve the optional repo-local prompt override directory."""
+    prompts_dir = config.runtime.prompts_dir
+    if not prompts_dir:
+        return ()
+    path = Path(prompts_dir)
+    if not path.is_absolute() and repo_root is not None:
+        path = repo_root / path
+    return (path,)
+
+
+def _write_rework_prompt(
+    state_file: Path,
+    pr: dict[str, Any],
+    issue_number: int | None,
+    summary: str,
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    """Write a rework brief for a PR under the shared ``prs/pr-{N}`` directory.
+
+    This module-level helper lets both the OrchestratorApp review path and the
+    dead-session recovery path produce the same ``rework-prompt.md`` artifact.
+    """
+    pr_number = int(pr["number"])
+    pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = pr_dir / "rework-prompt.md"
+    prompt = render_prompt(
+        config.dispatch.rework_template,
+        {
+            "pr_number": pr_number,
+            "pr_title": pr.get("title", ""),
+            "pr_url": pr.get("url", ""),
+            "issue_number": issue_number or "UNKNOWN",
+            "review_summary": summary,
+            "branch_name": pr.get("headRefName", ""),
+        },
+        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    )
+    prompt_path.write_text(prompt, encoding="utf-8")
+    return prompt_path
+
+
+def _is_pre_review_rework_candidate(
+    pr: dict[str, Any],
+    config: OrchestratorConfig,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Detect PRs that are stuck before review and need a rework cycle.
+
+    Returns ``(True, reason)`` when either:
+
+    * ``mergeable`` is ``CONFLICTING`` — the branch cannot be merged and CI
+      will not run because GitHub cannot build a merge ref; or
+    * ``statusCheckRollup`` is empty and the PR's ``updatedAt`` is older than
+      ``watchdog.pre_review_rework_stale_minutes`` — the worker opened a PR
+      and then died before any checks were created.
+    """
+    mergeable = str(pr.get("mergeable") or "").upper()
+    if mergeable == "CONFLICTING":
+        return True, "merge_conflict"
+
+    stale_minutes = config.watchdog.pre_review_rework_stale_minutes
+    if stale_minutes <= 0:
+        return False, ""
+
+    status_rollup = pr.get("statusCheckRollup")
+    if status_rollup:
+        return False, ""
+
+    updated_at = pr.get("updatedAt")
+    if not updated_at:
+        return False, ""
+
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False, ""
+
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    if (now - updated).total_seconds() > stale_minutes * 60:
+        return True, "stale_empty_checks"
+
+    return False, ""
+
+
+def _route_dead_worker_to_pre_review_rework(
+    state_file: Path,
+    gh: GitHub,
+    config: OrchestratorConfig,
+    pr: dict[str, Any],
+    issue_number: int,
+    reason: str,
+    *,
+    failure_kind: str | None = None,
+) -> dict[str, Any] | None:
+    """Route a dead worker's stuck pre-review PR to the rework pipeline.
+
+    Writes a rebase-onto-main brief, transitions the issue to ``needs_rework``,
+    and updates state.json to ``rework_requested``. Idempotent: if the issue is
+    already ``rework_requested`` or ``escalated``, this is a no-op.
+
+    Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
+    failures immediately, mirroring the existing redispatch-escalation logic.
+    """
+    pr_number = int(pr["number"])
+    summary = (
+        "The PR branch has a merge conflict with the base branch. "
+        "Rebase the branch onto the current base branch, resolve the conflicts, "
+        "and push. The code changes are already approved; do not re-litigate the review."
+        if reason == "merge_conflict"
+        else (
+            "The PR was opened but no CI checks have been created after the stale threshold. "
+            "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
+            "The existing changes are pre-approved; do not re-litigate the review."
+        )
+    )
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state.setdefault("issues", {})
+        state.setdefault("prs", {})
+        entry = state["issues"].get(str(issue_number), {})
+        if not isinstance(entry, dict):
+            entry = {}
+        current_status = entry.get("status")
+        if current_status in ("rework_requested", "escalated"):
+            return None
+
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
+        prior = [
+            t
+            for t in entry.get("redispatch_at", [])
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+        ]
+        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+
+        terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+            entry = {
+                **entry,
+                "number": issue_number,
+                "status": "escalated",
+                "redispatch_at": redispatch_at,
+                "escalation_reason": failure_kind
+                if terminal_failure
+                else "redispatch_cap_exceeded",
+                "pre_review_rework_reason": reason,
+            }
+            state["issues"][str(issue_number)] = entry
+            save_state(state_file, state)
+            result = transition(gh, config.labels, issue_number, "redispatch_escalated")
+            if result.outcome != TransitionOutcome.APPLIED:
+                entry = state["issues"].get(str(issue_number), {})
+                if isinstance(entry, dict):
+                    entry = {
+                        **entry,
+                        "label_error": {
+                            "edge": "redispatch_escalated",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        },
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    save_state(state_file, state)
+            return {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "escalated": True,
+                "escalation_reason": entry["escalation_reason"],
+            }
+
+        repo_root = getattr(gh, "repo_root", None)
+        _write_rework_prompt(state_file, pr, issue_number, summary, config, repo_root=repo_root)
+        entry = {
+            **entry,
+            "number": issue_number,
+            "status": "rework_requested",
+            "dispatched_at": None,
+            "pre_review_rework_reason": reason,
+        }
+        state["issues"][str(issue_number)] = entry
+        state["prs"][str(pr_number)] = {
+            **state["prs"].get(str(pr_number), {}),
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "rework_requested",
+        }
+        state = append_event(
+            state,
+            "pre_review_rework_routed",
+            {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "failure_kind": failure_kind,
+            },
+        )
+        save_state(state_file, state)
+
+    result = transition(gh, config.labels, issue_number, "rework_requested")
+    label_error = None
+    if result.outcome != TransitionOutcome.APPLIED:
+        label_error = {
+            "edge": "rework_requested",
+            "outcome": result.outcome.value,
+            "add_failures": result.add_failures,
+            "remove_failures": result.remove_failures,
+        }
+        with state_lock(state_file):
+            state = load_state(state_file)
+            entry = state["issues"].get(str(issue_number), {})
+            if isinstance(entry, dict):
+                entry = {**entry, "label_error": label_error}
+                state["issues"][str(issue_number)] = entry
+                save_state(state_file, state)
+
+    return {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "reason": reason,
+        "label_error": label_error,
+    }
+
+
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path,
     state_file: Path,
@@ -1679,7 +1960,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
             )
             continue
-        if w.error is None and not w.is_alive():
+        if not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
 
@@ -1700,12 +1981,16 @@ def _classify_dead_sessions_and_update_throttle_state(
             # genuinely-dead worker behind a permanently-broken probe still gets
             # reaped after N deferred passes (never an unconditional "never-reap").
             #
-            # Only workers with a real pid are corroborated. A pid=None worker
-            # (launch never spawned a process, or the pid was already cleared)
-            # has no liveness signal to second-guess -- is_alive() is trivially
-            # and unambiguously False -- so it keeps the prior immediate-reap
-            # behavior, matching _detect_and_handle_stalled_sessions's existing
-            # "if w.pid is None ...: continue" guard before it ever probes.
+            # Issue #426: the launch-failure lane above handles ``pid is None``
+            # sidecars. Sidecars that carry a real (dead) pid *and* a stale
+            # ``error`` string (e.g. ``live_worker_redispatch_averted``) must not
+            # be invisible to the confirmed-dead lane. Removing the ``w.error is
+            # None`` gate lets classify_worker_health decide, with the same
+            # max_inconclusive_probe_deferrals cap, instead of leaving them stuck
+            # forever. The stall lane skips ``w.error is not None`` workers, so
+            # the dead lane must persist the Signal-1 counter for those workers
+            # even when loop() asks it not to double-write for ``w.error is None``
+            # workers.
             if w.pid is not None:
                 probe = real_activity_probe_for(w, config, now_for_health)
                 health = classify_worker_health(w, config, now_for_health, probe)
@@ -1717,7 +2002,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # it. Every other caller (including every existing unit test)
                 # leaves this at its default True, so this lane remains fully
                 # self-sufficient when called on its own.
-                if persist_inconclusive_probe_counter:
+                #
+                # Issue #426: the stall lane unconditionally skips
+                # ``w.error is not None`` workers, so for those sidecars this
+                # dead lane is the only writer of the counter. Persist it even
+                # when loop() passes False.
+                if persist_inconclusive_probe_counter or w.error is not None:
                     new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
                     update_worker_log_stat(
                         sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
@@ -1970,9 +2260,45 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # rework_requested just because a launch-failure classifier
                 # ran on its now-dead sidecar.
                 if not is_completed:
-                    _reap_restore_rework_requested(
-                        state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
-                    )
+                    pr_data = _rework_pr_for_worker(open_prs_by_issue, w)
+                    if pr_data is not None:
+                        pr_number = int(pr_data["number"])
+                        try:
+                            pr_view = gh.pr_view(pr_number)
+                        except Exception:
+                            pr_view = None
+                        enriched = pr_view if pr_view else pr_data
+                        is_candidate, reason = _is_pre_review_rework_candidate(
+                            enriched, config, now_for_health
+                        )
+                        if is_candidate:
+                            _route_dead_worker_to_pre_review_rework(
+                                state_file,
+                                gh,
+                                config,
+                                enriched,
+                                w.issue_number,
+                                reason,
+                                failure_kind=failure_kind,
+                            )
+                        else:
+                            _reap_restore_rework_requested(
+                                state_file,
+                                gh,
+                                config,
+                                open_prs_by_issue,
+                                w,
+                                failure_kind=failure_kind,
+                            )
+                    else:
+                        _reap_restore_rework_requested(
+                            state_file,
+                            gh,
+                            config,
+                            open_prs_by_issue,
+                            w,
+                            failure_kind=failure_kind,
+                        )
 
     return reaped
 
@@ -2609,6 +2935,133 @@ class OrchestratorApp:
             },
         )
 
+    def _finalize_externally_merged_issues(
+        self,
+        ready_issues: list[dict[str, Any]] | None = None,
+    ) -> tuple[set[int], list[dict[str, Any]]]:
+        """Finalize closed ready-labeled issues whose linked PR merged externally.
+
+        Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
+        throttle) so a pass that defers new work still drains the backlog of
+        externally-merged issues (e.g. Aviator MergeQueue handoffs).  It first
+        binds candidates against the cheap most-recent-500 ``merged_pr_list()``;
+        only issues whose merged PR falls outside that window incur a per-issue
+        ``gh pr list --search`` lookup.
+
+        Per-issue lookups are capped at ``dispatch.finalize_limit`` and processed
+        oldest-first (by ``createdAt``, then issue number). A consecutive-failure
+        circuit breaker stops the pass after 3 failed lookups so a transient
+        Search API rate limit does not monopolize the shared token.
+        """
+        if ready_issues is None:
+            ready_issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        closed_ready = [
+            issue
+            for issue in ready_issues
+            if str(issue.get("state") or "OPEN").upper() == "CLOSED"
+        ]
+        if not closed_ready:
+            return set(), ready_issues
+
+        finalize_limit = self.config.dispatch.finalize_limit
+        if finalize_limit <= 0:
+            return set(), ready_issues
+
+        # Try the cheap 500-window binding first; if the GraphQL-budget guard
+        # refuses the call, fall back to per-issue search for all candidates.
+        bound_issue_numbers: set[int] = set()
+        try:
+            merged_prs = self.gh.merged_pr_list()
+        except GitHubError:
+            merged_prs = []
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if bound is not None:
+                bound_issue_numbers.add(bound)
+
+        # Only the unbound candidates need an expensive per-issue search.
+        unbound_issues = [
+            issue for issue in closed_ready if int(issue["number"]) not in bound_issue_numbers
+        ]
+
+        def _finalization_order(issue: dict[str, Any]) -> tuple[str, int]:
+            return (str(issue.get("createdAt") or ""), int(issue["number"]))
+
+        # Slice BEFORE any per-issue lookup so a large backlog cannot exhaust
+        # the GitHub Search API bucket in a single pass.
+        candidates = sorted(unbound_issues, key=_finalization_order)[:finalize_limit]
+
+        issue_pr_map: dict[int, list[dict[str, Any]]] = {}
+        consecutive_failures = 0
+        for issue in candidates:
+            if consecutive_failures >= 3:
+                break
+            issue_number = int(issue["number"])
+            merged_prs = self.gh.merged_prs_for_issue(
+                issue_number,
+                self.config.dispatch.branch_prefix,
+            )
+            if not getattr(merged_prs, "ok", True):
+                consecutive_failures += 1
+                continue
+            consecutive_failures = 0
+            if merged_prs:
+                issue_pr_map[issue_number] = list(merged_prs)
+
+        if not issue_pr_map:
+            return set(), ready_issues
+
+        # Persist state first, then apply labels outside the lock.
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for issue_number, prs in issue_pr_map.items():
+                issue_key = str(issue_number)
+                issue_entry = state["issues"].get(issue_key, {})
+                state["issues"][issue_key] = {
+                    **issue_entry,
+                    "number": issue_number,
+                    "status": "closed",
+                }
+                for pr in prs:
+                    pr_number = int(pr["number"])
+                    pr_key = str(pr_number)
+                    pr_entry = state["prs"].get(pr_key, {})
+                    state["prs"][pr_key] = {
+                        **pr_entry,
+                        "number": pr_number,
+                        "status": "merged",
+                        "merged": True,
+                        "issue_number": issue_number,
+                    }
+            state = append_event(
+                state,
+                "finalize_externally_merged",
+                {
+                    "issue_numbers": sorted(issue_pr_map.keys()),
+                    "pr_numbers": sorted(
+                        {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
+                    ),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        for issue_number in issue_pr_map:
+            transition(self.gh, self.config.labels, issue_number, "merged")
+            self.gh.close_issue(issue_number)
+
+        finalized: set[int] = set(issue_pr_map.keys())
+        remaining = [issue for issue in ready_issues if int(issue["number"]) not in finalized]
+        return finalized, remaining
+
     def dispatch(
         self,
         limit: int | None = None,
@@ -2628,6 +3081,19 @@ class OrchestratorApp:
         Finding 2). Standalone callers leave this as None and the sweep runs
         inside this call as before.
         """
+        # Finalize closed ready-labeled issues whose linked PR merged externally.
+        # This runs before fleet lock / GraphQL budget / provider throttle guards
+        # so a pass that defers new dispatch still drains the Aviator-merge backlog.
+        finalized: set[int] = set()
+        try:
+            finalized, ready_issues = self._finalize_externally_merged_issues()
+        except StateLockBusy:
+            return _state_lock_busy_result(
+                "dispatch deferred: state lock held",
+                selected_count=0,
+                deferred_reason="state_lock_busy",
+            )
+
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -2638,17 +3104,33 @@ class OrchestratorApp:
                     {
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
+                        "merged_pr_closed_issue_numbers": sorted(finalized),
+                        "merged_pr_referenced_issue_numbers": sorted(finalized),
                     },
                 )
         try:
-            return self._dispatch_impl(
-                limit, only_issues=only_issues, stalled_entries=stalled_entries
+            result = self._dispatch_impl(
+                limit,
+                only_issues=only_issues,
+                stalled_entries=stalled_entries,
+                ready_issues=ready_issues,
             )
+            data = dict(result.data)
+            if finalized:
+                data["merged_pr_closed_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_closed_issue_numbers", [])) | finalized
+                )
+                data["merged_pr_referenced_issue_numbers"] = sorted(
+                    set(data.get("merged_pr_referenced_issue_numbers", [])) | finalized
+                )
+            return CommandResult(result.ok, result.message, data)
         except StateLockBusy:
             return _state_lock_busy_result(
                 "dispatch deferred: state lock held",
                 selected_count=0,
                 deferred_reason="state_lock_busy",
+                merged_pr_closed_issue_numbers=sorted(finalized),
+                merged_pr_referenced_issue_numbers=sorted(finalized),
             )
         except GraphQLBudgetError as exc:
             return CommandResult(
@@ -2660,6 +3142,8 @@ class OrchestratorApp:
                     "graphql_remaining": exc.remaining,
                     "graphql_reset": exc.reset_at,
                     "graphql_threshold": exc.threshold,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
         finally:
@@ -2672,13 +3156,17 @@ class OrchestratorApp:
         *,
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
+        ready_issues: list[dict[str, Any]] | None = None,
     ) -> CommandResult:
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
-        issues = self.gh.issue_list(
-            labels=[self.config.labels.ready],
-            state="all",
-        )
+        if ready_issues is None:
+            issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="all",
+            )
+        else:
+            issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
 
@@ -7257,22 +7745,14 @@ class OrchestratorApp:
     def _write_rework_prompt(
         self, pr: dict[str, Any], issue_number: int | None, summary: str
     ) -> Path:
-        pr_number = int(pr["number"])
-        pr_dir = self.paths.prs / f"pr-{pr_number}"
-        prompt_path = pr_dir / "rework-prompt.md"
-        prompt = self._render(
-            self.config.dispatch.rework_template,
-            {
-                "pr_number": pr_number,
-                "pr_title": pr.get("title", ""),
-                "pr_url": pr.get("url", ""),
-                "issue_number": issue_number or "UNKNOWN",
-                "review_summary": summary,
-                "branch_name": pr.get("headRefName", ""),
-            },
+        return _write_rework_prompt(
+            self.paths.state_file,
+            pr,
+            issue_number,
+            summary,
+            self.config,
+            repo_root=self.repo_root,
         )
-        prompt_path.write_text(prompt, encoding="utf-8")
-        return prompt_path
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
