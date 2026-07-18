@@ -9,10 +9,15 @@ import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from . import CLI_NAME
-from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
+from .adapters import (
+    AdapterSettings,
+    SessionDispatchResult,
+    SessionRequest,
+    dispatch_sessions,
+)
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
@@ -102,6 +107,35 @@ def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
     }
     data.update(extra)
     return CommandResult(True, message, data)
+
+
+def _truncate_reason(reason: str, max_len: int = 200) -> str:
+    if len(reason) <= max_len:
+        return reason
+    return reason[: max_len - 3] + "..."
+
+
+def _dispatch_failure_reason(result: SessionDispatchResult) -> str:
+    if result.error:
+        return result.error
+    if result.failure_kind:
+        return f"dispatch failed: {result.failure_kind}"
+    return "dispatch failed"
+
+
+def _build_failure_map(
+    dispatch_results: Sequence[SessionDispatchResult],
+    failed_issue_numbers: Iterable[int],
+    deferred_by_concurrency: Iterable[int],
+    limit: int,
+) -> dict[int, str]:
+    failures: dict[int, str] = {}
+    for issue_number in deferred_by_concurrency:
+        failures[issue_number] = _truncate_reason(f"deferred by concurrency cap (limit: {limit})")
+    for result in dispatch_results:
+        if result.issue_number in failed_issue_numbers:
+            failures[result.issue_number] = _truncate_reason(_dispatch_failure_reason(result))
+    return failures
 
 
 def _guard_state_lock(func: Any) -> Any:
@@ -3469,6 +3503,12 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+            dispatch_failure_map = _build_failure_map(
+                dispatch_results,
+                failed_issue_numbers,
+                deferred_by_concurrency,
+                dispatch_limit,
+            )
             state = append_event(
                 state,
                 "dispatch",
@@ -3483,13 +3523,18 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
                     "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+                    "failures": dispatch_failure_map,
                 },
             )
             save_state(self.paths.state_file, state)
         result_dicts = [result.to_dict() for result in dispatch_results]
         message = "dispatch complete"
         if failed_issue_numbers:
-            message = "dispatch completed with failures"
+            entries = ", ".join(
+                f"#{issue} ({dispatch_failure_map[issue]})"
+                for issue in sorted(failed_issue_numbers)
+            )
+            message = f"dispatch failures: {entries}"
         elif live_worker_issue_numbers:
             message = "dispatch completed with live worker redispatch averted"
         if skipped_issue_numbers:
@@ -3500,6 +3545,7 @@ class OrchestratorApp:
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "failures": dispatch_failure_map,
             "live_worker_count": len(live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
@@ -6452,9 +6498,9 @@ class OrchestratorApp:
         elif not intake.ok:
             message = "loop completed with intake failures"
         elif not dispatch.ok:
-            message = "loop completed with dispatch failures"
+            message = dispatch.message
         elif not dispatch_rework.ok:
-            message = "loop completed with rework dispatch failures"
+            message = dispatch_rework.message
         elif not dispatch_reviews.ok:
             message = "loop completed with review dispatch failures"
         data = {
@@ -6747,6 +6793,7 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -6805,6 +6852,7 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -6848,6 +6896,9 @@ class OrchestratorApp:
 
         if not session_requests:
             # Release the dispatch_pending claims for all skipped issues
+            no_session_failure_map = _build_failure_map(
+                [], set(), deferred_by_concurrency, rework_limit
+            )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 for issue_number in skipped_issue_numbers:
@@ -6874,12 +6925,14 @@ class OrchestratorApp:
                         "deferred_by_concurrency": deferred_by_concurrency,
                         "label_errors": [],
                         "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                        "failures": no_session_failure_map,
                     },
                 )
                 save_state(self.paths.state_file, state)
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": no_session_failure_map,
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -6910,6 +6963,12 @@ class OrchestratorApp:
         failed_issue_numbers = {
             result.issue_number for result in dispatch_results if not result.ok
         }
+        rework_failure_map = _build_failure_map(
+            dispatch_results,
+            failed_issue_numbers,
+            deferred_by_concurrency,
+            rework_limit,
+        )
 
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         label_errors: list[int] = []
@@ -7029,6 +7088,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "label_errors": sorted(label_errors),
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                    "failures": rework_failure_map,
                 },
             )
             save_state(self.paths.state_file, state)
@@ -7036,13 +7096,17 @@ class OrchestratorApp:
         result_dicts = [result.to_dict() for result in dispatch_results]
         message = "rework dispatch complete"
         if failed_issue_numbers:
-            message = "rework dispatch completed with failures"
+            entries = ", ".join(
+                f"#{issue} ({rework_failure_map[issue]})" for issue in sorted(failed_issue_numbers)
+            )
+            message = f"rework dispatch failures: {entries}"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "failures": rework_failure_map,
             "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
