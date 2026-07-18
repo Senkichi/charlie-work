@@ -24129,6 +24129,8 @@ def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
     assert state["issues"]["42"]["pre_review_rework_reason"] == "merge_conflict"
+    assert state["issues"]["42"]["worker_pid"] == 9999999
+    assert state["issues"]["42"]["worker_process_start_time"] == 1234567890.0
     assert state["prs"]["1"]["status"] == "rework_requested"
     assert (42, config.labels.needs_rework) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed
@@ -24206,6 +24208,8 @@ def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> 
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
     assert state["issues"]["42"]["pre_review_rework_reason"] == "stale_empty_checks"
+    assert state["issues"]["42"]["worker_pid"] == 9999999
+    assert state["issues"]["42"]["worker_process_start_time"] == 1234567890.0
     assert state["prs"]["1"]["status"] == "rework_requested"
     assert (42, config.labels.needs_rework) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed

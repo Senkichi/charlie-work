@@ -1741,8 +1741,6 @@ def _route_dead_worker_to_pre_review_rework(
             "number": issue_number,
             "status": "rework_requested",
             "dispatched_at": None,
-            "worker_pid": None,
-            "worker_process_start_time": None,
             "pre_review_rework_reason": reason,
         }
         state["issues"][str(issue_number)] = entry
