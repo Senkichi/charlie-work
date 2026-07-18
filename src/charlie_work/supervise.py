@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from . import fleet_registry
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
@@ -189,6 +190,7 @@ class SelfDeployResult:
 def self_deploy(
     repo_root: Path,
     *,
+    fleet_dir_override: str | None = None,
     run_command: Callable[..., RunResult] = run_captured,
     pull_timeout: int = 60,
     sync_timeout: int = 300,
@@ -196,8 +198,13 @@ def self_deploy(
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
     Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
-    touched ``pyproject.toml`` or ``uv.lock``.  All subprocess errors are
-    returned as values (non-fatal); the function never raises.
+    touched ``pyproject.toml`` or ``uv.lock``.  Before running ``uv sync`` the
+    fleet registry is consulted for live worker sessions; if any are active the
+    sync is deferred to the next pass so the Windows venv is not mutated while
+    running workers hold file locks.
+
+    All subprocess errors are returned as values (non-fatal); the function
+    never raises.
     """
     try:
         before_res = run_command(
@@ -283,6 +290,19 @@ def self_deploy(
                 from_sha=before_sha,
                 to_sha=after_sha,
                 message=f"code-only update: {after_sha}",
+            )
+
+        live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
+        if live_count > 0:
+            runner_word = "runner" if live_count == 1 else "runners"
+            return SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=True,
+                synced=False,
+                from_sha=before_sha,
+                to_sha=after_sha,
+                message=f"sync deferred: {live_count} {runner_word} active",
             )
 
         sync_res = run_command(

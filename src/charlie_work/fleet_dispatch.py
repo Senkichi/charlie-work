@@ -776,7 +776,7 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(orchestrator_root)
+            deploy = self_deploy(orchestrator_root, fleet_dir_override=fleet_dir_override)
             if deploy.synced:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif not deploy.ok:
