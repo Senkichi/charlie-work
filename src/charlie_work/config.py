@@ -516,6 +516,11 @@ class WatchdogConfig:
     # broken probe from pinning a slot indefinitely while still allowing the
     # downstream liveness checks to avoid false reaps.
     max_inconclusive_probe_deferrals: int = 3
+    # Issue #439: a PR whose updatedAt is older than this many minutes and has
+    # an empty statusCheckRollup is treated as stuck before review (the worker
+    # died before CI could start). It is routed to the rework pipeline with a
+    # rebase-onto-main brief. 0 disables the stale-empty-check predicate.
+    pre_review_rework_stale_minutes: int = 30
     # Worktree file mtime corroboration (issue #353): a fourth real-activity
     # source that detects progress by scanning files written in the worker's
     # checkout. Workers read/plan for a while before writing, so this source uses
@@ -1130,6 +1135,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'watchdog' key 'max_inconclusive_probe_deferrals' must be an int, "
             f"got {type(max_inconclusive_probe_deferrals).__name__}"
+        )
+    pre_review_rework_stale_minutes = watchdog_data.get("pre_review_rework_stale_minutes")
+    if pre_review_rework_stale_minutes is not None and not isinstance(
+        pre_review_rework_stale_minutes, int
+    ):
+        raise ConfigError(
+            "config section 'watchdog' key 'pre_review_rework_stale_minutes' must be an int, "
+            f"got {type(pre_review_rework_stale_minutes).__name__}"
         )
     # Validate worktree mtime corroboration config (issue #353)
     worktree_mtime_enabled = watchdog_data.get("worktree_mtime_enabled")
