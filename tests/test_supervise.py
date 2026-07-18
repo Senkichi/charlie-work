@@ -1056,3 +1056,153 @@ def test_orchestrator_root_contains_pyproject_toml() -> None:
     assert (root / "pyproject.toml").is_file()
     # It should be the directory that holds the source tree, not a subpackage.
     assert (root / "src" / "charlie_work" / "supervise.py").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator venv editable .pth self-heal tests (issue #447)
+# ---------------------------------------------------------------------------
+
+
+def _setup_fake_venv(
+    repo_root: Path,
+    *,
+    wrong_target: Path | None = None,
+) -> Path:
+    """Create a fake venv under ``repo_root/.venv`` with one editable .pth file.
+
+    If ``wrong_target`` is provided, the .pth points there (mismatch).  If
+    ``None``, it points at ``repo_root/src`` (healthy).
+    """
+    site_packages = repo_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    pth = site_packages / "_editable_charlie_work.pth"
+    target = wrong_target if wrong_target is not None else repo_root / "src"
+    pth.write_text(str(target.resolve()) + "\n", encoding="utf-8")
+    init_path = repo_root / "src" / "charlie_work" / "__init__.py"
+    init_path.parent.mkdir(parents=True)
+    init_path.write_text("", encoding="utf-8")
+    return pth
+
+
+def _make_repair_runner(
+    repo_root: Path,
+    pth_path: Path,
+    responses: list[RunResult],
+) -> tuple[Callable[..., RunResult], list[tuple[list[str], Path, int]]]:
+    """Return a runner that rewrites the .pth to point at ``repo_root/src`` on repair."""
+    calls: list[tuple[list[str], Path, int]] = []
+    correct_src = (repo_root / "src").resolve()
+
+    def runner(command: list[str], *, cwd: Path, timeout_seconds: int) -> RunResult:
+        calls.append((command, cwd, timeout_seconds))
+        if command == ["uv", "sync", "--reinstall-package", "charlie-work"]:
+            pth_path.write_text(str(correct_src) + "\n", encoding="utf-8")
+            return RunResult(0, "", "")
+        return responses.pop(0)
+
+    return runner, calls
+
+
+def test_self_deploy_repairs_venv_pth_mismatch(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A poisoned editable .pth triggers a bounded uv sync repair."""
+    wrong_target = tmp_path / "wrong" / "src"
+    pth_path = _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (0, []),
+    )
+
+    runner, calls = _make_repair_runner(
+        tmp_path,
+        pth_path,
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "abc123\n", ""),  # after HEAD (no change)
+        ],
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is True
+    assert result.venv_repaired is True
+    assert result.venv_deferred is False
+    assert result.pulled is True
+    assert result.synced is False
+    assert result.from_sha == "abc123"
+    assert result.to_sha == "abc123"
+    assert [c[0] for c in calls] == [
+        ["uv", "sync", "--reinstall-package", "charlie-work"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
+
+
+def test_self_deploy_defers_venv_repair_while_runners_active(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A pth mismatch with active fleet runners defers repair and skips git."""
+    wrong_target = tmp_path / "wrong" / "src"
+    _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (2, []),
+    )
+
+    runner, calls = _make_fake_runner(
+        [
+            # These should not be reached because repair is deferred.
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is True
+    assert result.venv_repaired is False
+    assert result.venv_deferred is True
+    assert result.pulled is False
+    assert result.changed is False
+    assert result.synced is False
+    assert "2 runners active" in result.message
+    assert not calls
+
+
+def test_self_deploy_venv_repair_failure_is_non_fatal(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A failed repair uv sync is returned as a non-fatal error value."""
+    wrong_target = tmp_path / "wrong" / "src"
+    _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (0, []),
+    )
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(1, "", "Access is denied"),
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is False
+    assert result.venv_repaired is False
+    assert result.venv_deferred is False
+    assert result.pulled is False
+    assert result.changed is False
+    assert result.synced is False
+    assert result.error is not None
+    assert "Access is denied" in result.error
+    assert calls[0][0] == ["uv", "sync", "--reinstall-package", "charlie-work"]
+    assert len(calls) == 1

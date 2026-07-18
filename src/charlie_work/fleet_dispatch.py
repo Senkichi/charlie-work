@@ -778,9 +778,36 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(orchestrator_root())
+            deploy = self_deploy(
+                orchestrator_root(),
+                fleet_dir_override=fleet_dir_override,
+            )
             if deploy.synced:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+            elif deploy.venv_repaired:
+                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+            elif deploy.venv_deferred:
+                print(
+                    f"[{now_str}] self-deploy venv repair deferred: {deploy.message}",
+                    flush=True,
+                )
+                notify_config = getattr(global_config, "notify", None)
+                if notify_config is not None and getattr(notify_config, "enabled", False):
+                    attention_digest = AttentionDigest(
+                        generated_at=utc_now(),
+                        repo="fleet",
+                        transitions=(
+                            AttentionEntry(
+                                issue_number=-1,
+                                adapter_kind="self-deploy",
+                                health="DEFERRED",
+                                previous_health=None,
+                                last_log_line=deploy.message,
+                                pid=None,
+                            ),
+                        ),
+                    )
+                    emit_digest(notify_config, attention_digest)
             elif not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",

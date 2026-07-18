@@ -20,14 +20,19 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from . import fleet_registry, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .workflow import CommandResult, OrchestratorApp
@@ -189,6 +194,11 @@ class SelfDeployResult:
     is True when ``uv sync`` ran and succeeded.  ``ok`` is False whenever any
     step reported an error; callers must treat this as non-fatal and continue
     the pass.
+
+    ``venv_repaired`` is True when the orchestrator venv's editable ``.pth``
+    was detected pointing outside ``repo_root/src`` and a ``uv sync`` repair
+    succeeded.  ``venv_deferred`` is True when the same mismatch was detected
+    but live fleet runners prevented the repair ``uv sync`` from running.
     """
 
     ok: bool
@@ -199,22 +209,163 @@ class SelfDeployResult:
     to_sha: str | None = None
     message: str = ""
     error: str | None = None
+    venv_repaired: bool = False
+    venv_deferred: bool = False
+
+
+def _is_venv(path: Path) -> bool:
+    """Return True when ``path`` looks like a virtual environment directory."""
+    if not path.is_dir():
+        return False
+    return (
+        (path / "pyvenv.cfg").is_file()
+        or (path / "Lib" / "site-packages").is_dir()
+        or (path / "lib").is_dir()
+    )
+
+
+def _find_venv_path(repo_root: Path) -> Path | None:
+    """Locate the orchestrator virtual environment to verify/self-heal.
+
+    Prefers ``repo_root/.venv`` when it exists, then accepts ``VIRTUAL_ENV``
+    only when it points inside ``repo_root`` (or exactly at ``repo_root/.venv``
+    after resolving).  This prevents a leaked ``VIRTUAL_ENV`` from a different
+    checkout from being used for self-heal, and keeps tests that pass a fake
+    ``repo_root`` from touching the real orchestrator venv.
+    """
+    repo_venv = (repo_root / ".venv").resolve()
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        candidate = Path(virtual_env).resolve()
+        if _is_venv(candidate) and (
+            candidate == repo_venv or candidate.is_relative_to(repo_root.resolve())
+        ):
+            return candidate
+    if _is_venv(repo_venv):
+        return repo_venv
+    return None
+
+
+def _check_venv(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult] = run_captured,
+    fleet_dir_override: str | None = None,
+    sync_timeout: int = 300,
+) -> SelfDeployResult:
+    """Verify the orchestrator venv's editable ``.pth`` and repair on mismatch.
+
+    Reads the venv's editable ``.pth`` via ``worktree.verify_shared_venv`` and
+    checks that it resolves to ``repo_root/src``.  On mismatch, logs loudly and
+    runs ``uv sync --reinstall-package charlie-work`` when no fleet runners are
+    active, deferring to the next pass otherwise.  All errors are returned as
+    values.
+    """
+    venv_path = _find_venv_path(repo_root)
+    if venv_path is None:
+        return SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            message="no orchestrator venv found; pth check skipped",
+        )
+
+    venv_ok, venv_message = worktree.verify_shared_venv(repo_root, venv_path)
+    if venv_ok:
+        return SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            message=venv_message,
+        )
+
+    logger.error("ORCHESTRATOR VENV PTH MISMATCH: %s", venv_message)
+
+    live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
+    if live_count > 0:
+        runner_word = "runner" if live_count == 1 else "runners"
+        return SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            venv_deferred=True,
+            message=(
+                f"venv editable target mismatch; repair deferred: "
+                f"{live_count} {runner_word} active"
+            ),
+        )
+
+    repair_res = run_command(
+        ["uv", "sync", "--reinstall-package", "charlie-work"],
+        cwd=repo_root,
+        timeout_seconds=sync_timeout,
+    )
+    if not repair_res.ok:
+        return SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error=(
+                f"venv pth repair (uv sync) failed: "
+                f"{repair_res.error or repair_res.stderr or 'unknown error'}"
+            ),
+        )
+
+    venv_ok, venv_message = worktree.verify_shared_venv(repo_root, venv_path)
+    if not venv_ok:
+        return SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error=f"venv pth repair did not fix the mismatch: {venv_message}",
+        )
+
+    return SelfDeployResult(
+        ok=True,
+        pulled=False,
+        changed=False,
+        synced=False,
+        venv_repaired=True,
+        message=f"venv editable target repaired: {venv_message}",
+    )
 
 
 def self_deploy(
     repo_root: Path,
     *,
+    fleet_dir_override: str | None = None,
     run_command: Callable[..., RunResult] = run_captured,
     pull_timeout: int = 60,
     sync_timeout: int = 300,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
+    Before pulling, verifies the orchestrator venv's editable ``.pth`` points at
+    ``repo_root/src`` and self-heals with ``uv sync`` when it does not.  The
+    repair respects the in-flight-runner guard: if any fleet live sessions are
+    active the repair ``uv sync`` is deferred to the next pass so the Windows
+    venv is not mutated while running workers hold file locks.
+
     Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
     touched ``pyproject.toml`` or ``uv.lock``.  All subprocess errors are
     returned as values (non-fatal); the function never raises.
     """
     try:
+        venv_check = _check_venv(
+            repo_root,
+            run_command=run_command,
+            fleet_dir_override=fleet_dir_override,
+            sync_timeout=sync_timeout,
+        )
+        if not venv_check.ok or venv_check.venv_deferred:
+            return venv_check
+        venv_repaired = venv_check.venv_repaired
+
         before_res = run_command(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
@@ -226,6 +377,7 @@ def self_deploy(
                 pulled=False,
                 changed=False,
                 synced=False,
+                venv_repaired=venv_repaired,
                 error=before_res.error or before_res.stderr or "failed to read HEAD",
             )
         before_sha = before_res.stdout.strip()
@@ -242,6 +394,7 @@ def self_deploy(
                 changed=False,
                 synced=False,
                 from_sha=before_sha,
+                venv_repaired=venv_repaired,
                 error=pull_res.error or pull_res.stderr or "pull failed",
             )
 
@@ -257,6 +410,7 @@ def self_deploy(
                 changed=False,
                 synced=False,
                 from_sha=before_sha,
+                venv_repaired=venv_repaired,
                 error=after_res.error or after_res.stderr or "failed to read HEAD after pull",
             )
         after_sha = after_res.stdout.strip()
@@ -269,6 +423,7 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
+                venv_repaired=venv_repaired,
                 message="already up to date",
             )
 
@@ -285,6 +440,7 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
+                venv_repaired=venv_repaired,
                 error=diff_res.error or diff_res.stderr or "diff failed",
             )
 
@@ -297,6 +453,7 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
+                venv_repaired=venv_repaired,
                 message=f"code-only update: {after_sha}",
             )
 
@@ -313,6 +470,7 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
+                venv_repaired=venv_repaired,
                 error=sync_res.error or sync_res.stderr or "uv sync failed",
             )
 
@@ -323,6 +481,7 @@ def self_deploy(
             synced=True,
             from_sha=before_sha,
             to_sha=after_sha,
+            venv_repaired=venv_repaired,
             message=f"updated and synced: {after_sha}",
         )
     except Exception as exc:
@@ -331,6 +490,7 @@ def self_deploy(
             pulled=False,
             changed=False,
             synced=False,
+            venv_repaired=False,
             error=f"self_deploy crashed: {exc}",
         )
 

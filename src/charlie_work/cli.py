@@ -345,9 +345,13 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
-    deploy = self_deploy(orchestrator_root())
+    deploy = self_deploy(orchestrator_root(), fleet_dir_override=args.fleet_dir)
     if deploy.synced:
         print(f"self-deploy: {deploy.message}", flush=True)
+    elif deploy.venv_repaired:
+        print(f"self-deploy: {deploy.message}", flush=True)
+    elif deploy.venv_deferred:
+        print(f"self-deploy venv repair deferred: {deploy.message}", flush=True)
     elif not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
 
