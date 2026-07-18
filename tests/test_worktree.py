@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.worktree import (
@@ -3035,7 +3036,6 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
     # sessions table is missing the `id` column the probe's query selects -
     # the exact schema-drift shape from the live incident.
     db_path = tmp_path / "sessions.db"
-    import sqlite3
 
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE sessions (working_directory TEXT, created_at TEXT)")
@@ -3230,6 +3230,101 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     assert exc_info.value.probe_result == "devin_per_pid_log_activity"
     assert not worktree_path.exists()
     assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_increments_deferral_count_for_permanent_no_match(tmp_path: Path) -> None:
+    """Issue #426: a permanent sessions.db no-match increments the recovery
+    deferral counter on each attempt and still aborts below the cap.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-permanent-no-match"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db exists but has no row for this worktree (permanent no-match).
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "probe_error"
+    assert exc_info.value.inconclusive_probe_deferred_count == 1
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_allows_permanent_no_match_after_deferral_cap(tmp_path: Path) -> None:
+    """Issue #426: a structurally permanent sessions.db no-match is not an
+    unconditional recovery block. After ``max_inconclusive_probe_deferrals``
+    consecutive inconclusive probes, the destructive reset is allowed.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-permanent-no-match-capped"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db exists but has no row for this worktree (permanent no-match).
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+        "inconclusive_probe_deferred_count": 2,
+    }
+
+    # Should not raise: the permanent no-match has reached the deferral cap.
+    result = create_worktree(
+        repo_root,
+        branch_name,
+        base_ref="HEAD",
+        recovery=recovery_record,
+        config=config,
+    )
+
+    assert isinstance(result, WorktreeInfo)
+    assert worktree_path.exists()
+    assert branch_name in _git(repo_root, "branch", "--list").stdout
 
 
 def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:

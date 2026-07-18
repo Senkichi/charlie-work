@@ -157,6 +157,25 @@ def _log_path(sessions_dir: Path, issue_number: int, *, rework: bool = False) ->
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> int:
+    """Read the existing sidecar's Signal-1 deferral counter, if any."""
+    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    raw = payload.get("inconclusive_probe_deferred_count")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _classify_session_failure(
     log_path: Path,
     throttle_error_markers: Sequence[str] | None = None,
@@ -347,6 +366,16 @@ def launch_devin_session(
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
     session_id = str(uuid.uuid4())
 
+    # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
+    # the recovery dict from the existing sidecar (if any) so consecutive
+    # recovery attempts observe the same counter the reaper does.
+    if recovery is not None:
+        recovery = dict(recovery)
+        recovery.setdefault(
+            "inconclusive_probe_deferred_count",
+            _read_sidecar_inconclusive_count(sessions_dir, issue_number),
+        )
+
     # --- worktree creation ---------------------------------------------------
     try:
         worktree: WorktreeInfo = create_worktree(
@@ -396,6 +425,9 @@ def launch_devin_session(
             process_start_time=exc.process_start_time
             if isinstance(exc, LiveWorkerRedispatchError)
             else None,
+            inconclusive_probe_deferred_count=exc.inconclusive_probe_deferred_count
+            if isinstance(exc, LiveWorkerRedispatchError)
+            else 0,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record
