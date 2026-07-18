@@ -26,6 +26,7 @@ from typing import Any
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
 from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .janitor import _calculate_patch_id
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
@@ -135,7 +136,8 @@ class WorktreeInfo:
     path: Path
     branch: str
     venv_junction: Path | None
-    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
+    # "fetch-fallback" | "pruned" | "salvaged" | "reset-origin:*" | None
+    reclaimed: str | None = None
     # Set when a redispatch reset a branch tip that had commits worth
     # preserving (issue #261) — see attempt_refs.snapshot_attempt_ref.
     attempt_snapshot: AttemptSnapshot | None = None
@@ -439,6 +441,51 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
         return True
     # Branch does not exist (exit 0 with empty stdout)
     return False
+
+
+def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    """Return True if ``ancestor`` is an ancestor of ``descendant``."""
+    result = run_captured(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
+def _rework_patch_id(repo_root: Path, base_ref: str, head_ref: str) -> str:
+    """Return the patch-id of the changes ``head_ref`` introduces over ``base_ref``.
+
+    Uses the three-dot diff ``git diff base_ref...head_ref`` so only changes
+    unique to ``head_ref`` (relative to the merge-base) are hashed. Empty or
+    failed diffs return an empty string.
+    """
+    result = run_captured(
+        ["git", "diff", f"{base_ref}...{head_ref}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return ""
+    return _calculate_patch_id(result.stdout)
+
+
+def _rework_reset_reason(repo_root: Path, branch: str, base_ref: str) -> str:
+    """Decide why a non-FF rework reset is safe (or loud) before trusting origin.
+
+    Compares the patch-id of local ``branch`` with ``origin/{branch}`` relative
+    to ``base_ref``. Identical patch-ids mean the local-only commits carry the
+    same content as the origin tip (e.g. a rebase-only rewrite), so nothing real
+    is lost on reset. Different patch-ids mean the reset discards genuinely
+    different local work and must be reported loudly.
+    """
+    local_patch_id = _rework_patch_id(repo_root, base_ref, branch)
+    origin_patch_id = _rework_patch_id(repo_root, base_ref, f"origin/{branch}")
+    if local_patch_id and origin_patch_id and local_patch_id == origin_patch_id:
+        return "reset-origin:identical-patch-id"
+    if local_patch_id or origin_patch_id:
+        return "reset-origin:different-patch-id"
+    return "reset-origin:indeterminate-patch-id"
 
 
 def _parse_status_v2_paths(stdout: str) -> list[str]:
@@ -1050,9 +1097,18 @@ def create_worktree(
     If ``rework`` is True, the branch is assumed to already exist (from a
     previous PR cycle). In rework mode:
     - If a worktree for the branch already exists, fetch and fast-forward it
-      to the origin tip instead of failing.
+      to the origin tip. When the local branch has diverged non-FF from
+      origin (e.g. the PR was rebased), hard-reset the worktree and branch
+      to ``origin/{branch}`` instead of failing; the old tip is snapshotted
+      first if ``issue_number`` is provided.
     - Otherwise, use ``git worktree add <path> <branch>`` (no ``-b``) to
-      attach to the existing branch at its origin tip.
+      attach to the existing branch at the origin tip. On non-FF divergence
+      the local branch ref is reset to ``origin/{branch}`` before the
+      worktree is added.
+
+    For an OPEN PR's agent branch, origin is authoritative. A non-FF reset is
+    guarded by a patch-id comparison against ``base_ref``; the resulting
+    reason string is surfaced in ``WorktreeInfo.reclaimed``.
 
     If ``recovery`` is provided (a dict with state file dispatch record),
     this is a dead-worker recovery re-dispatch. The dict must contain
@@ -1398,12 +1454,34 @@ def create_worktree(
                         cwd=worktree_path,
                         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
-                    # If fast-forward fails (diverged history), fail the launch
                     if not ff_result.ok:
-                        raise RuntimeError(
-                            f"Cannot fast-forward rework branch {branch!r} to origin tip: "
-                            f"{ff_result.error or ff_result.stderr}"
+                        # Non-fast-forward: the PR branch was rebased or force-pushed
+                        # on origin. For an open PR, origin is authoritative; snapshot
+                        # the old tip (best-effort), compare patch-ids, and reset.
+                        _snapshot_before_delete(branch)
+                        base_branch = (
+                            resolved_base_ref[len("origin/") :]
+                            if resolved_base_ref.startswith("origin/")
+                            else None
                         )
+                        if base_branch and base_branch != branch:
+                            run_captured(
+                                ["git", "fetch", "origin", base_branch],
+                                cwd=repo_root,
+                                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                            )
+                        reset_reason = _rework_reset_reason(repo_root, branch, resolved_base_ref)
+                        reset_result = run_captured(
+                            ["git", "reset", "--hard", f"origin/{branch}"],
+                            cwd=worktree_path,
+                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                        )
+                        if not reset_result.ok:
+                            raise RuntimeError(
+                                f"Cannot reset rework branch {branch!r} to origin tip: "
+                                f"{reset_result.error or reset_result.stderr}"
+                            )
+                        reclaimed = reset_reason
                 # If fetch failed with origin present, raise (real network/error failure)
                 if not fetch_result.ok:
                     raise RuntimeError(
@@ -1441,7 +1519,7 @@ def create_worktree(
             # Fetch first to ensure we materialize at the origin tip, but only if origin exists
             if _has_origin_remote(repo_root):
                 fetch_result = run_captured(
-                    ["git", "fetch", "origin", f"{branch}:{branch}"],
+                    ["git", "fetch", "origin", branch],
                     cwd=repo_root,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
@@ -1451,6 +1529,43 @@ def create_worktree(
                         f"Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
+
+                # Decide whether the local branch can stay at its current tip.
+                # origin/branch is an ancestor of branch -> local is ahead/equal,
+                # so keep the local tip (it contains the origin work). Otherwise
+                # branch is behind or diverged; trust origin and reset the ref.
+                origin_is_ancestor = _is_ancestor(repo_root, f"origin/{branch}", branch)
+                branch_is_ancestor = _is_ancestor(repo_root, branch, f"origin/{branch}")
+                if not origin_is_ancestor and not branch_is_ancestor:
+                    # Diverged: snapshot, guard, and hard-reset the local ref.
+                    _snapshot_before_delete(branch)
+                    base_branch = (
+                        resolved_base_ref[len("origin/") :]
+                        if resolved_base_ref.startswith("origin/")
+                        else None
+                    )
+                    if base_branch and base_branch != branch:
+                        run_captured(
+                            ["git", "fetch", "origin", base_branch],
+                            cwd=repo_root,
+                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                        )
+                    reclaimed = _rework_reset_reason(repo_root, branch, resolved_base_ref)
+                if not origin_is_ancestor:
+                    # Local is behind or diverged: set branch to origin tip.
+                    # When diverged this is a hard reset; when behind it is a
+                    # fast-forward. Either way origin is authoritative for an open PR.
+                    update_result = run_captured(
+                        ["git", "branch", "-f", branch, f"origin/{branch}"],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                    if not update_result.ok:
+                        raise RuntimeError(
+                            f"Cannot reset rework branch {branch!r} to origin tip: "
+                            f"{update_result.error or update_result.stderr}"
+                        )
+
             result = run_captured(
                 ["git", "worktree", "add", str(worktree_path), branch],
                 cwd=repo_root,

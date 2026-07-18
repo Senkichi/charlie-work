@@ -538,6 +538,190 @@ def test_rework_fetch_failure_raises_when_origin_exists(tmp_path: Path) -> None:
         create_worktree(repo_root, branch_name, rework=True)
 
 
+def test_rework_reuse_resets_on_non_ff_identical_patch_id(tmp_path: Path) -> None:
+    """Rework reuse path must reset an existing worktree when local branch diverged
+    non-FF from origin but the patch-id is identical (e.g. rebase-only rewrite)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-identical"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance main on remote and rebase feature with the same content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info2 = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info2.path / "feature.txt").read_text(encoding="utf-8") == "feature content\n"
+    assert (info2.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info2.reclaimed == "reset-origin:identical-patch-id"
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_reuse_resets_on_non_ff_different_patch_id(tmp_path: Path) -> None:
+    """Rework reuse path must reset to origin and report a different patch-id
+    when the local-only commits genuinely diverge from the rebased origin tip."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-different"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("local version\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Remote rebases and changes the feature commit content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info2 = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info2.path / "feature.txt").read_text(encoding="utf-8") == "remote version\n"
+    assert (info2.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info2.reclaimed == "reset-origin:different-patch-id"
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_attach_resets_on_non_ff_identical_patch_id(tmp_path: Path) -> None:
+    """Rework attach path must reset a non-FF diverged local branch ref to the
+    origin tip when the patch-id is identical."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-attach-identical"
+    _git(repo_root, "checkout", "-b", branch_name)
+    (repo_root / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(repo_root, "add", "feature.txt")
+    _git(repo_root, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+    _git(repo_root, "checkout", "main")
+
+    # Advance main on remote and rebase feature with the same content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info.branch == branch_name
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info.path / "feature.txt").read_text(encoding="utf-8") == "feature content\n"
+    assert (info.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info.reclaimed == "reset-origin:identical-patch-id"
+    assert info.attempt_snapshot is not None
+    assert info.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info.path)
+
+
+def test_rework_attach_resets_on_non_ff_different_patch_id(tmp_path: Path) -> None:
+    """Rework attach path must reset a non-FF diverged local branch ref to the
+    origin tip and report a different patch-id."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-attach-different"
+    _git(repo_root, "checkout", "-b", branch_name)
+    (repo_root / "feature.txt").write_text("local version\n", encoding="utf-8")
+    _git(repo_root, "add", "feature.txt")
+    _git(repo_root, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+    _git(repo_root, "checkout", "main")
+
+    # Remote rebases and changes the feature commit content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info.branch == branch_name
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info.path / "feature.txt").read_text(encoding="utf-8") == "remote version\n"
+    assert (info.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info.reclaimed == "reset-origin:different-patch-id"
+    assert info.attempt_snapshot is not None
+    assert info.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info.path)
+
+
 def test_remove_worktree_deletes_branch_when_provided(tmp_path: Path) -> None:
     """remove_worktree should delete the branch when branch parameter is provided."""
     repo_root = tmp_path / "repo"
