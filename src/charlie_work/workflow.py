@@ -1960,7 +1960,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
             )
             continue
-        if w.error is None and not w.is_alive():
+        if not w.is_alive():
             # Update log stat fields for progress tracking (final update before classification)
             update_worker_log_stat(sessions_dir, w)
 
@@ -1981,12 +1981,16 @@ def _classify_dead_sessions_and_update_throttle_state(
             # genuinely-dead worker behind a permanently-broken probe still gets
             # reaped after N deferred passes (never an unconditional "never-reap").
             #
-            # Only workers with a real pid are corroborated. A pid=None worker
-            # (launch never spawned a process, or the pid was already cleared)
-            # has no liveness signal to second-guess -- is_alive() is trivially
-            # and unambiguously False -- so it keeps the prior immediate-reap
-            # behavior, matching _detect_and_handle_stalled_sessions's existing
-            # "if w.pid is None ...: continue" guard before it ever probes.
+            # Issue #426: the launch-failure lane above handles ``pid is None``
+            # sidecars. Sidecars that carry a real (dead) pid *and* a stale
+            # ``error`` string (e.g. ``live_worker_redispatch_averted``) must not
+            # be invisible to the confirmed-dead lane. Removing the ``w.error is
+            # None`` gate lets classify_worker_health decide, with the same
+            # max_inconclusive_probe_deferrals cap, instead of leaving them stuck
+            # forever. The stall lane skips ``w.error is not None`` workers, so
+            # the dead lane must persist the Signal-1 counter for those workers
+            # even when loop() asks it not to double-write for ``w.error is None``
+            # workers.
             if w.pid is not None:
                 probe = real_activity_probe_for(w, config, now_for_health)
                 health = classify_worker_health(w, config, now_for_health, probe)
@@ -1998,7 +2002,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # it. Every other caller (including every existing unit test)
                 # leaves this at its default True, so this lane remains fully
                 # self-sufficient when called on its own.
-                if persist_inconclusive_probe_counter:
+                #
+                # Issue #426: the stall lane unconditionally skips
+                # ``w.error is not None`` workers, so for those sidecars this
+                # dead lane is the only writer of the counter. Persist it even
+                # when loop() passes False.
+                if persist_inconclusive_probe_counter or w.error is not None:
                     new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
                     update_worker_log_stat(
                         sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
