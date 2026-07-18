@@ -4,6 +4,8 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 
 from charlie_work.config import (
     AutoMergeConfig,
@@ -758,3 +760,102 @@ def test_fake_github_payloads_align_with_field_constants() -> None:
         f"test_reconcile._issue has keys not in RECONCILE_ISSUE_FIELDS: {extra_issue_keys}. "
         f"Either remove these keys from the fake or add them to RECONCILE_ISSUE_FIELDS."
     )
+
+
+def _make_fleet_json(tmp_path: Path, state_dir: Path) -> Path:
+    """Create a fleet.json with one repo pointing at the given state_dir."""
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    fleet_json = fleet_dir_path / "fleet.json"
+    fleet_json.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repos": {
+                    "owner/repo": {
+                        "repo_root": str(tmp_path),
+                        "state_dir": str(state_dir),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return fleet_json
+
+
+def test_doctor_skips_fleet_supervisor_check_when_fleet_not_configured(
+    tmp_path: Path,
+) -> None:
+    """No fleet supervisor warning when fleet.json does not exist."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    names = {check.name for check in checks}
+    assert "fleet supervisor" not in names
+    assert ok is True
+
+
+def test_doctor_warns_when_fleet_configured_but_not_supervised(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """fleet.json has repos but no supervisor lock held → warning."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+    _make_fleet_json(tmp_path, paths.root)
+
+    # All locks are acquirable, so no supervisor is running.
+    monkeypatch.setattr(
+        "charlie_work.doctor.try_acquire_supervisor_lock",
+        lambda _path: MagicMock(),
+    )
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    fleet_check = by_name["fleet supervisor"]
+    assert fleet_check.ok is False
+    assert fleet_check.severity == "warning"
+    assert "run `charlie fleet supervise`" in fleet_check.detail
+    assert ok is True
+
+
+def test_doctor_passes_when_fleet_supervisor_lock_held(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """fleet-supervisor.lock held means the fleet is being driven."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+    _make_fleet_json(tmp_path, paths.root)
+
+    # Touch the fleet supervisor lock file so the existence check triggers the probe.
+    fleet_lock_path = tmp_path / "fleet" / "fleet-supervisor.lock"
+    fleet_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fleet_lock_path.write_text("", encoding="utf-8")
+
+    def _fake_lock(path: Path) -> MagicMock | None:
+        if path.name == "fleet-supervisor.lock":
+            return None  # held
+        return MagicMock()  # repo locks free
+
+    monkeypatch.setattr(
+        "charlie_work.doctor.try_acquire_supervisor_lock",
+        _fake_lock,
+    )
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    fleet_check = by_name["fleet supervisor"]
+    assert fleet_check.ok is True
+    assert "fleet supervisor appears to be running" in fleet_check.detail
+    assert ok is True

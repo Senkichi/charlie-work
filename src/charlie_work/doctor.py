@@ -17,6 +17,8 @@ from typing import Any
 import yaml
 
 from .config import OrchestratorConfig
+from .fleet_paths import fleet_dir
+from .fleet_registry import _load_registry
 from .github import (
     GitHub,
     GitHubError,
@@ -31,6 +33,7 @@ from .github import (
 )
 from .paths import RuntimePaths
 from .prompts import resolve_template
+from .supervise import try_acquire_supervisor_lock
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,63 @@ def _surface_post_mortems(
         )
 
 
+def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
+    """Warn when a fleet registry exists but no supervisor appears to be driving it.
+
+    The check is best-effort and non-blocking: it tries to acquire the fleet
+    supervisor lock and per-repo supervisor locks. If none are held, the fleet
+    is configured but probably not being driven continuously.
+    """
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    if not fleet_json_path.exists():
+        return
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+    if not repos:
+        return
+
+    fleet_lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    if fleet_lock_path.exists():
+        fleet_lock = try_acquire_supervisor_lock(fleet_lock_path)
+        if fleet_lock is None:
+            add("fleet supervisor", True, "fleet supervisor appears to be running")
+            return
+        fleet_lock.release()
+
+    held_repo_keys: list[str] = []
+    for repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            continue
+        state_dir = Path(state_dir_str)
+        if not state_dir.exists():
+            continue
+        repo_lock_path = state_dir / "supervisor.lock"
+        if not repo_lock_path.exists():
+            continue
+        repo_lock = try_acquire_supervisor_lock(repo_lock_path)
+        if repo_lock is None:
+            held_repo_keys.append(repo_key)
+        else:
+            repo_lock.release()
+
+    if held_repo_keys:
+        add(
+            "fleet supervisor",
+            True,
+            f"per-repo supervisor running for {len(held_repo_keys)} repo(s)",
+        )
+    else:
+        add(
+            "fleet supervisor",
+            False,
+            f"{len(repos)} repo(s) registered in fleet.json but no fleet or "
+            "per-repo supervisor appears to be running; run `charlie fleet supervise` "
+            "for continuous operation or schedule `charlie fleet bash-rats`",
+            severity="warning",
+        )
+
+
 def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
     """Validate gh --json field lists against the live gh CLI.
 
@@ -351,6 +411,7 @@ def run_doctor(
     *,
     adapter_probe: bool = False,
     live: bool = False,
+    fleet_dir_override: str | None = None,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
 
@@ -538,6 +599,9 @@ def run_doctor(
         template_path.is_file(),
         str(template_path) if template_path.is_file() else f"not found: {template_path}",
     )
+
+    # -- fleet supervisor ----------------------------------------------------
+    _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

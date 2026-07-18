@@ -8,6 +8,7 @@ import pytest
 
 from charlie_work import cli
 from charlie_work.fleet_paths import fleet_dir
+from charlie_work.workflow import CommandResult
 
 
 class _FakeGitHub:
@@ -262,3 +263,50 @@ def test_cli_spec_review_unreadable_file_json_output(
     assert payload["ok"] is False
     assert "OS error" in payload["message"]
     assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
+
+
+def test_cli_fleet_supervise_parser() -> None:
+    """``fleet supervise`` accepts the expected limit/repos/poll/max-runtime/merge flags."""
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "fleet",
+            "supervise",
+            "--limit",
+            "2",
+            "--repos",
+            "a/b,c/d",
+            "--poll-interval",
+            "10",
+            "--max-runtime",
+            "60",
+            "--merge",
+        ]
+    )
+    assert args.command == "fleet"
+    assert args.fleet_command == "supervise"
+    assert args.limit == 2
+    assert args.repos == "a/b,c/d"
+    assert args.poll_interval == 10
+    assert args.max_runtime == 60
+    assert args.merge is True
+
+
+def test_cli_fleet_supervise_command_runs_and_returns_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``charlie fleet supervise`` is wired through ``main`` and returns the loop result."""
+    captured: dict[str, Any] = {}
+
+    def _fake_run_fleet_supervise(**kwargs: Any) -> CommandResult:
+        captured["kwargs"] = kwargs
+        return CommandResult(True, "fleet supervisor complete", {})
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake_run_fleet_supervise)
+
+    rc = cli.main(["fleet", "supervise", "--limit", "3", "--max-runtime", "120"])
+
+    assert rc == 0
+    assert captured["kwargs"]["limit"] == 3
+    assert captured["kwargs"]["max_runtime_override"] == 120
