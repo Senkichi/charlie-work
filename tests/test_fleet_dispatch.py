@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import (
     _extract_attention_events,
@@ -13,6 +15,7 @@ from charlie_work.fleet_dispatch import (
     run_fleet_supervise,
 )
 from charlie_work.fleet_registry import count_fleet_runners
+from charlie_work.supervise import SelfDeployResult
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
 
@@ -31,6 +34,21 @@ class _FakeClock:
     def sleep(self, seconds: float) -> None:
         self.sleep_calls.append(seconds)
         self._now += self._auto_advance if self._auto_advance else seconds
+
+
+@pytest.fixture(autouse=True)
+def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> None:
+    """Self-deploy hits the real git/uv CLI; keep fleet supervisor unit tests hermetic."""
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root: SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            message="test no-op",
+        ),
+    )
 
 
 def test_select_repos_all_sorted_by_last_seen() -> None:
@@ -1273,3 +1291,46 @@ def test_run_fleet_supervise_full_pass_interval_fallback_triggers_pass(
     assert result.data["passes"] == 2
     assert mock_fleet_loop.call_count == 2
     assert fc.sleep_calls == [5.0, 5.0]
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploys_before_each_pass(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The fleet supervisor calls self_deploy before every fleet_loop pass."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            from_sha="abc123",
+            to_sha="def456",
+            message="code-only update: def456",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 3
+    assert mock_fleet_loop.call_count == 3
+    assert deploy_mock.call_count == 3

@@ -9,12 +9,15 @@ Injected sleep/clock: record sleep args; monotonically advancing fake clock.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
+    SelfDeployResult,
     has_delta,
     run_supervised,
+    self_deploy,
     should_exit,
     take_snapshot,
     try_acquire_supervisor_lock,
@@ -914,3 +917,133 @@ def test_run_supervised_summary_uses_fleet_live_count(tmp_path: Path, capfd: Any
     assert "live ~1" not in out, (
         "summary should not report local snapshot count when fleet count is available"
     )
+
+
+# ---------------------------------------------------------------------------
+# self_deploy unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_runner(
+    responses: list[RunResult],
+) -> tuple[Callable[..., RunResult], list[tuple[list[str], Path, int]]]:
+    """Return a callable that consumes ``responses`` and records its calls."""
+    calls: list[tuple[list[str], Path, int]] = []
+
+    def runner(command: list[str], *, cwd: Path, timeout_seconds: int) -> RunResult:
+        calls.append((command, cwd, timeout_seconds))
+        return responses.pop(0)
+
+    return runner, calls
+
+
+def test_self_deploy_code_only_change_does_not_sync(tmp_path: Path) -> None:
+    """A pull that changes only source files triggers no uv sync."""
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "src/foo.py\nREADME.md\n", ""),  # diff
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result == SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=True,
+        synced=False,
+        from_sha="abc123",
+        to_sha="def456",
+        message="code-only update: def456",
+    )
+    assert len(calls) == 4
+    assert [c[0] for c in calls] == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "diff", "--name-only", "abc123..def456"],
+    ]
+
+
+def test_self_deploy_dependency_change_triggers_uv_sync(tmp_path: Path) -> None:
+    """A pull touching pyproject.toml/uv.lock runs uv sync and reports success."""
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "def456\n", ""),
+            RunResult(0, "pyproject.toml\nuv.lock\n", ""),
+            RunResult(0, "", ""),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.ok is True
+    assert result.pulled is True
+    assert result.changed is True
+    assert result.synced is True
+    assert result.from_sha == "abc123"
+    assert result.to_sha == "def456"
+    assert "updated and synced" in result.message
+    assert calls[-1][0] == ["uv", "sync"]
+
+
+def test_self_deploy_pull_failure_is_non_fatal(tmp_path: Path) -> None:
+    """A diverged/dirty tree causes the pull to fail; self_deploy returns but does not raise."""
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(1, "", "fatal: Not possible to fast-forward, aborting."),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.ok is False
+    assert result.pulled is False
+    assert result.changed is False
+    assert result.synced is False
+    assert result.from_sha == "abc123"
+    assert "fast-forward" in (result.error or "")
+    assert len(calls) == 2
+
+
+def test_self_deploy_already_up_to_date(tmp_path: Path) -> None:
+    """When the pull succeeds but HEAD does not move, no sync is attempted."""
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "Already up to date.\n", ""),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result == SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=False,
+        synced=False,
+        from_sha="abc123",
+        to_sha="abc123",
+        message="already up to date",
+    )
+    assert len(calls) == 3
+    assert all(c[0] != ["uv", "sync"] for c in calls)
+
+
+def test_self_deploy_uv_sync_failure_is_non_fatal(tmp_path: Path) -> None:
+    """If uv sync fails after a dependency-changing pull, self_deploy reports the error."""
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "def456\n", ""),
+            RunResult(0, "uv.lock\n", ""),
+            RunResult(1, "", "failed to install"),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.ok is False
+    assert result.pulled is True
+    assert result.changed is True
+    assert result.synced is False
+    assert result.to_sha == "def456"
+    assert "failed to install" in (result.error or "")
