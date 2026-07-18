@@ -375,3 +375,103 @@ def test_merged_pr_list_runs_when_graphql_rate_limit_sufficient(
 
     assert result == merged_prs
     assert any(c[:2] == ["gh", "pr"] and "merged" in c for c in call_log)
+
+
+def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #433: per-issue merged-PR lookup bypasses the 500-window cap and does
+    not consume the GraphQL budget check used by merged_pr_list().
+    """
+    search_json = _read_fixture("gh_pr_list_search_merged.json")
+    call_log: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        call_log.append(cmd)
+        if cmd[:3] == ["gh", "api", "rate_limit"]:
+            # Should not be called; this method is intentionally budget-agnostic.
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
+        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=search_json, stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
+
+    assert len(result) == 1
+    assert result[0]["number"] == 335
+    assert result[0]["state"] == "MERGED"
+    search_calls = [c for c in call_log if c[:2] == ["gh", "pr"] and "--search" in c]
+    assert len(search_calls) == 1
+    assert search_calls[0] == [
+        "gh",
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--search",
+        '"#326"',
+        "--limit",
+        "20",
+        "--json",
+        github_module.MERGED_PR_LIST_FIELDS,
+    ]
+    assert not any(c[:3] == ["gh", "api", "rate_limit"] for c in call_log)
+
+
+def test_merged_prs_for_issue_returns_empty_when_pr_is_not_bound(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A merged PR that only mentions the issue (no branch prefix / closing keyword)
+    must not be returned, even if the issue number appears in its title/body.
+    """
+    prs = [
+        {
+            "number": 1,
+            "title": "chore: unrelated",
+            "body": "While in the area, this also happens to fix issue #326.",
+            "headRefName": "unrelated-cleanup",
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(prs), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
+
+    assert result == []
+
+
+def test_merged_prs_for_issue_returns_empty_on_gh_failure(monkeypatch, tmp_path: Path) -> None:
+    """Per-issue lookup is best-effort; a non-zero gh exit returns an empty list."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="HTTP 502: Bad gateway",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
+
+    assert result == []
+    assert result.ok is False
