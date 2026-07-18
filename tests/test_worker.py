@@ -11,7 +11,13 @@ import time
 
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
-from charlie_work.config import OrchestratorConfig, PostMortemConfig, WatchdogConfig
+from charlie_work.config import (
+    AutoMergeConfig,
+    DevinConfig,
+    OrchestratorConfig,
+    PostMortemConfig,
+    WatchdogConfig,
+)
 from charlie_work.devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
@@ -727,6 +733,129 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
 
     # Verify the sidecar was deleted as a side effect
     assert not sidecar_path.exists(), "Sidecar should be reaped after dead session classification"
+
+
+def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #426: a dead-pid sidecar with a stale ``probe_error``/``live_worker_redispatch_averted``
+    record is not invisible to the confirmed-dead lane. It is deferred up to
+    ``max_inconclusive_probe_deferrals`` and then reaped/relabeled.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+    import sys
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+        # Cap at 1 so the test reaches the reap in two passes.
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=1),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("Session log\n", encoding="utf-8")
+
+    issue_number = 123
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch="agent/issue-123",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=99999,  # Dead PID
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="probe_error",
+        failure_kind="live_worker_redispatch_averted",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    class FakeGitHub:
+        def __init__(self) -> None:
+            self.issues = [
+                {
+                    "number": issue_number,
+                    "title": "Test issue",
+                    "url": "https://example.test/issues/123",
+                    "body": "Test",
+                    "labels": [{"name": config.labels.in_progress}],
+                }
+            ]
+            self.prs = []
+            self.labels_added = []
+            self.labels_removed = []
+
+        def issue_list(self, labels=None, state=None):
+            return self.issues
+
+        def issue_view(self, number: int):
+            for issue in self.issues:
+                if issue["number"] == number:
+                    return issue
+            raise ValueError(f"Issue {number} not found")
+
+        def pr_list(self):
+            return self.prs
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            self.labels_added.append((number, label))
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            self.labels_removed.append((number, label))
+            return True
+
+    fake_gh = FakeGitHub()
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
+
+    # Force an all-errored (inconclusive) real-activity probe so the test is
+    # deterministic and exercises the deferral cap.
+    def _inconclusive_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no session found matching working_directory",
+                ),
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no per-PID log found",
+                ),
+            )
+        )
+
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+
+    # First pass: defer and advance the counter.
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
+    assert sidecar_path.exists()
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+    assert fake_gh.labels_removed == []
+    assert fake_gh.labels_added == []
+
+    # Second pass: deferral cap reached, sidecar reaped and issue relabeled.
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
+    assert not sidecar_path.exists()
+    assert (123, config.labels.in_progress) in fake_gh.labels_removed
+    assert (123, config.labels.ready) in fake_gh.labels_added
 
 
 def test_iter_workers_backward_compatibility(tmp_path: Path) -> None:
