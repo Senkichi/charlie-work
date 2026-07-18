@@ -12,12 +12,17 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0)
 
 
-def no_console_window_kwargs(extra_creationflags: int = 0) -> dict[str, int]:
+class _CreationFlagsKwargs(TypedDict, total=False):
+    creationflags: int
+
+
+def no_console_window_kwargs(extra_creationflags: int = 0) -> _CreationFlagsKwargs:
     """Return the ``creationflags`` kwargs that suppress the transient console
     window Windows allocates for a spawned child when the parent has no
     console/window of its own (e.g. an orchestrator running headless or from
