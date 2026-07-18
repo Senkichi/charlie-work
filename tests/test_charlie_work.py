@@ -3471,6 +3471,139 @@ def test_dispatch_finalizes_closed_issue_for_aviator_merge(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "closed"
 
 
+def test_dispatch_caps_merge_finalization_per_pass(tmp_path: Path) -> None:
+    """Issue #432: merge-finalization is capped at dispatch.finalize_limit per pass.
+
+    A backlog of bound-and-closed issues carrying a stale ready marker drains
+    oldest-first across passes; no single pass can monopolize the pass budget.
+    """
+    config = OrchestratorConfig(dispatch=DispatchConfig(finalize_limit=2))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    ready = config.labels.ready
+
+    class LabelMutatingFakeGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] != number:
+                    continue
+                names = {item.get("name") for item in issue["labels"]}
+                if label not in names:
+                    issue["labels"].append({"name": label})
+                break
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        item for item in issue["labels"] if item.get("name") != label
+                    ]
+                    break
+            return True
+
+    fake_gh = LabelMutatingFakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 101,
+            "title": "Fix one",
+            "url": "https://example.test/issues/101",
+            "body": "body one",
+            "labels": [{"name": ready}],
+            "state": "CLOSED",
+            "createdAt": "2026-01-01T00:00:00Z",
+        },
+        {
+            "number": 102,
+            "title": "Fix two",
+            "url": "https://example.test/issues/102",
+            "body": "body two",
+            "labels": [{"name": ready}],
+            "state": "CLOSED",
+            "createdAt": "2026-01-02T00:00:00Z",
+        },
+        {
+            "number": 103,
+            "title": "Fix three",
+            "url": "https://example.test/issues/103",
+            "body": "body three",
+            "labels": [{"name": ready}],
+            "state": "CLOSED",
+            "createdAt": "2026-01-03T00:00:00Z",
+        },
+    ]
+    fake_gh.prs = [
+        {
+            "number": 201,
+            "title": "Fix #101",
+            "url": "https://example.test/pull/201",
+            "headRefName": "agent/issue-101-fix-one",
+            "baseRefName": "main",
+            "headRefOid": "sha-101",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #101",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        },
+        {
+            "number": 202,
+            "title": "Fix #102",
+            "url": "https://example.test/pull/202",
+            "headRefName": "agent/issue-102-fix-two",
+            "baseRefName": "main",
+            "headRefOid": "sha-102",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #102",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        },
+        {
+            "number": 203,
+            "title": "Fix #103",
+            "url": "https://example.test/pull/203",
+            "headRefName": "agent/issue-103-fix-three",
+            "baseRefName": "main",
+            "headRefOid": "sha-103",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #103",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result1 = app.dispatch()
+
+    assert result1.ok is True
+    assert result1.data["selected_count"] == 0
+    assert result1.data["merged_pr_referenced_issue_numbers"] == [101, 102, 103]
+    assert result1.data["merged_pr_closed_issue_numbers"] == [101, 102]
+    assert 101 in fake_gh.closed_issues
+    assert 102 in fake_gh.closed_issues
+    assert 103 not in fake_gh.closed_issues
+    assert (101, config.labels.done) in fake_gh.labels_added
+    assert (102, config.labels.done) in fake_gh.labels_added
+    assert (103, config.labels.done) not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"]["101"]["status"] == "closed"
+    assert state["issues"]["102"]["status"] == "closed"
+    assert "103" not in state["issues"]
+
+    # Second pass drains the remaining bound-and-closed issue.
+    result2 = app.dispatch()
+    assert result2.ok is True
+    assert result2.data["selected_count"] == 0
+    assert result2.data["merged_pr_closed_issue_numbers"] == [103]
+    assert 103 in fake_gh.closed_issues
+    assert (103, config.labels.done) in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"]["103"]["status"] == "closed"
+
+
 def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
     tmp_path: Path,
 ) -> None:
