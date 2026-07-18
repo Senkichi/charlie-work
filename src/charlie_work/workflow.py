@@ -1134,6 +1134,51 @@ def _detect_and_handle_orphaned_workers(
                 "label_write_ok": label_write_ok,
             }
 
+    # Issue #439: route dead workers with stuck pre-review PRs to rework before
+    # the state-update sweep. PR views are fetched outside the state lock; the
+    # route helper updates state/labels in its own critical section. The second
+    # lock below will then skip issues that have already moved to
+    # rework_requested/escalated.
+    pre_review_routed: set[int] = set()
+    state_snapshot = state
+    now = datetime.now(UTC)
+    for issue_number in orphaned_issues:
+        pr_data = pr_by_issue.get(issue_number)
+        if not pr_data:
+            continue
+        pr_number = int(pr_data["number"])
+        pr_state = state_snapshot.get("prs", {}).get(str(pr_number), {})
+        last_decision = pr_state.get("decision")
+        reviewed_head_sha = pr_state.get("reviewed_head_sha")
+        live_head_sha = pr_data.get("headRefOid")
+        if (
+            last_decision == "request_changes"
+            and reviewed_head_sha
+            and live_head_sha
+            and reviewed_head_sha == live_head_sha
+        ):
+            # Let the second-lock request_changes restoration path handle this;
+            # do not overwrite an existing review feedback prompt.
+            continue
+        try:
+            pr_view = gh.pr_view(pr_number)
+        except Exception:
+            pr_view = None
+        enriched = pr_view if pr_view else pr_data
+        is_candidate, reason = _is_pre_review_rework_candidate(enriched, config, now)
+        if is_candidate:
+            route_result = _route_dead_worker_to_pre_review_rework(
+                state_file,
+                gh,
+                config,
+                enriched,
+                issue_number,
+                reason,
+                failure_kind=None,
+            )
+            if route_result is not None:
+                pre_review_routed.add(issue_number)
+
     # Handle orphaned workers
     with state_lock(state_file):
         state = load_state(state_file)
@@ -1504,6 +1549,242 @@ def _reap_restore_rework_requested(
             }
             state["issues"][str(worker.issue_number)] = entry
             save_state(state_file, state)
+
+
+def _rework_prompt_search_dirs(
+    config: OrchestratorConfig, repo_root: Path | None = None
+) -> tuple[Path, ...]:
+    """Resolve the optional repo-local prompt override directory."""
+    prompts_dir = config.runtime.prompts_dir
+    if not prompts_dir:
+        return ()
+    path = Path(prompts_dir)
+    if not path.is_absolute() and repo_root is not None:
+        path = repo_root / path
+    return (path,)
+
+
+def _write_rework_prompt(
+    state_file: Path,
+    pr: dict[str, Any],
+    issue_number: int | None,
+    summary: str,
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    """Write a rework brief for a PR under the shared ``prs/pr-{N}`` directory.
+
+    This module-level helper lets both the OrchestratorApp review path and the
+    dead-session recovery path produce the same ``rework-prompt.md`` artifact.
+    """
+    pr_number = int(pr["number"])
+    pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = pr_dir / "rework-prompt.md"
+    prompt = render_prompt(
+        config.dispatch.rework_template,
+        {
+            "pr_number": pr_number,
+            "pr_title": pr.get("title", ""),
+            "pr_url": pr.get("url", ""),
+            "issue_number": issue_number or "UNKNOWN",
+            "review_summary": summary,
+            "branch_name": pr.get("headRefName", ""),
+        },
+        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    )
+    prompt_path.write_text(prompt, encoding="utf-8")
+    return prompt_path
+
+
+def _is_pre_review_rework_candidate(
+    pr: dict[str, Any],
+    config: OrchestratorConfig,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Detect PRs that are stuck before review and need a rework cycle.
+
+    Returns ``(True, reason)`` when either:
+
+    * ``mergeable`` is ``CONFLICTING`` — the branch cannot be merged and CI
+      will not run because GitHub cannot build a merge ref; or
+    * ``statusCheckRollup`` is empty and the PR's ``updatedAt`` is older than
+      ``watchdog.pre_review_rework_stale_minutes`` — the worker opened a PR
+      and then died before any checks were created.
+    """
+    mergeable = str(pr.get("mergeable") or "").upper()
+    if mergeable == "CONFLICTING":
+        return True, "merge_conflict"
+
+    stale_minutes = config.watchdog.pre_review_rework_stale_minutes
+    if stale_minutes <= 0:
+        return False, ""
+
+    status_rollup = pr.get("statusCheckRollup")
+    if status_rollup:
+        return False, ""
+
+    updated_at = pr.get("updatedAt")
+    if not updated_at:
+        return False, ""
+
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False, ""
+
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    if (now - updated).total_seconds() > stale_minutes * 60:
+        return True, "stale_empty_checks"
+
+    return False, ""
+
+
+def _route_dead_worker_to_pre_review_rework(
+    state_file: Path,
+    gh: GitHub,
+    config: OrchestratorConfig,
+    pr: dict[str, Any],
+    issue_number: int,
+    reason: str,
+    *,
+    failure_kind: str | None = None,
+) -> dict[str, Any] | None:
+    """Route a dead worker's stuck pre-review PR to the rework pipeline.
+
+    Writes a rebase-onto-main brief, transitions the issue to ``needs_rework``,
+    and updates state.json to ``rework_requested``. Idempotent: if the issue is
+    already ``rework_requested`` or ``escalated``, this is a no-op.
+
+    Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
+    failures immediately, mirroring the existing redispatch-escalation logic.
+    """
+    pr_number = int(pr["number"])
+    summary = (
+        "The PR branch has a merge conflict with the base branch. "
+        "Rebase the branch onto the current base branch, resolve the conflicts, "
+        "and push. The code changes are already approved; do not re-litigate the review."
+        if reason == "merge_conflict"
+        else (
+            "The PR was opened but no CI checks have been created after the stale threshold. "
+            "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
+            "The existing changes are pre-approved; do not re-litigate the review."
+        )
+    )
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state.setdefault("issues", {})
+        state.setdefault("prs", {})
+        entry = state["issues"].get(str(issue_number), {})
+        if not isinstance(entry, dict):
+            entry = {}
+        current_status = entry.get("status")
+        if current_status in ("rework_requested", "escalated"):
+            return None
+
+        now = datetime.now(UTC)
+        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
+        prior = [
+            t
+            for t in entry.get("redispatch_at", [])
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+        ]
+        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+
+        terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+            entry = {
+                **entry,
+                "number": issue_number,
+                "status": "escalated",
+                "redispatch_at": redispatch_at,
+                "escalation_reason": failure_kind
+                if terminal_failure
+                else "redispatch_cap_exceeded",
+                "pre_review_rework_reason": reason,
+            }
+            state["issues"][str(issue_number)] = entry
+            save_state(state_file, state)
+            result = transition(gh, config.labels, issue_number, "redispatch_escalated")
+            if result.outcome != TransitionOutcome.APPLIED:
+                entry = state["issues"].get(str(issue_number), {})
+                if isinstance(entry, dict):
+                    entry = {
+                        **entry,
+                        "label_error": {
+                            "edge": "redispatch_escalated",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        },
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    save_state(state_file, state)
+            return {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "escalated": True,
+                "escalation_reason": entry["escalation_reason"],
+            }
+
+        repo_root = getattr(gh, "repo_root", None)
+        _write_rework_prompt(state_file, pr, issue_number, summary, config, repo_root=repo_root)
+        entry = {
+            **entry,
+            "number": issue_number,
+            "status": "rework_requested",
+            "dispatched_at": None,
+            "pre_review_rework_reason": reason,
+        }
+        state["issues"][str(issue_number)] = entry
+        state["prs"][str(pr_number)] = {
+            **state["prs"].get(str(pr_number), {}),
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "rework_requested",
+        }
+        state = append_event(
+            state,
+            "pre_review_rework_routed",
+            {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "failure_kind": failure_kind,
+            },
+        )
+        save_state(state_file, state)
+
+    result = transition(gh, config.labels, issue_number, "rework_requested")
+    label_error = None
+    if result.outcome != TransitionOutcome.APPLIED:
+        label_error = {
+            "edge": "rework_requested",
+            "outcome": result.outcome.value,
+            "add_failures": result.add_failures,
+            "remove_failures": result.remove_failures,
+        }
+        with state_lock(state_file):
+            state = load_state(state_file)
+            entry = state["issues"].get(str(issue_number), {})
+            if isinstance(entry, dict):
+                entry = {**entry, "label_error": label_error}
+                state["issues"][str(issue_number)] = entry
+                save_state(state_file, state)
+
+    return {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "reason": reason,
+        "label_error": label_error,
+    }
 
 
 def _classify_dead_sessions_and_update_throttle_state(
@@ -1979,9 +2260,45 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # rework_requested just because a launch-failure classifier
                 # ran on its now-dead sidecar.
                 if not is_completed:
-                    _reap_restore_rework_requested(
-                        state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
-                    )
+                    pr_data = _rework_pr_for_worker(open_prs_by_issue, w)
+                    if pr_data is not None:
+                        pr_number = int(pr_data["number"])
+                        try:
+                            pr_view = gh.pr_view(pr_number)
+                        except Exception:
+                            pr_view = None
+                        enriched = pr_view if pr_view else pr_data
+                        is_candidate, reason = _is_pre_review_rework_candidate(
+                            enriched, config, now_for_health
+                        )
+                        if is_candidate:
+                            _route_dead_worker_to_pre_review_rework(
+                                state_file,
+                                gh,
+                                config,
+                                enriched,
+                                w.issue_number,
+                                reason,
+                                failure_kind=failure_kind,
+                            )
+                        else:
+                            _reap_restore_rework_requested(
+                                state_file,
+                                gh,
+                                config,
+                                open_prs_by_issue,
+                                w,
+                                failure_kind=failure_kind,
+                            )
+                    else:
+                        _reap_restore_rework_requested(
+                            state_file,
+                            gh,
+                            config,
+                            open_prs_by_issue,
+                            w,
+                            failure_kind=failure_kind,
+                        )
 
     return reaped
 
@@ -7428,22 +7745,14 @@ class OrchestratorApp:
     def _write_rework_prompt(
         self, pr: dict[str, Any], issue_number: int | None, summary: str
     ) -> Path:
-        pr_number = int(pr["number"])
-        pr_dir = self.paths.prs / f"pr-{pr_number}"
-        prompt_path = pr_dir / "rework-prompt.md"
-        prompt = self._render(
-            self.config.dispatch.rework_template,
-            {
-                "pr_number": pr_number,
-                "pr_title": pr.get("title", ""),
-                "pr_url": pr.get("url", ""),
-                "issue_number": issue_number or "UNKNOWN",
-                "review_summary": summary,
-                "branch_name": pr.get("headRefName", ""),
-            },
+        return _write_rework_prompt(
+            self.paths.state_file,
+            pr,
+            issue_number,
+            summary,
+            self.config,
+            repo_root=self.repo_root,
         )
-        prompt_path.write_text(prompt, encoding="utf-8")
-        return prompt_path
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"

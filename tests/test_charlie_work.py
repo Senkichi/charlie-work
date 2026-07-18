@@ -24336,3 +24336,194 @@ def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
     assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
     assert state_path.stat().st_mtime == initial_mtime
     assert state_path.read_text(encoding="utf-8") == initial_content
+
+
+def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_checks() -> None:
+    """Issue #439: the two pre-review rework predicates are detected independently."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.workflow import _is_pre_review_rework_candidate
+
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+
+    # Merge conflict is an immediate rework trigger.
+    assert _is_pre_review_rework_candidate({"mergeable": "CONFLICTING"}, config, now) == (
+        True,
+        "merge_conflict",
+    )
+
+    old = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    stale_pr = {"statusCheckRollup": [], "updatedAt": old}
+    assert _is_pre_review_rework_candidate(stale_pr, config, now) == (
+        True,
+        "stale_empty_checks",
+    )
+
+    # A fresh empty-rollup PR is not yet stale.
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    fresh_pr = {"statusCheckRollup": [], "updatedAt": fresh}
+    assert _is_pre_review_rework_candidate(fresh_pr, config, now) == (False, "")
+
+    # Any present check disqualifies the stale predicate.
+    checks_pr = {"statusCheckRollup": [{"name": "Tests passed"}], "updatedAt": old}
+    assert _is_pre_review_rework_candidate(checks_pr, config, now) == (False, "")
+
+
+def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None:
+    """Issue #439: a dead worker with a CONFLICTING open PR is routed to rework."""
+    from datetime import UTC, datetime
+
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=("Tests passed", "Lint & Format", "Pre-commit"))
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    fake_gh.prs = [
+        {
+            "number": 1,
+            "title": "Fix #42: search",
+            "url": "https://example.test/pull/1",
+            "headRefName": "agent/issue-42-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "body": "Closes #42",
+            "state": "OPEN",
+            "labels": [],
+            "isCrossRepository": False,
+            "updatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "statusCheckRollup": [],
+        }
+    ]
+
+    state = {
+        "version": 1,
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "issues": {
+            "42": {
+                "number": 42,
+                "status": "dispatched",
+                "worker_pid": 9999999,
+                "worker_process_start_time": 1234567890.0,
+                "redispatch_at": [],
+            }
+        },
+        "prs": {},
+        "events": [],
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["42"]["status"] == "rework_requested"
+    assert state["issues"]["42"]["pre_review_rework_reason"] == "merge_conflict"
+    assert state["issues"]["42"]["worker_pid"] == 9999999
+    assert state["issues"]["42"]["worker_process_start_time"] == 1234567890.0
+    assert state["prs"]["1"]["status"] == "rework_requested"
+    assert (42, config.labels.needs_rework) in fake_gh.labels_added
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+
+    prompt_path = paths.prs / "pr-1" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert "merge conflict" in prompt_path.read_text(encoding="utf-8").lower()
+
+
+def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> None:
+    """Issue #439: a dead worker with an old PR and empty statusCheckRollup is routed to rework."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=("Tests passed", "Lint & Format", "Pre-commit"))
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": 42,
+            "title": "Fix search",
+            "url": "https://example.test/issues/42",
+            "body": "Search is broken",
+            "labels": [{"name": config.labels.in_progress}],
+        }
+    ]
+    old_updated = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    fake_gh.prs = [
+        {
+            "number": 1,
+            "title": "Fix #42: search",
+            "url": "https://example.test/pull/1",
+            "headRefName": "agent/issue-42-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #42",
+            "state": "OPEN",
+            "labels": [],
+            "isCrossRepository": False,
+            "updatedAt": old_updated,
+            "statusCheckRollup": [],
+        }
+    ]
+
+    state = {
+        "version": 1,
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "issues": {
+            "42": {
+                "number": 42,
+                "status": "dispatched",
+                "worker_pid": 9999999,
+                "worker_process_start_time": 1234567890.0,
+                "redispatch_at": [],
+            }
+        },
+        "prs": {},
+        "events": [],
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["42"]["status"] == "rework_requested"
+    assert state["issues"]["42"]["pre_review_rework_reason"] == "stale_empty_checks"
+    assert state["issues"]["42"]["worker_pid"] == 9999999
+    assert state["issues"]["42"]["worker_process_start_time"] == 1234567890.0
+    assert state["prs"]["1"]["status"] == "rework_requested"
+    assert (42, config.labels.needs_rework) in fake_gh.labels_added
+    assert (42, config.labels.in_progress) in fake_gh.labels_removed
+
+    prompt_path = paths.prs / "pr-1" / "rework-prompt.md"
+    assert prompt_path.exists()
+    prompt_text = prompt_path.read_text(encoding="utf-8").lower()
+    assert "no ci checks" in prompt_text
