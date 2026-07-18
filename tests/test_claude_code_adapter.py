@@ -1405,7 +1405,10 @@ def test_launch_claude_worker_recovery_mode_passes_recovery_dict(
 
     assert record.ok
     assert len(calls) == 1
-    assert calls[0]["recovery"] == recovery_dict
+    assert calls[0]["recovery"] == {
+        **recovery_dict,
+        "inconclusive_probe_deferred_count": 0,
+    }
 
 
 def test_launch_claude_worker_rework_log_suffix(
