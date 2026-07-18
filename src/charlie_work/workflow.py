@@ -6,7 +6,7 @@ import os
 import re
 import signal
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -2548,6 +2548,13 @@ class _BaseCurrentUnset:
 _BASE_CURRENT_UNSET = _BaseCurrentUnset()
 
 
+@dataclass(frozen=True)
+class _MergedPRListOutcome:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -2972,7 +2979,7 @@ class OrchestratorApp:
     def _finalize_externally_merged_issues(
         self,
         ready_issues: list[dict[str, Any]] | None = None,
-    ) -> tuple[set[int], list[dict[str, Any]]]:
+    ) -> tuple[set[int], list[dict[str, Any]], _MergedPRListOutcome]:
         """Finalize closed ready-labeled issues whose linked PR merged externally.
 
         Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
@@ -2998,19 +3005,23 @@ class OrchestratorApp:
             if str(issue.get("state") or "OPEN").upper() == "CLOSED"
         ]
         if not closed_ready:
-            return set(), ready_issues
+            return set(), ready_issues, _MergedPRListOutcome()
 
         finalize_limit = self.config.dispatch.finalize_limit
         if finalize_limit <= 0:
-            return set(), ready_issues
+            return set(), ready_issues, _MergedPRListOutcome()
 
         # Try the cheap 500-window binding first; if the GraphQL-budget guard
         # refuses the call, fall back to per-issue search for all candidates.
         bound_issue_numbers: set[int] = set()
+        merged_pr_outcome = _MergedPRListOutcome()
         try:
             merged_prs = self.gh.merged_pr_list()
-        except GitHubError:
+        except GitHubError as exc:
+            merged_pr_outcome = _MergedPRListOutcome([], exc, called=True)
             merged_prs = []
+        else:
+            merged_pr_outcome = _MergedPRListOutcome(merged_prs, called=True)
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
                 continue
@@ -3052,7 +3063,7 @@ class OrchestratorApp:
                 issue_pr_map[issue_number] = list(merged_prs)
 
         if not issue_pr_map:
-            return set(), ready_issues
+            return set(), ready_issues, merged_pr_outcome
 
         # Persist state first, then apply labels outside the lock.
         with state_lock(self.paths.state_file):
@@ -3094,7 +3105,7 @@ class OrchestratorApp:
 
         finalized: set[int] = set(issue_pr_map.keys())
         remaining = [issue for issue in ready_issues if int(issue["number"]) not in finalized]
-        return finalized, remaining
+        return finalized, remaining, merged_pr_outcome
 
     def dispatch(
         self,
@@ -3119,8 +3130,9 @@ class OrchestratorApp:
         # This runs before fleet lock / GraphQL budget / provider throttle guards
         # so a pass that defers new dispatch still drains the Aviator-merge backlog.
         finalized: set[int] = set()
+        merged_pr_outcome: _MergedPRListOutcome = _MergedPRListOutcome()
         try:
-            finalized, ready_issues = self._finalize_externally_merged_issues()
+            finalized, ready_issues, merged_pr_outcome = self._finalize_externally_merged_issues()
         except StateLockBusy:
             return _state_lock_busy_result(
                 "dispatch deferred: state lock held",
@@ -3148,6 +3160,7 @@ class OrchestratorApp:
                 only_issues=only_issues,
                 stalled_entries=stalled_entries,
                 ready_issues=ready_issues,
+                merged_prs=merged_pr_outcome,
             )
             data = dict(result.data)
             if finalized:
@@ -3191,6 +3204,7 @@ class OrchestratorApp:
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
         ready_issues: list[dict[str, Any]] | None = None,
+        merged_prs: _MergedPRListOutcome | None = None,
     ) -> CommandResult:
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
@@ -3253,6 +3267,15 @@ class OrchestratorApp:
                     data,
                 )
 
+        def _resolve_merged_prs(
+            outcome: _MergedPRListOutcome | None,
+        ) -> list[dict[str, Any]]:
+            if outcome is None or not outcome.called:
+                return self.gh.merged_pr_list() if issues else []
+            if outcome.error is not None and issues:
+                raise outcome.error
+            return outcome.items if issues else []
+
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
@@ -3268,7 +3291,7 @@ class OrchestratorApp:
             # (it intersects against the ready-issue-number set) — skip the
             # expensive listing query entirely rather than fetch-and-discard
             # (issue #361).
-            merged_prs = self.gh.merged_pr_list() if issues else []
+            merged_prs = _resolve_merged_prs(merged_prs)
             (
                 merged_pr_bound_issue_numbers,
                 merged_pr_mention_only_issue_numbers,
@@ -3424,7 +3447,7 @@ class OrchestratorApp:
         # return empty sets regardless of what merged_pr_list() returns (it
         # intersects against the ready-issue-number set) — skip the expensive
         # listing query entirely rather than fetch-and-discard (issue #361).
-        merged_prs = self.gh.merged_pr_list() if issues else []
+        merged_prs = _resolve_merged_prs(merged_prs)
         (
             merged_pr_bound_issue_numbers,
             merged_pr_mention_only_issue_numbers,
