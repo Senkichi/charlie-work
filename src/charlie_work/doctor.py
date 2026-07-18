@@ -17,6 +17,8 @@ from typing import Any
 import yaml
 
 from .config import OrchestratorConfig
+from .fleet_paths import fleet_dir
+from .fleet_registry import _load_registry
 from .github import (
     GitHub,
     GitHubError,
@@ -31,6 +33,7 @@ from .github import (
 )
 from .paths import RuntimePaths
 from .prompts import resolve_template
+from .supervise import try_acquire_supervisor_lock
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,96 @@ def _surface_post_mortems(
         )
 
 
+def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
+    """Warn when a fleet registry exists but no supervisor appears to be driving it.
+
+    The check is per-repo aware: if the fleet supervisor lock is not held, each
+    repo's per-repo supervisor lock is checked individually. A single supervised
+    repo no longer hides an unsupervised one.
+    """
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    if not fleet_json_path.exists():
+        return
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+    if not repos:
+        return
+
+    fleet_lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    if fleet_lock_path.exists():
+        fleet_lock = try_acquire_supervisor_lock(fleet_lock_path)
+        if fleet_lock is None:
+            add("fleet supervisor", True, "fleet supervisor appears to be running")
+            return
+        fleet_lock.release()
+
+    supervised_repo_keys: list[str] = []
+    unsupervised_repo_keys: list[str] = []
+    unreachable_repo_keys: list[str] = []
+    for repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            unsupervised_repo_keys.append(repo_key)
+            continue
+        state_dir = Path(state_dir_str)
+        if not state_dir.exists():
+            unreachable_repo_keys.append(repo_key)
+            continue
+        repo_lock_path = state_dir / "supervisor.lock"
+        if repo_lock_path.exists():
+            repo_lock = try_acquire_supervisor_lock(repo_lock_path)
+            if repo_lock is None:
+                supervised_repo_keys.append(repo_key)
+            else:
+                repo_lock.release()
+                unsupervised_repo_keys.append(repo_key)
+        else:
+            unsupervised_repo_keys.append(repo_key)
+
+    parts: list[str] = []
+    if supervised_repo_keys:
+        parts.append(f"supervised={len(supervised_repo_keys)} ({', '.join(supervised_repo_keys)})")
+    if unsupervised_repo_keys:
+        parts.append(
+            f"unsupervised={len(unsupervised_repo_keys)} ({', '.join(unsupervised_repo_keys)})"
+        )
+    if unreachable_repo_keys:
+        parts.append(
+            f"unreachable={len(unreachable_repo_keys)} ({', '.join(unreachable_repo_keys)})"
+        )
+
+    if not unsupervised_repo_keys:
+        detail = "fleet supervisor appears to be running"
+        if supervised_repo_keys:
+            detail += f" for all {', '.join(supervised_repo_keys)}"
+        if unreachable_repo_keys:
+            detail += f"; {len(unreachable_repo_keys)} repo(s) have no reachable state_dir"
+        add("fleet supervisor", True, detail)
+        return
+
+    detail = (
+        f"{len(repos)} repo(s) registered in fleet.json; "
+        "fleet supervisor not running; " + ", ".join(parts)
+    )
+    if supervised_repo_keys:
+        detail += (
+            "; run `charlie fleet supervise` for continuous operation or schedule "
+            "`charlie fleet bash-rats` for the unsupervised repo(s)"
+        )
+    else:
+        detail += (
+            "; run `charlie fleet supervise` for continuous operation or schedule "
+            "`charlie fleet bash-rats`"
+        )
+
+    add(
+        "fleet supervisor",
+        False,
+        detail,
+        severity="warning",
+    )
+
+
 def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
     """Validate gh --json field lists against the live gh CLI.
 
@@ -351,6 +444,7 @@ def run_doctor(
     *,
     adapter_probe: bool = False,
     live: bool = False,
+    fleet_dir_override: str | None = None,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
 
@@ -538,6 +632,9 @@ def run_doctor(
         template_path.is_file(),
         str(template_path) if template_path.is_file() else f"not found: {template_path}",
     )
+
+    # -- fleet supervisor ----------------------------------------------------
+    _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

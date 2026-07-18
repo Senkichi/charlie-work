@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import datetime
 import logging
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .config import ConfigError
+from .config import ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .paths import runtime_paths
-from .supervise import try_acquire_supervisor_lock
+from .paths import RepoNotFoundError, runtime_paths
+from .supervise import LocalSnapshot, take_snapshot, try_acquire_supervisor_lock
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -597,5 +599,247 @@ def fleet_loop(
         {
             "repos": repos_data,
             "digest": digest,
+        },
+    )
+
+
+def _is_fleet_pass_active(pass_result: CommandResult) -> bool:
+    """Return True when a fleet pass produced actionable work.
+
+    Activity is any dispatch, any successful merge, any generated review, or
+    any attention event (stalled worker, error, health transition, skip).
+    A skipped repo (another supervisor holds its lock) also counts as activity
+    because the fleet is not idle.
+    """
+    data = pass_result.data
+    if not isinstance(data, dict):
+        return False
+    digest = data.get("digest") or {}
+    if isinstance(digest, dict) and digest.get("count", 0) > 0:
+        return True
+    for repo_data in data.get("repos", {}).values():
+        if not isinstance(repo_data, dict):
+            continue
+        if repo_data.get("skipped") is True:
+            return True
+        for section_key in ("dispatch", "dispatch_rework", "dispatch_reviews"):
+            section = repo_data.get(section_key) or {}
+            if isinstance(section, dict) and section.get("selected_count", 0) > 0:
+                return True
+        merges = repo_data.get("merges", [])
+        if isinstance(merges, list) and any(
+            isinstance(m, dict) and m.get("merged") for m in merges
+        ):
+            return True
+        if isinstance(repo_data.get("reviews", []), list) and repo_data.get("reviews"):
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class FleetLocalSnapshot:
+    """Aggregate of per-repo ``LocalSnapshot`` values for cheap fleet-wide delta detection.
+
+    Each entry is keyed by the repo's name-with-owner so adding/removing a repo
+    is also a delta.  The snapshots themselves include live session counts, so
+    worker birth/death is detected even when sidecar file mtimes do not change.
+    """
+
+    repo_snapshots: frozenset[tuple[str, LocalSnapshot]]
+
+
+def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
+    """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
+    sessions_dir = state_dir / "dispatches" / "sessions"
+    prs_dir = state_dir / "prs"
+    return sessions_dir, prs_dir
+
+
+def _take_fleet_snapshot(
+    *,
+    fleet_dir_override: str | None = None,
+) -> FleetLocalSnapshot:
+    """Capture a cheap, network-free snapshot across all registered fleet repos."""
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+
+    repo_snapshots: set[tuple[str, LocalSnapshot]] = set()
+    for repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            continue
+        state_dir = Path(state_dir_str)
+        if not state_dir.exists():
+            continue
+        sessions_dir, prs_dir = _repo_state_dirs(state_dir)
+        repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir)))
+
+    return FleetLocalSnapshot(frozenset(repo_snapshots))
+
+
+def _has_fleet_delta(
+    before: FleetLocalSnapshot,
+    after: FleetLocalSnapshot,
+) -> bool:
+    """Return True if any per-repo local signal changed between snapshots."""
+    return before.repo_snapshots != after.repo_snapshots
+
+
+def run_fleet_supervise(
+    *,
+    fleet_dir_override: str | None = None,
+    repos: tuple[str, ...] | None = None,
+    limit: int | None = None,
+    merge: bool | None = None,
+    dry_run: bool = False,
+    poll_interval_override: int | None = None,
+    max_runtime_override: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    max_passes: int | None = None,
+) -> CommandResult:
+    """Run a continuous fleet supervisor loop.
+
+    This is the fleet-wide equivalent of ``charlie bash-rats``/``run_supervised``:
+    it polls cheap local signals (per-repo sidecar and verdict mtimes) across the
+    registered fleet and calls ``fleet_loop`` only when something actionable
+    changed or ``supervisor.full_pass_interval_seconds`` has elapsed since the
+    last full pass. It sleeps for ``supervisor.poll_interval_seconds`` after an
+    idle pass (or poll with no pass) and ``supervisor.active_cooldown_seconds``
+    after an active pass. The loop continues until ``max_runtime_minutes``
+    expires, ``max_passes`` is reached, or the operator interrupts it.
+
+    A single ``fleet-supervisor.lock`` in the fleet directory prevents two
+    ``charlie fleet supervise`` invocations from overlapping.
+    """
+    try:
+        global_config = load_layered_config(
+            Path.cwd(), None, fleet_dir_override=fleet_dir_override
+        )
+    except (ConfigError, RepoNotFoundError):
+        global_config = OrchestratorConfig()
+
+    overrides: dict[str, int] = {}
+    if poll_interval_override is not None:
+        overrides["poll_interval_seconds"] = poll_interval_override
+    if max_runtime_override is not None:
+        overrides["max_runtime_minutes"] = max_runtime_override
+    cfg = replace(global_config.supervisor, **overrides)
+
+    lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    lock = try_acquire_supervisor_lock(lock_path)
+    if lock is None:
+        return CommandResult(
+            False,
+            "fleet supervisor already running (fleet-supervisor.lock held)",
+            {},
+        )
+
+    pass_number = 0
+    total_repo_passes = 0
+    total_attention_events = 0
+    total_failed_repos = 0
+    start_time = clock()
+    full_pass_interval = cfg.full_pass_interval_seconds
+    last_full_pass_at = start_time - full_pass_interval
+    snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+
+    try:
+        while True:
+            now = clock()
+            if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
+                elapsed_minutes = (now - start_time) / 60.0
+                if elapsed_minutes >= cfg.max_runtime_minutes:
+                    break
+            if max_passes is not None and pass_number >= max_passes:
+                break
+
+            new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+            fallback_due = (now - last_full_pass_at) >= full_pass_interval
+            run_pass = _has_fleet_delta(snapshot, new_snapshot) or fallback_due
+
+            if not run_pass:
+                snapshot = new_snapshot
+                sleep(float(cfg.poll_interval_seconds))
+                continue
+
+            pass_number += 1
+            last_full_pass_at = now
+            pass_result = fleet_loop(
+                fleet_dir_override=fleet_dir_override,
+                global_config=global_config,
+                repos=repos,
+                limit=limit,
+                merge=merge,
+                dry_run=dry_run,
+                work_only=False,
+            )
+
+            data = pass_result.data
+            repos_data = data.get("repos", {}) if isinstance(data, dict) else {}
+            digest = data.get("digest", {}) if isinstance(data, dict) else {}
+            repo_count = len(repos_data)
+            failed = sum(
+                1 for r in repos_data.values() if isinstance(r, dict) and not r.get("ok", True)
+            )
+            attention_count = digest.get("count", 0) if isinstance(digest, dict) else 0
+
+            total_repo_passes += repo_count
+            total_attention_events += attention_count
+            total_failed_repos += failed
+
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            print(
+                f"[{now_str}] fleet pass {pass_number}: {repo_count} repo(s), "
+                f"{repo_count - failed} ok, {failed} failed, "
+                f"{attention_count} attention event(s)",
+                flush=True,
+            )
+
+            # Snapshot after the pass becomes the baseline for the next delta
+            # check; this avoids a spurious extra pass when this pass's own
+            # side-effect writes (new session sidecars, verdict files, etc.)
+            # show up as a "delta" on the very next poll.
+            snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+
+            sleep(
+                float(
+                    cfg.active_cooldown_seconds
+                    if _is_fleet_pass_active(pass_result)
+                    else cfg.poll_interval_seconds
+                )
+            )
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        elapsed_s = clock() - start_time
+        return CommandResult(
+            False,
+            f"fleet supervisor aborted on pass {pass_number}: {exc}",
+            {
+                "passes": pass_number,
+                "total_repo_passes": total_repo_passes,
+                "total_attention_events": total_attention_events,
+                "total_failed_repos": total_failed_repos,
+                "elapsed_seconds": elapsed_s,
+            },
+        )
+    finally:
+        lock.release()
+
+    elapsed_s = clock() - start_time
+    elapsed_str = str(datetime.timedelta(seconds=int(elapsed_s)))
+    return CommandResult(
+        True,
+        f"fleet supervisor complete: {pass_number} pass(es) in {elapsed_str}, "
+        f"{total_repo_passes} repo pass(es), {total_attention_events} attention "
+        f"event(s), {total_failed_repos} failed repo(s)",
+        {
+            "passes": pass_number,
+            "total_repo_passes": total_repo_passes,
+            "total_attention_events": total_attention_events,
+            "total_failed_repos": total_failed_repos,
+            "elapsed_seconds": elapsed_s,
         },
     )

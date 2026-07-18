@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
-from charlie_work.config import OrchestratorConfig, RuntimeConfig
-from charlie_work.fleet_dispatch import _extract_attention_events, _select_repos, fleet_loop
+from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
+from charlie_work.fleet_dispatch import (
+    _extract_attention_events,
+    _is_fleet_pass_active,
+    _select_repos,
+    fleet_loop,
+    run_fleet_supervise,
+)
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
+
+
+class _FakeClock:
+    """Monotonically advancing fake clock/sleep for supervisor tests."""
+
+    def __init__(self, start: float = 0.0, auto_advance: float = 0.0) -> None:
+        self._now = start
+        self._auto_advance = auto_advance
+        self.sleep_calls: list[float] = []
+
+    def now(self) -> float:
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self._now += self._auto_advance if self._auto_advance else seconds
 
 
 def test_select_repos_all_sorted_by_last_seen() -> None:
@@ -949,3 +972,304 @@ def test_count_fleet_runners_propagates_runtime_config(
     assert busy == 1
     assert skipped == []
     mock_gh_class.assert_called_once_with(repo_root=repo_root, runtime=runtime)
+
+
+def _drained_fleet_result() -> CommandResult:
+    return CommandResult(
+        True,
+        "fleet pass complete",
+        {
+            "repos": {"owner/repo": {"ok": True}},
+            "digest": {"count": 0, "events": []},
+        },
+    )
+
+
+def _active_fleet_result(dispatched: int = 1) -> CommandResult:
+    return CommandResult(
+        True,
+        "fleet pass complete",
+        {
+            "repos": {
+                "owner/repo": {
+                    "ok": True,
+                    "dispatch": {"selected_count": dispatched},
+                }
+            },
+            "digest": {"count": 0, "events": []},
+        },
+    )
+
+
+def test_is_fleet_pass_active_true_on_dispatch() -> None:
+    assert _is_fleet_pass_active(_active_fleet_result()) is True
+
+
+def test_is_fleet_pass_active_false_when_drained() -> None:
+    assert _is_fleet_pass_active(_drained_fleet_result()) is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_loops_until_max_passes(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """run_fleet_supervise runs fleet_loop repeatedly until max_passes is reached."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 3
+    assert mock_fleet_loop.call_count == 3
+    assert fc.sleep_calls == [5.0, 5.0, 5.0]
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_respects_max_runtime(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """max_runtime_minutes stops the loop after the wall-clock cap expires."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            max_runtime_minutes=1,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _active_fleet_result()
+
+    fc = _FakeClock(auto_advance=70.0)
+    result = run_fleet_supervise(clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 1
+    assert mock_fleet_loop.call_count == 1
+    assert fc.sleep_calls == [7.0]
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_uses_active_cooldown_after_activity(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """After an active pass, sleep equals active_cooldown_seconds; idle equals poll_interval."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.side_effect = [_active_fleet_result(), _drained_fleet_result()]
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 2
+    assert fc.sleep_calls == [7.0, 5.0]
+
+
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_returns_false_when_lock_held(
+    mock_lock: MagicMock,
+) -> None:
+    """A second concurrent invocation is rejected by the fleet supervisor lock."""
+    mock_lock.return_value = None
+
+    result = run_fleet_supervise()
+
+    assert result.ok is False
+    assert "fleet supervisor already running" in result.message
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_releases_lock_after_exception(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The fleet supervisor lock is released even if fleet_loop raises."""
+    lock = MagicMock()
+    mock_lock.return_value = lock
+    mock_load_config.return_value = OrchestratorConfig()
+    mock_fleet_loop.side_effect = RuntimeError("boom")
+
+    result = run_fleet_supervise(max_passes=3)
+
+    assert result.ok is False
+    assert "boom" in result.message
+    lock.release.assert_called_once()
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_keyboard_interrupt_returns_ok(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Ctrl+C is caught and reported as a clean completion."""
+    lock = MagicMock()
+    mock_lock.return_value = lock
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+        )
+    )
+    mock_fleet_loop.side_effect = [_drained_fleet_result(), KeyboardInterrupt]
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert "fleet supervisor complete" in result.message
+    assert result.data["passes"] >= 1
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_throttles_idle_passes(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Without a local delta, fleet_loop is skipped until the full-pass fallback expires."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=100,
+            max_runtime_minutes=1,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    snapshot = MagicMock()
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._take_fleet_snapshot",
+        lambda **_kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._has_fleet_delta",
+        lambda _before, _after: False,
+    )
+
+    fc = _FakeClock(start=0.0, auto_advance=2.0)
+    result = run_fleet_supervise(clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert mock_fleet_loop.call_count == 1  # only the initial fallback pass
+    assert all(s == 5.0 for s in fc.sleep_calls)
+    assert len(fc.sleep_calls) > 1
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_local_delta_triggers_pass_before_fallback(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A local signal delta triggers the next fleet pass before the fallback interval."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=100,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._take_fleet_snapshot",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._has_fleet_delta",
+        MagicMock(side_effect=[False, True]),
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 2
+    assert mock_fleet_loop.call_count == 2
+    assert fc.sleep_calls == [5.0, 5.0]
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_full_pass_interval_fallback_triggers_pass(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """When no local delta, the full_pass_interval fallback still drives a pass."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=10,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._take_fleet_snapshot",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._has_fleet_delta",
+        lambda _before, _after: False,
+    )
+
+    fc = _FakeClock(auto_advance=15.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 2
+    assert mock_fleet_loop.call_count == 2
+    assert fc.sleep_calls == [5.0, 5.0]

@@ -120,3 +120,14 @@ claude_code:
     PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
 
 # cross_family omitted → disabled (Claude-only review).
+
+supervisor:
+  # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and
+  # `charlie fleet supervise` (fleet-wide). All four fields below apply to both.
+  # full_pass_interval_seconds is the fallback max time between full GitHub passes
+  # when local sidecar/verdict signals have not changed.
+  # 0 max_runtime_minutes = unlimited.
+  poll_interval_seconds: 20
+  full_pass_interval_seconds: 300
+  active_cooldown_seconds: 30
+  max_runtime_minutes: 0

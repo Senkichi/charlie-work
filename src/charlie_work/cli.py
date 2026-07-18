@@ -11,7 +11,7 @@ import yaml
 from . import CLI_NAME
 from .config import ConfigError, find_config_path
 from .doctor import run_doctor
-from .fleet_dispatch import fleet_loop
+from .fleet_dispatch import fleet_loop, run_fleet_supervise
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
@@ -192,6 +192,36 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_bash_rats_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
     fleet_bash_rats.set_defaults(merge=None)
 
+    fleet_supervise = fleet_sub.add_parser("supervise")
+    fleet_supervise.add_argument("--limit", type=int, default=None)
+    fleet_supervise.add_argument(
+        "--repos",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated repo keys to process explicitly, e.g. "
+            "'owner/repo1,owner/repo2'. Overrides the oldest-last_seen heuristic."
+        ),
+    )
+    fleet_supervise.add_argument(
+        "--poll-interval",
+        type=int,
+        default=None,
+        dest="poll_interval",
+        help="Override supervisor poll_interval_seconds from config.",
+    )
+    fleet_supervise.add_argument(
+        "--max-runtime",
+        type=int,
+        default=None,
+        dest="max_runtime",
+        help="Override supervisor max_runtime_minutes from config (0 = unlimited).",
+    )
+    fleet_supervise_merge_group = fleet_supervise.add_mutually_exclusive_group()
+    fleet_supervise_merge_group.add_argument("--merge", action="store_true", dest="merge")
+    fleet_supervise_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
+    fleet_supervise.set_defaults(merge=None)
+
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
@@ -229,7 +259,14 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
     ok, checks = run_doctor(
-        repo_root, paths, config, config_path, gh, adapter_probe=args.adapter_probe, live=args.live
+        repo_root,
+        paths,
+        config,
+        config_path,
+        gh,
+        adapter_probe=args.adapter_probe,
+        live=args.live,
+        fleet_dir_override=args.fleet_dir,
     )
     failed = [check for check in checks if not check.ok]
     message = (
@@ -312,6 +349,28 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         merge=args.merge,
         dry_run=args.dry_run,
         work_only=False,
+    )
+
+
+def run_fleet_supervise_command(args: argparse.Namespace) -> CommandResult:
+    """Run the continuous fleet supervisor.
+
+    This is the fleet-wide equivalent of the single-repo 'bash-rats' supervisor:
+    repeated fleet passes separated by configurable sleep, honoring the
+    supervisor section of the config (poll_interval_seconds, active_cooldown_seconds,
+    max_runtime_minutes).
+    """
+    # Parse --repos into tuple if provided
+    repos = tuple(args.repos.split(",")) if args.repos else None
+
+    return run_fleet_supervise(
+        fleet_dir_override=args.fleet_dir,
+        repos=repos,
+        limit=args.limit,
+        merge=args.merge,
+        dry_run=args.dry_run,
+        poll_interval_override=args.poll_interval,
+        max_runtime_override=args.max_runtime,
     )
 
 
@@ -808,6 +867,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_work(args)
             elif args.fleet_command == "bash-rats":
                 result = run_fleet_bash_rats(args)
+            elif args.fleet_command == "supervise":
+                result = run_fleet_supervise_command(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":
