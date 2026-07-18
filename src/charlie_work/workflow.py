@@ -2911,6 +2911,26 @@ class OrchestratorApp:
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
         )
+
+        # Issue #432: cap merge-finalization per pass so a large backlog cannot
+        # monopolize the pass budget. Oldest first (by creation date, then issue
+        # number) drains the backlog deterministically.
+        issue_by_number = {int(issue["number"]): issue for issue in issues}
+        finalize_limit = self.config.dispatch.finalize_limit
+
+        def _finalization_order(issue_numbers: set[int]) -> list[int]:
+            return sorted(
+                issue_numbers,
+                key=lambda n: (issue_by_number.get(n, {}).get("createdAt", ""), n),
+            )
+
+        finalizable_bound_issue_numbers = _finalization_order(merged_pr_bound_issue_numbers)[
+            :finalize_limit
+        ]
+        finalizable_mention_issue_numbers = _finalization_order(
+            merged_pr_mention_only_issue_numbers
+        )[:finalize_limit]
+
         pr_by_issue = {}
         for pr in prs:
             issue_number = linked_issue_number(
@@ -2932,9 +2952,11 @@ class OrchestratorApp:
         # yet. These are network calls, so they run outside the state lock;
         # the successful closures are persisted to state.json inside the lock
         # below, and the issue numbers are excluded from dispatch candidates
-        # regardless of closure success.
+        # regardless of closure success. Issue #432: only the oldest
+        # finalize_limit issues are processed per pass, so a one-time backlog
+        # cannot monopolize the pass budget.
         closed_merged_pr_issues: set[int] = set()
-        for issue_number in merged_pr_bound_issue_numbers:
+        for issue_number in finalizable_bound_issue_numbers:
             # Best-effort label transition and issue close. A failure here is
             # non-fatal; the issue is still excluded from dispatch because the
             # merged PR reference exists, and the next pass will retry.
@@ -2948,8 +2970,8 @@ class OrchestratorApp:
         # issue is excluded from this pass's candidates (via
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
-        # redispatch it.
-        for issue_number in merged_pr_mention_only_issue_numbers:
+        # redispatch it. Issue #432: capped to finalize_limit per pass.
+        for issue_number in finalizable_mention_issue_numbers:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
         with state_lock(self.paths.state_file):
@@ -2989,7 +3011,7 @@ class OrchestratorApp:
             # check) can surface mention-only coverage without re-deriving
             # the mention scan. "status" is deliberately untouched — the
             # issue stays open and its normal state machine intact.
-            for issue_number in merged_pr_mention_only_issue_numbers:
+            for issue_number in finalizable_mention_issue_numbers:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -2997,11 +3019,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if merged_pr_mention_only_issue_numbers:
+            if finalizable_mention_issue_numbers:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": sorted(merged_pr_mention_only_issue_numbers)},
+                    {"issue_numbers": finalizable_mention_issue_numbers},
                 )
                 save_state(self.paths.state_file, state)
             # Defence-in-depth against double-dispatch: an issue whose state records
@@ -3298,9 +3320,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-                    "merged_pr_flagged_issue_numbers": sorted(
-                        merged_pr_mention_only_issue_numbers
-                    ),
+                    "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
                 },
             )
             save_state(self.paths.state_file, state)
@@ -3324,7 +3344,7 @@ class OrchestratorApp:
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-            "merged_pr_flagged_issue_numbers": sorted(merged_pr_mention_only_issue_numbers),
+            "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
