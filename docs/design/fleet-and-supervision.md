@@ -36,9 +36,15 @@ This matters for the following invariants:
 3. Exit.
 
 For continuous fleet operation use `charlie fleet supervise`.  It runs the same
-multi-repo sweep in a poll/sleep loop inside the Python process, honoring
-`supervisor.poll_interval_seconds`, `supervisor.active_cooldown_seconds`, and
-`supervisor.max_runtime_minutes` exactly like the per-repo `bash-rats` loop.
+multi-repo sweep in a poll/sleep loop inside the Python process, using the same
+`supervisor` config section as the per-repo `bash-rats` loop:
+`poll_interval_seconds`, `active_cooldown_seconds`, `max_runtime_minutes`, and
+`full_pass_interval_seconds`.  Between full passes it polls an aggregate
+`FleetLocalSnapshot` of every registered repo's sidecar and verdict mtimes
+(`_take_fleet_snapshot()` / `_has_fleet_delta()`); a full pass fires only when
+a local delta is detected or `full_pass_interval_seconds` has elapsed since the
+last full pass.  This keeps idle fleet polling cheap and avoids GitHub rate-limit
+exhaustion at fleet scale.
 A `fleet-supervisor.lock` in the fleet directory prevents overlapping
 `fleet supervise` invocations.
 

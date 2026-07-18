@@ -224,9 +224,9 @@ def _surface_post_mortems(
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
     """Warn when a fleet registry exists but no supervisor appears to be driving it.
 
-    The check is best-effort and non-blocking: it tries to acquire the fleet
-    supervisor lock and per-repo supervisor locks. If none are held, the fleet
-    is configured but probably not being driven continuously.
+    The check is per-repo aware: if the fleet supervisor lock is not held, each
+    repo's per-repo supervisor lock is checked individually. A single supervised
+    repo no longer hides an unsupervised one.
     """
     fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
     if not fleet_json_path.exists():
@@ -244,38 +244,71 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
             return
         fleet_lock.release()
 
-    held_repo_keys: list[str] = []
+    supervised_repo_keys: list[str] = []
+    unsupervised_repo_keys: list[str] = []
+    unreachable_repo_keys: list[str] = []
     for repo_key, entry in repos.items():
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
+            unsupervised_repo_keys.append(repo_key)
             continue
         state_dir = Path(state_dir_str)
         if not state_dir.exists():
+            unreachable_repo_keys.append(repo_key)
             continue
         repo_lock_path = state_dir / "supervisor.lock"
-        if not repo_lock_path.exists():
-            continue
-        repo_lock = try_acquire_supervisor_lock(repo_lock_path)
-        if repo_lock is None:
-            held_repo_keys.append(repo_key)
+        if repo_lock_path.exists():
+            repo_lock = try_acquire_supervisor_lock(repo_lock_path)
+            if repo_lock is None:
+                supervised_repo_keys.append(repo_key)
+            else:
+                repo_lock.release()
+                unsupervised_repo_keys.append(repo_key)
         else:
-            repo_lock.release()
+            unsupervised_repo_keys.append(repo_key)
 
-    if held_repo_keys:
-        add(
-            "fleet supervisor",
-            True,
-            f"per-repo supervisor running for {len(held_repo_keys)} repo(s)",
+    parts: list[str] = []
+    if supervised_repo_keys:
+        parts.append(f"supervised={len(supervised_repo_keys)} ({', '.join(supervised_repo_keys)})")
+    if unsupervised_repo_keys:
+        parts.append(
+            f"unsupervised={len(unsupervised_repo_keys)} ({', '.join(unsupervised_repo_keys)})"
+        )
+    if unreachable_repo_keys:
+        parts.append(
+            f"unreachable={len(unreachable_repo_keys)} ({', '.join(unreachable_repo_keys)})"
+        )
+
+    if not unsupervised_repo_keys:
+        detail = "fleet supervisor appears to be running"
+        if supervised_repo_keys:
+            detail += f" for all {', '.join(supervised_repo_keys)}"
+        if unreachable_repo_keys:
+            detail += f"; {len(unreachable_repo_keys)} repo(s) have no reachable state_dir"
+        add("fleet supervisor", True, detail)
+        return
+
+    detail = (
+        f"{len(repos)} repo(s) registered in fleet.json; "
+        "fleet supervisor not running; " + ", ".join(parts)
+    )
+    if supervised_repo_keys:
+        detail += (
+            "; run `charlie fleet supervise` for continuous operation or schedule "
+            "`charlie fleet bash-rats` for the unsupervised repo(s)"
         )
     else:
-        add(
-            "fleet supervisor",
-            False,
-            f"{len(repos)} repo(s) registered in fleet.json but no fleet or "
-            "per-repo supervisor appears to be running; run `charlie fleet supervise` "
-            "for continuous operation or schedule `charlie fleet bash-rats`",
-            severity="warning",
+        detail += (
+            "; run `charlie fleet supervise` for continuous operation or schedule "
+            "`charlie fleet bash-rats`"
         )
+
+    add(
+        "fleet supervisor",
+        False,
+        detail,
+        severity="warning",
+    )
 
 
 def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:

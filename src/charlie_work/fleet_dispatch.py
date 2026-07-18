@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -14,7 +14,7 @@ from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
-from .supervise import try_acquire_supervisor_lock
+from .supervise import LocalSnapshot, take_snapshot, try_acquire_supervisor_lock
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -636,6 +636,56 @@ def _is_fleet_pass_active(pass_result: CommandResult) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class FleetLocalSnapshot:
+    """Aggregate of per-repo ``LocalSnapshot`` values for cheap fleet-wide delta detection.
+
+    Each entry is keyed by the repo's name-with-owner so adding/removing a repo
+    is also a delta.  The snapshots themselves include live session counts, so
+    worker birth/death is detected even when sidecar file mtimes do not change.
+    """
+
+    repo_snapshots: frozenset[tuple[str, LocalSnapshot]]
+
+
+def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
+    """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
+    sessions_dir = state_dir / "dispatches" / "sessions"
+    prs_dir = state_dir / "prs"
+    return sessions_dir, prs_dir
+
+
+def _take_fleet_snapshot(
+    *,
+    fleet_dir_override: str | None = None,
+) -> FleetLocalSnapshot:
+    """Capture a cheap, network-free snapshot across all registered fleet repos."""
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+
+    repo_snapshots: set[tuple[str, LocalSnapshot]] = set()
+    for repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            continue
+        state_dir = Path(state_dir_str)
+        if not state_dir.exists():
+            continue
+        sessions_dir, prs_dir = _repo_state_dirs(state_dir)
+        repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir)))
+
+    return FleetLocalSnapshot(frozenset(repo_snapshots))
+
+
+def _has_fleet_delta(
+    before: FleetLocalSnapshot,
+    after: FleetLocalSnapshot,
+) -> bool:
+    """Return True if any per-repo local signal changed between snapshots."""
+    return before.repo_snapshots != after.repo_snapshots
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -652,10 +702,13 @@ def run_fleet_supervise(
     """Run a continuous fleet supervisor loop.
 
     This is the fleet-wide equivalent of ``charlie bash-rats``/``run_supervised``:
-    it repeatedly calls ``fleet_loop`` across all registered repos, sleeps for
-    ``supervisor.poll_interval_seconds`` (or ``active_cooldown_seconds`` when a
-    pass produced activity), and continues until ``max_runtime_minutes`` expires,
-    ``max_passes`` is reached, or the operator interrupts it.
+    it polls cheap local signals (per-repo sidecar and verdict mtimes) across the
+    registered fleet and calls ``fleet_loop`` only when something actionable
+    changed or ``supervisor.full_pass_interval_seconds`` has elapsed since the
+    last full pass. It sleeps for ``supervisor.poll_interval_seconds`` after an
+    idle pass (or poll with no pass) and ``supervisor.active_cooldown_seconds``
+    after an active pass. The loop continues until ``max_runtime_minutes``
+    expires, ``max_passes`` is reached, or the operator interrupts it.
 
     A single ``fleet-supervisor.lock`` in the fleet directory prevents two
     ``charlie fleet supervise`` invocations from overlapping.
@@ -688,6 +741,9 @@ def run_fleet_supervise(
     total_attention_events = 0
     total_failed_repos = 0
     start_time = clock()
+    full_pass_interval = cfg.full_pass_interval_seconds
+    last_full_pass_at = start_time - full_pass_interval
+    snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
     try:
         while True:
@@ -699,7 +755,17 @@ def run_fleet_supervise(
             if max_passes is not None and pass_number >= max_passes:
                 break
 
+            new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+            fallback_due = (now - last_full_pass_at) >= full_pass_interval
+            run_pass = _has_fleet_delta(snapshot, new_snapshot) or fallback_due
+
+            if not run_pass:
+                snapshot = new_snapshot
+                sleep(float(cfg.poll_interval_seconds))
+                continue
+
             pass_number += 1
+            last_full_pass_at = now
             pass_result = fleet_loop(
                 fleet_dir_override=fleet_dir_override,
                 global_config=global_config,
@@ -730,6 +796,12 @@ def run_fleet_supervise(
                 f"{attention_count} attention event(s)",
                 flush=True,
             )
+
+            # Snapshot after the pass becomes the baseline for the next delta
+            # check; this avoids a spurious extra pass when this pass's own
+            # side-effect writes (new session sidecars, verdict files, etc.)
+            # show up as a "delta" on the very next poll.
+            snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
             sleep(
                 float(

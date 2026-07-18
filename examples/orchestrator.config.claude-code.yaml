@@ -123,7 +123,10 @@ claude_code:
 
 supervisor:
   # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and
-  # `charlie fleet supervise` (fleet-wide). 0 max_runtime_minutes = unlimited.
+  # `charlie fleet supervise` (fleet-wide). All four fields below apply to both.
+  # full_pass_interval_seconds is the fallback max time between full GitHub passes
+  # when local sidecar/verdict signals have not changed.
+  # 0 max_runtime_minutes = unlimited.
   poll_interval_seconds: 20
   full_pass_interval_seconds: 300
   active_cooldown_seconds: 30

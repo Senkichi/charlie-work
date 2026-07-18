@@ -859,3 +859,72 @@ def test_doctor_passes_when_fleet_supervisor_lock_held(
     assert fleet_check.ok is True
     assert "fleet supervisor appears to be running" in fleet_check.detail
     assert ok is True
+
+
+def test_doctor_fleet_supervisor_per_repo_aware(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A single held repo lock does not hide unsupervised repos in the fleet."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    fleet_json = fleet_dir_path / "fleet.json"
+    state_dir1 = tmp_path / "state1"
+    state_dir1.mkdir(parents=True, exist_ok=True)
+    state_dir2 = tmp_path / "state2"
+    state_dir2.mkdir(parents=True, exist_ok=True)
+    fleet_json.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repos": {
+                    "owner/repo1": {
+                        "repo_root": str(tmp_path),
+                        "state_dir": str(state_dir1),
+                    },
+                    "owner/repo2": {
+                        "repo_root": str(tmp_path),
+                        "state_dir": str(state_dir2),
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Create the per-repo lock files so the probe attempts to acquire them.
+    (state_dir1 / "supervisor.lock").write_text("", encoding="utf-8")
+    (state_dir2 / "supervisor.lock").write_text("", encoding="utf-8")
+
+    def _fake_lock(path: Path) -> MagicMock | None:
+        # Only repo1 has a live per-repo supervisor.
+        if "state1" in str(path):
+            return None
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "charlie_work.doctor.try_acquire_supervisor_lock",
+        _fake_lock,
+    )
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "c.yaml",
+        gh,
+        fleet_dir_override=str(fleet_dir_path),
+    )
+
+    by_name = {check.name: check for check in checks}
+    fleet_check = by_name["fleet supervisor"]
+    assert fleet_check.ok is False
+    assert fleet_check.severity == "warning"
+    assert "owner/repo1" in fleet_check.detail
+    assert "owner/repo2" in fleet_check.detail
+    assert ok is True
