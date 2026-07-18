@@ -2999,7 +2999,9 @@ class OrchestratorApp:
         self,
         ready_issues: list[dict[str, Any]] | None = None,
     ) -> tuple[set[int], list[dict[str, Any]], _MergedPRListOutcome]:
-        """Finalize closed ready-labeled issues whose linked PR merged externally.
+        """Finalize closed ready-labeled issues whose linked PR merged externally,
+        and strip the ready/active labels from closed ready issues that have no
+        merged PR binding them (issue #429/#433).
 
         Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
         throttle) so a pass that defers new work still drains the backlog of
@@ -3033,6 +3035,7 @@ class OrchestratorApp:
         # Try the cheap 500-window binding first; if the GraphQL-budget guard
         # refuses the call, fall back to per-issue search for all candidates.
         bound_issue_numbers: set[int] = set()
+        mention_only_issue_numbers: set[int] = set()
         merged_pr_outcome = _MergedPRListOutcome()
         try:
             merged_prs = self.gh.merged_pr_list()
@@ -3051,8 +3054,20 @@ class OrchestratorApp:
             )
             if bound is not None:
                 bound_issue_numbers.add(bound)
+            # isCrossRepository describes the PR's own head-branch provenance
+            # (fork vs. same-repo). It cannot fully guard a cross-repo mention
+            # collision, but it does guard the common case of a fork PR's text
+            # being trusted at all.
+            if pr.get("isCrossRepository") is False:
+                for mentioned in issue_numbers_mentioned_by_pr(pr):
+                    mention_only_issue_numbers.add(mentioned)
 
-        # Only the unbound candidates need an expensive per-issue search.
+        # Mention-only references are advisory; they are not a binding, but
+        # they also must not be stripped as "unmerged" — dispatch() will flag
+        # them for a human decision.
+        mention_only_issue_numbers -= bound_issue_numbers
+
+        # Only unbound closed issues are candidates for per-issue search or strip.
         unbound_issues = [
             issue for issue in closed_ready if int(issue["number"]) not in bound_issue_numbers
         ]
@@ -3065,6 +3080,7 @@ class OrchestratorApp:
         candidates = sorted(unbound_issues, key=_finalization_order)[:finalize_limit]
 
         issue_pr_map: dict[int, list[dict[str, Any]]] = {}
+        closed_unmerged_ready_issues: set[int] = set()
         consecutive_failures = 0
         for issue in candidates:
             if consecutive_failures >= 3:
@@ -3080,50 +3096,70 @@ class OrchestratorApp:
             consecutive_failures = 0
             if merged_prs:
                 issue_pr_map[issue_number] = list(merged_prs)
-
-        if not issue_pr_map:
-            return set(), ready_issues, merged_pr_outcome
+            elif issue_number not in mention_only_issue_numbers:
+                # Confirmed closed ready issue with no merged PR binding it.
+                closed_unmerged_ready_issues.add(issue_number)
 
         # Persist state first, then apply labels outside the lock.
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            for issue_number, prs in issue_pr_map.items():
-                issue_key = str(issue_number)
-                issue_entry = state["issues"].get(issue_key, {})
-                state["issues"][issue_key] = {
-                    **issue_entry,
-                    "number": issue_number,
-                    "status": "closed",
-                }
-                for pr in prs:
-                    pr_number = int(pr["number"])
-                    pr_key = str(pr_number)
-                    pr_entry = state["prs"].get(pr_key, {})
-                    state["prs"][pr_key] = {
-                        **pr_entry,
-                        "number": pr_number,
-                        "status": "merged",
-                        "merged": True,
-                        "issue_number": issue_number,
+        if issue_pr_map or closed_unmerged_ready_issues:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number, prs in issue_pr_map.items():
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
                     }
-            state = append_event(
-                state,
-                "finalize_externally_merged",
-                {
-                    "issue_numbers": sorted(issue_pr_map.keys()),
-                    "pr_numbers": sorted(
-                        {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
-                    ),
-                },
-            )
-            save_state(self.paths.state_file, state)
+                    for pr in prs:
+                        pr_number = int(pr["number"])
+                        pr_key = str(pr_number)
+                        pr_entry = state["prs"].get(pr_key, {})
+                        state["prs"][pr_key] = {
+                            **pr_entry,
+                            "number": pr_number,
+                            "status": "merged",
+                            "merged": True,
+                            "issue_number": issue_number,
+                        }
+                if issue_pr_map:
+                    state = append_event(
+                        state,
+                        "finalize_externally_merged",
+                        {
+                            "issue_numbers": sorted(issue_pr_map.keys()),
+                            "pr_numbers": sorted(
+                                {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
+                            ),
+                        },
+                    )
+                for issue_number in closed_unmerged_ready_issues:
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
+                    }
+                if closed_unmerged_ready_issues:
+                    state = append_event(
+                        state,
+                        "dispatch_closed_unmerged_ready_stripped",
+                        {"issue_numbers": sorted(closed_unmerged_ready_issues)},
+                    )
+                save_state(self.paths.state_file, state)
 
         for issue_number in issue_pr_map:
             transition(self.gh, self.config.labels, issue_number, "merged")
             self.gh.close_issue(issue_number)
 
+        for issue_number in closed_unmerged_ready_issues:
+            transition(self.gh, self.config.labels, issue_number, "closed_unmerged")
+
         finalized: set[int] = set(issue_pr_map.keys())
-        remaining = [issue for issue in ready_issues if int(issue["number"]) not in finalized]
+        removed = finalized | closed_unmerged_ready_issues
+        remaining = [issue for issue in ready_issues if int(issue["number"]) not in removed]
         return finalized, remaining, merged_pr_outcome
 
     def dispatch(
@@ -3537,6 +3573,10 @@ class OrchestratorApp:
         # redispatch it. Issue #432: capped to finalize_limit per pass.
         for issue_number in finalizable_mention_issue_numbers:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
+
+        # Issue #429/#433: closed-unmerged stripping is handled by
+        # _finalize_externally_merged_issues, which already performs the
+        # capped per-issue merged-PR lookup and removes stale ready/active labels.
 
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
