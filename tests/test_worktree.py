@@ -629,6 +629,47 @@ def test_rework_reuse_resets_on_non_ff_different_patch_id(tmp_path: Path) -> Non
     remove_worktree(repo_root, info1.path)
 
 
+def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None:
+    """Rework reuse path must refuse to reset an existing worktree that has
+    uncommitted modifications and is non-FF diverged from origin."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-dirty"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Leave an uncommitted edit in the existing worktree.
+    (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
+
+    # Diverge origin so the reuse path cannot fast-forward.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    _git(remote_repo, "checkout", "main")
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(
+            repo_root,
+            branch_name,
+            rework=True,
+            base_ref="",
+            issue_number=451,
+        )
+
+    # The dirty file must survive untouched.
+    assert info1.path.exists()
+    assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted worker edit\n"
+
+    remove_worktree(repo_root, info1.path)
+
+
 def test_rework_attach_resets_on_non_ff_identical_patch_id(tmp_path: Path) -> None:
     """Rework attach path must reset a non-FF diverged local branch ref to the
     origin tip when the patch-id is identical."""

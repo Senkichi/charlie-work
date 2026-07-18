@@ -1458,6 +1458,11 @@ def create_worktree(
                         # Non-fast-forward: the PR branch was rebased or force-pushed
                         # on origin. For an open PR, origin is authoritative; snapshot
                         # the old tip (best-effort), compare patch-ids, and reset.
+                        # Uncommitted worker-authored edits must survive, so refuse
+                        # to reset a dirty worktree even when the branch diverged.
+                        dirty_reason = _worktree_dirty_reason(worktree_path, injected_paths)
+                        if dirty_reason:
+                            raise WorktreeUnsafeError(dirty_reason)
                         _snapshot_before_delete(branch)
                         base_branch = (
                             resolved_base_ref[len("origin/") :]
