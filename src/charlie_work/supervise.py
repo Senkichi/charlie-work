@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from . import fleet_registry
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
@@ -180,6 +182,33 @@ def orchestrator_root() -> Path:
     return _ORCHESTRATOR_ROOT
 
 
+def _pending_sync_marker_path(repo_root: Path) -> Path:
+    """Return the path to the pending-sync marker for this orchestrator tree."""
+    return repo_root / ".var" / "charlie-work" / "pending-sync.json"
+
+
+def _write_marker(path: Path, from_sha: str, to_sha: str) -> None:
+    """Persist the pending-sync marker atomically (temp-file + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"from_sha": from_sha, "to_sha": to_sha}, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_marker(path: Path) -> dict[str, str]:
+    """Read the marker, returning an empty dict on any read/parse error."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _clear_marker(path: Path) -> None:
+    """Remove the pending-sync marker, if it exists."""
+    path.unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class SelfDeployResult:
     """Result of a self-deploy attempt.
@@ -204,6 +233,7 @@ class SelfDeployResult:
 def self_deploy(
     repo_root: Path,
     *,
+    fleet_dir_override: str | None = None,
     run_command: Callable[..., RunResult] = run_captured,
     pull_timeout: int = 60,
     sync_timeout: int = 300,
@@ -211,9 +241,16 @@ def self_deploy(
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
     Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
-    touched ``pyproject.toml`` or ``uv.lock``.  All subprocess errors are
-    returned as values (non-fatal); the function never raises.
+    touched ``pyproject.toml`` or ``uv.lock``.  Before running ``uv sync`` the
+    fleet registry is consulted for live worker sessions; if any are active the
+    sync is deferred and a pending-sync marker is written atomically.  The
+    marker is checked on every subsequent pass, so the sync retries even when
+    the next ``git pull`` finds no new commits.
+
+    All subprocess errors are returned as values (non-fatal); the function
+    never raises.
     """
+    marker_path = _pending_sync_marker_path(repo_root)
     try:
         before_res = run_command(
             ["git", "rev-parse", "HEAD"],
@@ -261,7 +298,10 @@ def self_deploy(
             )
         after_sha = after_res.stdout.strip()
 
-        if before_sha == after_sha:
+        marker = _read_marker(marker_path) if marker_path.exists() else None
+        marker_from = marker.get("from_sha") if marker else None
+
+        if before_sha == after_sha and not marker:
             return SelfDeployResult(
                 ok=True,
                 pulled=True,
@@ -272,34 +312,66 @@ def self_deploy(
                 message="already up to date",
             )
 
-        diff_res = run_command(
-            ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"],
-            cwd=repo_root,
-            timeout_seconds=pull_timeout,
-        )
-        if not diff_res.ok:
-            return SelfDeployResult(
-                ok=False,
-                pulled=True,
-                changed=True,
-                synced=False,
-                from_sha=before_sha,
-                to_sha=after_sha,
-                error=diff_res.error or diff_res.stderr or "diff failed",
-            )
+        head_changed = before_sha != after_sha
+        changed = head_changed or marker is not None
 
-        changed_files = {line.strip() for line in diff_res.stdout.splitlines() if line.strip()}
-        if not (changed_files & _DEP_LOCK_FILES):
+        changed_files: set[str] = set()
+        if head_changed:
+            diff_res = run_command(
+                ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"],
+                cwd=repo_root,
+                timeout_seconds=pull_timeout,
+            )
+            if not diff_res.ok:
+                return SelfDeployResult(
+                    ok=False,
+                    pulled=True,
+                    changed=changed,
+                    synced=False,
+                    from_sha=before_sha,
+                    to_sha=after_sha,
+                    error=diff_res.error or diff_res.stderr or "diff failed",
+                )
+            changed_files = {line.strip() for line in diff_res.stdout.splitlines() if line.strip()}
+
+        dep_files_changed = bool(changed_files & _DEP_LOCK_FILES)
+        if not dep_files_changed and not marker:
             return SelfDeployResult(
                 ok=True,
                 pulled=True,
-                changed=True,
+                changed=changed,
                 synced=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
                 message=f"code-only update: {after_sha}",
             )
 
+        from_sha = marker_from or before_sha
+        to_sha = after_sha
+
+        live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
+        if live_count > 0:
+            _write_marker(marker_path, from_sha, to_sha)
+            runner_word = "runner" if live_count == 1 else "runners"
+            if marker is not None:
+                print(
+                    f"WARNING: pending dependency sync still deferred: {live_count} "
+                    f"{runner_word} active (marker {from_sha}..{to_sha})",
+                    flush=True,
+                )
+            return SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=changed,
+                synced=False,
+                from_sha=from_sha,
+                to_sha=to_sha,
+                message=f"sync deferred: {live_count} {runner_word} active",
+            )
+
+        # Persist marker before attempting sync so a crash between the pull and
+        # the successful sync is retried on the next pass.
+        _write_marker(marker_path, from_sha, to_sha)
         sync_res = run_command(
             ["uv", "sync"],
             cwd=repo_root,
@@ -309,21 +381,22 @@ def self_deploy(
             return SelfDeployResult(
                 ok=False,
                 pulled=True,
-                changed=True,
+                changed=changed,
                 synced=False,
-                from_sha=before_sha,
-                to_sha=after_sha,
+                from_sha=from_sha,
+                to_sha=to_sha,
                 error=sync_res.error or sync_res.stderr or "uv sync failed",
             )
 
+        _clear_marker(marker_path)
         return SelfDeployResult(
             ok=True,
             pulled=True,
-            changed=True,
+            changed=changed,
             synced=True,
-            from_sha=before_sha,
-            to_sha=after_sha,
-            message=f"updated and synced: {after_sha}",
+            from_sha=from_sha,
+            to_sha=to_sha,
+            message=f"updated and synced: {to_sha}",
         )
     except Exception as exc:
         return SelfDeployResult(
