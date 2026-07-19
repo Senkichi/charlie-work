@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import CLI_NAME
 from .adapters import (
@@ -608,12 +608,14 @@ def _detect_and_handle_stalled_sessions(
 
             # Sweep for orphan processes that survived the tree kill (Windows-only)
             # This catches detached/daemonized processes (e.g., nohup-style background processes)
-            orphan_pids = sweep_orphan_processes(w.worktree_path)
-            if orphan_pids:
+            orphan_pids: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
                 # Kill detected orphans to prevent them from running rejected code
-                for orphan_pid in orphan_pids:
-                    _kill_orphan_pid(orphan_pid)
-                    killed_pids.append(orphan_pid)
+                for orphan in orphan_processes:
+                    _kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids = [o["pid"] for o in orphan_processes]
 
             # Post-mortem extraction (issue #261): reads the Devin CLI's own
             # session store for a terminal-tool diagnosis (esp. decision:block
@@ -1076,7 +1078,12 @@ def _append_sweep_events(
 
 
 def _detect_and_handle_orphaned_workers(
-    sessions_dir: Path, state_file: Path, config: OrchestratorConfig, gh: GitHub
+    sessions_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+    gh: GitHub,
+    *,
+    review_callback: Callable[[int], Any] | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
 
@@ -1088,7 +1095,10 @@ def _detect_and_handle_orphaned_workers(
     For issues with status "dispatched" and a recorded worker_pid:
     - If the PID is dead, check the linked PR's last review decision
     - If last decision was "request_changes" and head unchanged, reset to "rework_requested"
-    - Otherwise, surface as drift for human triage
+    - If last decision was "request_changes" and head advanced, route to the
+      review-pending path by calling ``review_callback`` and then flipping the
+      issue status to "reviewing"
+    - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
 
@@ -1109,6 +1119,10 @@ def _detect_and_handle_orphaned_workers(
     """
     if not config.watchdog.enabled:
         return
+
+    def _drift_fingerprint(**parts: Any) -> str:
+        """Stable fingerprint for an orphaned-worker drift finding."""
+        return json.dumps(parts, sort_keys=True, default=str)
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -1232,7 +1246,10 @@ def _detect_and_handle_orphaned_workers(
             if route_result is not None:
                 pre_review_routed.add(issue_number)
 
-    # Handle orphaned workers
+    # Handle orphaned workers. Head-advanced request_changes findings are
+    # collected and routed to the review lane outside the state lock (review()
+    # itself acquires the lock and may call transition()).
+    review_routes: list[tuple[int, int, str, str, str]] = []
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -1278,7 +1295,55 @@ def _detect_and_handle_orphaned_workers(
                             )
                         )
                     else:
-                        # PR head has changed - surface as drift for human triage
+                        # PR head has changed - route to review if possible,
+                        # otherwise surface as a drift finding (once per fingerprint).
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_with_head_change",
+                            reviewed_head_sha=reviewed_head_sha,
+                            live_head_sha=live_head_sha,
+                        )
+                        if entry.get("orphan_drift_fingerprint") == fingerprint:
+                            # Already handled/failed for this exact head advance;
+                            # don't re-emit or retry.
+                            state["issues"][str(issue_number)] = entry
+                            continue
+                        if review_callback is not None:
+                            review_routes.append(
+                                (
+                                    issue_number,
+                                    pr_number,
+                                    reviewed_head_sha,
+                                    live_head_sha,
+                                    fingerprint,
+                                )
+                            )
+                        else:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reviewed_head_sha": reviewed_head_sha,
+                                        "live_head_sha": live_head_sha,
+                                        "reason": "dead_worker_with_head_change",
+                                    },
+                                )
+                            )
+                else:
+                    # Not a simple request_changes case - surface as drift once.
+                    fingerprint = _drift_fingerprint(
+                        reason="dead_worker_unsafe_to_auto_reset",
+                        last_decision=last_decision or "",
+                        pr_number=pr_number,
+                    )
+                    if entry.get("orphan_drift_fingerprint") != fingerprint:
+                        entry["orphan_drift_fingerprint"] = fingerprint
+                        entry["orphan_drift_at"] = utc_now()
                         sweep_events.append(
                             (
                                 "orphaned_worker_drift",
@@ -1287,26 +1352,10 @@ def _detect_and_handle_orphaned_workers(
                                     "pr_number": pr_number,
                                     "previous_status": "dispatched",
                                     "last_decision": last_decision,
-                                    "reviewed_head_sha": reviewed_head_sha,
-                                    "live_head_sha": live_head_sha,
-                                    "reason": "dead_worker_with_head_change",
+                                    "reason": "dead_worker_unsafe_to_auto_reset",
                                 },
                             )
                         )
-                else:
-                    # Not a simple request_changes case - surface as drift
-                    sweep_events.append(
-                        (
-                            "orphaned_worker_drift",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number,
-                                "previous_status": "dispatched",
-                                "last_decision": last_decision,
-                                "reason": "dead_worker_unsafe_to_auto_reset",
-                            },
-                        )
-                    )
             else:
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
@@ -1372,6 +1421,65 @@ def _detect_and_handle_orphaned_workers(
         state = _append_sweep_events(state, sweep_events)
         save_state(state_file, state)
 
+    # Route head-advanced request_changes findings to the review lane outside
+    # the state lock. review() generates the packet, fires the review_started
+    # label transition, and returns ok when a fresh packet is produced. We then
+    # flip the issue status to "reviewing" so it is not re-detected as an orphan
+    # on every subsequent pass. If review() fails, we record a drift fingerprint
+    # so the identical finding is not re-emitted every pass.
+    for (
+        issue_number,
+        pr_number,
+        reviewed_head_sha_before,
+        live_head_sha,
+        fingerprint,
+    ) in review_routes:
+        if review_callback is None:
+            continue
+        review_result = review_callback(pr_number)
+        routed = False
+        with state_lock(state_file):
+            state = load_state(state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            entry = state["issues"].get(str(issue_number), {})
+            decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
+            if (
+                review_result.ok
+                and decision_unchanged
+                and isinstance(entry, dict)
+                and entry.get("status") == "dispatched"
+            ):
+                state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
+                routed = True
+            elif (
+                not review_result.ok
+                and isinstance(entry, dict)
+                and entry.get("status") == "dispatched"
+            ):
+                # Review failed: mark the drift fingerprint so the next pass
+                # does not retry/re-emit for this unchanged head.
+                state["issues"][str(issue_number)] = {
+                    **entry,
+                    "orphan_drift_fingerprint": fingerprint,
+                    "orphan_drift_at": utc_now(),
+                }
+            state = append_event(
+                state,
+                "orphaned_worker_routed_to_review"
+                if review_result.ok
+                else "orphaned_worker_drift",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "review_ok": review_result.ok,
+                    "routed": routed,
+                    "live_head_sha": live_head_sha,
+                    "reviewed_head_sha": reviewed_head_sha_before,
+                    "reason": "dead_worker_with_head_change",
+                },
+            )
+            save_state(state_file, state)
+
 
 def _sweep_orphan_processes_for_dead_sessions(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig
@@ -1414,15 +1522,16 @@ def _sweep_orphan_processes_for_dead_sessions(
 
     # Sweep for orphans in each dead worktree
     for worktree_path in dead_worktree_paths:
-        orphan_pids = sweep_orphan_processes(worktree_path)
-        if orphan_pids:
+        orphan_processes = sweep_orphan_processes(worktree_path)
+        if orphan_processes:
             # Kill detected orphans
-            killed_orphans = []
-            for orphan_pid in orphan_pids:
-                _kill_orphan_pid(orphan_pid)
-                killed_orphans.append(orphan_pid)
+            killed_orphans: list[int] = []
+            for orphan in orphan_processes:
+                _kill_orphan_pid(orphan["pid"])
+                killed_orphans.append(orphan["pid"])
 
-            # Log the event
+            # Log the event with image/cmdline of each killed process so the
+            # respawn source in dead worktrees can be identified and shut off.
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
@@ -1430,8 +1539,16 @@ def _sweep_orphan_processes_for_dead_sessions(
                     "orphan_processes_killed",
                     {
                         "worktree_path": worktree_path,
-                        "orphan_pids": orphan_pids,
+                        "orphan_pids": [o["pid"] for o in orphan_processes],
                         "killed_orphans": killed_orphans,
+                        "orphan_processes": [
+                            {
+                                "pid": o["pid"],
+                                "name": o.get("name"),
+                                "command_line": o.get("command_line"),
+                            }
+                            for o in orphan_processes
+                        ],
                     },
                 )
                 save_state(state_file, state)
@@ -3742,6 +3859,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
         # Do all network calls, file writes, and worker launches outside the lock
@@ -3835,6 +3954,8 @@ class OrchestratorApp:
                 # A successful or live-worker recovery supersedes any previous orphan flag.
                 if ok or is_live_worker:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -6732,9 +6853,15 @@ class OrchestratorApp:
         _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
-        # This fallback detects dead workers even when session sidecar files are orphaned
+        # This fallback detects dead workers even when session sidecar files are orphaned.
+        # Pass the review callback so a head-advanced request_changes finding can be
+        # routed to the review-pending path instead of being re-emitted as drift.
         _detect_and_handle_orphaned_workers(
-            sessions_dir, self.paths.state_file, self.config, self.gh
+            sessions_dir,
+            self.paths.state_file,
+            self.config,
+            self.gh,
+            review_callback=self.review,
         )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
@@ -7019,18 +7146,17 @@ class OrchestratorApp:
             )
 
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        # Unconditional reaper call, matching dispatch()'s — previously this
+        # Unconditional stall reaper call, matching dispatch()'s — previously this
         # only ran when max_concurrent_sessions > 0 via the governor. Skipped
         # only when the caller (loop()) already ran the sweep this pass and
         # handed its result down — see dispatch_rework()'s docstring.
         if stalled_entries is None:
             _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
 
-        # Detect and handle orphaned workers using state.json PID records (issue #207)
-        # This fallback detects dead workers even when session sidecar files are orphaned
-        _detect_and_handle_orphaned_workers(
-            sessions_dir, self.paths.state_file, self.config, self.gh
-        )
+        # Note: orphaned-worker detection is intentionally NOT re-run here.
+        # loop() already runs _detect_and_handle_orphaned_workers once per pass
+        # (with the review callback needed to route head-advanced findings to
+        # review). Re-running it here produced duplicate drift events (#457).
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -7259,6 +7385,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
 
@@ -7428,6 +7556,8 @@ class OrchestratorApp:
                 # A successful dispatch supersedes any previous orphan flag.
                 if ok:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
