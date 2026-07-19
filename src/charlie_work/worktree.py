@@ -863,15 +863,76 @@ def is_junction(path: Path) -> bool:
 def _unlink_reparse_point(path: Path) -> None:
     """Remove a reparse point (Windows junction/symlink) or POSIX symlink.
 
-    ``os.rmdir`` is used on Windows because it removes the reparse point
-    itself without following into the target directory. ``os.unlink`` is used
-    on POSIX because ``os.rmdir`` raises on a symlink. In both cases the
-    target is left untouched.
+    On Windows, ``os.unlink`` removes a directory symlink (a name-surrogate
+    reparse point) without following into the target.  Some Windows/Python
+    combinations reject ``os.unlink`` on a junction with ``EACCES`` or
+    ``EISDIR``; ``os.rmdir`` is the fallback because it removes the reparse
+    point itself, never the target directory it points at.  On POSIX,
+    ``os.unlink`` removes the symlink.  In all cases the target is left
+    untouched.
     """
     if os.name == "nt":
-        os.rmdir(path)
+        try:
+            os.unlink(path)
+        except (IsADirectoryError, PermissionError, OSError):
+            # Older Windows builds or junctions may reject unlink; rmdir on a
+            # reparse point removes the link, not the target.
+            os.rmdir(path)
     else:
         os.unlink(path)
+
+
+def _unlink_worktree_reparse_points(worktree_path: Path) -> None:
+    """Unlink all reparse points inside ``worktree_path`` without following them.
+
+    ``os.walk`` with ``followlinks=False`` does not descend into symlinks, but
+    it may still list directory-symlink and junction names in ``dirnames``.
+    We prune those entries after unlinking them so the walk never treats a
+    reparse point as a real directory to recurse into.  Regular files and
+    directories are left untouched.
+    """
+    if not worktree_path.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(
+        str(worktree_path), topdown=True, onerror=lambda exc: None
+    ):
+        parent = Path(dirpath)
+        for name in dirnames + filenames:
+            child = parent / name
+            try:
+                if child.is_symlink() or is_junction(child):
+                    _unlink_reparse_point(child)
+            except OSError:
+                # Best-effort: leave the path for the rmtree fallback to report.
+                pass
+        # Do not descend into directories that are actually reparse points.
+        remaining: list[str] = []
+        for d in dirnames:
+            dpath = parent / d
+            try:
+                if dpath.is_symlink() or is_junction(dpath):
+                    continue
+            except OSError:
+                pass
+            remaining.append(d)
+        dirnames[:] = remaining
+
+
+def _robust_rmtree(path: Path) -> bool:
+    """Remove a directory tree, never following reparse points into targets.
+
+    Unlinks all junctions/symlinks first, then deletes the remaining files and
+    directories with ``shutil.rmtree``.  Returns True when the path no longer
+    exists.
+    """
+    if not path.exists() and not is_junction(path):
+        return True
+    _unlink_worktree_reparse_points(path)
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        return False
+    return not path.exists() and not is_junction(path)
 
 
 def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
@@ -1682,25 +1743,27 @@ def create_worktree(
 def remove_worktree(
     repo_root: Path, worktree_path: Path, *, force: bool = False, branch: str | None = None
 ) -> bool:
-    """Remove a worktree, taking care never to follow a ``.venv`` junction
-    into a shared virtualenv.
+    """Remove a worktree, taking care never to follow reparse points into a
+    shared virtualenv or other targets.
 
     Teardown order is mandatory:
       1. If ``<worktree>/.venv`` exists and is a real directory (not a
          junction/symlink), ABORT and return False unless ``force=True`` —
-         and even then, only the worktree-local directory is removed, never
-         a junction target.
-      2. If it is a junction/symlink, unlink the reparse point itself
-         (``os.rmdir`` on Windows; ``os.unlink`` on POSIX — never follows
-         into the target).
-      3. ``git worktree remove``.
-      4. On failure, ``git worktree prune`` to clear stale metadata.
-      5. If ``branch`` is provided, delete the branch with ``git branch -D``.
+         and even then, the directory is removed as part of the normal tree
+         deletion, never a junction target.
+      2. If ``.venv`` is a junction/symlink, unlink the reparse point itself.
+      3. Unlink any other reparse points found anywhere under the worktree so
+         ``git worktree remove``/``shutil.rmtree`` cannot follow them.
+      4. ``git worktree remove``.
+      5. On failure, ``git worktree prune`` to clear stale metadata, then a
+         reparse-point-safe ``shutil.rmtree`` fallback (only when ``force=True``
+         so we do not destroy uncommitted work the caller asked us to keep).
+      6. Verify the directory is actually gone; if not, report failure.
+      7. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
-    command failure); never raises for those. Programmer errors (e.g. a
-    nonexistent repo_root) surface as False via a failed git command, since
-    git itself reports the error rather than crashing this function.
+    command failure, directory survives); never raises for those. Programmer
+    errors surface as False via a failed git command.
     """
     venv_path = worktree_path / ".venv"
     if venv_path.exists() or is_junction(venv_path):
@@ -1715,21 +1778,37 @@ def remove_worktree(
             elif venv_path.is_dir():
                 if not force:
                     return False
-                shutil.rmtree(venv_path)
+                # Real .venv directory: let git remove --force / rmtree delete it.
             else:
                 venv_path.unlink()
         except OSError:
             return False
 
+    # Remove any other directory symlinks/junctions in the tree before git or
+    # rmtree touch it.  This is the single point of enforcement for reparse
+    # point safety during worktree teardown (issue #462).
+    _unlink_worktree_reparse_points(worktree_path)
+
     args = ["git", "worktree", "remove", str(worktree_path)]
     if force:
         args.append("--force")
     result = run_captured(args, cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
-    worktree_removed = result.ok
-    if not worktree_removed:
+    git_result_ok = result.ok
+    if not git_result_ok:
         run_captured(
             ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
         )
+        # When the caller has explicitly forced removal, fall back to a
+        # reparse-point-safe rmtree.  Without force we must not silently
+        # delete a worktree that git refused to remove (e.g. uncommitted work).
+        if force:
+            _robust_rmtree(worktree_path)
+
+    # Post-delete verification: report failure if the directory survived.
+    if not git_result_ok and not force:
+        worktree_removed = False
+    else:
+        worktree_removed = not worktree_path.exists() and not is_junction(worktree_path)
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
     # Attempt branch deletion independently of worktree-removal success to avoid
@@ -2014,12 +2093,14 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
-def list_worktrees(repo_root: Path) -> list[dict]:
+def _list_worktrees_porcelain(repo_root: Path) -> tuple[list[dict], str | None]:
     """Parse ``git worktree list --porcelain`` into one dict per worktree.
 
-    Invalid entries (missing required 'worktree' key or unknown flag keys) are
-    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
-    with a Path value. This makes all downstream consumers safe by construction.
+    Returns a tuple of (worktrees, error_message). Invalid entries (missing
+    required 'worktree' key or unknown flag keys) are dropped entirely - every
+    returned dict is guaranteed to have a 'worktree' key with a Path value.
+    Git command failures are returned as an error string instead of an empty
+    list, so callers can distinguish "no worktrees" from "could not determine".
     """
     result = run_captured(
         ["git", "worktree", "list", "--porcelain"],
@@ -2027,7 +2108,8 @@ def list_worktrees(repo_root: Path) -> list[dict]:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not result.ok:
-        return []
+        error = result.error or result.stderr or "git worktree list failed"
+        return [], error
 
     worktrees: list[dict] = []
     current: dict = {}
@@ -2066,6 +2148,20 @@ def list_worktrees(repo_root: Path) -> list[dict]:
     if current and not entry_malformed and "worktree" in current:
         worktrees.append(current)
 
+    return worktrees, None
+
+
+def list_worktrees(repo_root: Path) -> list[dict]:
+    """Parse ``git worktree list --porcelain`` into one dict per worktree.
+
+    Invalid entries (missing required 'worktree' key or unknown flag keys) are
+    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
+    with a Path value. This makes all downstream consumers safe by construction.
+
+    Git command failures return an empty list; callers that need to distinguish
+    "empty" from "unknown" should use ``_list_worktrees_porcelain``.
+    """
+    worktrees, _ = _list_worktrees_porcelain(repo_root)
     return worktrees
 
 
@@ -2207,7 +2303,8 @@ class WorktreeCleanResult:
     """Result of a ``clean_worktrees`` run.
 
     ``data`` carries ``planned``/``removed``/``skipped``/``failed`` (lists of
-    per-worktree dicts) plus ``venv_ok``/``venv_message``. Kept as a dict
+    per-worktree dicts), ``orphans`` (planned/removed/failed orphan dirs),
+    ``venv_ok``/``venv_message``, and ``attention_events``. Kept as a dict
     rather than further nested dataclasses since callers (``CommandResult``)
     consume it as a JSON-able blob for CLI output.
     """
@@ -2258,6 +2355,12 @@ def clean_worktrees(
     Eligible worktrees are removed with ``remove_worktree`` (junction-safe)
     and the local branch is deleted. After removals, the shared venv is
     checked for a poisoned editable ``.pth``.
+
+    A final orphan sweep removes directories under ``worktrees_dir`` whose
+    git admin record is gone but whose tree remains (the residue of
+    ``git worktree remove`` failing on a reparse point).  Such leftovers are
+    removed with the same reparse-point-safe rmtree and reported through
+    ``data["orphans"]`` so they cannot accumulate silently (issue #462).
     """
     state_issues = state.get("issues", {})
     state_prs = state.get("prs", {})
@@ -2265,8 +2368,12 @@ def clean_worktrees(
     removed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    orphans: dict[str, list[dict[str, Any]]] = {"planned": [], "removed": [], "failed": []}
+    attention_events: list[dict[str, Any]] = []
 
-    for wt in list_worktrees(repo_root):
+    registered_worktrees, list_error = _list_worktrees_porcelain(repo_root)
+    worktree_list_failed = list_error is not None
+    for wt in registered_worktrees:
         wt_path = wt.get("worktree")
         if not isinstance(wt_path, Path) or not wt_path.is_relative_to(worktrees_dir):
             continue
@@ -2451,6 +2558,40 @@ def clean_worktrees(
             }
         )
 
+    # Orphan sweep: directories under worktrees_dir with no git admin record.
+    # This is the residue left when ``git worktree remove`` unregisters a
+    # worktree but cannot delete its tree because of a reparse point.
+    if worktree_list_failed:
+        # A git worktree list failure must never be read as "zero worktrees".
+        # Skip the sweep and surface the failure so live worker state is not
+        # silently destroyed by a transient git hiccup.
+        attention_events.append(
+            {
+                "type": "worktree_list_failed",
+                "reason": list_error or "git worktree list failed",
+            }
+        )
+    elif worktrees_dir.is_dir():
+        registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
+        for child in worktrees_dir.iterdir():
+            if not child.is_dir() or child in registered_paths or is_junction(child):
+                continue
+            if dry_run:
+                orphans["planned"].append({"worktree": str(child)})
+                continue
+            if _robust_rmtree(child):
+                orphans["removed"].append({"worktree": str(child)})
+            else:
+                reason = "orphan directory removal failed"
+                orphans["failed"].append({"worktree": str(child), "reason": reason})
+                attention_events.append(
+                    {
+                        "type": "worktree_orphan_removal_failed",
+                        "worktree": str(child),
+                        "reason": reason,
+                    }
+                )
+
     venv_source = config.devin.venv_source or config.claude_code.venv_source
     venv_ok = True
     venv_message = "no shared venv configured; pth verification skipped"
@@ -2462,21 +2603,41 @@ def clean_worktrees(
             venv_ok = False
             venv_message = f"shared venv not found: {venv_path}"
 
+    # Surface regular removal failures as attention events too.
+    for failure in failed:
+        attention_events.append(
+            {
+                "type": "worktree_removal_failed",
+                "worktree": failure["worktree"],
+                "reason": failure.get("reason", "remove_worktree failed"),
+            }
+        )
+
     data = {
         "planned": planned,
         "removed": removed,
         "skipped": skipped,
         "failed": failed,
+        "orphans": orphans,
         "venv_ok": venv_ok,
         "venv_message": venv_message,
+        "attention_events": attention_events,
     }
-    ok = not failed and venv_ok
+    ok = not failed and not orphans["failed"] and venv_ok and not worktree_list_failed
     if dry_run:
-        message = f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped"
+        message = (
+            f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped, "
+            f"{len(orphans['planned'])} orphan(s)"
+        )
     else:
         message = (
-            f"worktree-clean: {len(removed)} removed, {len(skipped)} skipped, {len(failed)} failed"
+            f"worktree-clean: {len(removed)} removed, {len(skipped)} skipped, "
+            f"{len(failed)} failed, {len(orphans['removed'])} orphan(s)"
         )
+        if orphans["failed"]:
+            message = f"{message}, {len(orphans['failed'])} orphan removal(s) failed"
+    if worktree_list_failed:
+        message = f"{message}; could not list worktrees: {list_error}"
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
