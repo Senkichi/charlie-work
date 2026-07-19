@@ -347,9 +347,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
     deploy = self_deploy(orchestrator_root(), fleet_dir_override=args.fleet_dir)
-    if deploy.venv_deferred:
-        print(f"self-deploy venv repair deferred: {deploy.message}", flush=True)
-    elif not deploy.ok:
+    if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
         notify_config = getattr(global_config, "notify", None) if global_config else None
         if notify_config is not None and getattr(notify_config, "enabled", False):
@@ -372,6 +370,23 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
         print(f"self-deploy: {deploy.message}", flush=True)
+        notify_config = getattr(global_config, "notify", None) if global_config else None
+        if notify_config is not None and getattr(notify_config, "enabled", False):
+            attention_digest = AttentionDigest(
+                generated_at=utc_now(),
+                repo="fleet",
+                transitions=(
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="REPAIRED",
+                        previous_health=None,
+                        last_log_line=deploy.message,
+                        pid=None,
+                    ),
+                ),
+            )
+            emit_digest(notify_config, attention_digest)
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,

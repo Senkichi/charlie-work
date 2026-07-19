@@ -1340,7 +1340,7 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
-def test_run_fleet_supervise_emits_attention_digest_on_venv_deferred(
+def test_run_fleet_supervise_emits_attention_digest_on_venv_repaired(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
@@ -1348,7 +1348,7 @@ def test_run_fleet_supervise_emits_attention_digest_on_venv_deferred(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """A deferred venv repair emits an attention digest so it is never silent."""
+    """A successful self_deploy venv repair emits an attention digest so it is never silent."""
     from charlie_work.config import NotifyConfig
 
     cfg = OrchestratorConfig(
@@ -1374,8 +1374,8 @@ def test_run_fleet_supervise_emits_attention_digest_on_venv_deferred(
             pulled=False,
             changed=False,
             synced=False,
-            venv_deferred=True,
-            message="venv editable target mismatch; repair deferred: 2 runners active",
+            venv_repaired=True,
+            message="venv editable target repaired: shared venv editable .pth points to main checkout src",
         )
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
@@ -1391,7 +1391,8 @@ def test_run_fleet_supervise_emits_attention_digest_on_venv_deferred(
     assert len(digest.transitions) == 1
     assert digest.transitions[0].issue_number == -1
     assert digest.transitions[0].adapter_kind == "self-deploy"
-    assert digest.transitions[0].health == "DEFERRED"
+    assert digest.transitions[0].health == "REPAIRED"
+    assert "venv editable target repaired" in digest.transitions[0].last_log_line
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")

@@ -1308,7 +1308,6 @@ def test_self_deploy_repairs_venv_pth_mismatch(
 
     assert result.ok is True
     assert result.venv_repaired is True
-    assert result.venv_deferred is False
     assert result.pulled is True
     assert result.synced is False
     assert result.from_sha == "abc123"
@@ -1325,9 +1324,19 @@ def test_self_deploy_repairs_venv_pth_mismatch_with_runners_active(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    """A .pth rewrite is not exe-locked, so active runners do not defer repair."""
+    """A .pth rewrite is not exe-locked and succeeds while charlie.exe is held open."""
+    msvcrt = pytest.importorskip("msvcrt")
+
     wrong_target = tmp_path / "wrong" / "src"
     pth_path = _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+
+    # Simulate a live orchestrator process image by holding an exclusive byte-range
+    # lock on a charlie.exe stand-in in the venv. The .pth rewrite must still succeed.
+    charlie_exe = tmp_path / ".venv" / "Scripts" / "charlie.exe"
+    charlie_exe.parent.mkdir(parents=True, exist_ok=True)
+    charlie_exe.write_bytes(b"MZ fake executable content")
+    handle = charlie_exe.open("r+b", encoding=None)
+
     monkeypatch.setattr(
         "charlie_work.fleet_registry.count_fleet_live_sessions",
         lambda _fleet_dir_override: (2, []),
@@ -1341,19 +1350,23 @@ def test_self_deploy_repairs_venv_pth_mismatch_with_runners_active(
         ],
     )
 
-    result = self_deploy(tmp_path, run_command=runner)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        result = self_deploy(tmp_path, run_command=runner)
 
-    assert result.ok is True
-    assert result.venv_repaired is True
-    assert result.venv_deferred is False
-    assert result.pulled is True
-    assert result.synced is False
-    assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
-    assert [c[0] for c in calls] == [
-        ["git", "rev-parse", "HEAD"],
-        ["git", "pull", "--ff-only", "origin", "main"],
-        ["git", "rev-parse", "HEAD"],
-    ]
+        assert result.ok is True
+        assert result.venv_repaired is True
+        assert result.pulled is True
+        assert result.synced is False
+        assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
+        assert [c[0] for c in calls] == [
+            ["git", "rev-parse", "HEAD"],
+            ["git", "pull", "--ff-only", "origin", "main"],
+            ["git", "rev-parse", "HEAD"],
+        ]
+    finally:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        handle.close()
 
 
 def test_self_deploy_venv_repair_failure_is_non_fatal(
@@ -1374,7 +1387,6 @@ def test_self_deploy_venv_repair_failure_is_non_fatal(
 
     assert result.ok is False
     assert result.venv_repaired is False
-    assert result.venv_deferred is False
     assert result.pulled is False
     assert result.changed is False
     assert result.synced is False

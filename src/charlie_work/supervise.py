@@ -225,8 +225,7 @@ class SelfDeployResult:
 
     ``venv_repaired`` is True when the orchestrator venv's editable ``.pth``
     was detected pointing outside ``repo_root/src`` and was atomically rewritten
-    to the correct path.  ``venv_deferred`` is retained for compatibility but is
-    no longer produced by the .pth-rewrite repair path.
+    to the correct path.
     """
 
     ok: bool
@@ -238,7 +237,6 @@ class SelfDeployResult:
     message: str = ""
     error: str | None = None
     venv_repaired: bool = False
-    venv_deferred: bool = False
 
 
 def _is_venv(path: Path) -> bool:
@@ -328,13 +326,7 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
     return True, "rewrote editable .pth to point at main checkout src"
 
 
-def _check_venv(
-    repo_root: Path,
-    *,
-    run_command: Callable[..., RunResult] = run_captured,
-    fleet_dir_override: str | None = None,
-    sync_timeout: int = 300,
-) -> SelfDeployResult:
+def _check_venv(repo_root: Path) -> SelfDeployResult:
     """Verify the orchestrator venv's editable ``.pth`` and repair on mismatch.
 
     Reads the venv's editable ``.pth`` via ``worktree.verify_shared_venv`` and
@@ -421,12 +413,7 @@ def self_deploy(
     """
     marker_path = _pending_sync_marker_path(repo_root)
     try:
-        venv_check = _check_venv(
-            repo_root,
-            run_command=run_command,
-            fleet_dir_override=fleet_dir_override,
-            sync_timeout=sync_timeout,
-        )
+        venv_check = _check_venv(repo_root)
         if not venv_check.ok:
             return venv_check
         venv_repaired = venv_check.venv_repaired
