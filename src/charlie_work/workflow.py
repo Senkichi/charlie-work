@@ -3859,6 +3859,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
         # Do all network calls, file writes, and worker launches outside the lock
@@ -3952,6 +3954,8 @@ class OrchestratorApp:
                 # A successful or live-worker recovery supersedes any previous orphan flag.
                 if ok or is_live_worker:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -7381,6 +7385,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
 
@@ -7550,6 +7556,8 @@ class OrchestratorApp:
                 # A successful dispatch supersedes any previous orphan flag.
                 if ok:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:

@@ -25272,6 +25272,133 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
     assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
 
 
+def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #457 review: a fresh dispatch clears the drift fingerprint.
+
+    Without this, a worker that dies twice in the same failure class would
+    recompute an identical fingerprint and the second orphaned_worker_drift
+    event would be suppressed forever.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+        def issue_view(self, number: int):
+            if number == 457:
+                return {
+                    "number": 457,
+                    "title": "Orphan drift test",
+                    "url": "https://example.test/issues/457",
+                    "body": "",
+                    "labels": [{"name": config.labels.needs_rework}],
+                    "state": "OPEN",
+                }
+            return super().issue_view(number)
+
+    fake_gh = FakeGitHubForOrphan()
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "number": 457,
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+    assert "orphan_drift_fingerprint" in state["issues"]["457"]
+
+    # Simulate an external claim reset/redispatch: the issue returns to the
+    # rework queue and dispatch_rework claims it again.
+    state = load_state(paths.state_file)
+    state["issues"]["457"]["status"] = "rework_requested"
+    save_state(paths.state_file, state)
+
+    rework_prompt = paths.prs / "pr-100" / "rework-prompt.md"
+    rework_prompt.parent.mkdir(parents=True, exist_ok=True)
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+                pid=12345,
+                process_start_time=0.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["457"]["status"] == "dispatched"
+    assert "orphan_drift_fingerprint" not in state["issues"]["457"]
+
+    # Force the identical drift conditions again after the redispatch.
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 2, (
+        f"Expected two orphaned_worker_drift events across dispatch generations, "
+        f"got {len(drift_events)}"
+    )
+
+
 def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> None:
     """Issue #457: dispatch_rework must not run the orphaned-worker sweep, which is
     already run once per pass by loop(), to avoid duplicate drift events."""
