@@ -5293,9 +5293,8 @@ class OrchestratorApp:
                     },
                 )
             # Genuine merge conflict: gh pr update-branch cannot resolve this.
-            # Route the linked issue to rework_requested so dispatch_rework
-            # relaunches a worker; the worker's push will move the head and
-            # force a fresh re-review of the approved verdict.
+            # Record the conflict and let the failed-attempt alarm decide when
+            # to route the linked issue to rework_requested for a worker to resolve.
             if self._is_merge_conflict(pr):
                 state = load_state_locked(self.paths.state_file)
                 issue_state = (
@@ -5352,11 +5351,10 @@ class OrchestratorApp:
                     )
                 merge_conflict = True
                 sync_failed = True
-                if issue_status != "rework_requested" and issue_number is not None:
-                    merge_conflict_routed = True
-                    rework_label_error = self._request_merge_conflict_rework(
-                        pr, issue_number, decision
-                    )
+                # Conflict-rework dispatch is deferred until the consecutive
+                # failed-merge-attempt alarm threshold is reached (below). This
+                # debounces transient/stale CONFLICTING readings and keeps the
+                # approved verdict intact for the rework push's carry-forward.
             # Head matches the approved SHA. In front-of-train mode, only the
             # head of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
@@ -5520,7 +5518,6 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
-        label_error = rework_label_error
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
@@ -5637,6 +5634,47 @@ class OrchestratorApp:
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
         )
+        # Conflict-rework dispatch is debounced to the failed-attempt alarm
+        # threshold so a single transient/stale CONFLICTING reading does not
+        # clobber an approved verdict. Re-read the issue status and the PR
+        # attempt counter immediately before dispatch: the preceding checks,
+        # diff, and containment work are network-I/O windows long enough for a
+        # concurrent pass to have moved the issue into an in-flight or
+        # human-terminal state, and the stale `existing_pr_state` snapshot can
+        # diverge from the counter the final persistence block will reload
+        # (e.g. a carry-forward reset in this same pass). Dispatch outside the
+        # final state-lock because _request_merge_conflict_rework acquires its
+        # own lock.
+        if (
+            merge_conflict
+            and approved
+            and not can_merge
+            and not _is_pending_only(summary)
+            and issue_number is not None
+        ):
+            state = load_state_locked(self.paths.state_file)
+            issue_state = state["issues"].get(str(issue_number), {})
+            issue_status = issue_state.get("status")
+            existing_for_route = state["prs"].get(str(pr_number), {})
+            if issue_status not in (
+                "dispatched",
+                "dispatch_pending",
+                "manifest_written",
+                "escalated",
+                "blocked",
+                "rework_requested",
+            ):
+                new_attempts_for_route = (
+                    int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
+                )
+                threshold = self.config.auto_merge.failed_attempt_alarm
+                if threshold > 0 and new_attempts_for_route == threshold:
+                    merge_conflict_routed = True
+                    rework_label_error = self._request_merge_conflict_rework(
+                        pr, issue_number, decision
+                    )
+        if rework_label_error is not None:
+            label_error = rework_label_error
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
@@ -6391,6 +6429,8 @@ class OrchestratorApp:
         decision: dict[str, Any],
         summary: str,
         event_kind: str,
+        extra_payload: dict[str, Any] | None = None,
+        extra_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Route an approved PR to rework with a custom summary and event kind.
 
@@ -6398,7 +6438,9 @@ class OrchestratorApp:
         ``rework_requested`` (same label set as a non-escalated request_changes),
         and appends the requested state event. The PR's ``review-decision.json``
         is intentionally left untouched so the approved verdict is re-confirmed
-        after the worker push moves the head.
+        after the worker push moves the head. Any durable review fields already
+        present in the PR state are preserved, and callers may pass additional
+        keys to record without overwriting those verdict fields.
         """
         pr_number = int(pr["number"])
         self._write_rework_prompt(pr, issue_number, summary)
@@ -6419,18 +6461,21 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "status": "rework_requested",
+                "decision": pr_entry.get("decision"),
+                "reviewed_head_sha": pr_entry.get("reviewed_head_sha"),
+                "reviewed_patch_id": pr_entry.get("reviewed_patch_id"),
+                **(extra_state or {}),
             }
-            state = append_event(
-                state,
-                event_kind,
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "base_ref": pr.get("baseRefName"),
-                    "head_sha": pr.get("headRefOid"),
-                    "reviewed_head_sha": decision.get("reviewed_head_sha"),
-                },
-            )
+            payload = {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "base_ref": pr.get("baseRefName"),
+                "head_sha": pr.get("headRefOid"),
+                "reviewed_head_sha": decision.get("reviewed_head_sha"),
+            }
+            if extra_payload:
+                payload.update(extra_payload)
+            state = append_event(state, event_kind, payload)
             save_state(self.paths.state_file, state)
 
         result = transition(self.gh, self.config.labels, issue_number, "rework_requested")
@@ -6455,8 +6500,15 @@ class OrchestratorApp:
             "Merge the base branch into the PR branch, resolve the conflicts, and push. "
             "The code changes are already approved; do not re-litigate the review."
         )
+        requested_at = utc_now()
         return self._route_to_rework(
-            pr, issue_number, decision, summary, "merge_conflict_rework_requested"
+            pr,
+            issue_number,
+            decision,
+            summary,
+            "merge_conflict_rework_requested",
+            extra_payload={"conflict_rework_requested_at": requested_at},
+            extra_state={"conflict_rework_requested_at": requested_at},
         )
 
     def _request_cross_pr_revert_rework(
