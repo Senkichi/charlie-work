@@ -125,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     record.add_argument("--summary", default="")
     record.add_argument("--summary-file", type=Path, default=None)
+    record.add_argument("--reviewed-head", default=None)
     record.add_argument("--comment", action="store_true")
 
     merge_ready = subparsers.add_parser("ship-it")
@@ -852,6 +853,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary=args.summary,
                 summary_file=args.summary_file,
                 comment=args.comment,
+                reviewed_head=args.reviewed_head,
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})

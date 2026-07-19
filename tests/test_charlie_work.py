@@ -11793,15 +11793,22 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "live"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
     assert result.data["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_source"] == "live"
 
 
-def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path: Path) -> None:
-    """A commit landing between review() (packet generation) and record_review()
-    (verdict recording) must not reattribute the approval to a head/diff that
-    was never reviewed: reviewed_head_sha and reviewed_patch_id must come from
-    the packet the reviewer actually read, not a fresh fetch at verdict time.
+def test_record_review_requires_explicit_head_when_packet_and_live_differ(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: when the packet head and live PR head differ, record_review
+    must refuse to silently choose a source and must record provenance.
+
+    A commit landing between review() (packet generation) and record_review()
+    (verdict recording) now requires an explicit --reviewed-head choice.
+    Selecting the packet head preserves the original packet SHA/diff; selecting
+    the live head records the new SHA/diff and provenance.
     """
     from charlie_work.janitor import _calculate_patch_id
 
@@ -11815,19 +11822,45 @@ def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path:
     assert review_result.ok is True
     packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
-    # Simulate a new commit landing after the packet was generated but before
-    # the verdict is recorded.
+    # Simulate a new commit landing after the packet was generated.
     fake_gh.pr_head_shas[456] = "sha-new789"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
-
-    result = app.record_review(456, "approved", summary="lgtm")
+    live_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    # Without an explicit choice, the verdict must fail loudly and must not
+    # overwrite the pending decision file written by review().
+    result = app.record_review(456, "approved", summary="lgtm")
+    assert result.ok is False
+    assert "sha-abc123" in result.message
+    assert "sha-new789" in result.message
+    assert "--reviewed-head" in result.message
+    assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"
+
+    # Choosing the original packet head records the packet SHA, patch, and source.
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-abc123")
+    assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "packet"
     assert decision["reviewed_patch_id"] == packet_patch_id
+    assert result.data["reviewed_head_source"] == "packet"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
-    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+    # Choosing the live head records the live SHA, live patch, and source.
+    decision_path.unlink()
+    state = load_state(paths.state_file)
+    state["prs"].pop("456", None)
+    save_state(paths.state_file, state)
+
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    assert result.ok is True
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-new789"
+    assert decision["reviewed_head_source"] == "live"
+    assert decision["reviewed_patch_id"] == live_patch_id
+    assert result.data["reviewed_head_source"] == "live"
 
 
 def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> None:
@@ -11925,7 +11958,7 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
     result = app.record_review(456, "approved", summary="")
 
     assert result.ok is True
-    assert result.message == "review recorded"
+    assert result.message == "review recorded (head from live)"
     # Verify state mutation occurred
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
 
@@ -18658,7 +18691,7 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
                 "number": 456,
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
-                "headRefOid": "abc123",
+                "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }

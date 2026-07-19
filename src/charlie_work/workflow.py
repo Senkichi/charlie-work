@@ -4885,6 +4885,7 @@ class OrchestratorApp:
         summary: str = "",
         summary_file: Path | None = None,
         comment: bool = False,
+        reviewed_head: str | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -4919,11 +4920,52 @@ class OrchestratorApp:
         # when no packet exists (e.g. a decision recorded without a prior
         # review() call).
         packet_head_sha = self._read_packet_head_oid(pr_number)
-        reviewed_head_sha = (
-            packet_head_sha
-            if packet_head_sha is not None
-            else (pr.get("headRefOid") if pr else None)
-        )
+        live_head_sha = pr.get("headRefOid") if pr else None
+
+        # Issue #467: do not silently pin a verdict to a stale packet when the PR
+        # head has advanced since the packet was generated. If the packet head
+        # disagrees with the live PR head, require an explicit --reviewed-head
+        # choice. When they agree (or no packet exists), preserve the existing
+        # packet-first / live-fallback semantics and record where the SHA came from.
+        if reviewed_head is not None:
+            if packet_head_sha is not None and reviewed_head == packet_head_sha:
+                reviewed_head_sha = reviewed_head
+                reviewed_head_source = "packet"
+            elif live_head_sha is not None and reviewed_head == live_head_sha:
+                reviewed_head_sha = reviewed_head
+                reviewed_head_source = "live"
+            else:
+                options: list[str] = []
+                if packet_head_sha is not None:
+                    options.append(f"packet head {packet_head_sha}")
+                if live_head_sha is not None:
+                    options.append(f"live head {live_head_sha}")
+                options_str = " or ".join(options) if options else "any available head"
+                return CommandResult(
+                    False,
+                    f"--reviewed-head {reviewed_head} does not match {options_str}",
+                    {},
+                )
+        elif (
+            packet_head_sha is not None
+            and live_head_sha is not None
+            and packet_head_sha != live_head_sha
+        ):
+            return CommandResult(
+                False,
+                f"review packet head ({packet_head_sha}) differs from live PR head ({live_head_sha}); "
+                "use --reviewed-head to choose the head the verdict applies to",
+                {},
+            )
+        elif packet_head_sha is not None:
+            reviewed_head_sha = packet_head_sha
+            reviewed_head_source = "packet"
+        elif live_head_sha is not None:
+            reviewed_head_sha = live_head_sha
+            reviewed_head_source = "live"
+        else:
+            return CommandResult(False, "no packet or live PR head available", {})
+
         # Calculate patch-id for the PR diff to detect actual content changes
         # (issue #222: base-update merges can advance head SHA without changing diff content).
         # All terminal decisions (approved/request_changes/blocked) persist reviewed_patch_id
@@ -4935,9 +4977,13 @@ class OrchestratorApp:
         # check never needs to reconstruct this historical diff.
         reviewed_patch_id = ""
         reviewed_signature = DiffContentSignature((), frozenset())
+        diff: str | None = None
         if pr:
-            diff = self._read_packet_diff(pr_number)
-            if diff is None:
+            if reviewed_head_source == "packet":
+                diff = self._read_packet_diff(pr_number)
+                if diff is None:
+                    diff = self.gh.pr_diff(pr_number)
+            else:
                 diff = self.gh.pr_diff(pr_number)
             reviewed_patch_id = _calculate_patch_id(diff)
             if diff:
@@ -4949,6 +4995,7 @@ class OrchestratorApp:
             "summary": summary_text,
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
+            "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,
             "reviewed_changed_lines": list(reviewed_signature.changed_lines),
             "reviewed_changed_files": sorted(reviewed_signature.changed_files),
@@ -5098,11 +5145,12 @@ class OrchestratorApp:
                     label_error = {"comment_error": str(exc)}
                 else:
                     label_error["comment_error"] = str(exc)
+        source_note = f"head from {reviewed_head_source}"
         message = (
             f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
-            "escalated to human"
+            f"escalated to human ({source_note})"
             if escalated
-            else "review recorded"
+            else f"review recorded ({source_note})"
         )
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
@@ -5114,6 +5162,9 @@ class OrchestratorApp:
                 "decision": decision,
                 "decision_path": str(decision_path),
                 "reviewed_head_sha": reviewed_head_sha,
+                "reviewed_head_source": reviewed_head_source,
+                "live_head_sha": live_head_sha,
+                "packet_head_sha": packet_head_sha,
                 "rework_path": rework_path,
                 "escalated": escalated,
                 "request_changes_count": request_changes_count,
