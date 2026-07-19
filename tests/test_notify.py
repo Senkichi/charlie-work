@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -481,3 +483,231 @@ def test_loop_completes_when_notify_sink_fails():
         result = emit_digest(config, digest)
         assert result.ok is False  # sink failed
         assert result.error is not None  # error returned as value
+
+
+def _ps_command_from_mock(mock_run: MagicMock) -> str:
+    """Return the PowerShell script passed to subprocess.run for the desktop sink."""
+    assert mock_run.call_count == 1
+    args = mock_run.call_args[0][0]
+    assert args[0] == "powershell"
+    assert args[1] == "-Command"
+    return args[2]
+
+
+def _make_desktop_digest(*transitions: AttentionEntry) -> AttentionDigest:
+    """Build an AttentionDigest for desktop-sink tests."""
+    return AttentionDigest(
+        generated_at="2026-07-07T00:00:00Z",
+        repo="test-repo",
+        transitions=transitions,
+    )
+
+
+def test_desktop_sink_filters_benign_skipped_events():
+    """SKIPPED flow-control transitions are dropped from the desktop toast;
+    genuine attention transitions still notify.
+    """
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/repo1",
+            health="SKIPPED",
+            previous_health=None,
+            last_log_line="supervisor_lock_held",
+            pid=None,
+        ),
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="STALLED",
+            previous_health=None,
+            last_log_line="error: stuck",
+            pid=12345,
+        ),
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest)
+
+    assert result.ok is True
+    assert mock_run.call_count == 1
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "STALLED" in ps_command
+    assert "SKIPPED" not in ps_command
+    assert "supervisor_lock_held" not in ps_command
+
+
+def test_desktop_sink_renders_repo_context_for_pass_level_event():
+    """When no real issue number is present, the toast shows repo/pass context."""
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/repo1",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="GraphQL timeout",
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest)
+
+    assert result.ok is True
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "owner/repo1" in ps_command
+    assert "GraphQL timeout" in ps_command
+    assert "Issue #-1" not in ps_command
+
+
+def test_desktop_sink_truncates_last_log_line():
+    """Long last_log_line values are truncated to fit a toast."""
+    config = NotifyConfig(enabled=True, sink="desktop")
+    long_reason = "A" * 120
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="STALLED",
+            previous_health=None,
+            last_log_line=long_reason,
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest)
+
+    assert result.ok is True
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "..." in ps_command
+    assert long_reason not in ps_command
+    truncated = "A" * 77 + "..."
+    assert truncated in ps_command
+
+
+def test_desktop_sink_omits_was_clause_when_previous_health_is_none():
+    """The '(was ...)' clause is omitted when there is no previous health."""
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest_none = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="STALLED",
+            previous_health=None,
+            last_log_line="error: stuck",
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest_none)
+
+    assert result.ok is True
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "(was" not in ps_command
+
+    digest_previous = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="DEAD",
+            previous_health="STALLED",
+            last_log_line="process exited",
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest_previous)
+
+    assert result.ok is True
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "(was STALLED)" in ps_command
+
+
+def test_desktop_sink_powershell_uses_winrt_projection():
+    """The generated PowerShell script uses the 5.1-compatible WinRT projection
+    and the correct ToastNotificationManager class, not the broken Add-Type / ToastTemplateManager.
+    """
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="STALLED",
+            previous_health=None,
+            last_log_line="error: stuck",
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _desktop_sink(config, digest)
+
+    assert result.ok is True
+    ps_command = _ps_command_from_mock(mock_run)
+    assert "ToastNotificationManager" in ps_command
+    assert "ContentType=WindowsRuntime" in ps_command
+    assert "$ErrorActionPreference = 'Stop'" in ps_command
+    assert "Add-Type -AssemblyName Windows.UI.Notifications" not in ps_command
+    assert "ToastTemplateManager" not in ps_command
+
+
+def test_desktop_sink_all_benign_events_returns_ok_without_subprocess():
+    """A digest with only SKIPPED transitions short-circuits without spawning any process."""
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/repo1",
+            health="SKIPPED",
+            previous_health=None,
+            last_log_line="state_lock_busy",
+            pid=None,
+        )
+    )
+
+    with patch("charlie_work.notify.os.name", "nt"):
+        with patch("charlie_work.notify.subprocess.run") as mock_run:
+            result = _desktop_sink(config, digest)
+
+    assert result.ok is True
+    assert "no desktop-severity transitions" in result.error.lower()
+    mock_run.assert_not_called()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or bool(os.environ.get("CI")),
+    reason="Requires an interactive Windows desktop session",
+)
+def test_desktop_sink_powershell_toast_succeeds_on_windows():
+    """Real Windows smoke test: the rewritten PowerShell toast script exits 0."""
+    config = NotifyConfig(enabled=True, sink="desktop")
+    digest = _make_desktop_digest(
+        AttentionEntry(
+            issue_number=1,
+            adapter_kind="claude-code",
+            health="STALLED",
+            previous_health=None,
+            last_log_line="smoke test",
+            pid=None,
+        )
+    )
+
+    result = _desktop_sink(config, digest)
+    assert result.ok is True
