@@ -353,14 +353,37 @@ def test_sweep_orphan_processes_windows_no_powershell() -> None:
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
 def test_sweep_orphan_processes_windows_parsing() -> None:
-    """Test that sweep_orphan_processes parses PowerShell output correctly."""
+    """Test that sweep_orphan_processes parses PowerShell JSON output correctly."""
+    import json
     from unittest.mock import patch
 
-    # Mock subprocess.run to return sample PowerShell output
+    sample = [
+        {
+            "ProcessId": 1234,
+            "Name": "python.exe",
+            "CommandLine": "python worker.py /some/worktree/path",
+        },
+        {
+            "ProcessId": 5678,
+            "Name": "node.exe",
+            "CommandLine": "node server.js /some/worktree/path",
+        },
+    ]
     with patch("subprocess.run") as mock_run:
-        mock_run.return_value.stdout = "1234\n5678\n"
+        mock_run.return_value.stdout = json.dumps(sample)
         orphans = sweep_orphan_processes("/some/worktree/path")
-        assert orphans == [1234, 5678]
+        assert orphans == [
+            {
+                "pid": 1234,
+                "name": "python.exe",
+                "command_line": "python worker.py /some/worktree/path",
+            },
+            {
+                "pid": 5678,
+                "name": "node.exe",
+                "command_line": "node server.js /some/worktree/path",
+            },
+        ]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")

@@ -20705,7 +20705,8 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes", return_value=[3492]
+            "charlie_work.workflow.sweep_orphan_processes",
+            return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
@@ -21040,12 +21041,25 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         process_start_time=1234567890.0,
     )
 
-    # Mock sweep_orphan_processes to return fixed PIDs for dead worktrees
-    def mock_sweep_orphan(worktree_path: str) -> list[int]:
+    # Mock sweep_orphan_processes to return fixed orphan process details for dead worktrees
+    def mock_sweep_orphan(worktree_path: str) -> list[dict[str, Any]]:
         if worktree_path == "/dead/worktree":
-            return [5000, 5001]
+            return [
+                {
+                    "pid": 5000,
+                    "name": "python.exe",
+                    "command_line": "python script.py /dead/worktree",
+                },
+                {"pid": 5001, "name": "node.exe", "command_line": "node server.js /dead/worktree"},
+            ]
         elif worktree_path == "/dead/worker":
-            return [6000]
+            return [
+                {
+                    "pid": 6000,
+                    "name": "python.exe",
+                    "command_line": "python worker.py /dead/worker",
+                },
+            ]
         return []
 
     # Mock subprocess.run to track taskkill calls
@@ -25054,3 +25068,247 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     payload = rework_events[-1]["payload"]
     assert "123" in payload["failures"]
     assert payload["failures"]["123"] == reason
+
+
+def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
+    """Issue #457: dead worker with request_changes and an advanced head is routed
+    to the review-pending path instead of being re-emitted as drift."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",  # Changed since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    def fake_review(pr_number: int):
+        return CommandResult(True, "review packet generated", {"pr_number": pr_number})
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["457"]
+
+    # Should transition to the review-pending state, not stay dispatched.
+    assert entry.get("status") == "reviewing"
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 0
+
+    routed_events = [e for e in events if e.get("kind") == "orphaned_worker_routed_to_review"]
+    assert len(routed_events) == 1
+    assert routed_events[0]["payload"]["issue_number"] == 457
+    assert routed_events[0]["payload"]["pr_number"] == 100
+    assert routed_events[0]["payload"]["review_ok"] is True
+    assert routed_events[0]["payload"]["routed"] is True
+
+
+def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path: Path) -> None:
+    """Issue #457: if routing to review fails, the head-advance finding is emitted
+    as a single drift event and not re-emitted on subsequent passes."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    def fake_review(pr_number: int):
+        return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["457"]
+
+    # Status should remain dispatched; the finding is tracked as drift.
+    assert entry.get("status") == "dispatched"
+    assert "orphan_drift_fingerprint" in entry
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_with_head_change"
+
+    routed_events = [e for e in events if e.get("kind") == "orphaned_worker_routed_to_review"]
+    assert len(routed_events) == 0
+
+    # Second pass must not re-emit the drift.
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1, "drift must not be re-emitted for the same fingerprint"
+
+
+def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -> None:
+    """Issue #457: non-request_changes dead workers emit a drift finding once and
+    are not re-emitted on every subsequent pass."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # Last decision is "approved" instead of "request_changes".
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(3):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+
+
+def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> None:
+    """Issue #457: dispatch_rework must not run the orphaned-worker sweep, which is
+    already run once per pass by loop(), to avoid duplicate drift events."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPrs(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPrs()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    orphan_calls = []
+
+    def tracking_orphan_sweep(*args, **kwargs):
+        orphan_calls.append((args, kwargs))
+
+    with patch(
+        "charlie_work.workflow._detect_and_handle_orphaned_workers",
+        side_effect=tracking_orphan_sweep,
+    ):
+        result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert len(orphan_calls) == 0, "dispatch_rework must not re-run orphaned-worker detection"
