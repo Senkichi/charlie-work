@@ -4286,7 +4286,12 @@ class OrchestratorApp:
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
-                return self.record_review(pr_number, "request_changes", summary=summary)
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=summary,
+                    reviewed_head=pr.get("headRefOid"),
+                )
 
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -4338,7 +4343,12 @@ class OrchestratorApp:
                 summary = render_test_adequacy_summary(
                     test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
-                return self.record_review(pr_number, "request_changes", summary=summary)
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=summary,
+                    reviewed_head=pr.get("headRefOid"),
+                )
             # Gate passed while enabled: add Tier-2 packet section (issue #180)
             test_adequacy_section = render_test_adequacy_section(
                 test_adequacy_verdict.facts, test_adequacy_verdict.warnings

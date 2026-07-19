@@ -8748,6 +8748,63 @@ def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None
     assert decision["summary"] == "CI failed on Tests passed; push a fix"
 
 
+def test_janitor_required_check_failure_after_stale_packet_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: a stale review packet on disk must not block the automated
+    check-failure rework path; review() must record the verdict against the
+    live PR head, not the stale packet head."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    passing_checks = [
+        {"name": "Tests passed", "state": "SUCCESS"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    failing_checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    diff_a = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    diff_b = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix"
+    fake_gh = FakeGitHubWithChecks(checks=passing_checks)
+    fake_gh.diffs[456] = diff_a
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Round 1: clean review writes a packet at the original head.
+    result1 = app.review(456)
+    assert result1.ok is True
+    packet = paths.prs / "pr-456" / "pr.json"
+    assert packet.exists()
+    assert json.loads(packet.read_text(encoding="utf-8"))["headRefOid"] == "sha-abc123"
+
+    # Round 2: PR head advances and a required check fails.
+    fake_gh.checks = failing_checks
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = diff_b
+
+    result2 = app.review(456)
+
+    assert result2.ok is True, result2.message
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-new-head"
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    assert "CI failed on Tests passed; push a fix" in rework_prompt.read_text(encoding="utf-8")
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-new-head"
+    assert decision["reviewed_head_source"] == "live"
+
+
 def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
     tmp_path: Path,
 ) -> None:
