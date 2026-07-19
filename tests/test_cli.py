@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from charlie_work import cli
+from charlie_work.config import NotifyConfig
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
@@ -381,3 +382,94 @@ def test_run_fleet_bash_rats_self_deploy_failure_is_non_fatal(
     assert fleet_loop_mock.called is True
     out = capsys.readouterr().out
     assert "self-deploy skipped: diverged or dirty tree" in out
+
+
+def test_run_fleet_bash_rats_emits_attention_digest_on_repair_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A self_deploy repair failure emits an attention digest when notify is enabled."""
+    digest_path = tmp_path / "digest.jsonl"
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="venv pth repair failed: Access is denied",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+
+    # Provide a config whose notify sink writes to a temp file.
+    from charlie_work.config import OrchestratorConfig
+
+    notify_config = NotifyConfig(enabled=True, sink="file", file_path=str(digest_path))
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(notify=notify_config),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert fleet_loop_mock.called is True
+    assert digest_path.exists()
+    digest_line = digest_path.read_text(encoding="utf-8").strip()
+    digest = json.loads(digest_line)
+    assert digest["repo"] == "fleet"
+    assert len(digest["transitions"]) == 1
+    assert digest["transitions"][0]["adapter_kind"] == "self-deploy"
+    assert digest["transitions"][0]["health"] == "ERROR"
+    assert "Access is denied" in digest["transitions"][0]["last_log_line"]
+
+
+def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A successful self_deploy venv repair emits an attention digest when notify is enabled."""
+    digest_path = tmp_path / "digest.jsonl"
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            venv_repaired=True,
+            message="venv editable target repaired: shared venv editable .pth points to main checkout src",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+
+    # Provide a config whose notify sink writes to a temp file.
+    from charlie_work.config import OrchestratorConfig
+
+    notify_config = NotifyConfig(enabled=True, sink="file", file_path=str(digest_path))
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(notify=notify_config),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert fleet_loop_mock.called is True
+    assert digest_path.exists()
+    digest_line = digest_path.read_text(encoding="utf-8").strip()
+    digest = json.loads(digest_line)
+    assert digest["repo"] == "fleet"
+    assert len(digest["transitions"]) == 1
+    assert digest["transitions"][0]["adapter_kind"] == "self-deploy"
+    assert digest["transitions"][0]["health"] == "REPAIRED"
+    assert "venv editable target repaired" in digest["transitions"][0]["last_log_line"]
