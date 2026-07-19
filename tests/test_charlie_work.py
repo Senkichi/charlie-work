@@ -8748,6 +8748,63 @@ def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None
     assert decision["summary"] == "CI failed on Tests passed; push a fix"
 
 
+def test_janitor_required_check_failure_after_stale_packet_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: a stale review packet on disk must not block the automated
+    check-failure rework path; review() must record the verdict against the
+    live PR head, not the stale packet head."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    passing_checks = [
+        {"name": "Tests passed", "state": "SUCCESS"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    failing_checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    diff_a = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    diff_b = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix"
+    fake_gh = FakeGitHubWithChecks(checks=passing_checks)
+    fake_gh.diffs[456] = diff_a
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Round 1: clean review writes a packet at the original head.
+    result1 = app.review(456)
+    assert result1.ok is True
+    packet = paths.prs / "pr-456" / "pr.json"
+    assert packet.exists()
+    assert json.loads(packet.read_text(encoding="utf-8"))["headRefOid"] == "sha-abc123"
+
+    # Round 2: PR head advances and a required check fails.
+    fake_gh.checks = failing_checks
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = diff_b
+
+    result2 = app.review(456)
+
+    assert result2.ok is True, result2.message
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-new-head"
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    assert "CI failed on Tests passed; push a fix" in rework_prompt.read_text(encoding="utf-8")
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-new-head"
+    assert decision["reviewed_head_source"] == "live"
+
+
 def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
     tmp_path: Path,
 ) -> None:
@@ -11793,15 +11850,22 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "live"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
     assert result.data["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_source"] == "live"
 
 
-def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path: Path) -> None:
-    """A commit landing between review() (packet generation) and record_review()
-    (verdict recording) must not reattribute the approval to a head/diff that
-    was never reviewed: reviewed_head_sha and reviewed_patch_id must come from
-    the packet the reviewer actually read, not a fresh fetch at verdict time.
+def test_record_review_requires_explicit_head_when_packet_and_live_differ(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: when the packet head and live PR head differ, record_review
+    must refuse to silently choose a source and must record provenance.
+
+    A commit landing between review() (packet generation) and record_review()
+    (verdict recording) now requires an explicit --reviewed-head choice.
+    Selecting the packet head preserves the original packet SHA/diff; selecting
+    the live head records the new SHA/diff and provenance.
     """
     from charlie_work.janitor import _calculate_patch_id
 
@@ -11815,19 +11879,45 @@ def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path:
     assert review_result.ok is True
     packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
-    # Simulate a new commit landing after the packet was generated but before
-    # the verdict is recorded.
+    # Simulate a new commit landing after the packet was generated.
     fake_gh.pr_head_shas[456] = "sha-new789"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
-
-    result = app.record_review(456, "approved", summary="lgtm")
+    live_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    # Without an explicit choice, the verdict must fail loudly and must not
+    # overwrite the pending decision file written by review().
+    result = app.record_review(456, "approved", summary="lgtm")
+    assert result.ok is False
+    assert "sha-abc123" in result.message
+    assert "sha-new789" in result.message
+    assert "--reviewed-head" in result.message
+    assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"
+
+    # Choosing the original packet head records the packet SHA, patch, and source.
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-abc123")
+    assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "packet"
     assert decision["reviewed_patch_id"] == packet_patch_id
+    assert result.data["reviewed_head_source"] == "packet"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
-    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+    # Choosing the live head records the live SHA, live patch, and source.
+    decision_path.unlink()
+    state = load_state(paths.state_file)
+    state["prs"].pop("456", None)
+    save_state(paths.state_file, state)
+
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    assert result.ok is True
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-new789"
+    assert decision["reviewed_head_source"] == "live"
+    assert decision["reviewed_patch_id"] == live_patch_id
+    assert result.data["reviewed_head_source"] == "live"
 
 
 def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> None:
@@ -11925,7 +12015,7 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
     result = app.record_review(456, "approved", summary="")
 
     assert result.ok is True
-    assert result.message == "review recorded"
+    assert result.message == "review recorded (head from live)"
     # Verify state mutation occurred
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
 
@@ -18658,7 +18748,7 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
                 "number": 456,
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
-                "headRefOid": "abc123",
+                "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }

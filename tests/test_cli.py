@@ -121,6 +121,41 @@ def test_cli_verdict_success_records_decision(
     assert decision["summary"] == "lgtm"
 
 
+def test_cli_verdict_reviewed_head_flag_records_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #467: --reviewed-head is accepted and recorded with provenance."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text("lgtm", encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+            "--summary-file",
+            str(summary),
+            "--reviewed-head",
+            "sha-abc",
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "review recorded" in captured.out
+    decision_path = repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-abc"
+    assert decision["reviewed_head_source"] == "live"
+    assert "(head from live)" in captured.out
+
+
 def test_cli_verdict_missing_summary_file_json_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
