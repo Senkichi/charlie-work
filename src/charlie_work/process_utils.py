@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -414,7 +415,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     return killed_pids
 
 
-def sweep_orphan_processes(worktree_path: str) -> list[int]:
+def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     """Sweep for orphan processes whose CommandLine references a worktree path.
 
     On Windows: Uses PowerShell Get-CimInstance Win32_Process to find processes
@@ -425,35 +426,37 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
     detachment better via killpg, and /proc enumeration is more complex.
 
     This is a read-only detection function. Callers should decide whether to kill
-    the returned PIDs based on policy (e.g., janitor warnings vs. automatic cleanup).
+    the returned processes based on policy (e.g., janitor warnings vs. automatic cleanup).
 
     Args:
         worktree_path: The worktree path to search for in process CommandLines.
 
     Returns:
-        A list of PIDs whose CommandLine references the worktree path.
+        A list of dicts describing processes whose CommandLine references the
+        worktree path. Each dict contains ``pid`` (int), ``name`` (str), and
+        ``command_line`` (str). POSIX callers always get an empty list.
     """
-    orphans = []
+    orphans: list[dict[str, Any]] = []
 
     if os.name != "nt":
         # POSIX: not implemented - process groups handle detachment better
         return orphans
 
     try:
-        import subprocess
         import shutil
 
         if not shutil.which("powershell"):
             return orphans
 
-        # Use PowerShell to query Win32_Process for CommandLine matching the worktree path
-        # We use -like with wildcards for partial matching (handles both forward and backslashes)
+        # Use PowerShell to query Win32_Process for CommandLine matching the worktree path.
+        # Select-Object + ConvertTo-Json preserves PID, image name, and command line so
+        # callers can log what was killed and identify respawn sources.
         result = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{worktree_path}*" }} | Select-Object -ExpandProperty ProcessId',
+                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{worktree_path}*" }} | Select-Object ProcessId, CommandLine, Name | ConvertTo-Json -AsArray',
             ],
             capture_output=True,
             text=True,
@@ -461,11 +464,30 @@ def sweep_orphan_processes(worktree_path: str) -> list[int]:
             **no_console_window_kwargs(),
         )
 
-        # Parse output: extract PIDs (one per line)
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line and line.isdigit():
-                orphans.append(int(line))
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return orphans
+
+        if not isinstance(data, list):
+            return orphans
+
+        for proc in data:
+            if not isinstance(proc, dict):
+                continue
+            try:
+                pid = int(proc["ProcessId"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if pid <= 0:
+                continue
+            orphans.append(
+                {
+                    "pid": pid,
+                    "name": str(proc.get("Name") or ""),
+                    "command_line": str(proc.get("CommandLine") or ""),
+                }
+            )
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
         # Best-effort sweep - don't fail if PowerShell fails
         pass
