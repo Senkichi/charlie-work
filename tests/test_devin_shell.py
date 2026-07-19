@@ -2117,19 +2117,26 @@ def test_launch_devin_session_includes_start_new_session_on_posix(
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    # Detachment is enforced by no_console_window_kwargs + CREATE_NEW_PROCESS_GROUP
-    # directly; Policy A survival flags (DETACHED_PROCESS, CREATE_BREAKAWAY_FROM_JOB)
+    # Worker spawns use hidden_console_kwargs: CREATE_NEW_CONSOLE plus a
+    # STARTUPINFO with wShowWindow=SW_HIDE so descendants inherit a hidden
+    # console. Policy A survival flags (DETACHED_PROCESS, CREATE_BREAKAWAY_FROM_JOB)
     # are out of scope for issue #360.
     if os.name != "nt":
         assert popen_kwargs.get("start_new_session") is True
         assert "creationflags" not in popen_kwargs
+        assert "startupinfo" not in popen_kwargs
     else:
         assert "start_new_session" not in popen_kwargs
         flags = popen_kwargs.get("creationflags", 0)
         assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-        assert flags & subprocess.CREATE_NO_WINDOW
+        assert flags & subprocess.CREATE_NEW_CONSOLE
+        assert not (flags & subprocess.CREATE_NO_WINDOW)
         assert not (flags & subprocess.DETACHED_PROCESS)
         assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        startupinfo = popen_kwargs.get("startupinfo")
+        assert startupinfo is not None
+        assert startupinfo.wShowWindow == subprocess.SW_HIDE
+        assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
 
 
 # ---------------------------------------------------------------------------
