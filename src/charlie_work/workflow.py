@@ -5515,33 +5515,43 @@ class OrchestratorApp:
         )
         # Conflict-rework dispatch is debounced to the failed-attempt alarm
         # threshold so a single transient/stale CONFLICTING reading does not
-        # clobber an approved verdict. Dispatch outside the final state-lock
-        # because _request_merge_conflict_rework acquires its own lock.
+        # clobber an approved verdict. Re-read the issue status and the PR
+        # attempt counter immediately before dispatch: the preceding checks,
+        # diff, and containment work are network-I/O windows long enough for a
+        # concurrent pass to have moved the issue into an in-flight or
+        # human-terminal state, and the stale `existing_pr_state` snapshot can
+        # diverge from the counter the final persistence block will reload
+        # (e.g. a carry-forward reset in this same pass). Dispatch outside the
+        # final state-lock because _request_merge_conflict_rework acquires its
+        # own lock.
         if (
             merge_conflict
             and approved
             and not can_merge
             and not _is_pending_only(summary)
             and issue_number is not None
-            and issue_status
-            not in (
+        ):
+            state = load_state_locked(self.paths.state_file)
+            issue_state = state["issues"].get(str(issue_number), {})
+            issue_status = issue_state.get("status")
+            existing_for_route = state["prs"].get(str(pr_number), {})
+            if issue_status not in (
                 "dispatched",
                 "dispatch_pending",
                 "manifest_written",
                 "escalated",
                 "blocked",
                 "rework_requested",
-            )
-        ):
-            new_attempts_for_route = (
-                int(existing_pr_state.get("consecutive_failed_merge_attempts", 0)) + 1
-            )
-            threshold = self.config.auto_merge.failed_attempt_alarm
-            if threshold > 0 and new_attempts_for_route == threshold:
-                merge_conflict_routed = True
-                rework_label_error = self._request_merge_conflict_rework(
-                    pr, issue_number, decision
+            ):
+                new_attempts_for_route = (
+                    int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
                 )
+                threshold = self.config.auto_merge.failed_attempt_alarm
+                if threshold > 0 and new_attempts_for_route == threshold:
+                    merge_conflict_routed = True
+                    rework_label_error = self._request_merge_conflict_rework(
+                        pr, issue_number, decision
+                    )
         if rework_label_error is not None:
             label_error = rework_label_error
         with state_lock(self.paths.state_file):

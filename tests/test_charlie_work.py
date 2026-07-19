@@ -16390,6 +16390,169 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     assert fake_gh.labels_added == labels_added_before
 
 
+def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #456 rework: a verdict carry-forward resets the failed-attempt
+    counter and must not be defeated by the stale dispatch decision.
+
+    A PR whose head moved but whose cumulative diff is unchanged carries the
+    approved verdict forward and resets ``consecutive_failed_merge_attempts``.
+    If the PR is still CONFLICTING after the head move, the dispatch gate must
+    re-read the counter fresh and debounce from the new baseline instead of
+    dispatching based on the pre-reset count.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[pr_number] = diff_text
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}: search",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix-search",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": f"Closes #{issue_number}\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Two CONFLICTING passes with the original head bring the counter to 2.
+    for _ in range(2):
+        result = app.merge_ready(pr_number, merge=False)
+        assert result.data["merge_conflict"] is True
+        assert result.data["merge_attempt_alarm"] is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["consecutive_failed_merge_attempts"] == 2
+
+    # The PR head advances, but the cumulative diff is unchanged, so the
+    # approved verdict carries forward and resets the failed-attempt counter.
+    fake_gh.prs[0]["headRefOid"] = new_head
+    fake_gh.diffs[pr_number] = diff_text
+
+    result = app.merge_ready(pr_number, merge=False)
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["consecutive_failed_merge_attempts"] == 1
+
+    state = load_state(paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["consecutive_failed_merge_attempts"] == 1
+    assert any(e["kind"] == "verdict_carried_forward_clean_rebase" for e in state["events"])
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    assert (issue_number, config.labels.needs_rework) not in fake_gh.labels_added
+
+    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+    decision = json.loads(decision_path.read_text())
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["reviewed_patch_id"] == patch_id
+
+
+def test_merge_ready_conflict_dispatch_rechecks_issue_status_under_lock(
+    tmp_path: Path,
+) -> None:
+    """Issue #456 rework: the conflict-rework dispatch gate re-reads issue
+    status under lock after the network-I/O window.
+
+    If a concurrent pass moves the linked issue into an in-flight state while
+    this pass is fetching checks/diff/containment, dispatch must bail silently
+    and must not clobber the in-flight status or dispatch a duplicate rework.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class RaceGitHub(FakeGitHub):
+        def __init__(self, state_file: Path):
+            super().__init__()
+            self.state_file = state_file
+
+        def pr_checks(self, number: int):
+            # Simulate a concurrent pass transitioning the issue to 'dispatched'
+            # while this merge_ready pass was blocked on network I/O.
+            with state_lock(self.state_file):
+                state = load_state(self.state_file)
+                issue = state.setdefault("issues", {}).get("123")
+                if issue is not None:
+                    issue["status"] = "dispatched"
+                    save_state(self.state_file, state)
+            return super().pr_checks(number)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = RaceGitHub(paths.state_file)
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is True
+    assert result.data["merge_attempt_warning"] is not None
+    assert "merge conflict" in (result.data["merge_attempt_warning"] or "").lower()
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
 def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
     """Issue #334: next-mode update lane syncs a CLEAN-but-stale head candidate."""
     from charlie_work.config import AutoMergeConfig
