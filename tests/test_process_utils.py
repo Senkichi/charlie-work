@@ -466,7 +466,7 @@ def _capture_popen_call(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return mock
 
 
-def test_popen_worker_routes_creationflags_through_no_console_window_kwargs(
+def test_popen_worker_routes_creationflags_through_hidden_console_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`popen_worker` is the single chokepoint for creationflags/process-group composition."""
@@ -474,7 +474,7 @@ def test_popen_worker_routes_creationflags_through_no_console_window_kwargs(
     sentinel_kwargs = {"creationflags": 0xDEADBEEF}
 
     with patch(
-        "charlie_work.process_utils.no_console_window_kwargs",
+        "charlie_work.process_utils.hidden_console_kwargs",
         return_value=sentinel_kwargs,
     ) as mock_helper:
         popen_worker([sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL)
@@ -490,14 +490,14 @@ def test_popen_worker_combines_existing_creationflags(
     """Existing creationflags from the caller are merged with the process-group flag."""
     monkeypatch.setattr(subprocess, "Popen", MagicMock())
 
-    with patch("charlie_work.process_utils.no_console_window_kwargs") as mock_helper:
+    with patch("charlie_work.process_utils.hidden_console_kwargs") as mock_helper:
         popen_worker(
             [sys.executable, "-c", "pass"],
-            creationflags=0x00000008,
+            creationflags=0x00000400,
             stdout=subprocess.DEVNULL,
         )
 
-    expected_flag = 0x00000008 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    expected_flag = 0x00000400 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     mock_helper.assert_called_once_with(expected_flag)
 
 
@@ -539,3 +539,24 @@ def test_popen_worker_respects_explicit_start_new_session(
     )
 
     assert mock.call_args.kwargs.get("start_new_session") is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_popen_worker_composes_hidden_console_for_worker_spawns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker spawns inherit a hidden console via CREATE_NEW_CONSOLE + SW_HIDE."""
+    mock = _capture_popen_call(monkeypatch)
+
+    popen_worker([sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL)
+
+    kwargs = mock.call_args.kwargs
+    flags = kwargs.get("creationflags", 0)
+    assert flags & subprocess.CREATE_NEW_CONSOLE
+    assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+    assert not (flags & subprocess.CREATE_NO_WINDOW)
+    assert not (flags & subprocess.DETACHED_PROCESS)
+    startupinfo = kwargs.get("startupinfo")
+    assert startupinfo is not None
+    assert startupinfo.wShowWindow == subprocess.SW_HIDE
+    assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
