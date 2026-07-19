@@ -38,6 +38,7 @@ from charlie_work.worktree import (
     _is_git_tracked,
     _materialize_directory,
     _slugify,
+    _unlink_reparse_point,
 )
 
 
@@ -4231,3 +4232,139 @@ def test_remove_review_checkout_idempotent(tmp_path: Path) -> None:
     # Never dispatched at all: also True, never raises.
     removed_never_created = remove_review_checkout(repo_root, 12345, reviews_dir=reviews_dir)
     assert removed_never_created is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_remove_worktree_directory_symlink_preserves_shared_venv_target(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: directory symlinks (and junctions) at .venv must be unlinked,
+    never followed into the shared venv target.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    info = create_worktree(repo_root, "agent/issue-462-symlink", base_ref="HEAD")
+    venv_path = info.path / ".venv"
+    if venv_path.exists() or is_junction(venv_path):
+        _unlink_reparse_point(venv_path)
+
+    # Prefer a real directory symlink; fall back to a junction when the
+    # process lacks the symlink privilege on this Windows machine.
+    try:
+        os.symlink(shared_venv, venv_path, target_is_directory=True)
+    except OSError:
+        import _winapi
+
+        _winapi.CreateJunction(str(shared_venv), str(venv_path))
+
+    assert venv_path.is_symlink() or is_junction(venv_path)
+
+    removed = remove_worktree(repo_root, info.path)
+
+    assert removed is True
+    assert not info.path.exists()
+    assert shared_venv.exists()
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+
+
+def test_remove_worktree_force_fallback_rmtree_succeeds_when_git_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: when git worktree remove fails, the force fallback rmtree
+    removes the tree and reports success.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-fallback", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is True
+    assert not info.path.exists()
+
+
+def test_remove_worktree_reports_failure_when_tree_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: post-delete verification reports failure when the directory
+    is not actually removed.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-survives", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+    monkeypatch.setattr(worktree_mod, "_robust_rmtree", lambda path: None)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is False
+    assert info.path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_clean_worktrees_orphan_sweep_removes_unregistered_tree_with_reparse_point(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: orphan directories left after a failed git worktree remove are
+    detected and removed without following reparse points.
+    """
+    import _winapi
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    _git(repo_root, "add", ".gitignore")
+    _git(repo_root, "commit", "-m", "ignore venv")
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    orphan_dir = worktrees_dir / "agent-issue-462-orphan"
+    orphan_dir.mkdir(parents=True)
+    (orphan_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
+    _winapi.CreateJunction(str(shared_venv), str(orphan_dir / ".venv"))
+
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=462, pr_number=462)
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert result.ok is True
+    assert not orphan_dir.exists()
+    assert shared_venv.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+    assert any(str(orphan_dir) == r["worktree"] for r in result.data["orphans"]["removed"])
