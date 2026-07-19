@@ -99,62 +99,123 @@ def _webhook_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
         return NotifyResult(ok=False, error=f"webhook unexpected error: {e}")
 
 
+_DESKTOP_SEVERITIES = frozenset({"STALLED", "RUNAWAY", "DEAD", "ERROR"})
+_MAX_DESKTOP_REASON_LENGTH = 80
+
+
+def _truncate_desktop_reason(text: str | None) -> str | None:
+    if not text:
+        return text
+    if len(text) <= _MAX_DESKTOP_REASON_LENGTH:
+        return text
+    return text[: _MAX_DESKTOP_REASON_LENGTH - 3] + "..."
+
+
+def _desktop_context_line(entry: AttentionEntry) -> str:
+    if entry.issue_number > 0:
+        return f"Issue #{entry.issue_number}"
+    return entry.adapter_kind or "fleet"
+
+
+def _desktop_message(digest: AttentionDigest) -> tuple[str, str] | None:
+    """Build the title and message for a desktop toast.
+
+    Filters out benign flow-control transitions (e.g. SKIPPED) and uses repo
+    context for pass-level entries that have no real issue number.
+    """
+    filtered = tuple(e for e in digest.transitions if e.health in _DESKTOP_SEVERITIES)
+    if not filtered:
+        return None
+
+    if len(filtered) == 1:
+        entry = filtered[0]
+        context = _desktop_context_line(entry)
+        message = f"{context}: {entry.health}"
+        if entry.previous_health is not None:
+            message += f" (was {entry.previous_health})"
+
+        reason_parts: list[str] = []
+        if entry.terminal_reason:
+            reason_parts.append(entry.terminal_reason)
+        last_line = _truncate_desktop_reason(entry.last_log_line)
+        if last_line and last_line != entry.terminal_reason:
+            reason_parts.append(last_line)
+        if reason_parts:
+            message += " — " + " — ".join(reason_parts)
+    else:
+        contexts = [
+            str(e.issue_number) if e.issue_number > 0 else (e.adapter_kind or "fleet")
+            for e in filtered
+        ]
+        message = f"{len(filtered)} issues need attention: {', '.join(contexts)}"
+
+    return f"charlie-work: {digest.repo}", message
+
+
+def _ps_single_quote(value: str) -> str:
+    """Escape a value for insertion into a PowerShell single-quoted string."""
+    value = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return value.replace("'", "''")
+
+
 def _desktop_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
     """OS-native toast notification.
 
-    Windows: powershell -Command with Windows.UI.Notifications or msg.exe fallback.
+    Severity-gates to genuine attention transitions (STALLED / RUNAWAY / DEAD / ERROR).
+    Benign flow-control events (e.g. SKIPPED) are silently dropped so they do not
+    spam the operator; they are still written to file/webhook sinks by emit_digest.
+
+    Windows: PowerShell with WinRT Windows.UI.Notifications projection, falling back to msg.exe.
     POSIX: notify-send if present, else ok=False.
     Never raises; all failures return NotifyResult(ok=False, error=...).
     """
-    # Build a human-readable message
-    transition_count = len(digest.transitions)
-    if transition_count == 1:
-        entry = digest.transitions[0]
-        message = f"Issue #{entry.issue_number}: {entry.health} (was {entry.previous_health or 'unknown'})"
-        if entry.terminal_reason:
-            message += f" — {entry.terminal_reason}"
-    else:
-        message = f"{transition_count} issues need attention: {', '.join(str(e.issue_number) for e in digest.transitions)}"
-
-    title = f"charlie-work: {digest.repo}"
+    rendered = _desktop_message(digest)
+    if rendered is None:
+        return NotifyResult(ok=True, error="no desktop-severity transitions")
+    title, message = rendered
 
     if os.name == "nt":
         # Windows: try PowerShell toast first, fall back to msg.exe
         try:
-            # Try Windows.UI.Notifications toast (Windows 8+)
             ps_command = f"""
-            Add-Type -AssemblyName Windows.UI.Notifications;
-            $template = [Windows.UI.Notifications.ToastTemplateManager]::GetTemplateContent('ToastText02');
-            $textNodes = $template.GetElementsByTagName('text');
-            $textNodes[0].InnerText = '{title}';
-            $textNodes[1].InnerText = '{message}';
-            $toast = [Windows.UI.Notifications.ToastNotification]::new($template);
-            $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('charlie-work');
-            $notifier.Show($toast);
-            """
+$ErrorActionPreference = 'Stop'
+[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+[void][Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
+[void][Windows.UI.Notifications.ToastTemplateType, Windows.UI.Notifications, ContentType=WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]
+
+$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$textNodes = $template.GetElementsByTagName('text')
+$textNodes.Item(0).InnerText = '{_ps_single_quote(title)}'
+$textNodes.Item(1).InnerText = '{_ps_single_quote(message)}'
+$toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('charlie-work')
+$notifier.Show($toast)
+"""
             result = subprocess.run(
                 ["powershell", "-Command", ps_command],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
                 **no_console_window_kwargs(),
             )
             if result.returncode == 0:
                 return NotifyResult(ok=True)
         except (subprocess.SubprocessError, TimeoutError, OSError):
-            # Fall back to msg.exe
-            try:
-                result = subprocess.run(
-                    ["msg", "*", title + " - " + message],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    **no_console_window_kwargs(),
-                )
-                # msg.exe returns 0 on success even if no active session, treat as ok
-                return NotifyResult(ok=True)
-            except (subprocess.SubprocessError, TimeoutError, OSError) as e:
-                return NotifyResult(ok=False, error=f"msg.exe failed: {e}")
+            pass
+
+        try:
+            result = subprocess.run(
+                ["msg", "*", title + " - " + message],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                **no_console_window_kwargs(),
+            )
+            # msg.exe returns 0 on success even if no active session, treat as ok
+            return NotifyResult(ok=True)
+        except (subprocess.SubprocessError, TimeoutError, OSError) as e:
+            return NotifyResult(ok=False, error=f"msg.exe failed: {e}")
     else:
         # POSIX: try notify-send
         try:

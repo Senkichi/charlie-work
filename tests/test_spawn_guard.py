@@ -1,5 +1,6 @@
 """AST-based guard that every subprocess/os spawn site routes through
-``no_console_window_kwargs()`` (issue #399).
+``no_console_window_kwargs()`` (leaf spawns) or ``hidden_console_kwargs()``
+(worker spawns) (issues #399, #459).
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import charlie_work
 
-HELPER_NAME = "no_console_window_kwargs"
+HELPER_NAMES = {"no_console_window_kwargs", "hidden_console_kwargs"}
 ALLOWLIST_RE = re.compile(r"#\s*spawn-guard:\s*allow")
 
 SPAWN_ATTRS: dict[str, set[str]] = {
@@ -43,12 +44,12 @@ def _dotted_name(node: ast.expr) -> str | None:
 def _collect_aliases(
     tree: ast.AST,
 ) -> tuple[dict[str, str], dict[str, tuple[str, str]], set[str], set[str]]:
-    """Collect import aliases for subprocess/os modules/functions and the helper.
+    """Collect import aliases for subprocess/os modules/functions and the helpers.
 
     Returns:
         module_aliases: name -> module (e.g. "subprocess" -> "subprocess", "sp" -> "subprocess")
         func_aliases: name -> (module, attr) for from-imports
-        helper_names: names bound to ``no_console_window_kwargs``
+        helper_names: names bound to ``no_console_window_kwargs`` or ``hidden_console_kwargs``
         helper_modules: names bound to a module whose last component is ``subprocess_runner``
     """
     module_aliases: dict[str, str] = {}
@@ -71,15 +72,15 @@ def _collect_aliases(
                 bound = alias.asname if alias.asname else alias.name
                 if module in ("subprocess", "os") and _is_target_attr(module, alias.name):
                     func_aliases[bound] = (module, alias.name)
-                if module.endswith("subprocess_runner") and alias.name == HELPER_NAME:
+                if module.endswith("subprocess_runner") and alias.name in HELPER_NAMES:
                     helper_names.add(bound)
                 if module == "charlie_work" and alias.name == "subprocess_runner":
                     module_aliases[bound] = "charlie_work.subprocess_runner"
                     helper_modules.add(bound)
         elif (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == HELPER_NAME
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in HELPER_NAMES
         ):
-            helper_names.add(HELPER_NAME)
+            helper_names.add(node.name)
 
     return module_aliases, func_aliases, helper_names, helper_modules
 
@@ -108,10 +109,10 @@ def _is_helper_reference(
     helper_modules: set[str],
     module_aliases: dict[str, str],
 ) -> bool:
-    """Return True if ``node`` is a reference to ``no_console_window_kwargs``."""
+    """Return True if ``node`` is a reference to an allowed spawn helper."""
     if isinstance(node, ast.Name):
         return node.id in helper_names
-    if isinstance(node, ast.Attribute) and node.attr == HELPER_NAME:
+    if isinstance(node, ast.Attribute) and node.attr in HELPER_NAMES:
         full = _dotted_name(node.value)
         if full is not None:
             # Already a dotted module name; check if it points to the helper module.
@@ -220,7 +221,7 @@ def _dict_var_routes_through_helper(
     return False
 
 
-def _call_has_no_console_window_kwargs(
+def _call_has_spawn_kwargs(
     call: ast.Call,
     scope: ast.AST,
     parents: dict[ast.AST, ast.AST],
@@ -228,7 +229,7 @@ def _call_has_no_console_window_kwargs(
     helper_modules: set[str],
     module_aliases: dict[str, str],
 ) -> bool:
-    """Return True if the spawn call is routed through ``no_console_window_kwargs``."""
+    """Return True if the spawn call is routed through an allowed helper."""
     # Direct helper reference anywhere in the call (e.g. **no_console_window_kwargs(...)).
     if _contains_helper(call, helper_names, helper_modules, module_aliases):
         return True
@@ -291,14 +292,14 @@ def find_spawn_guard_violations(root: Path) -> list[str]:
                     continue
 
             scope = _enclosing_scope(node, parents)
-            if _call_has_no_console_window_kwargs(
+            if _call_has_spawn_kwargs(
                 node, scope, parents, helper_names, helper_modules, module_aliases
             ):
                 continue
 
             violations.append(
                 f"{path}:{line_no}: {module}.{attr}() call must route "
-                f"creationflags/startupinfo through {HELPER_NAME}(), or add "
+                f"creationflags/startupinfo through one of {sorted(HELPER_NAMES)}, or add "
                 f"'# spawn-guard: allow' to the call line"
             )
 

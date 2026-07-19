@@ -2156,28 +2156,34 @@ def test_launch_claude_worker_includes_start_new_session_on_posix(
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    # Detachment is enforced by no_console_window_kwargs + CREATE_NEW_PROCESS_GROUP
-    # directly; Policy A survival flags (DETACHED_PROCESS, CREATE_BREAKAWAY_FROM_JOB)
+    # Worker spawns use hidden_console_kwargs: CREATE_NEW_CONSOLE plus a
+    # STARTUPINFO with wShowWindow=SW_HIDE so descendants inherit a hidden
+    # console. Policy A survival flags (DETACHED_PROCESS, CREATE_BREAKAWAY_FROM_JOB)
     # are out of scope for issue #360.
     if os.name != "nt":
         assert popen_kwargs.get("start_new_session") is True
         assert "creationflags" not in popen_kwargs
+        assert "startupinfo" not in popen_kwargs
     else:
         assert popen_kwargs.get("start_new_session") is False
         flags = popen_kwargs.get("creationflags", 0)
         assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
-        assert flags & subprocess.CREATE_NO_WINDOW
+        assert flags & subprocess.CREATE_NEW_CONSOLE
+        assert not (flags & subprocess.CREATE_NO_WINDOW)
         assert not (flags & subprocess.DETACHED_PROCESS)
         assert not (flags & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        startupinfo = popen_kwargs.get("startupinfo")
+        assert startupinfo is not None
+        assert startupinfo.wShowWindow == subprocess.SW_HIDE
+        assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
 
 
-def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwargs(
+def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """launch_claude_worker must obtain its Popen creationflags via
-    ``no_console_window_kwargs`` (issue #393) rather than hard-coding
-    ``CREATE_NEW_PROCESS_GROUP`` -- the single point of enforcement for
-    suppressing spurious console-window flashes on Windows.
+    """launch_claude_worker must obtain its Popen kwargs via
+    ``hidden_console_kwargs`` (issue #459) so worker descendants inherit a
+    hidden console instead of each allocating their own visible window.
 
     Note: patching ``subprocess.Popen`` globally also intercepts the
     internal ``Popen`` calls that ``subprocess.run`` makes under the hood
@@ -2185,7 +2191,7 @@ def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwa
     kwargs *per call* and assert on the first one -- the actual worker
     launch -- rather than a merged/overwritten dict.
     """
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -2193,23 +2199,28 @@ def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwa
     _install_fake_create_worktree(monkeypatch, tmp_path)
 
     popen_calls: list[dict] = []
-    original_popen = subprocess.Popen
 
     def capture_popen(*args, **kwargs):
         popen_calls.append(kwargs)
-        return original_popen([sys.executable, "-c", "pass"], **kwargs)
+        return MagicMock(pid=12345)
 
-    sentinel_kwargs = {"creationflags": 0xDEADBEEF}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    sentinel_kwargs = {
+        "creationflags": subprocess.CREATE_NEW_CONSOLE,
+        "startupinfo": startupinfo,
+    }
     with (
         patch("subprocess.Popen", side_effect=capture_popen),
         patch(
-            "charlie_work.process_utils.no_console_window_kwargs",
+            "charlie_work.process_utils.hidden_console_kwargs",
             return_value=sentinel_kwargs,
         ) as mock_helper,
     ):
         launch_claude_worker(
             998,
-            "agent/issue-998-no-window",
+            "agent/issue-998-hidden-console",
             "prompt",
             repo_root=repo_root,
             sessions_dir=sessions_dir,
@@ -2219,7 +2230,8 @@ def test_launch_claude_worker_routes_creationflags_through_no_console_window_kwa
     expected_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     mock_helper.assert_called_once_with(expected_group_flag)
     assert popen_calls, "expected at least one Popen call from the worker launch"
-    assert popen_calls[0].get("creationflags") == 0xDEADBEEF
+    assert popen_calls[0].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
+    assert popen_calls[0].get("startupinfo") is startupinfo
 
 
 # ---------------------------------------------------------------------------

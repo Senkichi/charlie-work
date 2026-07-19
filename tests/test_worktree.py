@@ -38,6 +38,7 @@ from charlie_work.worktree import (
     _is_git_tracked,
     _materialize_directory,
     _slugify,
+    _unlink_reparse_point,
 )
 
 
@@ -536,6 +537,231 @@ def test_rework_fetch_failure_raises_when_origin_exists(tmp_path: Path) -> None:
     # Rework attach path should raise on fetch failure
     with pytest.raises(RuntimeError, match="Fetch failed for rework branch"):
         create_worktree(repo_root, branch_name, rework=True)
+
+
+def test_rework_reuse_resets_on_non_ff_identical_patch_id(tmp_path: Path) -> None:
+    """Rework reuse path must reset an existing worktree when local branch diverged
+    non-FF from origin but the patch-id is identical (e.g. rebase-only rewrite)."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-identical"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance main on remote and rebase feature with the same content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info2 = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info2.path / "feature.txt").read_text(encoding="utf-8") == "feature content\n"
+    assert (info2.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info2.reclaimed == "reset-origin:identical-patch-id"
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_reuse_resets_on_non_ff_different_patch_id(tmp_path: Path) -> None:
+    """Rework reuse path must reset to origin and report a different patch-id
+    when the local-only commits genuinely diverge from the rebased origin tip."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-different"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("local version\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Remote rebases and changes the feature commit content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info2 = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info2.path / "feature.txt").read_text(encoding="utf-8") == "remote version\n"
+    assert (info2.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info2.reclaimed == "reset-origin:different-patch-id"
+    assert info2.attempt_snapshot is not None
+    assert info2.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None:
+    """Rework reuse path must refuse to reset an existing worktree that has
+    uncommitted modifications and is non-FF diverged from origin."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-reuse-dirty"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    (info1.path / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(info1.path, "add", "feature.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Leave an uncommitted edit in the existing worktree.
+    (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
+
+    # Diverge origin so the reuse path cannot fast-forward.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    _git(remote_repo, "checkout", "main")
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(
+            repo_root,
+            branch_name,
+            rework=True,
+            base_ref="",
+            issue_number=451,
+        )
+
+    # The dirty file must survive untouched.
+    assert info1.path.exists()
+    assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted worker edit\n"
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_attach_resets_on_non_ff_identical_patch_id(tmp_path: Path) -> None:
+    """Rework attach path must reset a non-FF diverged local branch ref to the
+    origin tip when the patch-id is identical."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-attach-identical"
+    _git(repo_root, "checkout", "-b", branch_name)
+    (repo_root / "feature.txt").write_text("feature content\n", encoding="utf-8")
+    _git(repo_root, "add", "feature.txt")
+    _git(repo_root, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+    _git(repo_root, "checkout", "main")
+
+    # Advance main on remote and rebase feature with the same content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info.branch == branch_name
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info.path / "feature.txt").read_text(encoding="utf-8") == "feature content\n"
+    assert (info.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info.reclaimed == "reset-origin:identical-patch-id"
+    assert info.attempt_snapshot is not None
+    assert info.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info.path)
+
+
+def test_rework_attach_resets_on_non_ff_different_patch_id(tmp_path: Path) -> None:
+    """Rework attach path must reset a non-FF diverged local branch ref to the
+    origin tip and report a different patch-id."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-451-attach-different"
+    _git(repo_root, "checkout", "-b", branch_name)
+    (repo_root / "feature.txt").write_text("local version\n", encoding="utf-8")
+    _git(repo_root, "add", "feature.txt")
+    _git(repo_root, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+    _git(repo_root, "checkout", "main")
+
+    # Remote rebases and changes the feature commit content.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "base.txt").write_text("base v2\n", encoding="utf-8")
+    _git(remote_repo, "add", "base.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+    _git(remote_repo, "rebase", "main")
+    (remote_repo / "feature.txt").write_text("remote version\n", encoding="utf-8")
+    _git(remote_repo, "add", "feature.txt")
+    _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    info = create_worktree(
+        repo_root,
+        branch_name,
+        rework=True,
+        base_ref="",
+        issue_number=451,
+    )
+
+    assert info.branch == branch_name
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert (info.path / "feature.txt").read_text(encoding="utf-8") == "remote version\n"
+    assert (info.path / "base.txt").read_text(encoding="utf-8") == "base v2\n"
+    assert info.reclaimed == "reset-origin:different-patch-id"
+    assert info.attempt_snapshot is not None
+    assert info.attempt_snapshot.ref_name is not None
+
+    remove_worktree(repo_root, info.path)
 
 
 def test_remove_worktree_deletes_branch_when_provided(tmp_path: Path) -> None:
@@ -4006,3 +4232,182 @@ def test_remove_review_checkout_idempotent(tmp_path: Path) -> None:
     # Never dispatched at all: also True, never raises.
     removed_never_created = remove_review_checkout(repo_root, 12345, reviews_dir=reviews_dir)
     assert removed_never_created is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_remove_worktree_directory_symlink_preserves_shared_venv_target(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: directory symlinks (and junctions) at .venv must be unlinked,
+    never followed into the shared venv target.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    info = create_worktree(repo_root, "agent/issue-462-symlink", base_ref="HEAD")
+    venv_path = info.path / ".venv"
+    if venv_path.exists() or is_junction(venv_path):
+        _unlink_reparse_point(venv_path)
+
+    # Prefer a real directory symlink; fall back to a junction when the
+    # process lacks the symlink privilege on this Windows machine.
+    try:
+        os.symlink(shared_venv, venv_path, target_is_directory=True)
+    except OSError:
+        import _winapi
+
+        _winapi.CreateJunction(str(shared_venv), str(venv_path))
+
+    assert venv_path.is_symlink() or is_junction(venv_path)
+
+    removed = remove_worktree(repo_root, info.path)
+
+    assert removed is True
+    assert not info.path.exists()
+    assert shared_venv.exists()
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+
+
+def test_remove_worktree_force_fallback_rmtree_succeeds_when_git_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: when git worktree remove fails, the force fallback rmtree
+    removes the tree and reports success.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-fallback", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is True
+    assert not info.path.exists()
+
+
+def test_remove_worktree_reports_failure_when_tree_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: post-delete verification reports failure when the directory
+    is not actually removed.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-survives", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+    monkeypatch.setattr(worktree_mod, "_robust_rmtree", lambda path: None)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is False
+    assert info.path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_clean_worktrees_orphan_sweep_removes_unregistered_tree_with_reparse_point(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: orphan directories left after a failed git worktree remove are
+    detected and removed without following reparse points.
+    """
+    import _winapi
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    _git(repo_root, "add", ".gitignore")
+    _git(repo_root, "commit", "-m", "ignore venv")
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    orphan_dir = worktrees_dir / "agent-issue-462-orphan"
+    orphan_dir.mkdir(parents=True)
+    (orphan_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
+    _winapi.CreateJunction(str(shared_venv), str(orphan_dir / ".venv"))
+
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=462, pr_number=462)
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert result.ok is True
+    assert not orphan_dir.exists()
+    assert shared_venv.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+    assert any(str(orphan_dir) == r["worktree"] for r in result.data["orphans"]["removed"])
+
+
+def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A git worktree list failure must not be read as zero registered worktrees.
+
+    The orphan sweep must be skipped and surfaced as an attention event so a
+    transient git hiccup cannot silently destroy live worker state.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    info = create_worktree(repo_root, "agent/issue-1-live", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=1, pr_number=101)
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:4] == ["git", "worktree", "list", "--porcelain"]:
+            return RunResult(
+                returncode=1,
+                stdout="",
+                stderr="simulated git failure",
+                error="simulated git failure",
+            )
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert info.path.exists()
+    assert not result.data["orphans"]["removed"]
+    assert not result.data["orphans"]["failed"]
+    assert any(e["type"] == "worktree_list_failed" for e in result.data["attention_events"])
+    assert result.ok is False
