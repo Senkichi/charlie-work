@@ -6,13 +6,18 @@ import os
 import re
 import signal
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import CLI_NAME
-from .adapters import AdapterSettings, SessionRequest, dispatch_sessions
+from .adapters import (
+    AdapterSettings,
+    SessionDispatchResult,
+    SessionRequest,
+    dispatch_sessions,
+)
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
 from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
@@ -102,6 +107,54 @@ def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
     }
     data.update(extra)
     return CommandResult(True, message, data)
+
+
+def _truncate_reason(reason: str, max_len: int = 200) -> str:
+    if len(reason) <= max_len:
+        return reason
+    return reason[: max_len - 3] + "..."
+
+
+def _dispatch_failure_reason(result: SessionDispatchResult) -> str:
+    if result.error:
+        return result.error
+    if result.failure_kind:
+        return f"dispatch failed: {result.failure_kind}"
+    return "dispatch failed"
+
+
+def _label_error_reason(label_error: dict[str, Any]) -> str:
+    """Format a persisted label_error dict into a short, human-readable reason."""
+    edge = label_error.get("edge", "unknown")
+    outcome = label_error.get("outcome", "unknown")
+    add_failures = label_error.get("add_failures") or []
+    remove_failures = label_error.get("remove_failures") or []
+    add_labels = [label for _issue, label in add_failures]
+    remove_labels = [label for _issue, label in remove_failures]
+    parts = [f"label transition '{edge}' {outcome}"]
+    if add_labels:
+        parts.append(f"add failures: {add_labels}")
+    if remove_labels:
+        parts.append(f"remove failures: {remove_labels}")
+    return "; ".join(parts)
+
+
+def _build_failure_map(
+    dispatch_results: Sequence[SessionDispatchResult],
+    failed_issue_numbers: Iterable[int],
+    deferred_by_concurrency: Iterable[int],
+    limit: int,
+    extra_failures: Mapping[int, str] | None = None,
+) -> dict[int, str]:
+    failures: dict[int, str] = {}
+    for issue_number in deferred_by_concurrency:
+        failures[issue_number] = _truncate_reason(f"deferred by concurrency cap (limit: {limit})")
+    for result in dispatch_results:
+        if result.issue_number in failed_issue_numbers:
+            failures[result.issue_number] = _truncate_reason(_dispatch_failure_reason(result))
+    for issue_number, reason in (extra_failures or {}).items():
+        failures[issue_number] = _truncate_reason(reason)
+    return failures
 
 
 def _guard_state_lock(func: Any) -> Any:
@@ -2514,6 +2567,13 @@ class _BaseCurrentUnset:
 _BASE_CURRENT_UNSET = _BaseCurrentUnset()
 
 
+@dataclass(frozen=True)
+class _MergedPRListOutcome:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -2938,8 +2998,10 @@ class OrchestratorApp:
     def _finalize_externally_merged_issues(
         self,
         ready_issues: list[dict[str, Any]] | None = None,
-    ) -> tuple[set[int], list[dict[str, Any]]]:
-        """Finalize closed ready-labeled issues whose linked PR merged externally.
+    ) -> tuple[set[int], list[dict[str, Any]], _MergedPRListOutcome]:
+        """Finalize closed ready-labeled issues whose linked PR merged externally,
+        and strip the ready/active labels from closed ready issues that have no
+        merged PR binding them (issue #429/#433).
 
         Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
         throttle) so a pass that defers new work still drains the backlog of
@@ -2964,19 +3026,24 @@ class OrchestratorApp:
             if str(issue.get("state") or "OPEN").upper() == "CLOSED"
         ]
         if not closed_ready:
-            return set(), ready_issues
+            return set(), ready_issues, _MergedPRListOutcome()
 
         finalize_limit = self.config.dispatch.finalize_limit
         if finalize_limit <= 0:
-            return set(), ready_issues
+            return set(), ready_issues, _MergedPRListOutcome()
 
         # Try the cheap 500-window binding first; if the GraphQL-budget guard
         # refuses the call, fall back to per-issue search for all candidates.
         bound_issue_numbers: set[int] = set()
+        mention_only_issue_numbers: set[int] = set()
+        merged_pr_outcome = _MergedPRListOutcome()
         try:
             merged_prs = self.gh.merged_pr_list()
-        except GitHubError:
+        except GitHubError as exc:
+            merged_pr_outcome = _MergedPRListOutcome([], exc, called=True)
             merged_prs = []
+        else:
+            merged_pr_outcome = _MergedPRListOutcome(merged_prs, called=True)
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
                 continue
@@ -2987,8 +3054,20 @@ class OrchestratorApp:
             )
             if bound is not None:
                 bound_issue_numbers.add(bound)
+            # isCrossRepository describes the PR's own head-branch provenance
+            # (fork vs. same-repo). It cannot fully guard a cross-repo mention
+            # collision, but it does guard the common case of a fork PR's text
+            # being trusted at all.
+            if pr.get("isCrossRepository") is False:
+                for mentioned in issue_numbers_mentioned_by_pr(pr):
+                    mention_only_issue_numbers.add(mentioned)
 
-        # Only the unbound candidates need an expensive per-issue search.
+        # Mention-only references are advisory; they are not a binding, but
+        # they also must not be stripped as "unmerged" — dispatch() will flag
+        # them for a human decision.
+        mention_only_issue_numbers -= bound_issue_numbers
+
+        # Only unbound closed issues are candidates for per-issue search or strip.
         unbound_issues = [
             issue for issue in closed_ready if int(issue["number"]) not in bound_issue_numbers
         ]
@@ -3001,6 +3080,7 @@ class OrchestratorApp:
         candidates = sorted(unbound_issues, key=_finalization_order)[:finalize_limit]
 
         issue_pr_map: dict[int, list[dict[str, Any]]] = {}
+        closed_unmerged_ready_issues: set[int] = set()
         consecutive_failures = 0
         for issue in candidates:
             if consecutive_failures >= 3:
@@ -3016,51 +3096,71 @@ class OrchestratorApp:
             consecutive_failures = 0
             if merged_prs:
                 issue_pr_map[issue_number] = list(merged_prs)
-
-        if not issue_pr_map:
-            return set(), ready_issues
+            elif issue_number not in mention_only_issue_numbers:
+                # Confirmed closed ready issue with no merged PR binding it.
+                closed_unmerged_ready_issues.add(issue_number)
 
         # Persist state first, then apply labels outside the lock.
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            for issue_number, prs in issue_pr_map.items():
-                issue_key = str(issue_number)
-                issue_entry = state["issues"].get(issue_key, {})
-                state["issues"][issue_key] = {
-                    **issue_entry,
-                    "number": issue_number,
-                    "status": "closed",
-                }
-                for pr in prs:
-                    pr_number = int(pr["number"])
-                    pr_key = str(pr_number)
-                    pr_entry = state["prs"].get(pr_key, {})
-                    state["prs"][pr_key] = {
-                        **pr_entry,
-                        "number": pr_number,
-                        "status": "merged",
-                        "merged": True,
-                        "issue_number": issue_number,
+        if issue_pr_map or closed_unmerged_ready_issues:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number, prs in issue_pr_map.items():
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
                     }
-            state = append_event(
-                state,
-                "finalize_externally_merged",
-                {
-                    "issue_numbers": sorted(issue_pr_map.keys()),
-                    "pr_numbers": sorted(
-                        {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
-                    ),
-                },
-            )
-            save_state(self.paths.state_file, state)
+                    for pr in prs:
+                        pr_number = int(pr["number"])
+                        pr_key = str(pr_number)
+                        pr_entry = state["prs"].get(pr_key, {})
+                        state["prs"][pr_key] = {
+                            **pr_entry,
+                            "number": pr_number,
+                            "status": "merged",
+                            "merged": True,
+                            "issue_number": issue_number,
+                        }
+                if issue_pr_map:
+                    state = append_event(
+                        state,
+                        "finalize_externally_merged",
+                        {
+                            "issue_numbers": sorted(issue_pr_map.keys()),
+                            "pr_numbers": sorted(
+                                {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
+                            ),
+                        },
+                    )
+                for issue_number in closed_unmerged_ready_issues:
+                    issue_key = str(issue_number)
+                    issue_entry = state["issues"].get(issue_key, {})
+                    state["issues"][issue_key] = {
+                        **issue_entry,
+                        "number": issue_number,
+                        "status": "closed",
+                    }
+                if closed_unmerged_ready_issues:
+                    state = append_event(
+                        state,
+                        "dispatch_closed_unmerged_ready_stripped",
+                        {"issue_numbers": sorted(closed_unmerged_ready_issues)},
+                    )
+                save_state(self.paths.state_file, state)
 
         for issue_number in issue_pr_map:
             transition(self.gh, self.config.labels, issue_number, "merged")
             self.gh.close_issue(issue_number)
 
+        for issue_number in closed_unmerged_ready_issues:
+            transition(self.gh, self.config.labels, issue_number, "closed_unmerged")
+
         finalized: set[int] = set(issue_pr_map.keys())
-        remaining = [issue for issue in ready_issues if int(issue["number"]) not in finalized]
-        return finalized, remaining
+        removed = finalized | closed_unmerged_ready_issues
+        remaining = [issue for issue in ready_issues if int(issue["number"]) not in removed]
+        return finalized, remaining, merged_pr_outcome
 
     def dispatch(
         self,
@@ -3085,8 +3185,9 @@ class OrchestratorApp:
         # This runs before fleet lock / GraphQL budget / provider throttle guards
         # so a pass that defers new dispatch still drains the Aviator-merge backlog.
         finalized: set[int] = set()
+        merged_pr_outcome: _MergedPRListOutcome = _MergedPRListOutcome()
         try:
-            finalized, ready_issues = self._finalize_externally_merged_issues()
+            finalized, ready_issues, merged_pr_outcome = self._finalize_externally_merged_issues()
         except StateLockBusy:
             return _state_lock_busy_result(
                 "dispatch deferred: state lock held",
@@ -3114,6 +3215,7 @@ class OrchestratorApp:
                 only_issues=only_issues,
                 stalled_entries=stalled_entries,
                 ready_issues=ready_issues,
+                merged_prs=merged_pr_outcome,
             )
             data = dict(result.data)
             if finalized:
@@ -3157,6 +3259,7 @@ class OrchestratorApp:
         only_issues: str | None = None,
         stalled_entries: list[dict[str, int]] | None = None,
         ready_issues: list[dict[str, Any]] | None = None,
+        merged_prs: _MergedPRListOutcome | None = None,
     ) -> CommandResult:
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
@@ -3219,6 +3322,15 @@ class OrchestratorApp:
                     data,
                 )
 
+        def _resolve_merged_prs(
+            outcome: _MergedPRListOutcome | None,
+        ) -> list[dict[str, Any]]:
+            if outcome is None or not outcome.called:
+                return self.gh.merged_pr_list() if issues else []
+            if outcome.error is not None and issues:
+                raise outcome.error
+            return outcome.items if issues else []
+
         # Dry-run: read-only planning — compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
@@ -3234,7 +3346,7 @@ class OrchestratorApp:
             # (it intersects against the ready-issue-number set) — skip the
             # expensive listing query entirely rather than fetch-and-discard
             # (issue #361).
-            merged_prs = self.gh.merged_pr_list() if issues else []
+            merged_prs = _resolve_merged_prs(merged_prs)
             (
                 merged_pr_bound_issue_numbers,
                 merged_pr_mention_only_issue_numbers,
@@ -3390,7 +3502,7 @@ class OrchestratorApp:
         # return empty sets regardless of what merged_pr_list() returns (it
         # intersects against the ready-issue-number set) — skip the expensive
         # listing query entirely rather than fetch-and-discard (issue #361).
-        merged_prs = self.gh.merged_pr_list() if issues else []
+        merged_prs = _resolve_merged_prs(merged_prs)
         (
             merged_pr_bound_issue_numbers,
             merged_pr_mention_only_issue_numbers,
@@ -3461,6 +3573,10 @@ class OrchestratorApp:
         # redispatch it. Issue #432: capped to finalize_limit per pass.
         for issue_number in finalizable_mention_issue_numbers:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
+
+        # Issue #429/#433: closed-unmerged stripping is handled by
+        # _finalize_externally_merged_issues, which already performs the
+        # capped per-issue merged-PR lookup and removes stale ready/active labels.
 
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -3686,6 +3802,7 @@ class OrchestratorApp:
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         manual = self.config.devin.adapter == "manual"
         label_errors: list[int] = []
+        label_error_failures: dict[int, str] = {}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             for request in session_requests:
@@ -3744,13 +3861,17 @@ class OrchestratorApp:
                         target,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
-                        entry["label_error"] = {
+                        label_error = {
                             "edge": target,
                             "outcome": result.outcome.value,
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
                         }
+                        entry["label_error"] = label_error
                         label_errors.append(request.issue_number)
+                        label_error_failures[request.issue_number] = _label_error_reason(
+                            label_error
+                        )
                         save_state(self.paths.state_file, state)
                     if is_live_worker:
                         result = next(
@@ -3795,6 +3916,13 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+            dispatch_failure_map = _build_failure_map(
+                dispatch_results,
+                failed_issue_numbers,
+                deferred_by_concurrency,
+                dispatch_limit,
+                extra_failures=label_error_failures,
+            )
             state = append_event(
                 state,
                 "dispatch",
@@ -3809,13 +3937,18 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
                     "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+                    "failures": dispatch_failure_map,
                 },
             )
             save_state(self.paths.state_file, state)
         result_dicts = [result.to_dict() for result in dispatch_results]
         message = "dispatch complete"
         if failed_issue_numbers:
-            message = "dispatch completed with failures"
+            entries = ", ".join(
+                f"#{issue} ({dispatch_failure_map[issue]})"
+                for issue in sorted(failed_issue_numbers)
+            )
+            message = f"dispatch failures: {entries}"
         elif live_worker_issue_numbers:
             message = "dispatch completed with live worker redispatch averted"
         if skipped_issue_numbers:
@@ -3826,6 +3959,7 @@ class OrchestratorApp:
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "failures": dispatch_failure_map,
             "live_worker_count": len(live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
@@ -6778,9 +6912,9 @@ class OrchestratorApp:
         elif not intake.ok:
             message = "loop completed with intake failures"
         elif not dispatch.ok:
-            message = "loop completed with dispatch failures"
+            message = dispatch.message
         elif not dispatch_rework.ok:
-            message = "loop completed with rework dispatch failures"
+            message = dispatch_rework.message
         elif not dispatch_reviews.ok:
             message = "loop completed with review dispatch failures"
         data = {
@@ -7073,6 +7207,7 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -7131,6 +7266,7 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -7148,6 +7284,7 @@ class OrchestratorApp:
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
         skipped_issue_numbers: list[int] = []
+        missing_prompt_failures: dict[int, str] = {}
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -7161,6 +7298,9 @@ class OrchestratorApp:
                 # Skip if rework prompt doesn't exist — record as rework_requested
                 # to release the claim and allow retry (issue #116)
                 skipped_issue_numbers.append(issue_number)
+                missing_prompt_failures[issue_number] = (
+                    f"missing rework prompt: {rework_prompt_path}"
+                )
                 continue
             session_requests.append(
                 SessionRequest(
@@ -7174,6 +7314,13 @@ class OrchestratorApp:
 
         if not session_requests:
             # Release the dispatch_pending claims for all skipped issues
+            no_session_failure_map = _build_failure_map(
+                [],
+                set(),
+                deferred_by_concurrency,
+                rework_limit,
+                extra_failures=missing_prompt_failures,
+            )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 for issue_number in skipped_issue_numbers:
@@ -7200,12 +7347,14 @@ class OrchestratorApp:
                         "deferred_by_concurrency": deferred_by_concurrency,
                         "label_errors": [],
                         "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                        "failures": no_session_failure_map,
                     },
                 )
                 save_state(self.paths.state_file, state)
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
+                "failures": no_session_failure_map,
                 "deferred_by_concurrency": deferred_by_concurrency,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
@@ -7239,6 +7388,7 @@ class OrchestratorApp:
 
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         label_errors: list[int] = []
+        label_error_failures: dict[int, str] = {}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Record skipped issues (missing rework prompt) as rework_requested
@@ -7314,13 +7464,17 @@ class OrchestratorApp:
                             "redispatch_escalated",
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
-                            entry["label_error"] = {
+                            label_error = {
                                 "edge": "redispatch_escalated",
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
                             }
+                            entry["label_error"] = label_error
                             label_errors.append(request.issue_number)
+                            label_error_failures[request.issue_number] = _label_error_reason(
+                                label_error
+                            )
                             save_state(self.paths.state_file, state)
                         continue
                     else:
@@ -7334,17 +7488,28 @@ class OrchestratorApp:
                             "rework_dispatched",
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
-                            entry["label_error"] = {
+                            label_error = {
                                 "edge": "rework_dispatched",
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
                             }
+                            entry["label_error"] = label_error
                             label_errors.append(request.issue_number)
+                            label_error_failures[request.issue_number] = _label_error_reason(
+                                label_error
+                            )
                             save_state(self.paths.state_file, state)
                 else:
                     state["issues"][str(request.issue_number)] = entry
                     save_state(self.paths.state_file, state)
+            rework_failure_map = _build_failure_map(
+                dispatch_results,
+                failed_issue_numbers,
+                deferred_by_concurrency,
+                rework_limit,
+                extra_failures={**missing_prompt_failures, **label_error_failures},
+            )
             state = append_event(
                 state,
                 "dispatch_rework",
@@ -7355,6 +7520,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "label_errors": sorted(label_errors),
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                    "failures": rework_failure_map,
                 },
             )
             save_state(self.paths.state_file, state)
@@ -7362,13 +7528,17 @@ class OrchestratorApp:
         result_dicts = [result.to_dict() for result in dispatch_results]
         message = "rework dispatch complete"
         if failed_issue_numbers:
-            message = "rework dispatch completed with failures"
+            entries = ", ".join(
+                f"#{issue} ({rework_failure_map[issue]})" for issue in sorted(failed_issue_numbers)
+            )
+            message = f"rework dispatch failures: {entries}"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
+            "failures": rework_failure_map,
             "deferred_by_concurrency": deferred_by_concurrency,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
