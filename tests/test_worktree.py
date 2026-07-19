@@ -4368,3 +4368,46 @@ def test_clean_worktrees_orphan_sweep_removes_unregistered_tree_with_reparse_poi
     assert shared_venv.exists()
     assert marker.read_text(encoding="utf-8") == "shared contents\n"
     assert any(str(orphan_dir) == r["worktree"] for r in result.data["orphans"]["removed"])
+
+
+def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A git worktree list failure must not be read as zero registered worktrees.
+
+    The orphan sweep must be skipped and surfaced as an attention event so a
+    transient git hiccup cannot silently destroy live worker state.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    info = create_worktree(repo_root, "agent/issue-1-live", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=1, pr_number=101)
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:4] == ["git", "worktree", "list", "--porcelain"]:
+            return RunResult(
+                returncode=1,
+                stdout="",
+                stderr="simulated git failure",
+                error="simulated git failure",
+            )
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert info.path.exists()
+    assert not result.data["orphans"]["removed"]
+    assert not result.data["orphans"]["failed"]
+    assert any(e["type"] == "worktree_list_failed" for e in result.data["attention_events"])
+    assert result.ok is False

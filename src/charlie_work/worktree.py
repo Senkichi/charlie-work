@@ -2093,12 +2093,14 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
-def list_worktrees(repo_root: Path) -> list[dict]:
+def _list_worktrees_porcelain(repo_root: Path) -> tuple[list[dict], str | None]:
     """Parse ``git worktree list --porcelain`` into one dict per worktree.
 
-    Invalid entries (missing required 'worktree' key or unknown flag keys) are
-    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
-    with a Path value. This makes all downstream consumers safe by construction.
+    Returns a tuple of (worktrees, error_message). Invalid entries (missing
+    required 'worktree' key or unknown flag keys) are dropped entirely - every
+    returned dict is guaranteed to have a 'worktree' key with a Path value.
+    Git command failures are returned as an error string instead of an empty
+    list, so callers can distinguish "no worktrees" from "could not determine".
     """
     result = run_captured(
         ["git", "worktree", "list", "--porcelain"],
@@ -2106,7 +2108,8 @@ def list_worktrees(repo_root: Path) -> list[dict]:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not result.ok:
-        return []
+        error = result.error or result.stderr or "git worktree list failed"
+        return [], error
 
     worktrees: list[dict] = []
     current: dict = {}
@@ -2145,6 +2148,20 @@ def list_worktrees(repo_root: Path) -> list[dict]:
     if current and not entry_malformed and "worktree" in current:
         worktrees.append(current)
 
+    return worktrees, None
+
+
+def list_worktrees(repo_root: Path) -> list[dict]:
+    """Parse ``git worktree list --porcelain`` into one dict per worktree.
+
+    Invalid entries (missing required 'worktree' key or unknown flag keys) are
+    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
+    with a Path value. This makes all downstream consumers safe by construction.
+
+    Git command failures return an empty list; callers that need to distinguish
+    "empty" from "unknown" should use ``_list_worktrees_porcelain``.
+    """
+    worktrees, _ = _list_worktrees_porcelain(repo_root)
     return worktrees
 
 
@@ -2354,7 +2371,8 @@ def clean_worktrees(
     orphans: dict[str, list[dict[str, Any]]] = {"planned": [], "removed": [], "failed": []}
     attention_events: list[dict[str, Any]] = []
 
-    registered_worktrees = list_worktrees(repo_root)
+    registered_worktrees, list_error = _list_worktrees_porcelain(repo_root)
+    worktree_list_failed = list_error is not None
     for wt in registered_worktrees:
         wt_path = wt.get("worktree")
         if not isinstance(wt_path, Path) or not wt_path.is_relative_to(worktrees_dir):
@@ -2543,10 +2561,20 @@ def clean_worktrees(
     # Orphan sweep: directories under worktrees_dir with no git admin record.
     # This is the residue left when ``git worktree remove`` unregisters a
     # worktree but cannot delete its tree because of a reparse point.
-    if worktrees_dir.is_dir():
+    if worktree_list_failed:
+        # A git worktree list failure must never be read as "zero worktrees".
+        # Skip the sweep and surface the failure so live worker state is not
+        # silently destroyed by a transient git hiccup.
+        attention_events.append(
+            {
+                "type": "worktree_list_failed",
+                "reason": list_error or "git worktree list failed",
+            }
+        )
+    elif worktrees_dir.is_dir():
         registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
         for child in worktrees_dir.iterdir():
-            if not child.is_dir() or child in registered_paths:
+            if not child.is_dir() or child in registered_paths or is_junction(child):
                 continue
             if dry_run:
                 orphans["planned"].append({"worktree": str(child)})
@@ -2595,7 +2623,7 @@ def clean_worktrees(
         "venv_message": venv_message,
         "attention_events": attention_events,
     }
-    ok = not failed and not orphans["failed"] and venv_ok
+    ok = not failed and not orphans["failed"] and venv_ok and not worktree_list_failed
     if dry_run:
         message = (
             f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped, "
@@ -2608,6 +2636,8 @@ def clean_worktrees(
         )
         if orphans["failed"]:
             message = f"{message}, {len(orphans['failed'])} orphan removal(s) failed"
+    if worktree_list_failed:
+        message = f"{message}; could not list worktrees: {list_error}"
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
