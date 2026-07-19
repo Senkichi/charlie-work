@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import CLI_NAME
 from .adapters import (
@@ -123,11 +123,28 @@ def _dispatch_failure_reason(result: SessionDispatchResult) -> str:
     return "dispatch failed"
 
 
+def _label_error_reason(label_error: dict[str, Any]) -> str:
+    """Format a persisted label_error dict into a short, human-readable reason."""
+    edge = label_error.get("edge", "unknown")
+    outcome = label_error.get("outcome", "unknown")
+    add_failures = label_error.get("add_failures") or []
+    remove_failures = label_error.get("remove_failures") or []
+    add_labels = [label for _issue, label in add_failures]
+    remove_labels = [label for _issue, label in remove_failures]
+    parts = [f"label transition '{edge}' {outcome}"]
+    if add_labels:
+        parts.append(f"add failures: {add_labels}")
+    if remove_labels:
+        parts.append(f"remove failures: {remove_labels}")
+    return "; ".join(parts)
+
+
 def _build_failure_map(
     dispatch_results: Sequence[SessionDispatchResult],
     failed_issue_numbers: Iterable[int],
     deferred_by_concurrency: Iterable[int],
     limit: int,
+    extra_failures: Mapping[int, str] | None = None,
 ) -> dict[int, str]:
     failures: dict[int, str] = {}
     for issue_number in deferred_by_concurrency:
@@ -135,6 +152,8 @@ def _build_failure_map(
     for result in dispatch_results:
         if result.issue_number in failed_issue_numbers:
             failures[result.issue_number] = _truncate_reason(_dispatch_failure_reason(result))
+    for issue_number, reason in (extra_failures or {}).items():
+        failures[issue_number] = _truncate_reason(reason)
     return failures
 
 
@@ -3783,6 +3802,7 @@ class OrchestratorApp:
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         manual = self.config.devin.adapter == "manual"
         label_errors: list[int] = []
+        label_error_failures: dict[int, str] = {}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             for request in session_requests:
@@ -3841,13 +3861,17 @@ class OrchestratorApp:
                         target,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
-                        entry["label_error"] = {
+                        label_error = {
                             "edge": target,
                             "outcome": result.outcome.value,
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
                         }
+                        entry["label_error"] = label_error
                         label_errors.append(request.issue_number)
+                        label_error_failures[request.issue_number] = _label_error_reason(
+                            label_error
+                        )
                         save_state(self.paths.state_file, state)
                     if is_live_worker:
                         result = next(
@@ -3897,6 +3921,7 @@ class OrchestratorApp:
                 failed_issue_numbers,
                 deferred_by_concurrency,
                 dispatch_limit,
+                extra_failures=label_error_failures,
             )
             state = append_event(
                 state,
@@ -7301,6 +7326,7 @@ class OrchestratorApp:
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
         skipped_issue_numbers: list[int] = []
+        missing_prompt_failures: dict[int, str] = {}
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -7314,6 +7340,9 @@ class OrchestratorApp:
                 # Skip if rework prompt doesn't exist — record as rework_requested
                 # to release the claim and allow retry (issue #116)
                 skipped_issue_numbers.append(issue_number)
+                missing_prompt_failures[issue_number] = (
+                    f"missing rework prompt: {rework_prompt_path}"
+                )
                 continue
             session_requests.append(
                 SessionRequest(
@@ -7328,7 +7357,11 @@ class OrchestratorApp:
         if not session_requests:
             # Release the dispatch_pending claims for all skipped issues
             no_session_failure_map = _build_failure_map(
-                [], set(), deferred_by_concurrency, rework_limit
+                [],
+                set(),
+                deferred_by_concurrency,
+                rework_limit,
+                extra_failures=missing_prompt_failures,
             )
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -7394,15 +7427,10 @@ class OrchestratorApp:
         failed_issue_numbers = {
             result.issue_number for result in dispatch_results if not result.ok
         }
-        rework_failure_map = _build_failure_map(
-            dispatch_results,
-            failed_issue_numbers,
-            deferred_by_concurrency,
-            rework_limit,
-        )
 
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
         label_errors: list[int] = []
+        label_error_failures: dict[int, str] = {}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Record skipped issues (missing rework prompt) as rework_requested
@@ -7478,13 +7506,17 @@ class OrchestratorApp:
                             "redispatch_escalated",
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
-                            entry["label_error"] = {
+                            label_error = {
                                 "edge": "redispatch_escalated",
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
                             }
+                            entry["label_error"] = label_error
                             label_errors.append(request.issue_number)
+                            label_error_failures[request.issue_number] = _label_error_reason(
+                                label_error
+                            )
                             save_state(self.paths.state_file, state)
                         continue
                     else:
@@ -7498,17 +7530,28 @@ class OrchestratorApp:
                             "rework_dispatched",
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
-                            entry["label_error"] = {
+                            label_error = {
                                 "edge": "rework_dispatched",
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
                             }
+                            entry["label_error"] = label_error
                             label_errors.append(request.issue_number)
+                            label_error_failures[request.issue_number] = _label_error_reason(
+                                label_error
+                            )
                             save_state(self.paths.state_file, state)
                 else:
                     state["issues"][str(request.issue_number)] = entry
                     save_state(self.paths.state_file, state)
+            rework_failure_map = _build_failure_map(
+                dispatch_results,
+                failed_issue_numbers,
+                deferred_by_concurrency,
+                rework_limit,
+                extra_failures={**missing_prompt_failures, **label_error_failures},
+            )
             state = append_event(
                 state,
                 "dispatch_rework",
