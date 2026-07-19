@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import hidden_console_kwargs, no_console_window_kwargs
 
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
@@ -504,10 +504,11 @@ def popen_worker(
 ) -> subprocess.Popen[Any]:
     """Launch a worker process as the single point for creationflags/process-group composition.
 
-    Injects the worker detachment policy into the ``subprocess.Popen`` call:
-    - ``creationflags`` are composed through ``no_console_window_kwargs()`` so
-      ``CREATE_NO_WINDOW`` is combined with ``CREATE_NEW_PROCESS_GROUP`` on
-      Windows; on POSIX it is a no-op.
+    Injects the worker hidden-console policy into the ``subprocess.Popen`` call:
+    - ``creationflags`` and ``startupinfo`` are composed through
+      ``hidden_console_kwargs()`` so ``CREATE_NEW_CONSOLE`` is combined with
+      ``CREATE_NEW_PROCESS_GROUP`` on Windows and the console is hidden via
+      ``STARTF_USESHOWWINDOW`` / ``SW_HIDE``. On POSIX it is a no-op.
     - ``start_new_session`` defaults to ``True`` on POSIX and is omitted on
       Windows; callers may override by passing it explicitly.
 
@@ -524,6 +525,6 @@ def popen_worker(
 
     extra_flags = popen_kwargs.pop("creationflags", 0)
     process_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    popen_kwargs.update(no_console_window_kwargs(extra_flags | process_group_flag))
+    popen_kwargs.update(hidden_console_kwargs(extra_flags | process_group_flag))
 
     return subprocess.Popen(args, **popen_kwargs)

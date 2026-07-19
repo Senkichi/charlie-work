@@ -2,15 +2,23 @@
 
 Covers ``no_console_window_kwargs`` — the single point of enforcement for
 suppressing the transient console window Windows allocates for spawned
-children (issue #393) — and confirms ``run_captured`` routes through it.
+children (issue #393) — and ``hidden_console_kwargs`` for long-lived worker
+spawns that need an inherited hidden console (issue #459). Confirms
+``run_captured`` routes through the appropriate helper.
 """
 
 from __future__ import annotations
 
 import subprocess
+
+import pytest
 from unittest.mock import patch
 
-from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
+from charlie_work.subprocess_runner import (
+    hidden_console_kwargs,
+    no_console_window_kwargs,
+    run_captured,
+)
 
 
 class TestNoConsoleWindowKwargsWindows:
@@ -66,6 +74,62 @@ class TestNoConsoleWindowKwargsPosix:
         with patch("charlie_work.subprocess_runner.sys.platform", "linux"):
             assert no_console_window_kwargs() == {}
             assert no_console_window_kwargs(0x00000200) == {}
+
+
+class TestHiddenConsoleKwargsWindows:
+    """On Windows, worker spawns get CREATE_NEW_CONSOLE plus a STARTUPINFO
+    that hides the console so descendants inherit a hidden console."""
+
+    def test_default_adds_create_new_console_and_hidden_startupinfo(self):
+        with (
+            patch("charlie_work.subprocess_runner.sys.platform", "win32"),
+            patch("charlie_work.subprocess_runner._CREATE_NEW_CONSOLE", 0x00000010),
+        ):
+            result = hidden_console_kwargs()
+        assert result["creationflags"] == 0x00000010
+        assert "startupinfo" in result
+        assert result["startupinfo"].wShowWindow == subprocess.SW_HIDE
+        assert result["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+
+    def test_preserves_requested_group_flags(self):
+        create_new_console = 0x00000010
+        create_new_process_group = 0x00000200
+        with (
+            patch("charlie_work.subprocess_runner.sys.platform", "win32"),
+            patch("charlie_work.subprocess_runner._CREATE_NEW_CONSOLE", create_new_console),
+        ):
+            result = hidden_console_kwargs(create_new_process_group)
+        assert result["creationflags"] == create_new_process_group | create_new_console
+        assert result["startupinfo"].wShowWindow == subprocess.SW_HIDE
+
+    def test_rejects_create_no_window(self):
+        create_new_console = 0x00000010
+        create_no_window = 0x08000000
+        with (
+            patch("charlie_work.subprocess_runner.sys.platform", "win32"),
+            patch("charlie_work.subprocess_runner._CREATE_NEW_CONSOLE", create_new_console),
+            patch("charlie_work.subprocess_runner._CREATE_NO_WINDOW", create_no_window),
+        ):
+            with pytest.raises(ValueError, match="mutually-exclusive"):
+                hidden_console_kwargs(create_no_window)
+
+    def test_rejects_detached_process(self):
+        create_new_console = 0x00000010
+        detached_process = 0x00000008
+        with (
+            patch("charlie_work.subprocess_runner.sys.platform", "win32"),
+            patch("charlie_work.subprocess_runner._CREATE_NEW_CONSOLE", create_new_console),
+            patch("charlie_work.subprocess_runner._DETACHED_PROCESS", detached_process),
+        ):
+            with pytest.raises(ValueError, match="mutually-exclusive"):
+                hidden_console_kwargs(detached_process)
+
+
+class TestHiddenConsoleKwargsPosix:
+    def test_returns_empty_dict_regardless_of_requested_flags(self):
+        with patch("charlie_work.subprocess_runner.sys.platform", "linux"):
+            assert hidden_console_kwargs() == {}
+            assert hidden_console_kwargs(0x00000200) == {}
 
 
 class TestRunCapturedUsesHelper:
