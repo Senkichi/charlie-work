@@ -692,7 +692,7 @@ def test_desktop_sink_all_benign_events_returns_ok_without_subprocess():
 
 
 @pytest.mark.skipif(
-    sys.platform != "win32" or os.environ.get("CI"),
+    sys.platform != "win32" or bool(os.environ.get("CI")),
     reason="Requires an interactive Windows desktop session",
 )
 def test_desktop_sink_powershell_toast_succeeds_on_windows():
