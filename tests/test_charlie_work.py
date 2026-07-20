@@ -7148,6 +7148,77 @@ def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
     assert checkout.path.exists()
 
 
+def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #494: the review-dispatch pass must reap checkouts and clear
+    review-dispatch state for PRs that GitHub already reports as MERGED
+    or CLOSED, regardless of the local claim status.
+    """
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-1-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    removed_calls: list[tuple[Path, int, Path | None]] = []
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == [100]
+    assert len(removed_calls) == 1
+    assert removed_calls[0][0] == repo_root
+    assert removed_calls[0][1] == 100
+    assert removed_calls[0][2] == reviews_dir
+
+    new_state = load_state(state_file)
+    assert new_state["prs"]["100"]["review_dispatch_status"] is None
+    assert new_state["prs"]["100"]["review_dispatched_at"] is None
+    assert new_state["prs"]["100"]["reviewer_pid"] is None
+    assert new_state["prs"]["100"]["reviewer_process_start_time"] is None
+    assert new_state["prs"]["100"]["status"] == "merged"
+
+
 def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
     """Issue #370: loop() runs dispatch_reviews() and the per-PR merge lane uses the verdict."""
     config = OrchestratorConfig(
