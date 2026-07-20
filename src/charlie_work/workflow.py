@@ -2196,6 +2196,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 worktree_path,
                 config.dispatch.base_ref,
                 config.dispatch.injected_paths,
+                config.dispatch.materialize_dirs,
             )
             is_completed = inspection.state == WorktreeState.COMPLETED
 
