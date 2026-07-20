@@ -5766,6 +5766,7 @@ class OrchestratorApp:
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
         merge_hold: bool = False
+        merge_hold_check_unavailable: bool = False
         if can_merge and should_merge:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
@@ -5793,10 +5794,12 @@ class OrchestratorApp:
                     try:
                         issue = self.gh.issue_view(issue_number)
                     except (GitHubError, ValueError):
+                        merge_hold_check_unavailable = True
                         issue = None
-                    issue_labels = label_names(issue) if issue else set()
-                    merge_hold = self.config.labels.merge_hold in issue_labels
-                if not merge_hold:
+                    if not merge_hold_check_unavailable:
+                        issue_labels = label_names(issue) if issue else set()
+                        merge_hold = self.config.labels.merge_hold in issue_labels
+                if not merge_hold and not merge_hold_check_unavailable:
                     mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
@@ -6011,13 +6014,20 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            if approved and can_merge and merge_output is None and not mergequeue_handoff_failed:
+            if (
+                approved
+                and can_merge
+                and merge_output is None
+                and not mergequeue_handoff_failed
+                and not merge_hold_check_unavailable
+            ):
                 # merge=False / auto_merge.enabled=False: can_merge recovered but no
                 # merge was attempted. Clear the merge alert so a subsequent
                 # degradation can re-fire the digest (last_health == current_health
                 # dedup would otherwise drop it). Excluded when the mergequeue
-                # handoff itself failed — that is a genuine problem, not a
-                # benign evaluation-only pass, and must not be masked as OK.
+                # handoff itself failed or the merge-hold issue check was
+                # unavailable — both are genuine problems, not benign
+                # evaluation-only passes, and must not be masked as OK.
                 if issue_number is not None:
                     _issue_key = str(issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
@@ -6042,6 +6052,7 @@ class OrchestratorApp:
                     "can_merge": can_merge,
                     "merged": bool(merge_output),
                     "merge_hold": merge_hold,
+                    "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
@@ -6071,12 +6082,15 @@ class OrchestratorApp:
             "cross_pr_revert_routed": cross_pr_revert_routed,
             "mergequeue_label_applied": mergequeue_label_applied,
             "merge_hold": merge_hold,
+            "merge_hold_check_unavailable": merge_hold_check_unavailable,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif merge_hold_check_unavailable:
+            message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
         elif merge_hold:
             message += (
                 f" (merge-hold label {self.config.labels.merge_hold!r} present — left alone)"
@@ -6094,7 +6108,9 @@ class OrchestratorApp:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
         elif label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
-        return CommandResult(not checks_unavailable, message, data)
+        return CommandResult(
+            not (checks_unavailable or merge_hold_check_unavailable), message, data
+        )
 
     @_guard_state_lock
     def spec_review(self, artifact_path: Path) -> CommandResult:
@@ -7116,8 +7132,10 @@ class OrchestratorApp:
         errors: list[dict[str, Any]],
         merges: list[dict[str, Any]],
     ) -> None:
-        """Append a merge_ready result to merges or errors if checks are unavailable."""
-        if merge_result.data.get("checks_unavailable"):
+        """Append a merge_ready result to merges or errors if a gh check failed."""
+        if merge_result.data.get("checks_unavailable") or merge_result.data.get(
+            "merge_hold_check_unavailable"
+        ):
             errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
         else:
             merges.append(merge_result.data)

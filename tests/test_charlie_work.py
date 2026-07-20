@@ -9747,6 +9747,45 @@ def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path
     assert (456, "mergequeue") in fake_gh.pr_labels_added
 
 
+def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_path: Path) -> None:
+    """Issue #496 regression: if issue_view fails while checking for the
+    merge-hold label on the linked issue, the PR must not be handed to the
+    mergequeue. The failure is reported as merge_hold_check_unavailable and
+    must not be treated as a mergequeue handoff failure (no failed-attempt
+    alarm side effects)."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewFailGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                raise _GitHubError("transient gh issue view failure")
+            return super().issue_view(number)
+
+    fake_gh = IssueViewFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "merge-hold check unavailable" in result.message
+    assert "not handed off to Aviator" in result.message
+    pr_state = load_state(paths.state_file)["prs"]["456"]
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("consecutive_failed_merge_attempts", 0) == 0
+
+
 def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
     """An unapproved PR must never be labeled for the merge queue — the
     approval gate (can_merge) is upstream of the mergequeue branch, exactly as
