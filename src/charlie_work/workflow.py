@@ -150,9 +150,12 @@ def _parse_iso_timestamp(value: Any) -> datetime | None:
         return None
     ts = value.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(ts)
+        parsed = datetime.fromisoformat(ts)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _recent_dispatch_failed_attempts(
