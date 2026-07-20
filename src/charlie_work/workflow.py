@@ -5064,6 +5064,7 @@ class OrchestratorApp:
             "attempted_count": len(selected),
             "launched_count": len(launched),
             "failed_count": len(failed),
+            "failed": failed,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
         }
