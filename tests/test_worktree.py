@@ -3332,6 +3332,43 @@ def test_worker_authored_dirty_renamed_tracked_file_not_injected(tmp_path: Path)
     assert _worker_authored_dirty(repo_root, ("prompt-renamed.md",)) is False
 
 
+def test_worker_authored_dirty_excludes_materialize_dirs_surface(
+    tmp_path: Path,
+) -> None:
+    """Issue #471: tracked modifications confined to the configured
+    ``materialize_dirs`` surface must not count as worker-authored dirt,
+    even when the assume-unchanged bit is not set.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    prompt = repo_root / ".devin" / "prompts" / "worker.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("original prompt\n", encoding="utf-8")
+    _git(repo_root, "add", str(prompt))
+    _git(repo_root, "commit", "-m", "track prompt template")
+
+    # Simulate an external launch shim rewriting the tracked prompt in place
+    # without the assume-unchanged bit set.
+    prompt.write_text("per-dispatch prompt\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (), (".devin",)) is False
+
+
+def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
+    tmp_path: Path,
+) -> None:
+    """Issue #471: a modification outside both ``injected_paths`` and
+    ``materialize_dirs`` must still trip the worktree-safety guard.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
     """A clean worktree with no commits beyond the base is no_commits."""
     remote, repo = _init_repo_with_remote(tmp_path)

@@ -557,15 +557,17 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
 def _worker_authored_dirty(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> bool:
     """Return True if the worktree has uncommitted changes that are NOT
-    orchestrator-injected prompt files.
+    orchestrator scaffolding.
 
-    ``injected_paths`` are worktree-relative paths (files or directories) that
-    the orchestrator writes into the worktree (e.g. the Claude Code prompt
-    file, or a custom ``.devin/prompts/...`` convention that the operator has
+    ``injected_paths`` and ``materialize_dirs`` are worktree-relative paths
+    (files or directories) that the orchestrator writes into the worktree
+    (e.g. the Claude Code prompt file, per-dispatch prompt templates under
+    ``.devin/prompts/...``, or a custom convention the operator has
     configured). They are excluded from the dirty check so completed worker
-    work is not stranded by prompt-injection noise (issue #381).
+    work is not stranded by scaffolding noise (issue #381, issue #471).
 
     Uses ``git status --porcelain=v2 -z --untracked-files=all``:
     ``--untracked-files=all`` disables directory collapsing, so every
@@ -575,7 +577,7 @@ def _worker_authored_dirty(
     single ``?? dir/`` line could hide a worker-authored sibling file next to
     a configured injected path or directory, and a probe re-scoped to that
     directory was needed to tell the two apart). Every entry — whether it
-    matches an injected file or a whole injected directory — is now checked
+    matches an excluded file or a whole excluded directory — is now checked
     against the same normalized-path predicate below, with no separate
     collapse-probing code path to keep in sync.
 
@@ -604,12 +606,14 @@ def _worker_authored_dirty(
 
     # Normalize the configured side too, so a Windows-style backslash override
     # still matches git's forward-slash path reporting.
-    injected = [PurePosixPath(str(p).replace("\\", "/")) for p in injected_paths]
+    excluded = [
+        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
+    ]
     for raw_path in _parse_status_v2_paths(status_result.stdout):
         # Git may emit backslashes on Windows; normalize for comparison.
         path = PurePosixPath(str(raw_path).replace("\\", "/"))
         if any(
-            path == injected_path or injected_path in path.parents for injected_path in injected
+            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
         ):
             continue
         return True
@@ -622,6 +626,7 @@ def _worktree_refuse_to_reset_reason(
     base_ref: str,
     worktree_path: Path | None = None,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> str | None:
     """Return a human-readable reason if resetting the branch/worktree would destroy
     local work, otherwise ``None``.
@@ -644,7 +649,7 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        if _worker_authored_dirty(worktree_path, injected_paths):
+        if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "HEAD"],
@@ -722,6 +727,7 @@ def _worktree_refuse_to_reset_reason(
 def _worktree_dirty_reason(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> str | None:
     """Return a reason string if ``worktree_path`` has uncommitted modifications.
 
@@ -740,7 +746,7 @@ def _worktree_dirty_reason(
     """
     if not worktree_path.is_dir():
         return None
-    if _worker_authored_dirty(worktree_path, injected_paths):
+    if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
         return "worktree has uncommitted modifications"
     return None
 
@@ -1345,7 +1351,12 @@ def create_worktree(
         """Hard-refuse to reset if the worktree/branch contains local work."""
         check_path = target_path or worktree_path
         reason = _worktree_refuse_to_reset_reason(
-            repo_root, branch, resolved_base_ref, check_path, injected_paths
+            repo_root,
+            branch,
+            resolved_base_ref,
+            check_path,
+            injected_paths,
+            materialize_dirs,
         )
         if reason:
             raise WorktreeUnsafeError(reason)
@@ -1460,7 +1471,7 @@ def create_worktree(
                 wt_path = Path(existing_wt["worktree"])
                 # Check for dirty working tree, ignoring orchestrator-injected files.
                 try:
-                    has_dirty = _worker_authored_dirty(wt_path, injected_paths)
+                    has_dirty = _worker_authored_dirty(wt_path, injected_paths, materialize_dirs)
                 except WorktreeProbeFailedError:
                     # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
                     has_dirty = True
@@ -1595,7 +1606,9 @@ def create_worktree(
                         # the old tip (best-effort), compare patch-ids, and reset.
                         # Uncommitted worker-authored edits must survive, so refuse
                         # to reset a dirty worktree even when the branch diverged.
-                        dirty_reason = _worktree_dirty_reason(worktree_path, injected_paths)
+                        dirty_reason = _worktree_dirty_reason(
+                            worktree_path, injected_paths, materialize_dirs
+                        )
                         if dirty_reason:
                             raise WorktreeUnsafeError(dirty_reason)
                         _snapshot_before_delete(branch)
@@ -2007,6 +2020,7 @@ def inspect_worktree_state(
     worktree_path: Path,
     base_ref: str = "",
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> WorktreeInspection:
     """Inspect a worker worktree after the process dies.
 
@@ -2026,7 +2040,7 @@ def inspect_worktree_state(
         )
 
     try:
-        dirty = _worker_authored_dirty(worktree_path, injected_paths)
+        dirty = _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs)
     except WorktreeProbeFailedError as exc:
         return WorktreeInspection(
             WorktreeState.UNKNOWN,
@@ -2541,7 +2555,11 @@ def clean_worktrees(
             )
             continue
         try:
-            dirty_reason = _worktree_dirty_reason(wt_path, config.dispatch.injected_paths)
+            dirty_reason = _worktree_dirty_reason(
+                wt_path,
+                config.dispatch.injected_paths,
+                config.dispatch.materialize_dirs,
+            )
         except WorktreeProbeFailedError as exc:
             skipped.append(
                 {
