@@ -6764,6 +6764,7 @@ def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: P
     assert result.ok is False
     assert result.data["launched_count"] == 0
     assert result.data["failed_count"] == 1
+    assert result.data["failed"] == [{"pr": 100, "error": launch_error}]
 
     state = load_state(app.paths.state_file)
     pr_state = state["prs"]["100"]

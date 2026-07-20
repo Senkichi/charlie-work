@@ -8,6 +8,7 @@ import pytest
 
 from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import (
+    _build_fleet_attention_digest,
     _extract_attention_events,
     _is_fleet_pass_active,
     _select_repos,
@@ -259,6 +260,53 @@ def test_extract_attention_events_nested_loop_skip() -> None:
     assert all(event["type"] == "skipped" for event in events)
     assert {event["reason"] for event in events} == {"state_lock_busy", "graphql_rate_limit"}
     assert len(events) == 2
+
+
+def test_extract_attention_events_nested_dispatch_failures() -> None:
+    """Issue #497: worker/rework/reviewer launch failures in nested dispatch
+    sub-results are surfaced as attention events with the actual error text
+    and a non-sentinel issue/PR identifier.
+    """
+    review_error = (
+        "failed to launch claude: [WinError 2] The system cannot find the file specified"
+    )
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "intake": {"failed": []},
+            "dispatch": {
+                "selected_count": 0,
+                "failures": {11: "failed to launch claude: OSError"},
+            },
+            "dispatch_rework": {
+                "selected_count": 0,
+                "failures": {"12": "failed to launch claude: timeout"},
+            },
+            "dispatch_reviews": {
+                "selected_count": 1,
+                "failed_count": 1,
+                "failed": [{"pr": 100, "error": review_error}],
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    error_events = [e for e in events if e["type"] == "error"]
+    assert len(error_events) == 3
+    by_issue = {e.get("issue_number", e.get("pr")): e for e in error_events}
+    assert by_issue[11]["error"] == "failed to launch claude: OSError"
+    assert by_issue[12]["error"] == "failed to launch claude: timeout"
+    assert by_issue[100]["error"] == review_error
+
+    digest = _build_fleet_attention_digest(events)
+    entries = [e for e in digest.transitions if e.health == "ERROR"]
+    assert len(entries) == 3
+    assert all(e.issue_number != -1 for e in entries)
+    assert any(review_error in (e.last_log_line or "") for e in entries)
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
