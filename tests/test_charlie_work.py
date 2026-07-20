@@ -6714,6 +6714,71 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
+def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
+    """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
+    unresolved npm ``.CMD`` shim) must not strand the PR at
+    ``review_dispatch_pending`` forever. ``dispatch_reviews`` claims the PR
+    as pending before launching and must upgrade a failed launch to
+    ``review_dispatch_failed`` with the error recorded, freeing it for
+    redispatch after the stale-claim timeout rather than silently holding
+    the claim."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    launch_error = (
+        "failed to launch claude: [WinError 2] The system cannot find the file specified"
+    )
+
+    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error=launch_error,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is False
+    assert result.data["launched_count"] == 0
+    assert result.data["failed_count"] == 1
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    # The pending claim written before launch must be cleared, not left
+    # dangling — otherwise `_is_review_dispatchable` would never see this PR
+    # as re-claimable and it would sit stuck forever, same failure shape as
+    # issue #487's "never claimed at all" gap.
+    assert pr_state["review_dispatch_status"] == "review_dispatch_failed"
+    assert pr_state["review_dispatch_pending_at"] is None
+    assert pr_state["review_dispatched_at"] is None
+    assert pr_state["reviewer_pid"] is None
+    assert pr_state["review_dispatch_error"] == launch_error
+    assert pr_state["review_dispatch_failed_at"] is not None
+
+
 def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
     """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
     prs = [
