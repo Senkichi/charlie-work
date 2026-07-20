@@ -36,6 +36,12 @@ review_dispatch:
   # Local-only process bound. 0 means unlimited; raise only if local CPU/disk
   # from concurrent reviewer worktrees becomes a visible bottleneck.
   max_local_review_processes: 0
+  # Issue #495: cap consecutive reviewer launch failures before escalating to a
+  # human. retry_backoff_minutes is the base of an exponential backoff; the
+  # effective delay is base * 2^(attempts - 1) with the stale-claim timeout as
+  # the floor.
+  max_retries: 3
+  retry_backoff_minutes: 30
 
 auto_merge:
   enabled: true

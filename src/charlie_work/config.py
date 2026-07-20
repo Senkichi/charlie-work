@@ -214,6 +214,14 @@ class ReviewDispatchConfig:
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
     max_local_review_processes: int = 0
+    # Issue #495: cap consecutive reviewer launch failures before escalating to
+    # a human. 0 disables the cap (not recommended). 3 mirrors the sibling
+    # worker redispatch cap default in WatchdogConfig.
+    max_retries: int = 3
+    # Base backoff in minutes between retry attempts for failed review dispatches.
+    # The effective delay is base * 2^(attempts - 1); the existing 30-minute stale
+    # claim timeout provides the floor.
+    retry_backoff_minutes: int = 30
 
 
 @dataclass(frozen=True)
@@ -903,6 +911,28 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
             f"got {rd_max_local}"
+        )
+    rd_max_retries = review_dispatch_data.get("max_retries")
+    if rd_max_retries is not None and not isinstance(rd_max_retries, int):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_retries' must be an int, "
+            f"got {type(rd_max_retries).__name__}"
+        )
+    if rd_max_retries is not None and rd_max_retries < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_retries' must be >= 0, "
+            f"got {rd_max_retries}"
+        )
+    rd_retry_backoff = review_dispatch_data.get("retry_backoff_minutes")
+    if rd_retry_backoff is not None and not isinstance(rd_retry_backoff, int):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'retry_backoff_minutes' must be an int, "
+            f"got {type(rd_retry_backoff).__name__}"
+        )
+    if rd_retry_backoff is not None and rd_retry_backoff < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'retry_backoff_minutes' must be >= 0, "
+            f"got {rd_retry_backoff}"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")

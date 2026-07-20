@@ -20,7 +20,12 @@ from .adapters import (
 )
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
-from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    CrossFamilyConfig,
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+)
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -821,7 +826,10 @@ def _apply_local_review_cap(
 
 
 def _is_review_dispatchable(
-    state: dict[str, Any], pr_number: int, candidate: dict[str, Any]
+    state: dict[str, Any],
+    pr_number: int,
+    candidate: dict[str, Any],
+    review_dispatch: ReviewDispatchConfig,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -832,10 +840,16 @@ def _is_review_dispatchable(
     - A dispatched reviewer is no longer alive and its claim has gone stale.
 
     This reuses ``is_claim_stale`` for the timeout and ``_reviewer_pid_alive``
-    for liveness, avoiding a parallel mechanism.
+    for liveness, avoiding a parallel mechanism. Failed launches consult
+    ``ReviewDispatchConfig.max_retries`` and ``retry_backoff_minutes`` so
+    persistently broken launches back off and eventually escalate instead of
+    looping forever (issue #495).
     """
     pr_state = state["prs"].get(str(pr_number), {})
     status = pr_state.get("review_dispatch_status")
+
+    if pr_state.get("status") == "escalated":
+        return False
 
     if status is None or status == "review_dispatch_completed":
         return True
@@ -852,7 +866,27 @@ def _is_review_dispatchable(
 
     if status == "review_dispatch_failed":
         failed_at = pr_state.get("review_dispatch_failed_at")
-        return failed_at is None or is_claim_stale(failed_at)
+        if failed_at is None:
+            return True
+
+        attempts_data = pr_state.get("review_dispatch_failed_attempts")
+        if attempts_data is not None:
+            attempts = int(attempts_data)
+            if attempts >= review_dispatch.max_retries:
+                return False
+            if not is_claim_stale(failed_at):
+                return False
+            if review_dispatch.retry_backoff_minutes > 0:
+                try:
+                    failed_time = datetime.fromisoformat(failed_at.replace("Z", "+00:00"))
+                    age = datetime.now(UTC) - failed_time
+                    backoff_minutes = review_dispatch.retry_backoff_minutes * (2 ** (attempts - 1))
+                    return age > timedelta(minutes=backoff_minutes)
+                except (ValueError, TypeError):
+                    return True
+            return True
+
+        return is_claim_stale(failed_at)
 
     # Unknown status: treat as free so we don't silently orphan PRs.
     return True
@@ -4630,7 +4664,11 @@ class OrchestratorApp:
         The double-dispatch protection is a two-phase claim on
         ``state["prs"][pr]``: this method writes ``review_dispatch_pending``,
         launches outside the lock, then upgrades to ``review_dispatch_dispatched``
-        or ``review_dispatch_failed``. Overlapping passes see the pending claim
+        or ``review_dispatch_failed``. Failed launches increment a per-PR attempt
+        counter and apply ``ReviewDispatchConfig.retry_backoff_minutes`` so a
+        persistently broken launch (e.g. a missing binary) backs off and, after
+        ``max_retries`` consecutive failures, escalates to a human instead of
+        retrying forever (issue #495). Overlapping passes see the pending claim
         and skip until it goes stale. A reviewer that dies without a verdict is
         freed by ``_detect_and_handle_stalled_reviews`` after the stale-claim
         timeout, making the PR re-dispatchable.
@@ -4676,7 +4714,11 @@ class OrchestratorApp:
         # Filter out PRs that are already claimed or still have a live reviewer.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            dispatchable = [c for c in candidates if _is_review_dispatchable(state, c["pr"], c)]
+            dispatchable = [
+                c
+                for c in candidates
+                if _is_review_dispatchable(state, c["pr"], c, self.config.review_dispatch)
+            ]
 
         # Apply the local-only cap. max_local_review_processes == 0 means
         # unlimited, mirroring the unlimited-by-default intent of the stage.
@@ -4823,10 +4865,13 @@ class OrchestratorApp:
 
         # Upgrade claims outside the launch loop. Failed launches become
         # review_dispatch_failed with the current timestamp so rapid relaunches
-        # are throttled by is_claim_stale. Successful launches become
+        # are throttled by is_claim_stale. After ReviewDispatchConfig.max_retries
+        # consecutive failures the PR is escalated to a human instead of being
+        # retried forever (issue #495). Successful launches become
         # review_dispatch_dispatched with the reviewer's PID.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            escalated: list[int] = []
             for candidate in selected:
                 pr_number = candidate["pr"]
                 issue_number = candidate["issue"]
@@ -4842,30 +4887,85 @@ class OrchestratorApp:
                         "review_dispatched_at": utc_now(),
                         "review_dispatch_pending_at": None,
                         "review_dispatch_failed_at": None,
+                        "review_dispatch_failed_attempts": None,
+                        "review_dispatch_error": None,
                         "reviewer_pid": launch_info["pid"],
                         "reviewer_process_start_time": launch_info["process_start_time"],
                     }
                 else:
-                    failed_state = {
-                        **pr_state,
-                        "number": pr_number,
-                        "issue_number": issue_number,
-                        "review_dispatch_status": "review_dispatch_failed",
-                        "review_dispatch_failed_at": utc_now(),
-                        "review_dispatch_pending_at": None,
-                        "review_dispatched_at": None,
-                        "reviewer_pid": None,
-                        "reviewer_process_start_time": None,
-                    }
-                    if fail_info:
-                        failed_state["review_dispatch_error"] = fail_info["error"]
-                    state["prs"][str(pr_number)] = failed_state
+                    prior_attempts = int(pr_state.get("review_dispatch_failed_attempts") or 0)
+                    attempts = prior_attempts + 1
+                    if attempts >= self.config.review_dispatch.max_retries:
+                        escalation_state = {
+                            **pr_state,
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "escalated",
+                            "escalation_reason": "review_dispatch_cap_exceeded",
+                            "review_dispatch_status": "review_dispatch_failed",
+                            "review_dispatch_failed_at": utc_now(),
+                            "review_dispatch_failed_attempts": attempts,
+                            "review_dispatch_pending_at": None,
+                            "review_dispatched_at": None,
+                            "reviewer_pid": None,
+                            "reviewer_process_start_time": None,
+                        }
+                        if fail_info:
+                            escalation_state["review_dispatch_error"] = fail_info["error"]
+                        state["prs"][str(pr_number)] = escalation_state
+                        if issue_number is not None:
+                            issue_state = state["issues"].get(str(issue_number), {})
+                            state["issues"][str(issue_number)] = {
+                                **issue_state,
+                                "number": issue_number,
+                                "status": "escalated",
+                                "escalation_reason": "review_dispatch_cap_exceeded",
+                            }
+                        escalated.append(pr_number)
+                    else:
+                        failed_state = {
+                            **pr_state,
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "review_dispatch_status": "review_dispatch_failed",
+                            "review_dispatch_failed_at": utc_now(),
+                            "review_dispatch_failed_attempts": attempts,
+                            "review_dispatch_pending_at": None,
+                            "review_dispatched_at": None,
+                            "reviewer_pid": None,
+                            "reviewer_process_start_time": None,
+                        }
+                        if fail_info:
+                            failed_state["review_dispatch_error"] = fail_info["error"]
+                        state["prs"][str(pr_number)] = failed_state
+                save_state(self.paths.state_file, state)
+                if pr_number in escalated and issue_number is not None:
+                    result = transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        "redispatch_escalated",
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        entry = state["issues"].get(str(issue_number), {})
+                        if isinstance(entry, dict):
+                            state["issues"][str(issue_number)] = {
+                                **entry,
+                                "label_error": {
+                                    "edge": "redispatch_escalated",
+                                    "outcome": result.outcome.value,
+                                    "add_failures": result.add_failures,
+                                    "remove_failures": result.remove_failures,
+                                },
+                            }
+                            save_state(self.paths.state_file, state)
             state = append_event(
                 state,
                 "review_dispatch",
                 {
                     "launched": [x["pr"] for x in launched],
                     "failed": [x["pr"] for x in failed],
+                    "escalated": escalated,
                 },
             )
             save_state(self.paths.state_file, state)

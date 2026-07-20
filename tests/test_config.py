@@ -163,12 +163,14 @@ def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> No
 
 
 def test_load_config_review_dispatch_defaults() -> None:
-    """ReviewDispatchConfig defaults are safe (disabled, separate dir, no cap)."""
+    """ReviewDispatchConfig defaults are safe (disabled, separate dir, cap/backoff)."""
     config_file = Path("nonexistent.yaml")
     config = load_config(config_file)
     assert config.review_dispatch.enabled is False
     assert config.review_dispatch.reviews_dir == ".var/charlie-work/dispatches/reviews"
     assert config.review_dispatch.max_local_review_processes == 0
+    assert config.review_dispatch.max_retries == 3
+    assert config.review_dispatch.retry_backoff_minutes == 30
 
 
 def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
@@ -180,9 +182,34 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
   enabled: true
   reviews_dir: .var/reviews
   max_local_review_processes: 4
+  max_retries: 5
+  retry_backoff_minutes: 10
 """,
     )
     config = load_config(config_file)
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+    assert config.review_dispatch.max_retries == 5
+    assert config.review_dispatch.retry_backoff_minutes == 10
+
+
+def test_load_config_review_dispatch_rejects_invalid_retry_values(tmp_path: Path) -> None:
+    """Issue #495: review_dispatch cap/backoff values must be non-negative ints."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    for key, value in (
+        ("max_retries", "three"),
+        ("max_retries", -1),
+        ("retry_backoff_minutes", "fast"),
+        ("retry_backoff_minutes", -5),
+    ):
+        _write_config(
+            config_file,
+            f"""review_dispatch:
+  enabled: true
+  {key}: {value}
+""",
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_file)
+        assert key in str(exc_info.value)

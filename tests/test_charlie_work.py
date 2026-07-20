@@ -6617,11 +6617,16 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
 
 
 def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]] | None = None,
+    review_dispatch: ReviewDispatchConfig | None = None,
 ) -> OrchestratorApp:
     """Build an OrchestratorApp with review_dispatch enabled and an empty state file."""
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=True),
+        review_dispatch=review_dispatch
+        if review_dispatch is not None
+        else ReviewDispatchConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -6777,6 +6782,194 @@ def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: P
     assert pr_state["reviewer_pid"] is None
     assert pr_state["review_dispatch_error"] == launch_error
     assert pr_state["review_dispatch_failed_at"] is not None
+
+
+def test_dispatch_reviews_escalates_after_max_retries(monkeypatch, tmp_path: Path) -> None:
+    """Issue #495: N consecutive reviewer launch failures escalate to human."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    review_dispatch = ReviewDispatchConfig(enabled=True, max_retries=3, retry_backoff_minutes=30)
+    app = _dispatch_reviews_app(tmp_path, prs=prs, review_dispatch=review_dispatch)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    old_failed = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": old_failed,
+            "review_dispatch_failed_attempts": 2,
+        }
+        save_state(app.paths.state_file, state)
+
+    launch_error = "failed to launch claude: [WinError 2]"
+
+    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error=launch_error,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    assert result.data["launched_count"] == 0
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    assert pr_state["status"] == "escalated"
+    assert pr_state["escalation_reason"] == "review_dispatch_cap_exceeded"
+    assert pr_state["review_dispatch_status"] == "review_dispatch_failed"
+    assert pr_state["review_dispatch_failed_attempts"] == 3
+    assert pr_state["review_dispatch_error"] == launch_error
+    assert state["issues"]["10"]["status"] == "escalated"
+    assert state["issues"]["10"]["escalation_reason"] == "review_dispatch_cap_exceeded"
+    assert (10, app.config.labels.human_needed) in app.gh.labels_added
+
+
+def test_dispatch_reviews_success_after_failures_resets_attempt_count(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #495: N-1 failures followed by a success clears the failure counter."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    review_dispatch = ReviewDispatchConfig(enabled=True, max_retries=3, retry_backoff_minutes=30)
+    app = _dispatch_reviews_app(tmp_path, prs=prs, review_dispatch=review_dispatch)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    old_failed = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": old_failed,
+            "review_dispatch_failed_attempts": 2,
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    assert result.data["failed_count"] == 0
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    assert pr_state["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert pr_state.get("review_dispatch_failed_attempts") is None
+    assert pr_state.get("review_dispatch_failed_at") is None
+    assert pr_state.get("review_dispatch_error") is None
+    assert pr_state.get("status") != "escalated"
+    assert state["issues"].get("10", {}).get("status") != "escalated"
+    assert (10, app.config.labels.human_needed) not in app.gh.labels_added
+
+
+def test_dispatch_reviews_backoff_holds_retry_until_delay_elapses(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #495: a failed review dispatch with attempts pending is deferred until
+    the configured exponential backoff has elapsed, even past the stale-claim timeout."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    review_dispatch = ReviewDispatchConfig(enabled=True, max_retries=3, retry_backoff_minutes=30)
+    app = _dispatch_reviews_app(tmp_path, prs=prs, review_dispatch=review_dispatch)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # 45 minutes is past the 30-minute stale timeout but short of the 60-minute
+    # backoff for a second failure (base 30 * 2^(2-1)).
+    old_failed = (datetime.now(UTC) - timedelta(minutes=45)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": old_failed,
+            "review_dispatch_failed_attempts": 2,
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 0
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_count"] == 1
 
 
 def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
