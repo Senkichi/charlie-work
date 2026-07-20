@@ -7015,6 +7015,70 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
     assert str(checkout.path) not in result.stdout
 
 
+def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #487: a reviewing PR that was never claimed/dispatched is reaped
+    and then re-dispatched once its packet is past the stale-claim timeout."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Age the packet so the unclaimed safety net triggers on the next pass.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-100"
+    prompt_path = pr_dir / "review-prompt.md"
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(prompt_path, (old_mtime, old_mtime))
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(prompt_path),
+            "decision_path": str(pr_dir / "review-decision.json"),
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    assert launched == [100]
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("status") == "unclaimed"
+        for event in state.get("events", [])
+    )
+
+
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
     tmp_path: Path,
 ) -> None:
@@ -7146,6 +7210,77 @@ def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
 
     assert reaped == []
     assert checkout.path.exists()
+
+
+def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #494: the review-dispatch pass must reap checkouts and clear
+    review-dispatch state for PRs that GitHub already reports as MERGED
+    or CLOSED, regardless of the local claim status.
+    """
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-1-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    removed_calls: list[tuple[Path, int, Path | None]] = []
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == [100]
+    assert len(removed_calls) == 1
+    assert removed_calls[0][0] == repo_root
+    assert removed_calls[0][1] == 100
+    assert removed_calls[0][2] == reviews_dir
+
+    new_state = load_state(state_file)
+    assert new_state["prs"]["100"]["review_dispatch_status"] is None
+    assert new_state["prs"]["100"]["review_dispatched_at"] is None
+    assert new_state["prs"]["100"]["reviewer_pid"] is None
+    assert new_state["prs"]["100"]["reviewer_process_start_time"] is None
+    assert new_state["prs"]["100"]["status"] == "merged"
 
 
 def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
@@ -14027,6 +14162,88 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediately(
+    tmp_path: Path,
+) -> None:
+    """Issue #473: a dead rework worker whose failure_kind is rework_branch_conflict
+    escalates immediately with that reason, bypassing the redispatch cap."""
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-conflict",
+            "redispatch_at": [],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "rework branch agent/issue-123-conflict conflicts with base origin/main; "
+        "conflicted paths: file.txt\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-conflict",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="rework branch conflicts with origin/main; conflicted paths: file.txt",
+        failure_kind="rework_branch_conflict",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "rework_branch_conflict"
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
@@ -25224,6 +25441,12 @@ def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_c
     assert _is_pre_review_rework_candidate({"mergeable": "CONFLICTING"}, config, now) == (
         True,
         "merge_conflict",
+    )
+
+    # mergeStateStatus DIRTY is also an immediate trigger with a distinct reason.
+    assert _is_pre_review_rework_candidate({"mergeStateStatus": "DIRTY"}, config, now) == (
+        True,
+        "rework_branch_conflict",
     )
 
     old = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")

@@ -126,6 +126,38 @@ class WorktreeForeignWriterError(RuntimeError):
         )
 
 
+class ReworkBranchConflictError(RuntimeError):
+    """Raised when a rework worktree cannot be merge-updated onto the current
+    base because the branch conflicts with it.
+
+    This is a deterministic finding: GitHub cannot build the merge ref for a
+    conflicting PR, so no ``pull_request`` CI will ever run. The launch shim
+    surfaces it as ``failure_kind="rework_branch_conflict"``, which sits in
+    ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a human
+    on first occurrence.
+    """
+
+    def __init__(
+        self,
+        *,
+        worktree_path: Path,
+        branch: str,
+        base_ref: str,
+        conflicted_paths: tuple[str, ...],
+        stderr: str | None = None,
+    ) -> None:
+        self.worktree_path = worktree_path
+        self.branch = branch
+        self.base_ref = base_ref
+        self.conflicted_paths = conflicted_paths
+        self.stderr = stderr
+        paths_str = ", ".join(conflicted_paths) if conflicted_paths else "(unknown)"
+        super().__init__(
+            f"rework branch {branch!r} conflicts with base {base_ref!r}; "
+            f"conflicted paths: {paths_str}"
+        )
+
+
 # Known porcelain flag keys that may appear as space-less lines (value=True)
 # These are the only keys that map to True in git worktree --porcelain output
 KNOWN_FLAG_KEYS = frozenset({"bare", "detached", "locked", "prunable"})
@@ -456,6 +488,104 @@ def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     return result.ok
+
+
+def _resolve_merge_base_ref(repo_root: Path, base_ref: str) -> str:
+    """Resolve ``base_ref`` to a concrete ref that can be merged inside a worktree.
+
+    Remote-tracking refs (``origin/main``) are returned as-is so callers can
+    fetch/merge them. The ``HEAD`` sentinel is resolved to the main worktree's
+    current branch name or, when detached, its tip SHA, so ``git merge HEAD``
+    inside a child worktree does not accidentally merge the child branch into
+    itself.
+    """
+    if base_ref != "HEAD":
+        return base_ref
+    sym_result = run_captured(
+        ["git", "symbolic-ref", "HEAD"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if sym_result.ok:
+        ref = sym_result.stdout.strip()
+        if ref.startswith("refs/heads/"):
+            return ref[len("refs/heads/") :]
+    rev_result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if rev_result.ok and rev_result.stdout.strip():
+        return rev_result.stdout.strip()
+    return base_ref
+
+
+def _merge_update_rework_branch(
+    repo_root: Path,
+    worktree_path: Path,
+    branch: str,
+    base_ref: str,
+) -> None:
+    """Merge-update a checked-out rework branch onto the current base.
+
+    Before a rework worker starts, merge the resolved base ref into the PR
+    branch. If GitHub later tries to build ``refs/pull/N/merge`` it will see a
+    branch that already contains the latest base changes, which both avoids the
+    "DIRTY/no CI" stall and surfaces genuine unresolvable conflicts locally as
+    a deterministic escalation.
+
+    Raises:
+        ReworkBranchConflictError: if ``git merge`` cannot complete without
+            conflicts. The worktree is left with the merge aborted and the
+            conflicted paths are included in the exception.
+        RuntimeError: if the base ref cannot be fetched or the merge command
+            itself cannot be run.
+    """
+    merge_base_ref = _resolve_merge_base_ref(repo_root, base_ref)
+
+    if merge_base_ref.startswith("origin/") and _has_origin_remote(repo_root):
+        remote_branch = merge_base_ref[len("origin/") :]
+        fetch_result = run_captured(
+            ["git", "fetch", "origin", remote_branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not fetch_result.ok:
+            raise RuntimeError(
+                f"Fetch failed for base ref {merge_base_ref!r}: "
+                f"{fetch_result.error or fetch_result.stderr}"
+            )
+
+    merge_result = run_captured(
+        ["git", "merge", "--no-edit", merge_base_ref],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if merge_result.ok:
+        return
+
+    # Read the unmerged paths while the merge is still in progress, then abort.
+    diff_result = run_captured(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    run_captured(
+        ["git", "merge", "--abort"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    conflicted_paths: tuple[str, ...] = ()
+    if diff_result.ok:
+        conflicted_paths = tuple(p.strip() for p in diff_result.stdout.splitlines() if p.strip())
+
+    raise ReworkBranchConflictError(
+        worktree_path=worktree_path,
+        branch=branch,
+        base_ref=merge_base_ref,
+        conflicted_paths=conflicted_paths,
+        stderr=merge_result.stderr,
+    )
 
 
 def _rework_patch_id(repo_root: Path, base_ref: str, head_ref: str) -> str:
@@ -1641,6 +1771,8 @@ def create_worktree(
                         f"Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
+            if recovery is None:
+                _merge_update_rework_branch(repo_root, worktree_path, branch, resolved_base_ref)
             venv_link = worktree_path / ".venv"
             venv_junction: Path | None = None
             if venv_source is not None:
@@ -1728,6 +1860,8 @@ def create_worktree(
                 raise RuntimeError(
                     f"git worktree add failed for rework branch {branch!r}: {result.error or result.stderr}"
                 )
+            if recovery is None:
+                _merge_update_rework_branch(repo_root, worktree_path, branch, resolved_base_ref)
     else:
         # Fresh dispatch: create new branch off base_ref
         # Issue #110: Stale worktree reclamation before git worktree add
