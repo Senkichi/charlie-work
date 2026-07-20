@@ -362,10 +362,10 @@ def _check_state(pr: dict[str, Any], failures: list[str]) -> None:
 
 
 def _check_mergeable(pr: dict[str, Any], failures: list[str]) -> None:
-    if "mergeable" not in pr:
-        return
-    if str(pr.get("mergeable") or "").upper() == "CONFLICTING":
+    if "mergeable" in pr and str(pr.get("mergeable") or "").upper() == "CONFLICTING":
         failures.append("PR has merge conflicts (mergeable=CONFLICTING)")
+    if "mergeStateStatus" in pr and str(pr.get("mergeStateStatus") or "").upper() == "DIRTY":
+        failures.append("PR has merge conflicts (mergeStateStatus=DIRTY)")
 
 
 def _check_required_checks(

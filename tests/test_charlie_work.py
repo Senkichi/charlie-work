@@ -14040,6 +14040,88 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     assert "rework_requeued" not in event_kinds
 
 
+def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediately(
+    tmp_path: Path,
+) -> None:
+    """Issue #473: a dead rework worker whose failure_kind is rework_branch_conflict
+    escalates immediately with that reason, bypassing the redispatch cap."""
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-conflict",
+            "redispatch_at": [],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "rework branch agent/issue-123-conflict conflicts with base origin/main; "
+        "conflicted paths: file.txt\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-conflict",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="rework branch conflicts with origin/main; conflicted paths: file.txt",
+        failure_kind="rework_branch_conflict",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "rework_branch_conflict"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
 def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
     tmp_path: Path,
 ) -> None:
@@ -25229,6 +25311,12 @@ def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_c
     assert _is_pre_review_rework_candidate({"mergeable": "CONFLICTING"}, config, now) == (
         True,
         "merge_conflict",
+    )
+
+    # mergeStateStatus DIRTY is also an immediate trigger with a distinct reason.
+    assert _is_pre_review_rework_candidate({"mergeStateStatus": "DIRTY"}, config, now) == (
+        True,
+        "rework_branch_conflict",
     )
 
     old = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
