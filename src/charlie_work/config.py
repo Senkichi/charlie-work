@@ -491,6 +491,8 @@ class ApiBudgetConfig:
             "lifetime_usd",
         ):
             value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"api_worker.budget.{key} must be a number, got {value!r}")
             if value < 0:
                 raise ConfigError(f"api_worker.budget.{key} must be >= 0, got {value}")
 
@@ -501,7 +503,8 @@ class ApiWorkerConfig:
 
     ``enabled`` defaults to ``False`` so an absent config block is a no-op. When
     ``enabled`` is ``True``, ``provider`` must name a key in ``providers`` and the
-    selected provider must have a non-empty ``api_key_env`` and positive pricing.
+    selected provider must have a non-empty ``api_key_env``, positive input/output
+    pricing, and non-negative cached-input pricing.
     ``providers`` is exposed as an immutable view so the registry cannot be
     mutated after config load.
     """
@@ -550,16 +553,22 @@ class ApiWorkerConfig:
             raise ConfigError(
                 f"api_worker.providers.{self.provider}.api_key_env must be a non-empty string"
             )
-        for price_key in (
-            "input_usd_per_mtok",
-            "output_usd_per_mtok",
-            "cached_input_usd_per_mtok",
-        ):
+        for price_key in ("input_usd_per_mtok", "output_usd_per_mtok"):
             value = getattr(active, price_key)
-            if not isinstance(value, (int, float)) or value <= 0:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
                 raise ConfigError(
                     f"api_worker.providers.{self.provider}.{price_key} must be > 0, got {value!r}"
                 )
+        cached_value = active.cached_input_usd_per_mtok
+        if (
+            not isinstance(cached_value, (int, float))
+            or isinstance(cached_value, bool)
+            or cached_value < 0
+        ):
+            raise ConfigError(
+                "api_worker.providers."
+                f"{self.provider}.cached_input_usd_per_mtok must be >= 0, got {cached_value!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -1217,7 +1226,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         for budget_key in budget_fields:
             if budget_key in budget_data:
                 budget_value = budget_data[budget_key]
-                if not isinstance(budget_value, (int, float)):
+                if not isinstance(budget_value, (int, float)) or isinstance(budget_value, bool):
                     raise ConfigError(
                         f"config section 'api_worker' key 'budget.{budget_key}' must be a number, "
                         f"got {type(budget_value).__name__}"
@@ -1279,7 +1288,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             ):
                 if price_key in provider_data:
                     price_value = provider_data[price_key]
-                    if not isinstance(price_value, (int, float)):
+                    if not isinstance(price_value, (int, float)) or isinstance(price_value, bool):
                         raise ConfigError(
                             f"config section 'api_worker' key 'providers.{name}.{price_key}' "
                             f"must be a number, got {type(price_value).__name__}"

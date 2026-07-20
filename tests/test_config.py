@@ -352,14 +352,15 @@ def test_load_config_api_worker_enabled_rejects_empty_api_key_env(tmp_path: Path
     ("field", "value"),
     [
         ("input_usd_per_mtok", 0),
+        ("input_usd_per_mtok", -1.0),
+        ("output_usd_per_mtok", 0.0),
         ("output_usd_per_mtok", -1.0),
-        ("cached_input_usd_per_mtok", 0.0),
     ],
 )
 def test_load_config_api_worker_enabled_rejects_non_positive_pricing(
     tmp_path: Path, field: str, value: float
 ) -> None:
-    """Active provider pricing fields must be strictly positive."""
+    """Active provider input/output pricing must be strictly positive."""
     config_file = tmp_path / "orchestrator.config.yaml"
     prices = {
         "input_usd_per_mtok": 3.0,
@@ -383,6 +384,55 @@ def test_load_config_api_worker_enabled_rejects_non_positive_pricing(
 {provider_yaml}""",
     )
     with pytest.raises(ConfigError, match=f"{field}.*must be > 0"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_enabled_accepts_zero_cached_input_pricing(
+    tmp_path: Path,
+) -> None:
+    """A provider with no cached-input discount may set cached_input_usd_per_mtok to 0."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.0
+""",
+    )
+    config = load_config(config_file)
+    assert config.api_worker.enabled is True
+    assert config.api_worker.providers["kimi-k3"].cached_input_usd_per_mtok == 0.0
+
+
+def test_load_config_api_worker_enabled_rejects_negative_cached_input_pricing(
+    tmp_path: Path,
+) -> None:
+    """Cached-input pricing must be non-negative."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: -0.1
+""",
+    )
+    with pytest.raises(ConfigError, match="cached_input_usd_per_mtok.*must be >= 0"):
         load_config(config_file)
 
 
@@ -521,6 +571,73 @@ def test_global_config_api_worker_per_repo_overrides_scalar_and_keeps_global_pro
     assert config.api_worker.max_concurrent_sessions == 4
     assert config.api_worker.provider == "kimi-k3"
     assert "kimi-k3" in config.api_worker.providers
+
+
+def test_global_config_api_worker_per_repo_partial_budget_keeps_other_caps(
+    tmp_path: Path,
+) -> None:
+    """A repo-level partial api_worker.budget override must not reset other caps."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  budget:
+    max_usd_per_session: 10.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.api_worker.budget.max_usd_per_session == 10.0
+    assert config.api_worker.budget.preflight_reserve_usd == 1.0
+    assert config.api_worker.budget.max_usd_per_day == 5.0
+    assert config.api_worker.budget.lifetime_usd == 15.0
+
+
+def test_global_config_api_worker_per_repo_partial_providers_keeps_global_providers(
+    tmp_path: Path,
+) -> None:
+    """A repo-level partial api_worker.providers override must not replace the whole registry."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  enabled: true
+  provider: local-k3
+  providers:
+    local-k3:
+      base_url: http://localhost:11434/v1
+      api_key_env: OLLAMA_API_KEY
+      model: local-k3
+      input_usd_per_mtok: 0.5
+      output_usd_per_mtok: 0.5
+      cached_input_usd_per_mtok: 0.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert "kimi-k3" in config.api_worker.providers
+    assert "local-k3" in config.api_worker.providers
+    assert config.api_worker.provider == "local-k3"
+    assert config.api_worker.providers["local-k3"].cached_input_usd_per_mtok == 0.0
+    assert config.api_worker.budget.preflight_reserve_usd == 1.0
 
 
 def test_orchestrator_config_defaults_include_api_worker() -> None:

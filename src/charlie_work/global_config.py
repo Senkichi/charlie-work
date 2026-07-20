@@ -13,6 +13,21 @@ from .config import (
 from .fleet_paths import fleet_dir
 
 
+def _deep_merge(base: Any, override: Any) -> Any:
+    """Recursively merge two dicts; non-dict overrides win.
+
+    This keeps mapping-valued defaults from the global layer when a per-repo
+    config only overrides a subset (e.g. ``api_worker.budget.max_usd_per_session``
+    without redeclaring the other caps, or ``api_worker.providers`` additions).
+    """
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge(merged.get(key), value)
+        return merged
+    return override
+
+
 def load_layered_config(
     repo_root: Path,
     explicit: Path | None = None,
@@ -58,7 +73,7 @@ def load_layered_config(
     )
     repo_data = repo_raw if isinstance(repo_raw, dict) else {}
 
-    # Merge: global as base, per-repo as override (section-by-section)
+    # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
     all_sections = set(global_data.keys()) | set(repo_data.keys())
 
@@ -70,8 +85,9 @@ def load_layered_config(
         global_section = global_section if isinstance(global_section, dict) else {}
         repo_section = repo_section if isinstance(repo_section, dict) else {}
 
-        # Merge: repo values override global values
-        merged_section = {**global_section, **repo_section}
+        # Merge: repo values override global values; nested mappings are merged
+        # recursively so partial per-repo overrides do not drop global defaults.
+        merged_section = _deep_merge(global_section, repo_section)
         if merged_section:
             merged_data[section] = merged_section
 
