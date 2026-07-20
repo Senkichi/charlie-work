@@ -7015,6 +7015,70 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
     assert str(checkout.path) not in result.stdout
 
 
+def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #487: a reviewing PR that was never claimed/dispatched is reaped
+    and then re-dispatched once its packet is past the stale-claim timeout."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Age the packet so the unclaimed safety net triggers on the next pass.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-100"
+    prompt_path = pr_dir / "review-prompt.md"
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(prompt_path, (old_mtime, old_mtime))
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(prompt_path),
+            "decision_path": str(pr_dir / "review-decision.json"),
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    assert launched == [100]
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("status") == "unclaimed"
+        for event in state.get("events", [])
+    )
+
+
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
     tmp_path: Path,
 ) -> None:
