@@ -386,7 +386,17 @@ def _add_launch_failures(
     ``dispatch`` and ``dispatch_rework`` store issue-keyed ``failures`` maps;
     ``dispatch_reviews`` stores a PR-keyed ``failed`` list. Both shapes are
     normalized to ``{"repo_key": ..., "type": "error", "issue_number"/"pr": ..., "error": ...}``.
+
+    Issues deferred by the concurrency cap are not launch failures, so they are
+    excluded from ``failures`` maps via the ``deferred_by_concurrency`` list.
     """
+    deferred_issue_numbers: set[int] = set()
+    for d in data.get("deferred_by_concurrency", []):
+        try:
+            deferred_issue_numbers.add(int(d))
+        except (TypeError, ValueError):
+            continue
+
     failures_map = data.get("failures")
     if isinstance(failures_map, dict):
         for key, error in failures_map.items():
@@ -395,6 +405,8 @@ def _add_launch_failures(
             try:
                 issue_number = int(key)
             except (TypeError, ValueError):
+                continue
+            if issue_number in deferred_issue_numbers:
                 continue
             failures.append(
                 {

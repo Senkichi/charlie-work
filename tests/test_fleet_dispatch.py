@@ -265,7 +265,8 @@ def test_extract_attention_events_nested_loop_skip() -> None:
 def test_extract_attention_events_nested_dispatch_failures() -> None:
     """Issue #497: worker/rework/reviewer launch failures in nested dispatch
     sub-results are surfaced as attention events with the actual error text
-    and a non-sentinel issue/PR identifier.
+    and a non-sentinel issue/PR identifier. Concurrency deferrals are not
+    treated as launch failures.
     """
     review_error = (
         "failed to launch claude: [WinError 2] The system cannot find the file specified"
@@ -283,7 +284,11 @@ def test_extract_attention_events_nested_dispatch_failures() -> None:
             },
             "dispatch_rework": {
                 "selected_count": 0,
-                "failures": {"12": "failed to launch claude: timeout"},
+                "deferred_by_concurrency": [13],
+                "failures": {
+                    12: "failed to launch claude: timeout",
+                    13: "deferred by concurrency cap (limit: 1)",
+                },
             },
             "dispatch_reviews": {
                 "selected_count": 1,
@@ -301,6 +306,7 @@ def test_extract_attention_events_nested_dispatch_failures() -> None:
     assert by_issue[11]["error"] == "failed to launch claude: OSError"
     assert by_issue[12]["error"] == "failed to launch claude: timeout"
     assert by_issue[100]["error"] == review_error
+    assert 13 not in by_issue
 
     digest = _build_fleet_attention_digest(events)
     entries = [e for e in digest.transitions if e.health == "ERROR"]
