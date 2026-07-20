@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -450,6 +452,115 @@ class ClaudeCodeConfig:
 
 
 @dataclass(frozen=True)
+class ApiProviderConfig:
+    """Pricing and endpoint description for one Anthropic-compatible API provider.
+
+    ``api_key_env`` is the *name* of the environment variable that holds the key;
+    the key value never appears in config. ``cached_input_usd_per_mtok`` defaults
+    to ``0.0`` for providers that do not advertise a cached-input discount.
+    """
+
+    base_url: str
+    api_key_env: str
+    model: str
+    input_usd_per_mtok: float
+    output_usd_per_mtok: float
+    cached_input_usd_per_mtok: float = 0.0
+
+
+@dataclass(frozen=True)
+class ApiBudgetConfig:
+    """Per-session and aggregate spending caps for the api-worker adapter.
+
+    ``max_usd_per_session`` of ``0.0`` disables per-session enforcement. The
+    remaining defaults are conservative starting values for paid-API usage.
+    """
+
+    max_usd_per_session: float = 0.0
+    preflight_reserve_usd: float = 1.0
+    max_usd_per_day: float = 5.0
+    lifetime_usd: float = 15.0
+
+    def __post_init__(self) -> None:
+        for key in (
+            "max_usd_per_session",
+            "preflight_reserve_usd",
+            "max_usd_per_day",
+            "lifetime_usd",
+        ):
+            value = getattr(self, key)
+            if value < 0:
+                raise ConfigError(f"api_worker.budget.{key} must be >= 0, got {value}")
+
+
+@dataclass(frozen=True)
+class ApiWorkerConfig:
+    """Registry-backed config for the api-worker adapter.
+
+    ``enabled`` defaults to ``False`` so an absent config block is a no-op. When
+    ``enabled`` is ``True``, ``provider`` must name a key in ``providers`` and the
+    selected provider must have a non-empty ``api_key_env`` and positive pricing.
+    ``providers`` is exposed as an immutable view so the registry cannot be
+    mutated after config load.
+    """
+
+    enabled: bool = False
+    provider: str = ""
+    max_concurrent_sessions: int = 1
+    providers: Mapping[str, ApiProviderConfig] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    budget: ApiBudgetConfig = field(default_factory=ApiBudgetConfig)
+    fallback_adapter: str = "devin-shell"
+    worker_template: str = "worker_claude_code.md"
+    rework_template: str = "rework.md"
+
+    def __post_init__(self) -> None:
+        # Normalize to an immutable mapping view once at the boundary.
+        if not isinstance(self.providers, MappingProxyType):
+            providers_dict: dict[str, ApiProviderConfig] = {}
+            for name, cfg in self.providers.items():
+                if isinstance(cfg, ApiProviderConfig):
+                    providers_dict[str(name)] = cfg
+                elif isinstance(cfg, dict):
+                    providers_dict[str(name)] = ApiProviderConfig(**cfg)
+                else:
+                    raise ConfigError(
+                        f"api_worker.providers[{name!r}] must be a mapping of "
+                        f"ApiProviderConfig values, got {type(cfg).__name__}"
+                    )
+            object.__setattr__(self, "providers", MappingProxyType(providers_dict))
+
+        if not self.enabled:
+            return
+
+        if not self.provider:
+            raise ConfigError(
+                "api_worker.provider must be a non-empty string when api_worker.enabled is true"
+            )
+        if self.provider not in self.providers:
+            raise ConfigError(
+                f"api_worker.provider '{self.provider}' is not a key in api_worker.providers"
+            )
+
+        active = self.providers[self.provider]
+        if not active.api_key_env:
+            raise ConfigError(
+                f"api_worker.providers.{self.provider}.api_key_env must be a non-empty string"
+            )
+        for price_key in (
+            "input_usd_per_mtok",
+            "output_usd_per_mtok",
+            "cached_input_usd_per_mtok",
+        ):
+            value = getattr(active, price_key)
+            if not isinstance(value, (int, float)) or value <= 0:
+                raise ConfigError(
+                    f"api_worker.providers.{self.provider}.{price_key} must be > 0, got {value!r}"
+                )
+
+
+@dataclass(frozen=True)
 class CrossFamilyConfig:
     """Auto cross-family (non-Claude) adversarial pass over specs and PRs.
 
@@ -764,6 +875,7 @@ class OrchestratorConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
+    api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
@@ -1051,6 +1163,129 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             )
         claude_code_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
     claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
+    api_worker_data = _section(data, "api_worker")
+    enabled_value = api_worker_data.get("enabled")
+    if enabled_value is not None and not isinstance(enabled_value, bool):
+        raise ConfigError(
+            "config section 'api_worker' key 'enabled' must be a bool, "
+            f"got {type(enabled_value).__name__}"
+        )
+    provider_value = api_worker_data.get("provider")
+    if provider_value is not None and not isinstance(provider_value, str):
+        raise ConfigError(
+            "config section 'api_worker' key 'provider' must be a string, "
+            f"got {type(provider_value).__name__}"
+        )
+    max_concurrent_sessions = api_worker_data.get("max_concurrent_sessions")
+    if max_concurrent_sessions is not None:
+        if not isinstance(max_concurrent_sessions, int):
+            raise ConfigError(
+                "config section 'api_worker' key 'max_concurrent_sessions' must be an int, "
+                f"got {type(max_concurrent_sessions).__name__}"
+            )
+        if max_concurrent_sessions < 0:
+            raise ConfigError(
+                "config section 'api_worker' key 'max_concurrent_sessions' must be >= 0, "
+                f"got {max_concurrent_sessions}"
+            )
+    for str_key in ("fallback_adapter", "worker_template", "rework_template"):
+        str_value = api_worker_data.get(str_key)
+        if str_value is not None and not isinstance(str_value, str):
+            raise ConfigError(
+                f"config section 'api_worker' key '{str_key}' must be a string, "
+                f"got {type(str_value).__name__}"
+            )
+
+    # Parse budget sub-section.
+    budget_data = api_worker_data.get("budget")
+    if budget_data is not None:
+        if not isinstance(budget_data, dict):
+            raise ConfigError(
+                "config section 'api_worker' key 'budget' must be a mapping, "
+                f"got {type(budget_data).__name__}"
+            )
+        budget_fields = {f.name for f in fields(ApiBudgetConfig)}
+        unknown_budget_keys = sorted(set(budget_data) - budget_fields)
+        if unknown_budget_keys:
+            raise ConfigError(
+                "config section 'api_worker' key 'budget' has unknown key(s): "
+                f"{', '.join(unknown_budget_keys)} "
+                f"(valid: {', '.join(sorted(budget_fields))})"
+            )
+        for budget_key in budget_fields:
+            if budget_key in budget_data:
+                budget_value = budget_data[budget_key]
+                if not isinstance(budget_value, (int, float)):
+                    raise ConfigError(
+                        f"config section 'api_worker' key 'budget.{budget_key}' must be a number, "
+                        f"got {type(budget_value).__name__}"
+                    )
+                if budget_value < 0:
+                    raise ConfigError(
+                        f"config section 'api_worker' key 'budget.{budget_key}' must be >= 0, "
+                        f"got {budget_value}"
+                    )
+        api_worker_data["budget"] = ApiBudgetConfig(**budget_data)
+
+    # Parse providers registry.
+    providers_data = api_worker_data.get("providers")
+    if providers_data is not None:
+        if not isinstance(providers_data, dict):
+            raise ConfigError(
+                "config section 'api_worker' key 'providers' must be a mapping, "
+                f"got {type(providers_data).__name__}"
+            )
+        provider_fields = {f.name for f in fields(ApiProviderConfig)}
+        built_providers: dict[str, ApiProviderConfig] = {}
+        for name, provider_data in providers_data.items():
+            if not isinstance(provider_data, dict):
+                raise ConfigError(
+                    f"config section 'api_worker' key 'providers.{name}' must be a mapping, "
+                    f"got {type(provider_data).__name__}"
+                )
+            unknown_provider_keys = sorted(set(provider_data) - provider_fields)
+            if unknown_provider_keys:
+                raise ConfigError(
+                    f"config section 'api_worker' key 'providers.{name}' has unknown key(s): "
+                    f"{', '.join(unknown_provider_keys)} "
+                    f"(valid: {', '.join(sorted(provider_fields))})"
+                )
+            required_provider_keys = (
+                "base_url",
+                "api_key_env",
+                "model",
+                "input_usd_per_mtok",
+                "output_usd_per_mtok",
+            )
+            for req in required_provider_keys:
+                if req not in provider_data:
+                    raise ConfigError(
+                        f"config section 'api_worker' key 'providers.{name}' is missing "
+                        f"required key '{req}'"
+                    )
+            for str_provider_key in ("base_url", "api_key_env", "model"):
+                str_provider_value = provider_data.get(str_provider_key)
+                if not isinstance(str_provider_value, str) or not str_provider_value:
+                    raise ConfigError(
+                        f"config section 'api_worker' key 'providers.{name}.{str_provider_key}' "
+                        "must be a non-empty string"
+                    )
+            for price_key in (
+                "input_usd_per_mtok",
+                "output_usd_per_mtok",
+                "cached_input_usd_per_mtok",
+            ):
+                if price_key in provider_data:
+                    price_value = provider_data[price_key]
+                    if not isinstance(price_value, (int, float)):
+                        raise ConfigError(
+                            f"config section 'api_worker' key 'providers.{name}.{price_key}' "
+                            f"must be a number, got {type(price_value).__name__}"
+                        )
+            built_providers[str(name)] = ApiProviderConfig(**provider_data)
+        api_worker_data["providers"] = MappingProxyType(built_providers)
+
+    api_worker = _build_section(ApiWorkerConfig, "api_worker", api_worker_data)
     cross_family_data = _section(data, "cross_family")
     cf_command = cross_family_data.get("command")
     if isinstance(cf_command, list):
@@ -1387,6 +1622,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         runtime=runtime,
         devin=devin,
         claude_code=claude_code,
+        api_worker=api_worker,
         cross_family=cross_family,
         watchdog=watchdog,
         test_adequacy=test_adequacy,
