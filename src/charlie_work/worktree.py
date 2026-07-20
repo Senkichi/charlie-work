@@ -933,14 +933,19 @@ def _is_pristine_orchestrator_worktree(
     repo_root: Path,
     worktree_path: Path,
     base_ref: str,
-    injected_paths: tuple[str, ...] = (),
 ) -> bool:
-    """Return True when an existing worktree is a safe, unmodified orphan.
+    """Return True after bringing an existing worktree to the current dispatch base.
 
     A worktree created by the orchestrator and never handed to a worker is
     pristine when it has no worker-authored uncommitted changes and its HEAD
-    is the same commit as (or an ancestor of) the dispatch base. Such a worktree
-    can be reclaimed directly without the remote ``git ls-remote`` probe.
+    is at the dispatch base. Remote-tracking base refs are fetched first so
+    the comparison uses the live origin tip rather than a stale local
+    remote-tracking ref. If the worktree is behind the fetched base it is
+    reset to that tip in-place and still considered reclaimable; if it is
+    ahead or diverged it is not reclaimable without a remote probe.
+
+    Such a worktree can be reclaimed directly without the remote
+    ``git ls-remote`` probe.
     """
     if not worktree_path.is_dir():
         return False
@@ -966,6 +971,18 @@ def _is_pristine_orchestrator_worktree(
         return False
     head_sha = head_result.stdout.strip()
 
+    # For remote-tracking base refs, fetch first so we compare against the
+    # live origin tip rather than a stale local remote-tracking ref.
+    if base_ref.startswith("origin/") and _has_origin_remote(repo_root):
+        remote_branch = base_ref[len("origin/") :]
+        fetch_result = _run_remote_captured(
+            ["git", "fetch", "origin", remote_branch],
+            cwd=repo_root,
+        )
+        if not fetch_result.ok:
+            # Cannot verify base freshness; refuse to reuse a potentially stale worktree.
+            return False
+
     base_sha_result = run_captured(
         ["git", "rev-parse", "--verify", base_ref],
         cwd=repo_root,
@@ -978,12 +995,21 @@ def _is_pristine_orchestrator_worktree(
     if head_sha == base_sha:
         return True
 
+    # If the worktree is behind the fetched base, reset it in-place.
     ancestor_result = run_captured(
         ["git", "merge-base", "--is-ancestor", head_sha, base_sha],
         cwd=repo_root,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    return ancestor_result.ok
+    if ancestor_result.ok:
+        reset_result = run_captured(
+            ["git", "reset", "--hard", base_sha],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return reset_result.ok
+
+    return False
 
 
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
@@ -1968,12 +1994,11 @@ def create_worktree(
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
                 reclaimed = "pruned"
-            elif _is_pristine_orchestrator_worktree(
-                repo_root, wt_path, resolved_base_ref, injected_paths
-            ):
-                # Reuse the pristine leftover worktree directly. No remote
-                # round-trip is needed because the orchestrator created it at
-                # the dispatch base and it has no worker-authored changes.
+            elif _is_pristine_orchestrator_worktree(repo_root, wt_path, resolved_base_ref):
+                # Reuse the pristine leftover worktree directly. It is already
+                # at the current dispatch base (remote-tracking bases are
+                # fetched and reset in-place by the pristine check), and it has
+                # no worker-authored changes.
                 worktree_path = wt_path
                 reclaimed = "reused"
                 need_worktree_add = False

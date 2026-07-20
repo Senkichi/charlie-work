@@ -4584,6 +4584,51 @@ def test_create_worktree_reuses_pristine_leftover_without_remote_probe(
     assert info2.reclaimed == "reused"
 
 
+def test_create_worktree_reuses_pristine_leftover_and_resets_to_fresh_base(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #461: a pristine leftover worktree is reset to the fetched base
+    when origin/main has advanced, instead of being left at a stale commit.
+    """
+    from charlie_work import worktree
+
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch = "agent/issue-461-stale-base"
+
+    # First dispatch: worktree is at the current origin/main.
+    info1 = create_worktree(repo_root, branch, base_ref="")
+    old_base = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
+    assert info1.reclaimed is None
+
+    # Advance origin/main.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "new.txt").write_text("new\n", encoding="utf-8")
+    _git(remote_repo, "add", "new.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    new_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    assert new_tip != old_base
+
+    original_run_captured = worktree.run_captured
+
+    def _no_ls_remote(command, **kwargs):
+        if isinstance(command, list) and command[:3] == ["git", "ls-remote", "origin"]:
+            raise AssertionError(f"Unexpected git ls-remote during pristine reclaim: {command}")
+        return original_run_captured(command, **kwargs)
+
+    monkeypatch.setattr("charlie_work.worktree.run_captured", _no_ls_remote)
+
+    # Second fresh dispatch should reuse the same worktree but at the new tip.
+    info2 = create_worktree(repo_root, branch, base_ref="")
+    assert info2.path == info1.path
+    assert info2.reclaimed == "reused"
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == new_tip
+    assert (info2.path / "new.txt").exists()
+
+
 def test_create_worktree_remote_probe_failure_names_subcommand_and_uses_shorter_timeout(
     tmp_path: Path, monkeypatch
 ) -> None:
