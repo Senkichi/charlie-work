@@ -652,6 +652,34 @@ def test_read_session_records_skips_claude_code_sidecars(tmp_path: Path) -> None
     assert [record.issue_number for record in records] == [5]
 
 
+def test_read_session_records_skips_api_sidecars(tmp_path: Path) -> None:
+    """The new ``issue-N.api.json`` sidecar suffix is also ignored by the devin
+    reader by construction of the stem regex, but guard it explicitly."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    devin_payload = {
+        "issue_number": 7,
+        "branch": "agent/issue-7",
+        "worktree_path": "/tmp/wt/issue-7",
+        "prompt_path": "p.md",
+        "command": ["devin", "--print"],
+        "pid": 7777,
+        "started_at": "2026-01-01T00:00:00Z",
+        "log_path": "issue-7.log",
+        "error": None,
+    }
+    (sessions_dir / "issue-7.json").write_text(json.dumps(devin_payload), encoding="utf-8")
+    # A deliberately foreign api sidecar: if the exclusion regressed, the stem
+    # (``issue-7.api``) would not match ``^issue-\d+$`` and it would be skipped.
+    (sessions_dir / "issue-8.api.json").write_text(
+        json.dumps({"issue_number": 8, "worktree": "wt", "pid": 8888}), encoding="utf-8"
+    )
+
+    records = read_session_records(sessions_dir)
+
+    assert [record.issue_number for record in records] == [7]
+
+
 def test_read_session_records_skips_post_mortem_sidecars(tmp_path: Path) -> None:
     """Issue #343 Finding 1: the devin glob `issue-*.json` also matches
     post_mortem's `issue-N.post-mortem.json` sidecars (both live in the same
