@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import CLI_NAME
 from .adapters import (
@@ -639,12 +639,14 @@ def _detect_and_handle_stalled_sessions(
 
             # Sweep for orphan processes that survived the tree kill (Windows-only)
             # This catches detached/daemonized processes (e.g., nohup-style background processes)
-            orphan_pids = sweep_orphan_processes(w.worktree_path)
-            if orphan_pids:
+            orphan_pids: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
                 # Kill detected orphans to prevent them from running rejected code
-                for orphan_pid in orphan_pids:
-                    _kill_orphan_pid(orphan_pid)
-                    killed_pids.append(orphan_pid)
+                for orphan in orphan_processes:
+                    _kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids = [o["pid"] for o in orphan_processes]
 
             # Post-mortem extraction (issue #261): reads the Devin CLI's own
             # session store for a terminal-tool diagnosis (esp. decision:block
@@ -1107,7 +1109,12 @@ def _append_sweep_events(
 
 
 def _detect_and_handle_orphaned_workers(
-    sessions_dir: Path, state_file: Path, config: OrchestratorConfig, gh: GitHub
+    sessions_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+    gh: GitHub,
+    *,
+    review_callback: Callable[[int], Any] | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
 
@@ -1119,7 +1126,10 @@ def _detect_and_handle_orphaned_workers(
     For issues with status "dispatched" and a recorded worker_pid:
     - If the PID is dead, check the linked PR's last review decision
     - If last decision was "request_changes" and head unchanged, reset to "rework_requested"
-    - Otherwise, surface as drift for human triage
+    - If last decision was "request_changes" and head advanced, route to the
+      review-pending path by calling ``review_callback`` and then flipping the
+      issue status to "reviewing"
+    - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
 
@@ -1140,6 +1150,10 @@ def _detect_and_handle_orphaned_workers(
     """
     if not config.watchdog.enabled:
         return
+
+    def _drift_fingerprint(**parts: Any) -> str:
+        """Stable fingerprint for an orphaned-worker drift finding."""
+        return json.dumps(parts, sort_keys=True, default=str)
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -1263,7 +1277,10 @@ def _detect_and_handle_orphaned_workers(
             if route_result is not None:
                 pre_review_routed.add(issue_number)
 
-    # Handle orphaned workers
+    # Handle orphaned workers. Head-advanced request_changes findings are
+    # collected and routed to the review lane outside the state lock (review()
+    # itself acquires the lock and may call transition()).
+    review_routes: list[tuple[int, int, str, str, str]] = []
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -1309,7 +1326,55 @@ def _detect_and_handle_orphaned_workers(
                             )
                         )
                     else:
-                        # PR head has changed - surface as drift for human triage
+                        # PR head has changed - route to review if possible,
+                        # otherwise surface as a drift finding (once per fingerprint).
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_with_head_change",
+                            reviewed_head_sha=reviewed_head_sha,
+                            live_head_sha=live_head_sha,
+                        )
+                        if entry.get("orphan_drift_fingerprint") == fingerprint:
+                            # Already handled/failed for this exact head advance;
+                            # don't re-emit or retry.
+                            state["issues"][str(issue_number)] = entry
+                            continue
+                        if review_callback is not None:
+                            review_routes.append(
+                                (
+                                    issue_number,
+                                    pr_number,
+                                    reviewed_head_sha,
+                                    live_head_sha,
+                                    fingerprint,
+                                )
+                            )
+                        else:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reviewed_head_sha": reviewed_head_sha,
+                                        "live_head_sha": live_head_sha,
+                                        "reason": "dead_worker_with_head_change",
+                                    },
+                                )
+                            )
+                else:
+                    # Not a simple request_changes case - surface as drift once.
+                    fingerprint = _drift_fingerprint(
+                        reason="dead_worker_unsafe_to_auto_reset",
+                        last_decision=last_decision or "",
+                        pr_number=pr_number,
+                    )
+                    if entry.get("orphan_drift_fingerprint") != fingerprint:
+                        entry["orphan_drift_fingerprint"] = fingerprint
+                        entry["orphan_drift_at"] = utc_now()
                         sweep_events.append(
                             (
                                 "orphaned_worker_drift",
@@ -1318,26 +1383,10 @@ def _detect_and_handle_orphaned_workers(
                                     "pr_number": pr_number,
                                     "previous_status": "dispatched",
                                     "last_decision": last_decision,
-                                    "reviewed_head_sha": reviewed_head_sha,
-                                    "live_head_sha": live_head_sha,
-                                    "reason": "dead_worker_with_head_change",
+                                    "reason": "dead_worker_unsafe_to_auto_reset",
                                 },
                             )
                         )
-                else:
-                    # Not a simple request_changes case - surface as drift
-                    sweep_events.append(
-                        (
-                            "orphaned_worker_drift",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number,
-                                "previous_status": "dispatched",
-                                "last_decision": last_decision,
-                                "reason": "dead_worker_unsafe_to_auto_reset",
-                            },
-                        )
-                    )
             else:
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
@@ -1403,6 +1452,65 @@ def _detect_and_handle_orphaned_workers(
         state = _append_sweep_events(state, sweep_events)
         save_state(state_file, state)
 
+    # Route head-advanced request_changes findings to the review lane outside
+    # the state lock. review() generates the packet, fires the review_started
+    # label transition, and returns ok when a fresh packet is produced. We then
+    # flip the issue status to "reviewing" so it is not re-detected as an orphan
+    # on every subsequent pass. If review() fails, we record a drift fingerprint
+    # so the identical finding is not re-emitted every pass.
+    for (
+        issue_number,
+        pr_number,
+        reviewed_head_sha_before,
+        live_head_sha,
+        fingerprint,
+    ) in review_routes:
+        if review_callback is None:
+            continue
+        review_result = review_callback(pr_number)
+        routed = False
+        with state_lock(state_file):
+            state = load_state(state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            entry = state["issues"].get(str(issue_number), {})
+            decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
+            if (
+                review_result.ok
+                and decision_unchanged
+                and isinstance(entry, dict)
+                and entry.get("status") == "dispatched"
+            ):
+                state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
+                routed = True
+            elif (
+                not review_result.ok
+                and isinstance(entry, dict)
+                and entry.get("status") == "dispatched"
+            ):
+                # Review failed: mark the drift fingerprint so the next pass
+                # does not retry/re-emit for this unchanged head.
+                state["issues"][str(issue_number)] = {
+                    **entry,
+                    "orphan_drift_fingerprint": fingerprint,
+                    "orphan_drift_at": utc_now(),
+                }
+            state = append_event(
+                state,
+                "orphaned_worker_routed_to_review"
+                if review_result.ok
+                else "orphaned_worker_drift",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "review_ok": review_result.ok,
+                    "routed": routed,
+                    "live_head_sha": live_head_sha,
+                    "reviewed_head_sha": reviewed_head_sha_before,
+                    "reason": "dead_worker_with_head_change",
+                },
+            )
+            save_state(state_file, state)
+
 
 def _sweep_orphan_processes_for_dead_sessions(
     sessions_dir: Path, state_file: Path, config: OrchestratorConfig
@@ -1445,15 +1553,16 @@ def _sweep_orphan_processes_for_dead_sessions(
 
     # Sweep for orphans in each dead worktree
     for worktree_path in dead_worktree_paths:
-        orphan_pids = sweep_orphan_processes(worktree_path)
-        if orphan_pids:
+        orphan_processes = sweep_orphan_processes(worktree_path)
+        if orphan_processes:
             # Kill detected orphans
-            killed_orphans = []
-            for orphan_pid in orphan_pids:
-                _kill_orphan_pid(orphan_pid)
-                killed_orphans.append(orphan_pid)
+            killed_orphans: list[int] = []
+            for orphan in orphan_processes:
+                _kill_orphan_pid(orphan["pid"])
+                killed_orphans.append(orphan["pid"])
 
-            # Log the event
+            # Log the event with image/cmdline of each killed process so the
+            # respawn source in dead worktrees can be identified and shut off.
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
@@ -1461,8 +1570,16 @@ def _sweep_orphan_processes_for_dead_sessions(
                     "orphan_processes_killed",
                     {
                         "worktree_path": worktree_path,
-                        "orphan_pids": orphan_pids,
+                        "orphan_pids": [o["pid"] for o in orphan_processes],
                         "killed_orphans": killed_orphans,
+                        "orphan_processes": [
+                            {
+                                "pid": o["pid"],
+                                "name": o.get("name"),
+                                "command_line": o.get("command_line"),
+                            }
+                            for o in orphan_processes
+                        ],
                     },
                 )
                 save_state(state_file, state)
@@ -2110,6 +2227,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 worktree_path,
                 config.dispatch.base_ref,
                 config.dispatch.injected_paths,
+                config.dispatch.materialize_dirs,
             )
             is_completed = inspection.state == WorktreeState.COMPLETED
 
@@ -3791,6 +3909,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
         # Do all network calls, file writes, and worker launches outside the lock
@@ -3900,6 +4020,8 @@ class OrchestratorApp:
                 # A successful or live-worker recovery supersedes any previous orphan flag.
                 if ok or is_live_worker:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     entry.pop("escalation_reason", None)
                 elif status == "escalated":
@@ -4260,7 +4382,12 @@ class OrchestratorApp:
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
-                return self.record_review(pr_number, "request_changes", summary=summary)
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=summary,
+                    reviewed_head=pr.get("headRefOid"),
+                )
 
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -4312,7 +4439,12 @@ class OrchestratorApp:
                 summary = render_test_adequacy_summary(
                     test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
-                return self.record_review(pr_number, "request_changes", summary=summary)
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=summary,
+                    reviewed_head=pr.get("headRefOid"),
+                )
             # Gate passed while enabled: add Tier-2 packet section (issue #180)
             test_adequacy_section = render_test_adequacy_section(
                 test_adequacy_verdict.facts, test_adequacy_verdict.warnings
@@ -4859,6 +4991,7 @@ class OrchestratorApp:
         summary: str = "",
         summary_file: Path | None = None,
         comment: bool = False,
+        reviewed_head: str | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -4893,11 +5026,52 @@ class OrchestratorApp:
         # when no packet exists (e.g. a decision recorded without a prior
         # review() call).
         packet_head_sha = self._read_packet_head_oid(pr_number)
-        reviewed_head_sha = (
-            packet_head_sha
-            if packet_head_sha is not None
-            else (pr.get("headRefOid") if pr else None)
-        )
+        live_head_sha = pr.get("headRefOid") if pr else None
+
+        # Issue #467: do not silently pin a verdict to a stale packet when the PR
+        # head has advanced since the packet was generated. If the packet head
+        # disagrees with the live PR head, require an explicit --reviewed-head
+        # choice. When they agree (or no packet exists), preserve the existing
+        # packet-first / live-fallback semantics and record where the SHA came from.
+        if reviewed_head is not None:
+            if packet_head_sha is not None and reviewed_head == packet_head_sha:
+                reviewed_head_sha = reviewed_head
+                reviewed_head_source = "packet"
+            elif live_head_sha is not None and reviewed_head == live_head_sha:
+                reviewed_head_sha = reviewed_head
+                reviewed_head_source = "live"
+            else:
+                options: list[str] = []
+                if packet_head_sha is not None:
+                    options.append(f"packet head {packet_head_sha}")
+                if live_head_sha is not None:
+                    options.append(f"live head {live_head_sha}")
+                options_str = " or ".join(options) if options else "any available head"
+                return CommandResult(
+                    False,
+                    f"--reviewed-head {reviewed_head} does not match {options_str}",
+                    {},
+                )
+        elif (
+            packet_head_sha is not None
+            and live_head_sha is not None
+            and packet_head_sha != live_head_sha
+        ):
+            return CommandResult(
+                False,
+                f"review packet head ({packet_head_sha}) differs from live PR head ({live_head_sha}); "
+                "use --reviewed-head to choose the head the verdict applies to",
+                {},
+            )
+        elif packet_head_sha is not None:
+            reviewed_head_sha = packet_head_sha
+            reviewed_head_source = "packet"
+        elif live_head_sha is not None:
+            reviewed_head_sha = live_head_sha
+            reviewed_head_source = "live"
+        else:
+            return CommandResult(False, "no packet or live PR head available", {})
+
         # Calculate patch-id for the PR diff to detect actual content changes
         # (issue #222: base-update merges can advance head SHA without changing diff content).
         # All terminal decisions (approved/request_changes/blocked) persist reviewed_patch_id
@@ -4909,9 +5083,13 @@ class OrchestratorApp:
         # check never needs to reconstruct this historical diff.
         reviewed_patch_id = ""
         reviewed_signature = DiffContentSignature((), frozenset())
+        diff: str | None = None
         if pr:
-            diff = self._read_packet_diff(pr_number)
-            if diff is None:
+            if reviewed_head_source == "packet":
+                diff = self._read_packet_diff(pr_number)
+                if diff is None:
+                    diff = self.gh.pr_diff(pr_number)
+            else:
                 diff = self.gh.pr_diff(pr_number)
             reviewed_patch_id = _calculate_patch_id(diff)
             if diff:
@@ -4923,6 +5101,7 @@ class OrchestratorApp:
             "summary": summary_text,
             "required_changes": [],
             "reviewed_head_sha": reviewed_head_sha,
+            "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,
             "reviewed_changed_lines": list(reviewed_signature.changed_lines),
             "reviewed_changed_files": sorted(reviewed_signature.changed_files),
@@ -5072,11 +5251,12 @@ class OrchestratorApp:
                     label_error = {"comment_error": str(exc)}
                 else:
                     label_error["comment_error"] = str(exc)
+        source_note = f"head from {reviewed_head_source}"
         message = (
             f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
-            "escalated to human"
+            f"escalated to human ({source_note})"
             if escalated
-            else "review recorded"
+            else f"review recorded ({source_note})"
         )
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
@@ -5088,6 +5268,9 @@ class OrchestratorApp:
                 "decision": decision,
                 "decision_path": str(decision_path),
                 "reviewed_head_sha": reviewed_head_sha,
+                "reviewed_head_source": reviewed_head_source,
+                "live_head_sha": live_head_sha,
+                "packet_head_sha": packet_head_sha,
                 "rework_path": rework_path,
                 "escalated": escalated,
                 "request_changes_count": request_changes_count,
@@ -5267,9 +5450,8 @@ class OrchestratorApp:
                     },
                 )
             # Genuine merge conflict: gh pr update-branch cannot resolve this.
-            # Route the linked issue to rework_requested so dispatch_rework
-            # relaunches a worker; the worker's push will move the head and
-            # force a fresh re-review of the approved verdict.
+            # Record the conflict and let the failed-attempt alarm decide when
+            # to route the linked issue to rework_requested for a worker to resolve.
             if self._is_merge_conflict(pr):
                 state = load_state_locked(self.paths.state_file)
                 issue_state = (
@@ -5326,11 +5508,10 @@ class OrchestratorApp:
                     )
                 merge_conflict = True
                 sync_failed = True
-                if issue_status != "rework_requested" and issue_number is not None:
-                    merge_conflict_routed = True
-                    rework_label_error = self._request_merge_conflict_rework(
-                        pr, issue_number, decision
-                    )
+                # Conflict-rework dispatch is deferred until the consecutive
+                # failed-merge-attempt alarm threshold is reached (below). This
+                # debounces transient/stale CONFLICTING readings and keeps the
+                # approved verdict intact for the rework push's carry-forward.
             # Head matches the approved SHA. In front-of-train mode, only the
             # head of the approved queue is allowed to proceed, and it must be
             # up-to-date with main before checks are evaluated.
@@ -5494,7 +5675,6 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         branch_deleted: bool | None = None
-        label_error = rework_label_error
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
@@ -5611,6 +5791,47 @@ class OrchestratorApp:
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
         )
+        # Conflict-rework dispatch is debounced to the failed-attempt alarm
+        # threshold so a single transient/stale CONFLICTING reading does not
+        # clobber an approved verdict. Re-read the issue status and the PR
+        # attempt counter immediately before dispatch: the preceding checks,
+        # diff, and containment work are network-I/O windows long enough for a
+        # concurrent pass to have moved the issue into an in-flight or
+        # human-terminal state, and the stale `existing_pr_state` snapshot can
+        # diverge from the counter the final persistence block will reload
+        # (e.g. a carry-forward reset in this same pass). Dispatch outside the
+        # final state-lock because _request_merge_conflict_rework acquires its
+        # own lock.
+        if (
+            merge_conflict
+            and approved
+            and not can_merge
+            and not _is_pending_only(summary)
+            and issue_number is not None
+        ):
+            state = load_state_locked(self.paths.state_file)
+            issue_state = state["issues"].get(str(issue_number), {})
+            issue_status = issue_state.get("status")
+            existing_for_route = state["prs"].get(str(pr_number), {})
+            if issue_status not in (
+                "dispatched",
+                "dispatch_pending",
+                "manifest_written",
+                "escalated",
+                "blocked",
+                "rework_requested",
+            ):
+                new_attempts_for_route = (
+                    int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
+                )
+                threshold = self.config.auto_merge.failed_attempt_alarm
+                if threshold > 0 and new_attempts_for_route == threshold:
+                    merge_conflict_routed = True
+                    rework_label_error = self._request_merge_conflict_rework(
+                        pr, issue_number, decision
+                    )
+        if rework_label_error is not None:
+            label_error = rework_label_error
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
@@ -6365,6 +6586,8 @@ class OrchestratorApp:
         decision: dict[str, Any],
         summary: str,
         event_kind: str,
+        extra_payload: dict[str, Any] | None = None,
+        extra_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Route an approved PR to rework with a custom summary and event kind.
 
@@ -6372,7 +6595,9 @@ class OrchestratorApp:
         ``rework_requested`` (same label set as a non-escalated request_changes),
         and appends the requested state event. The PR's ``review-decision.json``
         is intentionally left untouched so the approved verdict is re-confirmed
-        after the worker push moves the head.
+        after the worker push moves the head. Any durable review fields already
+        present in the PR state are preserved, and callers may pass additional
+        keys to record without overwriting those verdict fields.
         """
         pr_number = int(pr["number"])
         self._write_rework_prompt(pr, issue_number, summary)
@@ -6393,18 +6618,21 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "status": "rework_requested",
+                "decision": pr_entry.get("decision"),
+                "reviewed_head_sha": pr_entry.get("reviewed_head_sha"),
+                "reviewed_patch_id": pr_entry.get("reviewed_patch_id"),
+                **(extra_state or {}),
             }
-            state = append_event(
-                state,
-                event_kind,
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "base_ref": pr.get("baseRefName"),
-                    "head_sha": pr.get("headRefOid"),
-                    "reviewed_head_sha": decision.get("reviewed_head_sha"),
-                },
-            )
+            payload = {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "base_ref": pr.get("baseRefName"),
+                "head_sha": pr.get("headRefOid"),
+                "reviewed_head_sha": decision.get("reviewed_head_sha"),
+            }
+            if extra_payload:
+                payload.update(extra_payload)
+            state = append_event(state, event_kind, payload)
             save_state(self.paths.state_file, state)
 
         result = transition(self.gh, self.config.labels, issue_number, "rework_requested")
@@ -6429,8 +6657,15 @@ class OrchestratorApp:
             "Merge the base branch into the PR branch, resolve the conflicts, and push. "
             "The code changes are already approved; do not re-litigate the review."
         )
+        requested_at = utc_now()
         return self._route_to_rework(
-            pr, issue_number, decision, summary, "merge_conflict_rework_requested"
+            pr,
+            issue_number,
+            decision,
+            summary,
+            "merge_conflict_rework_requested",
+            extra_payload={"conflict_rework_requested_at": requested_at},
+            extra_state={"conflict_rework_requested_at": requested_at},
         )
 
     def _request_cross_pr_revert_rework(
@@ -6827,9 +7062,15 @@ class OrchestratorApp:
         _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
-        # This fallback detects dead workers even when session sidecar files are orphaned
+        # This fallback detects dead workers even when session sidecar files are orphaned.
+        # Pass the review callback so a head-advanced request_changes finding can be
+        # routed to the review-pending path instead of being re-emitted as drift.
         _detect_and_handle_orphaned_workers(
-            sessions_dir, self.paths.state_file, self.config, self.gh
+            sessions_dir,
+            self.paths.state_file,
+            self.config,
+            self.gh,
+            review_callback=self.review,
         )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
@@ -7114,18 +7355,17 @@ class OrchestratorApp:
             )
 
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        # Unconditional reaper call, matching dispatch()'s — previously this
+        # Unconditional stall reaper call, matching dispatch()'s — previously this
         # only ran when max_concurrent_sessions > 0 via the governor. Skipped
         # only when the caller (loop()) already ran the sweep this pass and
         # handed its result down — see dispatch_rework()'s docstring.
         if stalled_entries is None:
             _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
 
-        # Detect and handle orphaned workers using state.json PID records (issue #207)
-        # This fallback detects dead workers even when session sidecar files are orphaned
-        _detect_and_handle_orphaned_workers(
-            sessions_dir, self.paths.state_file, self.config, self.gh
-        )
+        # Note: orphaned-worker detection is intentionally NOT re-run here.
+        # loop() already runs _detect_and_handle_orphaned_workers once per pass
+        # (with the review callback needed to route head-advanced findings to
+        # review). Re-running it here produced duplicate drift events (#457).
 
         # Load state to find rework_requested issues (state-driven selection)
         with state_lock(self.paths.state_file):
@@ -7354,6 +7594,8 @@ class OrchestratorApp:
                 }
                 # A fresh dispatch supersedes any previous orphan flag.
                 entry.pop("orphan_flagged_at", None)
+                entry.pop("orphan_drift_fingerprint", None)
+                entry.pop("orphan_drift_at", None)
                 state["issues"][str(issue_number)] = entry
             save_state(self.paths.state_file, state)
 
@@ -7523,6 +7765,8 @@ class OrchestratorApp:
                 # A successful dispatch supersedes any previous orphan flag.
                 if ok:
                     entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:

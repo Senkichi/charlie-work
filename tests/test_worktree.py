@@ -39,6 +39,7 @@ from charlie_work.worktree import (
     _is_git_tracked,
     _materialize_directory,
     _slugify,
+    _unlink_reparse_point,
 )
 
 
@@ -1815,22 +1816,40 @@ def test_materialize_directory_copies_untracked_dir(tmp_path: Path) -> None:
     assert (target_dir / "config.json").read_text(encoding="utf-8") == "config\n"
 
 
-def test_materialize_directory_skips_tracked_dir(tmp_path: Path) -> None:
-    """_materialize_directory should skip tracked directories."""
+def test_materialize_directory_preserves_tracked_files_and_copies_untracked_infra(
+    tmp_path: Path,
+) -> None:
+    """_materialize_directory should copy untracked infra but not overwrite
+    tracked files that are already identical in the target."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
-    # README.md is tracked by default
-    # Create a worktree
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+    _git(repo_root, "add", ".devin/prompts/worker.md")
+    _git(repo_root, "commit", "-m", "add prompt template")
+
+    # Pre-existing target with the same tracked prompt template
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
+    (worktree_path / ".devin" / "prompts").mkdir(parents=True)
+    (worktree_path / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
 
-    # Try to materialize a tracked file's parent directory
-    # This should be skipped because it's tracked
-    _materialize_directory(repo_root, worktree_path, ".")
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
 
-    # The worktree should still be empty (nothing was copied)
-    assert not (worktree_path / "README.md").exists()
+    # The tracked prompt template should be preserved (not overwritten)
+    assert (worktree_path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "committed worker\n"
+    # The untracked infra file should be copied
+    assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
+    assert ".devin/config.json" in written
+    assert ".devin/prompts/worker.md" not in written
 
 
 def test_materialize_directory_skips_nonexistent_source(tmp_path: Path) -> None:
@@ -1848,8 +1867,8 @@ def test_materialize_directory_skips_nonexistent_source(tmp_path: Path) -> None:
     assert not (worktree_path / "does-not-exist").exists()
 
 
-def test_materialize_directory_skips_if_target_exists(tmp_path: Path) -> None:
-    """_materialize_directory should skip if target already exists."""
+def test_materialize_directory_merges_into_existing_target(tmp_path: Path) -> None:
+    """_materialize_directory should copy missing files and preserve existing ones."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -1865,13 +1884,32 @@ def test_materialize_directory_skips_if_target_exists(tmp_path: Path) -> None:
     target_dir.mkdir()
     (target_dir / "existing.txt").write_text("existing\n", encoding="utf-8")
 
-    # Materialize the directory - should skip because target exists
-    _materialize_directory(repo_root, worktree_path, ".devin")
+    # Materialize the directory - should merge, not skip wholesale
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
 
     # The existing file should still be there (not overwritten)
     assert (target_dir / "existing.txt").read_text(encoding="utf-8") == "existing\n"
-    # The source file should not have been copied
-    assert not (target_dir / "config.json").exists()
+    # The missing source file should have been copied
+    assert (target_dir / "config.json").read_text(encoding="utf-8") == "original\n"
+    assert ".devin/config.json" in written
+
+
+def test_materialize_directory_preserves_empty_subdirectories(tmp_path: Path) -> None:
+    """Empty source subdirectories must be recreated in the target (copytree did)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "empty_subdir").mkdir(parents=True)
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    _materialize_directory(repo_root, worktree_path, ".devin")
+
+    assert (worktree_path / ".devin" / "empty_subdir").is_dir()
+    assert not any((worktree_path / ".devin" / "empty_subdir").iterdir())
+    assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
 
 
 def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
@@ -1896,6 +1934,194 @@ def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
     target_dir = info.path / ".devin"
     assert target_dir.exists()
     assert (target_dir / "hooks.json").read_text(encoding="utf-8") == "hooks\n"
+    assert ".devin/hooks.json" in info.materialized_paths
+
+
+def _simulated_require_ci_clean(worktree_path: Path) -> bool:
+    """Return True if the worktree has no staged or unstaged tracked changes."""
+    staged = subprocess.run(
+        ["git", "diff-index", "--cached", "--exit-code", "HEAD"],
+        cwd=worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unstaged = subprocess.run(
+        ["git", "diff", "--exit-code"],
+        cwd=worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return staged.returncode == 0 and unstaged.returncode == 0
+
+
+def test_materialize_directory_overwrites_tracked_prompt_and_hides_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #469: per-dispatch prompt files injected over tracked templates
+    must not leave the worktree dirty in ``git status``."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    # Simulate the orchestrator writing per-dispatch prompt content into the
+    # source tree (the content that the materializer will copy).
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "per-dispatch worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "per-dispatch rework\n", encoding="utf-8"
+    )
+
+    # Create a target worktree that already has the committed templates tracked.
+    worktree_path = tmp_path / "wt"
+    _git(repo_root, "clone", str(repo_root), str(worktree_path))
+    # Re-initialize the clone as a normal repo so git status is meaningful there.
+    _git(worktree_path, "config", "user.email", "test@example.test")
+    _git(worktree_path, "config", "user.name", "Test User")
+
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
+
+    assert set(written) == {
+        ".devin/prompts/worker.md",
+        ".devin/prompts/rework.md",
+        ".devin/config.json",
+    }
+    assert (worktree_path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch worker\n"
+    assert (worktree_path / ".devin" / "prompts" / "rework.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch rework\n"
+
+    # The copied prompt files should be marked assume-unchanged in the target.
+    ls_files = _git(worktree_path, "ls-files", "-v", ".devin/prompts/worker.md")
+    assert ls_files.stdout.startswith("h ")
+
+    # No tracked-file dirt visible to git status or a strict CI clean-tree gate.
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(worktree_path)
+
+
+def test_create_worktree_materialize_dirs_injects_prompt_and_keeps_clean_tree(
+    tmp_path: Path,
+) -> None:
+    """create_worktree with materialize_dirs must inject per-dispatch prompt
+    content over tracked templates while leaving the worktree clean."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    # Per-dispatch prompt content in the source tree.
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "per-dispatch worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "per-dispatch rework\n", encoding="utf-8"
+    )
+
+    info = create_worktree(
+        repo_root,
+        "agent/issue-469-materialize",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    assert set(info.materialized_paths) == {
+        ".devin/prompts/worker.md",
+        ".devin/prompts/rework.md",
+    }
+    assert (info.path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch worker\n"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(info.path)
+
+
+def test_create_worktree_materialize_dirs_survives_external_tracked_prompt_write(
+    tmp_path: Path,
+) -> None:
+    """Issue #469: tracked prompt files overwritten by an external shim after
+    create_worktree returns must not dirty the worktree.
+
+    The assume-unchanged bit must be applied proactively to every tracked path
+    under the configured materialize surface at worktree-creation time, not only
+    to paths whose content differed from the source tree during the copy loop.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    info = create_worktree(
+        repo_root,
+        "agent/issue-469-shim-write",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    # Source content matches HEAD, so the materializer does not rewrite anything.
+    assert info.materialized_paths == ()
+
+    # Simulate the external launch shim writing per-dispatch content into the
+    # worktree after create_worktree has already returned.
+    (info.path / ".devin" / "prompts" / "worker.md").write_text("shim worker\n", encoding="utf-8")
+
+    ls_files = _git(info.path, "ls-files", "-v", ".devin/prompts/worker.md")
+    assert ls_files.stdout.startswith("h ")
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(info.path)
 
 
 def test_resolve_default_branch_ref_with_origin(tmp_path: Path) -> None:
@@ -3107,6 +3333,43 @@ def test_worker_authored_dirty_renamed_tracked_file_not_injected(tmp_path: Path)
     assert _worker_authored_dirty(repo_root, ("prompt-renamed.md",)) is False
 
 
+def test_worker_authored_dirty_excludes_materialize_dirs_surface(
+    tmp_path: Path,
+) -> None:
+    """Issue #471: tracked modifications confined to the configured
+    ``materialize_dirs`` surface must not count as worker-authored dirt,
+    even when the assume-unchanged bit is not set.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    prompt = repo_root / ".devin" / "prompts" / "worker.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("original prompt\n", encoding="utf-8")
+    _git(repo_root, "add", str(prompt))
+    _git(repo_root, "commit", "-m", "track prompt template")
+
+    # Simulate an external launch shim rewriting the tracked prompt in place
+    # without the assume-unchanged bit set.
+    prompt.write_text("per-dispatch prompt\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (), (".devin",)) is False
+
+
+def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
+    tmp_path: Path,
+) -> None:
+    """Issue #471: a modification outside both ``injected_paths`` and
+    ``materialize_dirs`` must still trip the worktree-safety guard.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
     """A clean worktree with no commits beyond the base is no_commits."""
     remote, repo = _init_repo_with_remote(tmp_path)
@@ -4309,3 +4572,182 @@ def test_create_worktree_remote_probe_failure_names_subcommand_and_uses_shorter_
     ls_remote_calls = [c for c in calls if c[0][:3] == ["git", "ls-remote", "origin"]]
     assert ls_remote_calls
     assert all(timeout == worktree._REMOTE_TIMEOUT_SECONDS for _cmd, timeout in ls_remote_calls)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_remove_worktree_directory_symlink_preserves_shared_venv_target(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: directory symlinks (and junctions) at .venv must be unlinked,
+    never followed into the shared venv target.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    info = create_worktree(repo_root, "agent/issue-462-symlink", base_ref="HEAD")
+    venv_path = info.path / ".venv"
+    if venv_path.exists() or is_junction(venv_path):
+        _unlink_reparse_point(venv_path)
+
+    # Prefer a real directory symlink; fall back to a junction when the
+    # process lacks the symlink privilege on this Windows machine.
+    try:
+        os.symlink(shared_venv, venv_path, target_is_directory=True)
+    except OSError:
+        import _winapi
+
+        _winapi.CreateJunction(str(shared_venv), str(venv_path))
+
+    assert venv_path.is_symlink() or is_junction(venv_path)
+
+    removed = remove_worktree(repo_root, info.path)
+
+    assert removed is True
+    assert not info.path.exists()
+    assert shared_venv.exists()
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+
+
+def test_remove_worktree_force_fallback_rmtree_succeeds_when_git_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: when git worktree remove fails, the force fallback rmtree
+    removes the tree and reports success.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-fallback", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is True
+    assert not info.path.exists()
+
+
+def test_remove_worktree_reports_failure_when_tree_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #462: post-delete verification reports failure when the directory
+    is not actually removed.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-462-survives", base_ref="HEAD")
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:3] == ["git", "worktree", "remove"]:
+            return RunResult(returncode=1, stdout="", stderr="", error="simulated git failure")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+    monkeypatch.setattr(worktree_mod, "_robust_rmtree", lambda path: None)
+
+    removed = remove_worktree(repo_root, info.path, force=True)
+
+    assert removed is False
+    assert info.path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
+def test_clean_worktrees_orphan_sweep_removes_unregistered_tree_with_reparse_point(
+    tmp_path: Path,
+) -> None:
+    """Issue #462: orphan directories left after a failed git worktree remove are
+    detected and removed without following reparse points.
+    """
+    import _winapi
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    _git(repo_root, "add", ".gitignore")
+    _git(repo_root, "commit", "-m", "ignore venv")
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared contents\n", encoding="utf-8")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    orphan_dir = worktrees_dir / "agent-issue-462-orphan"
+    orphan_dir.mkdir(parents=True)
+    (orphan_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
+    _winapi.CreateJunction(str(shared_venv), str(orphan_dir / ".venv"))
+
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=462, pr_number=462)
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert result.ok is True
+    assert not orphan_dir.exists()
+    assert shared_venv.exists()
+    assert marker.read_text(encoding="utf-8") == "shared contents\n"
+    assert any(str(orphan_dir) == r["worktree"] for r in result.data["orphans"]["removed"])
+
+
+def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A git worktree list failure must not be read as zero registered worktrees.
+
+    The orphan sweep must be skipped and surfaced as an attention event so a
+    transient git hiccup cannot silently destroy live worker state.
+    """
+    from charlie_work.subprocess_runner import RunResult
+    import charlie_work.worktree as worktree_mod
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    info = create_worktree(repo_root, "agent/issue-1-live", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=1, pr_number=101)
+
+    original_run = worktree_mod.run_captured
+
+    def fake_run(args: list[str], **kwargs: Any) -> RunResult:
+        if args[:4] == ["git", "worktree", "list", "--porcelain"]:
+            return RunResult(
+                returncode=1,
+                stdout="",
+                stderr="simulated git failure",
+                error="simulated git failure",
+            )
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "run_captured", fake_run)
+
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert info.path.exists()
+    assert not result.data["orphans"]["removed"]
+    assert not result.data["orphans"]["failed"]
+    assert any(e["type"] == "worktree_list_failed" for e in result.data["attention_events"])
+    assert result.ok is False

@@ -347,6 +347,7 @@ def detect_drift(
                         worktree_path,
                         config.dispatch.base_ref,
                         config.dispatch.injected_paths,
+                        config.dispatch.materialize_dirs,
                     )
                     is_completed = inspection.state == WorktreeState.COMPLETED
 

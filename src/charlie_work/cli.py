@@ -16,8 +16,9 @@ from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
+from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
-from .state import StateLockBusy, load_state_locked
+from .state import StateLockBusy, load_state_locked, utc_now
 from .supervise import orchestrator_root, self_deploy
 from .runners import (
     decide_autoscale,
@@ -124,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     record.add_argument("--summary", default="")
     record.add_argument("--summary-file", type=Path, default=None)
+    record.add_argument("--reviewed-head", default=None)
     record.add_argument("--comment", action="store_true")
 
     merge_ready = subparsers.add_parser("ship-it")
@@ -346,10 +348,46 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
     deploy = self_deploy(orchestrator_root(), fleet_dir_override=args.fleet_dir)
-    if deploy.synced:
-        print(f"self-deploy: {deploy.message}", flush=True)
-    elif not deploy.ok:
+    if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
+        notify_config = getattr(global_config, "notify", None) if global_config else None
+        if notify_config is not None and getattr(notify_config, "enabled", False):
+            attention_digest = AttentionDigest(
+                generated_at=utc_now(),
+                repo="fleet",
+                transitions=(
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=deploy.error,
+                        pid=None,
+                    ),
+                ),
+            )
+            emit_digest(notify_config, attention_digest)
+    elif deploy.synced:
+        print(f"self-deploy: {deploy.message}", flush=True)
+    elif deploy.venv_repaired:
+        print(f"self-deploy: {deploy.message}", flush=True)
+        notify_config = getattr(global_config, "notify", None) if global_config else None
+        if notify_config is not None and getattr(notify_config, "enabled", False):
+            attention_digest = AttentionDigest(
+                generated_at=utc_now(),
+                repo="fleet",
+                transitions=(
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="REPAIRED",
+                        previous_health=None,
+                        last_log_line=deploy.message,
+                        pid=None,
+                    ),
+                ),
+            )
+            emit_digest(notify_config, attention_digest)
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -815,6 +853,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary=args.summary,
                 summary_file=args.summary_file,
                 comment=args.comment,
+                reviewed_head=args.reviewed_head,
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})

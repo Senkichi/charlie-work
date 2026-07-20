@@ -8748,6 +8748,63 @@ def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None
     assert decision["summary"] == "CI failed on Tests passed; push a fix"
 
 
+def test_janitor_required_check_failure_after_stale_packet_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: a stale review packet on disk must not block the automated
+    check-failure rework path; review() must record the verdict against the
+    live PR head, not the stale packet head."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    passing_checks = [
+        {"name": "Tests passed", "state": "SUCCESS"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    failing_checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    diff_a = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    diff_b = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+fix"
+    fake_gh = FakeGitHubWithChecks(checks=passing_checks)
+    fake_gh.diffs[456] = diff_a
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Round 1: clean review writes a packet at the original head.
+    result1 = app.review(456)
+    assert result1.ok is True
+    packet = paths.prs / "pr-456" / "pr.json"
+    assert packet.exists()
+    assert json.loads(packet.read_text(encoding="utf-8"))["headRefOid"] == "sha-abc123"
+
+    # Round 2: PR head advances and a required check fails.
+    fake_gh.checks = failing_checks
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = diff_b
+
+    result2 = app.review(456)
+
+    assert result2.ok is True, result2.message
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-new-head"
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    assert "CI failed on Tests passed; push a fix" in rework_prompt.read_text(encoding="utf-8")
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-new-head"
+    assert decision["reviewed_head_source"] == "live"
+
+
 def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
     tmp_path: Path,
 ) -> None:
@@ -11793,15 +11850,22 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "live"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
     assert result.data["reviewed_head_sha"] == "sha-abc123"
+    assert result.data["reviewed_head_source"] == "live"
 
 
-def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path: Path) -> None:
-    """A commit landing between review() (packet generation) and record_review()
-    (verdict recording) must not reattribute the approval to a head/diff that
-    was never reviewed: reviewed_head_sha and reviewed_patch_id must come from
-    the packet the reviewer actually read, not a fresh fetch at verdict time.
+def test_record_review_requires_explicit_head_when_packet_and_live_differ(
+    tmp_path: Path,
+) -> None:
+    """Issue #467: when the packet head and live PR head differ, record_review
+    must refuse to silently choose a source and must record provenance.
+
+    A commit landing between review() (packet generation) and record_review()
+    (verdict recording) now requires an explicit --reviewed-head choice.
+    Selecting the packet head preserves the original packet SHA/diff; selecting
+    the live head records the new SHA/diff and provenance.
     """
     from charlie_work.janitor import _calculate_patch_id
 
@@ -11815,19 +11879,45 @@ def test_record_review_pins_reviewed_head_sha_to_packet_not_live_fetch(tmp_path:
     assert review_result.ok is True
     packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
-    # Simulate a new commit landing after the packet was generated but before
-    # the verdict is recorded.
+    # Simulate a new commit landing after the packet was generated.
     fake_gh.pr_head_shas[456] = "sha-new789"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
-
-    result = app.record_review(456, "approved", summary="lgtm")
+    live_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    # Without an explicit choice, the verdict must fail loudly and must not
+    # overwrite the pending decision file written by review().
+    result = app.record_review(456, "approved", summary="lgtm")
+    assert result.ok is False
+    assert "sha-abc123" in result.message
+    assert "sha-new789" in result.message
+    assert "--reviewed-head" in result.message
+    assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"
+
+    # Choosing the original packet head records the packet SHA, patch, and source.
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-abc123")
+    assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "packet"
     assert decision["reviewed_patch_id"] == packet_patch_id
+    assert result.data["reviewed_head_source"] == "packet"
     assert load_state(paths.state_file)["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
-    assert result.data["reviewed_head_sha"] == "sha-abc123"
+
+    # Choosing the live head records the live SHA, live patch, and source.
+    decision_path.unlink()
+    state = load_state(paths.state_file)
+    state["prs"].pop("456", None)
+    save_state(paths.state_file, state)
+
+    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    assert result.ok is True
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["reviewed_head_sha"] == "sha-new789"
+    assert decision["reviewed_head_source"] == "live"
+    assert decision["reviewed_patch_id"] == live_patch_id
+    assert result.data["reviewed_head_source"] == "live"
 
 
 def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> None:
@@ -11925,7 +12015,7 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
     result = app.record_review(456, "approved", summary="")
 
     assert result.ok is True
-    assert result.message == "review recorded"
+    assert result.message == "review recorded (head from live)"
     # Verify state mutation occurred
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "approved"
 
@@ -15599,12 +15689,9 @@ def test_merge_ready_current_base_no_sync(tmp_path: Path) -> None:
     assert decision["reviewed_head_sha"] == "sha-abc123"
 
 
-def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
-    """Issue #371: an approved PR with a genuine merge conflict is routed to rework.
-
-    A conflict is detected from ``mergeable=CONFLICTING`` and is not retried
-    with ``gh pr update-branch``. Instead, the linked issue moves to
-    ``rework_requested`` and dispatch_rework can select it.
+def test_merge_ready_conflict_rework_debounces_and_preserves_approval(tmp_path: Path) -> None:
+    """Issue #456: conflict rework must not fire until N consecutive CONFLICTING
+    passes and must not clobber the approved review decision.
     """
     from charlie_work.config import AutoMergeConfig, DevinConfig
 
@@ -15612,6 +15699,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs="next",
+            failed_attempt_alarm=3,
         ),
         devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
     )
@@ -15635,13 +15723,105 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    original_decision = json.loads(decision_path.read_text())
+
+    # Two consecutive CONFLICTING passes must NOT dispatch rework yet.
+    for _ in range(2):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["can_merge"] is False
+        assert result.data["merge_conflict"] is True
+        assert result.data["merge_attempt_alarm"] is False
+        state = load_state(paths.state_file)
+        assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+        assert state["issues"]["123"]["status"] == "approved"
+        current_decision = json.loads(decision_path.read_text())
+        assert current_decision["decision"] == "approved"
+        assert current_decision["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+        assert current_decision["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+
+    # The third consecutive CONFLICTING pass reaches the alarm threshold and
+    # dispatches conflict rework. The approved verdict must survive untouched.
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["pr_number"] == 456
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+    assert "conflict_rework_requested_at" in conflict_events[0]["payload"]
+
+    current_decision = json.loads(decision_path.read_text())
+    assert current_decision["decision"] == "approved"
+    assert current_decision["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert current_decision["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert state["prs"]["456"]["decision"] == "approved"
+    assert state["prs"]["456"]["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert state["prs"]["456"]["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert "conflict_rework_requested_at" in state["prs"]["456"]
+
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+
+def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #371/#456: an approved PR with a genuine merge conflict is routed to rework.
+
+    A conflict is detected from ``mergeable=CONFLICTING`` and is not retried
+    with ``gh pr update-branch``. With the alarm threshold set to 1, a single
+    CONFLICTING pass dispatches conflict rework. The approved verdict and its
+    patch-id must survive so carry-forward can re-approve the rework push.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    original_decision = json.loads(decision_path.read_text())
+
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
     assert result.data["can_merge"] is False
     assert result.data["merge_conflict"] is True
-    assert result.data["merge_attempt_alarm"] is False
-    assert result.data["merge_attempt_warning"] is None
+    assert result.data["merge_attempt_alarm"] is True
+    assert result.data["merge_attempt_warning"] is not None
     # The sync step is bypassed: the PR head should not be advanced.
     assert fake_gh.prs[0]["headRefOid"] == "sha-abc123"
 
@@ -15655,6 +15835,16 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     assert len(conflict_events) == 1
     assert conflict_events[0]["payload"]["pr_number"] == 456
     assert conflict_events[0]["payload"]["issue_number"] == 123
+
+    # The approved verdict must not be clobbered by the rework request.
+    current_decision = json.loads(decision_path.read_text())
+    assert current_decision["decision"] == "approved"
+    assert current_decision["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert current_decision["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert state["prs"]["456"]["decision"] == "approved"
+    assert state["prs"]["456"]["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert state["prs"]["456"]["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert "conflict_rework_requested_at" in state["prs"]["456"]
 
     # The rework prompt was written and the issue was labeled for rework.
     prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
@@ -16288,6 +16478,169 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     # human_needed must stay in place.
     assert fake_gh.labels_removed == labels_removed_before
     assert fake_gh.labels_added == labels_added_before
+
+
+def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #456 rework: a verdict carry-forward resets the failed-attempt
+    counter and must not be defeated by the stale dispatch decision.
+
+    A PR whose head moved but whose cumulative diff is unchanged carries the
+    approved verdict forward and resets ``consecutive_failed_merge_attempts``.
+    If the PR is still CONFLICTING after the head move, the dispatch gate must
+    re-read the counter fresh and debounce from the new baseline instead of
+    dispatching based on the pre-reset count.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[pr_number] = diff_text
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}: search",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix-search",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": f"Closes #{issue_number}\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Two CONFLICTING passes with the original head bring the counter to 2.
+    for _ in range(2):
+        result = app.merge_ready(pr_number, merge=False)
+        assert result.data["merge_conflict"] is True
+        assert result.data["merge_attempt_alarm"] is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["consecutive_failed_merge_attempts"] == 2
+
+    # The PR head advances, but the cumulative diff is unchanged, so the
+    # approved verdict carries forward and resets the failed-attempt counter.
+    fake_gh.prs[0]["headRefOid"] = new_head
+    fake_gh.diffs[pr_number] = diff_text
+
+    result = app.merge_ready(pr_number, merge=False)
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["consecutive_failed_merge_attempts"] == 1
+
+    state = load_state(paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["status"] == "approved"
+    assert state["prs"][str(pr_number)]["consecutive_failed_merge_attempts"] == 1
+    assert any(e["kind"] == "verdict_carried_forward_clean_rebase" for e in state["events"])
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    assert (issue_number, config.labels.needs_rework) not in fake_gh.labels_added
+
+    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+    decision = json.loads(decision_path.read_text())
+    assert decision["reviewed_head_sha"] == new_head
+    assert decision["reviewed_patch_id"] == patch_id
+
+
+def test_merge_ready_conflict_dispatch_rechecks_issue_status_under_lock(
+    tmp_path: Path,
+) -> None:
+    """Issue #456 rework: the conflict-rework dispatch gate re-reads issue
+    status under lock after the network-I/O window.
+
+    If a concurrent pass moves the linked issue into an in-flight state while
+    this pass is fetching checks/diff/containment, dispatch must bail silently
+    and must not clobber the in-flight status or dispatch a duplicate rework.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    class RaceGitHub(FakeGitHub):
+        def __init__(self, state_file: Path):
+            super().__init__()
+            self.state_file = state_file
+
+        def pr_checks(self, number: int):
+            # Simulate a concurrent pass transitioning the issue to 'dispatched'
+            # while this merge_ready pass was blocked on network I/O.
+            with state_lock(self.state_file):
+                state = load_state(self.state_file)
+                issue = state.setdefault("issues", {}).get("123")
+                if issue is not None:
+                    issue["status"] = "dispatched"
+                    save_state(self.state_file, state)
+            return super().pr_checks(number)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = RaceGitHub(paths.state_file)
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["merge_conflict"] is True
+    assert result.data["merge_attempt_alarm"] is True
+    assert result.data["merge_attempt_warning"] is not None
+    assert "merge conflict" in (result.data["merge_attempt_warning"] or "").lower()
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
 
 def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) -> None:
@@ -18395,7 +18748,7 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
                 "number": 456,
                 "title": "PR for issue 123",
                 "url": "https://example.test/pr/456",
-                "headRefOid": "abc123",
+                "headRefOid": "sha-abc123",
                 "isCrossRepository": False,
                 "headRefName": "agent/issue-123",
             }
@@ -20705,7 +21058,8 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes", return_value=[3492]
+            "charlie_work.workflow.sweep_orphan_processes",
+            return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
@@ -21040,12 +21394,25 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         process_start_time=1234567890.0,
     )
 
-    # Mock sweep_orphan_processes to return fixed PIDs for dead worktrees
-    def mock_sweep_orphan(worktree_path: str) -> list[int]:
+    # Mock sweep_orphan_processes to return fixed orphan process details for dead worktrees
+    def mock_sweep_orphan(worktree_path: str) -> list[dict[str, Any]]:
         if worktree_path == "/dead/worktree":
-            return [5000, 5001]
+            return [
+                {
+                    "pid": 5000,
+                    "name": "python.exe",
+                    "command_line": "python script.py /dead/worktree",
+                },
+                {"pid": 5001, "name": "node.exe", "command_line": "node server.js /dead/worktree"},
+            ]
         elif worktree_path == "/dead/worker":
-            return [6000]
+            return [
+                {
+                    "pid": 6000,
+                    "name": "python.exe",
+                    "command_line": "python worker.py /dead/worker",
+                },
+            ]
         return []
 
     # Mock subprocess.run to track taskkill calls
@@ -25093,3 +25460,374 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
     result3 = app.dispatch(limit=1)
     assert result3.ok is True
     assert result3.data["selected_count"] == 0
+
+
+def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
+    """Issue #457: dead worker with request_changes and an advanced head is routed
+    to the review-pending path instead of being re-emitted as drift."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",  # Changed since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    def fake_review(pr_number: int):
+        return CommandResult(True, "review packet generated", {"pr_number": pr_number})
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["457"]
+
+    # Should transition to the review-pending state, not stay dispatched.
+    assert entry.get("status") == "reviewing"
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 0
+
+    routed_events = [e for e in events if e.get("kind") == "orphaned_worker_routed_to_review"]
+    assert len(routed_events) == 1
+    assert routed_events[0]["payload"]["issue_number"] == 457
+    assert routed_events[0]["payload"]["pr_number"] == 100
+    assert routed_events[0]["payload"]["review_ok"] is True
+    assert routed_events[0]["payload"]["routed"] is True
+
+
+def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path: Path) -> None:
+    """Issue #457: if routing to review fails, the head-advance finding is emitted
+    as a single drift event and not re-emitted on subsequent passes."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    def fake_review(pr_number: int):
+        return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["457"]
+
+    # Status should remain dispatched; the finding is tracked as drift.
+    assert entry.get("status") == "dispatched"
+    assert "orphan_drift_fingerprint" in entry
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_with_head_change"
+
+    routed_events = [e for e in events if e.get("kind") == "orphaned_worker_routed_to_review"]
+    assert len(routed_events) == 0
+
+    # Second pass must not re-emit the drift.
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+        )
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1, "drift must not be re-emitted for the same fingerprint"
+
+
+def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -> None:
+    """Issue #457: non-request_changes dead workers emit a drift finding once and
+    are not re-emitted on every subsequent pass."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # Last decision is "approved" instead of "request_changes".
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(3):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+
+
+def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #457 review: a fresh dispatch clears the drift fingerprint.
+
+    Without this, a worker that dies twice in the same failure class would
+    recompute an identical fingerprint and the second orphaned_worker_drift
+    event would be suppressed forever.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+        def issue_view(self, number: int):
+            if number == 457:
+                return {
+                    "number": 457,
+                    "title": "Orphan drift test",
+                    "url": "https://example.test/issues/457",
+                    "body": "",
+                    "labels": [{"name": config.labels.needs_rework}],
+                    "state": "OPEN",
+                }
+            return super().issue_view(number)
+
+    fake_gh = FakeGitHubForOrphan()
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "number": 457,
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+    assert "orphan_drift_fingerprint" in state["issues"]["457"]
+
+    # Simulate an external claim reset/redispatch: the issue returns to the
+    # rework queue and dispatch_rework claims it again.
+    state = load_state(paths.state_file)
+    state["issues"]["457"]["status"] = "rework_requested"
+    save_state(paths.state_file, state)
+
+    rework_prompt = paths.prs / "pr-100" / "rework-prompt.md"
+    rework_prompt.parent.mkdir(parents=True, exist_ok=True)
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+                pid=12345,
+                process_start_time=0.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["457"]["status"] == "dispatched"
+    assert "orphan_drift_fingerprint" not in state["issues"]["457"]
+
+    # Force the identical drift conditions again after the redispatch.
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 2, (
+        f"Expected two orphaned_worker_drift events across dispatch generations, "
+        f"got {len(drift_events)}"
+    )
+
+
+def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> None:
+    """Issue #457: dispatch_rework must not run the orphaned-worker sweep, which is
+    already run once per pass by loop(), to avoid duplicate drift events."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPrs(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPrs()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    orphan_calls = []
+
+    def tracking_orphan_sweep(*args, **kwargs):
+        orphan_calls.append((args, kwargs))
+
+    with patch(
+        "charlie_work.workflow._detect_and_handle_orphaned_workers",
+        side_effect=tracking_orphan_sweep,
+    ):
+        result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert len(orphan_calls) == 0, "dispatch_rework must not re-run orphaned-worker detection"

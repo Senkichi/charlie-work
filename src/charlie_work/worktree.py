@@ -155,6 +155,11 @@ class WorktreeInfo:
     # Set when a redispatch reset a branch tip that had commits worth
     # preserving (issue #261) — see attempt_refs.snapshot_attempt_ref.
     attempt_snapshot: AttemptSnapshot | None = None
+    # Forward-slash-normalized worktree-relative paths written by the materializer
+    # (issue #469). Derived from what the materializer actually writes, never a
+    # hardcoded list, and used to keep injected orchestrator-owned files from
+    # appearing as dirty in git status / CI-parity clean-tree gates.
+    materialized_paths: tuple[str, ...] = ()
 
 
 class WorktreeState(str, Enum):
@@ -407,18 +412,15 @@ def _resolve_default_branch_ref(repo_root: Path) -> str:
         cwd=repo_root,
         timeout_seconds=_REMOTE_TIMEOUT_SECONDS,
     )
-    if not set_head_result.ok:
-        raise RuntimeError(
-            f"git remote set-head origin --auto failed: "
-            f"{set_head_result.error or set_head_result.stderr}"
-        )
     resolved = _read_origin_head_symref(repo_root)
     if resolved is not None:
         return resolved
 
+    detail = set_head_result.error or set_head_result.stderr
     raise RuntimeError(
         "Cannot resolve origin's default branch: refs/remotes/origin/HEAD is "
-        "unset and 'git remote set-head origin --auto' did not heal it. "
+        "unset and 'git remote set-head origin --auto' did not heal it"
+        f"{f' ({detail})' if detail else ''}. "
         "Refusing to base a fresh worktree on local HEAD (issue #239)."
     )
 
@@ -573,15 +575,17 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
 def _worker_authored_dirty(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> bool:
     """Return True if the worktree has uncommitted changes that are NOT
-    orchestrator-injected prompt files.
+    orchestrator scaffolding.
 
-    ``injected_paths`` are worktree-relative paths (files or directories) that
-    the orchestrator writes into the worktree (e.g. the Claude Code prompt
-    file, or a custom ``.devin/prompts/...`` convention that the operator has
+    ``injected_paths`` and ``materialize_dirs`` are worktree-relative paths
+    (files or directories) that the orchestrator writes into the worktree
+    (e.g. the Claude Code prompt file, per-dispatch prompt templates under
+    ``.devin/prompts/...``, or a custom convention the operator has
     configured). They are excluded from the dirty check so completed worker
-    work is not stranded by prompt-injection noise (issue #381).
+    work is not stranded by scaffolding noise (issue #381, issue #471).
 
     Uses ``git status --porcelain=v2 -z --untracked-files=all``:
     ``--untracked-files=all`` disables directory collapsing, so every
@@ -591,7 +595,7 @@ def _worker_authored_dirty(
     single ``?? dir/`` line could hide a worker-authored sibling file next to
     a configured injected path or directory, and a probe re-scoped to that
     directory was needed to tell the two apart). Every entry — whether it
-    matches an injected file or a whole injected directory — is now checked
+    matches an excluded file or a whole excluded directory — is now checked
     against the same normalized-path predicate below, with no separate
     collapse-probing code path to keep in sync.
 
@@ -620,12 +624,14 @@ def _worker_authored_dirty(
 
     # Normalize the configured side too, so a Windows-style backslash override
     # still matches git's forward-slash path reporting.
-    injected = [PurePosixPath(str(p).replace("\\", "/")) for p in injected_paths]
+    excluded = [
+        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
+    ]
     for raw_path in _parse_status_v2_paths(status_result.stdout):
         # Git may emit backslashes on Windows; normalize for comparison.
         path = PurePosixPath(str(raw_path).replace("\\", "/"))
         if any(
-            path == injected_path or injected_path in path.parents for injected_path in injected
+            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
         ):
             continue
         return True
@@ -638,6 +644,7 @@ def _worktree_refuse_to_reset_reason(
     base_ref: str,
     worktree_path: Path | None = None,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> str | None:
     """Return a human-readable reason if resetting the branch/worktree would destroy
     local work, otherwise ``None``.
@@ -660,7 +667,7 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        if _worker_authored_dirty(worktree_path, injected_paths):
+        if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "HEAD"],
@@ -768,6 +775,7 @@ def _worktree_refuse_to_reset_reason(
 def _worktree_dirty_reason(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> str | None:
     """Return a reason string if ``worktree_path`` has uncommitted modifications.
 
@@ -786,7 +794,7 @@ def _worktree_dirty_reason(
     """
     if not worktree_path.is_dir():
         return None
-    if _worker_authored_dirty(worktree_path, injected_paths):
+    if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
         return "worktree has uncommitted modifications"
     return None
 
@@ -806,7 +814,17 @@ def _is_pristine_orchestrator_worktree(
     """
     if not worktree_path.is_dir():
         return False
-    if _worker_authored_dirty(worktree_path, injected_paths):
+    # A truly pristine worktree has no uncommitted changes at all, including
+    # orchestrator-injected prompt files. Injected-only dirty worktrees are
+    # reclaimed by pruning and recreating, not by reuse (issue #381), while
+    # still avoiding the remote git probe because the subsequent reset guard
+    # runs the same local checks.
+    status_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok or status_result.stdout.strip():
         return False
 
     head_result = run_captured(
@@ -961,15 +979,76 @@ def is_junction(path: Path) -> bool:
 def _unlink_reparse_point(path: Path) -> None:
     """Remove a reparse point (Windows junction/symlink) or POSIX symlink.
 
-    ``os.rmdir`` is used on Windows because it removes the reparse point
-    itself without following into the target directory. ``os.unlink`` is used
-    on POSIX because ``os.rmdir`` raises on a symlink. In both cases the
-    target is left untouched.
+    On Windows, ``os.unlink`` removes a directory symlink (a name-surrogate
+    reparse point) without following into the target.  Some Windows/Python
+    combinations reject ``os.unlink`` on a junction with ``EACCES`` or
+    ``EISDIR``; ``os.rmdir`` is the fallback because it removes the reparse
+    point itself, never the target directory it points at.  On POSIX,
+    ``os.unlink`` removes the symlink.  In all cases the target is left
+    untouched.
     """
     if os.name == "nt":
-        os.rmdir(path)
+        try:
+            os.unlink(path)
+        except (IsADirectoryError, PermissionError, OSError):
+            # Older Windows builds or junctions may reject unlink; rmdir on a
+            # reparse point removes the link, not the target.
+            os.rmdir(path)
     else:
         os.unlink(path)
+
+
+def _unlink_worktree_reparse_points(worktree_path: Path) -> None:
+    """Unlink all reparse points inside ``worktree_path`` without following them.
+
+    ``os.walk`` with ``followlinks=False`` does not descend into symlinks, but
+    it may still list directory-symlink and junction names in ``dirnames``.
+    We prune those entries after unlinking them so the walk never treats a
+    reparse point as a real directory to recurse into.  Regular files and
+    directories are left untouched.
+    """
+    if not worktree_path.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(
+        str(worktree_path), topdown=True, onerror=lambda exc: None
+    ):
+        parent = Path(dirpath)
+        for name in dirnames + filenames:
+            child = parent / name
+            try:
+                if child.is_symlink() or is_junction(child):
+                    _unlink_reparse_point(child)
+            except OSError:
+                # Best-effort: leave the path for the rmtree fallback to report.
+                pass
+        # Do not descend into directories that are actually reparse points.
+        remaining: list[str] = []
+        for d in dirnames:
+            dpath = parent / d
+            try:
+                if dpath.is_symlink() or is_junction(dpath):
+                    continue
+            except OSError:
+                pass
+            remaining.append(d)
+        dirnames[:] = remaining
+
+
+def _robust_rmtree(path: Path) -> bool:
+    """Remove a directory tree, never following reparse points into targets.
+
+    Unlinks all junctions/symlinks first, then deletes the remaining files and
+    directories with ``shutil.rmtree``.  Returns True when the path no longer
+    exists.
+    """
+    if not path.exists() and not is_junction(path):
+        return True
+    _unlink_worktree_reparse_points(path)
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        return False
+    return not path.exists() and not is_junction(path)
 
 
 def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
@@ -999,26 +1078,95 @@ def _is_git_tracked(repo_root: Path, path: Path) -> bool:
     return result.ok
 
 
-def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> None:
-    """Copy a directory from repo_root to worktree_path if it's not tracked.
+def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> tuple[str, ...]:
+    """Copy files from ``repo_root / dir_path`` into the worktree.
 
-    Skip if the path is already tracked by git (it will be in the worktree).
-    Copy-not-link (workers may write marker files). Errors surface as OSError.
+    Files are copied file-by-file; existing target files are only overwritten
+    when the source content differs. All tracked paths under the configured
+    materialize surface are marked ``assume-unchanged`` so that orchestrator-
+    injected content (e.g. per-dispatch ``.devin/prompts/worker.md``) written by
+    an external shim or worker after ``create_worktree`` returns does not
+    appear as working-tree dirt in ``git status`` or CI-parity clean-tree
+    gates. Empty source subdirectories are recreated in the target (matching
+    the behaviour of the previous ``shutil.copytree`` implementation).
+
+    Returns a tuple of worktree-relative paths (forward-slash normalized) that
+    were written, derived from the materializer's own manifest.
     """
-    source = repo_root / dir_path
+    dir_path_posix = Path(dir_path).as_posix()
+    source = repo_root / dir_path_posix
     if not source.exists():
-        return  # Source doesn't exist, nothing to copy
+        return ()
+    if not source.is_relative_to(repo_root):
+        return ()
 
-    # Check if the path is tracked by git
-    if _is_git_tracked(repo_root, source):
-        return  # Tracked paths are already in the worktree
+    target_root = worktree_path / dir_path_posix
+    if source.is_file():
+        source_files = [source]
+        source_root = source.parent
+    else:
+        source_files = [p for p in source.rglob("*") if p.is_file()]
+        source_root = source
 
-    # Copy the directory to the worktree
-    target = worktree_path / dir_path
-    if target.exists():
-        return  # Already exists in worktree (shouldn't happen, but be safe)
+    written: list[str] = []
+    for src_file in source_files:
+        if ".git" in src_file.parts:
+            continue
 
-    shutil.copytree(source, target)
+        if source.is_file():
+            rel = Path(".")
+        else:
+            rel = src_file.relative_to(source_root)
+        target_file = (target_root / rel).resolve()
+        if target_file.is_dir():
+            continue
+        if target_file.exists():
+            try:
+                if target_file.read_bytes() == src_file.read_bytes():
+                    continue
+            except OSError:
+                pass
+
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, target_file)
+        rel_worktree = (Path(dir_path_posix) / rel).as_posix()
+        written.append(rel_worktree)
+
+    # Recreate empty source subdirectories that the file copy loop above would
+    # otherwise silently drop.
+    if source.is_dir():
+        target_root.mkdir(parents=True, exist_ok=True)
+        for src_dir in source.rglob("*"):
+            if not src_dir.is_dir() or ".git" in src_dir.parts:
+                continue
+            rel = src_dir.relative_to(source_root)
+            (target_root / rel).mkdir(parents=True, exist_ok=True)
+
+    # Mark every tracked path under the configured materialize surface as
+    # assume-unchanged, regardless of whether the materializer's own copy loop
+    # rewrote it. This is what shields injected files from later writes (e.g.
+    # a worker launch shim mutating ``.devin/prompts/*.md`` after
+    # ``create_worktree`` returns) from ``git status`` and clean-tree gates.
+    ls_result = run_captured(
+        ["git", "ls-files", "--", dir_path_posix],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if ls_result.ok:
+        tracked_paths = [line for line in ls_result.stdout.splitlines() if line]
+        if tracked_paths:
+            assume_result = run_captured(
+                ["git", "update-index", "--assume-unchanged", "--", *tracked_paths],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not assume_result.ok:
+                raise RuntimeError(
+                    f"Failed to mark materialized paths as assume-unchanged: "
+                    f"{assume_result.error or assume_result.stderr}"
+                )
+
+    return tuple(written)
 
 
 _PERMANENT_NO_MATCH_ERROR_PREFIXES = (
@@ -1292,7 +1440,12 @@ def create_worktree(
         """Hard-refuse to reset if the worktree/branch contains local work."""
         check_path = target_path or worktree_path
         reason = _worktree_refuse_to_reset_reason(
-            repo_root, branch, resolved_base_ref, check_path, injected_paths
+            repo_root,
+            branch,
+            resolved_base_ref,
+            check_path,
+            injected_paths,
+            materialize_dirs,
         )
         if reason:
             raise WorktreeUnsafeError(reason)
@@ -1407,7 +1560,7 @@ def create_worktree(
                 wt_path = Path(existing_wt["worktree"])
                 # Check for dirty working tree, ignoring orchestrator-injected files.
                 try:
-                    has_dirty = _worker_authored_dirty(wt_path, injected_paths)
+                    has_dirty = _worker_authored_dirty(wt_path, injected_paths, materialize_dirs)
                 except WorktreeProbeFailedError:
                     # If the probe fails (index lock, corruption, permissions), treat as dirty to be safe
                     has_dirty = True
@@ -1541,7 +1694,9 @@ def create_worktree(
                         # the old tip (best-effort), compare patch-ids, and reset.
                         # Uncommitted worker-authored edits must survive, so refuse
                         # to reset a dirty worktree even when the branch diverged.
-                        dirty_reason = _worktree_dirty_reason(worktree_path, injected_paths)
+                        dirty_reason = _worktree_dirty_reason(
+                            worktree_path, injected_paths, materialize_dirs
+                        )
                         if dirty_reason:
                             raise WorktreeUnsafeError(dirty_reason)
                         _snapshot_before_delete(branch)
@@ -1763,16 +1918,19 @@ def create_worktree(
             raise
 
     # Materialize git-excluded directories into the worktree
+    materialized_paths: list[str] = []
     for dir_path in materialize_dirs:
         try:
-            _materialize_directory(repo_root, worktree_path, dir_path)
-        except OSError as exc:
+            written = _materialize_directory(repo_root, worktree_path, dir_path)
+        except (OSError, RuntimeError) as exc:
             # Clean up the worktree and branch if materialization fails
             delete_branch = None if rework else branch
             remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
             raise RuntimeError(
                 f"Failed to materialize directory {dir_path} into worktree: {exc}"
             ) from exc
+        else:
+            materialized_paths.extend(written)
 
     return WorktreeInfo(
         path=worktree_path,
@@ -1780,31 +1938,34 @@ def create_worktree(
         venv_junction=venv_junction,
         reclaimed=reclaimed,
         attempt_snapshot=attempt_snapshot,
+        materialized_paths=tuple(materialized_paths),
     )
 
 
 def remove_worktree(
     repo_root: Path, worktree_path: Path, *, force: bool = False, branch: str | None = None
 ) -> bool:
-    """Remove a worktree, taking care never to follow a ``.venv`` junction
-    into a shared virtualenv.
+    """Remove a worktree, taking care never to follow reparse points into a
+    shared virtualenv or other targets.
 
     Teardown order is mandatory:
       1. If ``<worktree>/.venv`` exists and is a real directory (not a
          junction/symlink), ABORT and return False unless ``force=True`` —
-         and even then, only the worktree-local directory is removed, never
-         a junction target.
-      2. If it is a junction/symlink, unlink the reparse point itself
-         (``os.rmdir`` on Windows; ``os.unlink`` on POSIX — never follows
-         into the target).
-      3. ``git worktree remove``.
-      4. On failure, ``git worktree prune`` to clear stale metadata.
-      5. If ``branch`` is provided, delete the branch with ``git branch -D``.
+         and even then, the directory is removed as part of the normal tree
+         deletion, never a junction target.
+      2. If ``.venv`` is a junction/symlink, unlink the reparse point itself.
+      3. Unlink any other reparse points found anywhere under the worktree so
+         ``git worktree remove``/``shutil.rmtree`` cannot follow them.
+      4. ``git worktree remove``.
+      5. On failure, ``git worktree prune`` to clear stale metadata, then a
+         reparse-point-safe ``shutil.rmtree`` fallback (only when ``force=True``
+         so we do not destroy uncommitted work the caller asked us to keep).
+      6. Verify the directory is actually gone; if not, report failure.
+      7. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
-    command failure); never raises for those. Programmer errors (e.g. a
-    nonexistent repo_root) surface as False via a failed git command, since
-    git itself reports the error rather than crashing this function.
+    command failure, directory survives); never raises for those. Programmer
+    errors surface as False via a failed git command.
     """
     venv_path = worktree_path / ".venv"
     if venv_path.exists() or is_junction(venv_path):
@@ -1819,21 +1980,37 @@ def remove_worktree(
             elif venv_path.is_dir():
                 if not force:
                     return False
-                shutil.rmtree(venv_path)
+                # Real .venv directory: let git remove --force / rmtree delete it.
             else:
                 venv_path.unlink()
         except OSError:
             return False
 
+    # Remove any other directory symlinks/junctions in the tree before git or
+    # rmtree touch it.  This is the single point of enforcement for reparse
+    # point safety during worktree teardown (issue #462).
+    _unlink_worktree_reparse_points(worktree_path)
+
     args = ["git", "worktree", "remove", str(worktree_path)]
     if force:
         args.append("--force")
     result = run_captured(args, cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
-    worktree_removed = result.ok
-    if not worktree_removed:
+    git_result_ok = result.ok
+    if not git_result_ok:
         run_captured(
             ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
         )
+        # When the caller has explicitly forced removal, fall back to a
+        # reparse-point-safe rmtree.  Without force we must not silently
+        # delete a worktree that git refused to remove (e.g. uncommitted work).
+        if force:
+            _robust_rmtree(worktree_path)
+
+    # Post-delete verification: report failure if the directory survived.
+    if not git_result_ok and not force:
+        worktree_removed = False
+    else:
+        worktree_removed = not worktree_path.exists() and not is_junction(worktree_path)
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
     # Attempt branch deletion independently of worktree-removal success to avoid
@@ -1954,6 +2131,7 @@ def inspect_worktree_state(
     worktree_path: Path,
     base_ref: str = "",
     injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> WorktreeInspection:
     """Inspect a worker worktree after the process dies.
 
@@ -1973,7 +2151,7 @@ def inspect_worktree_state(
         )
 
     try:
-        dirty = _worker_authored_dirty(worktree_path, injected_paths)
+        dirty = _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs)
     except WorktreeProbeFailedError as exc:
         return WorktreeInspection(
             WorktreeState.UNKNOWN,
@@ -2117,12 +2295,14 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
-def list_worktrees(repo_root: Path) -> list[dict]:
+def _list_worktrees_porcelain(repo_root: Path) -> tuple[list[dict], str | None]:
     """Parse ``git worktree list --porcelain`` into one dict per worktree.
 
-    Invalid entries (missing required 'worktree' key or unknown flag keys) are
-    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
-    with a Path value. This makes all downstream consumers safe by construction.
+    Returns a tuple of (worktrees, error_message). Invalid entries (missing
+    required 'worktree' key or unknown flag keys) are dropped entirely - every
+    returned dict is guaranteed to have a 'worktree' key with a Path value.
+    Git command failures are returned as an error string instead of an empty
+    list, so callers can distinguish "no worktrees" from "could not determine".
     """
     result = run_captured(
         ["git", "worktree", "list", "--porcelain"],
@@ -2130,7 +2310,8 @@ def list_worktrees(repo_root: Path) -> list[dict]:
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not result.ok:
-        return []
+        error = result.error or result.stderr or "git worktree list failed"
+        return [], error
 
     worktrees: list[dict] = []
     current: dict = {}
@@ -2169,6 +2350,20 @@ def list_worktrees(repo_root: Path) -> list[dict]:
     if current and not entry_malformed and "worktree" in current:
         worktrees.append(current)
 
+    return worktrees, None
+
+
+def list_worktrees(repo_root: Path) -> list[dict]:
+    """Parse ``git worktree list --porcelain`` into one dict per worktree.
+
+    Invalid entries (missing required 'worktree' key or unknown flag keys) are
+    dropped entirely - every returned dict is guaranteed to have a 'worktree' key
+    with a Path value. This makes all downstream consumers safe by construction.
+
+    Git command failures return an empty list; callers that need to distinguish
+    "empty" from "unknown" should use ``_list_worktrees_porcelain``.
+    """
+    worktrees, _ = _list_worktrees_porcelain(repo_root)
     return worktrees
 
 
@@ -2310,7 +2505,8 @@ class WorktreeCleanResult:
     """Result of a ``clean_worktrees`` run.
 
     ``data`` carries ``planned``/``removed``/``skipped``/``failed`` (lists of
-    per-worktree dicts) plus ``venv_ok``/``venv_message``. Kept as a dict
+    per-worktree dicts), ``orphans`` (planned/removed/failed orphan dirs),
+    ``venv_ok``/``venv_message``, and ``attention_events``. Kept as a dict
     rather than further nested dataclasses since callers (``CommandResult``)
     consume it as a JSON-able blob for CLI output.
     """
@@ -2361,6 +2557,12 @@ def clean_worktrees(
     Eligible worktrees are removed with ``remove_worktree`` (junction-safe)
     and the local branch is deleted. After removals, the shared venv is
     checked for a poisoned editable ``.pth``.
+
+    A final orphan sweep removes directories under ``worktrees_dir`` whose
+    git admin record is gone but whose tree remains (the residue of
+    ``git worktree remove`` failing on a reparse point).  Such leftovers are
+    removed with the same reparse-point-safe rmtree and reported through
+    ``data["orphans"]`` so they cannot accumulate silently (issue #462).
     """
     state_issues = state.get("issues", {})
     state_prs = state.get("prs", {})
@@ -2368,8 +2570,12 @@ def clean_worktrees(
     removed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    orphans: dict[str, list[dict[str, Any]]] = {"planned": [], "removed": [], "failed": []}
+    attention_events: list[dict[str, Any]] = []
 
-    for wt in list_worktrees(repo_root):
+    registered_worktrees, list_error = _list_worktrees_porcelain(repo_root)
+    worktree_list_failed = list_error is not None
+    for wt in registered_worktrees:
         wt_path = wt.get("worktree")
         if not isinstance(wt_path, Path) or not wt_path.is_relative_to(worktrees_dir):
             continue
@@ -2459,7 +2665,11 @@ def clean_worktrees(
             )
             continue
         try:
-            dirty_reason = _worktree_dirty_reason(wt_path, config.dispatch.injected_paths)
+            dirty_reason = _worktree_dirty_reason(
+                wt_path,
+                config.dispatch.injected_paths,
+                config.dispatch.materialize_dirs,
+            )
         except WorktreeProbeFailedError as exc:
             skipped.append(
                 {
@@ -2554,6 +2764,40 @@ def clean_worktrees(
             }
         )
 
+    # Orphan sweep: directories under worktrees_dir with no git admin record.
+    # This is the residue left when ``git worktree remove`` unregisters a
+    # worktree but cannot delete its tree because of a reparse point.
+    if worktree_list_failed:
+        # A git worktree list failure must never be read as "zero worktrees".
+        # Skip the sweep and surface the failure so live worker state is not
+        # silently destroyed by a transient git hiccup.
+        attention_events.append(
+            {
+                "type": "worktree_list_failed",
+                "reason": list_error or "git worktree list failed",
+            }
+        )
+    elif worktrees_dir.is_dir():
+        registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
+        for child in worktrees_dir.iterdir():
+            if not child.is_dir() or child in registered_paths or is_junction(child):
+                continue
+            if dry_run:
+                orphans["planned"].append({"worktree": str(child)})
+                continue
+            if _robust_rmtree(child):
+                orphans["removed"].append({"worktree": str(child)})
+            else:
+                reason = "orphan directory removal failed"
+                orphans["failed"].append({"worktree": str(child), "reason": reason})
+                attention_events.append(
+                    {
+                        "type": "worktree_orphan_removal_failed",
+                        "worktree": str(child),
+                        "reason": reason,
+                    }
+                )
+
     venv_source = config.devin.venv_source or config.claude_code.venv_source
     venv_ok = True
     venv_message = "no shared venv configured; pth verification skipped"
@@ -2565,21 +2809,41 @@ def clean_worktrees(
             venv_ok = False
             venv_message = f"shared venv not found: {venv_path}"
 
+    # Surface regular removal failures as attention events too.
+    for failure in failed:
+        attention_events.append(
+            {
+                "type": "worktree_removal_failed",
+                "worktree": failure["worktree"],
+                "reason": failure.get("reason", "remove_worktree failed"),
+            }
+        )
+
     data = {
         "planned": planned,
         "removed": removed,
         "skipped": skipped,
         "failed": failed,
+        "orphans": orphans,
         "venv_ok": venv_ok,
         "venv_message": venv_message,
+        "attention_events": attention_events,
     }
-    ok = not failed and venv_ok
+    ok = not failed and not orphans["failed"] and venv_ok and not worktree_list_failed
     if dry_run:
-        message = f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped"
+        message = (
+            f"worktree-clean (dry-run): {len(planned)} eligible, {len(skipped)} skipped, "
+            f"{len(orphans['planned'])} orphan(s)"
+        )
     else:
         message = (
-            f"worktree-clean: {len(removed)} removed, {len(skipped)} skipped, {len(failed)} failed"
+            f"worktree-clean: {len(removed)} removed, {len(skipped)} skipped, "
+            f"{len(failed)} failed, {len(orphans['removed'])} orphan(s)"
         )
+        if orphans["failed"]:
+            message = f"{message}, {len(orphans['failed'])} orphan removal(s) failed"
+    if worktree_list_failed:
+        message = f"{message}; could not list worktrees: {list_error}"
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
