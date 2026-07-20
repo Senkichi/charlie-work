@@ -7395,6 +7395,68 @@ def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -
     assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
+def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> None:
+    """A merged worker branch without an approved review decision is flagged as a possible self-merge (issue #502)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithMergedWorkerPR(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prs = [
+                {
+                    "number": 501,
+                    "title": "fix: worker self-merge",
+                    "url": "https://example.test/pull/501",
+                    "headRefName": "agent/issue-494-fix",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-501",
+                    "state": "MERGED",
+                    "isCrossRepository": False,
+                    "body": "Closes #494",
+                    "labels": [],
+                },
+                {
+                    "number": 502,
+                    "title": "fix: approved merge",
+                    "url": "https://example.test/pull/502",
+                    "headRefName": "agent/issue-495-fix",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-502",
+                    "state": "MERGED",
+                    "isCrossRepository": False,
+                    "body": "Closes #495",
+                    "labels": [],
+                },
+            ]
+
+    fake_gh = FakeGitHubWithMergedWorkerPR()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR 502 has an approved review decision on the merged head
+    pr_dir = paths.prs / "pr-502"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": "sha-502",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    detected = app._detect_unauthorized_merges()
+
+    assert len(detected) == 1
+    assert detected[0]["pr"] == 501
+    assert detected[0]["issue"] == 494
+    assert detected[0]["decision"] == "missing"
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(

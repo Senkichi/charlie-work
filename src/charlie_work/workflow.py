@@ -7200,6 +7200,22 @@ class OrchestratorApp:
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+
+        # Issue #502: post-merge tripwire. Detect any merged worker PR that was
+        # not approved by the orchestrator's adversarial review gate.
+        for unauthorized in self._detect_unauthorized_merges():
+            errors.append(
+                {
+                    "pr": unauthorized["pr"],
+                    "issue": unauthorized["issue"],
+                    "error": (
+                        f"PR #{unauthorized['pr']} ({unauthorized['head']}) is MERGED "
+                        f"without an approved review decision (decision={unauthorized['decision']!r}); "
+                        "possible worker self-merge"
+                    ),
+                }
+            )
+
         open_tracked_prs = 0
         skipped_reviews = 0
         prs = self.gh.pr_list()
@@ -8350,6 +8366,56 @@ class OrchestratorApp:
             self.config,
             repo_root=self.repo_root,
         )
+
+    def _detect_unauthorized_merges(self) -> list[dict[str, Any]]:
+        """Scan recently-merged PRs for worker branches that lack an approved review decision.
+
+        Workers are forbidden from merging their own PRs (issue #502). This
+        post-merge tripwire catches a bypass after it happens: any merged PR
+        whose head branch matches the configured worker branch prefix but has
+        no approved ``.var/charlie-work/prs/pr-N/review-decision.json`` was
+        merged without the orchestrator's adversarial review gate. GitHub
+        errors are swallowed so a transient ``gh`` failure cannot crash the
+        fleet pass.
+        """
+        unauthorized: list[dict[str, Any]] = []
+        prefix = self.config.dispatch.branch_prefix
+        try:
+            merged_prs = self.gh.merged_pr_list()
+        except GitHubError:
+            return unauthorized
+
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            if pr.get("isCrossRepository") is True:
+                continue
+            head = str(pr.get("headRefName") or "")
+            if not head.startswith(prefix):
+                continue
+            raw_number = pr.get("number")
+            try:
+                pr_number = int(raw_number) if raw_number is not None else None
+            except (TypeError, ValueError):
+                continue
+            if pr_number is None:
+                continue
+            decision = self._review_decision(pr_number)
+            if decision.get("decision") != "approved":
+                issue_number = linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=prefix,
+                )
+                unauthorized.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "head": head,
+                        "decision": decision.get("decision"),
+                    }
+                )
+        return unauthorized
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"

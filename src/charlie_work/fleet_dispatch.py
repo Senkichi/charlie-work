@@ -296,6 +296,7 @@ def _extract_attention_events(
                 "repo_key": repo_key,
                 "type": "error",
                 "pr": error.get("pr"),
+                "issue_number": error.get("issue") or error.get("pr"),
                 "error": error.get("error"),
             }
         )
@@ -384,7 +385,7 @@ def _build_fleet_attention_digest(
         elif event_type == "error":
             entries.append(
                 AttentionEntry(
-                    issue_number=event.get("pr") or -1,
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
                     adapter_kind=event["repo_key"],
                     health="ERROR",
                     previous_health=None,

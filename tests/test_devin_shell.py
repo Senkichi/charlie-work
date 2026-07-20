@@ -1246,6 +1246,20 @@ def test_sanitize_env_preserves_other_env_vars(
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped"
 
 
+def test_sanitize_env_drops_github_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sanitize_env must drop GH_TOKEN and GITHUB_TOKEN so workers do not inherit the orchestrator's admin token (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("GH_TOKEN", "admin-orchestrator-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "admin-orchestrator-token")
+
+    env = sanitize_env(worktree_path)
+
+    assert "GH_TOKEN" not in env, "GH_TOKEN must be dropped"
+    assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must be dropped"
+
+
 def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """launch_devin_session must sanitize the environment before spawning the worker."""
     repo_root = tmp_path / "repo"

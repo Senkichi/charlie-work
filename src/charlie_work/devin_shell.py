@@ -468,7 +468,10 @@ def launch_devin_session(
         return record
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
-    # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS)
+    # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS).
+    # sanitize_env also drops GH_TOKEN/GITHUB_TOKEN so workers do not inherit the
+    # orchestrator's admin token (issue #502). To give workers a scoped GitHub
+    # token, set worker_env={"GH_TOKEN": "<scoped-PAT>"} in the adapter config.
     worker_env_dict = {
         **sanitize_env(worktree.path),
         **{str(k): str(v) for k, v in (worker_env or {}).items()},

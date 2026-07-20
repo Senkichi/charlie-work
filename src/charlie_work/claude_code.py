@@ -725,7 +725,9 @@ def launch_claude_worker(
     # the shared host (see docs/RUNBOOK.md "Local host saturation ceiling
     # (claude-code adapter)"). `env` is a validated mapping (see config.py).
     # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
-    # leaks from the orchestrator, then merge user-provided overrides on top.
+    # leaks from the orchestrator and to drop GH_TOKEN/GITHUB_TOKEN so workers do
+    # not inherit the orchestrator's admin-scoped token (issue #502). To give
+    # workers a scoped GitHub token, set claude_code.worker_env={"GH_TOKEN": "<scoped-PAT>"}.
     worker_env = {
         **sanitize_env(worktree.path),
         **{str(k): str(v) for k, v in (env or {}).items()},
