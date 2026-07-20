@@ -344,6 +344,90 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
     return [int(part) for part in only_issues.replace(" ", "").split(",") if part]
 
 
+# Maximum recovery-retry candidates allowed per dispatch pass. Recovery retries
+# must not consume the same budget as fresh candidates; capping them at one per
+# pass prevents one stuck recovery candidate from starving the queue (issue #506).
+_MAX_RECOVERY_RETRY_PER_PASS = 1
+
+
+def _is_recovery_candidate(
+    issue: dict[str, Any],
+    state: dict[str, Any],
+    branch_name_for: Callable[[dict[str, Any]], str],
+) -> bool:
+    """Return True when ``issue`` is a recovery retry of a previous dispatch.
+
+    A recovery candidate has a state.json entry whose status is ``"dispatched"``
+    and whose stored branch_name matches the branch that would be generated for
+    the issue today. These candidates are separated from fresh dispatch
+    candidates so they cannot monopolize the dispatch budget.
+    """
+    issue_number = int(issue["number"])
+    prev_entry = state.get("issues", {}).get(str(issue_number), {})
+    if prev_entry.get("status") != "dispatched":
+        return False
+    prev_branch = prev_entry.get("branch_name")
+    return prev_branch == branch_name_for(issue)
+
+
+def _select_dispatch_candidates(
+    candidates: list[dict[str, Any]],
+    dispatch_limit: int,
+    state: dict[str, Any],
+    branch_name_for: Callable[[dict[str, Any]], str],
+    only_issues: str | None = None,
+) -> tuple[list[dict[str, Any]], list[int], list[int]]:
+    """Select dispatch candidates, filling fresh slots before recovery retries.
+
+    Fresh candidates are dispatched first; recovery-retry candidates are only
+    attempted with remaining slots, and at most one recovery retry is attempted
+    per pass. This prevents a stuck recovery candidate from head-of-line
+    blocking fresh work under a tight dispatch limit (issue #506).
+
+    Args:
+        candidates: Unblocked, sorted candidate issues from GitHub.
+        dispatch_limit: Maximum number of issues to select this pass.
+        state: Current state.json snapshot for recovery classification.
+        branch_name_for: Callable that returns the branch name for an issue.
+        only_issues: Optional explicit comma-separated issue numbers to select.
+
+    Returns:
+        Tuple of (selected, skipped_issue_numbers, deferred_by_concurrency).
+    """
+    if only_issues:
+        wanted = parse_issue_numbers(only_issues)
+        by_number = {int(issue["number"]): issue for issue in candidates}
+        ordered = [by_number[number] for number in wanted if number in by_number]
+        skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+    else:
+        ordered = candidates
+        skipped_issue_numbers = []
+
+    fresh = [
+        issue for issue in ordered if not _is_recovery_candidate(issue, state, branch_name_for)
+    ]
+    recovery = [
+        issue for issue in ordered if _is_recovery_candidate(issue, state, branch_name_for)
+    ]
+
+    # Fill fresh first, then allow at most one recovery-retry slot.
+    recovery_slots = max(0, dispatch_limit - len(fresh))
+    recovery_cap = min(_MAX_RECOVERY_RETRY_PER_PASS, recovery_slots)
+    selected = fresh[:dispatch_limit] + recovery[:recovery_cap]
+
+    if only_issues:
+        selected_numbers = {int(issue["number"]) for issue in selected}
+        deferred_by_concurrency = [
+            int(issue["number"])
+            for issue in ordered
+            if int(issue["number"]) not in selected_numbers
+        ]
+    else:
+        deferred_by_concurrency = []
+
+    return selected, skipped_issue_numbers, deferred_by_concurrency
+
+
 def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
     """Count the number of currently alive worker sessions across both adapters.
 
@@ -3713,22 +3797,15 @@ class OrchestratorApp:
                 # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
                 candidates = self._sort_by_dependency_depth(candidates)
 
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in candidates}
-                selected = [by_number[number] for number in wanted if number in by_number]
-                skipped_issue_numbers = sorted(set(wanted) - set(by_number))
-                # Apply concurrency governor cap to explicit issue selection
-                if len(selected) > dispatch_limit:
-                    deferred_by_concurrency = [
-                        int(issue["number"]) for issue in selected[dispatch_limit:]
-                    ]
-                    selected = selected[:dispatch_limit]
-                else:
-                    deferred_by_concurrency = []
-            else:
-                selected = candidates[:dispatch_limit]
-                deferred_by_concurrency = []
+            # Fill fresh candidates first; recovery retries only get leftover slots
+            # and are capped at one per pass (issue #506).
+            selected, skipped_issue_numbers, deferred_by_concurrency = _select_dispatch_candidates(
+                candidates,
+                dispatch_limit,
+                state,
+                self._branch_name,
+                only_issues=only_issues,
+            )
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
@@ -4003,22 +4080,15 @@ class OrchestratorApp:
                     )
                 save_state(self.paths.state_file, state)
 
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in candidates}
-                selected = [by_number[number] for number in wanted if number in by_number]
-                skipped_issue_numbers = sorted(set(wanted) - set(by_number))
-                # Apply concurrency governor cap to explicit issue selection
-                if len(selected) > dispatch_limit:
-                    deferred_by_concurrency = [
-                        int(issue["number"]) for issue in selected[dispatch_limit:]
-                    ]
-                    selected = selected[:dispatch_limit]
-                else:
-                    deferred_by_concurrency = []
-            else:
-                selected = candidates[:dispatch_limit]
-                deferred_by_concurrency = []
+            # Fill fresh candidates first; recovery retries only get leftover slots
+            # and are capped at one per pass (issue #506).
+            selected, skipped_issue_numbers, deferred_by_concurrency = _select_dispatch_candidates(
+                candidates,
+                dispatch_limit,
+                state,
+                self._branch_name,
+                only_issues=only_issues,
+            )
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Capture previous entries for recovery detection BEFORE overwriting status
             # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
@@ -4196,6 +4266,47 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
 
+            # Build dispatch-alert transitions for the notify digest. Averted
+            # redispatches surface as DISPATCH_AVERTED; a later successful or
+            # non-averted dispatch clears the alert back to OK.
+            dispatch_alert_transitions: dict[int, dict[str, Any]] = {}
+            live_worker_redispatch_averted: list[dict[str, Any]] = []
+            for request in session_requests:
+                prev_alert = previous_entries.get(request.issue_number, {}).get("dispatch_alert")
+                result = next(
+                    (r for r in dispatch_results if r.issue_number == request.issue_number),
+                    None,
+                )
+                is_live_worker = request.issue_number in live_worker_issue_numbers
+                if is_live_worker:
+                    dispatch_alert_transitions[request.issue_number] = {
+                        "adapter_kind": result.adapter if result else "unknown",
+                        "health": "DISPATCH_AVERTED",
+                        "last_log_line": None,
+                        "pid": result.pid if result else None,
+                        "terminal_tool": None,
+                        "terminal_reason": result.error if result else None,
+                    }
+                    live_worker_redispatch_averted.append(
+                        {
+                            "issue_number": request.issue_number,
+                            "branch_name": request.branch_name,
+                            "pid": result.pid if result else None,
+                            "process_start_time": result.process_start_time if result else None,
+                            "probe_result": result.error if result else None,
+                            "adapter_kind": result.adapter if result else "unknown",
+                        }
+                    )
+                elif prev_alert == "DISPATCH_AVERTED":
+                    dispatch_alert_transitions[request.issue_number] = {
+                        "adapter_kind": result.adapter if result else "unknown",
+                        "health": "OK",
+                        "last_log_line": None,
+                        "pid": result.pid if result else None,
+                        "terminal_tool": None,
+                        "terminal_reason": None,
+                    }
+
             for issue_number in foreign_writer_issue_numbers:
                 result = next(
                     (r for r in dispatch_results if r.issue_number == issue_number), None
@@ -4271,6 +4382,7 @@ class OrchestratorApp:
             "session_results": str(results_path),
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
+            "live_worker_redispatch_averted": live_worker_redispatch_averted,
             "stalled": stalled_entries,
             "blocked": [
                 {"issue": issue_number, "blockers": blockers}
@@ -4301,6 +4413,19 @@ class OrchestratorApp:
             )
             if digest:
                 emit_digest(self.config.notify, digest)
+
+        # Emit dispatch-alert digest for live-worker redispatch averted outcomes.
+        # This surfaces the silent-stall class of dispatch failures in the same
+        # attention pipeline used for stalled workers (issue #506 / #497).
+        if dispatch_alert_transitions and self.config.notify.enabled:
+            dispatch_digest = _build_attention_digest(
+                self.paths.state_file,
+                dispatch_alert_transitions,
+                repo=self.repo_root.name,
+                state_field="dispatch_alert",
+            )
+            if dispatch_digest:
+                emit_digest(self.config.notify, dispatch_digest)
 
         return CommandResult(
             not failed_issue_numbers,

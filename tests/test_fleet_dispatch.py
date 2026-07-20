@@ -1505,3 +1505,41 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     assert digest.transitions[0].adapter_kind == "self-deploy"
     assert digest.transitions[0].health == "ERROR"
     assert "Access is denied" in digest.transitions[0].last_log_line
+
+
+def test_extract_attention_events_includes_live_worker_redispatch_averted() -> None:
+    """Issue #506: fleet attention digest surfaces live-worker redispatch averted outcomes."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    result = CommandResult(
+        True,
+        "dispatch complete",
+        {
+            "dispatch": {
+                "live_worker_redispatch_averted": [
+                    {
+                        "issue_number": 1317,
+                        "branch_name": "agent/issue-1317-fix-search",
+                        "pid": 12345,
+                        "probe_result": "pid_alive",
+                        "adapter_kind": "devin-shell",
+                    }
+                ]
+            }
+        },
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+    assert len(events) == 1
+    assert events[0]["type"] == "live_worker_redispatch_averted"
+    assert events[0]["issue_number"] == 1317
+    assert events[0]["reason"] == "pid_alive"
+    assert events[0]["adapter_kind"] == "devin-shell"
+
+    digest = _build_fleet_attention_digest(events)
+    assert len(digest.transitions) == 1
+    entry = digest.transitions[0]
+    assert entry.issue_number == 1317
+    assert entry.health == "DISPATCH_AVERTED"
+    assert entry.last_log_line == "pid_alive"
+    assert entry.adapter_kind == "devin-shell"
