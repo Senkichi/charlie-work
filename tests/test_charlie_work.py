@@ -6714,6 +6714,71 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
+def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
+    """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
+    unresolved npm ``.CMD`` shim) must not strand the PR at
+    ``review_dispatch_pending`` forever. ``dispatch_reviews`` claims the PR
+    as pending before launching and must upgrade a failed launch to
+    ``review_dispatch_failed`` with the error recorded, freeing it for
+    redispatch after the stale-claim timeout rather than silently holding
+    the claim."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    launch_error = (
+        "failed to launch claude: [WinError 2] The system cannot find the file specified"
+    )
+
+    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error=launch_error,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is False
+    assert result.data["launched_count"] == 0
+    assert result.data["failed_count"] == 1
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    # The pending claim written before launch must be cleared, not left
+    # dangling — otherwise `_is_review_dispatchable` would never see this PR
+    # as re-claimable and it would sit stuck forever, same failure shape as
+    # issue #487's "never claimed at all" gap.
+    assert pr_state["review_dispatch_status"] == "review_dispatch_failed"
+    assert pr_state["review_dispatch_pending_at"] is None
+    assert pr_state["review_dispatched_at"] is None
+    assert pr_state["reviewer_pid"] is None
+    assert pr_state["review_dispatch_error"] == launch_error
+    assert pr_state["review_dispatch_failed_at"] is not None
+
+
 def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
     """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
     prs = [
@@ -7081,6 +7146,77 @@ def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
 
     assert reaped == []
     assert checkout.path.exists()
+
+
+def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #494: the review-dispatch pass must reap checkouts and clear
+    review-dispatch state for PRs that GitHub already reports as MERGED
+    or CLOSED, regardless of the local claim status.
+    """
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-1-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    removed_calls: list[tuple[Path, int, Path | None]] = []
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == [100]
+    assert len(removed_calls) == 1
+    assert removed_calls[0][0] == repo_root
+    assert removed_calls[0][1] == 100
+    assert removed_calls[0][2] == reviews_dir
+
+    new_state = load_state(state_file)
+    assert new_state["prs"]["100"]["review_dispatch_status"] is None
+    assert new_state["prs"]["100"]["review_dispatched_at"] is None
+    assert new_state["prs"]["100"]["reviewer_pid"] is None
+    assert new_state["prs"]["100"]["reviewer_process_start_time"] is None
+    assert new_state["prs"]["100"]["status"] == "merged"
 
 
 def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
