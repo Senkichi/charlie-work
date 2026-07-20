@@ -35,7 +35,7 @@ from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
@@ -649,6 +649,19 @@ def launch_claude_worker(
         )
         return _write_record(sessions_dir, record)
 
+    # Resolve argv[0] to the real binary before spawning. On Windows, npm
+    # installs `claude` as a `claude.CMD` shim; `Popen(shell=False)` with the
+    # bare name goes straight to CreateProcessW, which does not do the
+    # PATHEXT-based extension search cmd.exe does, so it cannot find the shim
+    # and fails with WinError 2 (issue #487) even though `claude` runs fine
+    # from an interactive shell. resolve_cli_binary unwraps the shim to its
+    # underlying .exe (rather than stopping at shutil.which's .CMD path,
+    # which would route through cmd.exe and mangle `|`-containing args via
+    # caret-escaping — see its docstring). No-op on POSIX or for binaries
+    # that aren't npm .cmd/.bat shims (e.g. the test doubles below).
+    if command:
+        command = (resolve_cli_binary(command[0]), *command[1:])
+
     # If tee_stream_json is enabled, extend the command with --output-format stream-json
     # and set up a tee to write to both plaintext log and events file
     events_path = None
@@ -840,8 +853,14 @@ def probe_claude(
     ``command`` defaults to the package-default binary so callers that do not
     configure a custom ``claude_code.command`` get the standard probe.  Pass a
     custom tuple to exercise a configured wrapper binary.
+
+    argv[0] is resolved through ``resolve_cli_binary`` for the same reason as
+    ``launch_claude_worker`` (issue #487): a bare ``"claude"`` on Windows
+    cannot be found by ``CreateProcessW`` since npm installs it as a
+    ``claude.CMD`` shim.
     """
-    return run_captured(list(command), cwd=repo_root, timeout_seconds=15)
+    resolved_command = (resolve_cli_binary(command[0]), *command[1:]) if command else command
+    return run_captured(list(resolved_command), cwd=repo_root, timeout_seconds=15)
 
 
 def _get_process_start_time(pid: int) -> float | None:
