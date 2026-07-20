@@ -237,6 +237,11 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum minutes after the PR's last update (updatedAt) to wait for any
+    # required check run to appear before routing an approved PR to readiness
+    # rework. This catches invisible CI-never-started stalls (mergeStateStatus
+    # DIRTY or a missing CI trigger). 0 disables the guard.
+    readiness_no_ci_minutes: int = 15
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #

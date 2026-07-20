@@ -20,7 +20,12 @@ from .adapters import (
 )
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
-from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    AutoMergeConfig,
+    CrossFamilyConfig,
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -1813,6 +1818,50 @@ def _is_pre_review_rework_candidate(
         return True, "stale_empty_checks"
 
     return False, ""
+
+
+def _is_readiness_no_ci_stall(
+    pr: dict[str, Any],
+    checks: list[dict[str, Any]],
+    config: AutoMergeConfig,
+    now: datetime,
+) -> bool:
+    """Detect an approved PR whose required checks have never started.
+
+    Returns True when:
+      * ``pr_checks`` returned a parseable (non-None) list;
+      * none of the configured ``required_checks`` appear in that list;
+      * the PR's ``updatedAt`` is older than ``readiness_no_ci_minutes``.
+
+    The required check names come from ``config.required_checks``; no names are
+    hard-coded. ``updatedAt`` is the best available proxy for "head SHA pushed"
+    in the ``gh pr view`` JSON field list.
+    """
+    no_ci_minutes = config.readiness_no_ci_minutes
+    if no_ci_minutes <= 0:
+        return False
+    required = config.required_checks
+    if not required:
+        return False
+    if not checks:
+        # Treat an empty list as zero check runs. ``None`` means the gh CLI
+        # itself failed and is handled elsewhere as ``checks_unavailable``.
+        pass
+    seen = {str(check.get("name") or "") for check in checks}
+    if any(name in seen for name in required):
+        return False
+    updated_at = pr.get("updatedAt")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return (now - updated).total_seconds() > no_ci_minutes * 60
 
 
 def _route_dead_worker_to_pre_review_rework(
@@ -5572,6 +5621,52 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+        # Readiness no-CI stall gate (issue #474): an approved PR whose required
+        # checks have not appeared within ``readiness_no_ci_minutes`` is routed to
+        # rework instead of waiting forever for CI that will never start.
+        if (
+            not checks_unavailable
+            and approved
+            and not sync_failed
+            and not summary.ready
+            and not _is_pending_only(summary)
+            and issue_number is not None
+        ):
+            now = datetime.now(UTC)
+            if _is_readiness_no_ci_stall(pr, enriched_checks, self.config.auto_merge, now):
+                state = load_state_locked(self.paths.state_file)
+                issue_state = state["issues"].get(str(issue_number), {})
+                issue_status = issue_state.get("status")
+                if issue_status not in (
+                    "dispatched",
+                    "dispatch_pending",
+                    "manifest_written",
+                    "escalated",
+                    "blocked",
+                    "rework_requested",
+                ):
+                    label_error = self._request_readiness_no_ci_rework(
+                        pr, issue_number, decision, summary.missing
+                    )
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} has not started required CI checks; rework requested",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "checks": asdict(summary),
+                            "checks_unavailable": False,
+                            "label_error": label_error,
+                            "readiness_no_ci_stall": True,
+                            "merge_conflict": merge_conflict,
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
+
         can_merge = (
             summary.ready
             and (approved or not self.config.auto_merge.require_approved_review)
@@ -6571,6 +6666,36 @@ class OrchestratorApp:
             "merge_conflict_rework_requested",
             extra_payload={"conflict_rework_requested_at": requested_at},
             extra_state={"conflict_rework_requested_at": requested_at},
+        )
+
+    def _request_readiness_no_ci_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+        missing_checks: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR whose required CI checks have not started to rework."""
+        summary = (
+            "The PR was approved but the required CI checks have not started after the "
+            f"configured readiness timeout ({self.config.auto_merge.readiness_no_ci_minutes} minutes). "
+            f"Required checks: {', '.join(missing_checks)}. Push an empty commit or amend the head "
+            "to re-trigger CI. The code changes are already approved; do not re-litigate the review."
+        )
+        requested_at = utc_now()
+        return self._route_to_rework(
+            pr,
+            issue_number,
+            decision,
+            summary,
+            "readiness_no_ci_rework_requested",
+            extra_payload={
+                "missing_checks": missing_checks,
+                "readiness_no_ci_rework_requested_at": requested_at,
+            },
+            extra_state={
+                "readiness_no_ci_rework_requested_at": requested_at,
+            },
         )
 
     def _request_cross_pr_revert_rework(

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -10771,6 +10771,99 @@ def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) ->
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     assert state["issues"]["123"]["merge_alert"] == "OK"
+
+
+def test_merge_ready_readiness_gate_escalates_no_ci_stall(tmp_path: Path) -> None:
+    """Issue #474: an approved PR with no CI check runs after the configured
+    readiness timeout is routed to rework instead of waiting silently.
+
+    Expected checks are derived from ``auto_merge.required_checks``; no check
+    names are hard-coded in the assertion.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+            readiness_no_ci_minutes=15,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    # Simulate a head push well beyond the no-CI timeout.
+    stale_updated = (datetime.now(UTC) - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fake_gh.prs[0]["updatedAt"] = stale_updated
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data.get("readiness_no_ci_stall") is True
+    assert result.data.get("merge_attempt_alarm") is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    no_ci_events = [e for e in state["events"] if e["kind"] == "readiness_no_ci_rework_requested"]
+    assert len(no_ci_events) == 1
+    missing = no_ci_events[0]["payload"]["missing_checks"]
+    assert set(missing) == set(required)
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    for check in required:
+        assert check in prompt_text
+
+
+def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
+    """Issue #474: a PR reporting mergeStateStatus=DIRTY escalates to rework."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    fake_gh._record_pr_heads(fake_gh.prs)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data.get("merge_attempt_alarm") is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert (paths.prs / "pr-456" / "rework-prompt.md").exists()
 
 
 def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Path) -> None:
