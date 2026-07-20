@@ -876,6 +876,13 @@ def _detect_and_handle_stalled_reviews(
     checkout (``worktree.remove_review_checkout``) so a dead reviewer never
     leaks its detached-HEAD checkout directory.
 
+    A PR that reached ``status == "reviewing"`` but has no
+    ``review_dispatch_status`` claim at all (a packet that was generated but
+    never dispatched) is also reaped once its review packet is older than the
+    stale-claim timeout. The claim is moved to ``review_dispatch_failed`` using
+    the packet's own mtime as ``review_dispatch_failed_at`` so the next
+    ``dispatch_reviews`` pass can retry it immediately.
+
     This is intentionally simpler than ``_detect_and_handle_stalled_sessions``:
     review dispatch has no provider-rate-limit throttle logic and the reviewer
     agent is solely responsible for producing a verdict. The only intervention
@@ -997,6 +1004,71 @@ def _detect_and_handle_stalled_reviews(
                 )
                 if pr_key.isdigit():
                     remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
+        elif status is None and pr_state.get("status") == "reviewing":
+            # Issue #487: a review packet was generated but was never claimed or
+            # dispatched at all. If the packet is past the stale-claim timeout,
+            # move the (missing) claim to failed using the packet's own mtime as
+            # the failure timestamp so the next dispatch_reviews pass can retry.
+            prompt_path_str = pr_state.get("prompt_path")
+            if not prompt_path_str:
+                continue
+            prompt_path = Path(prompt_path_str)
+            if not prompt_path.exists():
+                continue
+
+            decision_value: str | None = "missing"
+            decision_path_str = pr_state.get("decision_path")
+            if decision_path_str:
+                decision_path = Path(decision_path_str)
+                if decision_path.exists():
+                    try:
+                        with decision_path.open("r", encoding="utf-8") as handle:
+                            decision_data = json.load(handle)
+                        if isinstance(decision_data, dict):
+                            decision_value = decision_data.get("decision")
+                    except (OSError, json.JSONDecodeError):
+                        decision_value = "invalid"
+            if decision_value not in ("pending", "missing", "invalid", None):
+                continue
+
+            prompt_mtime = prompt_path.stat().st_mtime
+            packet_age = (
+                datetime.fromtimestamp(prompt_mtime, tz=UTC)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            if not is_claim_stale(packet_age):
+                continue
+
+            state["prs"][pr_key] = {
+                **pr_state,
+                "number": int(pr_key) if pr_key.isdigit() else pr_state.get("number"),
+                "review_dispatch_status": "review_dispatch_failed",
+                "review_dispatch_failed_at": packet_age,
+                "review_dispatch_pending_at": None,
+                "review_dispatched_at": None,
+                "reviewer_pid": None,
+                "reviewer_process_start_time": None,
+            }
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                {
+                    "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                    "status": "unclaimed",
+                    "prompt_mtime": packet_age,
+                },
+            )
+            changed = True
+            stalled.append(
+                {
+                    "pr": int(pr_key) if pr_key.isdigit() else None,
+                    "prompt_mtime": packet_age,
+                }
+            )
+            if pr_key.isdigit():
+                remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
 
     if changed:
         save_state(state_file, state)
