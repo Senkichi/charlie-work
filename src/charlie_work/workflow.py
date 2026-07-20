@@ -11,7 +11,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from . import CLI_NAME
 from .adapters import (
     AdapterSettings,
     SessionDispatchResult,
@@ -859,6 +858,69 @@ def _is_review_dispatchable(
     return True
 
 
+def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
+    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+
+    Looks for triple-backtick code fences in ``log_path`` and tries to parse
+    each one as JSON, starting from the last fence (the final output). Accepts
+    fences with or without a ``json`` language tag. A valid verdict block must
+    contain:
+
+    - ``decision`` in ``{"approved", "request_changes", "blocked"}``
+    - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
+      non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
+    - ``required_changes`` is optional; if present it must be a list of strings
+
+    Returns the parsed dict on success, or ``None`` if no valid block is found.
+    Malformed/truncated logs and 0-byte logs both return ``None``.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", log_text, re.DOTALL))
+    if not matches:
+        return None
+
+    for match in reversed(matches):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        decision = data.get("decision")
+        if decision not in {"approved", "request_changes", "blocked"}:
+            continue
+
+        summary = data.get("summary")
+        if not isinstance(summary, str):
+            continue
+        if decision in {"request_changes", "blocked"} and not summary.strip():
+            continue
+
+        required_changes = data.get("required_changes")
+        if required_changes is not None and not isinstance(required_changes, list):
+            continue
+        if required_changes is not None and not all(
+            isinstance(item, str) for item in required_changes
+        ):
+            continue
+
+        return {
+            "decision": decision,
+            "summary": summary,
+            "required_changes": required_changes if required_changes is not None else [],
+        }
+
+    return None
+
+
 def _detect_and_handle_stalled_reviews(
     reviews_dir: Path,
     state_file: Path,
@@ -884,10 +946,11 @@ def _detect_and_handle_stalled_reviews(
     the packet's own mtime as ``review_dispatch_failed_at`` so the next
     ``dispatch_reviews`` pass can retry it immediately.
 
-    This is intentionally simpler than ``_detect_and_handle_stalled_sessions``:
-    review dispatch has no provider-rate-limit throttle logic and the reviewer
-    agent is solely responsible for producing a verdict. The only intervention
-    the hub performs is claim/slot cleanup.
+    Callers should run ``_reap_review_verdicts`` first: it extracts and records
+    any verdict a dead reviewer emitted, so by the time this sweep runs only
+    PRs whose log has no parseable verdict fall through to the failed-claim
+    retry/backoff path. This function is intentionally simpler than
+    ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
     """
     stalled: list[dict[str, Any]] = []
     state = load_state_locked(state_file)
@@ -1085,8 +1148,8 @@ def _reap_completed_review_checkouts(
     """Remove isolated review checkouts for PRs whose reviewer already
     recorded a verdict, once the reviewer process itself has exited.
 
-    ``record_review`` (the CLI command a reviewer session runs to record its
-    verdict) sets ``review_dispatch_status = "review_dispatch_completed"`` and
+    ``record_review`` (called in-process by ``_reap_review_verdicts`` or invoked
+    via the ``verdict`` CLI) sets ``review_dispatch_status = "review_dispatch_completed"`` and
     clears ``reviewer_pid``/``reviewer_process_start_time`` on state.json as
     part of recording the verdict — so by the time this sweep can see
     "completed", state.json itself no longer carries a PID to check liveness
@@ -4564,7 +4627,6 @@ class OrchestratorApp:
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
-                "decision_command": f"{CLI_NAME} verdict --pr {pr_number} --decision approved --summary-file <path>",
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -4793,6 +4855,71 @@ class OrchestratorApp:
             {"queue": queue},
         )
 
+    def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
+        """Record verdicts for dead reviewers whose sidecar log contains a valid
+        fenced JSON verdict block.
+
+        Iterates claude-code review sidecars. For each reviewer that is no
+        longer alive and still has a ``review_dispatch_dispatched`` claim, parse
+        the log. If a valid verdict block is found, call ``record_review``
+        in-process with the packet head pinned as ``reviewed_head`` so the
+        verdict is attributed to the diff the reviewer actually read. On
+        success ``record_review`` moves the PR to
+        ``review_dispatch_completed``. If parsing fails or the verdict is
+        malformed, the PR is left for ``_detect_and_handle_stalled_reviews`` to
+        retry/backoff using the existing stale-claim path.
+
+        Returns a dict with ``recorded`` and ``missed`` verdict info lists for
+        the dispatch result and the fleet attention digest.
+        """
+        recorded: list[dict[str, Any]] = []
+        missed: list[dict[str, Any]] = []
+
+        for w in iter_workers(reviews_dir):
+            if w.adapter_kind != "claude-code":
+                continue
+            if w.is_alive():
+                continue
+
+            pr_number = w.issue_number
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                pr_state = state["prs"].get(str(pr_number), {})
+                if pr_state.get("review_dispatch_status") != "review_dispatch_dispatched":
+                    continue
+                issue_number = pr_state.get("issue_number")
+
+            verdict = _parse_review_verdict_from_log(Path(w.log_path))
+            if verdict is None:
+                continue
+
+            packet_head_sha = self._read_packet_head_oid(pr_number)
+            result = self.record_review(
+                pr_number,
+                verdict["decision"],
+                summary=verdict["summary"],
+                reviewed_head=packet_head_sha,
+                required_changes=verdict["required_changes"],
+            )
+            if result.ok:
+                recorded.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "decision": verdict["decision"],
+                    }
+                )
+            else:
+                missed.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "reason": result.message or "record_review failed",
+                    }
+                )
+
+        return {"recorded": recorded, "missed": missed}
+
     @_guard_state_lock
     def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
         """Launch Claude Code reviewer sessions concurrently for queued PRs.
@@ -4826,12 +4953,15 @@ class OrchestratorApp:
 
         reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
 
-        # Run the orphan/stalled sweep before selection so dead reviewers free
-        # their claim/slot, reap isolated review checkouts for both the
-        # stale-claim and completed-verdict cases, and reap checkouts for PRs
-        # that were merged or closed externally. In dry-run mode we skip these
-        # sweeps to stay read-only.
+        # Run the verdict-reaper and orphan/stalled sweeps before selection so
+        # dead reviewers that produced a valid verdict have it recorded in-process,
+        # dead reviewers without a parseable verdict fall through to the existing
+        # failed-claim retry/backoff path, and completed/failed/merged/closed PRs
+        # have their isolated review checkouts torn down. In dry-run mode we skip
+        # these sweeps to stay read-only.
+        verdict_result = {"recorded": [], "missed": []}
         if not self.dry_run:
+            verdict_result = self._reap_review_verdicts(reviews_dir)
             _detect_and_handle_stalled_reviews(
                 reviews_dir, self.paths.state_file, self.config, self.repo_root
             )
@@ -5052,7 +5182,14 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         ok = not failed
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+
         message = f"review dispatch: {len(launched)} launched, {len(failed)} failed"
+        if recorded_verdicts or missed_verdicts:
+            message += (
+                f"; {len(recorded_verdicts)} verdict(s) recorded, {len(missed_verdicts)} missed"
+            )
         if failed:
             message = (
                 f"review dispatch completed with {len(failed)} failure(s): "
@@ -5067,6 +5204,8 @@ class OrchestratorApp:
             "failed": failed,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
+            "recorded_verdicts": recorded_verdicts,
+            "missed_verdicts": missed_verdicts,
         }
         data.update(cap.report_fields())
         return CommandResult(ok, message, data)
@@ -5079,6 +5218,7 @@ class OrchestratorApp:
         summary_file: Path | None = None,
         comment: bool = False,
         reviewed_head: str | None = None,
+        required_changes: Sequence[str] | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -5186,7 +5326,7 @@ class OrchestratorApp:
             "issue_number": issue_number,
             "decision": decision,
             "summary": summary_text,
-            "required_changes": [],
+            "required_changes": list(required_changes) if required_changes is not None else [],
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -67,6 +67,8 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _detect_and_handle_stalled_reviews,
+    _parse_review_verdict_from_log,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -9364,11 +9366,9 @@ def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path
     assert "$test_adequacy_section" not in packet_text
 
 
-def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> None:
-    """Regression test for issue #10: the decision command must use a valid
-    argparse subparser name. The CLI registers 'verdict', not 'record-review'."""
-    from charlie_work.cli import build_parser
-
+def test_review_prompt_uses_fenced_json_verdict(tmp_path: Path) -> None:
+    """Issue #507: the review packet must request a fenced JSON verdict block,
+    not an unexecutable CLI command, because reviewers run in read-only plan mode."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -9380,30 +9380,14 @@ def test_review_decision_command_uses_valid_subparser_name(tmp_path: Path) -> No
     packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
     packet_text = packet.read_text(encoding="utf-8")
 
-    # Extract the decision command from the packet
-    import re
-
-    match = re.search(r"charlie (verdict|record-review) --pr", packet_text)
-    assert match is not None, f"decision command not found in packet. Packet text:\n{packet_text}"
-    command_verb = match.group(1)
-
-    # Verify the verb is a registered subparser
-    parser = build_parser()
-    # Find the subparsers action (it's the _SubParsersAction in _actions)
-    subparsers_action = None
-    for action in parser._subparsers._actions:
-        if hasattr(action, "choices") and action.choices:
-            subparsers_action = action
-            break
-    assert subparsers_action is not None, "Could not find subparsers action"
-    subparser_choices = set(subparsers_action.choices.keys())
-    assert command_verb in subparser_choices, (
-        f"decision command uses '{command_verb}' which is not a registered subparser. "
-        f"Valid subparsers: {sorted(subparser_choices)}"
-    )
-    assert command_verb == "verdict", (
-        f"decision command should use 'verdict' subparser, not '{command_verb}'"
-    )
+    # Issue #507: reviewers cannot run CLI commands in read-only plan mode, so
+    # the packet must ask for a fenced JSON verdict block instead.
+    assert "```json" in packet_text, "fenced JSON verdict block not found in packet"
+    assert '"decision"' in packet_text
+    assert '"summary"' in packet_text
+    assert '"required_changes"' in packet_text
+    assert "$decision_command" not in packet_text
+    assert "charlie verdict" not in packet_text
 
 
 def test_reconcile_wiring_reports_clean_repo(tmp_path: Path) -> None:
@@ -26081,3 +26065,218 @@ def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> Non
 
     assert result.ok is True
     assert len(orphan_calls) == 0, "dispatch_rework must not re-run orphaned-worker detection"
+
+
+# --- Issue #507: record review verdicts from dead reviewer logs -------------
+
+
+def _make_dead_review_sidecar(
+    reviews_dir: Path,
+    pr_number: int,
+    log_text: str,
+    *,
+    started_at: str | None = None,
+) -> Path:
+    """Create a claude-code review sidecar + log file for a dead reviewer."""
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    sidecar = {
+        "issue_number": pr_number,
+        "branch": f"agent/issue-{pr_number}-fix",
+        "worktree_path": str(reviews_dir / f"issue-{pr_number}"),
+        "prompt_path": str(reviews_dir / f"issue-{pr_number}-review-prompt.md"),
+        "command": ["claude", "-p", "--permission-mode", "plan"],
+        "pid": 99999,
+        "started_at": started_at or "2026-07-06T12:00:00Z",
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    sidecar_path = reviews_dir / f"issue-{pr_number}.claude.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar_path
+
+
+def _set_review_dispatched_state(
+    app: OrchestratorApp,
+    pr_number: int,
+    issue_number: int,
+    dispatched_at: str,
+) -> None:
+    """Seed state.json with a review_dispatch_dispatched claim."""
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": dispatched_at,
+            "review_dispatch_pending_at": None,
+            "review_dispatch_failed_at": None,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path) -> None:
+    """Issue #507: parse the last fenced JSON verdict block from a log."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        'Some earlier output\n```json\n{"decision": "blocked", "summary": "old"}\n```\n'
+        'Final verdict:\n```json\n{\n  "decision": "approved",\n  "summary": "lgtm",\n  "required_changes": []\n}\n```\n',
+        encoding="utf-8",
+    )
+
+    verdict = _parse_review_verdict_from_log(log)
+
+    assert verdict is not None
+    assert verdict["decision"] == "approved"
+    assert verdict["summary"] == "lgtm"
+    assert verdict["required_changes"] == []
+
+
+def test_parse_review_verdict_from_log_requires_valid_decision(tmp_path: Path) -> None:
+    """Issue #507: only accepted decisions and non-empty summaries are valid."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        '```json\n{"decision": "maybe", "summary": "?"}\n```\n',
+        encoding="utf-8",
+    )
+
+    assert _parse_review_verdict_from_log(log) is None
+
+
+def test_parse_review_verdict_from_log_rejects_empty_request_changes_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #507: request_changes with an empty summary is not a valid verdict."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        '```json\n{"decision": "request_changes", "summary": "   "}\n```\n',
+        encoding="utf-8",
+    )
+
+    assert _parse_review_verdict_from_log(log) is None
+
+
+def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path) -> None:
+    """Issue #507: a dead reviewer with a valid verdict block has its verdict recorded."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    verdict_log = (
+        "Final verdict:\n```json\n{\n"
+        '  "decision": "request_changes",\n'
+        '  "summary": "fix the edge case in validate()",\n'
+        '  "required_changes": ["add null check"]\n'
+        "}\n```\n"
+    )
+    _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
+    _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == [{"pr": 100, "issue": 10, "decision": "request_changes"}]
+    assert result["missed"] == []
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_completed"
+    assert state["prs"]["100"]["status"] == "request_changes"
+    assert state["issues"]["10"]["status"] == "rework_requested"
+
+    decision_path = app.paths.prs / "pr-100" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["decision"] == "request_changes"
+    assert decision["summary"] == "fix the edge case in validate()"
+    assert decision["required_changes"] == ["add null check"]
+    assert decision["reviewed_head_sha"] == "sha-100"
+
+
+def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #507: a dead reviewer whose log has no parseable verdict falls through
+    to the existing stale-claim failed path unchanged."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    reap = app._reap_review_verdicts(reviews_dir)
+    assert reap["recorded"] == []
+    assert reap["missed"] == []
+
+    # State should still be dispatched (reaper does not mark failed) and
+    # _detect_and_handle_stalled_reviews should then move it to failed.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, app.paths.state_file, app.config, repo_root
+    )
+    assert any(entry.get("pr") == 100 for entry in stalled)
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_record_review_persists_required_changes(tmp_path: Path) -> None:
+    """Issue #507: record_review accepts and persists required_changes."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(
+        456,
+        "request_changes",
+        summary="fix A",
+        required_changes=["add null check", "update tests"],
+    )
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == ["add null check", "update tests"]

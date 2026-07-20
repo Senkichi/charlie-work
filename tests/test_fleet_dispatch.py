@@ -1505,3 +1505,80 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     assert digest.transitions[0].adapter_kind == "self-deploy"
     assert digest.transitions[0].health == "ERROR"
     assert "Access is denied" in digest.transitions[0].last_log_line
+
+
+def test_extract_attention_events_review_verdicts() -> None:
+    """Issue #507: recorded/missed review verdicts surface in fleet attention events."""
+    result = CommandResult(
+        True,
+        "review dispatch: 0 launched, 0 failed; 1 verdict(s) recorded, 1 missed",
+        {
+            "stalled": [],
+            "errors": [],
+            "recorded_verdicts": [{"pr": 100, "issue": 10, "decision": "approved"}],
+            "missed_verdicts": [{"pr": 101, "issue": 11, "reason": "no parseable verdict"}],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    recorded = [e for e in events if e["type"] == "review_verdict_recorded"]
+    missed = [e for e in events if e["type"] == "review_verdict_missed"]
+    assert len(recorded) == 1
+    assert recorded[0]["pr"] == 100
+    assert recorded[0]["issue_number"] == 10
+    assert recorded[0]["decision"] == "approved"
+    assert len(missed) == 1
+    assert missed[0]["pr"] == 101
+    assert missed[0]["reason"] == "no parseable verdict"
+
+
+def test_extract_attention_events_nested_review_verdicts() -> None:
+    """Issue #507: review verdict events in nested dispatch_reviews sub-results are extracted."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "dispatch_reviews": {
+                "recorded_verdicts": [{"pr": 200, "issue": 20, "decision": "request_changes"}],
+                "missed_verdicts": [],
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    assert len(events) == 1
+    assert events[0]["type"] == "review_verdict_recorded"
+    assert events[0]["pr"] == 200
+    assert events[0]["issue_number"] == 20
+
+
+def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
+    """Issue #507: review verdict events map to OK/ERROR attention entries."""
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_recorded",
+            "issue_number": 10,
+            "pr": 100,
+            "decision": "approved",
+        },
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_missed",
+            "issue_number": 11,
+            "pr": 101,
+            "reason": "no parseable verdict",
+        },
+    ]
+
+    digest = _build_fleet_attention_digest(events)
+
+    by_health = {e.health: e for e in digest.transitions}
+    assert by_health["OK"].last_log_line == "approved recorded for PR 100"
+    assert by_health["OK"].issue_number == 10
+    assert by_health["ERROR"].last_log_line == "no parseable verdict"
+    assert by_health["ERROR"].issue_number == 11
