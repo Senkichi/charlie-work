@@ -1863,6 +1863,30 @@ def _write_rework_prompt(
     return prompt_path
 
 
+def _is_pr_updated_at_older_than(
+    pr: dict[str, Any],
+    now: datetime,
+    minutes: int,
+) -> bool:
+    """Return True when ``pr["updatedAt"]`` is more than ``minutes`` old.
+
+    Parses ISO-8601 timestamps with an optional ``Z`` suffix, normalizes
+    naive datetimes to UTC, and tolerates missing or malformed values.
+    """
+    updated_at = pr.get("updatedAt")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return (now - updated).total_seconds() > minutes * 60
+
+
 def _is_pre_review_rework_candidate(
     pr: dict[str, Any],
     config: OrchestratorConfig,
@@ -1896,21 +1920,7 @@ def _is_pre_review_rework_candidate(
     if status_rollup:
         return False, ""
 
-    updated_at = pr.get("updatedAt")
-    if not updated_at:
-        return False, ""
-
-    try:
-        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return False, ""
-
-    if updated.tzinfo is None:
-        updated = updated.replace(tzinfo=UTC)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-
-    if (now - updated).total_seconds() > stale_minutes * 60:
+    if _is_pr_updated_at_older_than(pr, now, stale_minutes):
         return True, "stale_empty_checks"
 
     return False, ""
@@ -1939,25 +1949,10 @@ def _is_readiness_no_ci_stall(
     required = config.required_checks
     if not required:
         return False
-    if not checks:
-        # Treat an empty list as zero check runs. ``None`` means the gh CLI
-        # itself failed and is handled elsewhere as ``checks_unavailable``.
-        pass
     seen = {str(check.get("name") or "") for check in checks}
     if any(name in seen for name in required):
         return False
-    updated_at = pr.get("updatedAt")
-    if not updated_at:
-        return False
-    try:
-        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return False
-    if updated.tzinfo is None:
-        updated = updated.replace(tzinfo=UTC)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return (now - updated).total_seconds() > no_ci_minutes * 60
+    return _is_pr_updated_at_older_than(pr, now, no_ci_minutes)
 
 
 def _route_dead_worker_to_pre_review_rework(

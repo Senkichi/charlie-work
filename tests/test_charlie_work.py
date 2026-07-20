@@ -10977,7 +10977,7 @@ def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
             "baseRefName": "main",
             "headRefOid": "sha-abc123",
             "mergeStateStatus": "DIRTY",
-            "mergeable": "CONFLICTING",
+            "mergeable": "UNKNOWN",
             "body": "Closes #123\n\nTests: regression coverage added.",
             "labels": [],
             "isCrossRepository": False,
@@ -25427,6 +25427,67 @@ def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_c
     # Any present check disqualifies the stale predicate.
     checks_pr = {"statusCheckRollup": [{"name": "Tests passed"}], "updatedAt": old}
     assert _is_pre_review_rework_candidate(checks_pr, config, now) == (False, "")
+
+
+def test_is_pr_updated_at_older_than() -> None:
+    """The shared updatedAt threshold helper parses, tz-normalizes, and compares."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.workflow import _is_pr_updated_at_older_than
+
+    now = datetime.now(UTC)
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+    assert _is_pr_updated_at_older_than({"updatedAt": stale}, now, 15) is True
+    assert _is_pr_updated_at_older_than({"updatedAt": fresh}, now, 15) is False
+    assert _is_pr_updated_at_older_than({}, now, 15) is False
+    assert _is_pr_updated_at_older_than({"updatedAt": "not-a-date"}, now, 15) is False
+
+    # Naive datetimes are normalized to UTC before comparison.
+    naive_now = datetime.now()
+    naive_updated = (naive_now - timedelta(minutes=20)).replace(microsecond=0)
+    assert (
+        _is_pr_updated_at_older_than({"updatedAt": naive_updated.isoformat()}, naive_now, 15)
+        is True
+    )
+
+
+def test_is_readiness_no_ci_stall() -> None:
+    """Issue #474: the readiness no-CI gate escalates only when required checks are missing and updatedAt is stale."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.workflow import _is_readiness_no_ci_stall
+
+    now = datetime.now(UTC)
+    required = ("Tests passed", "Lint & Format")
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    config = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=15)
+
+    # Missing required checks and stale updatedAt.
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], config, now) is True
+
+    # A required check has appeared.
+    assert (
+        _is_readiness_no_ci_stall({"updatedAt": stale}, [{"name": "Tests passed"}], config, now)
+        is False
+    )
+
+    # Missing checks but the PR was updated recently.
+    assert _is_readiness_no_ci_stall({"updatedAt": fresh}, [], config, now) is False
+
+    # Gate disabled by zero minutes.
+    disabled = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=0)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], disabled, now) is False
+
+    # No required checks configured: there is nothing to be missing.
+    no_required = AutoMergeConfig(required_checks=(), readiness_no_ci_minutes=15)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], no_required, now) is False
+
+    # Missing or malformed updatedAt is treated as not stale.
+    assert _is_readiness_no_ci_stall({}, [], config, now) is False
 
 
 def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None:
