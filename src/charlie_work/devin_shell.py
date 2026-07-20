@@ -40,6 +40,7 @@ from .subprocess_runner import RunResult, run_captured
 from .throttle_signatures import match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
+    ReworkBranchConflictError,
     WorktreeForeignWriterError,
     WorktreeInfo,
     WorktreeProbeFailedError,
@@ -399,6 +400,8 @@ def launch_devin_session(
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
             failure_kind = "worktree_unsafe"
+        elif isinstance(exc, ReworkBranchConflictError):
+            failure_kind = "rework_branch_conflict"
         elif isinstance(exc, WorktreeForeignWriterError):
             failure_kind = "worktree_foreign_writer"
         elif isinstance(exc, LiveWorkerRedispatchError):

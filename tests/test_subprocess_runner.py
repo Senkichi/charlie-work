@@ -4,7 +4,11 @@ Covers ``no_console_window_kwargs`` — the single point of enforcement for
 suppressing the transient console window Windows allocates for spawned
 children (issue #393) — and ``hidden_console_kwargs`` for long-lived worker
 spawns that need an inherited hidden console (issue #459). Confirms
-``run_captured`` routes through the appropriate helper.
+``run_captured`` routes through the appropriate helper. Also covers
+``resolve_cli_binary`` — the single point of enforcement for unwrapping
+npm ``.CMD``/``.bat`` shims (e.g. ``claude.CMD``) to their underlying
+``.exe`` so ``Popen(shell=False)`` can find and invoke them without going
+through ``cmd.exe`` (issue #487).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from unittest.mock import patch
 from charlie_work.subprocess_runner import (
     hidden_console_kwargs,
     no_console_window_kwargs,
+    resolve_cli_binary,
     run_captured,
 )
 
@@ -174,3 +179,90 @@ class TestRunCapturedUsesHelper:
         assert result.stdout == "hello\n"
         _, call_kwargs = mock_run.call_args
         assert call_kwargs["input"] == "hello\n"
+
+
+class TestResolveCliBinary:
+    """``resolve_cli_binary`` unwraps an npm ``.CMD`` shim to the ``.exe`` it
+    wraps, so a bare ``"claude"`` resolves to something ``CreateProcessW``
+    can execute directly without going through ``cmd.exe`` (issue #487)."""
+
+    def test_binary_not_on_path_returns_name_unchanged(self):
+        with patch("charlie_work.subprocess_runner.shutil.which", return_value=None):
+            assert resolve_cli_binary("this-binary-does-not-exist-xyz") == (
+                "this-binary-does-not-exist-xyz"
+            )
+
+    def test_posix_returns_which_result_unchanged(self):
+        with (
+            patch("charlie_work.subprocess_runner.os.name", "posix"),
+            patch("charlie_work.subprocess_runner.shutil.which", return_value="/usr/bin/claude"),
+        ):
+            assert resolve_cli_binary("claude") == "/usr/bin/claude"
+
+    def test_non_shim_extension_returned_unchanged(self, tmp_path):
+        exe_path = tmp_path / "claude.exe"
+        exe_path.write_bytes(b"")
+        with (
+            patch("charlie_work.subprocess_runner.os.name", "nt"),
+            patch("charlie_work.subprocess_runner.shutil.which", return_value=str(exe_path)),
+        ):
+            assert resolve_cli_binary("claude") == str(exe_path)
+
+    def test_npm_cmd_shim_unwrapped_to_underlying_exe(self, tmp_path):
+        # Mirror the real npm shim layout:
+        #   node_modules/.bin/claude.CMD
+        #   node_modules/@anthropic-ai/claude-code/cli.exe
+        bin_dir = tmp_path / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        pkg_dir = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code"
+        pkg_dir.mkdir(parents=True)
+        real_exe = pkg_dir / "cli.exe"
+        real_exe.write_bytes(b"")
+
+        shim_path = bin_dir / "claude.CMD"
+        shim_path.write_text(
+            '"%dp0%\\..\\@anthropic-ai\\claude-code\\cli.exe" %*\n',
+            encoding="utf-8",
+        )
+
+        with (
+            patch("charlie_work.subprocess_runner.os.name", "nt"),
+            patch("charlie_work.subprocess_runner.shutil.which", return_value=str(shim_path)),
+        ):
+            resolved = resolve_cli_binary("claude")
+
+        assert resolved == str(real_exe)
+        assert resolved.lower().endswith(".exe")
+
+    def test_shim_target_missing_falls_back_to_shim_path(self, tmp_path):
+        bin_dir = tmp_path / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        shim_path = bin_dir / "claude.CMD"
+        shim_path.write_text(
+            '"%dp0%\\..\\nonexistent-pkg\\cli.exe" %*\n',
+            encoding="utf-8",
+        )
+
+        with (
+            patch("charlie_work.subprocess_runner.os.name", "nt"),
+            patch("charlie_work.subprocess_runner.shutil.which", return_value=str(shim_path)),
+        ):
+            resolved = resolve_cli_binary("claude")
+
+        # Target .exe referenced by the shim does not exist on disk: fall
+        # back to the shim path itself rather than fabricating a path.
+        assert resolved == str(shim_path)
+
+    def test_unparseable_shim_falls_back_to_shim_path(self, tmp_path):
+        bin_dir = tmp_path / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        shim_path = bin_dir / "claude.CMD"
+        shim_path.write_text(
+            "@echo off\r\nrem not the expected npm shim shape\r\n", encoding="utf-8"
+        )
+
+        with (
+            patch("charlie_work.subprocess_runner.os.name", "nt"),
+            patch("charlie_work.subprocess_runner.shutil.which", return_value=str(shim_path)),
+        ):
+            assert resolve_cli_binary("claude") == str(shim_path)
