@@ -103,6 +103,8 @@ class ClaudeWorkerRecord:
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
     session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
+    adapter_kind: str = "claude-code"
+    provider: str = ""
 
     def __post_init__(self) -> None:
         """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
@@ -144,11 +146,33 @@ class ClaudeWorkerRecord:
                 payload.get("inconclusive_probe_deferred_count") or 0
             ),
             session_id=payload.get("session_id"),
+            adapter_kind=str(payload.get("adapter_kind", "claude-code")),
+            provider=str(payload.get("provider", "")),
         )
 
 
-def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
-    return sessions_dir / f"issue-{issue_number}.claude.json"
+_ADAPTER_SIDECAR_SUFFIXES: dict[str, str] = {
+    "claude-code": "claude",
+    "api": "api",
+}
+
+
+def _sidecar_suffix(adapter_kind: str) -> str:
+    """Return the dotted sidecar suffix for ``adapter_kind``.
+
+    This is the single mapping from adapter identity to filename suffix;
+    every sidecar path derivation in this module routes through it.
+    """
+    try:
+        return _ADAPTER_SIDECAR_SUFFIXES[adapter_kind]
+    except KeyError as exc:
+        raise ValueError(f"unknown adapter_kind {adapter_kind!r}") from exc
+
+
+def _sidecar_path(
+    sessions_dir: Path, issue_number: int, adapter_kind: str = "claude-code"
+) -> Path:
+    return sessions_dir / f"issue-{issue_number}.{_sidecar_suffix(adapter_kind)}.json"
 
 
 def _log_path(
@@ -163,9 +187,11 @@ def _log_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
-def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> int:
+def _read_sidecar_inconclusive_count(
+    sessions_dir: Path, issue_number: int, adapter_kind: str = "claude-code"
+) -> int:
     """Read the existing claude sidecar's Signal-1 deferral counter, if any."""
-    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    sidecar_path = _sidecar_path(sessions_dir, issue_number, adapter_kind)
     try:
         with sidecar_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -351,7 +377,10 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def _write_record(sessions_dir: Path, record: ClaudeWorkerRecord) -> ClaudeWorkerRecord:
-    _write_json_atomic(_sidecar_path(sessions_dir, record.issue_number), record.to_dict())
+    _write_json_atomic(
+        _sidecar_path(sessions_dir, record.issue_number, record.adapter_kind),
+        record.to_dict(),
+    )
     return record
 
 
@@ -369,6 +398,8 @@ def _error_record(
     process_start_time: float | None = None,
     inconclusive_probe_deferred_count: int = 0,
     session_id: str | None = None,
+    adapter_kind: str = "claude-code",
+    provider: str = "",
 ) -> ClaudeWorkerRecord:
     return ClaudeWorkerRecord(
         issue_number=issue_number,
@@ -384,6 +415,8 @@ def _error_record(
         process_start_time=process_start_time,
         inconclusive_probe_deferred_count=inconclusive_probe_deferred_count,
         session_id=session_id,
+        adapter_kind=adapter_kind,
+        provider=provider,
     )
 
 
@@ -471,6 +504,8 @@ def launch_claude_worker(
     base_ref: str = "",
     tee_stream_json: bool = False,
     config: OrchestratorConfig | None = None,
+    adapter_kind: str = "claude-code",
+    provider: str = "",
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -508,6 +543,11 @@ def launch_claude_worker(
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
     leftover worktree/branch and either clean it (no commits) or reuse it (has
     commits/dirty work). Not applicable to ``review`` mode.
+
+    ``adapter_kind`` selects which sidecar suffix to write (``claude-code`` ->
+    ``issue-<n>.claude.json``, ``api`` -> ``issue-<n>.api.json``). ``provider``
+    is recorded on the sidecar but does not change the launch command in this
+    issue; it is reserved for future adapter-specific command rendering.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -520,7 +560,7 @@ def launch_claude_worker(
         recovery = dict(recovery)
         recovery.setdefault(
             "inconclusive_probe_deferred_count",
-            _read_sidecar_inconclusive_count(sessions_dir, issue_number),
+            _read_sidecar_inconclusive_count(sessions_dir, issue_number, adapter_kind),
         )
 
     if review:
@@ -595,6 +635,8 @@ def launch_claude_worker(
             if isinstance(exc, LiveWorkerRedispatchError)
             else 0,
             session_id=session_id,
+            adapter_kind=adapter_kind,
+            provider=provider,
         )
         return _write_record(sessions_dir, record)
 
@@ -629,6 +671,8 @@ def launch_claude_worker(
             command=command_template,
             log_path=str(log_path),
             error=f"failed to write prompt file: {exc}",
+            adapter_kind=adapter_kind,
+            provider=provider,
         )
         return _write_record(sessions_dir, record)
 
@@ -646,6 +690,8 @@ def launch_claude_worker(
             command=command_template,
             log_path=str(log_path),
             error=f"command template rendering failed: {exc}",
+            adapter_kind=adapter_kind,
+            provider=provider,
         )
         return _write_record(sessions_dir, record)
 
@@ -775,6 +821,8 @@ def launch_claude_worker(
             command=command,
             log_path=str(log_path),
             error=f"failed to launch claude: {exc}",
+            adapter_kind=adapter_kind,
+            provider=provider,
         )
         return _write_record(sessions_dir, record)
 
@@ -804,20 +852,36 @@ def launch_claude_worker(
             worktree.attempt_snapshot.ahead_of_main_count if worktree.attempt_snapshot else None
         ),
         session_id=session_id,
+        adapter_kind=adapter_kind,
+        provider=provider,
     )
     return _write_record(sessions_dir, record)
 
 
-def read_worker_records(sessions_dir: Path) -> list[ClaudeWorkerRecord]:
-    """Load every ``issue-*.claude.json`` sidecar in ``sessions_dir``.
+def read_worker_records(
+    sessions_dir: Path, *, adapter_kind: str | None = "claude-code"
+) -> list[ClaudeWorkerRecord]:
+    """Load Claude adapter sidecars from ``sessions_dir``.
+
+    By default only ``claude-code`` sidecars (``issue-*.claude.json``) are
+    returned, preserving the behavior expected by existing callers. Pass
+    ``adapter_kind="api"`` to read only ``issue-*.api.json`` sidecars, or
+    ``adapter_kind=None`` to read every known adapter kind.
 
     Malformed sidecars are skipped rather than raising — a corrupt file from
     a crashed write must not take down reconciliation for every other worker.
     """
     if not sessions_dir.is_dir():
         return []
+    if adapter_kind is None:
+        suffixes = list(_ADAPTER_SIDECAR_SUFFIXES.values())
+    else:
+        suffixes = [_sidecar_suffix(adapter_kind)]
     records: list[ClaudeWorkerRecord] = []
-    for path in sorted(sessions_dir.glob("issue-*.claude.json")):
+    paths = sorted(
+        path for suffix in suffixes for path in sessions_dir.glob(f"issue-*.{suffix}.json")
+    )
+    for path in paths:
         try:
             with path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
