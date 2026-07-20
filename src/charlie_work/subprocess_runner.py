@@ -8,6 +8,9 @@ never an encoding crash.
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -91,6 +94,72 @@ def hidden_console_kwargs(extra_creationflags: int = 0) -> _SpawnKwargs:
         "creationflags": extra_creationflags | _CREATE_NEW_CONSOLE,
         "startupinfo": startupinfo,
     }
+
+
+_NPM_SHIM_EXE_PATTERN = re.compile(r'"%dp0%\\([^"]+\.exe)"', re.IGNORECASE)
+
+
+def resolve_cli_binary(name: str) -> str:
+    """Resolve an npm-installed CLI tool name to its underlying ``.exe`` on Windows.
+
+    npm-published shims (``claude.CMD``, ``gemini.CMD``, ...) are batch-file
+    wrappers around the real ``.exe``. Two distinct problems follow from that,
+    and this is the single point of enforcement that fixes both:
+
+    1. ``subprocess.Popen``/``subprocess.run`` with ``shell=False`` and a bare
+       name (e.g. ``"claude"``) goes straight to Windows' ``CreateProcessW``,
+       which does **not** perform the ``PATHEXT``-based extension search that
+       ``cmd.exe`` does — so it cannot find ``claude.CMD`` at all and fails
+       with ``OSError: [WinError 2] The system cannot find the file
+       specified``, even though ``claude`` is on ``PATH`` and works fine when
+       typed at a shell prompt (see charlie-work issue #487).
+    2. Pre-resolving via ``shutil.which()`` alone (which *does* honor
+       ``PATHEXT`` and returns the full ``.CMD`` path) fixes (1) but trades it
+       for a subtler bug: ``CreateProcessW`` on a ``.CMD`` file implicitly
+       routes the child through ``cmd.exe``, whose argv parser uses
+       caret-escaping rather than the C-runtime backslash-escaping that
+       Python's ``subprocess.list2cmdline`` emits. A literal ``|`` in an
+       argument value (e.g. a prompt containing ``"small|mid|large"``) is
+       then interpreted as a ``cmd.exe`` pipeline separator, breaking the
+       invocation.
+
+    The real fix is to skip ``cmd.exe`` entirely: parse the ``.CMD`` shim to
+    find the underlying ``.exe`` it wraps (the npm shim pattern is stable —
+    ``"%dp0%\\node_modules\\<pkg>\\bin\\<name>.exe" %*``) and use that ``.exe``
+    path directly as ``argv[0]``. ``CreateProcessW`` then invokes it without
+    any shell interposed. Ported from job-cannon's
+    ``claude_client._resolve_cli_binary`` (commit fe0cdde7), which fixed the
+    identical class of bug for the same npm-installed CLI shims.
+
+    On POSIX, or when ``shutil.which`` resolves to something other than a
+    ``.cmd``/``.bat`` file, the resolved path is returned unchanged (already
+    directly executable). If the binary cannot be found on ``PATH`` at all,
+    or the shim cannot be parsed/its target ``.exe`` does not exist, the
+    original (or ``shutil.which``-resolved) value is returned unchanged — a
+    deliberately conservative fallback that preserves the caller's existing
+    "binary not found" error handling rather than masking a missing install.
+
+    Args:
+        name: CLI tool name or path, e.g. ``"claude"``.
+
+    Returns:
+        A path safe to pass as ``argv[0]`` to ``subprocess.Popen``/``.run``
+        with ``shell=False``.
+    """
+    path = shutil.which(name)
+    if path is None:
+        return name
+    if os.name != "nt" or not path.lower().endswith((".cmd", ".bat")):
+        return path
+    try:
+        shim_text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return path
+    match = _NPM_SHIM_EXE_PATTERN.search(shim_text)
+    if match is None:
+        return path
+    exe_path = Path(os.path.normpath(Path(path).parent / match.group(1)))
+    return str(exe_path) if exe_path.exists() else path
 
 
 @dataclass(frozen=True)
