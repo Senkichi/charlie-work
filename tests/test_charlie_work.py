@@ -9546,6 +9546,72 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     assert persisted["status"] != "merged"
 
 
+def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: an approved PR carrying the configured merge-hold label
+    must not be swept back into the mergequeue on subsequent passes."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["labels"] = [{"name": config.labels.merge_hold}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "left alone" in result.message
+    assert load_state(paths.state_file)["prs"]["456"].get("status") != "mergequeue"
+
+
+def test_merge_ready_mergequeue_hold_label_on_issue_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: the merge-hold label on the linked issue is also a
+    valid operator signal and must keep the PR out of the mergequeue."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.merge_hold},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path) -> None:
+    """Issue #496: removing the merge-hold label restores normal
+    auto-merge behavior on the next pass."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    hold_label = config.labels.merge_hold
+    fake_gh.prs[0]["labels"] = [{"name": hold_label}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    held = app.merge_ready(456, merge=True)
+    assert held.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+
+    # Operator removes the hold label
+    fake_gh.prs[0]["labels"] = []
+    resumed = app.merge_ready(456, merge=True)
+
+    assert resumed.data["merge_hold"] is False
+    assert resumed.data["mergequeue_label_applied"] is True
+    assert (456, "mergequeue") in fake_gh.pr_labels_added
+
+
 def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
     """An unapproved PR must never be labeled for the merge queue — the
     approval gate (can_merge) is upstream of the mergequeue branch, exactly as

@@ -90,6 +90,7 @@ class LabelConfig:
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
+    merge_hold: str = "agent:merge-hold"
 
     @property
     def terminal(self) -> set[str]:
@@ -112,6 +113,7 @@ class LabelConfig:
             self.done,
             self.human_needed,
             self.prose_only_deps,
+            self.merge_hold,
         ]
 
     @property

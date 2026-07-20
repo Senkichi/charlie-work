@@ -2990,6 +2990,7 @@ class OrchestratorApp:
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
         }
         for label in self.config.labels.all:
             color = "0E8A16" if label == self.config.labels.ready else "5319E7"
@@ -5583,6 +5584,7 @@ class OrchestratorApp:
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
+        merge_hold: bool = False
         if can_merge and should_merge:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
@@ -5601,7 +5603,20 @@ class OrchestratorApp:
                 # reconcile.py's merged_outside_orchestrator drift path
                 # reconciles status to "merged" and runs the "merged" label
                 # transition — no new post-merge bookkeeping is added here.
-                mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
+                #
+                # Issue #496: an operator can park an approved PR by adding the
+                # configured merge-hold label to the PR or its linked issue.
+                # When the hold is present, skip the mergequeue re-add entirely.
+                merge_hold = self.config.labels.merge_hold in label_names(pr)
+                if not merge_hold and issue_number is not None:
+                    try:
+                        issue = self.gh.issue_view(issue_number)
+                    except (GitHubError, ValueError):
+                        issue = None
+                    issue_labels = label_names(issue) if issue else set()
+                    merge_hold = self.config.labels.merge_hold in issue_labels
+                if not merge_hold:
+                    mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
@@ -5845,6 +5860,7 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "can_merge": can_merge,
                     "merged": bool(merge_output),
+                    "merge_hold": merge_hold,
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
@@ -5873,12 +5889,17 @@ class OrchestratorApp:
             "cross_pr_revert_reason": cross_pr_revert_reason,
             "cross_pr_revert_routed": cross_pr_revert_routed,
             "mergequeue_label_applied": mergequeue_label_applied,
+            "merge_hold": merge_hold,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif merge_hold:
+            message += (
+                f" (merge-hold label {self.config.labels.merge_hold!r} present — left alone)"
+            )
         elif mergequeue_label_applied is False:
             message += (
                 f" (mergequeue label {self.config.auto_merge.mergequeue_label!r} FAILED to "
