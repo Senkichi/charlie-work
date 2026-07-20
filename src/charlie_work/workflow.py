@@ -1779,6 +1779,8 @@ def _is_pre_review_rework_candidate(
 
     * ``mergeable`` is ``CONFLICTING`` — the branch cannot be merged and CI
       will not run because GitHub cannot build a merge ref; or
+    * ``mergeStateStatus`` is ``DIRTY`` — the rework branch conflicts with the
+      base, so the merge ref cannot be built and no ``pull_request`` CI can run; or
     * ``statusCheckRollup`` is empty and the PR's ``updatedAt`` is older than
       ``watchdog.pre_review_rework_stale_minutes`` — the worker opened a PR
       and then died before any checks were created.
@@ -1786,6 +1788,10 @@ def _is_pre_review_rework_candidate(
     mergeable = str(pr.get("mergeable") or "").upper()
     if mergeable == "CONFLICTING":
         return True, "merge_conflict"
+
+    merge_state = str(pr.get("mergeStateStatus") or "").upper()
+    if merge_state == "DIRTY":
+        return True, "rework_branch_conflict"
 
     stale_minutes = config.watchdog.pre_review_rework_stale_minutes
     if stale_minutes <= 0:
@@ -1835,17 +1841,26 @@ def _route_dead_worker_to_pre_review_rework(
     failures immediately, mirroring the existing redispatch-escalation logic.
     """
     pr_number = int(pr["number"])
-    summary = (
-        "The PR branch has a merge conflict with the base branch. "
-        "Rebase the branch onto the current base branch, resolve the conflicts, "
-        "and push. The code changes are already approved; do not re-litigate the review."
-        if reason == "merge_conflict"
-        else (
+    if reason == "merge_conflict":
+        summary = (
+            "The PR branch has a merge conflict with the base branch. "
+            "Rebase the branch onto the current base branch, resolve the conflicts, "
+            "and push. The code changes are already approved; do not re-litigate the review."
+        )
+    elif reason == "rework_branch_conflict":
+        summary = (
+            "The rework branch conflicts with the current base branch; GitHub cannot "
+            "build the merge ref, so no pull_request CI will run. Resolve the conflicts "
+            "manually and push."
+        )
+        if failure_kind is None:
+            failure_kind = "rework_branch_conflict"
+    else:
+        summary = (
             "The PR was opened but no CI checks have been created after the stale threshold. "
             "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
             "The existing changes are pre-approved; do not re-litigate the review."
         )
-    )
 
     with state_lock(state_file):
         state = load_state(state_file)
