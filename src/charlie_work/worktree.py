@@ -141,6 +141,11 @@ class WorktreeInfo:
     # Set when a redispatch reset a branch tip that had commits worth
     # preserving (issue #261) — see attempt_refs.snapshot_attempt_ref.
     attempt_snapshot: AttemptSnapshot | None = None
+    # Forward-slash-normalized worktree-relative paths written by the materializer
+    # (issue #469). Derived from what the materializer actually writes, never a
+    # hardcoded list, and used to keep injected orchestrator-owned files from
+    # appearing as dirty in git status / CI-parity clean-tree gates.
+    materialized_paths: tuple[str, ...] = ()
 
 
 class WorktreeState(str, Enum):
@@ -962,26 +967,95 @@ def _is_git_tracked(repo_root: Path, path: Path) -> bool:
     return result.ok
 
 
-def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> None:
-    """Copy a directory from repo_root to worktree_path if it's not tracked.
+def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> tuple[str, ...]:
+    """Copy files from ``repo_root / dir_path`` into the worktree.
 
-    Skip if the path is already tracked by git (it will be in the worktree).
-    Copy-not-link (workers may write marker files). Errors surface as OSError.
+    Files are copied file-by-file; existing target files are only overwritten
+    when the source content differs. All tracked paths under the configured
+    materialize surface are marked ``assume-unchanged`` so that orchestrator-
+    injected content (e.g. per-dispatch ``.devin/prompts/worker.md``) written by
+    an external shim or worker after ``create_worktree`` returns does not
+    appear as working-tree dirt in ``git status`` or CI-parity clean-tree
+    gates. Empty source subdirectories are recreated in the target (matching
+    the behaviour of the previous ``shutil.copytree`` implementation).
+
+    Returns a tuple of worktree-relative paths (forward-slash normalized) that
+    were written, derived from the materializer's own manifest.
     """
-    source = repo_root / dir_path
+    dir_path_posix = Path(dir_path).as_posix()
+    source = repo_root / dir_path_posix
     if not source.exists():
-        return  # Source doesn't exist, nothing to copy
+        return ()
+    if not source.is_relative_to(repo_root):
+        return ()
 
-    # Check if the path is tracked by git
-    if _is_git_tracked(repo_root, source):
-        return  # Tracked paths are already in the worktree
+    target_root = worktree_path / dir_path_posix
+    if source.is_file():
+        source_files = [source]
+        source_root = source.parent
+    else:
+        source_files = [p for p in source.rglob("*") if p.is_file()]
+        source_root = source
 
-    # Copy the directory to the worktree
-    target = worktree_path / dir_path
-    if target.exists():
-        return  # Already exists in worktree (shouldn't happen, but be safe)
+    written: list[str] = []
+    for src_file in source_files:
+        if ".git" in src_file.parts:
+            continue
 
-    shutil.copytree(source, target)
+        if source.is_file():
+            rel = Path(".")
+        else:
+            rel = src_file.relative_to(source_root)
+        target_file = (target_root / rel).resolve()
+        if target_file.is_dir():
+            continue
+        if target_file.exists():
+            try:
+                if target_file.read_bytes() == src_file.read_bytes():
+                    continue
+            except OSError:
+                pass
+
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, target_file)
+        rel_worktree = (Path(dir_path_posix) / rel).as_posix()
+        written.append(rel_worktree)
+
+    # Recreate empty source subdirectories that the file copy loop above would
+    # otherwise silently drop.
+    if source.is_dir():
+        target_root.mkdir(parents=True, exist_ok=True)
+        for src_dir in source.rglob("*"):
+            if not src_dir.is_dir() or ".git" in src_dir.parts:
+                continue
+            rel = src_dir.relative_to(source_root)
+            (target_root / rel).mkdir(parents=True, exist_ok=True)
+
+    # Mark every tracked path under the configured materialize surface as
+    # assume-unchanged, regardless of whether the materializer's own copy loop
+    # rewrote it. This is what shields injected files from later writes (e.g.
+    # a worker launch shim mutating ``.devin/prompts/*.md`` after
+    # ``create_worktree`` returns) from ``git status`` and clean-tree gates.
+    ls_result = run_captured(
+        ["git", "ls-files", "--", dir_path_posix],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if ls_result.ok:
+        tracked_paths = [line for line in ls_result.stdout.splitlines() if line]
+        if tracked_paths:
+            assume_result = run_captured(
+                ["git", "update-index", "--assume-unchanged", "--", *tracked_paths],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not assume_result.ok:
+                raise RuntimeError(
+                    f"Failed to mark materialized paths as assume-unchanged: "
+                    f"{assume_result.error or assume_result.stderr}"
+                )
+
+    return tuple(written)
 
 
 _PERMANENT_NO_MATCH_ERROR_PREFIXES = (
@@ -1720,16 +1794,19 @@ def create_worktree(
             raise
 
     # Materialize git-excluded directories into the worktree
+    materialized_paths: list[str] = []
     for dir_path in materialize_dirs:
         try:
-            _materialize_directory(repo_root, worktree_path, dir_path)
-        except OSError as exc:
+            written = _materialize_directory(repo_root, worktree_path, dir_path)
+        except (OSError, RuntimeError) as exc:
             # Clean up the worktree and branch if materialization fails
             delete_branch = None if rework else branch
             remove_worktree(repo_root, worktree_path, force=True, branch=delete_branch)
             raise RuntimeError(
                 f"Failed to materialize directory {dir_path} into worktree: {exc}"
             ) from exc
+        else:
+            materialized_paths.extend(written)
 
     return WorktreeInfo(
         path=worktree_path,
@@ -1737,6 +1814,7 @@ def create_worktree(
         venv_junction=venv_junction,
         reclaimed=reclaimed,
         attempt_snapshot=attempt_snapshot,
+        materialized_paths=tuple(materialized_paths),
     )
 
 

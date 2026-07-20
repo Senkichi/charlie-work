@@ -1815,22 +1815,40 @@ def test_materialize_directory_copies_untracked_dir(tmp_path: Path) -> None:
     assert (target_dir / "config.json").read_text(encoding="utf-8") == "config\n"
 
 
-def test_materialize_directory_skips_tracked_dir(tmp_path: Path) -> None:
-    """_materialize_directory should skip tracked directories."""
+def test_materialize_directory_preserves_tracked_files_and_copies_untracked_infra(
+    tmp_path: Path,
+) -> None:
+    """_materialize_directory should copy untracked infra but not overwrite
+    tracked files that are already identical in the target."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
-    # README.md is tracked by default
-    # Create a worktree
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+    _git(repo_root, "add", ".devin/prompts/worker.md")
+    _git(repo_root, "commit", "-m", "add prompt template")
+
+    # Pre-existing target with the same tracked prompt template
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
+    (worktree_path / ".devin" / "prompts").mkdir(parents=True)
+    (worktree_path / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
 
-    # Try to materialize a tracked file's parent directory
-    # This should be skipped because it's tracked
-    _materialize_directory(repo_root, worktree_path, ".")
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
 
-    # The worktree should still be empty (nothing was copied)
-    assert not (worktree_path / "README.md").exists()
+    # The tracked prompt template should be preserved (not overwritten)
+    assert (worktree_path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "committed worker\n"
+    # The untracked infra file should be copied
+    assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
+    assert ".devin/config.json" in written
+    assert ".devin/prompts/worker.md" not in written
 
 
 def test_materialize_directory_skips_nonexistent_source(tmp_path: Path) -> None:
@@ -1848,8 +1866,8 @@ def test_materialize_directory_skips_nonexistent_source(tmp_path: Path) -> None:
     assert not (worktree_path / "does-not-exist").exists()
 
 
-def test_materialize_directory_skips_if_target_exists(tmp_path: Path) -> None:
-    """_materialize_directory should skip if target already exists."""
+def test_materialize_directory_merges_into_existing_target(tmp_path: Path) -> None:
+    """_materialize_directory should copy missing files and preserve existing ones."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -1865,13 +1883,32 @@ def test_materialize_directory_skips_if_target_exists(tmp_path: Path) -> None:
     target_dir.mkdir()
     (target_dir / "existing.txt").write_text("existing\n", encoding="utf-8")
 
-    # Materialize the directory - should skip because target exists
-    _materialize_directory(repo_root, worktree_path, ".devin")
+    # Materialize the directory - should merge, not skip wholesale
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
 
     # The existing file should still be there (not overwritten)
     assert (target_dir / "existing.txt").read_text(encoding="utf-8") == "existing\n"
-    # The source file should not have been copied
-    assert not (target_dir / "config.json").exists()
+    # The missing source file should have been copied
+    assert (target_dir / "config.json").read_text(encoding="utf-8") == "original\n"
+    assert ".devin/config.json" in written
+
+
+def test_materialize_directory_preserves_empty_subdirectories(tmp_path: Path) -> None:
+    """Empty source subdirectories must be recreated in the target (copytree did)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "empty_subdir").mkdir(parents=True)
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    _materialize_directory(repo_root, worktree_path, ".devin")
+
+    assert (worktree_path / ".devin" / "empty_subdir").is_dir()
+    assert not any((worktree_path / ".devin" / "empty_subdir").iterdir())
+    assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
 
 
 def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
@@ -1896,6 +1933,194 @@ def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
     target_dir = info.path / ".devin"
     assert target_dir.exists()
     assert (target_dir / "hooks.json").read_text(encoding="utf-8") == "hooks\n"
+    assert ".devin/hooks.json" in info.materialized_paths
+
+
+def _simulated_require_ci_clean(worktree_path: Path) -> bool:
+    """Return True if the worktree has no staged or unstaged tracked changes."""
+    staged = subprocess.run(
+        ["git", "diff-index", "--cached", "--exit-code", "HEAD"],
+        cwd=worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unstaged = subprocess.run(
+        ["git", "diff", "--exit-code"],
+        cwd=worktree_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return staged.returncode == 0 and unstaged.returncode == 0
+
+
+def test_materialize_directory_overwrites_tracked_prompt_and_hides_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #469: per-dispatch prompt files injected over tracked templates
+    must not leave the worktree dirty in ``git status``."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    # Simulate the orchestrator writing per-dispatch prompt content into the
+    # source tree (the content that the materializer will copy).
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "per-dispatch worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "per-dispatch rework\n", encoding="utf-8"
+    )
+
+    # Create a target worktree that already has the committed templates tracked.
+    worktree_path = tmp_path / "wt"
+    _git(repo_root, "clone", str(repo_root), str(worktree_path))
+    # Re-initialize the clone as a normal repo so git status is meaningful there.
+    _git(worktree_path, "config", "user.email", "test@example.test")
+    _git(worktree_path, "config", "user.name", "Test User")
+
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
+
+    assert set(written) == {
+        ".devin/prompts/worker.md",
+        ".devin/prompts/rework.md",
+        ".devin/config.json",
+    }
+    assert (worktree_path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch worker\n"
+    assert (worktree_path / ".devin" / "prompts" / "rework.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch rework\n"
+
+    # The copied prompt files should be marked assume-unchanged in the target.
+    ls_files = _git(worktree_path, "ls-files", "-v", ".devin/prompts/worker.md")
+    assert ls_files.stdout.startswith("h ")
+
+    # No tracked-file dirt visible to git status or a strict CI clean-tree gate.
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=worktree_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(worktree_path)
+
+
+def test_create_worktree_materialize_dirs_injects_prompt_and_keeps_clean_tree(
+    tmp_path: Path,
+) -> None:
+    """create_worktree with materialize_dirs must inject per-dispatch prompt
+    content over tracked templates while leaving the worktree clean."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    # Per-dispatch prompt content in the source tree.
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "per-dispatch worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "per-dispatch rework\n", encoding="utf-8"
+    )
+
+    info = create_worktree(
+        repo_root,
+        "agent/issue-469-materialize",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    assert set(info.materialized_paths) == {
+        ".devin/prompts/worker.md",
+        ".devin/prompts/rework.md",
+    }
+    assert (info.path / ".devin" / "prompts" / "worker.md").read_text(
+        encoding="utf-8"
+    ) == "per-dispatch worker\n"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(info.path)
+
+
+def test_create_worktree_materialize_dirs_survives_external_tracked_prompt_write(
+    tmp_path: Path,
+) -> None:
+    """Issue #469: tracked prompt files overwritten by an external shim after
+    create_worktree returns must not dirty the worktree.
+
+    The assume-unchanged bit must be applied proactively to every tracked path
+    under the configured materialize surface at worktree-creation time, not only
+    to paths whose content differed from the source tree during the copy loop.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    info = create_worktree(
+        repo_root,
+        "agent/issue-469-shim-write",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    # Source content matches HEAD, so the materializer does not rewrite anything.
+    assert info.materialized_paths == ()
+
+    # Simulate the external launch shim writing per-dispatch content into the
+    # worktree after create_worktree has already returned.
+    (info.path / ".devin" / "prompts" / "worker.md").write_text("shim worker\n", encoding="utf-8")
+
+    ls_files = _git(info.path, "ls-files", "-v", ".devin/prompts/worker.md")
+    assert ls_files.stdout.startswith("h ")
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(info.path)
 
 
 def test_resolve_default_branch_ref_with_origin(tmp_path: Path) -> None:
