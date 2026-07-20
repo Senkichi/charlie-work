@@ -24,6 +24,7 @@ from charlie_work.devin_shell import (
     _write_json,
 )
 from charlie_work.env_sanitize import sanitize_env
+from charlie_work.state import set_throttled_until
 from charlie_work.worktree import WorktreeInfo, create_worktree, is_junction, remove_worktree
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
@@ -1438,6 +1439,45 @@ def test_get_rate_limit_defer_until_no_match(tmp_path: Path) -> None:
     log_path.write_text("Working on task...\n", encoding="utf-8")
 
     assert get_rate_limit_defer_until(log_path, slack_minutes=2) is None
+
+
+def test_get_rate_limit_defer_until_includes_resume_margin(tmp_path: Path) -> None:
+    """Issue #499: provider reset estimates are floors; add a resume margin."""
+    from datetime import UTC, datetime, timedelta
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Your limit will reset in 3 minutes.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC)
+    defer_until = get_rate_limit_defer_until(
+        log_path,
+        slack_minutes=2,
+        now=now,
+        resume_margin_seconds=90,
+    )
+
+    assert defer_until is not None
+    parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+    expected = now + timedelta(minutes=3 + 2, seconds=90)
+    assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_set_throttled_until_overwrites_no_accumulation() -> None:
+    """set_throttled_until replaces the value; it does not accumulate margins."""
+    from datetime import UTC, datetime, timedelta
+
+    first = (datetime.now(UTC) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    second = (datetime.now(UTC) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+
+    original = {}
+    state = set_throttled_until(original, first)
+    state = set_throttled_until(state, second)
+
+    assert state["throttled_until"] == second
+    assert original.get("throttled_until") is None
 
 
 def test_update_session_record_with_failure_classification(tmp_path: Path) -> None:

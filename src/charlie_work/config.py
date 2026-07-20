@@ -369,6 +369,11 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: int = 1500
+    # Extra safety margin added to provider-reported rate-limit reset times
+    # when computing the ``throttled_until`` defer deadline. Provider reset
+    # estimates are floors, not guarantees; dispatching at T+0 races the
+    # provider's actual reset. Default 90 seconds.
+    throttle_resume_margin_s: int = 90
 
 
 @dataclass(frozen=True)
@@ -1000,6 +1005,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
                 f"got {graphql_rate_limit_threshold}"
+            )
+    throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
+    if throttle_resume_margin_s is not None:
+        if not isinstance(throttle_resume_margin_s, int):
+            raise ConfigError(
+                "config section 'runtime' key 'throttle_resume_margin_s' must be an int, "
+                f"got {type(throttle_resume_margin_s).__name__}"
+            )
+        if throttle_resume_margin_s < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
+                f"got {throttle_resume_margin_s}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

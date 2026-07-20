@@ -586,6 +586,7 @@ def _detect_and_handle_stalled_sessions(
                         config.watchdog.rate_limit_defer_slack_minutes,
                         now,
                         config.runtime.throttle_error_markers,
+                        config.runtime.throttle_resume_margin_s,
                     )
                     if defer_until is not None:
                         update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)

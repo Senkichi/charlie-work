@@ -186,3 +186,54 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+
+
+def test_load_config_runtime_throttle_resume_margin_default() -> None:
+    """RuntimeConfig.throttle_resume_margin_s defaults to 90 seconds."""
+    from charlie_work.config import RuntimeConfig
+
+    config = RuntimeConfig()
+    assert config.throttle_resume_margin_s == 90
+
+
+def test_load_config_runtime_throttle_resume_margin_override(tmp_path: Path) -> None:
+    """runtime.throttle_resume_margin_s is read from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: 120
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.throttle_resume_margin_s == 120
+
+
+def test_load_config_runtime_throttle_resume_margin_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """runtime.throttle_resume_margin_s must be an int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: "90"
+""",
+    )
+    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_runtime_throttle_resume_margin_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    """runtime.throttle_resume_margin_s must be >= 0."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be >= 0"):
+        load_config(config_file)
