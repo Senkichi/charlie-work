@@ -971,21 +971,25 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     """Copy files from ``repo_root / dir_path`` into the worktree.
 
     Files are copied file-by-file; existing target files are only overwritten
-    when the source content differs. Any written path that maps to a tracked
-    file in the worktree is marked ``assume-unchanged`` so that orchestrator-
-    injected content (e.g. per-dispatch ``.devin/prompts/worker.md``) does not
+    when the source content differs. All tracked paths under the configured
+    materialize surface are marked ``assume-unchanged`` so that orchestrator-
+    injected content (e.g. per-dispatch ``.devin/prompts/worker.md``) written by
+    an external shim or worker after ``create_worktree`` returns does not
     appear as working-tree dirt in ``git status`` or CI-parity clean-tree
-    gates.
+    gates. Empty source subdirectories are recreated in the target (matching
+    the behaviour of the previous ``shutil.copytree`` implementation).
 
     Returns a tuple of worktree-relative paths (forward-slash normalized) that
     were written, derived from the materializer's own manifest.
     """
-    source = repo_root / dir_path
+    dir_path_posix = Path(dir_path).as_posix()
+    source = repo_root / dir_path_posix
     if not source.exists():
         return ()
     if not source.is_relative_to(repo_root):
         return ()
 
+    target_root = worktree_path / dir_path_posix
     if source.is_file():
         source_files = [source]
         source_root = source.parent
@@ -1002,7 +1006,7 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
             rel = Path(".")
         else:
             rel = src_file.relative_to(source_root)
-        target_file = (worktree_path / dir_path / rel).resolve()
+        target_file = (target_root / rel).resolve()
         if target_file.is_dir():
             continue
         if target_file.exists():
@@ -1014,23 +1018,42 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
 
         target_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_file, target_file)
-        rel_worktree = (Path(dir_path) / rel).as_posix()
+        rel_worktree = (Path(dir_path_posix) / rel).as_posix()
         written.append(rel_worktree)
 
-    # Mark any tracked target paths as assume-unchanged so that orchestrator-
-    # injected per-dispatch content does not surface as tracked-file dirt.
-    tracked_written = [p for p in written if _is_git_tracked(worktree_path, worktree_path / p)]
-    if tracked_written:
-        assume_result = run_captured(
-            ["git", "update-index", "--assume-unchanged", "--", *tracked_written],
-            cwd=worktree_path,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if not assume_result.ok:
-            raise RuntimeError(
-                f"Failed to mark materialized paths as assume-unchanged: "
-                f"{assume_result.error or assume_result.stderr}"
+    # Recreate empty source subdirectories that the file copy loop above would
+    # otherwise silently drop.
+    if source.is_dir():
+        target_root.mkdir(parents=True, exist_ok=True)
+        for src_dir in source.rglob("*"):
+            if not src_dir.is_dir() or ".git" in src_dir.parts:
+                continue
+            rel = src_dir.relative_to(source_root)
+            (target_root / rel).mkdir(parents=True, exist_ok=True)
+
+    # Mark every tracked path under the configured materialize surface as
+    # assume-unchanged, regardless of whether the materializer's own copy loop
+    # rewrote it. This is what shields injected files from later writes (e.g.
+    # a worker launch shim mutating ``.devin/prompts/*.md`` after
+    # ``create_worktree`` returns) from ``git status`` and clean-tree gates.
+    ls_result = run_captured(
+        ["git", "ls-files", "--", dir_path_posix],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if ls_result.ok:
+        tracked_paths = [line for line in ls_result.stdout.splitlines() if line]
+        if tracked_paths:
+            assume_result = run_captured(
+                ["git", "update-index", "--assume-unchanged", "--", *tracked_paths],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
+            if not assume_result.ok:
+                raise RuntimeError(
+                    f"Failed to mark materialized paths as assume-unchanged: "
+                    f"{assume_result.error or assume_result.stderr}"
+                )
 
     return tuple(written)
 

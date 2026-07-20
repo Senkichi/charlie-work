@@ -1893,6 +1893,24 @@ def test_materialize_directory_merges_into_existing_target(tmp_path: Path) -> No
     assert ".devin/config.json" in written
 
 
+def test_materialize_directory_preserves_empty_subdirectories(tmp_path: Path) -> None:
+    """Empty source subdirectories must be recreated in the target (copytree did)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "empty_subdir").mkdir(parents=True)
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    _materialize_directory(repo_root, worktree_path, ".devin")
+
+    assert (worktree_path / ".devin" / "empty_subdir").is_dir()
+    assert not any((worktree_path / ".devin" / "empty_subdir").iterdir())
+    assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
+
+
 def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
     """create_worktree should materialize specified directories."""
     repo_root = tmp_path / "repo"
@@ -2042,6 +2060,57 @@ def test_create_worktree_materialize_dirs_injects_prompt_and_keeps_clean_tree(
     assert (info.path / ".devin" / "prompts" / "worker.md").read_text(
         encoding="utf-8"
     ) == "per-dispatch worker\n"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=info.path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert _simulated_require_ci_clean(info.path)
+
+
+def test_create_worktree_materialize_dirs_survives_external_tracked_prompt_write(
+    tmp_path: Path,
+) -> None:
+    """Issue #469: tracked prompt files overwritten by an external shim after
+    create_worktree returns must not dirty the worktree.
+
+    The assume-unchanged bit must be applied proactively to every tracked path
+    under the configured materialize surface at worktree-creation time, not only
+    to paths whose content differed from the source tree during the copy loop.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    (repo_root / ".devin" / "prompts").mkdir(parents=True)
+    (repo_root / ".devin" / "prompts" / "worker.md").write_text(
+        "committed worker\n", encoding="utf-8"
+    )
+    (repo_root / ".devin" / "prompts" / "rework.md").write_text(
+        "committed rework\n", encoding="utf-8"
+    )
+    _git(repo_root, "add", "-f", ".devin/prompts/worker.md", ".devin/prompts/rework.md")
+    _git(repo_root, "commit", "-m", "add prompt templates")
+
+    info = create_worktree(
+        repo_root,
+        "agent/issue-469-shim-write",
+        base_ref="HEAD",
+        materialize_dirs=(".devin",),
+    )
+
+    # Source content matches HEAD, so the materializer does not rewrite anything.
+    assert info.materialized_paths == ()
+
+    # Simulate the external launch shim writing per-dispatch content into the
+    # worktree after create_worktree has already returned.
+    (info.path / ".devin" / "prompts" / "worker.md").write_text("shim worker\n", encoding="utf-8")
+
+    ls_files = _git(info.path, "ls-files", "-v", ".devin/prompts/worker.md")
+    assert ls_files.stdout.startswith("h ")
 
     status = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
