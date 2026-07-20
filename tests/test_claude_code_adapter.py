@@ -2907,3 +2907,87 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
         text=True,
     )
     assert str(checkout_path) not in result.stdout
+
+
+def test_launch_claude_worker_api_kind_sidecar_naming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An api-kind launch writes ``issue-<n>.api.json`` and records the kind/provider."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-api",
+        "Do the api thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        adapter_kind="api",
+        provider="openai",
+    )
+
+    assert record.ok
+    assert record.adapter_kind == "api"
+    assert record.provider == "openai"
+
+    sidecar_path = sessions_dir / "issue-42.api.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["adapter_kind"] == "api"
+    assert payload["provider"] == "openai"
+
+    # Default read_worker_records filters to claude-code and must not return api records.
+    assert read_worker_records(sessions_dir) == []
+
+    # Reading with the api kind filter returns the record and preserves identity.
+    api_records = read_worker_records(sessions_dir, adapter_kind="api")
+    assert len(api_records) == 1
+    assert api_records[0].adapter_kind == "api"
+    assert api_records[0].provider == "openai"
+
+
+def test_claude_worker_record_round_trips_new_fields(tmp_path: Path) -> None:
+    """``to_dict`` / ``from_dict`` carry ``adapter_kind`` and ``provider``."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    record = ClaudeWorkerRecord(
+        issue_number=7,
+        branch="agent/issue-7",
+        worktree_path=str(tmp_path / "wt"),
+        prompt_path="p.md",
+        command=("claude", "-p", "p.md"),
+        pid=123,
+        started_at="2026-07-20T00:00:00Z",
+        log_path="log.txt",
+        adapter_kind="api",
+        provider="openai",
+    )
+
+    sidecar_path = sessions_dir / "issue-7.api.json"
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    [restored] = read_worker_records(sessions_dir, adapter_kind=None)
+    assert restored == record
+
+
+def test_claude_worker_record_from_dict_defaults_legacy_keys() -> None:
+    """Sidecars written before the new fields default them on read."""
+    payload = {
+        "issue_number": 9,
+        "branch": "agent/issue-9",
+        "worktree_path": "/wt",
+        "prompt_path": "p.md",
+        "command": ["claude", "-p", "p.md"],
+        "pid": 999,
+        "started_at": "2026-07-20T00:00:00Z",
+        "log_path": "log.txt",
+    }
+
+    record = ClaudeWorkerRecord.from_dict(payload)
+
+    assert record.adapter_kind == "claude-code"
+    assert record.provider == ""
