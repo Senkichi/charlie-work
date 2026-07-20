@@ -7,6 +7,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +26,7 @@ from charlie_work.claude_code import (
     _sidecar_path,
 )
 from charlie_work.env_sanitize import sanitize_env
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import WorktreeInfo
 
 
@@ -372,6 +374,72 @@ def test_launch_claude_worker_missing_binary_returns_error_record(
     assert payload["error"] == record.error
 
 
+def test_launch_claude_worker_resolves_argv0_through_resolve_cli_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #487: a bare ``"claude"`` on Windows is an npm ``.CMD`` shim that
+    ``Popen(shell=False)`` cannot find (WinError 2). ``launch_claude_worker``
+    must resolve argv[0] through ``resolve_cli_binary`` before spawning —
+    exercised here by stubbing the resolver to swap in a real Python script
+    standing in for the resolved ``.exe``, and asserting the recorded
+    ``command`` reflects the resolved binary, not the original template
+    token."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    fake_script = _fake_claude_script(tmp_path)
+    resolved_calls: list[str] = []
+
+    def fake_resolve_cli_binary(name: str) -> str:
+        resolved_calls.append(name)
+        assert name == "claude"
+        return fake_script[0]
+
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", fake_resolve_cli_binary)
+
+    record = launch_claude_worker(
+        55,
+        "agent/issue-55-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("claude", str(fake_script[1])),
+    )
+
+    assert record.ok
+    assert resolved_calls == ["claude"]
+    assert record.command[0] == fake_script[0]
+    assert record.command[0] != "claude"
+
+
+def test_probe_claude_resolves_argv0_through_resolve_cli_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``doctor --adapter-probe`` path (``probe_claude``) must resolve
+    the same way ``launch_claude_worker`` does, or `charlie doctor` would
+    report a healthy `claude` install failing to probe with WinError 2 on a
+    machine using the claude-code adapter (issue #487)."""
+    captured: dict[str, Any] = {}
+
+    def fake_resolve_cli_binary(name: str) -> str:
+        assert name == "claude"
+        return "C:\\resolved\\claude.exe"
+
+    def fake_run_captured(command, *, cwd, timeout_seconds):
+        captured["command"] = command
+        return RunResult(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", fake_resolve_cli_binary)
+    monkeypatch.setattr(claude_code, "run_captured", fake_run_captured)
+
+    result = probe_claude(tmp_path)
+
+    assert result.ok
+    assert captured["command"] == ["C:\\resolved\\claude.exe", "--version"]
+
+
 def test_launch_claude_worker_create_worktree_failure_does_not_raise(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -600,7 +668,19 @@ def test_read_worker_records_skips_sidecar_missing_required_fields(tmp_path: Pat
     assert read_worker_records(sessions_dir) == []
 
 
-def test_probe_claude_missing_binary_never_raises(tmp_path: Path) -> None:
+def test_probe_claude_missing_binary_never_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Force resolve_cli_binary's lookup to fail regardless of whether this
+    # test machine happens to have a real `claude` on PATH (as this repo's
+    # own dev box does) -- the point of this test is the genuinely-missing
+    # case, not this machine's install state.
+    monkeypatch.setattr(
+        claude_code,
+        "resolve_cli_binary",
+        lambda name: "this-binary-does-not-exist-xyz",
+    )
+
     result = probe_claude(tmp_path)
 
     assert result.ok is False
@@ -616,6 +696,10 @@ def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
         return RunResult(returncode=0, stdout="1.0.0", stderr="")
 
+    # Identity resolution: this test is about the run_captured plumbing, not
+    # binary resolution (covered separately by
+    # test_probe_claude_resolves_argv0_through_resolve_cli_binary).
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
     monkeypatch.setattr(claude_code, "run_captured", fake_run_captured)
 
     result = probe_claude(tmp_path)

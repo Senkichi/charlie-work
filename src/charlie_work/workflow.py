@@ -87,6 +87,7 @@ from .state import (
     stale_operator_claims,
     state_lock,
     utc_now,
+    without_review_dispatch_claim,
 )
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, iter_workers
@@ -1043,6 +1044,95 @@ def _reap_completed_review_checkouts(
     return reaped
 
 
+def _reap_orphaned_review_checkouts(
+    gh: GitHub,
+    repo_root: Path,
+    reviews_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+) -> list[int]:
+    """Remove isolated review checkouts for PRs whose GitHub lifecycle has
+    already reached ``MERGED`` or ``CLOSED``.
+
+    This is the review-dispatch-pass counterpart to reconcile.py's
+    ``merged_outside_orchestrator`` and ``closed_unmerged_pr_active_labels``
+    drift handlers. It runs unconditionally at the top of ``dispatch_reviews``
+    so an externally-merged/closed PR never leaves its ``reviews_dir``
+    checkout or ``review_dispatch_*`` claim alive indefinitely.
+    """
+    state = load_state_locked(state_file)
+    candidate_pr_numbers: set[int] = set()
+
+    review_dispatch_keys = (
+        "review_dispatch_status",
+        "review_dispatch_pending_at",
+        "review_dispatched_at",
+        "review_dispatch_failed_at",
+        "reviewer_pid",
+        "reviewer_process_start_time",
+    )
+    for pr_key, entry in state.get("prs", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if any(entry.get(field) is not None for field in review_dispatch_keys):
+            try:
+                candidate_pr_numbers.add(int(pr_key))
+            except ValueError:
+                continue
+
+    if reviews_dir.is_dir():
+        for entry in reviews_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith("pr-"):
+                suffix = entry.name.split("-", 1)[1]
+                try:
+                    candidate_pr_numbers.add(int(suffix))
+                except ValueError:
+                    continue
+
+    if not candidate_pr_numbers:
+        return []
+
+    reaped: list[int] = []
+    changed = False
+    for pr_number in sorted(candidate_pr_numbers):
+        try:
+            pr = gh.pr_view(pr_number)
+        except Exception:
+            # PR not found or transient lookup failure; do not act on uncertainty.
+            continue
+        if not isinstance(pr, dict):
+            continue
+
+        gh_state = str(pr.get("state") or "").upper()
+        if gh_state not in ("MERGED", "CLOSED"):
+            continue
+
+        pr_key = str(pr_number)
+        pr_state = state["prs"].get(pr_key, {})
+        new_pr_state = without_review_dispatch_claim(pr_state)
+        new_pr_state["number"] = pr_number
+        if gh_state == "MERGED":
+            new_pr_state["status"] = "merged"
+        elif "status" not in new_pr_state:
+            # Record the terminal closed state so a future pass does not re-query.
+            new_pr_state["status"] = "closed"
+        state["prs"][pr_key] = new_pr_state
+
+        remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
+        state = append_event(
+            state,
+            "review_dispatch_lifecycle_reaped",
+            {"pr_number": pr_number, "github_state": gh_state.lower()},
+        )
+        changed = True
+        reaped.append(pr_number)
+
+    if changed:
+        save_state(state_file, state)
+
+    return reaped
+
+
 def _append_sweep_events(
     state: dict[str, Any], sweep_events: list[tuple[str, dict[str, Any]]]
 ) -> dict[str, Any]:
@@ -1779,6 +1869,8 @@ def _is_pre_review_rework_candidate(
 
     * ``mergeable`` is ``CONFLICTING`` — the branch cannot be merged and CI
       will not run because GitHub cannot build a merge ref; or
+    * ``mergeStateStatus`` is ``DIRTY`` — the rework branch conflicts with the
+      base, so the merge ref cannot be built and no ``pull_request`` CI can run; or
     * ``statusCheckRollup`` is empty and the PR's ``updatedAt`` is older than
       ``watchdog.pre_review_rework_stale_minutes`` — the worker opened a PR
       and then died before any checks were created.
@@ -1786,6 +1878,10 @@ def _is_pre_review_rework_candidate(
     mergeable = str(pr.get("mergeable") or "").upper()
     if mergeable == "CONFLICTING":
         return True, "merge_conflict"
+
+    merge_state = str(pr.get("mergeStateStatus") or "").upper()
+    if merge_state == "DIRTY":
+        return True, "rework_branch_conflict"
 
     stale_minutes = config.watchdog.pre_review_rework_stale_minutes
     if stale_minutes <= 0:
@@ -1835,17 +1931,26 @@ def _route_dead_worker_to_pre_review_rework(
     failures immediately, mirroring the existing redispatch-escalation logic.
     """
     pr_number = int(pr["number"])
-    summary = (
-        "The PR branch has a merge conflict with the base branch. "
-        "Rebase the branch onto the current base branch, resolve the conflicts, "
-        "and push. The code changes are already approved; do not re-litigate the review."
-        if reason == "merge_conflict"
-        else (
+    if reason == "merge_conflict":
+        summary = (
+            "The PR branch has a merge conflict with the base branch. "
+            "Rebase the branch onto the current base branch, resolve the conflicts, "
+            "and push. The code changes are already approved; do not re-litigate the review."
+        )
+    elif reason == "rework_branch_conflict":
+        summary = (
+            "The rework branch conflicts with the current base branch; GitHub cannot "
+            "build the merge ref, so no pull_request CI will run. Resolve the conflicts "
+            "manually and push."
+        )
+        if failure_kind is None:
+            failure_kind = "rework_branch_conflict"
+    else:
+        summary = (
             "The PR was opened but no CI checks have been created after the stale threshold. "
             "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
             "The existing changes are pre-approved; do not re-litigate the review."
         )
-    )
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -4650,14 +4755,18 @@ class OrchestratorApp:
         reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
 
         # Run the orphan/stalled sweep before selection so dead reviewers free
-        # their claim/slot, and reap isolated review checkouts for both the
-        # stale-claim and completed-verdict cases. In dry-run mode we skip
-        # both sweeps to stay read-only.
+        # their claim/slot, reap isolated review checkouts for both the
+        # stale-claim and completed-verdict cases, and reap checkouts for PRs
+        # that were merged or closed externally. In dry-run mode we skip these
+        # sweeps to stay read-only.
         if not self.dry_run:
             _detect_and_handle_stalled_reviews(
                 reviews_dir, self.paths.state_file, self.config, self.repo_root
             )
             _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
+            _reap_orphaned_review_checkouts(
+                self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
+            )
 
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
@@ -6058,7 +6167,9 @@ class OrchestratorApp:
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
                 if fix and drift:
-                    new_state = apply_drift_fixes(self.gh, state, drift, self.config)
+                    new_state = apply_drift_fixes(
+                        self.gh, state, drift, self.config, repo_root=self.repo_root
+                    )
                     save_state(self.paths.state_file, new_state)
                     # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
                     # for failed adds/removes, and apply_fixes records the outcome in the
