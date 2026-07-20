@@ -2236,3 +2236,63 @@ def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> Non
     assert result.ok is True
     assert result.data.get("skipped") is True
     assert result.data.get("reason") == "supervisor_lock_held"
+
+
+def test_apply_fixes_merged_pr_reaps_review_checkout_and_clears_dispatch_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #494: a PR merged externally while a reviewer dispatch is still
+    in-flight must have its isolated review checkout removed and its
+    review-dispatch state cleared during mop-up --fix.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(1, "MERGED", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {
+        "number": 1,
+        "issue_number": 10,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+
+    removed_calls: list[tuple[Any, int, Any]] = []
+
+    def fake_remove_review_checkout(
+        repo_root: Path, pr_number: int, *, reviews_dir: Any = None
+    ) -> bool:
+        removed_calls.append((repo_root, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.reconcile.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "merged_outside_orchestrator"
+    ]
+    assert drift
+
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path)
+
+    assert len(removed_calls) == 1
+    repo_root, pr_number, reviews_dir = removed_calls[0]
+    assert repo_root == tmp_path
+    assert pr_number == 1
+    assert reviews_dir == tmp_path / config.review_dispatch.reviews_dir
+
+    assert new_state["prs"]["1"]["status"] == "merged"
+    assert new_state["prs"]["1"]["review_dispatch_status"] is None
+    assert new_state["prs"]["1"]["review_dispatched_at"] is None
+    assert new_state["prs"]["1"]["reviewer_pid"] is None
+    assert new_state["prs"]["1"]["reviewer_process_start_time"] is None
+
+    # Original state is never mutated in place.
+    assert state["prs"]["1"]["review_dispatch_status"] == "review_dispatch_dispatched"

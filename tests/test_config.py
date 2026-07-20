@@ -173,12 +173,12 @@ def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> No
 
 
 def test_load_config_review_dispatch_defaults() -> None:
-    """ReviewDispatchConfig defaults are safe (disabled, separate dir, no cap)."""
+    """ReviewDispatchConfig defaults are safe (disabled, separate dir, bounded)."""
     config_file = Path("nonexistent.yaml")
     config = load_config(config_file)
     assert config.review_dispatch.enabled is False
     assert config.review_dispatch.reviews_dir == ".var/charlie-work/dispatches/reviews"
-    assert config.review_dispatch.max_local_review_processes == 0
+    assert config.review_dispatch.max_local_review_processes == 2
 
 
 def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
