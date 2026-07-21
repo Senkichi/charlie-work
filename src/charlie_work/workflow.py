@@ -90,7 +90,7 @@ from .state import (
     without_review_dispatch_claim,
 )
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
-from .worker import WorkerHealth, WorkerView, iter_workers
+from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 
 
 @dataclass(frozen=True)
@@ -1106,7 +1106,7 @@ def _reap_completed_review_checkouts(
     if not completed_prs:
         return []
 
-    alive_pr_numbers = {w.issue_number for w in iter_workers(reviews_dir) if w.is_alive()}
+    alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
     reaped: list[int] = []
     for pr_number in sorted(completed_prs):
         if pr_number in alive_pr_numbers:
@@ -1124,13 +1124,16 @@ def _reap_orphaned_review_checkouts(
     config: OrchestratorConfig,
 ) -> list[int]:
     """Remove isolated review checkouts for PRs whose GitHub lifecycle has
-    already reached ``MERGED`` or ``CLOSED``.
+    already reached ``MERGED`` or ``CLOSED`` and whose reviewer process has
+    exited.
 
     This is the review-dispatch-pass counterpart to reconcile.py's
     ``merged_outside_orchestrator`` and ``closed_unmerged_pr_active_labels``
     drift handlers. It runs unconditionally at the top of ``dispatch_reviews``
     so an externally-merged/closed PR never leaves its ``reviews_dir``
-    checkout or ``review_dispatch_*`` claim alive indefinitely.
+    checkout or ``review_dispatch_*`` claim alive indefinitely. A PR whose
+    reviewer sidecar is still alive is deferred to a later pass so the live
+    session is not interrupted.
     """
     state = load_state_locked(state_file)
     candidate_pr_numbers: set[int] = set()
@@ -1164,6 +1167,7 @@ def _reap_orphaned_review_checkouts(
     if not candidate_pr_numbers:
         return []
 
+    alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
     reaped: list[int] = []
     changed = False
     for pr_number in sorted(candidate_pr_numbers):
@@ -1177,6 +1181,10 @@ def _reap_orphaned_review_checkouts(
 
         gh_state = str(pr.get("state") or "").upper()
         if gh_state not in ("MERGED", "CLOSED"):
+            continue
+
+        # Issue #504: a live reviewer process keeps its checkout alive until it exits.
+        if pr_number in alive_pr_numbers:
             continue
 
         pr_key = str(pr_number)
@@ -5065,6 +5073,7 @@ class OrchestratorApp:
             "attempted_count": len(selected),
             "launched_count": len(launched),
             "failed_count": len(failed),
+            "failed": failed,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
         }
