@@ -7033,7 +7033,9 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
     assert state.get("reviewer_quota", {}).get("throttled_until") is None
 
 
-def test_dispatch_reviews_probe_failure_sets_reviewer_quota_and_rolls_back(monkeypatch, tmp_path: Path) -> None:
+def test_dispatch_reviews_probe_failure_sets_reviewer_quota_and_rolls_back(
+    monkeypatch, tmp_path: Path
+) -> None:
     """A reviewer launch failure matching a usage-limit signature sets the global quota and rolls back the PR claim."""
     prs = [
         {

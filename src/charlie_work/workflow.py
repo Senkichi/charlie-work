@@ -4942,7 +4942,7 @@ class OrchestratorApp:
             concurrent_cap = local_cap.dispatch_limit
         # In probe mode, only launch one reviewer at a time to test quota.
         dispatch_limit = 1 if probe_mode else concurrent_cap
-        selected = dispatchable[: dispatch_limit]
+        selected = dispatchable[:dispatch_limit]
 
         if self.dry_run:
             return CommandResult(
@@ -5067,10 +5067,13 @@ class OrchestratorApp:
                     # A quota failure is a global condition, not a per-PR
                     # failure. Stop the pass immediately so the next probe can
                     # retry once the usage window resets.
-                    if record.error and match_throttle_tail(
-                        record.error,
-                        self.config.runtime.throttle_error_markers,
-                    )[0]:
+                    if (
+                        record.error
+                        and match_throttle_tail(
+                            record.error,
+                            self.config.runtime.throttle_error_markers,
+                        )[0]
+                    ):
                         quota_failure = {"pr": pr_number, "error": error_text}
                         quota_hit = True
                         break
@@ -5142,7 +5145,12 @@ class OrchestratorApp:
                     .replace("+00:00", "Z")
                 )
                 probe_after = (
-                    (now_dt + timedelta(minutes=self.config.review_dispatch.quota_probe_interval_minutes))
+                    (
+                        now_dt
+                        + timedelta(
+                            minutes=self.config.review_dispatch.quota_probe_interval_minutes
+                        )
+                    )
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
