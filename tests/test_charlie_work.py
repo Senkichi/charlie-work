@@ -7551,6 +7551,104 @@ def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> N
     assert detected[0]["decision"] == "missing"
 
 
+def test_detect_unauthorized_merges_flags_approved_sha_mismatch(tmp_path: Path) -> None:
+    """A merged worker branch with an approved decision for a different head SHA is flagged (issue #502 / cw #467)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithMergedWorkerPR(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prs = [
+                {
+                    "number": 503,
+                    "title": "fix: approved but then amended",
+                    "url": "https://example.test/pull/503",
+                    "headRefName": "agent/issue-496-fix",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-503-final",
+                    "state": "MERGED",
+                    "isCrossRepository": False,
+                    "body": "Closes #496",
+                    "labels": [],
+                },
+            ]
+
+    fake_gh = FakeGitHubWithMergedWorkerPR()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # The approval was recorded for an earlier head; the merged head differs.
+    pr_dir = paths.prs / "pr-503"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "reviewed_head_sha": "sha-503-reviewed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    detected = app._detect_unauthorized_merges()
+
+    assert len(detected) == 1
+    assert detected[0]["pr"] == 503
+    assert detected[0]["issue"] == 496
+    assert detected[0]["decision"] == "approved"
+    assert detected[0]["reviewed_head_sha"] == "sha-503-reviewed"
+    assert detected[0]["live_head_sha"] == "sha-503-final"
+
+
+def test_detect_unauthorized_merges_reuses_dispatch_merged_prs(tmp_path: Path) -> None:
+    """loop() should reuse the merged PR list from dispatch() instead of calling merged_pr_list() again (issue #502 Finding 3)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    class CountingFakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_pr_list_calls = 0
+
+        def merged_pr_list(self):
+            self.merged_pr_list_calls += 1
+            return super().merged_pr_list()
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = CountingFakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 501,
+            "title": "fix: worker self-merge",
+            "url": "https://example.test/pull/501",
+            "headRefName": "agent/issue-494-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-501",
+            "state": "MERGED",
+            "isCrossRepository": False,
+            "body": "Closes #494",
+            "labels": [],
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # dispatch() fetches merged PRs as part of its normal pass.
+    result = app.dispatch(limit=1)
+    assert result.data.get("merged_prs") == fake_gh.prs
+    assert fake_gh.merged_pr_list_calls == 1
+
+    # The tripwire, when handed that list, must not make a second API call.
+    detected = app._detect_unauthorized_merges(result.data["merged_prs"])
+    assert fake_gh.merged_pr_list_calls == 1
+    assert len(detected) == 1
+    assert detected[0]["pr"] == 501
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(

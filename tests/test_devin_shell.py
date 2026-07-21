@@ -1260,6 +1260,29 @@ def test_sanitize_env_drops_github_tokens(tmp_path: Path, monkeypatch: pytest.Mo
     assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must be dropped"
 
 
+def test_sanitize_env_isolates_gh_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sanitize_env must point GH_CONFIG_DIR at a worktree-local empty directory so gh cannot use the orchestrator's stored credentials (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Simulate the orchestrator having a live gh login.
+    orchestrator_config_dir = tmp_path / "orchestrator-gh-config"
+    orchestrator_config_dir.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(orchestrator_config_dir))
+
+    env = sanitize_env(worktree_path)
+
+    expected_gh_config_dir = worktree_path / ".var" / "gh-config"
+    assert env.get("GH_CONFIG_DIR") == str(expected_gh_config_dir), (
+        f"GH_CONFIG_DIR must be isolated to the worktree, got {env.get('GH_CONFIG_DIR')!r}"
+    )
+    assert expected_gh_config_dir.is_dir(), "isolated gh config directory must be created"
+    # The orchestrator's stored credential directory must not leak.
+    assert env.get("GH_CONFIG_DIR") != str(orchestrator_config_dir)
+
+
 def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """launch_devin_session must sanitize the environment before spawning the worker."""
     repo_root = tmp_path / "repo"

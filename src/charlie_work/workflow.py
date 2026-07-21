@@ -3498,6 +3498,14 @@ class OrchestratorApp:
                 deferred_reason="state_lock_busy",
             )
 
+        # Reuse the merged PR list already fetched by _finalize_externally_merged_issues
+        # so the post-merge tripwire in loop() can avoid a second GraphQL call.
+        merged_prs_for_result: list[dict[str, Any]] | None = (
+            merged_pr_outcome.items
+            if merged_pr_outcome.called and merged_pr_outcome.error is None
+            else None
+        )
+
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -3508,6 +3516,7 @@ class OrchestratorApp:
                     {
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
+                        "merged_prs": merged_prs_for_result,
                         "merged_pr_closed_issue_numbers": sorted(finalized),
                         "merged_pr_referenced_issue_numbers": sorted(finalized),
                     },
@@ -3534,6 +3543,7 @@ class OrchestratorApp:
                 "dispatch deferred: state lock held",
                 selected_count=0,
                 deferred_reason="state_lock_busy",
+                merged_prs=merged_prs_for_result,
                 merged_pr_closed_issue_numbers=sorted(finalized),
                 merged_pr_referenced_issue_numbers=sorted(finalized),
             )
@@ -3547,6 +3557,7 @@ class OrchestratorApp:
                     "graphql_remaining": exc.remaining,
                     "graphql_reset": exc.reset_at,
                     "graphql_threshold": exc.threshold,
+                    "merged_prs": merged_prs_for_result,
                     "merged_pr_closed_issue_numbers": sorted(finalized),
                     "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
@@ -3600,6 +3611,14 @@ class OrchestratorApp:
         gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
         dispatch_limit = gov.dispatch_limit
 
+        # Compute the merged PR list (if already fetched) for the tripwire so
+        # loop() can reuse it and avoid a second GraphQL call per pass.
+        merged_prs_for_tripwire: list[dict[str, Any]] | None = (
+            merged_prs.items
+            if merged_prs is not None and merged_prs.called and merged_prs.error is None
+            else None
+        )
+
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -3614,6 +3633,7 @@ class OrchestratorApp:
                     "label_errors": [],
                     "sessions": [],
                     "dispatch_results": [],
+                    "merged_prs": merged_prs_for_tripwire,
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
@@ -3772,6 +3792,7 @@ class OrchestratorApp:
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "merged_prs": merged_prs,
                 "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                 "merged_pr_mention_only_issue_numbers": sorted(
                     merged_pr_mention_only_issue_numbers
@@ -4271,6 +4292,7 @@ class OrchestratorApp:
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
+            "merged_prs": merged_prs,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
             "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
@@ -7212,15 +7234,30 @@ class OrchestratorApp:
 
         # Issue #502: post-merge tripwire. Detect any merged worker PR that was
         # not approved by the orchestrator's adversarial review gate.
-        for unauthorized in self._detect_unauthorized_merges():
+        # Reuse the merged PR list already fetched by dispatch() to avoid a
+        # second GraphQL call per loop pass.
+        merged_prs_for_tripwire: list[dict[str, Any]] | None = dispatch.data.get("merged_prs")
+        for unauthorized in self._detect_unauthorized_merges(merged_prs_for_tripwire):
+            reviewed_sha = unauthorized.get("reviewed_head_sha")
+            live_sha = unauthorized.get("live_head_sha")
+            if (
+                unauthorized["decision"] == "approved"
+                and reviewed_sha is not None
+                and live_sha is not None
+                and reviewed_sha != live_sha
+            ):
+                reason = f"approved for head {reviewed_sha!r} but merged head is {live_sha!r}"
+            else:
+                reason = (
+                    f"without an approved review decision (decision={unauthorized['decision']!r})"
+                )
             errors.append(
                 {
                     "pr": unauthorized["pr"],
                     "issue": unauthorized["issue"],
                     "error": (
                         f"PR #{unauthorized['pr']} ({unauthorized['head']}) is MERGED "
-                        f"without an approved review decision (decision={unauthorized['decision']!r}); "
-                        "possible worker self-merge"
+                        f"{reason}; possible worker self-merge"
                     ),
                 }
             )
@@ -8376,23 +8413,26 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
-    def _detect_unauthorized_merges(self) -> list[dict[str, Any]]:
-        """Scan recently-merged PRs for worker branches that lack an approved review decision.
+    def _detect_unauthorized_merges(
+        self, merged_prs: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Scan recently-merged PRs for worker branches whose merged head does not match an approved review decision.
 
         Workers are forbidden from merging their own PRs (issue #502). This
         post-merge tripwire catches a bypass after it happens: any merged PR
-        whose head branch matches the configured worker branch prefix but has
-        no approved ``.var/charlie-work/prs/pr-N/review-decision.json`` was
-        merged without the orchestrator's adversarial review gate. GitHub
+        whose head branch matches the configured worker branch prefix and whose
+        head SHA is not covered by an approved ``.var/charlie-work/prs/pr-N/review-decision.json``
+        was merged without the orchestrator's adversarial review gate. GitHub
         errors are swallowed so a transient ``gh`` failure cannot crash the
         fleet pass.
         """
         unauthorized: list[dict[str, Any]] = []
         prefix = self.config.dispatch.branch_prefix
-        try:
-            merged_prs = self.gh.merged_pr_list()
-        except GitHubError:
-            return unauthorized
+        if merged_prs is None:
+            try:
+                merged_prs = self.gh.merged_pr_list()
+            except GitHubError:
+                return unauthorized
 
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
@@ -8410,7 +8450,16 @@ class OrchestratorApp:
             if pr_number is None:
                 continue
             decision = self._review_decision(pr_number)
-            if decision.get("decision") != "approved":
+            decision_value = decision.get("decision")
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+            live_head_sha = pr.get("headRefOid")
+            approved = decision_value == "approved"
+            head_matches = (
+                reviewed_head_sha is not None
+                and live_head_sha is not None
+                and reviewed_head_sha == live_head_sha
+            )
+            if not approved or not head_matches:
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),
@@ -8421,7 +8470,9 @@ class OrchestratorApp:
                         "pr": pr_number,
                         "issue": issue_number,
                         "head": head,
-                        "decision": decision.get("decision"),
+                        "decision": decision_value,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "live_head_sha": live_head_sha,
                     }
                 )
         return unauthorized
