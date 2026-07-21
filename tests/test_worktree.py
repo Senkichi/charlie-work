@@ -3923,6 +3923,56 @@ def test_recovery_allows_reset_when_worker_pid_dead_and_probe_inconclusive(
     assert branch_name in _git(repo_root, "branch", "--list").stdout
 
 
+def test_recovery_aborts_on_transient_probe_error_despite_dead_pid(
+    tmp_path: Path,
+) -> None:
+    """Issue #506 rework: a confirmed-dead PID does NOT override a probe that
+    contains transient errors (locked/corrupt DB, schema drift, I/O failures).
+    Only structurally permanent absence-of-record errors may be overridden by
+    a dead PID; transient errors remain fail-closed.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-dead-pid-transient-probe"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db exists on disk but is not a valid SQLite file — a transient
+    # "failed to open sessions.db (locked or corrupt)" error, not a permanent
+    # no-match.
+    db_path = tmp_path / "sessions.db"
+    db_path.write_bytes(b"this is not a sqlite database")
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "probe_error"
+    assert exc_info.value.inconclusive_probe_deferred_count == 1
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
+
+
 def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:
     return {
         "issues": {str(issue_number): {"number": issue_number}},

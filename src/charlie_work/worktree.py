@@ -1339,10 +1339,11 @@ def _probe_recovery_liveness(
                 )
 
         if errored_sources:
-            if confirmed_dead:
-                # Confirmed-dead PID overrides an inconclusive probe; the
-                # wrapper is gone, so a missing/absent activity record is the
-                # expected post-mortem signature, not evidence of liveness.
+            if all_permanent and confirmed_dead:
+                # A confirmed-dead PID overrides an inconclusive probe only
+                # when every errored source is a structurally permanent absence-
+                # of-record. Transient errors (locked/corrupt DB, I/O failures)
+                # remain fail-closed (issue #282/#426).
                 return
 
             new_deferred_count = current_deferred_count + 1
