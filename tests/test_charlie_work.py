@@ -7200,6 +7200,85 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
     assert str(checkout.path) not in result.stdout
 
 
+def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log(
+    tmp_path: Path,
+) -> None:
+    """A dead reviewer whose own log shows a provider throttle signature
+    (e.g. Claude Code CLI's "You've hit your session limit ...") must set the
+    global reviewer-quota cooldown and roll back the claim, not mark it
+    review_dispatch_failed. Marking it failed lets the next dispatch_reviews
+    pass relaunch straight into the same limit -- job-cannon PRs #1342,
+    #1343, #1344, #1346 hot-looped for 5.5-20+ hours this way on 2026-07-21
+    before this reap path also learned to log-tail classify."""
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,  # not a real live pid
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled"
+        for entry in stalled
+    )
+
+    state = _load_state(state_file)
+    pr_state = state["prs"]["100"]
+    # Rolled back, not failed -- the claim is immediately re-dispatchable
+    # once the reviewer-quota gate clears.
+    assert pr_state.get("review_dispatch_status") is None
+    assert pr_state.get("reviewer_pid") is None
+
+    quota = state.get("reviewer_quota", {})
+    assert quota.get("throttled_until")
+    assert quota.get("probe_after")
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        for event in state.get("events", [])
+    )
+
+
 def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
     monkeypatch, tmp_path: Path
 ) -> None:

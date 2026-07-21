@@ -980,6 +980,73 @@ def _detect_and_handle_stalled_reviews(
             # Already terminal; don't overwrite a completed/failed record.
             continue
 
+        # A dead reviewer's own log may show why it died. If it hit a
+        # provider throttle signature (e.g. "You've hit your session
+        # limit"), the launch-time quota_hit check in dispatch_reviews never
+        # saw it -- that check only fires when launch_claude_worker() itself
+        # errors synchronously, but a throttled Claude Code CLI process
+        # starts fine and only dies after printing the limit message to its
+        # own log. Without this check, every pass here would mark the claim
+        # review_dispatch_failed and the next dispatch_reviews pass would
+        # relaunch straight into the same limit -- a redispatch loop that
+        # runs every stale-claim interval for as long as the provider window
+        # is closed, instead of backing off via the same reviewer-quota gate
+        # the launch-time path uses (job-cannon PRs #1342/#1343/#1344/#1346,
+        # 2026-07-21: 20+ hours of hot redispatch into a session-limit wall).
+        throttled = False
+        try:
+            log_text = Path(w.log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = ""
+        if log_text:
+            tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+            throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
+
+        if throttled:
+            now_dt = datetime.now(UTC)
+            throttled_until = (
+                (now_dt + timedelta(hours=config.review_dispatch.quota_reset_hours))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            probe_after = (
+                (now_dt + timedelta(minutes=config.review_dispatch.quota_probe_interval_minutes))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state = set_reviewer_quota_exhausted(
+                state, throttled_until=throttled_until, probe_after=probe_after
+            )
+            # Roll back (not fail) the claim: this is a global condition, not
+            # a defect in this PR's review, so it should be immediately
+            # re-dispatchable once the quota gate clears -- mirroring the
+            # launch-time quota_hit rollback in dispatch_reviews.
+            state["prs"][pr_key] = without_review_dispatch_claim(pr_state)
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                {
+                    "pr_number": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": "provider_throttled",
+                    "throttled_until": throttled_until,
+                },
+            )
+            changed = True
+            stalled.append(
+                {
+                    "pr": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": "provider_throttled",
+                }
+            )
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            continue
+
         state["prs"][pr_key] = {
             **pr_state,
             "number": w.issue_number,
