@@ -213,7 +213,9 @@ class ReviewDispatchConfig:
     reviews_dir: str = ".var/charlie-work/dispatches/reviews"
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
-    max_local_review_processes: int = 0
+    # Default is 2 so a host that enables review_dispatch without overriding
+    # this key does not run an unbounded number of local Claude Code reviewers.
+    max_local_review_processes: int = 2
 
 
 @dataclass(frozen=True)

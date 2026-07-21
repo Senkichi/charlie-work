@@ -6764,6 +6764,7 @@ def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: P
     assert result.ok is False
     assert result.data["launched_count"] == 0
     assert result.data["failed_count"] == 1
+    assert result.data["failed"] == [{"pr": 100, "error": launch_error}]
 
     state = load_state(app.paths.state_file)
     pr_state = state["prs"]["100"]
@@ -7015,6 +7016,70 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
     assert str(checkout.path) not in result.stdout
 
 
+def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #487: a reviewing PR that was never claimed/dispatched is reaped
+    and then re-dispatched once its packet is past the stale-claim timeout."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Age the packet so the unclaimed safety net triggers on the next pass.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-100"
+    prompt_path = pr_dir / "review-prompt.md"
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(prompt_path, (old_mtime, old_mtime))
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(prompt_path),
+            "decision_path": str(pr_dir / "review-decision.json"),
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    assert launched == [100]
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("status") == "unclaimed"
+        for event in state.get("events", [])
+    )
+
+
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
     tmp_path: Path,
 ) -> None:
@@ -7216,6 +7281,99 @@ def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
     assert new_state["prs"]["100"]["review_dispatched_at"] is None
     assert new_state["prs"]["100"]["reviewer_pid"] is None
     assert new_state["prs"]["100"]["reviewer_process_start_time"] is None
+    assert new_state["prs"]["100"]["status"] == "merged"
+
+
+def test_reap_orphaned_review_checkouts_defers_while_reviewer_alive(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #504: a PR merged/closed externally while its reviewer is still
+    alive must not have its review checkout removed or its dispatch claim
+    cleared until the reviewer exits.
+
+    Uses a sidecar in reviews_dir and monkeypatches WorkerView.is_alive to
+    True/False so the test exercises the liveness gate without a real process.
+    """
+    from charlie_work.state import empty_state, load_state, save_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 12345,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    removed_calls: list[tuple[Path, int, Path | None]] = []
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    # Live reviewer: defer the reap.
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert removed_calls == []
+    new_state = load_state(state_file)
+    assert new_state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+    # Dead reviewer: proceed with the reap.
+    removed_calls.clear()
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [100]
+    assert len(removed_calls) == 1
+    assert removed_calls[0][1] == 100
+    new_state = load_state(state_file)
+    assert new_state["prs"]["100"]["review_dispatch_status"] is None
     assert new_state["prs"]["100"]["status"] == "merged"
 
 
