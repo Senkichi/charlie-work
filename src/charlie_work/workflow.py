@@ -403,17 +403,32 @@ def _select_dispatch_candidates(
         ordered = candidates
         skipped_issue_numbers = []
 
-    fresh = [
-        issue for issue in ordered if not _is_recovery_candidate(issue, state, branch_name_for)
-    ]
-    recovery = [
-        issue for issue in ordered if _is_recovery_candidate(issue, state, branch_name_for)
-    ]
+    recovery_flags = [_is_recovery_candidate(issue, state, branch_name_for) for issue in ordered]
+    fresh_count = sum(1 for r in recovery_flags if not r)
+    recovery_cap = min(
+        _MAX_RECOVERY_RETRY_PER_PASS,
+        max(0, dispatch_limit - fresh_count),
+    )
 
-    # Fill fresh first, then allow at most one recovery-retry slot.
-    recovery_slots = max(0, dispatch_limit - len(fresh))
-    recovery_cap = min(_MAX_RECOVERY_RETRY_PER_PASS, recovery_slots)
-    selected = fresh[:dispatch_limit] + recovery[:recovery_cap]
+    selected: list[dict[str, Any]] = []
+    recovery_picked = 0
+    if only_issues:
+        # Preserve the operator's explicit issue order while still capping
+        # recovery retries so a stuck recovery issue cannot starve fresh work.
+        for issue, is_recovery in zip(ordered, recovery_flags):
+            if len(selected) >= dispatch_limit:
+                break
+            if is_recovery:
+                if recovery_picked < recovery_cap:
+                    selected.append(issue)
+                    recovery_picked += 1
+            else:
+                selected.append(issue)
+    else:
+        fresh = [issue for issue, r in zip(ordered, recovery_flags) if not r]
+        recovery = [issue for issue, r in zip(ordered, recovery_flags) if r]
+        # Fill fresh first, then allow at most one recovery-retry slot.
+        selected = fresh[:dispatch_limit] + recovery[:recovery_cap]
 
     if only_issues:
         selected_numbers = {int(issue["number"]) for issue in selected}
