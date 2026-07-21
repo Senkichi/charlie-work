@@ -22,7 +22,7 @@ from typing import Any
 
 from .config import RunnerScalingConfig
 from .github import GitHub
-from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
+from .subprocess_runner import RunResult, hidden_console_kwargs, no_console_window_kwargs, run_captured
 
 
 # Marker file name that identifies charlie-managed runner directories
@@ -893,17 +893,18 @@ def ensure_runner_running(
 
         # We use subprocess.Popen with detached flags to run as a background process
         if sys.platform == "win32":
-            # Windows: use DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP
-            startupinfo = subprocess.STARTUPINFO()  # type: ignore
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore
-            startupinfo.wShowWindow = subprocess.SW_HIDE  # type: ignore
+            # Windows: allocate a hidden console for the long-lived runner so
+            # Runner.Worker and any cmd/powershell job steps inherit that
+            # hidden console instead of flashing their own visible windows.
             proc = subprocess.Popen(
                 [str(launch_script)],
                 cwd=runner_dir.path,
                 env=env,
-                startupinfo=startupinfo,  # type: ignore
-                **no_console_window_kwargs(  # type: ignore
-                    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **hidden_console_kwargs(  # type: ignore
+                    subprocess.CREATE_NEW_PROCESS_GROUP
                 ),
             )
         else:
@@ -1338,7 +1339,8 @@ def _launch_runner(runner_dir: Path) -> RunResult:
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **no_console_window_kwargs(),
+            stdin=subprocess.DEVNULL,
+            **hidden_console_kwargs(subprocess.CREATE_NEW_PROCESS_GROUP),
         )
         return RunResult(returncode=0, stdout="", stderr="", error=None)
     except Exception as exc:
