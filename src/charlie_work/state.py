@@ -69,6 +69,24 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def without_review_dispatch_claim(pr_state: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a PR state entry with all review-dispatch claim fields cleared.
+
+    This is the single helper for finalizing a PR whose GitHub lifecycle has
+    moved on (merged or closed externally) or whose review claim is otherwise
+    moot. It never mutates the input dict.
+    """
+    return {
+        **pr_state,
+        "review_dispatch_status": None,
+        "review_dispatch_pending_at": None,
+        "review_dispatched_at": None,
+        "review_dispatch_failed_at": None,
+        "reviewer_pid": None,
+        "reviewer_process_start_time": None,
+    }
+
+
 def _to_float(value: Any) -> float | None:
     """Coerce a JSON-deserialized value to a float, or return None."""
     if value is None:

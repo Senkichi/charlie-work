@@ -30,7 +30,7 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe"}
+    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -213,7 +213,9 @@ class ReviewDispatchConfig:
     reviews_dir: str = ".var/charlie-work/dispatches/reviews"
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
-    max_local_review_processes: int = 0
+    # Default is 2 so a host that enables review_dispatch without overriding
+    # this key does not run an unbounded number of local Claude Code reviewers.
+    max_local_review_processes: int = 2
     # Issue #495: cap consecutive reviewer launch failures before escalating to
     # a human. 0 disables the cap (not recommended). 3 mirrors the sibling
     # worker redispatch cap default in WatchdogConfig.

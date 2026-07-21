@@ -300,6 +300,14 @@ def _extract_attention_events(
             }
         )
 
+    # Extract launch failures from dispatch lanes. `loop()` nests per-stage
+    # CommandResult data under "dispatch"/"dispatch_rework"/"dispatch_reviews";
+    # `fleet_loop(work_only=True)` passes a dispatch sub-dict directly. Walk both
+    # the result itself and the nested sub-results so worker/rework/reviewer
+    # launch failures reach the fleet attention digest.
+    launch_failures = _collect_launch_failures(repo_key, data)
+    events.extend(launch_failures)
+
     # Extract health transitions (if present from #161/#165)
     health_transitions = data.get("health_transitions", [])
     for transition in health_transitions:
@@ -352,6 +360,92 @@ def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
         reasons.add(skip_reason or "state_lock_busy")
 
 
+def _collect_launch_failures(repo_key: str, data: Any) -> list[dict[str, Any]]:
+    """Collect worker/rework/reviewer launch failures from a result and its nested sub-results.
+
+    Mirrors ``_collect_skip_reasons`` but walks the ``dispatch``/``dispatch_rework``/
+    ``dispatch_reviews`` sub-dicts that carry per-issue/per-PR failure text.
+    """
+    failures: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        _add_launch_failures(repo_key, data, failures)
+        for sub_key in ("dispatch", "dispatch_rework", "dispatch_reviews"):
+            sub_data = data.get(sub_key)
+            if isinstance(sub_data, dict):
+                _add_launch_failures(repo_key, sub_data, failures)
+    return failures
+
+
+def _add_launch_failures(
+    repo_key: str,
+    data: dict[str, Any],
+    failures: list[dict[str, Any]],
+) -> None:
+    """Add any worker/rework/reviewer launch failure present in a flat result dict.
+
+    ``dispatch`` and ``dispatch_rework`` store issue-keyed ``failures`` maps;
+    ``dispatch_reviews`` stores a PR-keyed ``failed`` list. Both shapes are
+    normalized to ``{"repo_key": ..., "type": "error", "issue_number"/"pr": ..., "error": ...}``.
+
+    Issues deferred by the concurrency cap are not launch failures, so they are
+    excluded from ``failures`` maps via the ``deferred_by_concurrency`` list.
+    """
+    deferred_issue_numbers: set[int] = set()
+    for d in data.get("deferred_by_concurrency", []):
+        try:
+            deferred_issue_numbers.add(int(d))
+        except (TypeError, ValueError):
+            continue
+
+    failures_map = data.get("failures")
+    if isinstance(failures_map, dict):
+        for key, error in failures_map.items():
+            if not isinstance(error, str):
+                continue
+            try:
+                issue_number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if issue_number in deferred_issue_numbers:
+                continue
+            failures.append(
+                {
+                    "repo_key": repo_key,
+                    "type": "error",
+                    "issue_number": issue_number,
+                    "error": error,
+                }
+            )
+
+    failed_list = data.get("failed")
+    if isinstance(failed_list, list):
+        for entry in failed_list:
+            if not isinstance(entry, dict):
+                continue
+            error = entry.get("error")
+            if not error:
+                continue
+            event: dict[str, Any] = {
+                "repo_key": repo_key,
+                "type": "error",
+                "error": error,
+            }
+            issue_number = entry.get("issue") or entry.get("issue_number")
+            pr = entry.get("pr")
+            if issue_number is not None:
+                try:
+                    event["issue_number"] = int(issue_number)
+                except (TypeError, ValueError):
+                    pass
+            if pr is not None:
+                try:
+                    event["pr"] = int(pr)
+                except (TypeError, ValueError):
+                    pass
+            if "issue_number" in event or "pr" in event:
+                failures.append(event)
+
+
 def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
 ) -> AttentionDigest:
@@ -384,7 +478,7 @@ def _build_fleet_attention_digest(
         elif event_type == "error":
             entries.append(
                 AttentionEntry(
-                    issue_number=event.get("pr") or -1,
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
                     adapter_kind=event["repo_key"],
                     health="ERROR",
                     previous_health=None,

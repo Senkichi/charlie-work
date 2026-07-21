@@ -39,11 +39,12 @@ from .github import (
 )
 from .labels import TransitionOutcome, transition
 from .process_utils import kill_process_tree
-from .state import append_event, is_claim_stale, set_throttled_until
+from .state import append_event, is_claim_stale, set_throttled_until, without_review_dispatch_claim
 from .worktree import (
     WorktreeState,
     inspect_worktree_state,
     push_branch,
+    remove_review_checkout,
     resolve_base_branch_name,
 )
 
@@ -692,22 +693,81 @@ def detect_drift(
 
 
 def apply_fixes(
-    gh: GitHub, state: dict[str, Any], drift: list[DriftItem], config: OrchestratorConfig
+    gh: GitHub,
+    state: dict[str, Any],
+    drift: list[DriftItem],
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Apply the structured fixes for each drift item and return a NEW state dict.
 
     ``state`` (and its nested ``issues``/``prs`` dicts) are never mutated in
     place — every touched entry is replaced via ``{**existing, ...}``.
+
+    If ``repo_root`` is provided, merged/closed PR drift items also tear down
+    the isolated ``reviews_dir`` checkout and clear any ``review_dispatch_*``
+    state so the closed lifecycle cannot be mistaken for a live claim. A PR
+    whose reviewer process is still alive is deferred to a later pass (issue
+    #504) so the live session is not interrupted.
     """
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
     new_state: dict[str, Any] = {**state, "issues": new_issues, "prs": new_prs}
 
+    alive_pr_numbers: set[int] = set()
+    if repo_root is not None:
+        reviews_dir = repo_root / config.review_dispatch.reviews_dir
+        from .worker import _alive_review_worker_issue_numbers
+
+        alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
+
     for item in drift:
         if item.kind == "merged_outside_orchestrator":
+            # Issue #504: defer if the reviewer process is still running.
+            if item.pr_number is not None and item.pr_number in alive_pr_numbers:
+                continue
             if item.pr_number is not None:
                 pr_key = str(item.pr_number)
-                new_prs[pr_key] = {**new_prs.get(pr_key, {}), "status": "merged"}
+                existing_pr = new_prs.get(pr_key, {})
+                new_pr_state = {
+                    **without_review_dispatch_claim(existing_pr),
+                    "number": item.pr_number,
+                    "status": "merged",
+                }
+                if item.issue_number is not None:
+                    new_pr_state["issue_number"] = item.issue_number
+                new_prs[pr_key] = new_pr_state
+
+                checkout_removed = False
+                if repo_root is not None:
+                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    checkout_removed = remove_review_checkout(
+                        repo_root, item.pr_number, reviews_dir=reviews_dir
+                    )
+                checkout_action = (
+                    (
+                        f"remove review checkout for PR #{item.pr_number}: "
+                        f"{'ok' if checkout_removed else 'failed'}"
+                    )
+                    if repo_root is not None
+                    else (
+                        f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
+                    )
+                )
+                fix_actions = list(item.fix_actions) + [
+                    checkout_action,
+                    f"clear review-dispatch fields for prs[{item.pr_number}]",
+                ]
+                item = DriftItem(
+                    kind=item.kind,
+                    issue_number=item.issue_number,
+                    pr_number=item.pr_number,
+                    detail=item.detail,
+                    fix_actions=tuple(fix_actions),
+                    remove_labels=item.remove_labels,
+                    add_labels=item.add_labels,
+                )
             if item.issue_number is not None:
                 result = transition(gh, config.labels, item.issue_number, "merged")
                 # Record transition outcome in the event
@@ -730,6 +790,19 @@ def apply_fixes(
                     )
 
         elif item.kind == "closed_unmerged_pr_active_labels":
+            # Issue #504: defer if the reviewer process is still running.
+            if item.pr_number is not None and item.pr_number in alive_pr_numbers:
+                continue
+            checkout_removed = False
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                if pr_key in new_prs:
+                    new_prs[pr_key] = without_review_dispatch_claim(new_prs[pr_key])
+                if repo_root is not None:
+                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    checkout_removed = remove_review_checkout(
+                        repo_root, item.pr_number, reviews_dir=reviews_dir
+                    )
             if item.issue_number is not None:
                 label_ok = True
                 for label in item.remove_labels:
@@ -737,8 +810,26 @@ def apply_fixes(
                         label_ok = False
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
+                if item.pr_number is not None:
+                    checkout_action = (
+                        (
+                            f"remove review checkout for PR #{item.pr_number}: "
+                            f"{'ok' if checkout_removed else 'failed'}"
+                        )
+                        if repo_root is not None
+                        else (
+                            f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
+                        )
+                    )
+                    fix_actions.extend(
+                        [
+                            checkout_action,
+                            f"clear review-dispatch fields for prs[{item.pr_number}]",
+                        ]
+                    )
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
+                if fix_actions != list(item.fix_actions):
                     # Replace item with updated fix_actions for event emission
                     item = DriftItem(
                         kind=item.kind,

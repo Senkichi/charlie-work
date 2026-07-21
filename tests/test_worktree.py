@@ -21,6 +21,7 @@ from charlie_work.worktree import (
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
+    ReworkBranchConflictError,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -453,6 +454,62 @@ def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
 
     # Clean up
     remove_worktree(repo_root, info.path)
+
+
+def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
+    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
+    with the local base (no origin remote), and report the conflicted paths."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-rework-conflict-local"
+    info1 = create_worktree(repo_root, branch_name, base_ref="")
+    (info1.path / "file.txt").write_text("feature line\n", encoding="utf-8")
+    _git(info1.path, "add", "file.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+
+    # Advance the local base branch with a conflicting edit.
+    _git(repo_root, "checkout", "main")
+    (repo_root / "file.txt").write_text("main line\n", encoding="utf-8")
+    _git(repo_root, "add", "file.txt")
+    _git(repo_root, "commit", "-m", "advance main")
+
+    with pytest.raises(ReworkBranchConflictError) as exc_info:
+        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+
+    assert "file.txt" in exc_info.value.conflicted_paths
+    assert "main" in exc_info.value.base_ref or "HEAD" in exc_info.value.base_ref
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
+    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
+    with the origin base, and report the conflicted paths."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch_name = "agent/issue-rework-conflict-remote"
+    info1 = create_worktree(repo_root, branch_name, base_ref="")
+    (info1.path / "file.txt").write_text("feature line\n", encoding="utf-8")
+    _git(info1.path, "add", "file.txt")
+    _git(info1.path, "commit", "-m", "add feature")
+    _git(repo_root, "push", "origin", branch_name)
+
+    # Advance origin/main with a conflicting edit.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "file.txt").write_text("main line\n", encoding="utf-8")
+    _git(remote_repo, "add", "file.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    _git(remote_repo, "checkout", branch_name)
+
+    with pytest.raises(ReworkBranchConflictError) as exc_info:
+        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+
+    assert "file.txt" in exc_info.value.conflicted_paths
+    assert "origin/main" in exc_info.value.base_ref
+    remove_worktree(repo_root, info1.path)
 
 
 def test_rework_reuse_fetches_and_fast_forwards_to_origin_tip(tmp_path: Path) -> None:
