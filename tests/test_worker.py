@@ -1430,8 +1430,9 @@ def test_deferred_worker_past_deadline_is_killed(
     state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state.get("throttled_until") is not None
     throttled_until = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_min = datetime.now(UTC) + timedelta(minutes=10 - 1)
-    expected_max = datetime.now(UTC) + timedelta(minutes=10 + 1)
+    margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    expected_min = datetime.now(UTC) + timedelta(minutes=10) + margin - timedelta(minutes=1)
+    expected_max = datetime.now(UTC) + timedelta(minutes=10) + margin + timedelta(minutes=1)
     assert expected_min <= throttled_until <= expected_max
 
 

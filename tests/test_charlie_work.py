@@ -12969,9 +12969,11 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
 
-    # Verify the cooldown reflects the parsed 10 minutes
+    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    expected_time = datetime.now(UTC) + timedelta(
+        minutes=10, seconds=config.runtime.throttle_resume_margin_s
+    )
     # Allow 2 second tolerance for test execution time
     assert abs((throttle_time - expected_time).total_seconds()) < 2
 
@@ -13162,11 +13164,13 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
     assert not sidecar_path.exists()
 
     # The throttle window from the classifier is persisted, same as the
-    # dead-session lane
+    # dead-session lane, including the resume margin.
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    expected_time = datetime.now(UTC) + timedelta(
+        minutes=10, seconds=config.runtime.throttle_resume_margin_s
+    )
     assert abs((throttle_time - expected_time).total_seconds()) < 5
 
 
@@ -13886,7 +13890,15 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     assert (123, config.labels.in_progress) in fake_gh.labels_removed
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
 
-    # Next dispatch_rework should re-select the issue.
+    # Next dispatch_rework should re-select the issue. Clear the throttle
+    # window first so the test verifies the rework restore path, not the
+    # provider-throttle deferral behavior (issue #499 adds a resume margin
+    # that makes a "0 minutes" reset window a real 90-second deferral).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state.pop("throttled_until", None)
+        save_state(paths.state_file, state)
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch_rework()
     assert result.ok is True
@@ -21562,11 +21574,13 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     assert updated_sidecar["failure_kind"] == "rate_limited"
 
     # throttled_until must be persisted to state.json, roughly now + 7 minutes
+    # plus the resume margin.
     state = load_state(paths.state_file)
     throttled_until = state.get("throttled_until")
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8)
+    margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8) + margin
 
     # session_stalled event must carry the resolved failure_kind
     events = state.get("events", [])
@@ -21616,7 +21630,8 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     throttled_until = state.get("throttled_until")
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+    margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25) + margin
 
     events = state.get("events", [])
     stalled_events = [e for e in events if e.get("kind") == "session_stalled"]

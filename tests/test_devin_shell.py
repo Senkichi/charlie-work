@@ -1392,6 +1392,28 @@ def test_classify_session_failure_missing_log(tmp_path: Path) -> None:
     assert throttled_until is None
 
 
+def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None:
+    """Issue #499: killed-worker rate-limit classification must include the resume margin."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Your limit will reset in 3 minutes.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC)
+    failure_kind, throttled_until = _classify_session_failure(log_path, resume_margin_seconds=90)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = now + timedelta(minutes=3, seconds=90)
+    assert abs((parsed - expected).total_seconds()) < 1
+
+
 def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
     """Test that get_rate_limit_defer_until returns a deadline offset by the parsed reset time plus slack."""
     from datetime import UTC, datetime, timedelta
@@ -1522,6 +1544,52 @@ def test_update_session_record_with_failure_classification(tmp_path: Path) -> No
     # Verify the sidecar was updated
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_update_session_record_with_failure_classification_includes_resume_margin(
+    tmp_path: Path,
+) -> None:
+    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s."""
+    from datetime import UTC, datetime, timedelta
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Your limit will reset in 5 minutes.\n",
+        encoding="utf-8",
+    )
+
+    config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, config=config
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    now = datetime.now(UTC)
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = now + timedelta(minutes=5, seconds=90)
+    assert abs((parsed - expected).total_seconds()) < 1
 
 
 def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
