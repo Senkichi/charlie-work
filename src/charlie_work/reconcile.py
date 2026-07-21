@@ -707,14 +707,26 @@ def apply_fixes(
 
     If ``repo_root`` is provided, merged/closed PR drift items also tear down
     the isolated ``reviews_dir`` checkout and clear any ``review_dispatch_*``
-    state so the closed lifecycle cannot be mistaken for a live claim.
+    state so the closed lifecycle cannot be mistaken for a live claim. A PR
+    whose reviewer process is still alive is deferred to a later pass (issue
+    #504) so the live session is not interrupted.
     """
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
     new_state: dict[str, Any] = {**state, "issues": new_issues, "prs": new_prs}
 
+    alive_pr_numbers: set[int] = set()
+    if repo_root is not None:
+        reviews_dir = repo_root / config.review_dispatch.reviews_dir
+        from .worker import _alive_review_worker_issue_numbers
+
+        alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
+
     for item in drift:
         if item.kind == "merged_outside_orchestrator":
+            # Issue #504: defer if the reviewer process is still running.
+            if item.pr_number is not None and item.pr_number in alive_pr_numbers:
+                continue
             if item.pr_number is not None:
                 pr_key = str(item.pr_number)
                 existing_pr = new_prs.get(pr_key, {})
@@ -778,6 +790,9 @@ def apply_fixes(
                     )
 
         elif item.kind == "closed_unmerged_pr_active_labels":
+            # Issue #504: defer if the reviewer process is still running.
+            if item.pr_number is not None and item.pr_number in alive_pr_numbers:
+                continue
             checkout_removed = False
             if item.pr_number is not None:
                 pr_key = str(item.pr_number)
