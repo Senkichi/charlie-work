@@ -2296,3 +2296,162 @@ def test_apply_fixes_merged_pr_reaps_review_checkout_and_clears_dispatch_state(
 
     # Original state is never mutated in place.
     assert state["prs"]["1"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_apply_fixes_merged_pr_defers_reap_while_reviewer_alive(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #504: a PR merged externally while its reviewer is alive must not
+    have its review checkout removed, dispatch claim cleared, or issue labels
+    transitioned until the reviewer exits.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(1, "MERGED", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {
+        "number": 1,
+        "issue_number": 10,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+
+    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = {
+        "issue_number": 1,
+        "branch": "agent/issue-10-x",
+        "worktree_path": str(reviews_dir / "pr-1"),
+        "prompt_path": str(reviews_dir / "pr-1" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 12345,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-1.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-1.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    removed_calls: list[tuple[Any, int, Any]] = []
+
+    def fake_remove_review_checkout(
+        repo_root: Path, pr_number: int, *, reviews_dir: Any = None
+    ) -> bool:
+        removed_calls.append((repo_root, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.reconcile.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "merged_outside_orchestrator"
+    ]
+    assert drift
+
+    # Live reviewer: defer the reap.
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path)
+
+    assert removed_calls == []
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+    assert new_state["prs"]["1"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert new_state["prs"]["1"]["status"] == "reviewing"
+
+    # Dead reviewer: proceed with the reap.
+    removed_calls.clear()
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path)
+
+    assert len(removed_calls) == 1
+    assert removed_calls[0][1] == 1
+    assert new_state["prs"]["1"]["status"] == "merged"
+    assert new_state["prs"]["1"]["review_dispatch_status"] is None
+
+
+def test_apply_fixes_closed_unmerged_pr_defers_reap_while_reviewer_alive(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #504: a PR closed without merging while its reviewer is alive
+    must not have its review checkout removed, dispatch claim cleared, or
+    active labels stripped until the reviewer exits.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(2, "CLOSED", head_ref="agent/issue-20-x")],
+        issues=[_issue(20, [config.labels.pr_open, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["2"] = {
+        "number": 2,
+        "issue_number": 20,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+
+    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = {
+        "issue_number": 2,
+        "branch": "agent/issue-20-x",
+        "worktree_path": str(reviews_dir / "pr-2"),
+        "prompt_path": str(reviews_dir / "pr-2" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 12345,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-2.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-2.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    removed_calls: list[tuple[Any, int, Any]] = []
+
+    def fake_remove_review_checkout(
+        repo_root: Path, pr_number: int, *, reviews_dir: Any = None
+    ) -> bool:
+        removed_calls.append((repo_root, pr_number, reviews_dir))
+        return True
+
+    monkeypatch.setattr(
+        "charlie_work.reconcile.remove_review_checkout", fake_remove_review_checkout
+    )
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_active_labels"
+    ]
+    assert drift
+
+    # Live reviewer: defer the reap.
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path)
+
+    assert removed_calls == []
+    assert gh.labels_removed == []
+    assert new_state["prs"]["2"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+    # Dead reviewer: proceed with the reap.
+    removed_calls.clear()
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path)
+
+    assert len(removed_calls) == 1
+    assert removed_calls[0][1] == 2
+    assert (20, config.labels.pr_open) in gh.labels_removed
+    assert (20, config.labels.reviewing) in gh.labels_removed
+    assert new_state["prs"]["2"]["review_dispatch_status"] is None
