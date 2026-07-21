@@ -581,6 +581,48 @@ def detect_drift(
                 )
             )
 
+        # Issue #515: an issue carrying stale active labels (needs_rework,
+        # in_progress, queued) while an OPEN PR already links to it is a
+        # self-healable drift. Move the labels back to pr_open so the normal
+        # review/merge lifecycle takes over instead of looping through failed
+        # rework dispatches.
+        open_prs = open_prs_by_issue.get(issue_number, [])
+        if open_prs:
+            stale_active = active_present - {labels_cfg.pr_open, labels_cfg.reviewing}
+            if (
+                stale_active
+                and not terminal_present
+                and issue_number not in issues_handled_by_session_relabel
+                and issue_number not in live_session_issue_numbers
+                and _issue_state(issue) == "OPEN"
+            ):
+                pr_number = min(int(pr["number"]) for pr in open_prs)
+                needs_pr_open = labels_cfg.pr_open not in issue_labels
+                fix_actions = [
+                    f"remove label '{label}' from issue #{issue_number}"
+                    for label in sorted(stale_active)
+                ]
+                add_labels: tuple[str, ...] = ()
+                if needs_pr_open:
+                    fix_actions.append(
+                        f"add label '{labels_cfg.pr_open}' to issue #{issue_number}"
+                    )
+                    add_labels = (labels_cfg.pr_open,)
+                drift.append(
+                    DriftItem(
+                        kind="issue_active_label_with_open_pr",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"issue #{issue_number} carries stale active labels "
+                            f"{sorted(stale_active)} while open PR #{pr_number} links to it"
+                        ),
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=tuple(sorted(stale_active)),
+                        add_labels=add_labels,
+                    )
+                )
+
         if terminal_present and active_present:
             drift.append(
                 DriftItem(
@@ -863,6 +905,43 @@ def apply_fixes(
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
                     # Replace item with updated fix_actions for event emission
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
+
+        elif item.kind == "issue_active_label_with_open_pr":
+            # Issue #515: repair the stale labels and mirror the fix into state
+            # so state-driven dispatch_rework stops selecting the issue.
+            if item.issue_number is not None:
+                label_ok = True
+                for label in item.remove_labels:
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                for label in item.add_labels:
+                    if not gh.add_issue_label(item.issue_number, label):
+                        label_ok = False
+
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                new_issue = {
+                    **existing_issue,
+                    "number": item.issue_number,
+                    "status": "approved",
+                    "merge_alert": "OK",
+                }
+                new_issue.pop("worker_pid", None)
+                new_issue.pop("worker_process_start_time", None)
+                new_issues[issue_key] = new_issue
+
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
                     item = DriftItem(
                         kind=item.kind,
                         issue_number=item.issue_number,
