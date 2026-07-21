@@ -756,6 +756,17 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
     return workers
 
 
+def _alive_review_worker_issue_numbers(sessions_dir: Path) -> set[int]:
+    """Return the set of PR/issue numbers whose reviewer sidecar is still alive.
+
+    This is the single source of truth for liveness-exempt reap decisions
+    across workflow.py's review-dispatch sweeps and reconcile.py's drift
+    fixers. A PR whose reviewer process has not exited is deferred until a
+    later pass, so its isolated review checkout is not torn down mid-session.
+    """
+    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+
+
 def _log_activity_advanced(
     log_stat_result: stat_result | None,
     previous_activity_at: str | None,
