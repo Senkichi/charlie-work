@@ -4701,29 +4701,39 @@ class OrchestratorApp:
         issue is a blocker for more downstream issues are dispatched first,
         with PR number as a stable tiebreaker.
         """
+        import logging
+
+        logger = logging.getLogger(__name__)
         if not queue:
             return queue
 
-        ready_issues = self.gh.issue_list(
-            labels=[self.config.labels.ready],
-            state="OPEN",
-        )
-        blocker_to_dependents: dict[int, list[int]] = {}
-        for issue in ready_issues:
-            issue_number = int(issue["number"])
-            declared_blockers, open_blockers = self._get_open_blockers(issue)
-            if not open_blockers:
-                continue
-            for blocker in declared_blockers:
-                blocker_to_dependents.setdefault(blocker, []).append(issue_number)
-
-        def sort_key(entry: dict[str, Any]) -> tuple[int, int]:
-            return (
-                -len(blocker_to_dependents.get(entry["issue"], [])),
-                entry["pr"],
+        try:
+            ready_issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="OPEN",
             )
+            blocker_to_dependents: dict[int, list[int]] = {}
+            for issue in ready_issues:
+                issue_number = int(issue["number"])
+                declared_blockers, open_blockers = self._get_open_blockers(issue)
+                if not open_blockers:
+                    continue
+                for blocker in declared_blockers:
+                    blocker_to_dependents.setdefault(blocker, []).append(issue_number)
 
-        return sorted(queue, key=sort_key)
+            def sort_key(entry: dict[str, Any]) -> tuple[int, int]:
+                return (
+                    -len(blocker_to_dependents.get(entry["issue"], [])),
+                    entry["pr"],
+                )
+
+            return sorted(queue, key=sort_key)
+        except Exception:
+            logger.warning(
+                "Dependency depth sort failed; returning unsorted review queue",
+                exc_info=True,
+            )
+            return queue
 
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
@@ -4995,7 +5005,6 @@ class OrchestratorApp:
         # is synchronous per-PR but independent across PRs.
         launched: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        quota_failure: dict[str, Any] | None = None
         quota_hit = False
         for candidate in selected:
             pr_number = candidate["pr"]
@@ -5074,7 +5083,6 @@ class OrchestratorApp:
                             self.config.runtime.throttle_error_markers,
                         )[0]
                     ):
-                        quota_failure = {"pr": pr_number, "error": error_text}
                         quota_hit = True
                         break
                     failed.append({"pr": pr_number, "error": error_text})
