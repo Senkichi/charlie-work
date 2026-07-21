@@ -6973,6 +6973,143 @@ def test_dispatch_reviews_backoff_holds_retry_until_delay_elapses(
     assert result.data["deferred_count"] == 1
 
 
+def test_dispatch_reviews_max_retries_zero_does_not_escalate(monkeypatch, tmp_path: Path) -> None:
+    """Issue #495: max_retries=0 disables the retry cap, not the retry itself."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    review_dispatch = ReviewDispatchConfig(enabled=True, max_retries=0, retry_backoff_minutes=0)
+    app = _dispatch_reviews_app(tmp_path, prs=prs, review_dispatch=review_dispatch)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    old_failed = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": old_failed,
+            "review_dispatch_failed_attempts": 5,
+        }
+        save_state(app.paths.state_file, state)
+
+    launch_error = "failed to launch claude: [WinError 2]"
+
+    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error=launch_error,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    assert result.data["launched_count"] == 0
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    assert pr_state.get("status") != "escalated"
+    assert pr_state.get("escalation_reason") is None
+    assert pr_state["review_dispatch_status"] == "review_dispatch_failed"
+    assert pr_state["review_dispatch_failed_attempts"] == 6
+    assert state["issues"].get("10", {}).get("status") != "escalated"
+    assert (10, app.config.labels.human_needed) not in app.gh.labels_added
+
+
+def test_dispatch_reviews_malformed_attempt_count_does_not_crash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #495: a non-integer review_dispatch_failed_attempts value must not
+    abort the dispatch pass; it degrades to one fresh failure."""
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    review_dispatch = ReviewDispatchConfig(enabled=True, max_retries=3, retry_backoff_minutes=0)
+    app = _dispatch_reviews_app(tmp_path, prs=prs, review_dispatch=review_dispatch)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    old_failed = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": old_failed,
+            "review_dispatch_failed_attempts": "two",
+        }
+        save_state(app.paths.state_file, state)
+
+    launch_error = "failed to launch claude: [WinError 2]"
+
+    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error=launch_error,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    assert result.data["launched_count"] == 0
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    assert pr_state["review_dispatch_status"] == "review_dispatch_failed"
+    assert pr_state["review_dispatch_failed_attempts"] == 1
+    assert pr_state.get("status") != "escalated"
+    assert state["issues"].get("10", {}).get("status") != "escalated"
+
+
 def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
     """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
     prs = [

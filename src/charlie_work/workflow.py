@@ -826,6 +826,19 @@ def _apply_local_review_cap(
     )
 
 
+def _parse_review_dispatch_attempts(raw: Any) -> int:
+    """Return ``review_dispatch_failed_attempts`` as an int, defaulting to 0.
+
+    A malformed persisted attempt count must not abort the whole dispatch
+    pass. Treating an invalid value as zero prior failures lets the current
+    failure be recorded as attempt 1 and avoids crashing the loop.
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_review_dispatchable(
     state: dict[str, Any],
     pr_number: int,
@@ -844,7 +857,8 @@ def _is_review_dispatchable(
     for liveness, avoiding a parallel mechanism. Failed launches consult
     ``ReviewDispatchConfig.max_retries`` and ``retry_backoff_minutes`` so
     persistently broken launches back off and eventually escalate instead of
-    looping forever (issue #495).
+    looping forever (issue #495). ``max_retries == 0`` disables the cap and
+    allows retries indefinitely.
     """
     pr_state = state["prs"].get(str(pr_number), {})
     status = pr_state.get("review_dispatch_status")
@@ -872,8 +886,8 @@ def _is_review_dispatchable(
 
         attempts_data = pr_state.get("review_dispatch_failed_attempts")
         if attempts_data is not None:
-            attempts = int(attempts_data)
-            if attempts >= review_dispatch.max_retries:
+            attempts = _parse_review_dispatch_attempts(attempts_data)
+            if review_dispatch.max_retries > 0 and attempts >= review_dispatch.max_retries:
                 return False
             if not is_claim_stale(failed_at):
                 return False
@@ -881,7 +895,9 @@ def _is_review_dispatchable(
                 try:
                     failed_time = datetime.fromisoformat(failed_at.replace("Z", "+00:00"))
                     age = datetime.now(UTC) - failed_time
-                    backoff_minutes = review_dispatch.retry_backoff_minutes * (2 ** (attempts - 1))
+                    backoff_minutes = review_dispatch.retry_backoff_minutes * (
+                        2 ** max(attempts - 1, 0)
+                    )
                     return age > timedelta(minutes=backoff_minutes)
                 except (ValueError, TypeError):
                     return True
@@ -5082,9 +5098,14 @@ class OrchestratorApp:
                         "reviewer_process_start_time": launch_info["process_start_time"],
                     }
                 else:
-                    prior_attempts = int(pr_state.get("review_dispatch_failed_attempts") or 0)
+                    prior_attempts = _parse_review_dispatch_attempts(
+                        pr_state.get("review_dispatch_failed_attempts") or 0
+                    )
                     attempts = prior_attempts + 1
-                    if attempts >= self.config.review_dispatch.max_retries:
+                    if (
+                        self.config.review_dispatch.max_retries > 0
+                        and attempts >= self.config.review_dispatch.max_retries
+                    ):
                         escalation_state = {
                             **pr_state,
                             "number": pr_number,

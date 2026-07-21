@@ -213,3 +213,24 @@ def test_load_config_review_dispatch_rejects_invalid_retry_values(tmp_path: Path
         with pytest.raises(ConfigError) as exc_info:
             load_config(config_file)
         assert key in str(exc_info.value)
+
+
+def test_load_config_review_dispatch_rejects_bool_int_values(tmp_path: Path) -> None:
+    """Booleans are not valid integer values for review_dispatch numeric keys."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    for key, value in (
+        ("max_retries", True),
+        ("max_retries", False),
+        ("retry_backoff_minutes", True),
+        ("retry_backoff_minutes", False),
+    ):
+        _write_config(
+            config_file,
+            f"""review_dispatch:
+  enabled: true
+  {key}: {value}
+""",
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_file)
+        assert key in str(exc_info.value)

@@ -904,7 +904,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {type(rd_reviews_dir).__name__}"
         )
     rd_max_local = review_dispatch_data.get("max_local_review_processes")
-    if rd_max_local is not None and not isinstance(rd_max_local, int):
+    if rd_max_local is not None and (
+        not isinstance(rd_max_local, int) or isinstance(rd_max_local, bool)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'max_local_review_processes' must be an int, "
             f"got {type(rd_max_local).__name__}"
@@ -915,7 +917,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {rd_max_local}"
         )
     rd_max_retries = review_dispatch_data.get("max_retries")
-    if rd_max_retries is not None and not isinstance(rd_max_retries, int):
+    if rd_max_retries is not None and (
+        not isinstance(rd_max_retries, int) or isinstance(rd_max_retries, bool)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'max_retries' must be an int, "
             f"got {type(rd_max_retries).__name__}"
@@ -926,7 +930,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {rd_max_retries}"
         )
     rd_retry_backoff = review_dispatch_data.get("retry_backoff_minutes")
-    if rd_retry_backoff is not None and not isinstance(rd_retry_backoff, int):
+    if rd_retry_backoff is not None and (
+        not isinstance(rd_retry_backoff, int) or isinstance(rd_retry_backoff, bool)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'retry_backoff_minutes' must be an int, "
             f"got {type(rd_retry_backoff).__name__}"
