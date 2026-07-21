@@ -8942,6 +8942,12 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    # Issue #1337: the recorded PID must be verified as actually alive for the
+    # live-worker abort path to fire. Stub the OS probe so the dispatch-side
+    # result PID is live, but keep the state.json worker_pid from blocking
+    # candidate selection.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -8971,6 +8977,87 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
         and event["payload"]["issue_number"] == 123
         for event in state.get("events", [])
     )
+
+
+def test_dispatch_recovery_frees_slot_when_recorded_pid_is_dead(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1337: a live_worker_redispatch_averted result with a dead recorded
+    PID must not count as a live worker slot; the issue must be routed back to
+    dispatchable."""
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+            error="pid_alive",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=1_234_567.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    # Issue #1337: the recorded PID is dead, so the result must not count as a
+    # live worker. Also prevent the state.json worker_pid from blocking candidate
+    # selection.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    # Simulate stale label state: issue_list returns only ready (so the issue
+    # is selectable), but issue_view still reports the stale in-progress label
+    # that a previous dispatch left behind.
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 4242,
+        "worker_process_start_time": 1_234_567.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is reported as a dispatch failure, but the slot
+    # is freed and the issue is routed back to dispatchable.
+    assert result.ok is False
+    assert result.data["live_worker_count"] == 0
+    assert result.data["attempted_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    # The stale in-progress label should be removed, and ready must not be lost.
+    assert (123, "agent:in-progress") in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+    # A second dispatch pass should still be able to select the issue again.
+    result2 = app.dispatch(limit=1)
+    assert result2.data["attempted_count"] == 1
+    assert result2.data["live_worker_count"] == 0
 
 
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:

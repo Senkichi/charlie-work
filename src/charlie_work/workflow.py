@@ -4089,11 +4089,25 @@ class OrchestratorApp:
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
-        live_worker_issue_numbers = {
-            result.issue_number
-            for result in dispatch_results
-            if not result.ok and result.failure_kind == "live_worker_redispatch_averted"
-        }
+        # Issue #1337: a live_worker_redispatch_averted result claims the prior
+        # worker is still alive, but the adapter's probe can fail closed on an
+        # inconclusive real-activity signal even when the recorded wrapper PID
+        # is gone. Verify the PID against the OS (with start-time identity) at
+        # the single point where live worker slots are counted. A session whose
+        # recorded PID is dead is a phantom slot and is routed as dead below.
+        live_worker_issue_numbers: set[int] = set()
+        phantom_live_worker_issue_numbers: set[int] = set()
+        for result in dispatch_results:
+            if result.ok or result.failure_kind != "live_worker_redispatch_averted":
+                continue
+            if (
+                result.pid is not None
+                and result.pid > 0
+                and is_pid_alive(result.pid, result.process_start_time)
+            ):
+                live_worker_issue_numbers.add(result.issue_number)
+            else:
+                phantom_live_worker_issue_numbers.add(result.issue_number)
         failed_issue_numbers = {
             result.issue_number
             for result in dispatch_results
@@ -4114,6 +4128,11 @@ class OrchestratorApp:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
                 is_live_worker = request.issue_number in live_worker_issue_numbers
+                is_phantom_live_worker = request.issue_number in phantom_live_worker_issue_numbers
+                result = next(
+                    (r for r in dispatch_results if r.issue_number == request.issue_number),
+                    None,
+                )
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
                     dispatched_at = utc_now()
@@ -4121,6 +4140,22 @@ class OrchestratorApp:
                     status = "dispatched"
                     prev_entry = previous_entries.get(request.issue_number, {})
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
+                elif is_phantom_live_worker:
+                    # Issue #1337: the adapter reported a live worker, but the
+                    # recorded PID is dead. Free the phantom slot and route the
+                    # issue back to the appropriate lane.
+                    (
+                        status,
+                        dispatched_at,
+                        state,
+                    ) = self._route_phantom_live_worker(
+                        state,
+                        request,
+                        result,
+                        full_issue,
+                        pr_by_issue,
+                        sessions_dir,
+                    )
                 else:
                     status = "dispatch_failed"
                     dispatched_at = None
@@ -4142,13 +4177,17 @@ class OrchestratorApp:
                     entry.pop("orphan_flagged_at", None)
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
+                # Issue #1337: a phantom live worker is being routed as dead; do not
+                # preserve a stale worker_pid that would keep the slot occupied.
+                if is_phantom_live_worker:
+                    entry.pop("worker_pid", None)
+                    entry.pop("worker_process_start_time", None)
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
-                    result = next(
-                        (r for r in dispatch_results if r.issue_number == request.issue_number),
-                        None,
-                    )
                     if result and result.pid is not None:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
@@ -4181,7 +4220,7 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
                     if is_live_worker:
-                        result = next(
+                        live_result = next(
                             (
                                 r
                                 for r in dispatch_results
@@ -4195,11 +4234,11 @@ class OrchestratorApp:
                             {
                                 "issue_number": request.issue_number,
                                 "branch_name": request.branch_name,
-                                "pid": result.pid if result else None,
-                                "process_start_time": result.process_start_time
-                                if result
+                                "pid": live_result.pid if live_result else None,
+                                "process_start_time": live_result.process_start_time
+                                if live_result
                                 else None,
-                                "probe_result": result.error if result else None,
+                                "probe_result": live_result.error if live_result else None,
                             },
                         )
                         save_state(self.paths.state_file, state)
@@ -8163,6 +8202,103 @@ class OrchestratorApp:
             state = load_state_locked(self.paths.state_file)
             operator_claimed = operator_claimed_issues(state)
         return int(issue["number"]) not in operator_claimed
+
+    def _phantom_sidecar_path(self, sessions_dir: Path, issue_number: int, adapter: str) -> Path:
+        """Return the sidecar path for a phantom dispatch result."""
+        if adapter == "claude-code":
+            return sessions_dir / f"issue-{issue_number}.claude.json"
+        return sessions_dir / f"issue-{issue_number}.json"
+
+    def _route_phantom_live_worker(
+        self,
+        state: dict[str, Any],
+        request: SessionRequest,
+        result: SessionDispatchResult | None,
+        full_issue: dict[str, Any],
+        pr_by_issue: dict[int, dict[str, Any]],
+        sessions_dir: Path,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        """Route a phantom ``live_worker_redispatch_averted`` result as dead.
+
+        The adapter reported a live worker, but the recorded PID failed the
+        OS-level liveness + identity check. Remove the stale sidecar/marker so
+        the session no longer occupies a concurrency slot, then route the issue
+        using the same dead-worker rules the reaper uses:
+
+        * Open PR with a live ``request_changes`` verdict -> ``rework_requested``.
+        * Otherwise strip active labels and restore ``automated-ready`` so the
+          issue is dispatchable again.
+        """
+        issue_number = request.issue_number
+
+        # Remove the stale sidecar and matching worktree writer marker.
+        if result is not None:
+            sidecar_path = self._phantom_sidecar_path(sessions_dir, issue_number, result.adapter)
+            try:
+                if sidecar_path.exists():
+                    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    worktree_path_str = payload.get("worktree_path")
+                    session_id = payload.get("session_id")
+                    if worktree_path_str and session_id:
+                        remove_worktree_marker(Path(worktree_path_str), session_id)
+            except (OSError, json.JSONDecodeError):
+                pass
+            try:
+                sidecar_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Route an open PR with a live request_changes verdict to rework.
+        pr_data = pr_by_issue.get(issue_number)
+        if pr_data is not None:
+            pr_number = int(pr_data["number"])
+            live_head_sha = pr_data.get("headRefOid")
+            pr_state = state.get("prs", {}).get(str(pr_number), {})
+            last_decision = pr_state.get("decision")
+            reviewed_head_sha = pr_state.get("reviewed_head_sha")
+            if (
+                last_decision == "request_changes"
+                and reviewed_head_sha is not None
+                and live_head_sha is not None
+                and reviewed_head_sha == live_head_sha
+            ):
+                transition(self.gh, self.config.labels, issue_number, "rework_requested")
+                state = append_event(
+                    state,
+                    "rework_requeued",
+                    {
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": "phantom_live_worker_pid_dead",
+                    },
+                )
+                return "rework_requested", None, state
+
+        # No open PR (or not a clean request_changes case): strip active labels
+        # and ensure the ready label is present so the issue becomes dispatchable.
+        issue_labels = label_names(full_issue)
+        active_labels = issue_labels & self.config.labels.active
+        label_write_ok = True
+        for label in sorted(active_labels):
+            if not self.gh.remove_issue_label(issue_number, label):
+                label_write_ok = False
+        needs_ready = self.config.labels.ready not in issue_labels
+        if needs_ready:
+            if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
+                label_write_ok = False
+        state = append_event(
+            state,
+            "session_failed_relabeled",
+            {
+                "issue_number": issue_number,
+                "failure_kind": "live_worker_redispatch_averted",
+                "reason": "phantom_live_worker_pid_dead",
+                "removed_labels": sorted(active_labels),
+                "added_ready": needs_ready,
+                "label_write_ok": label_write_ok,
+            },
+        )
+        return "dispatch_failed", None, state
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
