@@ -6954,6 +6954,188 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     assert state["prs"]["100"]["reviewer_pid"] == 12345
 
 
+def test_dispatch_reviews_defers_when_reviewer_quota_exhausted(tmp_path: Path) -> None:
+    """When reviewer quota is exhausted and the probe window has not passed, defer without dispatching."""
+    from datetime import UTC, datetime, timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {"throttled_until": future, "probe_after": future}
+        save_state(app.paths.state_file, state)
+
+    result = app.dispatch_reviews()
+
+    assert result.data["selected_count"] == 0
+    assert result.data["launched_count"] == 0
+    assert result.data.get("deferred_reason") == "reviewer_quota_probe_backoff"
+
+
+def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_path: Path) -> None:
+    """A successful reviewer launch while in probe mode clears the global reviewer quota."""
+    from datetime import UTC, datetime, timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    future_throttle = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    past_probe = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {
+            "throttled_until": future_throttle,
+            "probe_after": past_probe,
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    assert result.data["launched_count"] == 1
+    assert result.data.get("quota_hit") is False
+    assert state.get("reviewer_quota", {}).get("throttled_until") is None
+
+
+def test_dispatch_reviews_probe_failure_sets_reviewer_quota_and_rolls_back(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer launch failure matching a usage-limit signature sets the global quota and rolls back the PR claim."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error="usage limit exceeded",
+            process_start_time=1.0,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    assert result.data["launched_count"] == 0
+    assert result.data.get("quota_hit") is True
+    assert state["reviewer_quota"]["throttled_until"] is not None
+    assert state["reviewer_quota"]["probe_after"] is not None
+    # The PR should not be marked as a normal failed dispatch; its claim is rolled back.
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+
+
+def test_dispatch_reviews_respects_max_concurrent_reviews(monkeypatch, tmp_path: Path) -> None:
+    """max_concurrent_reviews caps the number of reviewers launched in a single pass."""
+    prs = [
+        {
+            "number": i,
+            "title": f"Fix #{i}",
+            "url": f"https://example.test/pull/{i}",
+            "headRefName": f"agent/issue-{i}-fix",
+            "baseRefName": "main",
+            "headRefOid": f"sha-{i}",
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{i}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+        for i in range(300, 303)
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(
+            enabled=True,
+            max_local_review_processes=0,
+            max_concurrent_reviews=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    for pr in prs:
+        _write_review_packet(tmp_path, pr["number"], pr["headRefOid"])
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 2
+
+
 def _init_git_repo(repo_root: Path) -> None:
     import subprocess
 

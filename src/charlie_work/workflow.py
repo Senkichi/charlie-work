@@ -74,7 +74,10 @@ from .worktree import (
 from .state import (
     StateLockBusy,
     append_event,
+    clear_reviewer_quota,
     is_claim_stale,
+    is_reviewer_probe_ready,
+    is_reviewer_quota_exhausted,
     is_throttled,
     load_state,
     load_state_locked,
@@ -82,12 +85,14 @@ from .state import (
     release_operator_claimed,
     save_state,
     set_operator_claimed,
+    set_reviewer_quota_exhausted,
     set_throttled_until,
     stale_operator_claims,
     state_lock,
     utc_now,
     without_review_dispatch_claim,
 )
+from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 
@@ -4748,6 +4753,50 @@ class OrchestratorApp:
             },
         )
 
+    def _sort_review_queue_by_dependency_depth(
+        self, queue: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Sort review queue so PRs blocking the most downstream work come first.
+
+        Builds the same blocker->dependents graph used by worker dispatch
+        against the currently-blocked ready-labeled issues. PRs whose linked
+        issue is a blocker for more downstream issues are dispatched first,
+        with PR number as a stable tiebreaker.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        if not queue:
+            return queue
+
+        try:
+            ready_issues = self.gh.issue_list(
+                labels=[self.config.labels.ready],
+                state="OPEN",
+            )
+            blocker_to_dependents: dict[int, list[int]] = {}
+            for issue in ready_issues:
+                issue_number = int(issue["number"])
+                declared_blockers, open_blockers = self._get_open_blockers(issue)
+                if not open_blockers:
+                    continue
+                for blocker in declared_blockers:
+                    blocker_to_dependents.setdefault(blocker, []).append(issue_number)
+
+            def sort_key(entry: dict[str, Any]) -> tuple[int, int]:
+                return (
+                    -len(blocker_to_dependents.get(entry["issue"], [])),
+                    entry["pr"],
+                )
+
+            return sorted(queue, key=sort_key)
+        except Exception:
+            logger.warning(
+                "Dependency depth sort failed; returning unsorted review queue",
+                exc_info=True,
+            )
+            return queue
+
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
@@ -4856,7 +4905,7 @@ class OrchestratorApp:
                     }
                 )
 
-        queue.sort(key=lambda entry: entry["pr"])
+        queue = self._sort_review_queue_by_dependency_depth(queue)
         return CommandResult(
             True,
             f"review queue: {len(queue)} PR(s) awaiting verdict",
@@ -4959,6 +5008,29 @@ class OrchestratorApp:
                 },
             )
 
+        # System-wide reviewer quota gate. If the quota is exhausted and we are
+        # not yet due to probe again, defer without touching any PR state.
+        # When the probe window opens, only one reviewer is launched until the
+        # probe succeeds, at which point the global quota is cleared.
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            if is_reviewer_quota_exhausted(state):
+                if not is_reviewer_probe_ready(state):
+                    return CommandResult(
+                        True,
+                        "review dispatch deferred: reviewer quota exhausted, probe not ready",
+                        {
+                            "selected_count": 0,
+                            "attempted_count": 0,
+                            "failed_count": 0,
+                            "launched_count": 0,
+                            "deferred_reason": "reviewer_quota_probe_backoff",
+                        },
+                    )
+                probe_mode = True
+            else:
+                probe_mode = False
+
         reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
 
         # Run the verdict-reaper and orphan/stalled sweeps before selection so
@@ -4997,13 +5069,20 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             dispatchable = [c for c in candidates if _is_review_dispatchable(state, c["pr"], c)]
 
-        # Apply the local-only cap. max_local_review_processes == 0 means
-        # unlimited, mirroring the unlimited-by-default intent of the stage.
+        # Apply the local and provider-token caps. 0 means unlimited for both.
         max_local = self.config.review_dispatch.max_local_review_processes
+        max_concurrent = self.config.review_dispatch.max_concurrent_reviews
         live_count = _count_live_reviews(reviews_dir, self.paths.state_file)
         requested_limit = limit if limit is not None else len(dispatchable)
-        cap = _apply_local_review_cap(requested_limit, max_local, live_count)
-        selected = dispatchable[: cap.dispatch_limit]
+        local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
+        if max_concurrent > 0:
+            concurrent_available = max(0, max_concurrent - live_count)
+            concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
+        else:
+            concurrent_cap = local_cap.dispatch_limit
+        # In probe mode, only launch one reviewer at a time to test quota.
+        dispatch_limit = 1 if probe_mode else concurrent_cap
+        selected = dispatchable[:dispatch_limit]
 
         if self.dry_run:
             return CommandResult(
@@ -5015,7 +5094,7 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_count": len(candidates) - len(selected),
-                    **cap.report_fields(),
+                    **local_cap.report_fields(),
                 },
             )
 
@@ -5056,6 +5135,7 @@ class OrchestratorApp:
         # is synchronous per-PR but independent across PRs.
         launched: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        quota_hit = False
         for candidate in selected:
             pr_number = candidate["pr"]
             issue_number = candidate["issue"]
@@ -5122,12 +5202,20 @@ class OrchestratorApp:
                     **launch_kwargs,
                 )
                 if record.error or record.pid is None:
-                    failed.append(
-                        {
-                            "pr": pr_number,
-                            "error": record.error or "launch returned no pid",
-                        }
-                    )
+                    error_text = record.error or "launch returned no pid"
+                    # A quota failure is a global condition, not a per-PR
+                    # failure. Stop the pass immediately so the next probe can
+                    # retry once the usage window resets.
+                    if (
+                        record.error
+                        and match_throttle_tail(
+                            record.error,
+                            self.config.runtime.throttle_error_markers,
+                        )[0]
+                    ):
+                        quota_hit = True
+                        break
+                    failed.append({"pr": pr_number, "error": error_text})
                 else:
                     launched.append(
                         {
@@ -5140,19 +5228,21 @@ class OrchestratorApp:
             except (OSError, GitHubError, ValueError) as exc:
                 failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
 
-        # Upgrade claims outside the launch loop. Failed launches become
-        # review_dispatch_failed with the current timestamp so rapid relaunches
-        # are throttled by is_claim_stale. Successful launches become
-        # review_dispatch_dispatched with the reviewer's PID.
+        # Upgrade claims outside the launch loop. Successful launches become
+        # review_dispatch_dispatched. A quota failure rolls back the claim so
+        # the PR is not wedged by a global condition; it remains dispatchable
+        # once quota is available. Non-quota failures become
+        # review_dispatch_failed.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            launched_prs = {x["pr"] for x in launched}
+            failed_prs = {x["pr"] for x in failed}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 issue_number = candidate["issue"]
-                launch_info = next((x for x in launched if x["pr"] == pr_number), None)
-                fail_info = next((x for x in failed if x["pr"] == pr_number), None)
                 pr_state = state["prs"].get(str(pr_number), {})
-                if launch_info:
+                if pr_number in launched_prs:
+                    launch_info = next(x for x in launched if x["pr"] == pr_number)
                     state["prs"][str(pr_number)] = {
                         **pr_state,
                         "number": pr_number,
@@ -5164,7 +5254,8 @@ class OrchestratorApp:
                         "reviewer_pid": launch_info["pid"],
                         "reviewer_process_start_time": launch_info["process_start_time"],
                     }
-                else:
+                elif pr_number in failed_prs:
+                    fail_info = next(x for x in failed if x["pr"] == pr_number)
                     failed_state = {
                         **pr_state,
                         "number": pr_number,
@@ -5176,20 +5267,53 @@ class OrchestratorApp:
                         "reviewer_pid": None,
                         "reviewer_process_start_time": None,
                     }
-                    if fail_info:
-                        failed_state["review_dispatch_error"] = fail_info["error"]
+                    failed_state["review_dispatch_error"] = fail_info["error"]
                     state["prs"][str(pr_number)] = failed_state
+                else:
+                    # Quota failure (or not reached due to break) — roll back
+                    # the pending claim so the PR stays dispatchable.
+                    state["prs"][str(pr_number)] = without_review_dispatch_claim(pr_state)
+
+            if quota_hit:
+                now_dt = datetime.now(UTC)
+                throttled_until = (
+                    (now_dt + timedelta(hours=self.config.review_dispatch.quota_reset_hours))
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                probe_after = (
+                    (
+                        now_dt
+                        + timedelta(
+                            minutes=self.config.review_dispatch.quota_probe_interval_minutes
+                        )
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = set_reviewer_quota_exhausted(
+                    state,
+                    throttled_until=throttled_until,
+                    probe_after=probe_after,
+                )
+            elif is_reviewer_quota_exhausted(state):
+                # A successful probe cleared the way — clear global quota.
+                state = clear_reviewer_quota(state)
+
             state = append_event(
                 state,
                 "review_dispatch",
                 {
                     "launched": [x["pr"] for x in launched],
                     "failed": [x["pr"] for x in failed],
+                    "quota_hit": quota_hit,
                 },
             )
             save_state(self.paths.state_file, state)
 
-        ok = not failed
+        ok = not failed and not quota_hit
         recorded_verdicts = verdict_result.get("recorded", [])
         missed_verdicts = verdict_result.get("missed", [])
 
@@ -5198,7 +5322,12 @@ class OrchestratorApp:
             message += (
                 f"; {len(recorded_verdicts)} verdict(s) recorded, {len(missed_verdicts)} missed"
             )
-        if failed:
+        if quota_hit:
+            message = (
+                f"review dispatch: reviewer quota hit after {len(launched)} "
+                f"launched; will probe again later"
+            )
+        elif failed:
             message = (
                 f"review dispatch completed with {len(failed)} failure(s): "
                 f"{len(launched)} launched"
@@ -5210,12 +5339,14 @@ class OrchestratorApp:
             "launched_count": len(launched),
             "failed_count": len(failed),
             "failed": failed,
+            "quota_hit": quota_hit,
+            "probe_mode": probe_mode,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
         }
-        data.update(cap.report_fields())
+        data.update(local_cap.report_fields())
         return CommandResult(ok, message, data)
 
     def record_review(
