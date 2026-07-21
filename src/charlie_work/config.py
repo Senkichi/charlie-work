@@ -128,6 +128,7 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
+            self.merge_hold,
         }
 
 

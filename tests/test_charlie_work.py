@@ -9880,6 +9880,39 @@ def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_pa
     assert pr_state.get("consecutive_failed_merge_attempts", 0) == 0
 
 
+@pytest.mark.parametrize("degraded_payload", [{}, {"number": 123}])
+def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
+    tmp_path: Path,
+    degraded_payload: dict[str, Any],
+) -> None:
+    """Issue #496 regression: a degraded gh issue view payload (empty dict or
+    missing labels) must be treated as unavailable, not as "no hold"."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewDegradedGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                return degraded_payload
+            return super().issue_view(number)
+
+    fake_gh = IssueViewDegradedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+
+
 def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
     """An unapproved PR must never be labeled for the merge queue — the
     approval gate (can_merge) is upstream of the mergequeue branch, exactly as

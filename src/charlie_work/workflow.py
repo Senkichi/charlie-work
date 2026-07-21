@@ -5805,6 +5805,11 @@ class OrchestratorApp:
                     except (GitHubError, ValueError):
                         merge_hold_check_unavailable = True
                         issue = None
+                    if not merge_hold_check_unavailable and (
+                        not isinstance(issue, dict) or "labels" not in issue
+                    ):
+                        merge_hold_check_unavailable = True
+                        issue = None
                     if not merge_hold_check_unavailable:
                         issue_labels = label_names(issue) if issue else set()
                         merge_hold = self.config.labels.merge_hold in issue_labels

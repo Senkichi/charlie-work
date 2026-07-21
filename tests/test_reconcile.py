@@ -1619,6 +1619,46 @@ def test_terminal_transition_clears_sibling_workflow_labels() -> None:
     assert (852, config.labels.done) not in gh.labels_removed
 
 
+def test_merged_transition_removes_merge_hold_label() -> None:
+    """Issue #496: merge-hold is a transient operator control and must be
+    stripped when an issue reaches the terminal merged state."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(10, [config.labels.merge_hold, config.labels.in_progress])],
+    )
+
+    result = transition(gh, config.labels, 10, "merged")
+
+    assert result.outcome == TO.APPLIED
+    assert (10, config.labels.done) in gh.labels_added
+    assert (10, config.labels.merge_hold) in gh.labels_removed
+    assert (10, config.labels.in_progress) in gh.labels_removed
+
+
+def test_closed_unmerged_transition_removes_merge_hold_label() -> None:
+    """Issue #496: merge-hold must also be stripped when an issue is closed
+    without merging, matching the transient-operator model."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[
+            _issue(10, [config.labels.merge_hold, config.labels.pr_open, config.labels.ready])
+        ],
+    )
+
+    result = transition(gh, config.labels, 10, "closed_unmerged")
+
+    assert result.outcome == TO.APPLIED
+    assert (10, config.labels.merge_hold) in gh.labels_removed
+    assert (10, config.labels.pr_open) in gh.labels_removed
+    assert (10, config.labels.ready) in gh.labels_removed
+
+
 def test_apply_fixes_multi_item_with_one_failed_label_write() -> None:
     """Issue #125: apply_fixes should record failure when one label write fails."""
     config = OrchestratorConfig()
