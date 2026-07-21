@@ -22,7 +22,12 @@ from typing import Any
 
 from .config import RunnerScalingConfig
 from .github import GitHub
-from .subprocess_runner import RunResult, hidden_console_kwargs, no_console_window_kwargs, run_captured
+from .subprocess_runner import (
+    RunResult,
+    hidden_console_kwargs,
+    no_console_window_kwargs,
+    run_captured,
+)
 
 
 # Marker file name that identifies charlie-managed runner directories
