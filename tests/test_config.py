@@ -490,6 +490,22 @@ def test_load_config_api_worker_rejects_unknown_provider_key(tmp_path: Path) -> 
         load_config(config_file)
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_load_config_api_worker_rejects_bool_max_concurrent_sessions(
+    tmp_path: Path, value: bool
+) -> None:
+    """Boolean values are not valid ints for max_concurrent_sessions."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        f"""api_worker:
+  max_concurrent_sessions: {str(value).lower()}
+""",
+    )
+    with pytest.raises(ConfigError, match="max_concurrent_sessions.*must be an int"):
+        load_config(config_file)
+
+
 def test_load_config_api_worker_rejects_invalid_types(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
@@ -638,6 +654,38 @@ def test_global_config_api_worker_per_repo_partial_providers_keeps_global_provid
     assert config.api_worker.provider == "local-k3"
     assert config.api_worker.providers["local-k3"].cached_input_usd_per_mtok == 0.0
     assert config.api_worker.budget.preflight_reserve_usd == 1.0
+
+
+def test_global_config_non_api_worker_dict_section_is_replaced_not_merged(
+    tmp_path: Path,
+) -> None:
+    """Layered config only deep-merges api_worker; other sections keep old semantics."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(
+        """claude_code:
+  worker_env:
+    GLOBAL: global
+""",
+        encoding="utf-8",
+    )
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """claude_code:
+  worker_env:
+    REPO: repo
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.claude_code.worker_env == {"REPO": "repo"}
 
 
 def test_orchestrator_config_defaults_include_api_worker() -> None:

@@ -1189,7 +1189,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         )
     max_concurrent_sessions = api_worker_data.get("max_concurrent_sessions")
     if max_concurrent_sessions is not None:
-        if not isinstance(max_concurrent_sessions, int):
+        if isinstance(max_concurrent_sessions, bool) or not isinstance(
+            max_concurrent_sessions, int
+        ):
             raise ConfigError(
                 "config section 'api_worker' key 'max_concurrent_sessions' must be an int, "
                 f"got {type(max_concurrent_sessions).__name__}"

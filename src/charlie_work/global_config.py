@@ -85,9 +85,14 @@ def load_layered_config(
         global_section = global_section if isinstance(global_section, dict) else {}
         repo_section = repo_section if isinstance(repo_section, dict) else {}
 
-        # Merge: repo values override global values; nested mappings are merged
-        # recursively so partial per-repo overrides do not drop global defaults.
-        merged_section = _deep_merge(global_section, repo_section)
+        # Merge: repo values override global values. The api_worker section is
+        # deep-merged so partial per-repo overrides (e.g. budget caps or provider
+        # additions) do not drop global defaults. All other sections keep the
+        # original shallow-merge semantics: repo keys fully replace global keys.
+        if section == "api_worker":
+            merged_section = _deep_merge(global_section, repo_section)
+        else:
+            merged_section = {**global_section, **repo_section}
         if merged_section:
             merged_data[section] = merged_section
 
