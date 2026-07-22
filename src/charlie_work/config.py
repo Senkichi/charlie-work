@@ -382,6 +382,10 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: int = 1500
+    # Bounded in-memory event ring for state.json. A larger cap costs only a
+    # few hundred KB of JSON and preserves far more diagnostic history when a
+    # single sweep emits repetitive events. Tuned via config (issue #525).
+    event_ring_size: int = 2000
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1017,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
                 f"got {graphql_rate_limit_threshold}"
+            )
+    event_ring_size = runtime_data.get("event_ring_size")
+    if event_ring_size is not None:
+        if not isinstance(event_ring_size, int):
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be an int, "
+                f"got {type(event_ring_size).__name__}"
+            )
+        if event_ring_size < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be >= 0, "
+                f"got {event_ring_size}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

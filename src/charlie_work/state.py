@@ -25,6 +25,11 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
+# Default event ring cap. OrchestratorApp sets EVENT_RING_SIZE from
+# RuntimeConfig at startup so the bound is config-driven (issue #525).
+DEFAULT_EVENT_RING_SIZE = 2000
+EVENT_RING_SIZE = DEFAULT_EVENT_RING_SIZE
+
 logger = logging.getLogger(__name__)
 
 
@@ -457,12 +462,25 @@ def load_state_locked(path: Path) -> dict[str, Any]:
         return load_state(path)
 
 
-def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Return a new state dict with the event appended; do not mutate ``data``."""
+def append_event(
+    data: dict[str, Any],
+    kind: str,
+    payload: dict[str, Any],
+    max_size: int | None = None,
+) -> dict[str, Any]:
+    """Return a new state dict with the event appended; do not mutate ``data``.
+
+    ``max_size`` defaults to the module-level ``EVENT_RING_SIZE``, which
+    OrchestratorApp sets from ``RuntimeConfig.event_ring_size`` at startup.
+    Callers (including tests) may pass an explicit cap to pin the truncation
+    behavior they are validating.
+    """
+    if max_size is None:
+        max_size = EVENT_RING_SIZE
     events = list(data.get("events", []))
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
-    if len(events) > 200:
-        events = events[-200:]
+    if len(events) > max_size:
+        events = events[-max_size:]
     return {**data, "events": events}
 
 

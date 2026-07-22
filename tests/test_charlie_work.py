@@ -56,6 +56,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
     append_event,
+    empty_state,
     is_throttled,
     load_state,
     save_state,
@@ -67,8 +68,10 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _append_sweep_events,
     _detect_and_handle_stalled_reviews,
     _parse_review_verdict_from_log,
+    _reap_orphaned_review_checkouts,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -10656,7 +10659,7 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
     for i in range(300):
-        state = _append(state, "review_packet", {"pr_number": 90000 + i})
+        state = _append(state, "review_packet", {"pr_number": 90000 + i}, max_size=200)
     save_state(paths.state_file, state)
     assert not any(  # prove the earlier request_changes events are gone
         e.get("kind") == "record_review" for e in load_state(paths.state_file)["events"]
@@ -26884,3 +26887,133 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #525: multiple stalled reviewer claims in one pass become one sweep event."""
+    from charlie_work.worker import WorkerView
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    prs = [100, 200, 300]
+    old = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state = empty_state()
+    for pr in prs:
+        state["prs"][str(pr)] = {
+            "number": pr,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+    save_state(state_file, state)
+
+    for pr in prs:
+        _make_dead_review_sidecar(reviews_dir, pr, "no verdict")
+
+    monkeypatch.setattr(WorkerView, "is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert {entry["pr"] for entry in stalled} == set(prs)
+    state_after = load_state(state_file)
+    events = state_after["events"]
+    sweep = [e for e in events if e.get("kind") == "review_dispatch_stalled_sweep"]
+    assert len(sweep) == 1
+    assert sweep[0]["payload"]["count"] == len(prs)
+    assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
+
+
+def test_reap_orphaned_review_checkouts_aggregates_same_pass_events(
+    tmp_path: Path,
+) -> None:
+    """Issue #525: multiple lifecycle-reaped PRs in one pass become one sweep event."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    prs = [100, 200, 300]
+    state = empty_state()
+    for pr in prs:
+        state["prs"][str(pr)] = {
+            "number": pr,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": "2026-07-20T00:00:00Z",
+            "reviewer_pid": 12345,
+            "reviewer_process_start_time": 1.0,
+        }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": pr,
+            "title": f"Fix #{pr}",
+            "url": f"https://example.test/pull/{pr}",
+            "headRefName": f"agent/issue-{pr}-fix",
+            "baseRefName": "main",
+            "headRefOid": f"sha-{pr}",
+            "body": f"Closes #{pr}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+        for pr in prs
+    ]
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == prs
+    state_after = load_state(state_file)
+    sweep = [
+        e
+        for e in state_after["events"]
+        if e.get("kind") == "review_dispatch_lifecycle_reaped_sweep"
+    ]
+    assert len(sweep) == 1
+    assert sweep[0]["payload"]["count"] == len(prs)
+    assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
+
+
+def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
+    """Issue #525: a repeating per-pass noise loop cannot evict unrelated events.
+
+    Simulates 5 ghost reviewer sessions x 2 events per pass for 250 passes.
+    Without aggregation the events array would hold 2501 entries and evict the
+    diagnostic event; with per-kind aggregation it stays at 501.
+    """
+    state = empty_state()
+    state = append_event(state, "diagnostic_event", {"note": "keep me"}, max_size=2000)
+
+    prs = list(range(1, 6))
+    passes = 250
+    for _ in range(passes):
+        sweep_events = [
+            ("review_dispatch_stalled", {"pr_number": pr, "status": "dispatched"}) for pr in prs
+        ] + [
+            (
+                "review_dispatch_lifecycle_reaped",
+                {"pr_number": pr, "github_state": "merged"},
+            )
+            for pr in prs
+        ]
+        state = _append_sweep_events(state, sweep_events, max_size=2000)
+
+    diagnostic = [e for e in state["events"] if e.get("kind") == "diagnostic_event"]
+    assert len(diagnostic) == 1
+    assert len(state["events"]) == 1 + (passes * 2)
+    stalled_sweeps = [
+        e for e in state["events"] if e.get("kind") == "review_dispatch_stalled_sweep"
+    ]
+    assert len(stalled_sweeps) == passes
+    assert all(e["payload"]["count"] == len(prs) for e in stalled_sweeps)

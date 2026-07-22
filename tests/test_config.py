@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import ConfigError, DispatchConfig, load_config
+from charlie_work.config import ConfigError, DispatchConfig, RuntimeConfig, load_config
 
 
 def _write_config(config_file: Path, content: str) -> None:
@@ -186,3 +186,34 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+
+
+def test_runtime_config_event_ring_size_default() -> None:
+    """Issue #525: RuntimeConfig.event_ring_size defaults to 2000."""
+    assert RuntimeConfig().event_ring_size == 2000
+
+
+def test_load_config_event_ring_size_override(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size is configurable from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 5000
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.event_ring_size == 5000
+
+
+def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size must be a non-negative int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: "lots"
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+        load_config(config_file)

@@ -72,6 +72,7 @@ from .worktree import (
     worktree_path_for_branch,
     write_worktree_marker,
 )
+from . import state as _state
 from .state import (
     StateLockBusy,
     append_event,
@@ -960,6 +961,7 @@ def _detect_and_handle_stalled_reviews(
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
     """
     stalled: list[dict[str, Any]] = []
+    sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
     changed = False
     seen_pr_keys: set[str] = set()
@@ -1002,14 +1004,15 @@ def _detect_and_handle_stalled_reviews(
             "reviewer_pid": None,
             "reviewer_process_start_time": None,
         }
-        state = append_event(
-            state,
-            "review_dispatch_stalled",
-            {
-                "pr_number": w.issue_number,
-                "pid": w.pid,
-                "started_at": w.started_at,
-            },
+        sweep_events.append(
+            (
+                "review_dispatch_stalled",
+                {
+                    "pr_number": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                },
+            )
         )
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
@@ -1037,14 +1040,15 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                 }
-                state = append_event(
-                    state,
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "pending",
-                        "pending_at": pending_at,
-                    },
+                sweep_events.append(
+                    (
+                        "review_dispatch_stalled",
+                        {
+                            "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                            "status": "pending",
+                            "pending_at": pending_at,
+                        },
+                    )
                 )
                 changed = True
                 stalled.append(
@@ -1071,14 +1075,15 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                 }
-                state = append_event(
-                    state,
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "dispatched",
-                        "dispatched_at": dispatched_at,
-                    },
+                sweep_events.append(
+                    (
+                        "review_dispatch_stalled",
+                        {
+                            "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                            "status": "dispatched",
+                            "dispatched_at": dispatched_at,
+                        },
+                    )
                 )
                 changed = True
                 stalled.append(
@@ -1136,14 +1141,15 @@ def _detect_and_handle_stalled_reviews(
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
             }
-            state = append_event(
-                state,
-                "review_dispatch_stalled",
-                {
-                    "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                    "status": "unclaimed",
-                    "prompt_mtime": packet_age,
-                },
+            sweep_events.append(
+                (
+                    "review_dispatch_stalled",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "status": "unclaimed",
+                        "prompt_mtime": packet_age,
+                    },
+                )
             )
             changed = True
             stalled.append(
@@ -1156,6 +1162,7 @@ def _detect_and_handle_stalled_reviews(
                 remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
 
     if changed:
+        state = _append_sweep_events(state, sweep_events, max_size=config.runtime.event_ring_size)
         save_state(state_file, state)
 
     return stalled
@@ -1270,6 +1277,7 @@ def _reap_orphaned_review_checkouts(
 
     alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
     reaped: list[int] = []
+    sweep_events: list[tuple[str, dict[str, Any]]] = []
     changed = False
     for pr_number in sorted(candidate_pr_numbers):
         try:
@@ -1304,28 +1312,32 @@ def _reap_orphaned_review_checkouts(
         # session as a phantom failed claim in the stalled sweep next pass,
         # which re-triggers this reap — an infinite ping-pong per merged PR.
         _reap_review_sidecar(reviews_dir, pr_number)
-        state = append_event(
-            state,
-            "review_dispatch_lifecycle_reaped",
-            {"pr_number": pr_number, "github_state": gh_state.lower()},
+        sweep_events.append(
+            (
+                "review_dispatch_lifecycle_reaped",
+                {"pr_number": pr_number, "github_state": gh_state.lower()},
+            )
         )
         changed = True
         reaped.append(pr_number)
 
     if changed:
+        state = _append_sweep_events(state, sweep_events, max_size=config.runtime.event_ring_size)
         save_state(state_file, state)
 
     return reaped
 
 
 def _append_sweep_events(
-    state: dict[str, Any], sweep_events: list[tuple[str, dict[str, Any]]]
+    state: dict[str, Any],
+    sweep_events: list[tuple[str, dict[str, Any]]],
+    max_size: int | None = None,
 ) -> dict[str, Any]:
     """Append events collected during a sweep, aggregating same-kind runs.
 
     A single occurrence of a kind is emitted with the original kind and payload.
     Multiple occurrences of the same kind are emitted as one ``{kind}_sweep`` event
-    with a count and issue-numbers list. This prevents a single bulk sweep from
+    with a count and a numbers list. This prevents a single bulk sweep from
     flooding the bounded event buffer and evicting unrelated diagnostic history.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1334,20 +1346,28 @@ def _append_sweep_events(
 
     for kind, payloads in grouped.items():
         if len(payloads) == 1:
-            state = append_event(state, kind, payloads[0])
+            state = append_event(state, kind, payloads[0], max_size=max_size)
         else:
-            issue_numbers = [
-                payload["issue_number"]
-                for payload in payloads
-                if payload.get("issue_number") is not None
-            ]
+            numbers: list[int] = []
+            numbers_key = "numbers"
+            for payload in payloads:
+                if payload.get("issue_number") is not None:
+                    numbers.append(payload["issue_number"])
+                    numbers_key = "issue_numbers"
+                elif payload.get("pr_number") is not None:
+                    numbers.append(payload["pr_number"])
+                    if numbers_key == "numbers":
+                        numbers_key = "pr_numbers"
+                elif payload.get("number") is not None:
+                    numbers.append(payload["number"])
             state = append_event(
                 state,
                 f"{kind}_sweep",
                 {
                     "count": len(payloads),
-                    "issue_numbers": issue_numbers,
+                    numbers_key: numbers,
                 },
+                max_size=max_size,
             )
     return state
 
@@ -1693,7 +1713,7 @@ def _detect_and_handle_orphaned_workers(
 
             state["issues"][str(issue_number)] = entry
 
-        state = _append_sweep_events(state, sweep_events)
+        state = _append_sweep_events(state, sweep_events, max_size=config.runtime.event_ring_size)
         save_state(state_file, state)
 
     # Route head-advanced request_changes findings to the review lane outside
@@ -2999,6 +3019,8 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
+        # Make the event ring cap config-driven (issue #525).
+        _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
