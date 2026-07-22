@@ -7258,8 +7258,7 @@ def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log
     stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
 
     assert any(
-        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled"
-        for entry in stalled
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
     )
 
     state = _load_state(state_file)
