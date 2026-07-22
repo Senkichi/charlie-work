@@ -8430,6 +8430,52 @@ class OrchestratorApp:
                             )
                             save_state(self.paths.state_file, state)
                 else:
+                    # Track every rework-dispatch attempt, successful or not,
+                    # against the same redispatch window used on the success path.
+                    # Failed attempts that repeat without ever succeeding
+                    # eventually trip max_auto_redispatch and escalate instead of
+                    # looping forever (issue #515).
+                    now = datetime.now(UTC)
+                    window_start = now - timedelta(
+                        minutes=self.config.watchdog.redispatch_window_minutes
+                    )
+                    prior = [
+                        t
+                        for t in entry.get("redispatch_at", [])
+                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                    ]
+                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
+                        # Escalate to human review
+                        entry["status"] = "escalated"
+                        entry["redispatch_at"] = redispatch_at
+                        entry["escalation_reason"] = "redispatch_cap_exceeded"
+                        entry["dispatched_at"] = None
+                        state["issues"][str(request.issue_number)] = entry
+                        save_state(self.paths.state_file, state)
+                        result = transition(
+                            self.gh,
+                            self.config.labels,
+                            request.issue_number,
+                            "redispatch_escalated",
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            label_error = {
+                                "edge": "redispatch_escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                            entry["label_error"] = label_error
+                            label_errors.append(request.issue_number)
+                            label_error_failures[request.issue_number] = _label_error_reason(
+                                label_error
+                            )
+                            save_state(self.paths.state_file, state)
+                        continue
+                    entry["status"] = "rework_requested"
+                    entry["dispatched_at"] = None
+                    entry["redispatch_at"] = redispatch_at
                     state["issues"][str(request.issue_number)] = entry
                     save_state(self.paths.state_file, state)
             rework_failure_map = _build_failure_map(
