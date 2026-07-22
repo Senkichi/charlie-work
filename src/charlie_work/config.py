@@ -216,6 +216,18 @@ class ReviewDispatchConfig:
     # Default is 2 so a host that enables review_dispatch without overriding
     # this key does not run an unbounded number of local Claude Code reviewers.
     max_local_review_processes: int = 2
+    # Provider-token budget slots. Limits how many reviewers can be in flight
+    # simultaneously against the Claude usage budget. When a slot frees (a
+    # reviewer finishes), the next poll dispatches another. 0 means unlimited.
+    max_concurrent_reviews: int = 3
+    # Fixed interval between quota-probe attempts after a reviewer launch hits
+    # the usage wall. A probe is a single reviewer launch; this many minutes
+    # must elapse before the next probe. No escalation backoff.
+    quota_probe_interval_minutes: int = 15
+    # Approximate provider usage-limit reset window in hours. When a reviewer
+    # launch hits the wall, the global reviewer quota is held exhausted for at
+    # least this long while probes run every ``quota_probe_interval_minutes``.
+    quota_reset_hours: int = 5
 
 
 @dataclass(frozen=True)
@@ -357,6 +369,7 @@ class RuntimeConfig:
         "Reached overall message rate limit",
         "rate limit",
         "too many requests",
+        "usage limit",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().

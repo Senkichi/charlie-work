@@ -1817,6 +1817,41 @@ def create_worktree(
     if rework:
         # Rework mode: branch already exists, reuse or attach to it
         existing_worktrees = list_worktrees(repo_root)
+
+        # Issue #461: a leftover worktree can occupy the target path DETACHED
+        # (crashed attempt, reboot mid-rework). `git worktree list --porcelain`
+        # emits no `branch` line for a detached worktree, so the branch-name
+        # match below can never see it — and the attach path's
+        # `git worktree add` against the still-registered directory then fails
+        # with exit 128 on every pass, forever. Reclaim by path first,
+        # mirroring the fresh-dispatch reclaim (issue #110) and the recovery
+        # path, before falling back to the branch-name lookup.
+        stale_at_path = next(
+            (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
+            None,
+        )
+        if stale_at_path is not None:
+            stale_branch = (stale_at_path.get("branch") or "").replace("refs/heads/", "")
+            if stale_branch != branch:
+                if not worktree_path.exists():
+                    # Directory missing but still registered: prune the record.
+                    run_captured(
+                        ["git", "worktree", "prune"],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                else:
+                    # Refuse to clobber uncommitted or unpushed work — a dirty
+                    # leftover needs attention, not silent deletion. The branch
+                    # ref itself is never deleted here, only the checkout.
+                    _raise_if_unsafe_to_reset(worktree_path)
+                    if not remove_worktree(repo_root, worktree_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to reclaim stale worktree {worktree_path} "
+                            f"for rework branch {branch!r}"
+                        )
+                existing_worktrees = list_worktrees(repo_root)
+
         # Branch names in git worktree list may have refs/heads/ prefix
         existing_wt = next(
             (
@@ -2190,6 +2225,16 @@ def _default_reviews_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "dispatches" / "reviews"
 
 
+def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
+    """True if ``sha`` resolves to a commit object already present locally."""
+    result = run_captured(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def create_review_checkout(
     repo_root: Path,
     pr_number: int,
@@ -2239,17 +2284,28 @@ def create_review_checkout(
     # Only fetch if an origin remote exists (mirrors create_worktree's own
     # guard). Pure-local repos (test fixtures) have no origin to fetch from —
     # the caller-supplied head_sha must already be reachable locally there.
-    if _has_origin_remote(repo_root):
+    # Skip the network round-trip entirely when the commit is already local.
+    if _has_origin_remote(repo_root) and not _commit_exists_locally(repo_root, head_sha):
         fetch_result = _run_remote_captured(
             ["git", "fetch", "origin", head_sha],
             cwd=repo_root,
         )
         if not fetch_result.ok:
-            raise RuntimeError(
-                f"[git fetch origin {head_sha}] Failed to fetch head_sha {head_sha!r} "
-                f"for PR #{pr_number} review checkout: "
-                f"{fetch_result.error or fetch_result.stderr}"
+            # Raw-SHA fetches are refused by the server when the SHA is not
+            # currently advertised (e.g. read just before a push updated the
+            # branch). The PR head ref is always advertised — fall back to it
+            # so a transient race doesn't block the review checkout; the
+            # worktree add below still pins the exact caller-supplied head_sha.
+            _run_remote_captured(
+                ["git", "fetch", "origin", f"refs/pull/{pr_number}/head"],
+                cwd=repo_root,
             )
+            if not _commit_exists_locally(repo_root, head_sha):
+                raise RuntimeError(
+                    f"[git fetch origin {head_sha}] Failed to fetch head_sha {head_sha!r} "
+                    f"for PR #{pr_number} review checkout: "
+                    f"{fetch_result.error or fetch_result.stderr}"
+                )
 
     result = run_captured(
         ["git", "worktree", "add", "--detach", str(checkout_path), head_sha],

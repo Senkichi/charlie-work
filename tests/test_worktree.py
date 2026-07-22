@@ -822,6 +822,76 @@ def test_rework_attach_resets_on_non_ff_different_patch_id(tmp_path: Path) -> No
     remove_worktree(repo_root, info.path)
 
 
+def test_rework_reclaims_detached_worktree_at_target_path(tmp_path: Path) -> None:
+    """Issue #461: a leftover worktree registered at the rework target path but
+    left DETACHED (crashed mid-rework, reboot) is invisible to the branch-name
+    lookup (`git worktree list --porcelain` emits no `branch` line for it).
+    The by-path reclaim must remove it first so the attach path can succeed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-9-x"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+
+    worktrees = list_worktrees(repo_root)
+    stale = next(wt for wt in worktrees if Path(wt["worktree"]) == info1.path)
+    assert not stale.get("branch")
+
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    current_branch = _git(info2.path, "branch", "--show-current").stdout.strip()
+    assert current_branch == branch_name
+
+    remove_worktree(repo_root, info2.path)
+
+
+def test_rework_reclaim_refuses_dirty_detached_worktree(tmp_path: Path) -> None:
+    """A detached leftover worktree with uncommitted work must not be silently
+    clobbered by the by-path reclaim — WorktreeUnsafeError, work survives."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-10-dirty-detach"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+    (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo_root, branch_name, rework=True)
+
+    assert info1.path.exists()
+    assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted worker edit\n"
+
+    remove_worktree(repo_root, info1.path)
+
+
+def test_rework_reclaims_worktree_when_directory_deleted(tmp_path: Path) -> None:
+    """A worktree registered at the rework target path whose directory was
+    deleted out-of-band (not via `git worktree remove`) is pruned before the
+    attach path runs `git worktree add`."""
+    import shutil
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-11-pruned-detach"
+    info1 = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    _git(info1.path, "checkout", "--detach")
+    shutil.rmtree(info1.path)
+
+    info2 = create_worktree(repo_root, branch_name, rework=True)
+
+    assert info2.path == info1.path
+    assert info2.path.exists()
+    current_branch = _git(info2.path, "branch", "--show-current").stdout.strip()
+    assert current_branch == branch_name
+
+    remove_worktree(repo_root, info2.path)
+
+
 def test_remove_worktree_deletes_branch_when_provided(tmp_path: Path) -> None:
     """remove_worktree should delete the branch when branch parameter is provided."""
     repo_root = tmp_path / "repo"
@@ -4529,6 +4599,74 @@ def test_create_review_checkout_replaces_stale_checkout(tmp_path: Path) -> None:
     assert (second_checkout.path / "second.txt").exists()
     review_head = _git(second_checkout.path, "rev-parse", "HEAD").stdout.strip()
     assert review_head == second_sha
+
+
+def test_create_review_checkout_skips_fetch_when_commit_already_local(tmp_path: Path) -> None:
+    """When head_sha is already present in the local object store, the fetch
+    is skipped entirely — a commit unpushed to origin (or an origin whose
+    object store doesn't advertise it) must not block the checkout."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Local-only commit: present in repo_root's object store but never
+    # pushed, so origin's bare object store does not advertise it. If the
+    # fetch were attempted (not skipped), it would fail against this origin.
+    (repo_root / "local_only.txt").write_text("local work\n", encoding="utf-8")
+    _git(repo_root, "add", "local_only.txt")
+    _git(repo_root, "commit", "-m", "local only commit")
+    head_sha = _git(repo_root, "rev-parse", "HEAD").stdout.strip()
+
+    reviews_dir = tmp_path / "reviews"
+    info = create_review_checkout(repo_root, 55, head_sha, reviews_dir=reviews_dir)
+
+    assert info.path.exists()
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == head_sha
+
+
+def test_create_review_checkout_falls_back_to_refs_pull_head(tmp_path: Path) -> None:
+    """When head_sha isn't local and a direct-by-SHA fetch is refused (GitHub,
+    and most local git configs, disable uploadpack.allowReachableSHA1InWant),
+    create_review_checkout falls back to fetching refs/pull/<pr>/head and
+    proceeds once the sha becomes locally reachable.
+
+    On this machine's git, local (file://-style path) transport may itself
+    take a shortcut that lets the direct SHA fetch succeed anyway — the
+    assertions below only require functional success and the correct sha
+    checked out, not which internal fetch path ran.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # A third clone pushes a commit under refs/pull/7/head only — never as a
+    # branch — mirroring how GitHub exposes PR heads that were never merged
+    # into a tracked branch on origin.
+    third_clone = tmp_path / "third"
+    _clone_repo(remote_repo, third_clone)
+    (third_clone / "pr_only.txt").write_text("pr head content\n", encoding="utf-8")
+    _git(third_clone, "add", "pr_only.txt")
+    _git(third_clone, "commit", "-m", "pr head commit")
+    head_sha = _git(third_clone, "rev-parse", "HEAD").stdout.strip()
+    _git(third_clone, "push", "origin", "HEAD:refs/pull/7/head")
+
+    # repo_root never fetched refs/pull/*, so the object is absent locally.
+    cat_file = subprocess.run(
+        ["git", "cat-file", "-e", f"{head_sha}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert cat_file.returncode != 0
+
+    reviews_dir = tmp_path / "reviews"
+    info = create_review_checkout(repo_root, 7, head_sha, reviews_dir=reviews_dir)
+
+    assert info.path.exists()
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == head_sha
+    assert (info.path / "pr_only.txt").read_text(encoding="utf-8") == "pr head content\n"
 
 
 def test_remove_review_checkout_idempotent(tmp_path: Path) -> None:
