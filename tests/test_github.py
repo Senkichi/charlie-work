@@ -313,40 +313,52 @@ def test_check_graphql_rate_limit_below_threshold_returns_insufficient(
     assert isinstance(reset_at, int)
 
 
-def test_merged_pr_list_defers_when_graphql_rate_limit_below_threshold(
+def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Issue #398: merged_pr_list() must not start a quota-heavy listing when the
-    GraphQL budget is below the configured threshold.
+    """merged_pr_list() now paginates through the REST pulls endpoint and
+    filters to merged PRs, avoiding the GraphQL query entirely.
     """
-    rate_limit_json = _read_fixture("gh_rate_limit.json")
+    page1 = [
+        {
+            "number": 1,
+            "title": "x",
+            "body": "",
+            "head": {"ref": "agent/issue-1-x", "repo": {"full_name": "owner/repo"}},
+            "base": {"repo": {"full_name": "owner/repo"}},
+            "merged_at": "2026-07-21T20:00:00Z",
+            "state": "closed",
+        },
+        {
+            "number": 2,
+            "title": "closed not merged",
+            "body": "",
+            "head": {"ref": "other", "repo": {"full_name": "owner/repo"}},
+            "base": {"repo": {"full_name": "owner/repo"}},
+            "merged_at": None,
+            "state": "closed",
+        },
+    ]
     call_log: list[list[str]] = []
+    pull_call_count = 0
 
     def fake_run(cmd, *args, **kwargs):
+        nonlocal pull_call_count
         call_log.append(cmd)
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
-            )
+        if cmd[:2] == ["gh", "api"] and "pulls" in cmd[2]:
+            pull_call_count += 1
+            if pull_call_count == 1:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=json.dumps(page1), stderr=""
+                )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(graphql_rate_limit_threshold=5000))
-    with pytest.raises(github_module.GraphQLBudgetError) as exc_info:
-        gh.merged_pr_list()
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_pr_list()
 
-    assert exc_info.value.remaining == 4114
-    assert exc_info.value.threshold == 5000
-    assert all(c[:3] == ["gh", "api", "rate_limit"] for c in call_log)
-
-
-def test_merged_pr_list_runs_when_graphql_rate_limit_sufficient(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #398: merged_pr_list() proceeds normally when the GraphQL budget is sufficient."""
-    rate_limit_json = _read_fixture("gh_rate_limit.json")
-    merged_prs = [
+    assert result == [
         {
             "number": 1,
             "title": "x",
@@ -356,25 +368,42 @@ def test_merged_pr_list_runs_when_graphql_rate_limit_sufficient(
             "state": "MERGED",
         }
     ]
-    call_log: list[list[str]] = []
+    assert pull_call_count >= 1
+    assert any("pulls?state=closed" in c[2] for c in call_log)
+    assert not any(c[:2] == ["gh", "pr"] for c in call_log)
+
+
+def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: Path) -> None:
+    """A terminal REST failure during pagination raises GitHubError."""
+    merged_pr = {
+        "number": 1,
+        "title": "x",
+        "body": "",
+        "head": {"ref": "agent/issue-1-x", "repo": {"full_name": "owner/repo"}},
+        "base": {"repo": {"full_name": "owner/repo"}},
+        "merged_at": "2026-07-21T20:00:00Z",
+        "state": "closed",
+    }
+    call_count = 0
 
     def fake_run(cmd, *args, **kwargs):
-        call_log.append(cmd)
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
+                args=cmd, returncode=0, stdout=json.dumps([merged_pr]), stderr=""
             )
         return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=json.dumps(merged_prs), stderr=""
+            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
         )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(graphql_rate_limit_threshold=1500))
-    result = gh.merged_pr_list()
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError):
+        gh.merged_pr_list()
 
-    assert result == merged_prs
-    assert any(c[:2] == ["gh", "pr"] and "merged" in c for c in call_log)
+    assert call_count == 2
 
 
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(

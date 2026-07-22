@@ -2645,23 +2645,15 @@ def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: P
 # --- Issue #361: merged_pr_list() cost (field scope + transient-gateway retry)
 
 
-def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path) -> None:
-    """merged_pr_list()'s sole consumer (workflow._merged_pr_referenced_issue_numbers,
-    via linked_issue_number()/issue_numbers_mentioned_by_pr()) only reads
-    state/headRefName/title/body/isCrossRepository. It must not request the
-    broader PR_LIST_FIELDS set — in particular not `statusCheckRollup`, which
-    forces gh's GraphQL query to walk each PR's check-run connection and is
-    the root cause of intermittent gateway 502s at ~500-merged-PR scale.
+def test_github_merged_pr_list_uses_rest_pagination(monkeypatch, tmp_path: Path) -> None:
+    """merged_pr_list() now uses the REST pulls endpoint instead of the
+    GraphQL-backed `gh pr list --state merged`, avoiding expensive field sets
+    such as `statusCheckRollup` (issue #361).
     """
     captured_args: list[list[str]] = []
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         captured_args.append(cmd)
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
@@ -2669,45 +2661,28 @@ def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path
     gh = github_module.GitHub(tmp_path)
     gh.merged_pr_list()
 
-    assert len(captured_args) == 2
-    args = captured_args[1]
-    assert args[:5] == ["gh", "pr", "list", "--state", "merged"]
-    fields = args[args.index("--json") + 1].split(",")
-    assert set(fields) == set(github_module.MERGED_PR_LIST_FIELDS.split(","))
-    for unused_field in (
-        "statusCheckRollup",
-        "reviewDecision",
-        "labels",
-        "author",
-        "updatedAt",
-        "url",
-        "baseRefName",
-        "mergeStateStatus",
-        "headRefOid",
-        "isDraft",
-    ):
-        assert unused_field not in fields
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    assert args[:2] == ["gh", "api"]
+    assert "pulls" in args[2]
+    assert "state=closed" in args[2]
+    assert not any(c[:2] == ["gh", "pr"] and "merged" in c for c in captured_args)
 
 
 def test_github_merged_pr_list_retries_on_transient_gateway_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """A transient 502/503/504 from the GraphQL-backed listing endpoint retries
+    """A transient 502/503/504 from the REST pulls endpoint retries
     in-pass (bounded) instead of immediately failing the whole fleet pass for
     that repo (issue #361). Succeeds on the 2nd attempt here.
     """
     call_count = 0
     sleeps: list[float] = []
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
-        if call_count == 2:
+        if call_count == 1:
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=1,
@@ -2723,7 +2698,7 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     result = gh.merged_pr_list()
 
     assert result == []
-    assert call_count == 3
+    assert call_count == 2
     assert len(sleeps) == 1
 
 
@@ -2733,15 +2708,10 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     on to the next repo.
     """
     call_count = 0
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=1,
@@ -2756,7 +2726,7 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 4
+    assert call_count == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -2766,15 +2736,10 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     than be swallowed into the transient-gateway retry loop.
     """
     call_count = 0
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(
             args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
         )
@@ -2785,7 +2750,7 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 2
+    assert call_count == 1
 
 
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
