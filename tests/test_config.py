@@ -169,6 +169,8 @@ def test_load_config_review_dispatch_defaults() -> None:
     assert config.review_dispatch.enabled is False
     assert config.review_dispatch.reviews_dir == ".var/charlie-work/dispatches/reviews"
     assert config.review_dispatch.max_local_review_processes == 2
+    assert config.review_dispatch.stall_minutes == 0
+    assert config.review_dispatch.max_stall_attempts == 3
 
 
 def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
@@ -180,9 +182,13 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
   enabled: true
   reviews_dir: .var/reviews
   max_local_review_processes: 4
+  stall_minutes: 20
+  max_stall_attempts: 5
 """,
     )
     config = load_config(config_file)
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+    assert config.review_dispatch.stall_minutes == 20
+    assert config.review_dispatch.max_stall_attempts == 5

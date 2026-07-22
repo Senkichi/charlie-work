@@ -40,6 +40,11 @@ review_dispatch:
   # Local-only process bound. 0 means unlimited; raise only if local CPU/disk
   # from concurrent reviewer worktrees becomes a visible bottleneck.
   max_local_review_processes: 0
+  # Issue #524: live reviewer stall watchdog. Minutes of sidecar-log inactivity
+  # before an alive-but-wedged reviewer is killed and its slot freed. 0 disables.
+  # stall_minutes: 0
+  # Issue #524: consecutive stall kills before the PR is escalated to a human.
+  # max_stall_attempts: 3
 
 auto_merge:
   enabled: true

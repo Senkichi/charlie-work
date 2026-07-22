@@ -68,6 +68,7 @@ from charlie_work.workflow import (
     ConcurrencyGovernorResult,
     OrchestratorApp,
     _detect_and_handle_stalled_reviews,
+    _is_review_dispatchable,
     _parse_review_verdict_from_log,
     slugify,
 )
@@ -7227,6 +7228,276 @@ def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
         and event.get("payload", {}).get("status") == "unclaimed"
         for event in state.get("events", [])
     )
+
+
+def _make_live_review_sidecar(
+    reviews_dir: Path,
+    pr_number: int,
+    *,
+    log_age_seconds: float = 0.0,
+    log_text: str = "reviewer log line\n",
+) -> Path:
+    """Create a claude-code review sidecar + log for stall-detection tests."""
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    mtime = (datetime.now(UTC) - timedelta(seconds=log_age_seconds)).timestamp()
+    os.utime(log_path, (mtime, mtime))
+
+    sidecar = {
+        "issue_number": pr_number,
+        "branch": f"agent/issue-{pr_number}",
+        "worktree_path": str(reviews_dir / f"pr-{pr_number}"),
+        "prompt_path": "/fake/prompt.md",
+        "command": ["claude", "-p"],
+        "pid": 99999,
+        "started_at": "2026-07-06T12:00:00Z",
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    sidecar_path = reviews_dir / f"issue-{pr_number}.claude.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar_path
+
+
+def _init_review_stall_state(
+    state_file: Path,
+    pr_number: int,
+    issue_number: int | None,
+    *,
+    attempts: int = 0,
+) -> None:
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+            "review_dispatch_attempts": attempts,
+        }
+        save_state(state_file, state)
+
+
+def test_detect_and_handle_stalled_reviews_kills_live_wedged_reviewer(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #524: a live-but-wedged reviewer is killed and its claim released."""
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    sidecar_path = _make_live_review_sidecar(reviews_dir, 100, log_age_seconds=60 * 60)
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 100, head_sha, reviews_dir=reviews_dir)
+    assert checkout.path.exists()
+
+    _init_review_stall_state(state_file, 100, 10)
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+    monkeypatch.setattr(
+        "charlie_work.workflow.kill_process_tree",
+        lambda pid, start: [pid] if pid == 99999 else [],
+    )
+
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, stall_minutes=20, max_stall_attempts=3)
+    )
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(entry.get("pr") == 100 and entry.get("escalated") is False for entry in stalled)
+    state = load_state(state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] is None
+    assert state["prs"]["100"]["review_dispatch_attempts"] == 1
+    assert state["prs"]["100"]["reviewer_pid"] is None
+    assert state["prs"]["100"]["reviewer_process_start_time"] is None
+    assert _is_review_dispatchable(state, 100, {})
+    assert not sidecar_path.exists()
+    assert not checkout.path.exists()
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("pr_number") == 100
+        and event.get("payload", {}).get("escalated") is False
+        for event in state.get("events", [])
+    )
+
+
+def test_detect_and_handle_stalled_reviews_skips_healthy_live_reviewer(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #524: a live reviewer with a fresh log is not killed."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    sidecar_path = _make_live_review_sidecar(reviews_dir, 101, log_age_seconds=0)
+    _init_review_stall_state(state_file, 101, 11)
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, stall_minutes=20, max_stall_attempts=3)
+    )
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert not any(entry.get("pr") == 101 for entry in stalled)
+    state = load_state(state_file)
+    assert state["prs"]["101"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert sidecar_path.exists()
+
+
+def test_detect_and_handle_stalled_reviews_disabled_when_stall_minutes_zero(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #524: stall detection is a no-op when stall_minutes == 0."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    sidecar_path = _make_live_review_sidecar(reviews_dir, 102, log_age_seconds=60 * 60)
+    _init_review_stall_state(state_file, 102, 12)
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert not any(entry.get("pr") == 102 for entry in stalled)
+    state = load_state(state_file)
+    assert state["prs"]["102"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert sidecar_path.exists()
+
+
+def test_detect_and_handle_stalled_reviews_escalates_past_max_attempts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #524: after max_stall_attempts kills, the PR is escalated to human."""
+    from charlie_work.worktree import create_review_checkout
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    sidecar_path = _make_live_review_sidecar(reviews_dir, 103, log_age_seconds=60 * 60)
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    checkout = create_review_checkout(repo_root, 103, head_sha, reviews_dir=reviews_dir)
+
+    _init_review_stall_state(state_file, 103, 13)
+    fake_gh = FakeGitHub()
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+    monkeypatch.setattr(
+        "charlie_work.workflow.kill_process_tree",
+        lambda pid, start: [pid] if pid == 99999 else [],
+    )
+
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, stall_minutes=20, max_stall_attempts=1)
+    )
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, fake_gh
+    )
+
+    assert any(entry.get("pr") == 103 and entry.get("escalated") is True for entry in stalled)
+    state = load_state(state_file)
+    assert state["prs"]["103"]["status"] == "escalated"
+    assert state["prs"]["103"]["escalation_reason"] == "reviewer_stall_cap_exceeded"
+    assert state["prs"]["103"]["review_dispatch_status"] is None
+    assert state["issues"]["13"]["status"] == "escalated"
+    assert (13, config.labels.human_needed) in fake_gh.labels_added
+    assert not sidecar_path.exists()
+    assert not checkout.path.exists()
+    assert not _is_review_dispatchable(state, 103, {})
+
+
+def test_is_review_dispatchable_rejects_escalated_pr() -> None:
+    """Issue #524: escalated PRs are never re-dispatchable."""
+    state: dict[str, Any] = {
+        "version": 1,
+        "issues": {},
+        "prs": {
+            "200": {
+                "number": 200,
+                "status": "escalated",
+                "review_dispatch_status": None,
+            }
+        },
+        "events": [],
+    }
+    assert not _is_review_dispatchable(state, 200, {})
+
+    state["prs"]["200"]["review_dispatch_status"] = "review_dispatch_completed"
+    assert not _is_review_dispatchable(state, 200, {})
+
+
+def test_record_review_resets_review_dispatch_attempts(tmp_path: Path) -> None:
+    """Issue #524: a completed review resets the stall-kill attempt counter."""
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+            "review_dispatch_attempts": 5,
+        }
+        save_state(app.paths.state_file, state)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["review_dispatch_attempts"] == 0
+    assert state["prs"]["456"]["review_dispatch_status"] == "review_dispatch_completed"
 
 
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(

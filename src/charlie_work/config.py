@@ -228,6 +228,14 @@ class ReviewDispatchConfig:
     # launch hits the wall, the global reviewer quota is held exhausted for at
     # least this long while probes run every ``quota_probe_interval_minutes``.
     quota_reset_hours: int = 5
+    # Issue #524: review-lane sibling of watchdog.stall_minutes. 0 disables
+    # stall detection; a live reviewer whose sidecar log is idle for longer
+    # than this is killed and its claim released so the review slot is freed.
+    stall_minutes: int = 0
+    # Issue #524: consecutive stall kills before the PR is escalated to
+    # agent:human-needed instead of kill-relaunch looping. Only consulted when
+    # ``stall_minutes`` is > 0.
+    max_stall_attempts: int = 3
 
 
 @dataclass(frozen=True)
@@ -919,6 +927,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
             f"got {rd_max_local}"
         )
+    for rd_int_key in ("stall_minutes", "max_stall_attempts"):
+        rd_int_value = review_dispatch_data.get(rd_int_key)
+        if rd_int_value is not None and not isinstance(rd_int_value, int):
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{rd_int_key}' must be an int, "
+                f"got {type(rd_int_value).__name__}"
+            )
+        if rd_int_value is not None and rd_int_value < 0:
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{rd_int_key}' must be >= 0, "
+                f"got {rd_int_value}"
+            )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")

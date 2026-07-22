@@ -96,7 +96,13 @@ from .state import (
 )
 from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
-from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
+from .worker import (
+    WorkerHealth,
+    WorkerView,
+    _alive_review_worker_issue_numbers,
+    iter_workers,
+    update_worker_log_stat,
+)
 
 
 @dataclass(frozen=True)
@@ -842,6 +848,10 @@ def _is_review_dispatchable(
     for liveness, avoiding a parallel mechanism.
     """
     pr_state = state["prs"].get(str(pr_number), {})
+    # Issue #524: an escalated PR (e.g. from stall cap or rework cap) is no
+    # longer dispatchable, regardless of the review_dispatch_status field.
+    if pr_state.get("status") == "escalated":
+        return False
     status = pr_state.get("review_dispatch_status")
 
     if status is None or status == "review_dispatch_completed":
@@ -933,18 +943,22 @@ def _detect_and_handle_stalled_reviews(
     state_file: Path,
     config: OrchestratorConfig,
     repo_root: Path,
+    gh: GitHub | None = None,
 ) -> list[dict[str, Any]]:
-    """Detect reviewer processes that died without a verdict and free their claims.
+    """Detect reviewer processes that are dead or alive-but-wedged and free claims.
 
-    A reviewer is considered stalled/orphaned when its sidecar process is no
-    longer alive and the claim timestamp is past the stale-claim timeout (30
-    minutes, see ``state.is_claim_stale``). When that happens, the per-PR
-    ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
-    stale timestamp as ``review_dispatch_failed_at``. The next
-    ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
-    timeout elapses. Every reap path also tears down that PR's isolated review
-    checkout (``worktree.remove_review_checkout``) so a dead reviewer never
-    leaks its detached-HEAD checkout directory.
+    Dead reviewers are handled as before: when their sidecar process is no
+    longer alive and the claim is past the stale-claim timeout (30 minutes, see
+    ``state.is_claim_stale``), the per-PR ``review_dispatch_status`` moves to
+    ``review_dispatch_failed`` with the stale timestamp as
+    ``review_dispatch_failed_at``.
+
+    Issue #524: live-but-wedged reviewers are killed when their sidecar log has
+    not advanced for ``review_dispatch.stall_minutes``. The claim is released
+    (``without_review_dispatch_claim``) so the PR becomes dispatchable again, the
+    sidecar is reaped, and an attention event is emitted. After
+    ``review_dispatch.max_stall_attempts`` consecutive stall kills, the PR is
+    escalated to ``agent:human-needed`` instead of kill-relaunch looping.
 
     A PR that reached ``status == "reviewing"`` but has no
     ``review_dispatch_status`` claim at all (a packet that was generated but
@@ -956,19 +970,133 @@ def _detect_and_handle_stalled_reviews(
     Callers should run ``_reap_review_verdicts`` first: it extracts and records
     any verdict a dead reviewer emitted, so by the time this sweep runs only
     PRs whose log has no parseable verdict fall through to the failed-claim
-    retry/backoff path. This function is intentionally simpler than
-    ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
+    retry/backoff path.
     """
     stalled: list[dict[str, Any]] = []
+    attention_entries: list[AttentionEntry] = []
     state = load_state_locked(state_file)
     changed = False
     seen_pr_keys: set[str] = set()
+    stall_minutes = config.review_dispatch.stall_minutes
+    max_stall_attempts = config.review_dispatch.max_stall_attempts
+    now = datetime.now(UTC)
 
     for w in iter_workers(reviews_dir):
         pr_key = str(w.issue_number)
-        # A live reviewer needs no cleanup.
         if w.is_alive():
+            if stall_minutes <= 0:
+                continue
+            # Only kill reviewers whose dispatch claim we own.
+            pr_state = state["prs"].get(pr_key, {})
+            if pr_state.get("review_dispatch_status") not in (
+                "review_dispatch_dispatched",
+                "review_dispatch_pending",
+            ):
+                continue
+
+            # Log-activity-based stall detection (not wall-clock-since-launch).
+            log_stat = w.log_stat()
+            if log_stat is None:
+                # A live reviewer with no visible log is inconclusive; wait for
+                # the log to appear or the process to exit.
+                continue
+            log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+            if now - log_mtime <= timedelta(minutes=stall_minutes):
+                continue
+
+            # Update the sidecar log-stat before we reap it so forensics see the
+            # frozen mtime on the final sidecar snapshot.
+            update_worker_log_stat(reviews_dir, w)
+
+            seen_pr_keys.add(pr_key)
+            attempts = int(pr_state.get("review_dispatch_attempts", 0)) + 1
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            w.reap_sidecar(reviews_dir)
+
+            issue_number = pr_state.get("issue_number")
+            last_log_line: str | None = None
+            if w.log_path:
+                try:
+                    log_text = Path(w.log_path).read_text(encoding="utf-8", errors="replace")
+                    lines = log_text.splitlines()
+                    if lines:
+                        last_log_line = lines[-1].strip()
+                except OSError:
+                    pass
+
+            escalated = attempts >= max_stall_attempts
+            reason = (
+                "reviewer stall cap exceeded"
+                if escalated
+                else f"reviewer log idle for {stall_minutes} minutes"
+            )
+
+            if escalated:
+                new_pr_state = without_review_dispatch_claim(pr_state)
+                new_pr_state["number"] = w.issue_number
+                new_pr_state["status"] = "escalated"
+                new_pr_state["escalation_reason"] = "reviewer_stall_cap_exceeded"
+                new_pr_state["review_dispatch_attempts"] = attempts
+
+                if issue_number is not None:
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "status": "escalated",
+                        "merge_alert": "OK",
+                    }
+                    if gh is not None:
+                        result = transition(gh, config.labels, issue_number, "escalated")
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            new_pr_state["label_error"] = {
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+            else:
+                new_pr_state = without_review_dispatch_claim(pr_state)
+                new_pr_state["number"] = w.issue_number
+                new_pr_state["review_dispatch_attempts"] = attempts
+
+            state["prs"][pr_key] = new_pr_state
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                {
+                    "pr_number": w.issue_number,
+                    "issue_number": issue_number,
+                    "pid": w.pid,
+                    "attempts": attempts,
+                    "killed_pids": killed_pids or None,
+                    "escalated": escalated,
+                    "reason": reason,
+                    "last_log_line": last_log_line,
+                },
+            )
+            attention_entries.append(
+                AttentionEntry(
+                    issue_number=issue_number or w.issue_number,
+                    adapter_kind="reviewer",
+                    health="STALLED",
+                    previous_health=None,
+                    last_log_line=last_log_line,
+                    pid=w.pid,
+                    terminal_tool=None,
+                    terminal_reason=reason,
+                )
+            )
+            stalled.append(
+                {
+                    "pr": w.issue_number,
+                    "pid": w.pid,
+                    "attempts": attempts,
+                    "escalated": escalated,
+                }
+            )
+            changed = True
             continue
+
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
         # launch path is flaky). Old dead reviewers become re-dispatchable.
@@ -1157,6 +1285,16 @@ def _detect_and_handle_stalled_reviews(
 
     if changed:
         save_state(state_file, state)
+
+    if attention_entries and config.notify.enabled:
+        emit_digest(
+            config.notify,
+            AttentionDigest(
+                generated_at=utc_now(),
+                repo=repo_root.name,
+                transitions=tuple(attention_entries),
+            ),
+        )
 
     return stalled
 
@@ -5121,7 +5259,11 @@ class OrchestratorApp:
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
             _detect_and_handle_stalled_reviews(
-                reviews_dir, self.paths.state_file, self.config, self.repo_root
+                reviews_dir,
+                self.paths.state_file,
+                self.config,
+                self.repo_root,
+                self.gh,
             )
             _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
             _reap_orphaned_review_checkouts(
@@ -5605,6 +5747,9 @@ class OrchestratorApp:
                 "review_dispatch_status": "review_dispatch_completed",
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
+                # Issue #524: a completed review resets the stall-kill counter
+                # so a fresh review attempt starts from a clean slate.
+                "review_dispatch_attempts": 0,
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
