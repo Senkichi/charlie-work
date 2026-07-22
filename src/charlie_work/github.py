@@ -529,11 +529,8 @@ class GitHub:
                     f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
                 ],
                 json_output=True,
-                allow_failure=True,
             )
-            if not isinstance(result, GitHubRunResult) or not result.ok:
-                break
-            page_prs = result.value if isinstance(result.value, list) else []
+            page_prs = result if isinstance(result, list) else []
             if not page_prs:
                 break
             for pr in page_prs:
@@ -1163,6 +1160,15 @@ def _is_mutating(args: list[str]) -> bool:
     if not args:
         return False
     text = " ".join(args)
+    # `gh api` defaults to GET and is read-only unless a mutating method is given.
+    # run() passes args without the leading "gh" token.
+    if text.startswith("api"):
+        for i, arg in enumerate(args):
+            if arg == "--method" and i + 1 < len(args):
+                return args[i + 1].upper() not in ("GET", "HEAD")
+            if arg.startswith("--method="):
+                return arg.split("=", 1)[1].upper() not in ("GET", "HEAD")
+        return False
     readonly_prefixes = (
         "issue list",
         "issue view",

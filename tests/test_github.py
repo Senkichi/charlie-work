@@ -373,10 +373,8 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
     assert not any(c[:2] == ["gh", "pr"] for c in call_log)
 
 
-def test_merged_pr_list_returns_partial_on_rest_error(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """A REST failure during pagination returns the merged PRs collected so far."""
+def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: Path) -> None:
+    """A terminal REST failure during pagination raises GitHubError."""
     merged_pr = {
         "number": 1,
         "title": "x",
@@ -396,24 +394,16 @@ def test_merged_pr_list_returns_partial_on_rest_error(
                 args=cmd, returncode=0, stdout=json.dumps([merged_pr]), stderr=""
             )
         return subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout="", stderr="HTTP 502: Bad gateway"
+            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
         )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
     gh = github_module.GitHub(tmp_path)
-    result = gh.merged_pr_list()
+    with pytest.raises(github_module.GitHubError):
+        gh.merged_pr_list()
 
-    assert result == [
-        {
-            "number": 1,
-            "title": "x",
-            "body": "",
-            "headRefName": "agent/issue-1-x",
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-    ]
+    assert call_count == 2
 
 
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
