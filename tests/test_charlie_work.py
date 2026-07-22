@@ -9593,6 +9593,318 @@ def test_dispatch_recovery_frees_slot_when_recorded_pid_is_dead(
     assert result2.data["live_worker_count"] == 0
 
 
+def test_route_phantom_live_worker_open_pr_rework_requested_under_cap(
+    tmp_path: Path,
+) -> None:
+    """PR #528 review: an open-PR phantom live worker with a live request_changes
+    verdict and redispatch_at under max_auto_redispatch is requeued to
+    rework_requested, and the transition result is recorded on failure."""
+    from charlie_work.adapters import SessionDispatchResult, SessionRequest
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr = {"number": 456, "headRefOid": "sha-abc123"}
+    full_issue = {
+        "number": 123,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+        "labels": [{"name": config.labels.in_progress}],
+    }
+    request = SessionRequest(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=tmp_path / "worker-prompt.md",
+        branch_name="agent/issue-123-fix-search",
+    )
+    result = SessionDispatchResult(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=str(tmp_path / "worker-prompt.md"),
+        branch_name="agent/issue-123-fix-search",
+        adapter="claude-code",
+        ok=False,
+        error="pid_alive",
+        failure_kind="live_worker_redispatch_averted",
+        pid=4242,
+        process_start_time=1_234_567.0,
+    )
+
+    now = datetime.now(UTC)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "redispatch_at": [
+                (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+            ],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    state = load_state(paths.state_file)
+    sessions_dir = paths.dispatches / "sessions"
+    status, dispatched_at, state, label_error = app._route_phantom_live_worker(
+        state,
+        request,
+        result,
+        full_issue,
+        {123: pr},
+        sessions_dir,
+    )
+
+    assert status == "rework_requested"
+    assert dispatched_at is None
+    assert label_error is None
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 2
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.in_progress) in fake_gh.labels_removed
+
+
+def test_route_phantom_live_worker_open_pr_escalates_at_redispatch_cap(
+    tmp_path: Path,
+) -> None:
+    """PR #528 review: an open-PR phantom live worker whose redispatch_at would
+    exceed max_auto_redispatch escalates to human_needed instead of looping
+    back to rework_requested."""
+    from charlie_work.adapters import SessionDispatchResult, SessionRequest
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr = {"number": 456, "headRefOid": "sha-abc123"}
+    full_issue = {
+        "number": 123,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+        "labels": [{"name": config.labels.in_progress}],
+    }
+    request = SessionRequest(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=tmp_path / "worker-prompt.md",
+        branch_name="agent/issue-123-fix-search",
+    )
+    result = SessionDispatchResult(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=str(tmp_path / "worker-prompt.md"),
+        branch_name="agent/issue-123-fix-search",
+        adapter="claude-code",
+        ok=False,
+        error="pid_alive",
+        failure_kind="live_worker_redispatch_averted",
+        pid=4242,
+        process_start_time=1_234_567.0,
+    )
+
+    now = datetime.now(UTC)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "redispatch_at": [
+                (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                (now - timedelta(minutes=8)).isoformat().replace("+00:00", "Z"),
+                (now - timedelta(minutes=6)).isoformat().replace("+00:00", "Z"),
+            ],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    state = load_state(paths.state_file)
+    sessions_dir = paths.dispatches / "sessions"
+    status, dispatched_at, state, label_error = app._route_phantom_live_worker(
+        state,
+        request,
+        result,
+        full_issue,
+        {123: pr},
+        sessions_dir,
+    )
+
+    assert status == "escalated"
+    assert dispatched_at is None
+    assert label_error is None
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 4
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.in_progress) in fake_gh.labels_removed
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+
+def test_route_phantom_live_worker_open_pr_deterministic_failure_escalates(
+    tmp_path: Path,
+) -> None:
+    """PR #528 review: an open-PR phantom live worker whose failure_kind is in
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS escalates immediately, bypassing the
+    redispatch cap."""
+    from charlie_work.adapters import SessionDispatchResult, SessionRequest
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr = {"number": 456, "headRefOid": "sha-abc123"}
+    full_issue = {
+        "number": 123,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+        "labels": [{"name": config.labels.in_progress}],
+    }
+    request = SessionRequest(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=tmp_path / "worker-prompt.md",
+        branch_name="agent/issue-123-fix-search",
+    )
+    result = SessionDispatchResult(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=str(tmp_path / "worker-prompt.md"),
+        branch_name="agent/issue-123-fix-search",
+        adapter="claude-code",
+        ok=False,
+        error="worktree unsafe",
+        failure_kind="worktree_unsafe",
+        pid=4242,
+        process_start_time=1_234_567.0,
+    )
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "redispatch_at": [],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    state = load_state(paths.state_file)
+    sessions_dir = paths.dispatches / "sessions"
+    status, dispatched_at, state, label_error = app._route_phantom_live_worker(
+        state,
+        request,
+        result,
+        full_issue,
+        {123: pr},
+        sessions_dir,
+    )
+
+    assert status == "escalated"
+    assert dispatched_at is None
+    assert label_error is None
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_route_phantom_live_worker_open_pr_label_transition_failure_recorded(
+    tmp_path: Path,
+) -> None:
+    """PR #528 review: if the rework_requested label transition fails for an
+    open-PR phantom live worker, a label_error is persisted to state.json."""
+    from charlie_work.adapters import SessionDispatchResult, SessionRequest
+    from charlie_work.labels import TransitionOutcome
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class LabelFailGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            self.labels_added.append((number, label))
+            if label == config.labels.needs_rework:
+                return False
+            return True
+
+    fake_gh = LabelFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr = {"number": 456, "headRefOid": "sha-abc123"}
+    full_issue = {
+        "number": 123,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+        "labels": [{"name": config.labels.in_progress}],
+    }
+    request = SessionRequest(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=tmp_path / "worker-prompt.md",
+        branch_name="agent/issue-123-fix-search",
+    )
+    result = SessionDispatchResult(
+        issue_number=123,
+        issue_title="Fix search",
+        prompt_path=str(tmp_path / "worker-prompt.md"),
+        branch_name="agent/issue-123-fix-search",
+        adapter="claude-code",
+        ok=False,
+        error="pid_alive",
+        failure_kind="live_worker_redispatch_averted",
+        pid=4242,
+        process_start_time=1_234_567.0,
+    )
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "redispatch_at": [],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    state = load_state(paths.state_file)
+    sessions_dir = paths.dispatches / "sessions"
+    status, dispatched_at, state, label_error = app._route_phantom_live_worker(
+        state,
+        request,
+        result,
+        full_issue,
+        {123: pr},
+        sessions_dir,
+    )
+
+    assert status == "rework_requested"
+    assert label_error is not None
+    assert label_error["edge"] == "rework_requested"
+    assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
+    assert (123, config.labels.needs_rework) in label_error["add_failures"]
+    assert state["issues"]["123"]["label_error"] == label_error
+
+
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

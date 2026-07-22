@@ -4253,6 +4253,7 @@ class OrchestratorApp:
                         status,
                         dispatched_at,
                         state,
+                        phantom_label_error,
                     ) = self._route_phantom_live_worker(
                         state,
                         request,
@@ -4277,6 +4278,14 @@ class OrchestratorApp:
                 # Clear the claim timestamp on successful upgrade
                 entry.pop("dispatch_pending_at", None)
                 entry.pop("label_error", None)
+                # PR #528: a phantom live worker may have just failed a label
+                # transition inside _route_phantom_live_worker; preserve it.
+                if is_phantom_live_worker and phantom_label_error is not None:
+                    entry["label_error"] = phantom_label_error
+                    label_errors.append(request.issue_number)
+                    label_error_failures[request.issue_number] = _label_error_reason(
+                        phantom_label_error
+                    )
                 # A successful or live-worker recovery supersedes any previous orphan flag.
                 if ok or is_live_worker:
                     entry.pop("orphan_flagged_at", None)
@@ -8647,7 +8656,7 @@ class OrchestratorApp:
         full_issue: dict[str, Any],
         pr_by_issue: dict[int, dict[str, Any]],
         sessions_dir: Path,
-    ) -> tuple[str, str | None, dict[str, Any]]:
+    ) -> tuple[str, str | None, dict[str, Any], dict[str, Any] | None]:
         """Route a phantom ``live_worker_redispatch_averted`` result as dead.
 
         The adapter reported a live worker, but the recorded PID failed the
@@ -8655,11 +8664,18 @@ class OrchestratorApp:
         the session no longer occupies a concurrency slot, then route the issue
         using the same dead-worker rules the reaper uses:
 
-        * Open PR with a live ``request_changes`` verdict -> ``rework_requested``.
+        * Open PR with a live ``request_changes`` verdict -> ``rework_requested``
+          (or ``escalated`` if the redispatch cap is exhausted or the failure is
+          deterministic, mirroring ``_reap_restore_rework_requested``).
         * Otherwise strip active labels and restore ``automated-ready`` so the
           issue is dispatchable again.
+
+        Returns a tuple of ``(status, dispatched_at, state, label_error)``.
+        ``label_error`` is non-None when a label transition failed and must be
+        persisted by the caller.
         """
         issue_number = request.issue_number
+        label_error: dict[str, Any] | None = None
 
         # Remove the stale sidecar and matching worktree writer marker.
         if result is not None:
@@ -8678,7 +8694,9 @@ class OrchestratorApp:
             except OSError:
                 pass
 
-        # Route an open PR with a live request_changes verdict to rework.
+        # Route an open PR with a live request_changes verdict to rework,
+        # enforcing the same redispatch-cap and deterministic-failure escalation
+        # rules as _reap_restore_rework_requested (issue #315, PR #528).
         pr_data = pr_by_issue.get(issue_number)
         if pr_data is not None:
             pr_number = int(pr_data["number"])
@@ -8695,17 +8713,86 @@ class OrchestratorApp:
                 and live_head_sha is not None
                 and reviewed_head_sha == live_head_sha
             ):
-                transition(self.gh, self.config.labels, issue_number, "rework_requested")
-                state = append_event(
-                    state,
-                    "rework_requeued",
-                    {
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": "phantom_live_worker_pid_dead",
-                    },
+                entry = state["issues"].get(str(issue_number), {})
+                if not isinstance(entry, dict):
+                    entry = {}
+                now = datetime.now(UTC)
+                window_start = now - timedelta(
+                    minutes=self.config.watchdog.redispatch_window_minutes
                 )
-                return "rework_requested", None, state
+                prior = [
+                    t
+                    for t in entry.get("redispatch_at", [])
+                    if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
+                ]
+                redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+
+                failure_kind = result.failure_kind if result is not None else None
+                terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                should_escalate = (
+                    terminal_failure
+                    or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
+                )
+
+                if should_escalate:
+                    entry = {
+                        **entry,
+                        "number": issue_number,
+                        "status": "escalated",
+                        "redispatch_at": redispatch_at,
+                        "escalation_reason": (
+                            failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        ),
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    state = append_event(
+                        state,
+                        "session_failed_escalated",
+                        {
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "failure_kind": failure_kind,
+                            "previous_status": "dispatched",
+                            "reason": "phantom_live_worker_pid_dead",
+                            "redispatch_count": len(redispatch_at),
+                        },
+                    )
+                    edge = "redispatch_escalated"
+                else:
+                    entry = {
+                        **entry,
+                        "number": issue_number,
+                        "status": "rework_requested",
+                        "dispatched_at": None,
+                        "redispatch_at": redispatch_at,
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    state = append_event(
+                        state,
+                        "rework_requeued",
+                        {
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "failure_kind": failure_kind,
+                            "previous_status": "dispatched",
+                            "reason": "phantom_live_worker_pid_dead_recovered",
+                            "redispatch_count": len(redispatch_at),
+                        },
+                    )
+                    edge = "rework_requested"
+
+                transition_result = transition(self.gh, self.config.labels, issue_number, edge)
+                if transition_result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": edge,
+                        "outcome": transition_result.outcome.value,
+                        "add_failures": transition_result.add_failures,
+                        "remove_failures": transition_result.remove_failures,
+                    }
+                    entry["label_error"] = label_error
+                    state["issues"][str(issue_number)] = entry
+
+                return entry["status"], None, state, label_error
 
         # No open PR (or not a clean request_changes case): strip active labels
         # and ensure the ready label is present so the issue becomes dispatchable.
@@ -8731,7 +8818,7 @@ class OrchestratorApp:
                 "label_write_ok": label_write_ok,
             },
         )
-        return "dispatch_failed", None, state
+        return "dispatch_failed", None, state, None
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
