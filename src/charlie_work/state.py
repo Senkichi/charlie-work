@@ -488,3 +488,86 @@ def set_throttled_until(data: dict[str, Any], throttled_until: str) -> dict[str,
     Returns a new state dict with throttled_until set; does not mutate ``data``.
     """
     return {**data, "throttled_until": throttled_until}
+
+
+def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the reviewer quota sub-dict from ``data``.
+
+    Ensures a mutable copy is returned so callers can build new state without
+    mutating the original ``data``.
+    """
+    quota = data.get("reviewer_quota")
+    if not isinstance(quota, dict):
+        return {}
+    return dict(quota)
+
+
+def is_reviewer_quota_exhausted(data: dict[str, Any]) -> bool:
+    """Check if reviewer quota is currently exhausted.
+
+    True when ``reviewer_quota.throttled_until`` is a future timestamp.
+    Malformed timestamps are treated as not exhausted.
+    """
+    throttled_until = _reviewer_quota(data).get("throttled_until")
+    if not throttled_until:
+        return False
+    try:
+        throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+        return datetime.now(UTC) < throttle_time
+    except (ValueError, TypeError):
+        return False
+
+
+def is_reviewer_probe_ready(data: dict[str, Any]) -> bool:
+    """Check if enough time has passed to attempt a reviewer quota probe.
+
+    True when ``reviewer_quota.probe_after`` is absent or in the past.
+    Malformed timestamps are treated as ready to avoid wedging dispatch.
+    """
+    probe_after = _reviewer_quota(data).get("probe_after")
+    if not probe_after:
+        return True
+    try:
+        probe_time = datetime.fromisoformat(probe_after.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= probe_time
+    except (ValueError, TypeError):
+        return True
+
+
+def set_reviewer_quota_exhausted(
+    data: dict[str, Any], *, throttled_until: str, probe_after: str
+) -> dict[str, Any]:
+    """Set reviewer quota exhaustion and the next probe timestamp.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    quota = _reviewer_quota(data)
+    quota["throttled_until"] = throttled_until
+    quota["probe_after"] = probe_after
+    return {**data, "reviewer_quota": quota}
+
+
+def mark_reviewer_quota_alerted(data: dict[str, Any]) -> dict[str, Any]:
+    """Record that the current quota-exhaustion episode has been alerted.
+
+    One attention digest per exhaustion episode: the marker is cleared with
+    the rest of the quota record when the probe succeeds, so a later episode
+    alerts again. Returns a new state dict; does not mutate ``data``.
+    """
+    quota = _reviewer_quota(data)
+    quota["alerted_at"] = utc_now()
+    return {**data, "reviewer_quota": quota}
+
+
+def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
+    """Clear reviewer quota exhaustion state.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    quota = _reviewer_quota(data)
+    if not quota:
+        return data
+    quota.pop("throttled_until", None)
+    quota.pop("probe_after", None)
+    quota.pop("alerted_at", None)
+    return {**data, "reviewer_quota": quota}

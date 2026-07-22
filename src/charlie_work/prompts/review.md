@@ -93,13 +93,17 @@ helps the rework pass trust the rest of the feedback.
 
 ## Decision output
 
-Write your review summary to a Markdown file, then record one decision:
+Write your review summary to a Markdown file, then emit your final verdict as a fenced JSON object. The orchestrator will extract this block from your final output and record the verdict.
 
-```powershell
-$decision_command
+```json
+{
+  "decision": "approved",
+  "summary": "<concise summary of the review>",
+  "required_changes": []
+}
 ```
 
-Use `--decision request_changes` when rework is required. Use `--decision blocked` when human input is needed.
+Use `"decision": "request_changes"` when rework is required. Use `"decision": "blocked"` when human input is needed. The `summary` must be non-empty for `request_changes` and `blocked`. `required_changes` is optional; when provided it must be a list of strings and will be persisted in the verdict file.
 
 Your summary must include:
 
