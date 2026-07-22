@@ -928,6 +928,51 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _remove_review_checkout_with_warning(
+    state: dict[str, Any],
+    repo_root: Path,
+    reviews_dir: Path,
+    pr_number: int,
+) -> tuple[dict[str, Any], bool]:
+    """Remove an isolated review checkout and emit a one-shot warning on failure.
+
+    Returns ``(new_state, removed)``. On failure, sets a per-PR warning marker
+    in ``state["prs"][pr_number]`` and appends a ``review_checkout_removal_failed``
+    event, but only if that PR does not already have an active warning marker.
+    The marker is cleared when removal succeeds so a future failure can alert
+    again. Retry happens on the next sweep pass; the warning is never re-emitted
+    per pass.
+    """
+    removed = remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
+    pr_key = str(pr_number)
+    prs = state.get("prs")
+    if not isinstance(prs, dict):
+        prs = {}
+    pr_state = prs.get(pr_key)
+    if not isinstance(pr_state, dict):
+        pr_state = {}
+
+    if removed:
+        if pr_state.get("review_checkout_removal_warned"):
+            state = {
+                **state,
+                "prs": {**prs, pr_key: {**pr_state, "review_checkout_removal_warned": None}},
+            }
+        return state, True
+
+    if not pr_state.get("review_checkout_removal_warned"):
+        state = {
+            **state,
+            "prs": {**prs, pr_key: {**pr_state, "review_checkout_removal_warned": True}},
+        }
+        state = append_event(
+            state,
+            "review_checkout_removal_failed",
+            {"pr_number": pr_number, "reviews_dir": str(reviews_dir)},
+        )
+    return state, False
+
+
 def _detect_and_handle_stalled_reviews(
     reviews_dir: Path,
     state_file: Path,
@@ -1013,7 +1058,9 @@ def _detect_and_handle_stalled_reviews(
         )
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
-        remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+        state, _ = _remove_review_checkout_with_warning(
+            state, repo_root, reviews_dir, w.issue_number
+        )
         # The failed record above is now the source of truth for redispatch;
         # the dead session's sidecar must go with the checkout or it re-enters
         # this sweep as a phantom on every subsequent pass.
@@ -1054,7 +1101,9 @@ def _detect_and_handle_stalled_reviews(
                     }
                 )
                 if pr_key.isdigit():
-                    remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
+                    state, _ = _remove_review_checkout_with_warning(
+                        state, repo_root, reviews_dir, int(pr_key)
+                    )
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
             process_start_time = pr_state.get("reviewer_process_start_time")
@@ -1088,7 +1137,9 @@ def _detect_and_handle_stalled_reviews(
                     }
                 )
                 if pr_key.isdigit():
-                    remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
+                    state, _ = _remove_review_checkout_with_warning(
+                        state, repo_root, reviews_dir, int(pr_key)
+                    )
         elif status is None and pr_state.get("status") == "reviewing":
             # Issue #487: a review packet was generated but was never claimed or
             # dispatched at all. If the packet is past the stale-claim timeout,
@@ -1153,7 +1204,9 @@ def _detect_and_handle_stalled_reviews(
                 }
             )
             if pr_key.isdigit():
-                remove_review_checkout(repo_root, int(pr_key), reviews_dir=reviews_dir)
+                state, _ = _remove_review_checkout_with_warning(
+                    state, repo_root, reviews_dir, int(pr_key)
+                )
 
     if changed:
         save_state(state_file, state)
@@ -1298,19 +1351,22 @@ def _reap_orphaned_review_checkouts(
             # Record the terminal closed state so a future pass does not re-query.
             new_pr_state["status"] = "closed"
         state["prs"][pr_key] = new_pr_state
+        changed = True
 
-        remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
+        state, removed = _remove_review_checkout_with_warning(
+            state, repo_root, reviews_dir, pr_number
+        )
         # Reap the sidecar with the checkout: leaving it resurrects the dead
         # session as a phantom failed claim in the stalled sweep next pass,
         # which re-triggers this reap — an infinite ping-pong per merged PR.
         _reap_review_sidecar(reviews_dir, pr_number)
-        state = append_event(
-            state,
-            "review_dispatch_lifecycle_reaped",
-            {"pr_number": pr_number, "github_state": gh_state.lower()},
-        )
-        changed = True
-        reaped.append(pr_number)
+        if removed:
+            state = append_event(
+                state,
+                "review_dispatch_lifecycle_reaped",
+                {"pr_number": pr_number, "github_state": gh_state.lower()},
+            )
+            reaped.append(pr_number)
 
     if changed:
         save_state(state_file, state)
