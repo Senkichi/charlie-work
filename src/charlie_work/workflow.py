@@ -146,6 +146,40 @@ def _label_error_reason(label_error: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO 8601 timestamp from state.json into a timezone-aware datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    if not isinstance(value, str):
+        return None
+    ts = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _recent_dispatch_failed_attempts(
+    entry: dict[str, Any], now: datetime, window_minutes: int
+) -> list[str]:
+    """Return ``dispatch_failed_at`` entries inside the redispatch window."""
+    attempts = entry.get("dispatch_failed_at") or []
+    if not isinstance(attempts, (list, tuple)):
+        return []
+    window_start = now - timedelta(minutes=window_minutes)
+    recent: list[str] = []
+    for value in attempts:
+        ts = _parse_iso_timestamp(value)
+        if ts is not None and ts >= window_start:
+            recent.append(value)
+    return recent
+
+
 def _build_failure_map(
     dispatch_results: Sequence[SessionDispatchResult],
     failed_issue_numbers: Iterable[int],
@@ -4104,6 +4138,8 @@ class OrchestratorApp:
             # Issue #5: also check worker liveness for "dispatched" status to recover
             # from crashed workers before PR opens.
             live_dispatched = set()
+            dispatch_blocked = set()
+            now = datetime.now(UTC)
             for number, entry in state.get("issues", {}).items():
                 if not isinstance(entry, dict):
                     continue
@@ -4125,6 +4161,21 @@ class OrchestratorApp:
                         or issue_number in pr_by_issue
                     ):
                         live_dispatched.add(issue_number)
+                elif status in ("dispatch_failed", "escalated"):
+                    # Issue #461: bound dispatch_failed retries using the same
+                    # redispatch-window cap that rework uses. A status already
+                    # marked ``escalated`` should also drop out of dispatch.
+                    issue_number = int(number)
+                    if status == "escalated":
+                        dispatch_blocked.add(issue_number)
+                    else:
+                        recent = _recent_dispatch_failed_attempts(
+                            entry,
+                            now,
+                            self.config.watchdog.redispatch_window_minutes,
+                        )
+                        if len(recent) > self.config.watchdog.max_auto_redispatch:
+                            dispatch_blocked.add(issue_number)
             operator_claimed = operator_claimed_issues(state)
             ready_issue_numbers = {int(issue["number"]) for issue in issues}
             operator_claimed_ready = sorted(operator_claimed & ready_issue_numbers)
@@ -4137,6 +4188,7 @@ class OrchestratorApp:
                 and int(issue["number"]) not in stalled_issues
                 and int(issue["number"]) not in issues_with_open_tracked_prs
                 and int(issue["number"]) not in merged_pr_issue_numbers
+                and int(issue["number"]) not in dispatch_blocked
             ]
             if operator_claimed_ready:
                 state = append_event(
@@ -4275,18 +4327,34 @@ class OrchestratorApp:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
                 is_live_worker = request.issue_number in live_worker_issue_numbers
+                prev_entry = state["issues"].get(str(request.issue_number), {})
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
                     dispatched_at = utc_now()
                 elif is_live_worker:
                     status = "dispatched"
-                    prev_entry = previous_entries.get(request.issue_number, {})
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
                 else:
-                    status = "dispatch_failed"
-                    dispatched_at = None
+                    # Issue #461: bound dispatch_failed retries with the same
+                    # redispatch-window cap used for rework.
+                    now = datetime.now(UTC)
+                    all_attempts = list(prev_entry.get("dispatch_failed_at") or [])
+                    if not isinstance(all_attempts, list):
+                        all_attempts = []
+                    all_attempts.append(now.isoformat())
+                    recent = _recent_dispatch_failed_attempts(
+                        {"dispatch_failed_at": all_attempts},
+                        now,
+                        self.config.watchdog.redispatch_window_minutes,
+                    )
+                    if len(recent) > self.config.watchdog.max_auto_redispatch:
+                        status = "escalated"
+                        dispatched_at = None
+                    else:
+                        status = "dispatch_failed"
+                        dispatched_at = None
                 entry = {
-                    **state["issues"].get(str(request.issue_number), {}),
+                    **prev_entry,
                     "number": request.issue_number,
                     "title": full_issue.get("title"),
                     "url": full_issue.get("url"),
@@ -4303,6 +4371,14 @@ class OrchestratorApp:
                     entry.pop("orphan_flagged_at", None)
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    entry.pop("escalation_reason", None)
+                elif status == "escalated":
+                    entry["dispatch_failed_at"] = all_attempts
+                    entry["escalation_reason"] = "dispatch_failed_cap_exceeded"
+                else:
+                    entry["dispatch_failed_at"] = all_attempts
+                    entry.pop("escalation_reason", None)
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -4362,6 +4438,28 @@ class OrchestratorApp:
                                 else None,
                                 "probe_result": result.error if result else None,
                             },
+                        )
+                        save_state(self.paths.state_file, state)
+                elif status == "escalated":
+                    # Issue #461: dispatch-failed retry cap exceeded; escalate to
+                    # human-needed and remove the issue from the dispatch pool.
+                    result = transition(
+                        self.gh,
+                        self.config.labels,
+                        request.issue_number,
+                        "redispatch_escalated",
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        label_error = {
+                            "edge": "redispatch_escalated",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
+                        entry["label_error"] = label_error
+                        label_errors.append(request.issue_number)
+                        label_error_failures[request.issue_number] = _label_error_reason(
+                            label_error
                         )
                         save_state(self.paths.state_file, state)
 

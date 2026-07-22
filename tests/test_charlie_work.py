@@ -26527,6 +26527,45 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     assert payload["failures"]["123"] == reason
 
 
+def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None:
+    """Issue #461: repeated dispatch failures are capped and then escalated."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=1),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First dispatch failure is recorded normally.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+
+    # Second failure exceeds the cap and escalates the issue.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    assert result2.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # Third dispatch no longer selects the escalated issue.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    assert result3.data["selected_count"] == 0
+
+
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
     """Issue #457: dead worker with request_changes and an advanced head is routed
     to the review-pending path instead of being re-emitted as drift."""
