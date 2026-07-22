@@ -216,6 +216,18 @@ class ReviewDispatchConfig:
     # Default is 2 so a host that enables review_dispatch without overriding
     # this key does not run an unbounded number of local Claude Code reviewers.
     max_local_review_processes: int = 2
+    # Provider-token budget slots. Limits how many reviewers can be in flight
+    # simultaneously against the Claude usage budget. When a slot frees (a
+    # reviewer finishes), the next poll dispatches another. 0 means unlimited.
+    max_concurrent_reviews: int = 3
+    # Fixed interval between quota-probe attempts after a reviewer launch hits
+    # the usage wall. A probe is a single reviewer launch; this many minutes
+    # must elapse before the next probe. No escalation backoff.
+    quota_probe_interval_minutes: int = 15
+    # Approximate provider usage-limit reset window in hours. When a reviewer
+    # launch hits the wall, the global reviewer quota is held exhausted for at
+    # least this long while probes run every ``quota_probe_interval_minutes``.
+    quota_reset_hours: int = 5
 
 
 @dataclass(frozen=True)
@@ -362,6 +374,7 @@ class RuntimeConfig:
         "Reached overall message rate limit",
         "rate limit",
         "too many requests",
+        "usage limit",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
@@ -424,6 +437,16 @@ class DevinConfig:
 class ClaudeCodeConfig:
     """Settings for the claude-code worker adapter (devin.adapter: claude-code)."""
 
+    # Every worker/reviewer launch pins this explicitly via `--model` — see
+    # claude_code._apply_model_pin. Without an explicit pin, the spawned
+    # `claude` CLI subprocess falls back to whatever model an interactive
+    # session on this machine last set globally (e.g. via `/model`), which
+    # is never guaranteed to be available/affordable for headless fleet
+    # dispatch (2026-07-22 outage: an operator session's `/model` choice of
+    # a premium tier silently propagated to every reviewer launch and hit a
+    # credits wall, stalling every PR review fleet-wide with zero backoff
+    # signal since the error didn't match the quota-exhaustion classifier).
+    model: str = "claude-sonnet-5"
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
     command: tuple[str, ...] = ()
