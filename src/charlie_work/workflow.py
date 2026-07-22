@@ -3025,12 +3025,22 @@ class OrchestratorApp:
     def _adapter_settings(self) -> AdapterSettings:
         claude = self.config.claude_code
         devin = self.config.devin
+        api_worker = self.config.api_worker
         adapter = devin.adapter
         # Use adapter-specific venv_source and worker_env
         if adapter == "devin-shell":
             venv_source = self._resolve(devin.venv_source) if devin.venv_source else None
             worker_env = devin.worker_env
         elif adapter == "claude-code":
+            venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
+            worker_env = claude.worker_env
+        elif adapter == "api":
+            # api workers are Claude Code CLI processes with provider env
+            # injected, so they reuse the claude-code venv/env resolution
+            # (shared venv junction, worker_env overrides). The provider
+            # routing vars (ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL) are merged
+            # inside launch_api_worker, over any worker_env values, so an
+            # operator's worker_env cannot accidentally override the provider.
             venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
             worker_env = claude.worker_env
         else:
@@ -3052,6 +3062,7 @@ class OrchestratorApp:
             base_ref=self.config.dispatch.base_ref,
             tee_stream_json=claude.tee_stream_json,
             launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
+            api_worker_config=api_worker if adapter == "api" else None,
             config=self.config,
         )
 
