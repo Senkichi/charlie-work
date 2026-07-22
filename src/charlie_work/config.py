@@ -432,6 +432,16 @@ class DevinConfig:
 class ClaudeCodeConfig:
     """Settings for the claude-code worker adapter (devin.adapter: claude-code)."""
 
+    # Every worker/reviewer launch pins this explicitly via `--model` — see
+    # claude_code._apply_model_pin. Without an explicit pin, the spawned
+    # `claude` CLI subprocess falls back to whatever model an interactive
+    # session on this machine last set globally (e.g. via `/model`), which
+    # is never guaranteed to be available/affordable for headless fleet
+    # dispatch (2026-07-22 outage: an operator session's `/model` choice of
+    # a premium tier silently propagated to every reviewer launch and hit a
+    # credits wall, stalling every PR review fleet-wide with zero backoff
+    # signal since the error didn't match the quota-exhaustion classifier).
+    model: str = "claude-sonnet-5"
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
     command: tuple[str, ...] = ()
