@@ -11357,6 +11357,70 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
     assert result.data["failures"][123] == payload["failures"]["123"]
 
 
+def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> None:
+    """Issue #515: repeated failed rework-dispatch attempts must count toward the
+    redispatch cap and escalate instead of retrying forever.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    for i in range(2):
+        result = app.dispatch_rework()
+        assert result.ok is False
+        assert result.data["failed_count"] == 1
+        state = load_state(paths.state_file)
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        assert len(state["issues"]["123"].get("redispatch_at", [])) == i + 1
+
+    # Third failure exceeds the cap and escalates to human-needed.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 3
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
+
+
 def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     config = OrchestratorConfig(auto_merge=_approved_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -24033,31 +24097,30 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 
 
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
-    """Test that redispatch_at is only written by the three known call sites (issue #165)."""
+    """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework (workflow.py:2440-2472)
-    # 2. _classify_dead_sessions_and_update_throttle_state (workflow.py:468-504)
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2: the
-    #    rework lane must consult the same redispatch cap the other two
-    #    sites do, instead of preserving redispatch_at unchanged forever).
+    # 1. dispatch_rework success + escalation paths, and now the failure path
+    #    (issue #515: failed rework-dispatch attempts also append redispatch_at
+    #    so they count toward the cap).
+    # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
+    #    escalation + dead-session normal + dead-session escalation).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
     # No other code paths write to redispatch_at.
 
-    # Verify the two call sites exist in the code
     import charlie_work.workflow as workflow_module
     import inspect
 
     workflow_source = inspect.getsource(workflow_module)
 
-    # Count occurrences of redispatch_at assignments to entry
-    # We have 2 assignments in dispatch_rework (normal + escalation), 3 in
-    # _classify_dead_sessions_and_update_throttle_state (launch-failure
-    # escalation + dead-session normal + dead-session escalation), and 2 in
-    # _reap_restore_rework_requested (rework escalation + rework restore,
-    # issue #315).
-    # Total of 7 assignments is correct.
+    # Count occurrences of redispatch_at assignments to entry:
+    # dispatch_rework: 2 (success normal + escalation) +
+    #                  2 (failure normal + escalation, issue #515) = 4
+    # _classify_dead_sessions_and_update_throttle_state: 3
+    # _reap_restore_rework_requested: 2
+    # Total of 9 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 7, (
-        f"Expected 7 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 9, (
+        f"Expected 9 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
