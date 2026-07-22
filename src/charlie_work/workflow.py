@@ -7596,9 +7596,9 @@ class OrchestratorApp:
         open_tracked_prs = 0
         skipped_reviews = 0
         prs = self.gh.pr_list()
-        # Snapshot for foreign-PR markers only: reads are safe without the lock
-        # (state writes are atomic), and markers change at most once per PR.
-        state_snapshot = load_state(self.paths.state_file)
+        # Snapshot for foreign-PR markers only: markers change at most once
+        # per PR, so a single point-in-time read at loop start is sufficient.
+        state_snapshot = load_state_locked(self.paths.state_file)
         merge_train_head = (
             self._merge_train_head(prs)
             if self.config.auto_merge.update_branch_strategy == "front_of_train"
