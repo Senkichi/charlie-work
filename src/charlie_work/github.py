@@ -33,7 +33,7 @@ _JITTER_FRACTION = 0.25
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
 # All call sites must use these constants — no inline field-list literals.
-ISSUE_LIST_FIELDS = "number,title,url,body,labels,assignees,author,createdAt,updatedAt,state"
+ISSUE_LIST_FIELDS = "number,title,url,body,labels,author,createdAt,updatedAt,state"
 ISSUE_VIEW_FIELDS = (
     "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
 )
@@ -173,6 +173,32 @@ class GitHub:
         if self.runtime is not None:
             return self.runtime.gh_retry_base_seconds
         return _DEFAULT_GH_RETRY_BASE_SECONDS
+
+    def __post_init__(self) -> None:
+        # Cache expensive list results within a single GitHub instance lifetime
+        # (typically one fleet pass) to avoid repeated GraphQL calls.
+        object.__setattr__(self, "_list_cache", {})
+
+    def _normalize_rest_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
+        """Map a PR object from the REST pulls endpoint to the shape expected
+        by consumers of merged_pr_list().
+        """
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        head_repo = (head.get("repo") or {}).get("full_name")
+        base_repo = (base.get("repo") or {}).get("full_name")
+        if head_repo is None or base_repo is None:
+            is_cross_repository: bool | None = None
+        else:
+            is_cross_repository = head_repo != base_repo
+        return {
+            "number": pr.get("number"),
+            "title": pr.get("title"),
+            "body": pr.get("body"),
+            "headRefName": head.get("ref"),
+            "isCrossRepository": is_cross_repository,
+            "state": "MERGED",
+        }
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
@@ -412,51 +438,40 @@ class GitHub:
         return items
 
     def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
-        # Support both old signature (ready_label: str) and new (labels=None, state=None)
+        # Normalize labels for caching and arg building; support legacy str signature.
         if isinstance(labels, str):
-            ready_label = labels
-            return self._list_json(
-                [
-                    "issue",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    ready_label,
-                    "--limit",
-                    str(_LIST_LIMIT),
-                    "--json",
-                    ISSUE_LIST_FIELDS,
-                ],
-                limit=_LIST_LIMIT,
-                kind=f"ready-labeled open issues (label={ready_label})",
-            )
+            label_tuple = (labels,)
+        elif labels is None:
+            label_tuple = ()
+        else:
+            label_tuple = tuple(labels)
+        effective_state = state or "open"
+        cache_key = ("issue_list", effective_state, label_tuple)
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # New signature: labels as list, state as string
         args = [
             "issue",
             "list",
             "--limit",
             str(_LIST_LIMIT),
+            "--state",
+            effective_state,
             "--json",
             ISSUE_LIST_FIELDS,
         ]
+        for label in label_tuple:
+            args.extend(["--label", label])
 
-        if state:
-            args.extend(["--state", state])
-        else:
-            args.extend(["--state", "open"])
-
-        if labels:
-            for label in labels:
-                args.extend(["--label", label])
-
-        label_str = ", ".join(labels) if labels else "all"
-        return self._list_json(
+        label_str = ", ".join(label_tuple) if label_tuple else "all"
+        result = self._list_json(
             args,
             limit=_LIST_LIMIT,
-            kind=f"issues (labels={label_str}, state={state or 'open'})",
+            kind=f"issues (labels={label_str}, state={effective_state})",
         )
+        self._list_cache[cache_key] = result
+        return result
 
     def issue_view(self, number: int) -> dict[str, Any]:
         result = self.run(
@@ -472,7 +487,11 @@ class GitHub:
         return result if isinstance(result, dict) else {}
 
     def pr_list(self) -> list[dict[str, Any]]:
-        return self._list_json(
+        cache_key = ("pr_list",)
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = self._list_json(
             [
                 "pr",
                 "list",
@@ -486,30 +505,47 @@ class GitHub:
             limit=_LIST_LIMIT,
             kind="open PRs",
         )
+        self._list_cache[cache_key] = result
+        return result
 
     def merged_pr_list(self) -> list[dict[str, Any]]:
-        threshold = (
-            self.runtime.graphql_rate_limit_threshold
-            if self.runtime is not None
-            else _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
-        )
-        sufficient, remaining, reset_at = self.check_graphql_rate_limit(threshold)
-        if not sufficient:
-            raise GraphQLBudgetError(remaining, reset_at, threshold)
-        return self._list_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "merged",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                MERGED_PR_LIST_FIELDS,
-            ],
-            limit=_LIST_LIMIT,
-            kind="merged PRs",
-        )
+        """List recently merged PRs using the REST API to avoid the expensive
+        GraphQL query that gh pr list --state merged issues.
+
+        Paginates through closed PRs (most recently updated first) and filters
+        to merged PRs, returning up to _LIST_LIMIT (500) items.
+        """
+        cache_key = ("merged_pr_list",)
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        merged: list[dict[str, Any]] = []
+        max_pages = (_LIST_LIMIT // 100) + 1
+        for page in range(1, max_pages + 1):
+            result = self.run(
+                [
+                    "api",
+                    f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
+                ],
+                json_output=True,
+                allow_failure=True,
+            )
+            if not isinstance(result, GitHubRunResult) or not result.ok:
+                break
+            page_prs = result.value if isinstance(result.value, list) else []
+            if not page_prs:
+                break
+            for pr in page_prs:
+                if pr.get("merged_at"):
+                    merged.append(self._normalize_rest_pr(pr))
+                if len(merged) >= _LIST_LIMIT:
+                    break
+            if len(merged) >= _LIST_LIMIT:
+                break
+
+        self._list_cache[cache_key] = merged
+        return merged
 
     def merged_prs_for_issue(
         self,
