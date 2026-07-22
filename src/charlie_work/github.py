@@ -85,6 +85,16 @@ class GitHubError(RuntimeError):
     pass
 
 
+class GitHubNotFoundError(GitHubError):
+    """The referenced GitHub object does not exist in this repository.
+
+    Permanent (not retryable): raised when gh reports a GraphQL
+    could-not-resolve or REST 404 for the requested object. Callers that
+    derive object numbers from untrusted inputs (e.g. PR branch names) use
+    this to distinguish "will never succeed" from transient gh failures.
+    """
+
+
 class GraphQLBudgetError(GitHubError):
     """Raised when the GitHub GraphQL rate-limit budget is too low to start a
     quota-heavy phase safely.
@@ -306,6 +316,8 @@ class GitHub:
             last_result.stderr.strip() or last_result.stdout.strip() or str(last_result.returncode)
         )
         if not allow_failure:
+            if _is_not_found_gh_error(final_error):
+                raise GitHubNotFoundError(final_error)
             raise GitHubError(final_error)
 
         value = None
@@ -1063,6 +1075,19 @@ def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
     text = _FENCED_CODE_BLOCK_RE.sub("", text)
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
     return {int(m.group(1)) for m in _ISSUE_MENTION_RE.finditer(text)}
+
+
+def _is_not_found_gh_error(error: str) -> bool:
+    """Classify a gh stderr/stdout string as an object-does-not-exist failure.
+
+    Matches GitHub's GraphQL could-not-resolve shape and REST 404s — the same
+    signals `_is_transient_gh_error` already treats as terminal. Permanent:
+    retrying can never succeed while the referenced object is absent.
+    """
+    text = error.lower()
+    if "could not resolve to a" in text or "not_found" in text:
+        return True
+    return bool(re.search(r"\bhttp 404\b", text))
 
 
 def _is_transient_gh_error(error: str) -> bool:

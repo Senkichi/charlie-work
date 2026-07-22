@@ -504,3 +504,78 @@ def test_merged_prs_for_issue_returns_empty_on_gh_failure(monkeypatch, tmp_path:
 
     assert result == []
     assert result.ok is False
+
+
+def test_run_raises_not_found_error_for_graphql_could_not_resolve(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A GraphQL could-not-resolve terminal error raises GitHubNotFoundError, a
+    GitHubError subclass, so existing `except GitHubError` callers still catch it."""
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr=(
+                "GraphQL: Could not resolve to an issue or pull request with the "
+                "number of 1337. (repository.issue)"
+            ),
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubNotFoundError) as exc_info:
+        gh.run(["issue", "view", "1337"], json_output=True)
+
+    assert isinstance(exc_info.value, github_module.GitHubError)
+    assert call_count == 1
+
+
+def test_run_raises_plain_github_error_for_unrelated_terminal_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An unrelated terminal error raises plain GitHubError, not the not-found
+    subclass — callers that only special-case not-found must not misclassify it."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="some fatal thing"
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError) as exc_info:
+        gh.run(["issue", "view", "1"], json_output=True)
+
+    assert not isinstance(exc_info.value, github_module.GitHubNotFoundError)
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (
+            "GraphQL: Could not resolve to an issue or pull request with the "
+            "number of 1337. (repository.issue)",
+            True,
+        ),
+        ("Not Found (HTTP 404)", True),
+        ("NOT_FOUND", True),
+        ("TLS handshake timeout", False),
+        ("HTTP 403: Forbidden", False),
+    ],
+    ids=[
+        "graphql_could_not_resolve",
+        "rest_404",
+        "not_found_token",
+        "tls_timeout",
+        "http_403",
+    ],
+)
+def test_is_not_found_gh_error_classifies_correctly(error: str, expected: bool) -> None:
+    assert github_module._is_not_found_gh_error(error) is expected
