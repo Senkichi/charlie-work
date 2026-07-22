@@ -34,6 +34,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
     cancel_superseded_runs,
@@ -81,6 +82,7 @@ from .state import (
     is_throttled,
     load_state,
     load_state_locked,
+    mark_reviewer_quota_alerted,
     operator_claimed_issues,
     release_operator_claimed,
     save_state,
@@ -977,7 +979,17 @@ def _detect_and_handle_stalled_reviews(
         pr_state = state["prs"].get(pr_key, {})
         status = pr_state.get("review_dispatch_status")
         if status in ("review_dispatch_completed", "review_dispatch_failed"):
-            # Already terminal; don't overwrite a completed/failed record.
+            # Already terminal; don't overwrite a completed/failed record, but
+            # reap the dead session's sidecar so it stops resurfacing here.
+            w.reap_sidecar(reviews_dir)
+            continue
+        if status is None and pr_state.get("status") in ("merged", "closed"):
+            # Lifecycle-reaped terminal PR: the claim was already cleared by
+            # the orphan sweep. Without reaping the sidecar here, the dead
+            # session resurrects as a phantom failed claim every pass and the
+            # orphan sweep re-reaps it — an infinite stalled/reaped ping-pong
+            # that floods the event ring (observed on 5 merged PRs, 07-22).
+            w.reap_sidecar(reviews_dir)
             continue
 
         state["prs"][pr_key] = {
@@ -1002,6 +1014,10 @@ def _detect_and_handle_stalled_reviews(
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
         remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+        # The failed record above is now the source of truth for redispatch;
+        # the dead session's sidecar must go with the checkout or it re-enters
+        # this sweep as a phantom on every subsequent pass.
+        w.reap_sidecar(reviews_dir)
 
     # Catch state entries that have no sidecar (launch crashed before sidecar
     # write, or sidecar was deleted) and are past the stale timeout.
@@ -1145,6 +1161,20 @@ def _detect_and_handle_stalled_reviews(
     return stalled
 
 
+def _reap_review_sidecar(reviews_dir: Path, pr_number: int) -> None:
+    """Delete a dead reviewer's sidecar so it cannot resurrect as a phantom.
+
+    Reviewer sessions are keyed by PR number in ``reviews_dir``. Never touches
+    a live session's sidecar (the governor counts live sidecars — deleting one
+    would silently free a slot for over-cap dispatch). Best-effort:
+    ``WorkerView.reap_sidecar`` swallows OSError, and a sidecar that survives
+    one pass is reaped on the next.
+    """
+    for w in iter_workers(reviews_dir):
+        if w.issue_number == pr_number and not w.is_alive():
+            w.reap_sidecar(reviews_dir)
+
+
 def _reap_completed_review_checkouts(
     repo_root: Path,
     reviews_dir: Path,
@@ -1181,6 +1211,9 @@ def _reap_completed_review_checkouts(
             continue
         if remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir):
             reaped.append(pr_number)
+        # The verdict is recorded and the reviewer has exited: the sidecar has
+        # served its purpose and must not linger as a phantom session.
+        _reap_review_sidecar(reviews_dir, pr_number)
     return reaped
 
 
@@ -1267,6 +1300,10 @@ def _reap_orphaned_review_checkouts(
         state["prs"][pr_key] = new_pr_state
 
         remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
+        # Reap the sidecar with the checkout: leaving it resurrects the dead
+        # session as a phantom failed claim in the stalled sweep next pass,
+        # which re-triggers this reap — an infinite ping-pong per merged PR.
+        _reap_review_sidecar(reviews_dir, pr_number)
         state = append_event(
             state,
             "review_dispatch_lifecycle_reaped",
@@ -5012,24 +5049,65 @@ class OrchestratorApp:
         # not yet due to probe again, defer without touching any PR state.
         # When the probe window opens, only one reviewer is launched until the
         # probe succeeds, at which point the global quota is cleared.
+        quota_alert: dict[str, Any] | None = None
+        deferred = False
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             if is_reviewer_quota_exhausted(state):
                 if not is_reviewer_probe_ready(state):
-                    return CommandResult(
-                        True,
-                        "review dispatch deferred: reviewer quota exhausted, probe not ready",
-                        {
-                            "selected_count": 0,
-                            "attempted_count": 0,
-                            "failed_count": 0,
-                            "launched_count": 0,
-                            "deferred_reason": "reviewer_quota_probe_backoff",
-                        },
-                    )
-                probe_mode = True
+                    deferred = True
+                    # Quota deferral is by design, but it must never be silent:
+                    # an exhaustion episode that outlives its probe window
+                    # stalls the review lane fleet-wide. Alert once per
+                    # episode (marker cleared with the quota record on probe
+                    # success). The digest is emitted after the lock releases —
+                    # sinks may do network I/O.
+                    quota = state.get("reviewer_quota") or {}
+                    if not quota.get("alerted_at") and self.config.notify.enabled:
+                        save_state(self.paths.state_file, mark_reviewer_quota_alerted(state))
+                        quota_alert = dict(quota)
+                    probe_mode = False
+                else:
+                    probe_mode = True
             else:
                 probe_mode = False
+        if deferred:
+            if quota_alert is not None:
+                emit_digest(
+                    self.config.notify,
+                    AttentionDigest(
+                        generated_at=utc_now(),
+                        repo=self.repo_root.name,
+                        transitions=(
+                            AttentionEntry(
+                                issue_number=0,
+                                adapter_kind="reviewer",
+                                health="REVIEWER_QUOTA_EXHAUSTED",
+                                previous_health=None,
+                                last_log_line=(
+                                    f"throttled_until={quota_alert.get('throttled_until')} "
+                                    f"probe_after={quota_alert.get('probe_after')}"
+                                ),
+                                pid=None,
+                                terminal_tool=None,
+                                terminal_reason=(
+                                    "all reviewer launches deferred until the quota probe succeeds"
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            return CommandResult(
+                True,
+                "review dispatch deferred: reviewer quota exhausted, probe not ready",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "deferred_reason": "reviewer_quota_probe_backoff",
+                },
+            )
 
         reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
 
@@ -5251,6 +5329,10 @@ class OrchestratorApp:
                         "review_dispatched_at": utc_now(),
                         "review_dispatch_pending_at": None,
                         "review_dispatch_failed_at": None,
+                        # A successful launch supersedes any earlier failure:
+                        # without this reset the last error string is carried
+                        # forward verbatim by the **pr_state spread forever.
+                        "review_dispatch_error": None,
                         "reviewer_pid": launch_info["pid"],
                         "reviewer_process_start_time": launch_info["process_start_time"],
                     }
@@ -7381,6 +7463,36 @@ class OrchestratorApp:
         else:
             merges.append(merge_result.data)
 
+    def _mark_foreign_issue_ref(self, pr_number: int, issue_number: int, reason: str) -> bool:
+        """Durably park a PR whose linked issue does not exist in this repo.
+
+        A PR opened against the wrong fleet repo (e.g. its branch references
+        another repo's issue number) can never be processed here: every pass
+        would re-derive the same issue number and re-fail the same GitHub
+        lookup forever. Persist a ``foreign_issue_ref`` marker in the PR's
+        state entry so subsequent passes skip it with zero GitHub calls.
+
+        Returns True only on the first marking for this (pr, issue) pair so
+        the caller can emit a one-shot attention event.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            marker = pr_state.get("foreign_issue_ref") or {}
+            if marker.get("issue") == issue_number:
+                return False
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "foreign_issue_ref": {
+                    "issue": issue_number,
+                    "detected_at": utc_now(),
+                    "reason": reason,
+                },
+            }
+            save_state(self.paths.state_file, state)
+        return True
+
     @_guard_state_lock
     def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
@@ -7480,9 +7592,13 @@ class OrchestratorApp:
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        foreign_transitions: dict[int, dict[str, Any]] = {}
         open_tracked_prs = 0
         skipped_reviews = 0
         prs = self.gh.pr_list()
+        # Snapshot for foreign-PR markers only: markers change at most once
+        # per PR, so a single point-in-time read at loop start is sufficient.
+        state_snapshot = load_state_locked(self.paths.state_file)
         merge_train_head = (
             self._merge_train_head(prs)
             if self.config.auto_merge.update_branch_strategy == "front_of_train"
@@ -7496,9 +7612,18 @@ class OrchestratorApp:
             )
             if issue_number is None:
                 continue
+            pr_number = int(pr["number"])
+            parked = (state_snapshot["prs"].get(str(pr_number)) or {}).get(
+                "foreign_issue_ref"
+            ) or {}
+            if parked.get("issue") == issue_number:
+                # Foreign/unlinked PR: its claimed issue does not exist in this
+                # repo (e.g. opened against the wrong fleet repo). Skip all
+                # per-PR work with zero GitHub calls until the marker is
+                # cleared or the PR's linked-issue ref changes.
+                continue
             # Count every PR with a resolvable linked issue (includes skipped ones)
             open_tracked_prs += 1
-            pr_number = int(pr["number"])
             is_merge_head = merge_train_head is None or pr_number == merge_train_head
             # Per-PR isolation: one PR's merge conflict or gh failure must not
             # abort review/merge of every remaining PR in the batch.
@@ -7577,6 +7702,21 @@ class OrchestratorApp:
                                 pr_number, merge=merge, merge_train_head=merge_train_head
                             )
                             self._record_merge_or_error(merge_result, errors, merges)
+            except GitHubNotFoundError as exc:
+                # Permanent: the PR's claimed issue (or another object it
+                # references) does not exist in this repo. Park it durably and
+                # alert once instead of failing the pass every 5 minutes
+                # forever — retrying can never succeed.
+                if self._mark_foreign_issue_ref(pr_number, issue_number, str(exc)):
+                    foreign_transitions[pr_number] = {
+                        "adapter_kind": "unknown",
+                        "health": "FOREIGN_ISSUE_REF",
+                        "last_log_line": str(exc),
+                        "terminal_reason": (
+                            f"linked issue #{issue_number} not found in this repo; "
+                            f"PR #{pr_number} parked until the marker is cleared"
+                        ),
+                    }
             except GitHubError as exc:
                 errors.append({"pr": pr_number, "error": str(exc)})
         warnings: list[str] = []
@@ -7606,6 +7746,32 @@ class OrchestratorApp:
             )
             if digest:
                 emit_digest(self.config.notify, digest)
+
+        # One-shot alert for newly parked foreign PRs. Dedupe comes from the
+        # durable state marker (_mark_foreign_issue_ref returns True exactly
+        # once per (pr, issue) pair), so this digest is built directly rather
+        # than through the per-issue health-baseline machinery.
+        if foreign_transitions and self.config.notify.enabled:
+            emit_digest(
+                self.config.notify,
+                AttentionDigest(
+                    generated_at=utc_now(),
+                    repo=self.repo_root.name,
+                    transitions=tuple(
+                        AttentionEntry(
+                            issue_number=pr_num,
+                            adapter_kind=t["adapter_kind"],
+                            health=t["health"],
+                            previous_health=None,
+                            last_log_line=t["last_log_line"],
+                            pid=None,
+                            terminal_tool=None,
+                            terminal_reason=t["terminal_reason"],
+                        )
+                        for pr_num, t in foreign_transitions.items()
+                    ),
+                ),
+            )
 
         ok = (
             intake.ok and dispatch.ok and dispatch_rework.ok and dispatch_reviews.ok and not errors

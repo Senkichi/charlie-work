@@ -8647,6 +8647,370 @@ def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
     assert result.ok is False
 
 
+def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
+    """A PR whose branch-derived issue number does not exist in this repo
+    (e.g. opened against the wrong fleet repo) is parked via
+    ``foreign_issue_ref`` instead of failing the pass every 5 minutes
+    forever. GitHubNotFoundError from issue_view is caught before the
+    general GitHubError handler, so it never lands in result.data["errors"]
+    and does not flip result.ok to False."""
+    from charlie_work.config import NotifyConfig
+    from charlie_work.github import GitHubNotFoundError
+
+    class ForeignIssueGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+            self.prs = [
+                {
+                    "number": 789,
+                    "title": "Fix #4242: foreign",
+                    "url": "https://example.test/pull/789",
+                    "headRefName": "agent/issue-4242-x",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-789",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #4242",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+            self.issue_view_calls = 0
+
+        def issue_view(self, number: int):
+            if number == 4242:
+                self.issue_view_calls += 1
+                raise GitHubNotFoundError("could not resolve to a Issue with the number 4242.")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=False),
+        notify=NotifyConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ForeignIssueGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    assert result.data["errors"] == []
+    assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 1
+    assert captured[0].transitions[0].health == "FOREIGN_ISSUE_REF"
+    assert captured[0].transitions[0].issue_number == 789
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+
+    # Second pass: the durable marker skips all per-PR work with zero GitHub
+    # calls and no repeat digest.
+    result2 = app.loop(limit=0)
+
+    assert result2.ok is True
+    assert result2.data["open_tracked_prs"] == 0
+    assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 1
+
+
+def test_clear_reviewer_quota_drops_alerted_at() -> None:
+    """clear_reviewer_quota must also pop alerted_at so a later exhaustion
+    episode alerts again instead of staying silently suppressed."""
+    from charlie_work.state import (
+        clear_reviewer_quota,
+        mark_reviewer_quota_alerted,
+        set_reviewer_quota_exhausted,
+    )
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    state = mark_reviewer_quota_alerted(state)
+    assert "alerted_at" in state["reviewer_quota"]
+
+    cleared = clear_reviewer_quota(state)
+
+    assert "alerted_at" not in cleared["reviewer_quota"]
+    assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The first deferred pass of a quota-exhaustion episode emits one
+    REVIEWER_QUOTA_EXHAUSTED digest and persists reviewer_quota.alerted_at;
+    subsequent deferred passes in the same episode emit nothing."""
+    from charlie_work.config import NotifyConfig
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+        notify=NotifyConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {"throttled_until": future, "probe_after": future}
+        save_state(app.paths.state_file, state)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.data.get("deferred_reason") == "reviewer_quota_probe_backoff"
+    assert len(captured) == 1
+    assert captured[0].transitions[0].health == "REVIEWER_QUOTA_EXHAUSTED"
+    state_after = load_state(app.paths.state_file)
+    assert state_after["reviewer_quota"].get("alerted_at") is not None
+
+    # Second deferred pass in the same episode: no new digest.
+    result2 = app.dispatch_reviews()
+
+    assert result2.data.get("deferred_reason") == "reviewer_quota_probe_backoff"
+    assert len(captured) == 1
+
+
+def test_dispatch_reviews_launch_success_clears_stale_review_dispatch_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A successful launch must clear a stale review_dispatch_error left over
+    from an earlier failed attempt; otherwise the last error string is
+    carried forward verbatim by the **pr_state spread forever."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_error": "old boom",
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_error"] is None
+
+
+def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue observed 07-22: a dead reviewer sidecar for a PR already
+    lifecycle-reaped to merged/closed (review_dispatch_status None) must be
+    silently reaped -- no review_dispatch_stalled event, no rewrite to
+    failed. A second, non-terminal PR in the same pass still gets the normal
+    reap-to-failed treatment, proving the terminal skip is scoped to that PR
+    only."""
+    from charlie_work.state import empty_state
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "status": "merged",
+        "review_dispatch_status": None,
+    }
+    state["prs"]["200"] = {
+        "number": 200,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    def _sidecar(pr_number: int, started_at: str) -> dict[str, Any]:
+        return {
+            "issue_number": pr_number,
+            "branch": f"agent/issue-{pr_number}-fix",
+            "worktree_path": str(reviews_dir / f"pr-{pr_number}"),
+            "prompt_path": str(reviews_dir / f"pr-{pr_number}" / ".orchestrator-prompt.md"),
+            "command": ["claude", "-p"],
+            "pid": 999999999,
+            "started_at": started_at,
+            "log_path": str(reviews_dir / f"issue-{pr_number}.claude.log"),
+            "error": None,
+            "process_start_time": 1.0,
+            "adapter_kind": "claude-code",
+        }
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar_100 = reviews_dir / "issue-100.claude.json"
+    sidecar_100.write_text(json.dumps(_sidecar(100, old_started)), encoding="utf-8")
+    sidecar_200 = reviews_dir / "issue-200.claude.json"
+    sidecar_200.write_text(json.dumps(_sidecar(200, old_started)), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert not sidecar_100.exists()
+    assert not sidecar_200.exists()
+    assert [entry["pr"] for entry in stalled] == [200]
+
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["review_dispatch_status"] is None
+    assert state_after["prs"]["100"]["status"] == "merged"
+    assert state_after["prs"]["200"]["review_dispatch_status"] == "review_dispatch_failed"
+
+    stalled_events = [
+        e for e in state_after.get("events", []) if e.get("kind") == "review_dispatch_stalled"
+    ]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["payload"]["pr_number"] == 200
+
+
+def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue observed 07-22: reaping a merged PR's checkout without reaping
+    its dead reviewer sidecar left the sidecar to resurrect as a phantom
+    failed claim on every subsequent stalled sweep, which re-reaped it --
+    an infinite ping-pong. The orphan sweep must delete the sidecar, and a
+    following stalled-sweep pass must then see nothing to reap."""
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == [100]
+    assert not sidecar_path.exists()
+
+    # A following stalled-sweep pass sees nothing left to reap: the sidecar
+    # is gone (iter_workers yields no worker for PR 100) and the state's
+    # review_dispatch_status is already None -- the ping-pong is dead.
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert stalled == []
+    state_after = load_state(state_file)
+    assert not any(
+        e.get("kind") == "review_dispatch_stalled" for e in state_after.get("events", [])
+    )
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
