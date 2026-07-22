@@ -219,8 +219,10 @@ def test_launch_api_worker_force_enables_tee_stream_json(
     assert captured["adapter_kind"] == "api"
     assert captured["provider"] == "kimi-k3"
 
-    # events.jsonl path is derived alongside the sidecar.
-    assert (sessions_dir / "issue-7.events.jsonl").exists() or record.ok
+    # tee_stream_json=True opens issue-<n>.events.jsonl at launch time, so it
+    # must exist on disk (independent of whether the fake worker has written
+    # any stream-json events yet).
+    assert (sessions_dir / "issue-7.events.jsonl").exists()
 
 
 def test_launch_api_worker_injects_provider_env(
@@ -375,11 +377,15 @@ def test_launch_api_worker_missing_key_env_returns_error_record(
     assert "MOONSHOT_API_KEY" in record.error
     assert record.pid is None
     assert record.adapter_kind == "api"
+    # The provider was resolved before the key-env lookup failed, so the
+    # error record must carry the provider name (not "") for triage.
+    assert record.provider == "kimi-k3"
 
     sidecar_path = sessions_dir / "issue-13.api.json"
     assert sidecar_path.exists()
     payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert payload["error"] == record.error
+    assert payload["provider"] == "kimi-k3"
     # No key material leaked into the error message.
     assert "sk-test-key-value-1234" not in json.dumps(payload)
 
@@ -408,6 +414,9 @@ def test_launch_api_worker_disabled_config_returns_error_record(
     assert record.error is not None
     assert "enabled" in record.error
     assert record.pid is None
+    # The disabled-config path returns before the provider name is read, so
+    # the error record carries provider="" (no provider was resolved).
+    assert record.provider == ""
 
 
 def test_launch_api_worker_unknown_provider_returns_error_record(
@@ -442,6 +451,51 @@ def test_launch_api_worker_unknown_provider_returns_error_record(
     assert record.error is not None
     assert "nonexistent-provider" in record.error
     assert record.pid is None
+    # The configured provider name is known even though it was not in the
+    # registry; the error record carries it for triage.
+    assert record.provider == "nonexistent-provider"
+
+
+def test_launch_api_worker_launch_exception_returns_error_record_with_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If launch_claude_worker raises (it never should, but the except clause
+    guards against regressions in this module's own plumbing), the exception is
+    caught and an error record is returned with the resolved provider name
+    carried through (errors as values; never raises)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    def raising_launch(*args, **kwargs):
+        raise RuntimeError("plumbing exploded")
+
+    monkeypatch.setattr(api_worker, "launch_claude_worker", raising_launch)
+
+    record = launch_api_worker(
+        16,
+        "agent/issue-16-x",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "plumbing exploded" in record.error
+    assert record.pid is None
+    assert record.adapter_kind == "api"
+    # The provider was resolved before the launch call, so the error record
+    # carries it for triage.
+    assert record.provider == "kimi-k3"
+    # No key material leaked into the error record/sidecar.
+    sidecar_path = sessions_dir / "issue-16.api.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert "sk-test-key-value-1234" not in json.dumps(payload)
 
 
 def test_launch_api_worker_delegates_to_claude_code_launch(

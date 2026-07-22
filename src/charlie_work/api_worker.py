@@ -123,6 +123,10 @@ def launch_api_worker(
                 f"api_worker.provider {provider_name!r} is not in "
                 f"api_worker.providers; cannot launch api worker"
             ),
+            # The configured provider name is known even though resolution
+            # failed; carry it so the sidecar/record identify which provider
+            # was attempted (useful for triage without leaking key material).
+            provider=provider_name,
         )
 
     # Resolve the auth token from the named env var. The key VALUE never enters
@@ -139,6 +143,7 @@ def launch_api_worker(
                 f"provider {provider_name!r}) is not set or empty; cannot launch "
                 f"api worker"
             ),
+            provider=provider_name,
         )
 
     provider_env = _provider_env(provider.base_url, auth_token, provider.model)
@@ -181,6 +186,7 @@ def launch_api_worker(
             branch,
             sessions_dir,
             error=f"api worker launch failed: {exc}",
+            provider=provider_name,
         )
 
 
@@ -190,12 +196,16 @@ def _error_record(
     sessions_dir: Path,
     *,
     error: str,
+    provider: str = "",
 ) -> ClaudeWorkerRecord:
     """Write an error sidecar (issue-<n>.api.json) and return the record.
 
     Mirrors claude_code._error_record's never-raise + atomic-write contract.
     The sidecar carries no key material: only the error string, which is
-    constructed from the env var NAME (never the value) and provider name.
+    constructed from the env var NAME (never the value) and the provider name.
+    ``provider`` is the configured provider name when known (carried through so
+    the sidecar/record identify which provider was attempted); empty for the
+    disabled-config path where no provider was resolved.
     """
     from .claude_code import _error_record as _claude_error_record
 
@@ -208,7 +218,7 @@ def _error_record(
         log_path=str(sessions_dir / f"issue-{issue_number}.claude.log"),
         error=error,
         adapter_kind="api",
-        provider="",
+        provider=provider,
     )
     # Write the sidecar atomically via the shared claude_code helper so the
     # error is durable even when the failure happened before launch_claude_worker
