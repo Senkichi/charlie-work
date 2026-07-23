@@ -18,7 +18,7 @@ from .adapters import (
     SessionRequest,
     dispatch_sessions,
 )
-from .claude_code import launch_claude_worker
+from .claude_code import _events_path, launch_claude_worker, parse_claude_events
 from .checks import CheckSummary, summarize_checks
 from .config import (
     AutoMergeConfig,
@@ -80,6 +80,7 @@ from .worktree import (
 )
 from .state import (
     StateLockBusy,
+    _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
     clear_reviewer_quota,
     is_claim_stale,
@@ -104,6 +105,100 @@ from .instrumentation import correlation_context, log_event, record_loop_pass
 from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
+
+
+def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
+    """Return (total_lines, per_file_stats) from a unified diff.
+
+    ``per_file_stats`` is a list of ``(filename, added, deleted)`` tuples.
+    ``total_lines`` counts content lines (not diff headers/meta lines).
+    """
+    files: list[tuple[str, int, int]] = []
+    current_file = ""
+    added = 0
+    deleted = 0
+    total = 0
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            if current_file:
+                files.append((current_file, added, deleted))
+            current_file = ""
+            added = 0
+            deleted = 0
+        elif line.startswith("+++ "):
+            current_file = line[4:].strip()
+            if current_file == "/dev/null":
+                current_file = ""
+        elif line.startswith("--- "):
+            # Use the source file if the dest is /dev/null (deletion)
+            if not current_file:
+                current_file = line[4:].strip()
+                if current_file == "/dev/null":
+                    current_file = ""
+        elif line.startswith("+") and not line.startswith("+++"):
+            added += 1
+            total += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deleted += 1
+            total += 1
+    if current_file:
+        files.append((current_file, added, deleted))
+    return total, files
+
+
+def _diff_size_section(diff: str, threshold: int, diff_path: Path) -> str:
+    """Return a prompt section warning about large diffs, or empty string.
+
+    When the diff exceeds ``threshold`` content lines, this returns a Markdown
+    section with a per-file summary and instructions to read the diff
+    file-by-file rather than in one shot. When the diff is small or the
+    threshold is 0, returns an empty string.
+    """
+    if threshold <= 0:
+        return ""
+    total, files = _diff_file_summary(diff)
+    if total <= threshold:
+        return ""
+    lines = [
+        "",
+        "## Large diff guidance",
+        "",
+        f"This diff has {total} changed lines across {len(files)} file(s). "
+        f"Do **not** read the entire diff in one pass — it will waste your "
+        f"token budget. Instead, read `$diff_path` file-by-file, starting "
+        f"with the files that have the most changes.",
+        "",
+        "| File | + | - |",
+        "|------|---|---|",
+    ]
+    for name, add, dele in sorted(files, key=lambda x: x[1] + x[2], reverse=True):
+        lines.append(f"| `{name}` | +{add} | -{dele} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# Fields the reviewer actually needs from pr.json. Excludes large fields that
+# bloat the reviewer's context without aiding the review: ``comments`` (can be
+# huge on active PRs), ``statusCheckRollup`` (separate checks.json is written),
+# and ``createdAt``/``updatedAt`` (not used by the review rubric).
+_PR_SLIM_FIELDS: frozenset[str] = frozenset({
+    "number", "title", "url", "body", "headRefOid", "baseRefName",
+    "headRefName", "isDraft", "state", "labels", "author",
+    "additions", "deletions", "mergeable", "mergeStateStatus",
+    "isCrossRepository", "reviewDecision",
+})
+
+
+def _slim_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``pr`` with only the fields the reviewer needs.
+
+    Strips ``comments``, ``statusCheckRollup``, ``createdAt``, ``updatedAt``
+    and other large fields that inflate the reviewer's token budget without
+    aiding the review. The full PR data is not needed by the reviewer prompt
+    (which references the file path, not inline content), and the reviewer
+    reads the diff from ``diff.patch`` and checks from ``checks.json``.
+    """
+    return {k: v for k, v in pr.items() if k in _PR_SLIM_FIELDS}
 
 
 @dataclass(frozen=True)
@@ -971,7 +1066,8 @@ def _apply_local_review_cap(
 
 
 def _is_review_dispatchable(
-    state: dict[str, Any], pr_number: int, candidate: dict[str, Any]
+    state: dict[str, Any], pr_number: int, candidate: dict[str, Any],
+    *, max_attempts: int = 3,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -980,6 +1076,7 @@ def _is_review_dispatchable(
     - A prior claim is terminal (completed or stale-failed) and the stale timeout
       has elapsed, allowing retry.
     - A dispatched reviewer is no longer alive and its claim has gone stale.
+    - The per-PR dispatch attempt count has not reached ``max_attempts``.
 
     This reuses ``is_claim_stale`` for the timeout and ``_reviewer_pid_alive``
     for liveness, avoiding a parallel mechanism.
@@ -987,22 +1084,36 @@ def _is_review_dispatchable(
     pr_state = state["prs"].get(str(pr_number), {})
     status = pr_state.get("review_dispatch_status")
 
+    # Per-PR dispatch attempt cap: a PR that has been dispatched max_attempts
+    # times without producing a verdict is stuck (e.g. every reviewer hits the
+    # session limit). Escalation is handled by the caller; here we just block
+    # further dispatch.
+    attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+    if attempt_count >= max_attempts:
+        return False
+
     if status is None or status == "review_dispatch_completed":
         return True
 
     if status == "review_dispatch_pending":
         pending_at = pr_state.get("review_dispatch_pending_at")
-        return pending_at is None or is_claim_stale(pending_at)
+        return pending_at is None or is_claim_stale(
+            pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+        )
 
     if status == "review_dispatch_dispatched":
         if _reviewer_pid_alive(pr_state):
             return False
         dispatched_at = pr_state.get("review_dispatched_at")
-        return dispatched_at is None or is_claim_stale(dispatched_at)
+        return dispatched_at is None or is_claim_stale(
+            dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+        )
 
     if status == "review_dispatch_failed":
         failed_at = pr_state.get("review_dispatch_failed_at")
-        return failed_at is None or is_claim_stale(failed_at)
+        return failed_at is None or is_claim_stale(
+            failed_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+        )
 
     # Unknown status: treat as free so we don't silently orphan PRs.
     return True
@@ -1069,6 +1180,215 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
         }
 
     return None
+
+
+def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
+    """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
+
+    Fallback for when ``_parse_review_verdict_from_log`` fails: the plaintext
+    log may be truncated or the verdict block may be split across tee buffer
+    boundaries, but the structured stream-json events.jsonl contains the
+    assistant's message text in discrete JSONL lines. This scans
+    ``assistant_message`` events for the same fenced JSON verdict block.
+
+    Returns the parsed dict on success, or ``None`` if no valid block is found.
+    """
+    if not events_path.exists():
+        return None
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    # Scan in reverse: the verdict is in the final assistant message.
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "assistant_message":
+            continue
+
+        # The content may be a string or a list of content blocks.
+        content = event.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text += str(block.get("text", ""))
+        elif isinstance(content, dict):
+            text = str(content.get("text", ""))
+
+        if not text:
+            continue
+
+        # Reuse the same fenced-JSON extraction logic.
+        matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL))
+        if not matches:
+            continue
+
+        for match in reversed(matches):
+            candidate = match.group(1).strip()
+            if not candidate:
+                continue
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            decision = data.get("decision")
+            if decision not in {"approved", "request_changes", "blocked"}:
+                continue
+
+            summary = data.get("summary")
+            if not isinstance(summary, str):
+                continue
+            if decision in {"request_changes", "blocked"} and not summary.strip():
+                continue
+
+            required_changes = data.get("required_changes")
+            if required_changes is not None and not isinstance(required_changes, list):
+                continue
+            if required_changes is not None and not all(
+                isinstance(item, str) for item in required_changes
+            ):
+                continue
+
+            return {
+                "decision": decision,
+                "summary": summary,
+                "required_changes": required_changes if required_changes is not None else [],
+            }
+
+    return None
+
+
+def _extract_review_session_summary(
+    events_path: Path,
+    log_path: Path,
+    max_turns: int,
+) -> str | None:
+    """Extract a markdown summary of a reviewer session that produced no verdict.
+
+    When a reviewer hits the ``--max-turns`` limit (or dies for any other
+    reason after doing substantial work), the structured verdict block is
+    missing but the events.jsonl contains the assistant's analysis text and
+    tool-call metrics. This function reconstructs a human-readable summary
+    from those events so the work is not silently lost.
+
+    Returns a markdown string suitable for a PR comment, or ``None`` if the
+    events file is missing or contains no assistant messages (nothing to
+    summarize).
+    """
+    progress = parse_claude_events(events_path)
+    # Also try the plaintext log as a fallback for assistant text.
+    assistant_texts: list[str] = []
+
+    if events_path.exists():
+        try:
+            with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") != "assistant_message":
+                        continue
+                    content = event.get("content")
+                    text = ""
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text += str(block.get("text", ""))
+                    elif isinstance(content, dict):
+                        text = str(content.get("text", ""))
+                    if text.strip():
+                        assistant_texts.append(text.strip())
+        except OSError:
+            pass
+
+    # Fallback: if no events.jsonl, try extracting non-verdict text from the
+    # plaintext log. This is less structured but still preserves the reviewer's
+    # analysis for the human.
+    if not assistant_texts:
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = ""
+        # Strip fenced code blocks (those are verdict attempts, not analysis)
+        # and keep the remaining prose lines.
+        stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+        for line in stripped.splitlines():
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith((">", "#", "-")):
+                assistant_texts.append(stripped_line)
+
+    if not assistant_texts:
+        return None
+
+    turn_count = progress.turn_count if progress else 0
+    tool_call_count = progress.tool_call_count if progress else 0
+    tokens = progress.tokens if progress else None
+    cost_usd = progress.cost_usd if progress else None
+
+    parts: list[str] = [
+        "## Reviewer session summary (no verdict produced)\n",
+    ]
+    if max_turns > 0 and turn_count >= max_turns:
+        parts.append(
+            f"The automated reviewer hit the {max_turns}-turn limit before "
+            f"producing a structured verdict.\n"
+        )
+    elif turn_count > 0:
+        parts.append(
+            f"The automated reviewer ran for {turn_count} turns "
+            f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
+        )
+    else:
+        parts.append(
+            "The automated reviewer did not produce a structured verdict.\n"
+        )
+
+    # Include the last few assistant messages — earlier turns are usually
+    # tool-use planning; the final messages contain the analysis.
+    recent = assistant_texts[-3:]
+    parts.append("\n### Recent analysis from the reviewer:\n")
+    for text in recent:
+        if len(text) > 2000:
+            text = text[:2000] + "\n... (truncated)"
+        parts.append(text)
+        parts.append("\n---\n")
+
+    meta_parts: list[str] = []
+    if turn_count:
+        meta_parts.append(f"turns: {turn_count}")
+    if tool_call_count:
+        meta_parts.append(f"tool calls: {tool_call_count}")
+    if tokens is not None:
+        meta_parts.append(f"tokens: {tokens:,}")
+    if cost_usd is not None:
+        meta_parts.append(f"cost: ${cost_usd:.4f}")
+    if meta_parts:
+        parts.append(f"\n*{' · '.join(meta_parts)}*")
+
+    return "\n".join(parts)
 
 
 def _remove_review_checkout_with_warning(
@@ -1163,7 +1483,7 @@ def _detect_and_handle_stalled_reviews(
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
         # launch path is flaky). Old dead reviewers become re-dispatchable.
-        if not is_claim_stale(w.started_at):
+        if not is_claim_stale(w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
             continue
 
         seen_pr_keys.add(pr_key)
@@ -1290,7 +1610,7 @@ def _detect_and_handle_stalled_reviews(
         status = pr_state.get("review_dispatch_status")
         if status == "review_dispatch_pending":
             pending_at = pr_state.get("review_dispatch_pending_at")
-            if pending_at and is_claim_stale(pending_at):
+            if pending_at and is_claim_stale(pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
                 state["prs"][pr_key] = {
                     **pr_state,
                     "review_dispatch_status": "review_dispatch_failed",
@@ -1327,7 +1647,7 @@ def _detect_and_handle_stalled_reviews(
             if pid_alive:
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
-            if dispatched_at and is_claim_stale(dispatched_at):
+            if dispatched_at and is_claim_stale(dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
                 state["prs"][pr_key] = {
                     **pr_state,
                     "review_dispatch_status": "review_dispatch_failed",
@@ -1391,7 +1711,7 @@ def _detect_and_handle_stalled_reviews(
                 .isoformat()
                 .replace("+00:00", "Z")
             )
-            if not is_claim_stale(packet_age):
+            if not is_claim_stale(packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
                 continue
 
             state["prs"][pr_key] = {
@@ -5101,7 +5421,7 @@ class OrchestratorApp:
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
-        self._write_json(pr_dir / "pr.json", pr)
+        self._write_json(pr_dir / "pr.json", _slim_pr_json(pr))
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
@@ -5148,6 +5468,9 @@ class OrchestratorApp:
             enabled=cross_family,
         )
         prompt_path = pr_dir / "review-prompt.md"
+        diff_size_section = _diff_size_section(
+            diff, self.config.review_dispatch.diff_line_threshold, diff_path
+        )
         prompt = self._render(
             "review.md",
             {
@@ -5163,6 +5486,7 @@ class OrchestratorApp:
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
+                "diff_size_section": diff_size_section,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -5178,11 +5502,16 @@ class OrchestratorApp:
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
         else:
-            # An approval is pinned to a specific head. If the PR has moved on,
+            # A verdict is pinned to a specific head. If the PR has moved on,
             # the old verdict is void and must not survive into the new packet.
+            # This applies to all terminal decisions (approved, request_changes,
+            # blocked), not just approvals: a request_changes on an old head is
+            # equally stale when the head has advanced, and carrying forward its
+            # summary/required_changes misleads the reviewer into re-issuing the
+            # same verdict without examining the new diff.
             existing_decision = self._review_decision(pr_number)
             reviewed_head_sha = existing_decision.get("reviewed_head_sha")
-            if existing_decision.get("decision") == "approved" and (
+            if existing_decision.get("decision") not in ("pending", None) and (
                 reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
@@ -5200,11 +5529,15 @@ class OrchestratorApp:
                 "decision_path": str(decision_path),
                 "status": "reviewing",
                 "janitor_ok": True,
+                "janitor_failures": [],
                 "janitor_warnings": list(merged_warnings),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
                 "consecutive_failed_merge_attempts": 0,
                 "check_rerun_attempts": verdict.check_rerun_attempts,
+                # New packet for a (possibly) new head: reset the dispatch
+                # attempt counter so the fresh review cycle starts clean.
+                "review_dispatch_attempt_count": 0,
             }
             if issue_number is not None:
                 _issue_key = str(issue_number)
@@ -5472,6 +5805,44 @@ class OrchestratorApp:
 
             verdict = _parse_review_verdict_from_log(Path(w.log_path))
             if verdict is None:
+                # Fallback: parse the structured events.jsonl. The plaintext log
+                # may be truncated or the verdict block split across tee buffer
+                # boundaries, but the stream-json events contain the assistant's
+                # message text in discrete JSONL lines.
+                events_path = _events_path(reviews_dir, pr_number, review=True)
+                verdict = _parse_review_verdict_from_events(events_path)
+            if verdict is None:
+                # No structured verdict found. Before discarding this reviewer's
+                # work, check if it did substantial analysis (e.g. hit the
+                # --max-turns limit) and post a summary PR comment so the work
+                # is not silently lost. Only post once per dispatch lifecycle.
+                pr_state_dict = pr_state
+                if not pr_state_dict.get("review_turn_limit_summary_posted"):
+                    events_path = _events_path(reviews_dir, pr_number, review=True)
+                    max_turns = self.config.review_dispatch.review_max_turns
+                    summary_text = _extract_review_session_summary(
+                        events_path, Path(w.log_path), max_turns
+                    )
+                    if summary_text is not None:
+                        try:
+                            self._comment_pr(pr_number, summary_text)
+                        except Exception:
+                            pass
+                        with state_lock(self.paths.state_file):
+                            state = load_state(self.paths.state_file)
+                            ps = state["prs"].get(str(pr_number), {})
+                            state["prs"][str(pr_number)] = {
+                                **ps,
+                                "review_turn_limit_summary_posted": True,
+                            }
+                            save_state(self.paths.state_file, state)
+                        missed.append(
+                            {
+                                "pr": pr_number,
+                                "issue": issue_number,
+                                "reason": "turn_limit_summary_posted",
+                            }
+                        )
                 continue
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
@@ -5615,6 +5986,22 @@ class OrchestratorApp:
                 self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
             )
 
+        # Clear the reviewer quota if any verdicts were recorded from dead
+        # reviewers. This is the only proof the quota window is actually open:
+        # a process that merely *started* can still die seconds later from an
+        # asynchronous session-limit kill. Moved here (before the queue check)
+        # so the quota is cleared even when the reaped PR was the only candidate
+        # and the queue is now empty — otherwise the early return at "no
+        # candidates" would skip the quota clearing and leave the fleet wedged.
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+        if not self.dry_run and recorded_verdicts:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                if is_reviewer_quota_exhausted(state):
+                    state = clear_reviewer_quota(state)
+                    save_state(self.paths.state_file, state)
+
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
         if not candidates:
@@ -5626,13 +6013,62 @@ class OrchestratorApp:
                     "attempted_count": 0,
                     "failed_count": 0,
                     "launched_count": 0,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
                 },
             )
 
         # Filter out PRs that are already claimed or still have a live reviewer.
+        # Also escalate PRs that have exhausted their dispatch attempt budget.
+        max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            dispatchable = [c for c in candidates if _is_review_dispatchable(state, c["pr"], c)]
+            # Escalate PRs whose dispatch attempt count has reached the cap.
+            # These PRs are stuck (every reviewer died without a verdict) and
+            # must not be re-dispatched indefinitely. Mark them escalated so a
+            # human can intervene, mirroring the rework-cycle escalation pattern.
+            changed = False
+            for c in candidates:
+                pr_key = str(c["pr"])
+                pr_state = state["prs"].get(pr_key, {})
+                attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
+                    issue_num = pr_state.get("issue_number") or c.get("issue")
+                    state["prs"][pr_key] = {
+                        **pr_state,
+                        "status": "escalated",
+                        "review_dispatch_status": "review_dispatch_failed",
+                        "review_dispatch_failed_at": utc_now(),
+                        "review_dispatch_pending_at": None,
+                        "review_dispatched_at": None,
+                        "reviewer_pid": None,
+                        "reviewer_process_start_time": None,
+                    }
+                    if issue_num is not None:
+                        state["issues"][str(issue_num)] = {
+                            **state["issues"].get(str(issue_num), {}),
+                            "number": issue_num,
+                            "status": "escalated",
+                            "merge_alert": "OK",
+                        }
+                    state = append_event(
+                        state,
+                        "review_dispatch_escalated",
+                        {
+                            "pr_number": c["pr"],
+                            "issue_number": issue_num,
+                            "attempt_count": attempt_count,
+                            "reason": "max_review_dispatch_attempts_exceeded",
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    changed = True
+            if changed:
+                save_state(self.paths.state_file, state)
+            dispatchable = [
+                c for c in candidates
+                if _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
+            ]
 
         # Apply the local and provider-token caps. 0 means unlimited for both.
         max_local = self.config.review_dispatch.max_local_review_processes
@@ -5673,6 +6109,7 @@ class OrchestratorApp:
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
+                attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -5683,6 +6120,8 @@ class OrchestratorApp:
                     "review_dispatch_failed_at": None,
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
+                    "review_dispatch_attempt_count": attempt_count + 1,
+                    "review_turn_limit_summary_posted": False,
                 }
             if selected:
                 state = append_event(
@@ -5757,9 +6196,13 @@ class OrchestratorApp:
                     "materialize_dirs": self.config.dispatch.materialize_dirs,
                     "review": True,
                     "head_sha": head_sha,
+                    # Force-enabled for reviewers: the structured events.jsonl
+                    # is needed for verdict fallback parsing (issue #540) and
+                    # token/turn monitoring. Unlike workers, reviewers always
+                    # benefit from the structured output because their verdict
+                    # extraction depends on it.
+                    "tee_stream_json": True,
                 }
-                if claude_cfg.tee_stream_json:
-                    launch_kwargs["tee_stream_json"] = True
 
                 record = launch_claude_worker(
                     issue_number=pr_number,
@@ -5868,9 +6311,6 @@ class OrchestratorApp:
                     throttled_until=throttled_until,
                     probe_after=probe_after,
                 )
-            elif is_reviewer_quota_exhausted(state):
-                # A successful probe cleared the way — clear global quota.
-                state = clear_reviewer_quota(state)
 
             state = append_event(
                 state,
@@ -5885,8 +6325,6 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
 
         ok = not failed and not quota_hit
-        recorded_verdicts = verdict_result.get("recorded", [])
-        missed_verdicts = verdict_result.get("missed", [])
 
         message = f"review dispatch: {len(launched)} launched, {len(failed)} failed"
         if recorded_verdicts or missed_verdicts:
@@ -6094,6 +6532,10 @@ class OrchestratorApp:
                 "review_dispatch_status": "review_dispatch_completed",
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
+                # Reset the dispatch attempt counter: a verdict was produced, so
+                # the PR is not stuck. If the head later advances and triggers a
+                # new review cycle, the counter starts fresh.
+                "review_dispatch_attempt_count": 0,
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue

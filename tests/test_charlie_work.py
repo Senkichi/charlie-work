@@ -7034,7 +7034,13 @@ def test_dispatch_reviews_defers_when_reviewer_quota_exhausted(tmp_path: Path) -
 
 
 def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_path: Path) -> None:
-    """A successful reviewer launch while in probe mode clears the global reviewer quota."""
+    """A successful reviewer verdict from a probe clears the global reviewer quota.
+
+    Fix 1.1: the quota is cleared only when a verdict is actually recorded from
+    a dead reviewer, not when a probe process merely starts. A session-limited
+    reviewer starts successfully but dies seconds later — clearing on start
+    caused a hot redispatch loop.
+    """
     from datetime import UTC, datetime, timedelta
 
     prs = [
@@ -7062,7 +7068,51 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
             "throttled_until": future_throttle,
             "probe_after": past_probe,
         }
+        # Simulate a prior dispatched reviewer that has died with a verdict in
+        # its log — _reap_review_verdicts will record this verdict before the
+        # dispatch pass, and the recorded verdict is what clears the quota.
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
         save_state(app.paths.state_file, state)
+
+    # Write a sidecar + log with a verdict so _reap_review_verdicts finds it.
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        'Review complete.\n```json\n{"decision": "approved", "summary": "LGTM"}\n```',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(
         "charlie_work.workflow.launch_claude_worker",
@@ -7075,9 +7125,202 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
     result = app.dispatch_reviews()
     state = load_state(app.paths.state_file)
 
-    assert result.data["launched_count"] == 1
-    assert result.data.get("quota_hit") is False
+    # The verdict was recorded, which clears the quota. The reaped PR is now
+    # completed, so the queue is empty and dispatch returns early — but the
+    # quota clearing happens before the queue check (fix 1.1).
     assert state.get("reviewer_quota", {}).get("throttled_until") is None
+
+
+def test_dispatch_reviews_turn_limit_posts_summary_comment(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """When a reviewer dies without a verdict but has analysis in events.jsonl,
+    a summary PR comment is posted so the work is not lost."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
+        save_state(app.paths.state_file, state)
+
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a log with NO verdict block (simulates turn-limit exhaustion).
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "I reviewed the diff and checked the tests.\n"
+        "The changes look reasonable but I need more turns to verify.\n",
+        encoding="utf-8",
+    )
+
+    # Write events.jsonl with assistant messages and turn metrics.
+    events_path = reviews_dir / "issue-100-review.events.jsonl"
+    events_lines = [
+        '{"type": "user_message", "tokens": 100}',
+        '{"type": "assistant_message", "content": "Let me read the diff first.", "tokens": 200}',
+        '{"type": "tool_call", "tokens": 300}',
+        '{"type": "assistant_message", "content": "The changes look reasonable but I need more turns to verify the edge cases.", "tokens": 400}',
+        '{"type": "assistant_message", "content": "I was unable to complete the review within the turn limit.", "tokens": 500}',
+    ]
+    events_path.write_text("\n".join(events_lines) + "\n", encoding="utf-8")
+
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Capture PR comments.
+    captured_comments: list[tuple[int, str]] = []
+
+    class _CapturingGitHub(type(app.gh)):  # type: ignore[misc]
+        def pr_comment(self, number: int, body_file: Path) -> None:
+            captured_comments.append((number, body_file.read_text(encoding="utf-8")))
+
+    app.gh = _CapturingGitHub()
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    # A summary comment should have been posted.
+    assert len(captured_comments) == 1
+    assert captured_comments[0][0] == 100
+    comment_body = captured_comments[0][1]
+    assert "no verdict produced" in comment_body
+    assert "Recent analysis" in comment_body
+
+    # The state flag should be set to prevent duplicate comments.
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
+
+    # The missed list should include the turn_limit_summary_posted reason.
+    missed = result.data.get("missed_verdicts", [])
+    assert any(m.get("reason") == "turn_limit_summary_posted" for m in missed)
+
+
+def test_dispatch_reviews_turn_limit_summary_not_posted_twice(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The turn-limit summary is only posted once per dispatch lifecycle."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+            "review_turn_limit_summary_posted": True,
+        }
+        save_state(app.paths.state_file, state)
+
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text("Some analysis without a verdict.\n", encoding="utf-8")
+    events_path = reviews_dir / "issue-100-review.events.jsonl"
+    events_path.write_text(
+        '{"type": "assistant_message", "content": "Some analysis.", "tokens": 100}\n',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured_comments: list[tuple[int, str]] = []
+
+    class _CapturingGitHub(type(app.gh)):  # type: ignore[misc]
+        def pr_comment(self, number: int, body_file: Path) -> None:
+            captured_comments.append((number, body_file.read_text(encoding="utf-8")))
+
+    app.gh = _CapturingGitHub()
+
+    app.dispatch_reviews()
+
+    # No comment should be posted — the flag was already set.
+    assert len(captured_comments) == 0
 
 
 def test_dispatch_reviews_probe_failure_sets_reviewer_quota_and_rolls_back(
@@ -27768,7 +28011,10 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
 
     reap = app._reap_review_verdicts(reviews_dir)
     assert reap["recorded"] == []
-    assert reap["missed"] == []
+    # The reviewer had prose in its log (no verdict), so a turn-limit summary
+    # comment is posted and the miss is recorded with that reason.
+    assert len(reap["missed"]) == 1
+    assert reap["missed"][0]["reason"] == "turn_limit_summary_posted"
 
     # State should still be dispatched (reaper does not mark failed) and
     # _detect_and_handle_stalled_reviews should then move it to failed.

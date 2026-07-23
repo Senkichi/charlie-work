@@ -238,6 +238,25 @@ class ReviewDispatchConfig:
     # launch hits the wall, the global reviewer quota is held exhausted for at
     # least this long while probes run every ``quota_probe_interval_minutes``.
     quota_reset_hours: int = 5
+    # Maximum reviewer dispatch attempts per PR before escalating to a human.
+    # A dispatch attempt is counted each time a reviewer is launched; the
+    # counter resets when a verdict is recorded or a new packet is generated
+    # for an advanced head. Without this cap, a PR that never produces a
+    # verdict (e.g. every reviewer hits the session limit) is re-dispatched
+    # indefinitely, burning quota every stale-claim interval.
+    max_review_dispatch_attempts: int = 3
+    # Maximum agentic turns for a reviewer session. Caps token spend per
+    # review by limiting how many tool-call round-trips the reviewer can make.
+    # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
+    # a review (read diff, read tests, read a few source files, write verdict)
+    # but prevents unbounded codebase exploration.
+    review_max_turns: int = 40
+    # Diff line count above which the review prompt includes a diff-size
+    # warning and a per-file summary instead of encouraging the reviewer to
+    # read the entire diff in one shot. 0 disables the threshold (always
+    # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
+    # single-read budget; beyond that the reviewer should read file-by-file.
+    diff_line_threshold: int = 500
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1101,39 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
             f"got {rd_max_local}"
+        )
+    rd_max_attempts = review_dispatch_data.get("max_review_dispatch_attempts")
+    if rd_max_attempts is not None and (isinstance(rd_max_attempts, bool) or not isinstance(rd_max_attempts, int)):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be an int, "
+            f"got {type(rd_max_attempts).__name__}"
+        )
+    if rd_max_attempts is not None and rd_max_attempts < 1:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
+            f"got {rd_max_attempts}"
+        )
+    rd_max_turns = review_dispatch_data.get("review_max_turns")
+    if rd_max_turns is not None and (isinstance(rd_max_turns, bool) or not isinstance(rd_max_turns, int)):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_max_turns' must be an int, "
+            f"got {type(rd_max_turns).__name__}"
+        )
+    if rd_max_turns is not None and rd_max_turns < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_max_turns' must be >= 0, "
+            f"got {rd_max_turns}"
+        )
+    rd_diff_threshold = review_dispatch_data.get("diff_line_threshold")
+    if rd_diff_threshold is not None and (isinstance(rd_diff_threshold, bool) or not isinstance(rd_diff_threshold, int)):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'diff_line_threshold' must be an int, "
+            f"got {type(rd_diff_threshold).__name__}"
+        )
+    if rd_diff_threshold is not None and rd_diff_threshold < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
+            f"got {rd_diff_threshold}"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")

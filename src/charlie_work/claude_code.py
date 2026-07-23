@@ -188,6 +188,26 @@ def _log_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def _rotate_old_log(log_path: Path) -> None:
+    """Rename an existing log file to ``.1`` before a new launch overwrites it.
+
+    Preserves the previous session's log for post-mortem analysis when a
+    re-dispatch overwrites the same deterministic log path. Best-effort:
+    OSError is swallowed (the old log may not exist on a first dispatch, or
+    may be locked on Windows). Only one generation is kept (``.1``); an
+    existing ``.1`` file is removed first.
+    """
+    if not log_path.exists():
+        return
+    rotated = log_path.with_suffix(log_path.suffix + ".1")
+    try:
+        if rotated.exists():
+            rotated.unlink(missing_ok=True)
+        log_path.rename(rotated)
+    except OSError:
+        pass
+
+
 def _read_sidecar_inconclusive_count(
     sessions_dir: Path, issue_number: int, adapter_kind: str = "claude-code"
 ) -> int:
@@ -532,6 +552,31 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
     return tuple(filtered) + ("--effort", effort)
 
 
+def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> tuple[str, ...]:
+    """Hard-pin ``--max-turns {max_turns}`` onto ``command_template``.
+
+    Mirrors ``_apply_model_pin``: strips any existing ``--max-turns`` flag
+    (both space-separated and ``=``-joined forms) and appends a single
+    authoritative pin. A ``max_turns`` of 0 or less is a no-op — the CLI
+    uses its default (unlimited).
+    """
+    if max_turns <= 0:
+        return command_template
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--max-turns":
+            skip_next = True
+            continue
+        if token.startswith("--max-turns="):
+            continue
+        filtered.append(token)
+    return tuple(filtered) + ("--max-turns", str(max_turns))
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -615,6 +660,13 @@ def launch_claude_worker(
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
+    # Rotate the previous session's log before the new launch overwrites it.
+    # This preserves the old log for post-mortem analysis on re-dispatch.
+    _rotate_old_log(log_path)
+    # Also rotate the previous events.jsonl if it exists.
+    if tee_stream_json:
+        _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
+        _rotate_old_log(_events_path_old)
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
@@ -638,6 +690,12 @@ def launch_claude_worker(
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
     command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
+    if review:
+        # Cap agentic turns for reviewer sessions to prevent unbounded
+        # codebase exploration and runaway token spend. 0 = unlimited.
+        command_template = _apply_max_turns_pin(
+            command_template, resolved_config.review_dispatch.review_max_turns
+        )
 
     try:
         if review:

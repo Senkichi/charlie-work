@@ -25,6 +25,14 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
+# Reviewer-specific stale claim timeout (minutes). Session-limit kills are
+# detectable within seconds (the reviewer dies and prints the limit message to
+# its log), so the 30-minute worker timeout is far too long for review
+# dispatches: it extends the hot-redispatch loop cycle unnecessarily. 5
+# minutes is ample for a reviewer that started successfully but died from a
+# throttle, while still avoiding thrash on flaky launch paths.
+_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,10 +151,12 @@ def _canonical_started_at(started_at: Any, process_start_time: Any | None = None
     )
 
 
-def is_claim_stale(claim_timestamp: str | None) -> bool:
+def is_claim_stale(
+    claim_timestamp: str | None, *, timeout_minutes: int = _STALE_CLAIM_TIMEOUT_MINUTES
+) -> bool:
     """Check if a dispatch_pending claim is stale and should be re-dispatchable.
 
-    A claim is stale if it's older than _STALE_CLAIM_TIMEOUT_MINUTES.
+    A claim is stale if it's older than ``timeout_minutes``.
     This prevents crashed phase-2 processes from wedging issues permanently.
     """
     if not claim_timestamp:
@@ -154,7 +164,7 @@ def is_claim_stale(claim_timestamp: str | None) -> bool:
     try:
         claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
         age = datetime.now(UTC) - claim_time
-        return age > timedelta(minutes=_STALE_CLAIM_TIMEOUT_MINUTES)
+        return age > timedelta(minutes=timeout_minutes)
     except (ValueError, TypeError):
         # Malformed timestamp — treat as stale to be safe
         return True
