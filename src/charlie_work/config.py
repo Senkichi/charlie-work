@@ -261,6 +261,11 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum minutes after the PR's last update (updatedAt) to wait for any
+    # required check run to appear before routing an approved PR to readiness
+    # rework. This catches invisible CI-never-started stalls (mergeStateStatus
+    # DIRTY or a missing CI trigger). 0 disables the guard.
+    readiness_no_ci_minutes: int = 15
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #
@@ -1102,6 +1107,19 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
             f"got {type(failed_attempt_alarm).__name__}"
         )
+    readiness_no_ci_minutes = auto_merge_data.get("readiness_no_ci_minutes")
+    if readiness_no_ci_minutes is not None:
+        if isinstance(readiness_no_ci_minutes, bool) or not isinstance(
+            readiness_no_ci_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'readiness_no_ci_minutes' must be an int, "
+                f"got {type(readiness_no_ci_minutes).__name__}"
+            )
+        if readiness_no_ci_minutes < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
+            )
     mergequeue_label = auto_merge_data.get("mergequeue_label")
     if mergequeue_label is not None:
         if not isinstance(mergequeue_label, str):
