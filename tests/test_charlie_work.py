@@ -2203,6 +2203,85 @@ def test_adapter_settings_launch_stagger_seconds_wired_from_dispatch_config(
     assert app._adapter_settings().launch_stagger_seconds == 17
 
 
+def test_adapter_settings_api_branch_carries_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """_adapter_settings() with devin.adapter='api' must carry the resolved
+    ApiWorkerConfig into AdapterSettings and reuse the claude-code
+    venv_source/worker_env. This is the single point that routes the provider
+    registry into the api dispatch lane; a regression here silently breaks all
+    api dispatches with no downstream error (the adapter raises an error
+    result only at dispatch time, by which point the misconfiguration is
+    already fleet-wide)."""
+    from charlie_work.config import (
+        ApiBudgetConfig,
+        ApiProviderConfig,
+        ApiWorkerConfig,
+    )
+
+    api_provider = ApiProviderConfig(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+    api_cfg = ApiWorkerConfig(
+        enabled=True,
+        provider="kimi-k3",
+        max_concurrent_sessions=2,
+        providers={"kimi-k3": api_provider},
+        budget=ApiBudgetConfig(max_usd_per_session=1.5),
+        fallback_adapter="claude-code",
+    )
+    claude_cfg = ClaudeCodeConfig(
+        venv_source=".venv",
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"},
+        tee_stream_json=True,
+    )
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="api"),
+        claude_code=claude_cfg,
+        api_worker=api_cfg,
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    settings = app._adapter_settings()
+    assert settings.adapter == "api"
+    # The api branch must carry the resolved ApiWorkerConfig (not None) so the
+    # api dispatch lane can resolve the provider. This is the regression guard:
+    # test_dispatch_sessions_api_adapter_end_to_end constructs AdapterSettings
+    # directly and bypasses this path, so without this test a broken wiring
+    # (e.g. dropping the api_worker_config= line) would go undetected.
+    assert settings.api_worker_config is api_cfg
+    # The api branch reuses the claude-code venv_source/worker_env resolution.
+    assert settings.venv_source == tmp_path / ".venv"
+    assert settings.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+    # tee_stream_json is read from claude_code config (launch_api_worker
+    # force-enables it internally, but AdapterSettings still carries the
+    # configured value for the manifest/results surface).
+    assert settings.tee_stream_json is True
+
+
+def test_adapter_settings_non_api_branches_omit_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """For devin-shell / claude-code / manual adapters, _adapter_settings()
+    must set api_worker_config=None so a stale config block cannot leak into a
+    non-api dispatch lane."""
+    for adapter in ("devin-shell", "claude-code", "manual"):
+        config = OrchestratorConfig(devin=DevinConfig(adapter=adapter))
+        paths = runtime_paths(tmp_path, config.runtime.state_dir)
+        app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+        settings = app._adapter_settings()
+        assert settings.adapter == adapter
+        assert settings.api_worker_config is None, (
+            f"adapter={adapter} must not carry api_worker_config"
+        )
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
@@ -9282,6 +9361,170 @@ def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
     )
 
 
+def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: a genuine worktree-removal failure must not be silently
+    discarded; the stalled sweep emits a one-shot warning event and sets a
+    per-PR marker so the next pass can retry without flooding the event ring."""
+    from datetime import timedelta
+
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": old_dispatched,
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_dispatched,
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert [entry["pr"] for entry in stalled] == [100]
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+    assert warning_events[0]["payload"]["pr_number"] == 100
+
+
+def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: when a merged PR's review checkout cannot be removed, the
+    orphan sweep must not silently discard the failure, must not append a
+    lifecycle-reaped event or claim the PR as reaped, and must emit only one
+    warning per failure episode. A later successful retry clears the marker
+    and records the reap."""
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    checkout_dir = reviews_dir / "pr-100"
+    checkout_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "review_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    call_count = 0
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return False
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    # First pass: failure is reported once, PR is not claimed as reaped.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 1
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["status"] == "merged"
+    assert state_after["prs"]["100"]["review_dispatch_status"] is None
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    assert not any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Second pass: retry without re-emitting the warning.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 2
+    state_after = load_state(state_file)
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Third pass succeeds: the marker is cleared and the reap is recorded.
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [100]
+    assert call_count == 2  # the lambda does not increment the nested counter
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"].get("review_checkout_removal_warned") is None
+    assert any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
@@ -11626,6 +11869,70 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
     assert "123" in payload["failures"]
     assert "command exited 1" in payload["failures"]["123"]
     assert result.data["failures"][123] == payload["failures"]["123"]
+
+
+def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> None:
+    """Issue #515: repeated failed rework-dispatch attempts must count toward the
+    redispatch cap and escalate instead of retrying forever.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    for i in range(2):
+        result = app.dispatch_rework()
+        assert result.ok is False
+        assert result.data["failed_count"] == 1
+        state = load_state(paths.state_file)
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        assert len(state["issues"]["123"].get("redispatch_at", [])) == i + 1
+
+    # Third failure exceeds the cap and escalates to human-needed.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 3
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
 def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
@@ -17381,6 +17688,64 @@ def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
     alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
     assert len(alarm_events) == 1
     assert "merge conflict" in alarm_events[0]["payload"]["message"].lower()
+
+
+def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> None:
+    """Regression: a PR that exceeded the failed_attempt_alarm threshold must
+    still be routed to rework, not silently stuck.
+
+    If the initial rework dispatch at the threshold failed to transition the
+    issue (e.g. label transition error), the counter keeps incrementing past
+    the threshold.  With ``==`` the rework condition never matches again,
+    permanently orphaning the PR.  ``>=`` ensures it retries.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Pre-seed the state with attempt count *past* the threshold (simulates
+    # a prior rework dispatch that failed to transition the issue).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"]["consecutive_failed_merge_attempts"] = 5
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
 
 
 def test_merge_ready_conflict_no_linked_issue_alarm_is_honest(tmp_path: Path) -> None:
@@ -24304,31 +24669,30 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 
 
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
-    """Test that redispatch_at is only written by the three known call sites (issue #165)."""
+    """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework (workflow.py:2440-2472)
-    # 2. _classify_dead_sessions_and_update_throttle_state (workflow.py:468-504)
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2: the
-    #    rework lane must consult the same redispatch cap the other two
-    #    sites do, instead of preserving redispatch_at unchanged forever).
+    # 1. dispatch_rework success + escalation paths, and now the failure path
+    #    (issue #515: failed rework-dispatch attempts also append redispatch_at
+    #    so they count toward the cap).
+    # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
+    #    escalation + dead-session normal + dead-session escalation).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
     # No other code paths write to redispatch_at.
 
-    # Verify the two call sites exist in the code
     import charlie_work.workflow as workflow_module
     import inspect
 
     workflow_source = inspect.getsource(workflow_module)
 
-    # Count occurrences of redispatch_at assignments to entry
-    # We have 2 assignments in dispatch_rework (normal + escalation), 3 in
-    # _classify_dead_sessions_and_update_throttle_state (launch-failure
-    # escalation + dead-session normal + dead-session escalation), and 2 in
-    # _reap_restore_rework_requested (rework escalation + rework restore,
-    # issue #315).
-    # Total of 7 assignments is correct.
+    # Count occurrences of redispatch_at assignments to entry:
+    # dispatch_rework: 2 (success normal + escalation) +
+    #                  2 (failure normal + escalation, issue #515) = 4
+    # _classify_dead_sessions_and_update_throttle_state: 3
+    # _reap_restore_rework_requested: 2
+    # Total of 9 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 7, (
-        f"Expected 7 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 9, (
+        f"Expected 9 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
@@ -26569,6 +26933,45 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     payload = rework_events[-1]["payload"]
     assert "123" in payload["failures"]
     assert payload["failures"]["123"] == reason
+
+
+def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None:
+    """Issue #461: repeated dispatch failures are capped and then escalated."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=1),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First dispatch failure is recorded normally.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+
+    # Second failure exceeds the cap and escalates the issue.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    assert result2.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # Third dispatch no longer selects the escalated issue.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    assert result3.data["selected_count"] == 0
 
 
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:

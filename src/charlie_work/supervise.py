@@ -186,6 +186,30 @@ def orchestrator_root() -> Path:
     return _ORCHESTRATOR_ROOT
 
 
+def read_head_sha(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult] = run_captured,
+    timeout_seconds: int = 30,
+) -> str | None:
+    """Return the current ``HEAD`` SHA of ``repo_root``, or ``None`` on error.
+
+    Used by the supervisor to detect HEAD drift caused by an external actor
+    (operator pull, another process) between passes — ``self_deploy`` only
+    reports ``from_sha``/``to_sha`` for pulls *it* performed, so a HEAD moved
+    out-of-band shows as "already up to date" and the daemon silently runs
+    stale code forever.
+    """
+    res = run_command(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        timeout_seconds=timeout_seconds,
+    )
+    if not res.ok:
+        return None
+    return res.stdout.strip() or None
+
+
 def _pending_sync_marker_path(repo_root: Path) -> Path:
     """Return the path to the pending-sync marker for this orchestrator tree."""
     return repo_root / ".var" / "charlie-work" / "pending-sync.json"

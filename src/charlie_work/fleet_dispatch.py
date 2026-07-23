@@ -17,6 +17,7 @@ from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
+    read_head_sha,
     self_deploy,
     take_snapshot,
     try_acquire_supervisor_lock,
@@ -925,6 +926,15 @@ def run_fleet_supervise(
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
+    # Capture the HEAD SHA at process startup so we can detect drift caused
+    # by an external actor (operator pull, another process) between passes.
+    # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
+    # HEAD moved out-of-band shows as "already up to date" and the daemon
+    # silently runs stale code forever (observed 2026-07-23: ~90 minutes of
+    # ConfigError crashes after an operator pulled origin/main manually while
+    # the daemon was already running).
+    startup_head = read_head_sha(orchestrator_root())
+
     try:
         while True:
             now = clock()
@@ -996,6 +1006,56 @@ def run_fleet_supervise(
                         ),
                     )
                     emit_digest(notify_config, attention_digest)
+
+            # A successful pull that actually moved HEAD updated the files on
+            # disk, but this process already imported every charlie_work
+            # module at startup -- Python does not hot-reload modules just
+            # because git changed them underneath it. Left running, the
+            # supervisor would keep executing whatever code was live at
+            # process start for its entire (max-runtime-0 == unbounded)
+            # lifetime, silently ignoring every fix merged to main afterward
+            # (observed 2026-07-22: ~40 minutes on stale code, including a
+            # dispatch-rework redispatch-cap fix and a worker model-pin fix
+            # that had already landed on main). Exit cleanly here so the
+            # scheduled-task watchdog (5-minute trigger, MultipleInstancesPolicy
+            # =IgnoreNew) relaunches a fresh process with the new commit
+            # actually imported. Safe to do before this pass's fleet_loop
+            # call: no dispatch/state mutation has happened yet this
+            # iteration, and state.json is disk-persisted, not in-memory, so
+            # the next process resumes from exactly where this one left off.
+            head_changed = bool(
+                deploy.ok
+                and deploy.pulled
+                and deploy.from_sha
+                and deploy.to_sha
+                and deploy.from_sha != deploy.to_sha
+            )
+            if head_changed:
+                print(
+                    f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
+                    f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
+
+            # Independent drift check: even when self_deploy reports "already
+            # up to date" (head_changed=False), HEAD may have been moved by an
+            # external actor (operator pull, another process) since this
+            # process started. Python does not hot-reload modules on disk
+            # changes, so we must exit and let the watchdog relaunch with the
+            # new code (observed 2026-07-23: ~90 minutes of ConfigError crashes
+            # after an operator pulled origin/main while the daemon was
+            # already running — self_deploy saw "already up to date" every
+            # pass because HEAD was already at the new commit).
+            current_head = read_head_sha(orchestrator_root())
+            if startup_head and current_head and current_head != startup_head:
+                print(
+                    f"[{now_str}] HEAD drift detected: startup={startup_head[:12]} "
+                    f"current={current_head[:12]} (moved externally); exiting for "
+                    f"watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
 
             pass_result = fleet_loop(
                 fleet_dir_override=fleet_dir_override,
