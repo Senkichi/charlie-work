@@ -7,8 +7,6 @@ from pathlib import Path
 import pytest
 from types import MappingProxyType
 
-from charlie_work.config import ConfigError, DispatchConfig, RuntimeConfig, load_config
-
 from charlie_work.config import (
     ApiBudgetConfig,
     ApiProviderConfig,
@@ -16,6 +14,7 @@ from charlie_work.config import (
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RuntimeConfig,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -219,7 +218,7 @@ def test_load_config_event_ring_size_override(tmp_path: Path) -> None:
 
 
 def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
-    """Issue #525: runtime.event_ring_size must be a non-negative int."""
+    """Issue #525: runtime.event_ring_size must be an int."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
@@ -229,6 +228,39 @@ def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
         load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_zero(tmp_path: Path) -> None:
+    """Issue #525: event_ring_size=0 is rejected — it would disable truncation.
+
+    append_event truncates via events[-max_size:]; because -0 == 0 in Python,
+    max_size=0 yields events[0:] (the FULL list), causing unbounded growth —
+    the exact failure the cap exists to prevent. There is no sensible "disable"
+    semantic for a bounded ring, so 0 is invalid.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
+    """Issue #525: negative event_ring_size is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: -5
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
+
 
 def test_api_worker_config_defaults() -> None:
     """An absent api_worker section yields safe defaults and no behavior change."""

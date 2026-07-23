@@ -1169,9 +1169,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 "config section 'runtime' key 'event_ring_size' must be an int, "
                 f"got {type(event_ring_size).__name__}"
             )
-        if event_ring_size < 0:
+        # >= 1, not >= 0: append_event truncates via events[-max_size:], and
+        # -0 == 0 in Python, so max_size=0 would yield events[0:] (the FULL
+        # list) — no truncation, i.e. unbounded growth, the exact failure this
+        # cap exists to prevent. There is no sensible "disable" semantic for a
+        # bounded ring (unlike graphql_rate_limit_threshold: 0), so reject 0.
+        if event_ring_size < 1:
             raise ConfigError(
-                "config section 'runtime' key 'event_ring_size' must be >= 0, "
+                "config section 'runtime' key 'event_ring_size' must be >= 1, "
                 f"got {event_ring_size}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)

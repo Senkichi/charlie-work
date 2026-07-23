@@ -1402,14 +1402,14 @@ def _reap_orphaned_review_checkouts(
         # session as a phantom failed claim in the stalled sweep next pass,
         # which re-triggers this reap — an infinite ping-pong per merged PR.
         _reap_review_sidecar(reviews_dir, pr_number)
-        sweep_events.append(
-            (
-                "review_dispatch_lifecycle_reaped",
-                {"pr_number": pr_number, "github_state": gh_state.lower()},
+        if removed:
+            sweep_events.append(
+                (
+                    "review_dispatch_lifecycle_reaped",
+                    {"pr_number": pr_number, "github_state": gh_state.lower()},
+                )
             )
-        )
-        changed = True
-        reaped.append(pr_number)
+            reaped.append(pr_number)
 
     if changed:
         state = _append_sweep_events(state, sweep_events, max_size=config.runtime.event_ring_size)

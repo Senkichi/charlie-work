@@ -27420,3 +27420,23 @@ def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
     ]
     assert len(stalled_sweeps) == passes
     assert all(e["payload"]["count"] == len(prs) for e in stalled_sweeps)
+
+
+def test_orchestrator_app_init_wires_event_ring_size_from_config(tmp_path: Path) -> None:
+    """Issue #525: OrchestratorApp.__init__ sets state.EVENT_RING_SIZE from
+    RuntimeConfig.event_ring_size so the default append_event cap is
+    config-driven. A regression here silently leaves the ring at the hardcoded
+    default regardless of operator config."""
+    from charlie_work.config import RuntimeConfig
+
+    custom_size = 7777
+    config = OrchestratorConfig(runtime=RuntimeConfig(event_ring_size=custom_size))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    # Snapshot the module global before construction and restore it after so
+    # the test does not leak the override into other tests in the same process.
+    saved = state_module.EVENT_RING_SIZE
+    try:
+        OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+        assert state_module.EVENT_RING_SIZE == custom_size
+    finally:
+        state_module.EVENT_RING_SIZE = saved
