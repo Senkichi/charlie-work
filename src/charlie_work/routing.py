@@ -110,6 +110,7 @@ def select_adapter(
     *,
     rework: bool,
     issue_labels: frozenset[str] | set[str],
+    complexity_high_label: str,
     api_config: ApiWorkerConfig,
     budget: BudgetStatus,
     api_key_present: bool,
@@ -122,14 +123,19 @@ def select_adapter(
     Every input is passed in — no filesystem, GitHub, env, or clock access
     inside. Same inputs always yield the same ``AdapterChoice``.
 
+    ``complexity_high_label`` is the label string from
+    ``config.labels.complexity_high``; the literal never lives in this module
+    (issue #481). It is matched against ``issue_labels`` for the first-pass
+    complexity rule.
+
     Rules, in order (each candidate rule produces a prospective api choice
     that is then validated through api preflight; the first matching
     candidate wins):
 
     1. ``rework=True`` -> prospective api with ``"policy:rework"``.
-       (Future: a complexity-high first-pass rule slots in here as another
-       candidate — adding a rule is one small block, not a rewrite.)
-    2. Otherwise -> ``AdapterChoice(default_adapter, "", "policy:default")``.
+    2. First pass (``rework=False``) and ``complexity_high_label`` is in
+       ``issue_labels`` -> prospective api with ``"policy:complexity"``.
+    3. Otherwise -> ``AdapterChoice(default_adapter, "", "policy:default")``.
 
     For any prospective api choice, preflight is evaluated (first failing
     check wins). On failure the fallback adapter is returned with a
@@ -142,10 +148,10 @@ def select_adapter(
     # shared via _api_choice_or_fallback.
     candidate_reasons: list[str | None] = [
         "policy:rework" if rework else None,
-        # Future: complexity-high first-pass rule. Example:
-        #   "policy:complexity-high"
-        #   if (not rework) and <complexity_high_label> in issue_labels else None,
-        # The label string must come from a LabelConfig field, never a literal.
+        # First-pass complexity rule (issue #481). The rework rule above fires
+        # first, so a rework issue carrying the label still routes to api with
+        # the rework reason — the complexity rule is gated on ``not rework``.
+        "policy:complexity" if (not rework) and complexity_high_label in issue_labels else None,
     ]
     for reason in candidate_reasons:
         if reason is None:
