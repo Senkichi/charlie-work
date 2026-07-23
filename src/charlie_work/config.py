@@ -385,6 +385,16 @@ class RuntimeConfig:
         "rate limit",
         "too many requests",
         "usage limit",
+        # Claude Code CLI's own account-level session-limit phrasing (observed
+        # 2026-07-21 verbatim as "You've hit your session limit · resets
+        # 4:40pm (America/Los_Angeles)"). Distinct wording from "rate limit"/
+        # "usage limit" above, so it silently fell through _classify_session_
+        # failure's marker match and every downstream reap path: reviewer
+        # workers that died on this message got no throttled_until cooldown
+        # and were relaunched straight into the same limit every stale-claim
+        # interval (job-cannon PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
+        # hours in a redispatch loop before this was added).
+        "hit your session limit",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
