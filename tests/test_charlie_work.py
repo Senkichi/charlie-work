@@ -9307,9 +9307,7 @@ def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
         }
     ]
 
-    monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", lambda *a, **k: True
-    )
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
     reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
