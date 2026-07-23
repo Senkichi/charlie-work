@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from charlie_work import claude_code
-from charlie_work.config import OrchestratorConfig, RuntimeConfig
+from charlie_work.config import ClaudeCodeConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.claude_code import (
     ClaudeProgress,
     ClaudeWorkerRecord,
@@ -22,6 +22,8 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     update_worker_record_with_failure_classification,
+    _apply_model_pin,
+    _apply_effort_pin,
     _sanitize_review_command_template,
     _sidecar_path,
 )
@@ -331,7 +333,7 @@ def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
     )
 
     assert record.ok
-    assert record.command[-1] == record.prompt_path
+    assert record.prompt_path in record.command
 
     worktree_path = Path(record.worktree_path)
     marker_path = worktree_path / "worker-ran.txt"
@@ -2194,7 +2196,7 @@ def test_launch_sanitizes_environment_with_prompt_path(
     )
 
     assert record.ok
-    assert record.command[-1] == record.prompt_path
+    assert record.prompt_path in record.command
 
     worktree_path = Path(record.worktree_path)
     probe_path = worktree_path / "env-received.txt"
@@ -2743,6 +2745,77 @@ def test_launch_claude_worker_review_ignores_caller_command_template_override(
     assert "acceptEdits" not in record.command
 
 
+def test_launch_claude_worker_pins_configured_model_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #530: a worker launch with no explicit config must still pin
+    ClaudeCodeConfig's default model — never fall back to ambient global CLI
+    state (the 2026-07-22 outage: every reviewer launch silently inherited an
+    interactive session's premium `/model` choice and hit a credits wall)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+    )
+
+    assert "--model" in record.command
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == ClaudeCodeConfig().model
+
+
+def test_launch_claude_worker_honors_configured_model_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-opus-4-8"))
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == "claude-opus-4-8"
+
+
+def test_launch_claude_worker_review_pins_configured_model_by_default(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        502,
+        "agent/issue-502-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert "--model" in record.command
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == ClaudeCodeConfig().model
+
+
 def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
     """Round-3 review (PR #397): a template with duplicate space-form
     `--permission-mode` flags must not let the trailing occurrence survive —
@@ -2816,6 +2889,115 @@ def test_sanitize_review_command_template_preserves_lookalike_token() -> None:
 
     assert "--permission-modex" in result
     assert result == ("claude", "-p", "--permission-modex", "plan", "--permission-mode", "plan")
+
+
+def test_apply_model_pin_appends_to_template_without_model() -> None:
+    """Issue #530: a bare template (no --model) must get the configured
+    model pinned so the subprocess never falls back to ambient global CLI
+    state (e.g. an interactive session's last `/model` choice)."""
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_model_pin(template, "claude-sonnet-5")
+
+    assert result == ("claude", "-p", "--permission-mode", "plan", "--model", "claude-sonnet-5")
+
+
+def test_apply_model_pin_strips_existing_space_form_flag() -> None:
+    template = ("claude", "-p", "--model", "claude-opus-4-8", "--permission-mode", "plan")
+
+    result = _apply_model_pin(template, "claude-sonnet-5")
+
+    assert result.count("--model") == 1
+    idx = result.index("--model")
+    assert result[idx + 1] == "claude-sonnet-5"
+    assert idx == len(result) - 2  # positioned last, last-flag-wins
+
+
+def test_apply_model_pin_strips_equals_joined_flag() -> None:
+    template = ("claude", "-p", "--model=claude-opus-4-8")
+
+    result = _apply_model_pin(template, "claude-sonnet-5")
+
+    assert not any(tok.startswith("--model=") for tok in result)
+    assert result[-2:] == ("--model", "claude-sonnet-5")
+
+
+def test_apply_model_pin_handles_bare_trailing_flag() -> None:
+    template = ("claude", "-p", "--model")
+
+    result = _apply_model_pin(template, "claude-sonnet-5")
+
+    assert result == ("claude", "-p", "--model", "claude-sonnet-5")
+
+
+def test_apply_model_pin_preserves_lookalike_token() -> None:
+    template = ("claude", "-p", "--modelx", "plan")
+
+    result = _apply_model_pin(template, "claude-sonnet-5")
+
+    assert "--modelx" in result
+    assert result == ("claude", "-p", "--modelx", "plan", "--model", "claude-sonnet-5")
+
+
+def test_apply_model_pin_handles_empty_template() -> None:
+    assert _apply_model_pin((), "claude-sonnet-5") == ("--model", "claude-sonnet-5")
+
+
+def test_apply_effort_pin_appends_to_template_without_effort() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--permission-mode", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_strips_existing_space_form_flag() -> None:
+    template = ("claude", "-p", "--effort", "high", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result.count("--effort") == 1
+    idx = result.index("--effort")
+    assert result[idx + 1] == "medium"
+    assert idx == len(result) - 2
+
+
+def test_apply_effort_pin_strips_equals_joined_flag() -> None:
+    template = ("claude", "-p", "--effort=high")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert not any(tok.startswith("--effort=") for tok in result)
+    assert result[-2:] == ("--effort", "medium")
+
+
+def test_apply_effort_pin_empty_effort_is_noop() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "")
+
+    assert result == template
+
+
+def test_apply_effort_pin_handles_bare_trailing_flag() -> None:
+    template = ("claude", "-p", "--effort")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--effort", "medium")
+
+
+def test_apply_effort_pin_preserves_lookalike_token() -> None:
+    template = ("claude", "-p", "--effortx", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert "--effortx" in result
+    assert result == ("claude", "-p", "--effortx", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_handles_empty_template() -> None:
+    assert _apply_effort_pin((), "medium") == ("--effort", "medium")
 
 
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
