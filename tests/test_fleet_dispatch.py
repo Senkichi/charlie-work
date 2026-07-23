@@ -1378,7 +1378,15 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """The fleet supervisor calls self_deploy before every fleet_loop pass."""
+    """The fleet supervisor calls self_deploy before every fleet_loop pass.
+
+    ``from_sha == to_sha`` here deliberately means HEAD did not move on this
+    pull (e.g. a pending dependency-sync marker with no new commit) --
+    otherwise the supervisor's restart-for-fresh-code exit (see
+    test_run_fleet_supervise_restarts_when_self_deploy_moves_head below)
+    would legitimately break the loop after pass 1, since a running process
+    never picks up newly-pulled source on its own.
+    """
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -1396,8 +1404,8 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
             changed=True,
             synced=False,
             from_sha="abc123",
-            to_sha="def456",
-            message="code-only update: def456",
+            to_sha="abc123",
+            message="already up to date",
         )
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
@@ -1409,6 +1417,166 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
     assert result.data["passes"] == 3
     assert mock_fleet_loop.call_count == 3
     assert deploy_mock.call_count == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A pull that actually moves HEAD exits the loop instead of continuing.
+
+    This process already imported every charlie_work module at startup;
+    git changing files on disk underneath it does not hot-reload those
+    modules. Left looping, the supervisor would keep running whatever code
+    was live at process start for its entire max-runtime-0 lifetime,
+    silently ignoring every fix merged to main afterward (observed
+    2026-07-22: the daemon ran ~40 minutes on stale code after several
+    fixes had already landed on main, because self_deploy's git pull only
+    updates files on disk -- it never made the already-running process
+    pick them up). Exiting here hands control back to the scheduled-task
+    watchdog, which relaunches a fresh process with the new commit
+    actually imported.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=True,
+            from_sha="abc123",
+            to_sha="def456",
+            message="updated and synced: def456",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    # max_passes=5 proves the exit is driven by the head-change detection,
+    # not by exhausting the pass budget.
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 1
+    assert deploy_mock.call_count == 1
+    # fleet_loop must never run this pass's (now-stale) code path.
+    assert mock_fleet_loop.call_count == 0
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """No new commits (from_sha == to_sha) must not trigger a restart-exit."""
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=False,
+            synced=False,
+            from_sha="abc123",
+            to_sha="abc123",
+            message="already up to date",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 3
+    assert mock_fleet_loop.call_count == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_restarts_on_external_head_drift(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """HEAD moved externally (operator pull, another process) triggers restart.
+
+    self_deploy reports "already up to date" because HEAD was already at the
+    new commit when the daemon's own git pull ran. Without an independent
+    startup-vs-current HEAD comparison, the daemon would run stale code
+    forever (observed 2026-07-23: ~90 minutes of ConfigError crashes).
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=False,
+            synced=False,
+            from_sha="def456",
+            to_sha="def456",
+            message="already up to date",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    # Simulate: startup HEAD is "abc123", then an external actor moved HEAD
+    # to "def456" before the first pass. self_deploy sees "already up to date"
+    # because its own pull didn't move anything, but the drift check catches it.
+    sha_sequence = iter(["abc123", "def456", "def456"])
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.read_head_sha",
+        lambda _root: next(sha_sequence),
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 1
+    assert deploy_mock.call_count == 1
+    # fleet_loop must never run with stale code.
+    assert mock_fleet_loop.call_count == 0
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")
@@ -1526,3 +1694,80 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     assert digest.transitions[0].adapter_kind == "self-deploy"
     assert digest.transitions[0].health == "ERROR"
     assert "Access is denied" in digest.transitions[0].last_log_line
+
+
+def test_extract_attention_events_review_verdicts() -> None:
+    """Issue #507: recorded/missed review verdicts surface in fleet attention events."""
+    result = CommandResult(
+        True,
+        "review dispatch: 0 launched, 0 failed; 1 verdict(s) recorded, 1 missed",
+        {
+            "stalled": [],
+            "errors": [],
+            "recorded_verdicts": [{"pr": 100, "issue": 10, "decision": "approved"}],
+            "missed_verdicts": [{"pr": 101, "issue": 11, "reason": "no parseable verdict"}],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    recorded = [e for e in events if e["type"] == "review_verdict_recorded"]
+    missed = [e for e in events if e["type"] == "review_verdict_missed"]
+    assert len(recorded) == 1
+    assert recorded[0]["pr"] == 100
+    assert recorded[0]["issue_number"] == 10
+    assert recorded[0]["decision"] == "approved"
+    assert len(missed) == 1
+    assert missed[0]["pr"] == 101
+    assert missed[0]["reason"] == "no parseable verdict"
+
+
+def test_extract_attention_events_nested_review_verdicts() -> None:
+    """Issue #507: review verdict events in nested dispatch_reviews sub-results are extracted."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "dispatch_reviews": {
+                "recorded_verdicts": [{"pr": 200, "issue": 20, "decision": "request_changes"}],
+                "missed_verdicts": [],
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    assert len(events) == 1
+    assert events[0]["type"] == "review_verdict_recorded"
+    assert events[0]["pr"] == 200
+    assert events[0]["issue_number"] == 20
+
+
+def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
+    """Issue #507: review verdict events map to OK/ERROR attention entries."""
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_recorded",
+            "issue_number": 10,
+            "pr": 100,
+            "decision": "approved",
+        },
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_missed",
+            "issue_number": 11,
+            "pr": 101,
+            "reason": "no parseable verdict",
+        },
+    ]
+
+    digest = _build_fleet_attention_digest(events)
+
+    by_health = {e.health: e for e in digest.transitions}
+    assert by_health["OK"].last_log_line == "approved recorded for PR 100"
+    assert by_health["OK"].issue_number == 10
+    assert by_health["ERROR"].last_log_line == "no parseable verdict"
+    assert by_health["ERROR"].issue_number == 11

@@ -17,6 +17,7 @@ from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
+    read_head_sha,
     self_deploy,
     take_snapshot,
     try_acquire_supervisor_lock,
@@ -309,6 +310,13 @@ def _extract_attention_events(
     launch_failures = _collect_launch_failures(repo_key, data)
     events.extend(launch_failures)
 
+    # Extract review verdict reaper results. `dispatch_reviews` carries
+    # `recorded_verdicts`/`missed_verdicts` lists; `loop()` nests them under the
+    # "dispatch_reviews" key. Surfacing both recorded and missed verdicts in the
+    # digest makes a silent 0%-recording-rate regression visible to the heartbeat.
+    verdict_events = _collect_review_verdict_events(repo_key, data)
+    events.extend(verdict_events)
+
     # Extract health transitions (if present from #161/#165)
     health_transitions = data.get("health_transitions", [])
     for transition in health_transitions:
@@ -359,6 +367,56 @@ def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
     skip_reason = data.get("reason") or data.get("deferred_reason")
     if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
         reasons.add(skip_reason or "state_lock_busy")
+
+
+def _collect_review_verdict_events(repo_key: str, data: Any) -> list[dict[str, Any]]:
+    """Collect review verdict reaper results from a result and nested dispatch_reviews.
+
+    ``dispatch_reviews`` returns ``recorded_verdicts`` and ``missed_verdicts``;
+    ``loop()`` nests them under the ``dispatch_reviews`` key. Both recorded
+    (heartbeat confirmation) and missed (regression signal) verdicts become
+    attention events so a future silent 0%-recording-rate regression is caught.
+    """
+    events: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        _add_review_verdict_events(repo_key, data, events)
+        sub_data = data.get("dispatch_reviews")
+        if isinstance(sub_data, dict):
+            _add_review_verdict_events(repo_key, sub_data, events)
+    return events
+
+
+def _add_review_verdict_events(
+    repo_key: str,
+    data: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> None:
+    """Add recorded/missed review verdict events from a flat result dict."""
+    for verdict in data.get("recorded_verdicts", []):
+        if not isinstance(verdict, dict):
+            continue
+        events.append(
+            {
+                "repo_key": repo_key,
+                "type": "review_verdict_recorded",
+                "issue_number": verdict.get("issue") or verdict.get("pr"),
+                "pr": verdict.get("pr"),
+                "decision": verdict.get("decision"),
+            }
+        )
+
+    for verdict in data.get("missed_verdicts", []):
+        if not isinstance(verdict, dict):
+            continue
+        events.append(
+            {
+                "repo_key": repo_key,
+                "type": "review_verdict_missed",
+                "issue_number": verdict.get("issue") or verdict.get("pr"),
+                "pr": verdict.get("pr"),
+                "reason": verdict.get("reason", "verdict not recorded"),
+            }
+        )
 
 
 def _collect_launch_failures(repo_key: str, data: Any) -> list[dict[str, Any]]:
@@ -453,7 +511,8 @@ def _build_fleet_attention_digest(
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
     Fleet events are already-flattened per-repo dicts (stalled / error /
-    health_transition) produced by ``_extract_attention_events``. This maps
+    health_transition / review_verdict_recorded / review_verdict_missed)
+    produced by ``_extract_attention_events``. This maps
     each one onto the real #166 ``AttentionEntry`` schema so the fleet pass
     can go through the same ``emit_digest`` sink pipeline as a single-repo
     pass, rather than re-deriving its own notification format.
@@ -504,6 +563,28 @@ def _build_fleet_attention_digest(
                     issue_number=-1,
                     adapter_kind=event["repo_key"],
                     health="SKIPPED",
+                    previous_health=None,
+                    last_log_line=event.get("reason"),
+                    pid=None,
+                )
+            )
+        elif event_type == "review_verdict_recorded":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event["repo_key"],
+                    health="OK",
+                    previous_health=None,
+                    last_log_line=f"{event.get('decision')} recorded for PR {event.get('pr')}",
+                    pid=None,
+                )
+            )
+        elif event_type == "review_verdict_missed":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event["repo_key"],
+                    health="ERROR",
                     previous_health=None,
                     last_log_line=event.get("reason"),
                     pid=None,
@@ -846,6 +927,15 @@ def run_fleet_supervise(
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
+    # Capture the HEAD SHA at process startup so we can detect drift caused
+    # by an external actor (operator pull, another process) between passes.
+    # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
+    # HEAD moved out-of-band shows as "already up to date" and the daemon
+    # silently runs stale code forever (observed 2026-07-23: ~90 minutes of
+    # ConfigError crashes after an operator pulled origin/main manually while
+    # the daemon was already running).
+    startup_head = read_head_sha(orchestrator_root())
+
     try:
         while True:
             now = clock()
@@ -917,6 +1007,56 @@ def run_fleet_supervise(
                         ),
                     )
                     emit_digest(notify_config, attention_digest)
+
+            # A successful pull that actually moved HEAD updated the files on
+            # disk, but this process already imported every charlie_work
+            # module at startup -- Python does not hot-reload modules just
+            # because git changed them underneath it. Left running, the
+            # supervisor would keep executing whatever code was live at
+            # process start for its entire (max-runtime-0 == unbounded)
+            # lifetime, silently ignoring every fix merged to main afterward
+            # (observed 2026-07-22: ~40 minutes on stale code, including a
+            # dispatch-rework redispatch-cap fix and a worker model-pin fix
+            # that had already landed on main). Exit cleanly here so the
+            # scheduled-task watchdog (5-minute trigger, MultipleInstancesPolicy
+            # =IgnoreNew) relaunches a fresh process with the new commit
+            # actually imported. Safe to do before this pass's fleet_loop
+            # call: no dispatch/state mutation has happened yet this
+            # iteration, and state.json is disk-persisted, not in-memory, so
+            # the next process resumes from exactly where this one left off.
+            head_changed = bool(
+                deploy.ok
+                and deploy.pulled
+                and deploy.from_sha
+                and deploy.to_sha
+                and deploy.from_sha != deploy.to_sha
+            )
+            if head_changed:
+                print(
+                    f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
+                    f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
+
+            # Independent drift check: even when self_deploy reports "already
+            # up to date" (head_changed=False), HEAD may have been moved by an
+            # external actor (operator pull, another process) since this
+            # process started. Python does not hot-reload modules on disk
+            # changes, so we must exit and let the watchdog relaunch with the
+            # new code (observed 2026-07-23: ~90 minutes of ConfigError crashes
+            # after an operator pulled origin/main while the daemon was
+            # already running — self_deploy saw "already up to date" every
+            # pass because HEAD was already at the new commit).
+            current_head = read_head_sha(orchestrator_root())
+            if startup_head and current_head and current_head != startup_head:
+                print(
+                    f"[{now_str}] HEAD drift detected: startup={startup_head[:12]} "
+                    f"current={current_head[:12]} (moved externally); exiting for "
+                    f"watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
 
             pass_result = fleet_loop(
                 fleet_dir_override=fleet_dir_override,
