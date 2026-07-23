@@ -3381,9 +3381,20 @@ class OrchestratorApp:
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            self.config.labels.complexity_high: (
+                "Routing hint: route this first-pass issue to the api worker "
+                "(multi-module, cross-cutting invariant, or prior escalation)."
+            ),
         }
         for label in self.config.labels.all:
-            color = "0E8A16" if label == self.config.labels.ready else "5319E7"
+            # The ready marker is green; the complexity routing hint gets a
+            # distinct amber so it is visually separable from workflow state.
+            if label == self.config.labels.ready:
+                color = "0E8A16"
+            elif label == self.config.labels.complexity_high:
+                color = "BFD4F2"
+            else:
+                color = "5319E7"
             self.gh.label_create(label, color, descriptions[label])
         # Verify: check which labels actually exist after creation attempts.
         # label_create uses allow_failure=True, so silent failures are possible
