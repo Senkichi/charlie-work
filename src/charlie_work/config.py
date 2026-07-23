@@ -92,6 +92,13 @@ class LabelConfig:
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
+    # Routing hint, NOT a workflow state (issue #481). Never a member of
+    # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
+    # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
+    # creates it on GitHub with a sensible description. Human-applied at filing
+    # time; read by routing.select_adapter to send a complex first-pass issue to
+    # the api worker instead of the weaker default worker.
+    complexity_high: str = "complexity:high"
 
     @property
     def terminal(self) -> set[str]:
@@ -114,6 +121,7 @@ class LabelConfig:
             self.done,
             self.human_needed,
             self.prose_only_deps,
+            self.complexity_high,
         ]
 
     @property

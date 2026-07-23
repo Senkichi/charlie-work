@@ -9011,6 +9011,170 @@ def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
     )
 
 
+def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: a genuine worktree-removal failure must not be silently
+    discarded; the stalled sweep emits a one-shot warning event and sets a
+    per-PR marker so the next pass can retry without flooding the event ring."""
+    from datetime import timedelta
+
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": old_dispatched,
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_dispatched,
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert [entry["pr"] for entry in stalled] == [100]
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+    assert warning_events[0]["payload"]["pr_number"] == 100
+
+
+def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: when a merged PR's review checkout cannot be removed, the
+    orphan sweep must not silently discard the failure, must not append a
+    lifecycle-reaped event or claim the PR as reaped, and must emit only one
+    warning per failure episode. A later successful retry clears the marker
+    and records the reap."""
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    checkout_dir = reviews_dir / "pr-100"
+    checkout_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "review_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    call_count = 0
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return False
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    # First pass: failure is reported once, PR is not claimed as reaped.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 1
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["status"] == "merged"
+    assert state_after["prs"]["100"]["review_dispatch_status"] is None
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    assert not any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Second pass: retry without re-emitting the warning.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 2
+    state_after = load_state(state_file)
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Third pass succeeds: the marker is cleared and the reap is recorded.
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [100]
+    assert call_count == 2  # the lambda does not increment the nested counter
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"].get("review_checkout_removal_warned") is None
+    assert any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
@@ -26361,6 +26525,45 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     payload = rework_events[-1]["payload"]
     assert "123" in payload["failures"]
     assert payload["failures"]["123"] == reason
+
+
+def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None:
+    """Issue #461: repeated dispatch failures are capped and then escalated."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=1),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First dispatch failure is recorded normally.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+
+    # Second failure exceeds the cap and escalates the issue.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    assert result2.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # Third dispatch no longer selects the escalated issue.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    assert result3.data["selected_count"] == 0
 
 
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
