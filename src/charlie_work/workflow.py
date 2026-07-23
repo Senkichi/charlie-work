@@ -19,7 +19,12 @@ from .adapters import (
 )
 from .claude_code import launch_claude_worker
 from .checks import CheckSummary, summarize_checks
-from .config import CrossFamilyConfig, DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    AutoMergeConfig,
+    CrossFamilyConfig,
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -382,6 +387,105 @@ def slugify(value: str, *, max_length: int = 48) -> str:
 
 def parse_issue_numbers(only_issues: str) -> list[int]:
     return [int(part) for part in only_issues.replace(" ", "").split(",") if part]
+
+
+# Maximum recovery-retry candidates allowed per dispatch pass. Recovery retries
+# must not consume the same budget as fresh candidates; capping them at one per
+# pass prevents one stuck recovery candidate from starving the queue (issue #506).
+_MAX_RECOVERY_RETRY_PER_PASS = 1
+
+
+def _is_recovery_candidate(
+    issue: dict[str, Any],
+    state: dict[str, Any],
+    branch_name_for: Callable[[dict[str, Any]], str],
+) -> bool:
+    """Return True when ``issue`` is a recovery retry of a previous dispatch.
+
+    A recovery candidate has a state.json entry whose status is ``"dispatched"``
+    and whose stored branch_name matches the branch that would be generated for
+    the issue today. These candidates are separated from fresh dispatch
+    candidates so they cannot monopolize the dispatch budget.
+    """
+    issue_number = int(issue["number"])
+    prev_entry = state.get("issues", {}).get(str(issue_number), {})
+    if prev_entry.get("status") != "dispatched":
+        return False
+    prev_branch = prev_entry.get("branch_name")
+    return prev_branch == branch_name_for(issue)
+
+
+def _select_dispatch_candidates(
+    candidates: list[dict[str, Any]],
+    dispatch_limit: int,
+    state: dict[str, Any],
+    branch_name_for: Callable[[dict[str, Any]], str],
+    only_issues: str | None = None,
+) -> tuple[list[dict[str, Any]], list[int], list[int]]:
+    """Select dispatch candidates, filling fresh slots before recovery retries.
+
+    Fresh candidates are dispatched first; recovery-retry candidates are only
+    attempted with remaining slots, and at most one recovery retry is attempted
+    per pass. This prevents a stuck recovery candidate from head-of-line
+    blocking fresh work under a tight dispatch limit (issue #506).
+
+    Args:
+        candidates: Unblocked, sorted candidate issues from GitHub.
+        dispatch_limit: Maximum number of issues to select this pass.
+        state: Current state.json snapshot for recovery classification.
+        branch_name_for: Callable that returns the branch name for an issue.
+        only_issues: Optional explicit comma-separated issue numbers to select.
+
+    Returns:
+        Tuple of (selected, skipped_issue_numbers, deferred_by_concurrency).
+    """
+    if only_issues:
+        wanted = parse_issue_numbers(only_issues)
+        by_number = {int(issue["number"]): issue for issue in candidates}
+        ordered = [by_number[number] for number in wanted if number in by_number]
+        skipped_issue_numbers = sorted(set(wanted) - set(by_number))
+    else:
+        ordered = candidates
+        skipped_issue_numbers = []
+
+    recovery_flags = [_is_recovery_candidate(issue, state, branch_name_for) for issue in ordered]
+    fresh_count = sum(1 for r in recovery_flags if not r)
+    recovery_cap = min(
+        _MAX_RECOVERY_RETRY_PER_PASS,
+        max(0, dispatch_limit - fresh_count),
+    )
+
+    selected: list[dict[str, Any]] = []
+    recovery_picked = 0
+    if only_issues:
+        # Preserve the operator's explicit issue order while still capping
+        # recovery retries so a stuck recovery issue cannot starve fresh work.
+        for issue, is_recovery in zip(ordered, recovery_flags):
+            if len(selected) >= dispatch_limit:
+                break
+            if is_recovery:
+                if recovery_picked < recovery_cap:
+                    selected.append(issue)
+                    recovery_picked += 1
+            else:
+                selected.append(issue)
+    else:
+        fresh = [issue for issue, r in zip(ordered, recovery_flags) if not r]
+        recovery = [issue for issue, r in zip(ordered, recovery_flags) if r]
+        # Fill fresh first, then allow at most one recovery-retry slot.
+        selected = fresh[:dispatch_limit] + recovery[:recovery_cap]
+
+    if only_issues:
+        selected_numbers = {int(issue["number"]) for issue in selected}
+        deferred_by_concurrency = [
+            int(issue["number"])
+            for issue in ordered
+            if int(issue["number"]) not in selected_numbers
+        ]
+    else:
+        deferred_by_concurrency = []
+
+    return selected, skipped_issue_numbers, deferred_by_concurrency
 
 
 def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
@@ -1448,8 +1552,11 @@ def _reap_orphaned_review_checkouts(
         new_pr_state["number"] = pr_number
         if gh_state == "MERGED":
             new_pr_state["status"] = "merged"
-        elif "status" not in new_pr_state:
-            # Record the terminal closed state so a future pass does not re-query.
+        else:
+            # Record the terminal closed state so a future pass does not
+            # re-query.  Always overwrite — a stale "reviewing" status left
+            # by the review pipeline causes the unclaimed-stalled sweep to
+            # re-trigger every pass (infinite ping-pong with this reaper).
             new_pr_state["status"] = "closed"
         state["prs"][pr_key] = new_pr_state
         changed = True
@@ -2200,6 +2307,30 @@ def _write_rework_prompt(
     return prompt_path
 
 
+def _is_pr_updated_at_older_than(
+    pr: dict[str, Any],
+    now: datetime,
+    minutes: int,
+) -> bool:
+    """Return True when ``pr["updatedAt"]`` is more than ``minutes`` old.
+
+    Parses ISO-8601 timestamps with an optional ``Z`` suffix, normalizes
+    naive datetimes to UTC, and tolerates missing or malformed values.
+    """
+    updated_at = pr.get("updatedAt")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return (now - updated).total_seconds() > minutes * 60
+
+
 def _is_pre_review_rework_candidate(
     pr: dict[str, Any],
     config: OrchestratorConfig,
@@ -2233,24 +2364,39 @@ def _is_pre_review_rework_candidate(
     if status_rollup:
         return False, ""
 
-    updated_at = pr.get("updatedAt")
-    if not updated_at:
-        return False, ""
-
-    try:
-        updated = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return False, ""
-
-    if updated.tzinfo is None:
-        updated = updated.replace(tzinfo=UTC)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-
-    if (now - updated).total_seconds() > stale_minutes * 60:
+    if _is_pr_updated_at_older_than(pr, now, stale_minutes):
         return True, "stale_empty_checks"
 
     return False, ""
+
+
+def _is_readiness_no_ci_stall(
+    pr: dict[str, Any],
+    checks: list[dict[str, Any]],
+    config: AutoMergeConfig,
+    now: datetime,
+) -> bool:
+    """Detect an approved PR whose required checks have never started.
+
+    Returns True when:
+      * ``pr_checks`` returned a parseable (non-None) list;
+      * none of the configured ``required_checks`` appear in that list;
+      * the PR's ``updatedAt`` is older than ``readiness_no_ci_minutes``.
+
+    The required check names come from ``config.required_checks``; no names are
+    hard-coded. ``updatedAt`` is the best available proxy for "head SHA pushed"
+    in the ``gh pr view`` JSON field list.
+    """
+    no_ci_minutes = config.readiness_no_ci_minutes
+    if no_ci_minutes <= 0:
+        return False
+    required = config.required_checks
+    if not required:
+        return False
+    seen = {str(check.get("name") or "") for check in checks}
+    if any(name in seen for name in required):
+        return False
+    return _is_pr_updated_at_older_than(pr, now, no_ci_minutes)
 
 
 def _route_dead_worker_to_pre_review_rework(
@@ -4005,22 +4151,15 @@ class OrchestratorApp:
                 # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
                 candidates = self._sort_by_dependency_depth(candidates)
 
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in candidates}
-                selected = [by_number[number] for number in wanted if number in by_number]
-                skipped_issue_numbers = sorted(set(wanted) - set(by_number))
-                # Apply concurrency governor cap to explicit issue selection
-                if len(selected) > dispatch_limit:
-                    deferred_by_concurrency = [
-                        int(issue["number"]) for issue in selected[dispatch_limit:]
-                    ]
-                    selected = selected[:dispatch_limit]
-                else:
-                    deferred_by_concurrency = []
-            else:
-                selected = candidates[:dispatch_limit]
-                deferred_by_concurrency = []
+            # Fill fresh candidates first; recovery retries only get leftover slots
+            # and are capped at one per pass (issue #506).
+            selected, skipped_issue_numbers, deferred_by_concurrency = _select_dispatch_candidates(
+                candidates,
+                dispatch_limit,
+                state,
+                self._branch_name,
+                only_issues=only_issues,
+            )
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
@@ -4313,22 +4452,15 @@ class OrchestratorApp:
                     )
                 save_state(self.paths.state_file, state)
 
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in candidates}
-                selected = [by_number[number] for number in wanted if number in by_number]
-                skipped_issue_numbers = sorted(set(wanted) - set(by_number))
-                # Apply concurrency governor cap to explicit issue selection
-                if len(selected) > dispatch_limit:
-                    deferred_by_concurrency = [
-                        int(issue["number"]) for issue in selected[dispatch_limit:]
-                    ]
-                    selected = selected[:dispatch_limit]
-                else:
-                    deferred_by_concurrency = []
-            else:
-                selected = candidates[:dispatch_limit]
-                deferred_by_concurrency = []
+            # Fill fresh candidates first; recovery retries only get leftover slots
+            # and are capped at one per pass (issue #506).
+            selected, skipped_issue_numbers, deferred_by_concurrency = _select_dispatch_candidates(
+                candidates,
+                dispatch_limit,
+                state,
+                self._branch_name,
+                only_issues=only_issues,
+            )
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Capture previous entries for recovery detection BEFORE overwriting status
             # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
@@ -4552,6 +4684,47 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
 
+            # Build dispatch-alert transitions for the notify digest. Averted
+            # redispatches surface as DISPATCH_AVERTED; a later successful or
+            # non-averted dispatch clears the alert back to OK.
+            dispatch_alert_transitions: dict[int, dict[str, Any]] = {}
+            live_worker_redispatch_averted: list[dict[str, Any]] = []
+            for request in session_requests:
+                prev_alert = previous_entries.get(request.issue_number, {}).get("dispatch_alert")
+                result = next(
+                    (r for r in dispatch_results if r.issue_number == request.issue_number),
+                    None,
+                )
+                is_live_worker = request.issue_number in live_worker_issue_numbers
+                if is_live_worker:
+                    dispatch_alert_transitions[request.issue_number] = {
+                        "adapter_kind": result.adapter if result else "unknown",
+                        "health": "DISPATCH_AVERTED",
+                        "last_log_line": None,
+                        "pid": result.pid if result else None,
+                        "terminal_tool": None,
+                        "terminal_reason": result.error if result else None,
+                    }
+                    live_worker_redispatch_averted.append(
+                        {
+                            "issue_number": request.issue_number,
+                            "branch_name": request.branch_name,
+                            "pid": result.pid if result else None,
+                            "process_start_time": result.process_start_time if result else None,
+                            "probe_result": result.error if result else None,
+                            "adapter_kind": result.adapter if result else "unknown",
+                        }
+                    )
+                elif prev_alert == "DISPATCH_AVERTED":
+                    dispatch_alert_transitions[request.issue_number] = {
+                        "adapter_kind": result.adapter if result else "unknown",
+                        "health": "OK",
+                        "last_log_line": None,
+                        "pid": result.pid if result else None,
+                        "terminal_tool": None,
+                        "terminal_reason": None,
+                    }
+
             for issue_number in foreign_writer_issue_numbers:
                 result = next(
                     (r for r in dispatch_results if r.issue_number == issue_number), None
@@ -4627,6 +4800,7 @@ class OrchestratorApp:
             "session_results": str(results_path),
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": result_dicts,
+            "live_worker_redispatch_averted": live_worker_redispatch_averted,
             "stalled": stalled_entries,
             "blocked": [
                 {"issue": issue_number, "blockers": blockers}
@@ -4657,6 +4831,19 @@ class OrchestratorApp:
             )
             if digest:
                 emit_digest(self.config.notify, digest)
+
+        # Emit dispatch-alert digest for live-worker redispatch averted outcomes.
+        # This surfaces the silent-stall class of dispatch failures in the same
+        # attention pipeline used for stalled workers (issue #506 / #497).
+        if dispatch_alert_transitions and self.config.notify.enabled:
+            dispatch_digest = _build_attention_digest(
+                self.paths.state_file,
+                dispatch_alert_transitions,
+                repo=self.repo_root.name,
+                state_field="dispatch_alert",
+            )
+            if dispatch_digest:
+                emit_digest(self.config.notify, dispatch_digest)
 
         return CommandResult(
             not failed_issue_numbers,
@@ -6358,6 +6545,52 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
+        # Readiness no-CI stall gate (issue #474): an approved PR whose required
+        # checks have not appeared within ``readiness_no_ci_minutes`` is routed to
+        # rework instead of waiting forever for CI that will never start.
+        if (
+            not checks_unavailable
+            and approved
+            and not sync_failed
+            and not summary.ready
+            and not _is_pending_only(summary)
+            and issue_number is not None
+        ):
+            now = datetime.now(UTC)
+            if _is_readiness_no_ci_stall(pr, enriched_checks, self.config.auto_merge, now):
+                state = load_state_locked(self.paths.state_file)
+                issue_state = state["issues"].get(str(issue_number), {})
+                issue_status = issue_state.get("status")
+                if issue_status not in (
+                    "dispatched",
+                    "dispatch_pending",
+                    "manifest_written",
+                    "escalated",
+                    "blocked",
+                    "rework_requested",
+                ):
+                    label_error = self._request_readiness_no_ci_rework(
+                        pr, issue_number, decision, summary.missing
+                    )
+                    return CommandResult(
+                        True,
+                        f"PR #{pr_number} has not started required CI checks; rework requested",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "review_decision": decision,
+                            "checks": asdict(summary),
+                            "checks_unavailable": False,
+                            "label_error": label_error,
+                            "readiness_no_ci_stall": True,
+                            "merge_conflict": merge_conflict,
+                            "merge_attempt_alarm": False,
+                            "merge_attempt_warning": None,
+                        },
+                    )
+
         can_merge = (
             summary.ready
             and (approved or not self.config.auto_merge.require_approved_review)
@@ -6516,7 +6749,7 @@ class OrchestratorApp:
                     int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
                 )
                 threshold = self.config.auto_merge.failed_attempt_alarm
-                if threshold > 0 and new_attempts_for_route == threshold:
+                if threshold > 0 and new_attempts_for_route >= threshold:
                     merge_conflict_routed = True
                     rework_label_error = self._request_merge_conflict_rework(
                         pr, issue_number, decision
@@ -7359,6 +7592,36 @@ class OrchestratorApp:
             "merge_conflict_rework_requested",
             extra_payload={"conflict_rework_requested_at": requested_at},
             extra_state={"conflict_rework_requested_at": requested_at},
+        )
+
+    def _request_readiness_no_ci_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+        missing_checks: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        """Route an approved PR whose required CI checks have not started to rework."""
+        summary = (
+            "The PR was approved but the required CI checks have not started after the "
+            f"configured readiness timeout ({self.config.auto_merge.readiness_no_ci_minutes} minutes). "
+            f"Required checks: {', '.join(missing_checks)}. Push an empty commit or amend the head "
+            "to re-trigger CI. The code changes are already approved; do not re-litigate the review."
+        )
+        requested_at = utc_now()
+        return self._route_to_rework(
+            pr,
+            issue_number,
+            decision,
+            summary,
+            "readiness_no_ci_rework_requested",
+            extra_payload={
+                "missing_checks": missing_checks,
+                "readiness_no_ci_rework_requested_at": requested_at,
+            },
+            extra_state={
+                "readiness_no_ci_rework_requested_at": requested_at,
+            },
         )
 
     def _request_cross_pr_revert_rework(

@@ -1398,14 +1398,20 @@ def _probe_recovery_liveness(
     except (TypeError, ValueError):
         worker_pid = None
 
-    if worker_pid is not None and is_pid_alive(worker_pid, worker_process_start_time):
-        raise LiveWorkerRedispatchError(
-            issue_number=issue_number,
-            pid=worker_pid,
-            process_start_time=worker_process_start_time,
-            probe_result="pid_alive",
-            inconclusive_probe_deferred_count=0,
-        )
+    pid_alive = False
+    if worker_pid is not None:
+        pid_alive = is_pid_alive(worker_pid, worker_process_start_time)
+        if pid_alive:
+            raise LiveWorkerRedispatchError(
+                issue_number=issue_number,
+                pid=worker_pid,
+                process_start_time=worker_process_start_time,
+                probe_result="pid_alive",
+                inconclusive_probe_deferred_count=0,
+            )
+    # A confirmed-dead PID is stronger evidence than an inconclusive activity
+    # probe. Reconcile the two signals at this single point (issue #506).
+    confirmed_dead = worker_pid is not None and not pid_alive
 
     # For devin-shell sessions, the real-activity probe (sessions.db +
     # per-PID Devin log) is the source of truth even when the wrapper PID is
@@ -1445,15 +1451,6 @@ def _probe_recovery_liveness(
                 # reset rather than leaving the issue stuck indefinitely.
                 return
 
-            new_deferred_count = current_deferred_count + 1
-            raise LiveWorkerRedispatchError(
-                issue_number=issue_number,
-                pid=worker_pid,
-                process_start_time=worker_process_start_time,
-                probe_result="probe_error",
-                inconclusive_probe_deferred_count=new_deferred_count,
-            )
-
         # Consult BOTH activity sources via the probe's own freshest-signal
         # aggregation (the same corroboration classify_worker_health uses for
         # the stall watchdog, issue #280) instead of a sessions.db-only check
@@ -1471,6 +1468,23 @@ def _probe_recovery_liveness(
                     probe_result=f"{source_label}_activity",
                     inconclusive_probe_deferred_count=0,
                 )
+
+        if errored_sources:
+            if all_permanent and confirmed_dead:
+                # A confirmed-dead PID overrides an inconclusive probe only
+                # when every errored source is a structurally permanent absence-
+                # of-record. Transient errors (locked/corrupt DB, I/O failures)
+                # remain fail-closed (issue #282/#426).
+                return
+
+            new_deferred_count = current_deferred_count + 1
+            raise LiveWorkerRedispatchError(
+                issue_number=issue_number,
+                pid=worker_pid,
+                process_start_time=worker_process_start_time,
+                probe_result="probe_error",
+                inconclusive_probe_deferred_count=new_deferred_count,
+            )
 
 
 def create_worktree(

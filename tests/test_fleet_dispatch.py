@@ -1499,6 +1499,65 @@ def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
     assert mock_fleet_loop.call_count == 3
 
 
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_restarts_on_external_head_drift(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """HEAD moved externally (operator pull, another process) triggers restart.
+
+    self_deploy reports "already up to date" because HEAD was already at the
+    new commit when the daemon's own git pull ran. Without an independent
+    startup-vs-current HEAD comparison, the daemon would run stale code
+    forever (observed 2026-07-23: ~90 minutes of ConfigError crashes).
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=False,
+            synced=False,
+            from_sha="def456",
+            to_sha="def456",
+            message="already up to date",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    # Simulate: startup HEAD is "abc123", then an external actor moved HEAD
+    # to "def456" before the first pass. self_deploy sees "already up to date"
+    # because its own pull didn't move anything, but the drift check catches it.
+    sha_sequence = iter(["abc123", "def456", "def456"])
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.read_head_sha",
+        lambda _root: next(sha_sequence),
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 1
+    assert deploy_mock.call_count == 1
+    # fleet_loop must never run with stale code.
+    assert mock_fleet_loop.call_count == 0
+
+
 @patch("charlie_work.fleet_dispatch.emit_digest")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
@@ -1614,6 +1673,44 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     assert digest.transitions[0].adapter_kind == "self-deploy"
     assert digest.transitions[0].health == "ERROR"
     assert "Access is denied" in digest.transitions[0].last_log_line
+
+
+def test_extract_attention_events_includes_live_worker_redispatch_averted() -> None:
+    """Issue #506: fleet attention digest surfaces live-worker redispatch averted outcomes."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    result = CommandResult(
+        True,
+        "dispatch complete",
+        {
+            "dispatch": {
+                "live_worker_redispatch_averted": [
+                    {
+                        "issue_number": 1317,
+                        "branch_name": "agent/issue-1317-fix-search",
+                        "pid": 12345,
+                        "probe_result": "pid_alive",
+                        "adapter_kind": "devin-shell",
+                    }
+                ]
+            }
+        },
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+    assert len(events) == 1
+    assert events[0]["type"] == "live_worker_redispatch_averted"
+    assert events[0]["issue_number"] == 1317
+    assert events[0]["reason"] == "pid_alive"
+    assert events[0]["adapter_kind"] == "devin-shell"
+
+    digest = _build_fleet_attention_digest(events)
+    assert len(digest.transitions) == 1
+    entry = digest.transitions[0]
+    assert entry.issue_number == 1317
+    assert entry.health == "DISPATCH_AVERTED"
+    assert entry.last_log_line == "pid_alive"
+    assert entry.adapter_kind == "devin-shell"
 
 
 def test_extract_attention_events_review_verdicts() -> None:
