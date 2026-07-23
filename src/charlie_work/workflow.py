@@ -1485,8 +1485,11 @@ def _reap_orphaned_review_checkouts(
         new_pr_state["number"] = pr_number
         if gh_state == "MERGED":
             new_pr_state["status"] = "merged"
-        elif "status" not in new_pr_state:
-            # Record the terminal closed state so a future pass does not re-query.
+        else:
+            # Record the terminal closed state so a future pass does not
+            # re-query.  Always overwrite — a stale "reviewing" status left
+            # by the review pipeline causes the unclaimed-stalled sweep to
+            # re-trigger every pass (infinite ping-pong with this reaper).
             new_pr_state["status"] = "closed"
         state["prs"][pr_key] = new_pr_state
         changed = True
