@@ -17,6 +17,7 @@ from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
+    read_head_sha,
     self_deploy,
     take_snapshot,
     try_acquire_supervisor_lock,
@@ -925,6 +926,15 @@ def run_fleet_supervise(
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
+    # Capture the HEAD SHA at process startup so we can detect drift caused
+    # by an external actor (operator pull, another process) between passes.
+    # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
+    # HEAD moved out-of-band shows as "already up to date" and the daemon
+    # silently runs stale code forever (observed 2026-07-23: ~90 minutes of
+    # ConfigError crashes after an operator pulled origin/main manually while
+    # the daemon was already running).
+    startup_head = read_head_sha(orchestrator_root())
+
     try:
         while True:
             now = clock()
@@ -1024,6 +1034,25 @@ def run_fleet_supervise(
                 print(
                     f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
                     f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
+
+            # Independent drift check: even when self_deploy reports "already
+            # up to date" (head_changed=False), HEAD may have been moved by an
+            # external actor (operator pull, another process) since this
+            # process started. Python does not hot-reload modules on disk
+            # changes, so we must exit and let the watchdog relaunch with the
+            # new code (observed 2026-07-23: ~90 minutes of ConfigError crashes
+            # after an operator pulled origin/main while the daemon was
+            # already running — self_deploy saw "already up to date" every
+            # pass because HEAD was already at the new commit).
+            current_head = read_head_sha(orchestrator_root())
+            if startup_head and current_head and current_head != startup_head:
+                print(
+                    f"[{now_str}] HEAD drift detected: startup={startup_head[:12]} "
+                    f"current={current_head[:12]} (moved externally); exiting for "
+                    f"watchdog restart to pick up new code",
                     flush=True,
                 )
                 break
