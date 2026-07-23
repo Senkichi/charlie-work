@@ -203,7 +203,7 @@ def run_captured(
             shell=shell,
             check=False,
             input=stdin,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         return RunResult(
