@@ -316,6 +316,8 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
 def _classify_session_failure(
     log_path: Path,
     throttle_error_markers: Sequence[str] | None = None,
+    *,
+    resume_margin_seconds: int = 0,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
@@ -324,6 +326,11 @@ def _classify_session_failure(
     - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
+
+    ``resume_margin_seconds`` is an extra safety margin past the provider's
+    reported reset (or fixed quota cooldown) time. Provider reset estimates are
+    floors, not guarantees, and dispatching at T+0 races the actual reset
+    (issue #499).
     """
     if not log_path.exists():
         return None, None
@@ -339,7 +346,7 @@ def _classify_session_failure(
     # Check for quota exhaustion first (more severe)
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
         # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
         throttled_until = datetime.now(UTC) + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -358,7 +365,8 @@ def _classify_session_failure(
         cooldown = timedelta(
             minutes=reset_minutes
             if reset_minutes is not None
-            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
+            seconds=resume_margin_seconds,
         )
         throttled_until = datetime.now(UTC) + cooldown
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
@@ -1097,7 +1105,8 @@ def update_worker_record_with_failure_classification(
     never gets set and dispatch keeps relaunching workers into the same limit.
 
     ``config`` is optional for backward compatibility; when provided, its
-    ``runtime.throttle_error_markers`` are used instead of the defaults.
+    ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
+    are used instead of the defaults.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
@@ -1124,9 +1133,16 @@ def update_worker_record_with_failure_classification(
     throttled_until: str | None = None
     log_path_str = payload.get("log_path")
     if log_path_str:
-        throttle_markers = config.runtime.throttle_error_markers if config is not None else None
+        if config is not None:
+            throttle_markers = config.runtime.throttle_error_markers
+            resume_margin_seconds = config.runtime.throttle_resume_margin_s
+        else:
+            throttle_markers = None
+            resume_margin_seconds = 0
         classified_kind, throttled_until = _classify_session_failure(
-            Path(log_path_str), throttle_markers
+            Path(log_path_str),
+            throttle_markers,
+            resume_margin_seconds=resume_margin_seconds,
         )
 
     resolved_kind = classified_kind or fallback_kind
