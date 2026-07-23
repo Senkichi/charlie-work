@@ -997,6 +997,37 @@ def run_fleet_supervise(
                     )
                     emit_digest(notify_config, attention_digest)
 
+            # A successful pull that actually moved HEAD updated the files on
+            # disk, but this process already imported every charlie_work
+            # module at startup -- Python does not hot-reload modules just
+            # because git changed them underneath it. Left running, the
+            # supervisor would keep executing whatever code was live at
+            # process start for its entire (max-runtime-0 == unbounded)
+            # lifetime, silently ignoring every fix merged to main afterward
+            # (observed 2026-07-22: ~40 minutes on stale code, including a
+            # dispatch-rework redispatch-cap fix and a worker model-pin fix
+            # that had already landed on main). Exit cleanly here so the
+            # scheduled-task watchdog (5-minute trigger, MultipleInstancesPolicy
+            # =IgnoreNew) relaunches a fresh process with the new commit
+            # actually imported. Safe to do before this pass's fleet_loop
+            # call: no dispatch/state mutation has happened yet this
+            # iteration, and state.json is disk-persisted, not in-memory, so
+            # the next process resumes from exactly where this one left off.
+            head_changed = bool(
+                deploy.ok
+                and deploy.pulled
+                and deploy.from_sha
+                and deploy.to_sha
+                and deploy.from_sha != deploy.to_sha
+            )
+            if head_changed:
+                print(
+                    f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
+                    f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    flush=True,
+                )
+                break
+
             pass_result = fleet_loop(
                 fleet_dir_override=fleet_dir_override,
                 global_config=global_config,
