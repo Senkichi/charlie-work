@@ -452,6 +452,11 @@ class ClaudeCodeConfig:
     # credits wall, stalling every PR review fleet-wide with zero backoff
     # signal since the error didn't match the quota-exhaustion classifier).
     model: str = "claude-sonnet-5"
+    # Effort level pinned via ``--effort`` on every worker/reviewer launch —
+    # see claude_code._apply_effort_pin. Empty string means no pin (the CLI
+    # uses its default effort). Mirrors the model pin: prevents ambient CLI
+    # state from leaking into headless fleet sessions.
+    effort: str = ""
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
     command: tuple[str, ...] = ()
@@ -1204,6 +1209,12 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"env-var names to values, got {type(worker_env).__name__}"
             )
         claude_code_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
+    effort_value = claude_code_data.get("effort")
+    if effort_value is not None and not isinstance(effort_value, str):
+        raise ConfigError(
+            "config section 'claude_code' key 'effort' must be a string, "
+            f"got {type(effort_value).__name__}"
+        )
     claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
     api_worker_data = _section(data, "api_worker")
     enabled_value = api_worker_data.get("enabled")
