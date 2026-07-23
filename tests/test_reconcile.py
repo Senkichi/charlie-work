@@ -291,6 +291,59 @@ def test_detect_drift_issue_active_label_with_open_pr_is_not_drift() -> None:
     drift = detect_drift(gh, state, config)
 
     assert [item for item in drift if item.kind == "issue_active_label_no_open_pr"] == []
+    assert [item for item in drift if item.kind == "issue_active_label_with_open_pr"] == []
+
+
+def test_detect_drift_finds_issue_active_label_with_open_pr() -> None:
+    """Issue #515: an issue stuck on needs_rework while an open PR exists is drift."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [item for item in drift if item.kind == "issue_active_label_with_open_pr"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 30
+    assert matches[0].pr_number == 3
+    assert matches[0].remove_labels == (config.labels.needs_rework,)
+    assert matches[0].add_labels == (config.labels.pr_open,)
+    assert matches[0].fix_actions == (
+        f"remove label '{config.labels.needs_rework}' from issue #30",
+        f"add label '{config.labels.pr_open}' to issue #30",
+    )
+
+
+def test_apply_fixes_issue_active_label_with_open_pr() -> None:
+    """Issue #515: the --fix path must repair labels and update state status."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {
+        "number": 30,
+        "status": "rework_requested",
+        "worker_pid": 12345,
+    }
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_active_label_with_open_pr"
+    ]
+    assert drift
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert (30, config.labels.needs_rework) in gh.labels_removed
+    assert (30, config.labels.pr_open) in gh.labels_added
+    assert new_state["issues"]["30"]["status"] == "approved"
+    assert "worker_pid" not in new_state["issues"]["30"]
 
 
 def test_detect_drift_finds_done_label_with_active_labels(tmp_path: Path) -> None:

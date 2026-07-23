@@ -444,7 +444,7 @@ def remove_runner(
             capture_output=True,
             text=True,
             timeout=60,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         if result.returncode != 0:
             return False, f"config.cmd remove failed: {result.stderr}"

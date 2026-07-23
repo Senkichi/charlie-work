@@ -14,6 +14,7 @@ from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import (
     WorktreeCleanResult,
     WorktreeInfo,
@@ -4689,6 +4690,128 @@ def test_remove_review_checkout_idempotent(tmp_path: Path) -> None:
     # Never dispatched at all: also True, never raises.
     removed_never_created = remove_review_checkout(repo_root, 12345, reviews_dir=reviews_dir)
     assert removed_never_created is True
+
+
+def test_create_worktree_reuses_pristine_leftover_without_remote_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #461: a pristine orchestrator-created leftover worktree is reclaimed
+    directly, without any remote fetch or ls-remote probe.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    branch = "agent/issue-461-pristine"
+
+    info1 = create_worktree(repo_root, branch, base_ref="HEAD")
+    assert info1.path.exists()
+    assert info1.reclaimed is None
+
+    original_run_captured = create_worktree.__globals__["run_captured"]
+
+    def _no_remote_calls(command, *, cwd, timeout_seconds):
+        if command[:2] == ["git", "fetch"] and "origin" in command:
+            raise AssertionError(f"Unexpected git fetch during pristine reclaim: {command}")
+        if command[:2] == ["git", "ls-remote"]:
+            raise AssertionError(f"Unexpected git ls-remote during pristine reclaim: {command}")
+        return original_run_captured(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr("charlie_work.worktree.run_captured", _no_remote_calls)
+
+    info2 = create_worktree(repo_root, branch, base_ref="HEAD")
+    assert info2.path == info1.path
+    assert info2.reclaimed == "reused"
+
+
+def test_create_worktree_reuses_pristine_leftover_and_resets_to_fresh_base(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #461: a pristine leftover worktree is reset to the fetched base
+    when origin/main has advanced, instead of being left at a stale commit.
+    """
+    from charlie_work import worktree
+
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    branch = "agent/issue-461-stale-base"
+
+    # First dispatch: worktree is at the current origin/main.
+    info1 = create_worktree(repo_root, branch, base_ref="")
+    old_base = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
+    assert info1.reclaimed is None
+
+    # Advance origin/main.
+    _git(remote_repo, "checkout", "main")
+    (remote_repo / "new.txt").write_text("new\n", encoding="utf-8")
+    _git(remote_repo, "add", "new.txt")
+    _git(remote_repo, "commit", "-m", "advance main")
+    new_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    assert new_tip != old_base
+
+    original_run_captured = worktree.run_captured
+
+    def _no_ls_remote(command, **kwargs):
+        if isinstance(command, list) and command[:3] == ["git", "ls-remote", "origin"]:
+            raise AssertionError(f"Unexpected git ls-remote during pristine reclaim: {command}")
+        return original_run_captured(command, **kwargs)
+
+    monkeypatch.setattr("charlie_work.worktree.run_captured", _no_ls_remote)
+
+    # Second fresh dispatch should reuse the same worktree but at the new tip.
+    info2 = create_worktree(repo_root, branch, base_ref="")
+    assert info2.path == info1.path
+    assert info2.reclaimed == "reused"
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == new_tip
+    assert (info2.path / "new.txt").exists()
+
+
+def test_create_worktree_remote_probe_failure_names_subcommand_and_uses_shorter_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #461: a failing remote probe uses the shorter network timeout and the
+    resulting error names the failing git subcommand.
+    """
+    from charlie_work import worktree
+
+    remote_repo = tmp_path / "remote.git"
+    repo_root = tmp_path / "repo"
+    _init_repo(remote_repo, bare=True)
+    _clone_repo(remote_repo, repo_root)
+    branch = "agent/issue-461-probe"
+
+    info1 = create_worktree(repo_root, branch, base_ref="HEAD")
+    # Create a local commit beyond the base so the unsafe-to-reset check must
+    # consult the remote.
+    (info1.path / "local.txt").write_text("local work\n", encoding="utf-8")
+    _git(info1.path, "add", "local.txt")
+    _git(info1.path, "commit", "-m", "local commit")
+
+    calls: list[tuple[list[str], int]] = []
+    original_run_captured = worktree.run_captured
+
+    def _intercept(command, *, cwd, timeout_seconds):
+        calls.append((command, timeout_seconds))
+        if command[:3] == ["git", "ls-remote", "origin"]:
+            return RunResult(
+                returncode=None,
+                stdout="",
+                stderr="",
+                timed_out=True,
+                error=f"command timed out after {timeout_seconds}s",
+            )
+        return original_run_captured(command, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr("charlie_work.worktree.run_captured", _intercept)
+
+    with pytest.raises(WorktreeProbeFailedError) as exc_info:
+        create_worktree(repo_root, branch, base_ref="HEAD")
+
+    assert "git ls-remote" in str(exc_info.value)
+    ls_remote_calls = [c for c in calls if c[0][:3] == ["git", "ls-remote", "origin"]]
+    assert ls_remote_calls
+    assert all(timeout == worktree._REMOTE_TIMEOUT_SECONDS for _cmd, timeout in ls_remote_calls)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows reparse point regression")
