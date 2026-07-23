@@ -204,7 +204,6 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.max_stall_attempts == 5
 
 
-
 def test_api_worker_config_defaults() -> None:
     """An absent api_worker section yields safe defaults and no behavior change."""
     config = load_config()
