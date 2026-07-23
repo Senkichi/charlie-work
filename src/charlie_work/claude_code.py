@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -241,11 +241,51 @@ class ClaudeProgress:
     cost_usd: float | None = None
 
 
+def iter_claude_events(events_path: Path) -> Iterator[dict[str, Any]]:
+    """Yield parsed JSON event dicts from a Claude Code stream-json events file.
+
+    This is the single parsing primitive for ``events.jsonl``: it owns the
+    tolerant line-by-line read (partial/trailing lines and malformed JSON are
+    skipped, never raised; a missing file yields nothing). Higher-level
+    consumers — ``parse_claude_events`` (progress metrics) and
+    ``api_budget.usage_from_events`` (token usage for spend accounting) —
+    iterate this generator so the JSONL parsing logic is implemented once and
+    reused, never duplicated.
+
+    Args:
+        events_path: Path to the events.jsonl file.
+
+    Yields:
+        Each parsed JSON object that is a dict. Non-dict JSON values are
+        skipped.
+    """
+    if not events_path.exists():
+        return
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines (including partial trailing lines
+                    # written while the file is being appended to live).
+                    continue
+                if isinstance(event, dict):
+                    yield event
+    except OSError:
+        # File read error — treat as no events (absence is not an error).
+        return
+
+
 def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     """Parse Claude Code's stream-json events file and extract progress metrics.
 
-    Reads the events.jsonl file line-by-line, accumulating tool_call_count and
-    turn_count, and taking the last-seen cumulative usage fields (tokens, cost_usd).
+    Reads the events.jsonl file via ``iter_claude_events`` (the shared parsing
+    primitive), accumulating tool_call_count and turn_count, and taking the
+    last-seen cumulative usage fields (tokens, cost_usd).
 
     Tolerates partial/incomplete final lines (file is being appended to live).
     Malformed/unparseable lines are skipped, not raised.
@@ -259,47 +299,25 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     Returns:
         ClaudeProgress with accumulated metrics, or None if file doesn't exist
     """
-    if not events_path.exists():
-        return None
-
     tool_call_count = 0
     turn_count = 0
     tokens = None
     cost_usd = None
 
-    try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
+    for event in iter_claude_events(events_path):
+        # Count tool calls
+        if event.get("type") == "tool_call":
+            tool_call_count += 1
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
-                    continue
+        # Count turns (user/assistant exchanges)
+        if event.get("type") in ("user_message", "assistant_message"):
+            turn_count += 1
 
-                if not isinstance(event, dict):
-                    continue
-
-                # Count tool calls
-                if event.get("type") == "tool_call":
-                    tool_call_count += 1
-
-                # Count turns (user/assistant exchanges)
-                if event.get("type") in ("user_message", "assistant_message"):
-                    turn_count += 1
-
-                # Extract cumulative usage fields (take last-seen value)
-                if "tokens" in event and isinstance(event["tokens"], int):
-                    tokens = event["tokens"]
-                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
-                    cost_usd = float(event["cost_usd"])
-
-    except OSError:
-        # File read error - treat as no progress data
-        return None
+        # Extract cumulative usage fields (take last-seen value)
+        if "tokens" in event and isinstance(event["tokens"], int):
+            tokens = event["tokens"]
+        if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+            cost_usd = float(event["cost_usd"])
 
     # If we parsed no valid events, return None
     if tool_call_count == 0 and turn_count == 0 and tokens is None and cost_usd is None:
@@ -1124,5 +1142,6 @@ __all__ = [
     "_sidecar_path",
     "ClaudeProgress",
     "parse_claude_events",
+    "iter_claude_events",
     "_events_path",
 ]
