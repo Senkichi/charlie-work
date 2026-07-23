@@ -11870,6 +11870,99 @@ def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) ->
     assert state["issues"]["123"]["merge_alert"] == "OK"
 
 
+def test_merge_ready_readiness_gate_escalates_no_ci_stall(tmp_path: Path) -> None:
+    """Issue #474: an approved PR with no CI check runs after the configured
+    readiness timeout is routed to rework instead of waiting silently.
+
+    Expected checks are derived from ``auto_merge.required_checks``; no check
+    names are hard-coded in the assertion.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+            readiness_no_ci_minutes=15,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    # Simulate a head push well beyond the no-CI timeout.
+    stale_updated = (datetime.now(UTC) - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fake_gh.prs[0]["updatedAt"] = stale_updated
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data.get("readiness_no_ci_stall") is True
+    assert result.data.get("merge_attempt_alarm") is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    no_ci_events = [e for e in state["events"] if e["kind"] == "readiness_no_ci_rework_requested"]
+    assert len(no_ci_events) == 1
+    missing = no_ci_events[0]["payload"]["missing_checks"]
+    assert set(missing) == set(required)
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    for check in required:
+        assert check in prompt_text
+
+
+def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
+    """Issue #474: a PR reporting mergeStateStatus=DIRTY escalates to rework."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "UNKNOWN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    fake_gh._record_pr_heads(fake_gh.prs)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data.get("merge_attempt_alarm") is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert (paths.prs / "pr-456" / "rework-prompt.md").exists()
+
+
 def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Path) -> None:
     """Issue #254: a decision change resets the failed attempt counter."""
     from charlie_work.config import AutoMergeConfig
@@ -26352,6 +26445,67 @@ def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_c
     # Any present check disqualifies the stale predicate.
     checks_pr = {"statusCheckRollup": [{"name": "Tests passed"}], "updatedAt": old}
     assert _is_pre_review_rework_candidate(checks_pr, config, now) == (False, "")
+
+
+def test_is_pr_updated_at_older_than() -> None:
+    """The shared updatedAt threshold helper parses, tz-normalizes, and compares."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.workflow import _is_pr_updated_at_older_than
+
+    now = datetime.now(UTC)
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+    assert _is_pr_updated_at_older_than({"updatedAt": stale}, now, 15) is True
+    assert _is_pr_updated_at_older_than({"updatedAt": fresh}, now, 15) is False
+    assert _is_pr_updated_at_older_than({}, now, 15) is False
+    assert _is_pr_updated_at_older_than({"updatedAt": "not-a-date"}, now, 15) is False
+
+    # Naive datetimes are normalized to UTC before comparison.
+    naive_now = datetime.now()
+    naive_updated = (naive_now - timedelta(minutes=20)).replace(microsecond=0)
+    assert (
+        _is_pr_updated_at_older_than({"updatedAt": naive_updated.isoformat()}, naive_now, 15)
+        is True
+    )
+
+
+def test_is_readiness_no_ci_stall() -> None:
+    """Issue #474: the readiness no-CI gate escalates only when required checks are missing and updatedAt is stale."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.workflow import _is_readiness_no_ci_stall
+
+    now = datetime.now(UTC)
+    required = ("Tests passed", "Lint & Format")
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    config = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=15)
+
+    # Missing required checks and stale updatedAt.
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], config, now) is True
+
+    # A required check has appeared.
+    assert (
+        _is_readiness_no_ci_stall({"updatedAt": stale}, [{"name": "Tests passed"}], config, now)
+        is False
+    )
+
+    # Missing checks but the PR was updated recently.
+    assert _is_readiness_no_ci_stall({"updatedAt": fresh}, [], config, now) is False
+
+    # Gate disabled by zero minutes.
+    disabled = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=0)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], disabled, now) is False
+
+    # No required checks configured: there is nothing to be missing.
+    no_required = AutoMergeConfig(required_checks=(), readiness_no_ci_minutes=15)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], no_required, now) is False
+
+    # Missing or malformed updatedAt is treated as not stale.
+    assert _is_readiness_no_ci_stall({}, [], config, now) is False
 
 
 def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None:
