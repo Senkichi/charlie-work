@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -99,6 +100,7 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
+from .instrumentation import correlation_context, log_event, record_loop_pass
 from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
@@ -745,6 +747,7 @@ def _detect_and_handle_stalled_sessions(
                                     "pid": w.pid,
                                     "defer_until": defer_until,
                                 },
+                                state_path=state_file,
                             )
                             save_state(state_file, state)
                         continue
@@ -847,6 +850,7 @@ def _detect_and_handle_stalled_sessions(
                         "latest_real_activity_at": probe_payload.get("latest_timestamp"),
                         "latest_real_activity_source": probe_payload.get("latest_source"),
                     },
+                    state_path=state_file,
                 )
                 save_state(state_file, state)
 
@@ -1072,6 +1076,8 @@ def _remove_review_checkout_with_warning(
     repo_root: Path,
     reviews_dir: Path,
     pr_number: int,
+    *,
+    state_file: Path | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Remove an isolated review checkout and emit a one-shot warning on failure.
 
@@ -1108,6 +1114,7 @@ def _remove_review_checkout_with_warning(
             state,
             "review_checkout_removal_failed",
             {"pr_number": pr_number, "reviews_dir": str(reviews_dir)},
+            state_path=state_file,
         )
     return state, False
 
@@ -1230,6 +1237,7 @@ def _detect_and_handle_stalled_reviews(
                     "reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 },
+                state_path=state_file,
             )
             changed = True
             stalled.append(
@@ -1261,11 +1269,12 @@ def _detect_and_handle_stalled_reviews(
                 "pid": w.pid,
                 "started_at": w.started_at,
             },
+            state_path=state_file,
         )
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
         state, _ = _remove_review_checkout_with_warning(
-            state, repo_root, reviews_dir, w.issue_number
+            state, repo_root, reviews_dir, w.issue_number, state_file=state_file
         )
         # The failed record above is now the source of truth for redispatch;
         # the dead session's sidecar must go with the checkout or it re-enters
@@ -1298,6 +1307,7 @@ def _detect_and_handle_stalled_reviews(
                         "status": "pending",
                         "pending_at": pending_at,
                     },
+                    state_path=state_file,
                 )
                 changed = True
                 stalled.append(
@@ -1308,7 +1318,7 @@ def _detect_and_handle_stalled_reviews(
                 )
                 if pr_key.isdigit():
                     state, _ = _remove_review_checkout_with_warning(
-                        state, repo_root, reviews_dir, int(pr_key)
+                        state, repo_root, reviews_dir, int(pr_key), state_file=state_file
                     )
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
@@ -1334,6 +1344,7 @@ def _detect_and_handle_stalled_reviews(
                         "status": "dispatched",
                         "dispatched_at": dispatched_at,
                     },
+                    state_path=state_file,
                 )
                 changed = True
                 stalled.append(
@@ -1344,7 +1355,7 @@ def _detect_and_handle_stalled_reviews(
                 )
                 if pr_key.isdigit():
                     state, _ = _remove_review_checkout_with_warning(
-                        state, repo_root, reviews_dir, int(pr_key)
+                        state, repo_root, reviews_dir, int(pr_key), state_file=state_file
                     )
         elif status is None and pr_state.get("status") == "reviewing":
             # Issue #487: a review packet was generated but was never claimed or
@@ -1401,6 +1412,7 @@ def _detect_and_handle_stalled_reviews(
                     "status": "unclaimed",
                     "prompt_mtime": packet_age,
                 },
+                state_path=state_file,
             )
             changed = True
             stalled.append(
@@ -1411,7 +1423,7 @@ def _detect_and_handle_stalled_reviews(
             )
             if pr_key.isdigit():
                 state, _ = _remove_review_checkout_with_warning(
-                    state, repo_root, reviews_dir, int(pr_key)
+                    state, repo_root, reviews_dir, int(pr_key), state_file=state_file
                 )
 
     if changed:
@@ -1563,7 +1575,7 @@ def _reap_orphaned_review_checkouts(
         changed = True
 
         state, removed = _remove_review_checkout_with_warning(
-            state, repo_root, reviews_dir, pr_number
+            state, repo_root, reviews_dir, pr_number, state_file=state_file
         )
         # Reap the sidecar with the checkout: leaving it resurrects the dead
         # session as a phantom failed claim in the stalled sweep next pass,
@@ -1574,6 +1586,7 @@ def _reap_orphaned_review_checkouts(
                 state,
                 "review_dispatch_lifecycle_reaped",
                 {"pr_number": pr_number, "github_state": gh_state.lower()},
+                state_path=state_file,
             )
             reaped.append(pr_number)
 
@@ -1584,7 +1597,10 @@ def _reap_orphaned_review_checkouts(
 
 
 def _append_sweep_events(
-    state: dict[str, Any], sweep_events: list[tuple[str, dict[str, Any]]]
+    state: dict[str, Any],
+    sweep_events: list[tuple[str, dict[str, Any]]],
+    *,
+    state_file: Path | None = None,
 ) -> dict[str, Any]:
     """Append events collected during a sweep, aggregating same-kind runs.
 
@@ -1599,7 +1615,7 @@ def _append_sweep_events(
 
     for kind, payloads in grouped.items():
         if len(payloads) == 1:
-            state = append_event(state, kind, payloads[0])
+            state = append_event(state, kind, payloads[0], state_path=state_file)
         else:
             issue_numbers = [
                 payload["issue_number"]
@@ -1613,6 +1629,7 @@ def _append_sweep_events(
                     "count": len(payloads),
                     "issue_numbers": issue_numbers,
                 },
+                state_path=state_file,
             )
     return state
 
@@ -1958,7 +1975,7 @@ def _detect_and_handle_orphaned_workers(
 
             state["issues"][str(issue_number)] = entry
 
-        state = _append_sweep_events(state, sweep_events)
+        state = _append_sweep_events(state, sweep_events, state_file=state_file)
         save_state(state_file, state)
 
     # Route head-advanced request_changes findings to the review lane outside
@@ -2017,6 +2034,7 @@ def _detect_and_handle_orphaned_workers(
                     "reviewed_head_sha": reviewed_head_sha_before,
                     "reason": "dead_worker_with_head_change",
                 },
+                state_path=state_file,
             )
             save_state(state_file, state)
 
@@ -2090,6 +2108,7 @@ def _sweep_orphan_processes_for_dead_sessions(
                             for o in orphan_processes
                         ],
                     },
+                    state_path=state_file,
                 )
                 save_state(state_file, state)
 
@@ -2220,6 +2239,7 @@ def _reap_restore_rework_requested(
                     "reason": "dead_rework_session_escalated",
                     "redispatch_count": len(redispatch_at),
                 },
+                state_path=state_file,
             )
             save_state(state_file, state)
         else:
@@ -2240,6 +2260,7 @@ def _reap_restore_rework_requested(
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
                 },
+                state_path=state_file,
             )
             save_state(state_file, state)
 
@@ -2523,6 +2544,7 @@ def _route_dead_worker_to_pre_review_rework(
                 "reason": reason,
                 "failure_kind": failure_kind,
             },
+            state_path=state_file,
         )
         save_state(state_file, state)
 
@@ -2705,6 +2727,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             "removed_labels": sorted(active_labels),
                             "redispatch_count": len(redispatch_at),
                         },
+                        state_path=state_file,
                     )
                     save_state(state_file, state)
 
@@ -2968,6 +2991,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                                 "removed_labels": sorted(active_labels),
                                 "redispatch_count": len(redispatch_at),
                             },
+                            state_path=state_file,
                         )
                         save_state(state_file, state)
                         continue
@@ -3010,6 +3034,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             "salvage_failed": is_completed,
                             "salvage_error": salvage_error,
                         },
+                        state_path=state_file,
                     )
                     save_state(state_file, state)
             else:
@@ -3116,6 +3141,7 @@ def _attempt_salvage(
                 "removed_labels": sorted(active_labels),
                 "pr_number": pr_number,
             },
+            state_path=state_file,
         )
         save_state(state_file, state)
     return True, None
@@ -3320,6 +3346,25 @@ class OrchestratorApp:
 
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
+
+    def _record_event(
+        self, state: dict[str, Any], kind: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Append an event to state.json and the unlimited events.jsonl log.
+
+        This is the single instrumentation entry point for OrchestratorApp
+        methods. It wraps ``append_event`` with ``self.paths.state_file`` and
+        the repo name so every event is dual-written: once to the 200-entry
+        convenience cache in ``state.json`` and once to the append-only
+        ``events.jsonl`` audit log.
+        """
+        return append_event(
+            state,
+            kind,
+            payload,
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+        )
 
     def _resolve(self, value: str) -> Path:
         # pathlib keeps an absolute right-hand side as-is, so this handles
@@ -3554,7 +3599,7 @@ class OrchestratorApp:
                 state = release_operator_claimed(state, issue_number)
             else:
                 state = set_operator_claimed(state, issue_number)
-            state = append_event(
+            state = self._record_event(
                 state,
                 "operator_claim_released" if release else "operator_claim",
                 {
@@ -3697,18 +3742,18 @@ class OrchestratorApp:
                     "updated_at": entry["updated_at"],
                 }
             for failure in failed:
-                state = append_event(
+                state = self._record_event(
                     state,
                     "intake_failed",
                     {"issue_number": failure["issue"], "error": failure["error"]},
                 )
             if prose_only_deps_issues:
-                state = append_event(
+                state = self._record_event(
                     state,
                     "intake_prose_only_deps",
                     {"issue_numbers": sorted(prose_only_deps_issues)},
                 )
-            state = append_event(
+            state = self._record_event(
                 state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
             )
             save_state(self.paths.state_file, state)
@@ -3858,7 +3903,7 @@ class OrchestratorApp:
                             "issue_number": issue_number,
                         }
                 if issue_pr_map:
-                    state = append_event(
+                    state = self._record_event(
                         state,
                         "finalize_externally_merged",
                         {
@@ -3877,7 +3922,7 @@ class OrchestratorApp:
                         "status": "closed",
                     }
                 if closed_unmerged_ready_issues:
-                    state = append_event(
+                    state = self._record_event(
                         state,
                         "dispatch_closed_unmerged_ready_stripped",
                         {"issue_numbers": sorted(closed_unmerged_ready_issues)},
@@ -4323,6 +4368,7 @@ class OrchestratorApp:
                     state,
                     "dispatch_merged_pr_references_closed",
                     {"issue_numbers": sorted(closed_merged_pr_issues)},
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
             # Issue #427: finalize state.json entries for the merged PRs so
@@ -4355,6 +4401,7 @@ class OrchestratorApp:
                     state,
                     "dispatch_merged_pr_mention_flagged",
                     {"issue_numbers": finalizable_mention_issue_numbers},
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
             # Defence-in-depth against double-dispatch: an issue whose state records
@@ -4424,6 +4471,7 @@ class OrchestratorApp:
                     state,
                     "dispatch_skip_operator_claimed",
                     {"issue_numbers": operator_claimed_ready},
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
 
@@ -4450,6 +4498,7 @@ class OrchestratorApp:
                         state,
                         "dispatch_skip_blocked",
                         {"issue": issue_number, "blockers": blockers},
+                        state_path=self.paths.state_file,
                     )
                 save_state(self.paths.state_file, state)
 
@@ -4660,6 +4709,7 @@ class OrchestratorApp:
                                 else None,
                                 "probe_result": result.error if result else None,
                             },
+                            state_path=self.paths.state_file,
                         )
                         save_state(self.paths.state_file, state)
                 elif status == "escalated":
@@ -4743,6 +4793,7 @@ class OrchestratorApp:
                         "pid": result.pid if result else None,
                         "probe_result": result.error if result else None,
                     },
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
             dispatch_failure_map = _build_failure_map(
@@ -4768,6 +4819,7 @@ class OrchestratorApp:
                     "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
                     "failures": dispatch_failure_map,
                 },
+                state_path=self.paths.state_file,
             )
             save_state(self.paths.state_file, state)
         result_dicts = [result.to_dict() for result in dispatch_results]
@@ -4977,6 +5029,7 @@ class OrchestratorApp:
                                 "run_ids": triggered_run_ids,
                                 "head_sha": pr.get("headRefOid"),
                             },
+                            state_path=self.paths.state_file,
                         )
                         save_state(self.paths.state_file, state)
                     return CommandResult(
@@ -5002,6 +5055,7 @@ class OrchestratorApp:
                             "run_ids": list(verdict.rerun_run_ids),
                             "errors": rerun_errors,
                         },
+                        state_path=self.paths.state_file,
                     )
                     save_state(self.paths.state_file, state)
 
@@ -5030,6 +5084,7 @@ class OrchestratorApp:
                     state,
                     "janitor_gate",
                     {"pr_number": pr_number, "failures": list(verdict.failures)},
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
             return CommandResult(
@@ -5164,6 +5219,7 @@ class OrchestratorApp:
                     "cross_family_ok": cf_result.ok if cf_result else None,
                     "cross_family_reused": cf_result.reused if cf_result else None,
                 },
+                state_path=self.paths.state_file,
             )
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
@@ -5636,6 +5692,7 @@ class OrchestratorApp:
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
                     },
+                    state_path=self.paths.state_file,
                 )
             save_state(self.paths.state_file, state)
 
@@ -5823,6 +5880,7 @@ class OrchestratorApp:
                     "failed": [x["pr"] for x in failed],
                     "quota_hit": quota_hit,
                 },
+                state_path=self.paths.state_file,
             )
             save_state(self.paths.state_file, state)
 
@@ -6078,7 +6136,7 @@ class OrchestratorApp:
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
                     state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-            state = append_event(
+            state = self._record_event(
                 state,
                 "record_review",
                 {"pr_number": pr_number, "decision": decision, "escalated": escalated},
@@ -6257,7 +6315,7 @@ class OrchestratorApp:
                             if check.tier == "patch-id"
                             else "verdict_carried_forward_line_content"
                         )
-                        state = append_event(
+                        state = self._record_event(
                             state,
                             event_kind,
                             {
@@ -6303,7 +6361,7 @@ class OrchestratorApp:
                         _issue_key = str(issue_number)
                         _issue_entry = state["issues"].get(_issue_key, {})
                         state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
-                    state = append_event(
+                    state = self._record_event(
                         state,
                         "head_moved",
                         {
@@ -6537,7 +6595,7 @@ class OrchestratorApp:
             # This is report-only, not blocking (per issue directive)
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
-                state = append_event(
+                state = self._record_event(
                     state,
                     "containment_check",
                     {
@@ -6823,7 +6881,7 @@ class OrchestratorApp:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
                             pr_number, new_attempts, summary
                         )
-                    state = append_event(
+                    state = self._record_event(
                         state,
                         "merge_failed_attempt_alarm",
                         {
@@ -6858,7 +6916,7 @@ class OrchestratorApp:
                 prs_entry["status"] = "merged"
                 prs_entry["merged"] = True
             state["prs"][str(pr_number)] = prs_entry
-            state = append_event(
+            state = self._record_event(
                 state,
                 "merge_ready",
                 {
@@ -6942,7 +7000,7 @@ class OrchestratorApp:
         )
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            state = append_event(
+            state = self._record_event(
                 state, "spec_review", {"artifact": str(path), "ok": result.ok, "model": cfg.model}
             )
             save_state(self.paths.state_file, state)
@@ -7061,6 +7119,7 @@ class OrchestratorApp:
                             "threshold": threshold,
                             "phase": "reconcile",
                         },
+                        state_path=self.paths.state_file,
                     )
                     save_state(self.paths.state_file, state)
                     return CommandResult(
@@ -7447,6 +7506,7 @@ class OrchestratorApp:
                         "threshold": threshold,
                         "message": stale_base_warning,
                     },
+                    state_path=self.paths.state_file,
                 )
             state = append_event(
                 state,
@@ -7458,6 +7518,7 @@ class OrchestratorApp:
                     "head_sha": head_sha,
                     "reason": reason,
                 },
+                state_path=self.paths.state_file,
             )
             state["prs"][str(pr_number)] = {
                 **existing,
@@ -7559,7 +7620,7 @@ class OrchestratorApp:
             }
             if extra_payload:
                 payload.update(extra_payload)
-            state = append_event(state, event_kind, payload)
+            state = self._record_event(state, event_kind, payload)
             save_state(self.paths.state_file, state)
 
         result = transition(self.gh, self.config.labels, issue_number, "rework_requested")
@@ -8002,10 +8063,52 @@ class OrchestratorApp:
 
     @_guard_state_lock
     def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
+        return self._loop_impl(limit, merge=merge)
+
+    def _loop_impl(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
         # pr_list (newest-first) merge order would land PRs in the wrong order.
+        loop_start = time.monotonic()
+        with correlation_context() as cid:
+            start_ts = utc_now()
+            log_event(
+                self.paths.state_file,
+                "loop_started",
+                {"limit": limit, "merge": merge},
+                repo=self.repo_root.name,
+                correlation_id=cid,
+            )
+            record_loop_pass(self.paths.state_file, cid, start_ts)
+            result = self._loop_body(limit, merge=merge)
+            elapsed = time.monotonic() - loop_start
+            log_event(
+                self.paths.state_file,
+                "loop_completed",
+                {
+                    "ok": result.ok,
+                    "message": result.message,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "error_count": len(result.data.get("errors", [])),
+                },
+                repo=self.repo_root.name,
+                correlation_id=cid,
+            )
+            record_loop_pass(
+                self.paths.state_file,
+                cid,
+                start_ts,
+                completed_at=utc_now(),
+                ok=result.ok,
+                elapsed_seconds=round(elapsed, 2),
+                error_count=len(result.data.get("errors", [])),
+                merge_count=len(result.data.get("merges", [])),
+                review_count=len(result.data.get("reviews", [])),
+            )
+            return result
+
+    def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
@@ -8214,6 +8317,12 @@ class OrchestratorApp:
                 # references) does not exist in this repo. Park it durably and
                 # alert once instead of failing the pass every 5 minutes
                 # forever — retrying can never succeed.
+                log_event(
+                    self.paths.state_file,
+                    "github_not_found_error",
+                    {"pr_number": pr_number, "issue_number": issue_number, "error": str(exc)},
+                    repo=self.repo_root.name,
+                )
                 if self._mark_foreign_issue_ref(pr_number, issue_number, str(exc)):
                     foreign_transitions[pr_number] = {
                         "adapter_kind": "unknown",
@@ -8225,6 +8334,12 @@ class OrchestratorApp:
                         ),
                     }
             except GitHubError as exc:
+                log_event(
+                    self.paths.state_file,
+                    "github_error",
+                    {"pr_number": pr_number, "issue_number": issue_number, "error": str(exc)},
+                    repo=self.repo_root.name,
+                )
                 errors.append({"pr": pr_number, "error": str(exc)})
         warnings: list[str] = []
         merge_alert_transitions: dict[int, dict[str, Any]] = {}
@@ -8727,6 +8842,7 @@ class OrchestratorApp:
                         "operator_claimed_skipped": sorted(operator_claimed_skipped),
                         "failures": no_session_failure_map,
                     },
+                    state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
             data = {
@@ -8948,6 +9064,7 @@ class OrchestratorApp:
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
                     "failures": rework_failure_map,
                 },
+                state_path=self.paths.state_file,
             )
             save_state(self.paths.state_file, state)
 
@@ -9071,6 +9188,7 @@ class OrchestratorApp:
                     "review_ok": review_result.ok,
                     "routed": routed,
                 },
+                state_path=self.paths.state_file,
             )
             save_state(self.paths.state_file, state)
         return routed, review_result

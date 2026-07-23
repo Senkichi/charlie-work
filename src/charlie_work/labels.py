@@ -8,11 +8,14 @@ the workflow was how stalled label states happened in production.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
 from .config import LabelConfig
 from .github import GitHub
+
+logger = logging.getLogger(__name__)
 
 
 class TransitionOutcome(Enum):
@@ -103,7 +106,27 @@ def transition(gh: GitHub, labels: LabelConfig, issue_number: int, event: str) -
             remove_failures.append((issue_number, label))
 
     if not add and not remove:
+        logger.info(
+            "label_transition issue=%d event=%s outcome=nothing_changed",
+            issue_number,
+            event,
+        )
         return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
     if add_failures or remove_failures:
+        logger.warning(
+            "label_transition issue=%d event=%s outcome=partial_failure "
+            "add_failures=%s remove_failures=%s",
+            issue_number,
+            event,
+            add_failures,
+            remove_failures,
+        )
         return TransitionResult(TransitionOutcome.PARTIAL_FAILURE, add_failures, remove_failures)
+    logger.info(
+        "label_transition issue=%d event=%s outcome=applied add=%s remove=%s",
+        issue_number,
+        event,
+        add,
+        remove,
+    )
     return TransitionResult(TransitionOutcome.APPLIED, [], [])
