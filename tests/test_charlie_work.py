@@ -31,6 +31,7 @@ from charlie_work.config import (
     DispatchConfig,
     FleetConfig,
     LabelConfig,
+    NotifyConfig,
     OrchestratorConfig,
     PostMortemConfig,
     ReviewConfig,
@@ -27289,6 +27290,210 @@ def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> Non
 
     assert result.ok is True
     assert len(orphan_calls) == 0, "dispatch_rework must not re-run orphaned-worker detection"
+
+
+def test_dispatch_fresh_candidates_take_priority_over_recovery_retry(
+    tmp_path: Path,
+) -> None:
+    """Issue #506: a stuck recovery-retry candidate must not starve fresh candidates.
+
+    With dispatch_limit=1, the fresh candidate must dispatch and the recovery
+    retry must not consume the only slot.
+    """
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["1317"] = {
+        "number": 1317,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1317-fix-stuck",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+    }
+    save_state(paths.state_file, state)
+
+    class FreshAndStuckGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1317,
+                    "title": "Fix stuck",
+                    "url": "https://example.test/issues/1317",
+                    "body": "Stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:00:00Z",
+                },
+                {
+                    "number": 1322,
+                    "title": "Fix fresh",
+                    "url": "https://example.test/issues/1322",
+                    "body": "Fresh",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T01:00:00Z",
+                },
+            ]
+            self.prs = []
+
+    fake_gh = FreshAndStuckGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    sessions = result.data["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["issue_number"] == 1322
+    assert sessions[0].get("recovery") is None
+
+
+def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #506: a live-worker redispatch averted outcome surfaces in the digest."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.state import empty_state, load_state, save_state
+
+    digest_path = tmp_path / "digest.jsonl"
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
+        devin=DevinConfig(adapter="manual"),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=str(digest_path)),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="manual",
+                ok=False,
+                error="pid_alive",
+                failure_kind="live_worker_redispatch_averted",
+                pid=12345,
+                process_start_time=1_234_567.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["live_worker_count"] == 1
+
+    digest_lines = digest_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(digest_lines) == 1
+    digest = json.loads(digest_lines[0])
+    transitions = digest["transitions"]
+    assert len(transitions) == 1
+    assert transitions[0]["issue_number"] == 123
+    assert transitions[0]["health"] == "DISPATCH_AVERTED"
+    assert transitions[0]["terminal_reason"] == "pid_alive"
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["dispatch_alert"] == "DISPATCH_AVERTED"
+
+
+def test_dispatch_only_issues_preserves_mixed_fresh_recovery_order(
+    tmp_path: Path,
+) -> None:
+    """Issue #506: --only-issues preserves operator order for mixed fresh/recovery.
+
+    When an operator explicitly lists recovery candidates before fresh work,
+    the requested order is honored, but recovery retries are still capped at
+    one per pass so a backlog of stuck recovery issues cannot consume the
+    budget.
+    """
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["1317"] = {
+        "number": 1317,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1317-fix-stuck",
+    }
+    state["issues"]["1323"] = {
+        "number": 1323,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1323-fix-stuck-too",
+    }
+    save_state(paths.state_file, state)
+
+    class MixedOrderGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1317,
+                    "title": "Fix stuck",
+                    "url": "https://example.test/issues/1317",
+                    "body": "Stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:00:00Z",
+                },
+                {
+                    "number": 1323,
+                    "title": "Fix stuck too",
+                    "url": "https://example.test/issues/1323",
+                    "body": "Also stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:01:00Z",
+                },
+                {
+                    "number": 1322,
+                    "title": "Fix fresh",
+                    "url": "https://example.test/issues/1322",
+                    "body": "Fresh",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:02:00Z",
+                },
+            ]
+            self.prs = []
+
+    fake_gh = MixedOrderGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(only_issues="1317,1323,1322")
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [1317, 1322]
+    assert result.data["deferred_by_concurrency"] == [1323]
+    assert result.data["skipped_issue_numbers"] == []
 
 
 # --- Issue #507: record review verdicts from dead reviewer logs -------------
