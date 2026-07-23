@@ -6449,7 +6449,7 @@ class OrchestratorApp:
                     int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
                 )
                 threshold = self.config.auto_merge.failed_attempt_alarm
-                if threshold > 0 and new_attempts_for_route == threshold:
+                if threshold > 0 and new_attempts_for_route >= threshold:
                     merge_conflict_routed = True
                     rework_label_error = self._request_merge_conflict_rework(
                         pr, issue_number, decision

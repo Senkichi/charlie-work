@@ -17419,6 +17419,64 @@ def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
     assert "merge conflict" in alarm_events[0]["payload"]["message"].lower()
 
 
+def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> None:
+    """Regression: a PR that exceeded the failed_attempt_alarm threshold must
+    still be routed to rework, not silently stuck.
+
+    If the initial rework dispatch at the threshold failed to transition the
+    issue (e.g. label transition error), the counter keeps incrementing past
+    the threshold.  With ``==`` the rework condition never matches again,
+    permanently orphaning the PR.  ``>=`` ensures it retries.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Pre-seed the state with attempt count *past* the threshold (simulates
+    # a prior rework dispatch that failed to transition the issue).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"]["consecutive_failed_merge_attempts"] = 5
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+
+
 def test_merge_ready_conflict_no_linked_issue_alarm_is_honest(tmp_path: Path) -> None:
     """Issue #379: an approved conflicting PR with no linked issue cannot be routed.
 
