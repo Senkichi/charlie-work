@@ -311,3 +311,336 @@ def test_check_review_liveness_falls_back_to_packet_mtime_when_state_timestamp_m
 
     assert report.anomaly
     assert "pr-200" in report.lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests for the remaining checks (review-liveness is covered above).
+# Each test exercises one check's OK and/or anomaly path with stubbed I/O.
+# ---------------------------------------------------------------------------
+
+
+def _gh_dispatch(monkeypatch: Any, hb: ModuleType, handler: Any) -> None:
+    """Install a fake run_gh_json that dispatches to ``handler(args, cwd)``."""
+
+    def fake_run_gh_json(args: list[str], cwd: Path) -> tuple[bool, Any, str]:
+        return handler(args, cwd)
+
+    monkeypatch.setattr(hb, "run_gh_json", fake_run_gh_json)
+
+
+def test_state_file_respects_env_override(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """CHARLIE_WORK_HEARTBEAT_STATE overrides the derived fleet_dir path."""
+    custom = tmp_path / "custom-state.json"
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(custom))
+    assert hb.state_file() == custom
+
+
+def test_state_file_derives_from_fleet_dir(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Without an explicit override, state_file() follows CHARLIE_WORK_FLEET_DIR."""
+    monkeypatch.delenv("CHARLIE_WORK_HEARTBEAT_STATE", raising=False)
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path))
+    assert hb.state_file() == tmp_path / "heartbeat-state.json"
+
+
+def test_save_and_load_state_round_trip(hb: ModuleType, monkeypatch: Any, tmp_path: Path) -> None:
+    """save_state writes atomically and load_state reads it back."""
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb.json"))
+    payload = {"last_beat_at": "2026-07-22T00:00:00Z", "repos": {}}
+    hb.save_state(payload)
+    assert hb.load_state() == payload
+
+
+def test_check_dispatch_throttle_ok_when_no_state(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_dispatch_throttle(report, repo)
+    assert not report.anomaly
+    assert "none (no state.json)" in report.lines[0]
+
+
+def test_check_dispatch_throttle_ok_when_not_throttled(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "state.json").write_text(
+        json.dumps({"throttled_until": None}), encoding="utf-8"
+    )
+    report = hb.Report()
+    hb.check_dispatch_throttle(report, repo)
+    assert not report.anomaly
+    assert "none" in report.lines[0]
+
+
+def test_check_dispatch_throttle_ok_within_threshold(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    # _iso(-10) = 10 minutes in the future (throttle still active)
+    (repo.state_dir / "state.json").write_text(
+        json.dumps({"throttled_until": _iso(-10)}), encoding="utf-8"
+    )
+    report = hb.Report()
+    hb.check_dispatch_throttle(report, repo)
+    assert not report.anomaly
+    assert "throttled until" in report.lines[0]
+
+
+def test_check_dispatch_throttle_anomaly_when_exceeds_threshold(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    # _iso(-60) = 60 minutes in the future, beyond the 30-min threshold
+    (repo.state_dir / "state.json").write_text(
+        json.dumps({"throttled_until": _iso(-60)}), encoding="utf-8"
+    )
+    report = hb.Report()
+    hb.check_dispatch_throttle(report, repo)
+    assert report.anomaly
+    assert "cooldown exceeds threshold" in report.lines[0]
+
+
+def test_check_dispatch_coverage_ok_when_no_dispatchable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, [], ""),
+    )
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, {}, {}, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    assert "dispatch-coverage" in report.lines[0]
+
+
+def test_check_dispatch_coverage_anomaly_when_persisting(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        {"number": 42, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, issues, ""),
+    )
+    prev = {"dispatchable_issues": [42]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert report.anomaly
+    assert "dispatchable across 2 consecutive beats" in report.lines[0]
+
+
+def test_check_in_progress_staleness_anomaly_when_unchanged_across_beats(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    updated = _iso(5)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_in_progress_staleness(report, repo, [(99, updated)], prev, new, skip_delta=False)
+    assert report.anomaly
+    assert "99" in report.lines[0]
+
+
+def test_check_dispatch_failures_ok_when_no_dir(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_dispatch_failures(report, repo, datetime.now(timezone.utc))
+    assert not report.anomaly
+    assert "scanned=0" in report.lines[0]
+
+
+def test_check_dispatch_failures_anomaly_for_new_failure(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    dispatches = repo.state_dir / "dispatches"
+    dispatches.mkdir(parents=True, exist_ok=True)
+    (dispatches / "bad.json").write_text(json.dumps({"error": "boom"}), encoding="utf-8")
+    baseline = datetime.now(timezone.utc) - timedelta(hours=1)
+    report = hb.Report()
+    hb.check_dispatch_failures(report, repo, baseline)
+    assert report.anomaly
+    assert "bad.json" in report.lines[0]
+
+
+def test_check_dispatch_failures_ok_when_failure_before_baseline(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    dispatches = repo.state_dir / "dispatches"
+    dispatches.mkdir(parents=True, exist_ok=True)
+    old_path = dispatches / "old.json"
+    old_path.write_text(json.dumps({"error": "boom"}), encoding="utf-8")
+    old_time = (datetime(2020, 1, 1, tzinfo=timezone.utc)).timestamp()
+    os.utime(old_path, (old_time, old_time))
+    baseline = datetime.now(timezone.utc)
+    report = hb.Report()
+    hb.check_dispatch_failures(report, repo, baseline)
+    assert not report.anomaly
+
+
+def test_check_log_freshness_ok_when_fresh(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "run.log").write_text("hi", encoding="utf-8")
+    report = hb.Report()
+    hb.check_log_freshness(report, repo)
+    assert not report.anomaly
+    assert "run.log" in report.lines[0]
+
+
+def test_check_log_freshness_anomaly_when_no_files(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    # state_dir exists but contains no log/state/checkpoint files
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    report = hb.Report()
+    hb.check_log_freshness(report, repo)
+    assert report.anomaly
+    assert "no log/state/checkpoint files" in report.lines[0]
+
+
+def test_check_log_freshness_anomaly_when_stale(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    stale_path = repo.state_dir / "run.log"
+    stale_path.write_text("hi", encoding="utf-8")
+    old_time = (datetime(2020, 1, 1, tzinfo=timezone.utc)).timestamp()
+    os.utime(stale_path, (old_time, old_time))
+    report = hb.Report()
+    hb.check_log_freshness(report, repo)
+    assert report.anomaly
+    assert "older than threshold" in report.lines[0]
+
+
+def test_check_merge_flow_ok_when_no_mergequeue_label(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, [], ""),
+    )
+    report = hb.Report()
+    hb.check_merge_flow(report, repo, {}, {}, skip_delta=False)
+    assert not report.anomaly
+    assert "merge-flow" in report.lines[0]
+
+
+def test_check_merge_flow_anomaly_when_mergequeue_stalled(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    # Write a config with a mergequeue label so the check counts it.
+    repo.config_path.parent.mkdir(parents=True, exist_ok=True)
+    repo.config_path.write_text("auto_merge:\n  mergequeue_label: mergequeue\n", encoding="utf-8")
+
+    merged_at = "2020-01-01T00:00:00Z"
+
+    def handler(args: list[str], cwd: Path) -> tuple[bool, Any, str]:
+        if "--state" in args and "merged" in args[args.index("--state") + 1]:
+            return True, [{"number": 9, "mergedAt": merged_at}], ""
+        # open PRs: one carrying the mergequeue label
+        return True, [{"number": 1, "labels": [{"name": "mergequeue"}]}], ""
+
+    _gh_dispatch(monkeypatch, hb, handler)
+    prev = {
+        "mergequeue_count": 1,
+        "mergequeue_unchanged_streak": 1,
+        "last_merged_at": merged_at,
+    }
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_merge_flow(report, repo, prev, new, skip_delta=False)
+    assert report.anomaly
+    assert "mergequeue count stuck" in report.lines[0]
+
+
+def test_check_github_rate_ok(hb: ModuleType, monkeypatch: Any, tmp_path: Path) -> None:
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, {"resources": {"graphql": {"remaining": 5000}}}, ""),
+    )
+    report = hb.Report()
+    hb.check_github_rate(report, tmp_path)
+    assert not report.anomaly
+    assert "graphql_remaining=5000" in report.lines[0]
+
+
+def test_check_github_rate_anomaly_when_low(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, {"resources": {"graphql": {"remaining": 100}}}, ""),
+    )
+    report = hb.Report()
+    hb.check_github_rate(report, tmp_path)
+    assert report.anomaly
+    assert "below threshold" in report.lines[0]
+
+
+def test_check_github_rate_anomaly_on_gh_failure(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (False, None, "gh exploded"),
+    )
+    report = hb.Report()
+    hb.check_github_rate(report, tmp_path)
+    assert report.anomaly
+
+
+def test_check_runners_skipped_off_windows(hb: ModuleType, monkeypatch: Any) -> None:
+    monkeypatch.setattr(hb.sys, "platform", "linux")
+    report = hb.Report()
+    hb.check_runners(report)
+    assert not report.anomaly
+    assert "skipped on linux" in report.lines[0]
+
+
+def test_check_runners_ok_on_windows_with_good_result(hb: ModuleType, monkeypatch: Any) -> None:
+    monkeypatch.setattr(hb.sys, "platform", "win32")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "Last Result: 0\n"
+        stderr = ""
+
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: FakeProc())
+    report = hb.Report()
+    hb.check_runners(report)
+    assert not report.anomaly
+    assert "last_result=0" in report.lines[0]
+
+
+def test_check_runners_anomaly_on_windows_with_bad_result(
+    hb: ModuleType, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(hb.sys, "platform", "win32")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "Last Result: 1\n"
+        stderr = ""
+
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: FakeProc())
+    report = hb.Report()
+    hb.check_runners(report)
+    assert report.anomaly
+    assert "last run result 1" in report.lines[0]

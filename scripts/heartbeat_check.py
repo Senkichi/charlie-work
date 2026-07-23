@@ -53,8 +53,6 @@ FLEET_TASK_NAME = "charlie-fleet-pass"
 # 0 = success, 267009 = task currently running, 267011 = task has not yet run.
 SCHTASKS_OK_RESULT_CODES = {0, 267009, 267011}
 
-STATE_FILE = Path(r"C:\Users\senki\repos\charlie-work\scratchpad\heartbeat-state.json")
-
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -94,6 +92,20 @@ def fleet_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return base / "charlie-work"
+
+
+def state_file() -> Path:
+    """Resolve the heartbeat state file path.
+
+    Derives from :func:`fleet_dir` (so it follows the same platform-aware base
+    and ``CHARLIE_WORK_FLEET_DIR`` override) unless an explicit
+    ``CHARLIE_WORK_HEARTBEAT_STATE`` env var points at a specific file.  Never
+    hard-coded to a developer-machine path.
+    """
+    override = os.environ.get("CHARLIE_WORK_HEARTBEAT_STATE")
+    if override:
+        return Path(override)
+    return fleet_dir() / "heartbeat-state.json"
 
 
 def load_repos() -> tuple[list[RepoInfo], str | None]:
@@ -195,19 +207,21 @@ def parse_iso(value: str | None) -> datetime | None:
 
 
 def load_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
+    path = state_file()
+    if not path.exists():
         return {}
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def save_state(state: dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    path = state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    tmp.replace(path)
 
 
 def load_orchestrator_config(config_path: Path) -> dict[str, Any]:
@@ -437,11 +451,15 @@ def _claim_is_open(decision_path: Path) -> bool:
 def _reviewer_pid_alive(entry: dict[str, Any]) -> bool | None:
     """Check if a reviewer PID recorded in state.json is alive.
 
-    Mirror of ``charlie_work.workflow._reviewer_pid_alive`` for the heartbeat
-    script.  Uses ``psutil`` (already a project dependency) for a cross-platform
-    PID + start-time probe.  Returns ``None`` when no PID is recorded, ``True``
-    when the process is alive or its state is indeterminate, and ``False`` only
-    when we can prove the PID is dead or has been recycled.
+    Companion to ``charlie_work.workflow._reviewer_pid_alive`` /
+    ``charlie_work.process_utils.is_pid_alive``, adapted for the heartbeat
+    script's reporting needs.  Uses ``psutil`` (already a project dependency)
+    for a cross-platform PID + start-time probe rather than the
+    platform-specific ctypes/``os.kill`` code in ``process_utils``.  Returns
+    three-valued (``None``/``True``/``False``) so the heartbeat can distinguish
+    "no PID recorded" from "alive" / "dead": ``None`` when no PID is recorded,
+    ``True`` when the process is alive or its state is indeterminate, and
+    ``False`` only when we can prove the PID is dead or has been recycled.
     """
     reviewer_pid = entry.get("reviewer_pid")
     if reviewer_pid is None:
@@ -786,6 +804,12 @@ def check_github_rate(report: Report, any_repo_root: Path) -> None:
 
 def check_runners(report: Report) -> None:
     check = "runners"
+    if sys.platform != "win32":
+        # schtasks is Windows-only; on other platforms there is no equivalent
+        # scheduled-task probe, so report OK with an explicit note rather than
+        # a false anomaly from the OSError catch.
+        report.ok(check, f"skipped on {sys.platform} (schtasks is Windows-only)")
+        return
     try:
         proc = subprocess.run(
             ["schtasks", "/query", "/tn", FLEET_TASK_NAME, "/fo", "LIST", "/v"],
