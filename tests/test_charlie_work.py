@@ -2202,6 +2202,85 @@ def test_adapter_settings_launch_stagger_seconds_wired_from_dispatch_config(
     assert app._adapter_settings().launch_stagger_seconds == 17
 
 
+def test_adapter_settings_api_branch_carries_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """_adapter_settings() with devin.adapter='api' must carry the resolved
+    ApiWorkerConfig into AdapterSettings and reuse the claude-code
+    venv_source/worker_env. This is the single point that routes the provider
+    registry into the api dispatch lane; a regression here silently breaks all
+    api dispatches with no downstream error (the adapter raises an error
+    result only at dispatch time, by which point the misconfiguration is
+    already fleet-wide)."""
+    from charlie_work.config import (
+        ApiBudgetConfig,
+        ApiProviderConfig,
+        ApiWorkerConfig,
+    )
+
+    api_provider = ApiProviderConfig(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+    api_cfg = ApiWorkerConfig(
+        enabled=True,
+        provider="kimi-k3",
+        max_concurrent_sessions=2,
+        providers={"kimi-k3": api_provider},
+        budget=ApiBudgetConfig(max_usd_per_session=1.5),
+        fallback_adapter="claude-code",
+    )
+    claude_cfg = ClaudeCodeConfig(
+        venv_source=".venv",
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"},
+        tee_stream_json=True,
+    )
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="api"),
+        claude_code=claude_cfg,
+        api_worker=api_cfg,
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    settings = app._adapter_settings()
+    assert settings.adapter == "api"
+    # The api branch must carry the resolved ApiWorkerConfig (not None) so the
+    # api dispatch lane can resolve the provider. This is the regression guard:
+    # test_dispatch_sessions_api_adapter_end_to_end constructs AdapterSettings
+    # directly and bypasses this path, so without this test a broken wiring
+    # (e.g. dropping the api_worker_config= line) would go undetected.
+    assert settings.api_worker_config is api_cfg
+    # The api branch reuses the claude-code venv_source/worker_env resolution.
+    assert settings.venv_source == tmp_path / ".venv"
+    assert settings.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+    # tee_stream_json is read from claude_code config (launch_api_worker
+    # force-enables it internally, but AdapterSettings still carries the
+    # configured value for the manifest/results surface).
+    assert settings.tee_stream_json is True
+
+
+def test_adapter_settings_non_api_branches_omit_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """For devin-shell / claude-code / manual adapters, _adapter_settings()
+    must set api_worker_config=None so a stale config block cannot leak into a
+    non-api dispatch lane."""
+    for adapter in ("devin-shell", "claude-code", "manual"):
+        config = OrchestratorConfig(devin=DevinConfig(adapter=adapter))
+        paths = runtime_paths(tmp_path, config.runtime.state_dir)
+        app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+        settings = app._adapter_settings()
+        assert settings.adapter == adapter
+        assert settings.api_worker_config is None, (
+            f"adapter={adapter} must not carry api_worker_config"
+        )
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
