@@ -31,7 +31,11 @@ from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
-from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
+from charlie_work.subprocess_runner import (
+    hidden_console_kwargs,
+    no_console_window_kwargs,
+    run_captured,
+)
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -642,7 +646,7 @@ def _check_no_op_rework(
             capture_output=True,
             check=True,
             text=True,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         # Count non-merge commits since the reviewed head, excluding base-reachable commits
         # The ^ syntax excludes commits reachable from the given refs
@@ -796,7 +800,7 @@ def detect_cross_pr_revert(
             capture_output=True,
             text=True,
             check=False,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         if fetch.returncode != 0:
             return None

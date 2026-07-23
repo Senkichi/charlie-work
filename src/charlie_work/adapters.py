@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import OrchestratorConfig
+from .config import ApiWorkerConfig, OrchestratorConfig
 from .subprocess_runner import run_captured
 
 
@@ -67,6 +67,12 @@ class AdapterSettings:
     # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
     # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
     tee_stream_json: bool = False
+    # api-worker adapter: the resolved ApiWorkerConfig registry section. Carried
+    # through AdapterSettings the same way claude_command/worker_env carry the
+    # claude-code settings. None for non-api adapters; required for the "api"
+    # adapter branch. The provider registry, budget caps, and active provider
+    # name all live on this frozen value object (added in #475).
+    api_worker_config: ApiWorkerConfig | None = None
     # Full orchestrator config passed to worktree creation/recovery for liveness probes.
     config: OrchestratorConfig | None = None
 
@@ -142,6 +148,12 @@ def dispatch_sessions(
             lambda request: _run_claude_code_adapter(repo_root, request, sessions_dir, settings),
             settings.launch_stagger_seconds,
         )
+    elif adapter == "api":
+        results = _launch_staggered(
+            requests,
+            lambda request: _run_api_adapter(repo_root, request, sessions_dir, settings),
+            settings.launch_stagger_seconds,
+        )
     else:
         results = [
             _result(
@@ -215,6 +227,14 @@ def _instructions(adapter: str) -> list[str]:
             "Claude Code workers were launched headless in isolated git worktrees.",
             "Per-worker sidecar JSON and logs live under the sessions directory.",
             "Never remove a worktree before deleting its .venv junction.",
+        ]
+    if adapter == "api":
+        return [
+            "API workers were launched headless via the Claude Code CLI against a",
+            "configured Anthropic-compatible provider endpoint (adapter_kind: api).",
+            "Per-worker sidecar JSON (issue-<n>.api.json) and logs live under the",
+            "sessions directory; the provider env is injected into the child process",
+            "only — the API key never appears in sidecars, logs, or argv.",
         ]
     return [
         "Open one Devin worker session per request.",
@@ -336,6 +356,72 @@ def _run_claude_code_adapter(
     return _result(
         request,
         adapter="claude-code",
+        ok=ok,
+        command=list(record.command),
+        error=record.error if not ok else None,
+        reclaimed=record.reclaimed,
+        pid=record.pid,
+        process_start_time=record.process_start_time,
+        failure_kind=record.failure_kind,
+    )
+
+
+def _run_api_adapter(
+    repo_root: Path,
+    request: SessionRequest,
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> SessionDispatchResult:
+    """Launch an api worker (Claude Code CLI + provider env).
+
+    Mirrors ``_run_claude_code_adapter``: reads the prompt, delegates to
+    ``api_worker.launch_api_worker`` (which resolves the active provider, builds
+    the provider env, and calls ``claude_code.launch_claude_worker`` with
+    ``adapter_kind="api"``), and maps the record into a SessionDispatchResult.
+    ``tee_stream_json`` is force-enabled inside ``launch_api_worker`` regardless
+    of ``settings.tee_stream_json`` (the budget ledger depends on events.jsonl).
+    """
+    from .api_worker import launch_api_worker
+
+    api_worker_config = settings.api_worker_config
+    if api_worker_config is None:
+        return _result(
+            request,
+            adapter="api",
+            ok=False,
+            error=(
+                "api adapter selected but no api_worker_config was resolved into "
+                "AdapterSettings; cannot launch api worker"
+            ),
+        )
+    try:
+        prompt_text = request.prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _result(request, adapter="api", ok=False, error=str(exc))
+    kwargs: dict[str, Any] = {}
+    if settings.claude_command:
+        kwargs["command_template"] = settings.claude_command
+    record = launch_api_worker(
+        request.issue_number,
+        request.branch_name,
+        prompt_text,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=api_worker_config,
+        worktrees_dir=settings.worktrees_dir,
+        venv_source=settings.venv_source,
+        worker_env=settings.worker_env,
+        materialize_dirs=settings.materialize_dirs,
+        rework=request.rework,
+        recovery=request.recovery,
+        base_ref=settings.base_ref,
+        config=settings.config,
+        **kwargs,
+    )
+    ok = record.error is None and record.pid is not None
+    return _result(
+        request,
+        adapter="api",
         ok=ok,
         command=list(record.command),
         error=record.error if not ok else None,
