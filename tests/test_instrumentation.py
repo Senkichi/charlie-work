@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -58,9 +57,9 @@ def test_log_event_with_correlation_id(tmp_path: Path) -> None:
 
 def test_correlation_context_nesting(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
-    with correlation_context("outer") as outer_cid:
+    with correlation_context("outer"):
         assert current_correlation_id() == "outer"
-        with correlation_context("inner") as inner_cid:
+        with correlation_context("inner"):
             assert current_correlation_id() == "inner"
             log_event(state_path, "inner_event", {})
         assert current_correlation_id() == "outer"
@@ -265,9 +264,7 @@ def test_query_events_multiple_filters(tmp_path: Path) -> None:
     with correlation_context("pass-2"):
         log_event(state_path, "github_error", {"pr_number": 42})
 
-    results = query_events(
-        state_path, kind="github_error", correlation_id="pass-1", pr_number=42
-    )
+    results = query_events(state_path, kind="github_error", correlation_id="pass-1", pr_number=42)
     assert len(results) == 1
     assert results[0]["kind"] == "github_error"
     assert results[0]["correlation_id"] == "pass-1"
@@ -278,6 +275,7 @@ def test_query_events_since_until(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     # Insert an event with a known past timestamp
     from charlie_work.instrumentation import _get_db
+
     conn = _get_db(state_path)
     assert conn is not None
     conn.execute(
@@ -337,6 +335,7 @@ def test_record_loop_pass(tmp_path: Path) -> None:
     )
 
     from charlie_work.instrumentation import _get_db
+
     conn = _get_db(state_path)
     assert conn is not None
     cursor = conn.execute("SELECT * FROM loop_passes WHERE correlation_id = ?", ("cid-1",))
@@ -359,8 +358,18 @@ def test_jsonl_migration(tmp_path: Path) -> None:
 
     # Write some legacy JSONL entries
     records = [
-        {"ts": "2025-01-01T00:00:00Z", "kind": "dispatch", "payload": {"issue": 1}, "repo": "test"},
-        {"ts": "2025-01-01T00:01:00Z", "kind": "review", "payload": {"pr_number": 42}, "correlation_id": "abc"},
+        {
+            "ts": "2025-01-01T00:00:00Z",
+            "kind": "dispatch",
+            "payload": {"issue": 1},
+            "repo": "test",
+        },
+        {
+            "ts": "2025-01-01T00:01:00Z",
+            "kind": "review",
+            "payload": {"pr_number": 42},
+            "correlation_id": "abc",
+        },
         {"ts": "2025-01-01T00:02:00Z", "kind": "loop_completed", "payload": {"ok": True}},
     ]
     with open(jsonl_path, "w", encoding="utf-8") as f:
@@ -392,7 +401,9 @@ def test_jsonl_migration_skips_malformed(tmp_path: Path) -> None:
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(json.dumps({"ts": "2025-01-01T00:00:00Z", "kind": "good", "payload": {}}) + "\n")
         f.write("not valid json\n")
-        f.write(json.dumps({"ts": "2025-01-01T00:01:00Z", "kind": "also_good", "payload": {}}) + "\n")
+        f.write(
+            json.dumps({"ts": "2025-01-01T00:01:00Z", "kind": "also_good", "payload": {}}) + "\n"
+        )
 
     events = read_event_log(state_path)
     assert len(events) == 2
@@ -411,6 +422,7 @@ def test_wal_mode_enabled(tmp_path: Path) -> None:
     log_event(state_path, "test", {})
 
     from charlie_work.instrumentation import _get_db
+
     conn = _get_db(state_path)
     assert conn is not None
     cursor = conn.execute("PRAGMA journal_mode")

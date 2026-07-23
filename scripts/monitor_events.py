@@ -15,7 +15,6 @@ from pathlib import Path
 from charlie_work.instrumentation import (
     close_db,
     event_counts_by_kind,
-    query_events,
     read_event_log,
 )
 
@@ -34,8 +33,10 @@ def monitor(state_path: Path, interval: int = 60) -> None:
 
             if current_count > last_count:
                 new_events = events[last_count:]
-                print(f"\n[{datetime.now(UTC).isoformat()}] {len(new_events)} new event(s) "
-                      f"(total: {current_count})")
+                print(
+                    f"\n[{datetime.now(UTC).isoformat()}] {len(new_events)} new event(s) "
+                    f"(total: {current_count})"
+                )
 
                 # Group by kind
                 kinds: dict[str, int] = {}
@@ -58,16 +59,20 @@ def monitor(state_path: Path, interval: int = 60) -> None:
                 # Show errors and warnings in detail
                 for e in new_events:
                     if e.get("level") in ("error", "warning"):
-                        print(f"  [{e.get('ts')}] {e.get('kind')} "
-                              f"pr={e.get('pr_number')} issue={e.get('issue_number')} "
-                              f"cid={e.get('correlation_id')} "
-                              f"payload={e.get('payload')}")
+                        print(
+                            f"  [{e.get('ts')}] {e.get('kind')} "
+                            f"pr={e.get('pr_number')} issue={e.get('issue_number')} "
+                            f"cid={e.get('correlation_id')} "
+                            f"payload={e.get('payload')}"
+                        )
 
                 last_count = current_count
             elif current_count < last_count:
                 # DB was reset or migration happened
-                print(f"\n[{datetime.now(UTC).isoformat()}] Event count reset "
-                      f"({last_count} -> {current_count})")
+                print(
+                    f"\n[{datetime.now(UTC).isoformat()}] Event count reset "
+                    f"({last_count} -> {current_count})"
+                )
                 last_count = current_count
 
             # Full summary every 5 minutes

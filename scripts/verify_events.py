@@ -1,4 +1,5 @@
 """One-shot verification of events.db health."""
+
 from pathlib import Path
 from charlie_work.instrumentation import (
     read_event_log,
@@ -40,7 +41,9 @@ rows = cursor.fetchall()
 print(f"Loop passes recorded: {lp_count}")
 print("Last 5 loop passes:")
 for r in rows:
-    print(f"  cid={r[0]} started={r[1]} completed={r[2]} ok={r[3]} elapsed={r[4]}s errors={r[5]} merges={r[6]} reviews={r[7]}")
+    print(
+        f"  cid={r[0]} started={r[1]} completed={r[2]} ok={r[3]} elapsed={r[4]}s errors={r[5]} merges={r[6]} reviews={r[7]}"
+    )
 print()
 
 db_path = sp.parent / "events.db"

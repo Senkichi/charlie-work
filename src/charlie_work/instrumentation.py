@@ -117,34 +117,38 @@ CREATE TABLE IF NOT EXISTS loop_passes (
 """
 
 # Event kinds that are considered errors or warnings for the ``level`` column.
-_ERROR_KINDS = frozenset({
-    "github_error",
-    "github_not_found_error",
-    "intake_failed",
-    "session_stalled",
-    "session_failed_escalated",
-    "session_failed_relabeled",
-    "session_salvaged",
-    "review_dispatch_stalled",
-    "review_checkout_removal_failed",
-    "dispatch_failed",
-    "orphan_processes_killed",
-    "orphaned_worker_routed_to_review",
-    "pre_review_rework_routed",
-    "rework_requeued",
-    "merge_blocked",
-    "merge_failed",
-    "spec_review_failed",
-    "operator_claim_failed",
-})
-_WARNING_KINDS = frozenset({
-    "dispatch_skip_blocked",
-    "dispatch_skip_operator_claimed",
-    "dispatch_merged_pr_references_closed",
-    "dispatch_merged_pr_mention_flagged",
-    "review_dispatch_lifecycle_reaped",
-    "session_rate_limit_deferred",
-})
+_ERROR_KINDS = frozenset(
+    {
+        "github_error",
+        "github_not_found_error",
+        "intake_failed",
+        "session_stalled",
+        "session_failed_escalated",
+        "session_failed_relabeled",
+        "session_salvaged",
+        "review_dispatch_stalled",
+        "review_checkout_removal_failed",
+        "dispatch_failed",
+        "orphan_processes_killed",
+        "orphaned_worker_routed_to_review",
+        "pre_review_rework_routed",
+        "rework_requeued",
+        "merge_blocked",
+        "merge_failed",
+        "spec_review_failed",
+        "operator_claim_failed",
+    }
+)
+_WARNING_KINDS = frozenset(
+    {
+        "dispatch_skip_blocked",
+        "dispatch_skip_operator_claimed",
+        "dispatch_merged_pr_references_closed",
+        "dispatch_merged_pr_mention_flagged",
+        "review_dispatch_lifecycle_reaped",
+        "session_rate_limit_deferred",
+    }
+)
 
 
 def _now_iso() -> str:
@@ -212,7 +216,9 @@ def _extract_payload_refs(payload: dict[str, Any]) -> tuple[int | None, int | No
         issue_number = payload.get("issue")
     return (
         int(pr_number) if isinstance(pr_number, (int, float)) and pr_number == pr_number else None,
-        int(issue_number) if isinstance(issue_number, (int, float)) and issue_number == issue_number else None,
+        int(issue_number)
+        if isinstance(issue_number, (int, float)) and issue_number == issue_number
+        else None,
     )
 
 
@@ -404,8 +410,15 @@ def record_loop_pass(
                        SET completed_at = ?, ok = ?, elapsed_seconds = ?,
                            error_count = ?, merge_count = ?, review_count = ?
                        WHERE correlation_id = ?""",
-                    (completed_at, 1 if ok else 0, elapsed_seconds,
-                     error_count, merge_count, review_count, correlation_id),
+                    (
+                        completed_at,
+                        1 if ok else 0,
+                        elapsed_seconds,
+                        error_count,
+                        merge_count,
+                        review_count,
+                        correlation_id,
+                    ),
                 )
     except sqlite3.Error as exc:
         logger.warning("Failed to record loop pass: %s", exc)
@@ -552,9 +565,7 @@ def query_events(
         return []
 
 
-def event_counts_by_kind(
-    state_path: Path, *, since: str | None = None
-) -> dict[str, int]:
+def event_counts_by_kind(state_path: Path, *, since: str | None = None) -> dict[str, int]:
     """Return a summary of event counts grouped by kind.
 
     Useful for quick dashboards: "what kinds of things happened?"
