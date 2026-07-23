@@ -33,6 +33,25 @@ Issue workflow state (`queued`, `in-progress`, `pr-open`, …) is stored as GitH
 labels on the issue and mirrored to `.var/charlie-work/state.json`. It is never
 inferred from conversation history or process memory.
 
+### Instrumentation: events.db (SQLite) + correlation IDs
+Every event written to `state.json`'s capped `events` array (200 entries) is
+also dual-written to an unlimited append-only SQLite database (`events.db`)
+next to `state.json`. Use `self._record_event()` in `OrchestratorApp` methods
+(it passes `state_path` automatically). In standalone functions, pass
+`state_path=state_file` to `append_event()`. For events outside state-lock
+contexts (e.g. loop-level errors), call `log_event()` directly from
+`instrumentation.py`.
+
+The `events` table has indexed columns for `kind`, `ts`, `correlation_id`,
+`pr_number`, `issue_number`, and `level` (auto-classified info/warning/error).
+Use `query_events()` for structured filtering or `event_counts_by_kind()` for
+quick aggregation summaries. A `loop_passes` table records per-pass metadata.
+
+Each `loop()` pass is wrapped in a `correlation_context()` so all events from
+that pass share a correlation ID. Use `events_by_correlation_id()` to retrieve
+the full event sequence for a specific pass when investigating issues. Legacy
+`events.jsonl` files are auto-migrated to SQLite on first access.
+
 ### Label state-machine names come from `LabelConfig`
 All label strings must be read from a `LabelConfig` instance (default fields in
 `config.LabelConfig`). Never hard-code label strings like `"agent:queued"` in

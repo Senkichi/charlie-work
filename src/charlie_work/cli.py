@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug-level logging")
     parser.add_argument(
         "--fleet-dir", type=str, default=None, help="Override fleet directory path"
     )
@@ -904,6 +906,12 @@ def main(argv: list[str] | None = None) -> int:
     json_output = "--json" in raw_argv
     args = parser.parse_args([arg for arg in raw_argv if arg != "--json"])
     args.json_output = json_output or args.json_output
+
+    logging.basicConfig(
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
     try:
         if args.command == "doctor":
             result = run_doctor_command(args)

@@ -457,12 +457,30 @@ def load_state_locked(path: Path) -> dict[str, Any]:
         return load_state(path)
 
 
-def append_event(data: dict[str, Any], kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Return a new state dict with the event appended; do not mutate ``data``."""
+def append_event(
+    data: dict[str, Any],
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    state_path: Path | None = None,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Return a new state dict with the event appended; do not mutate ``data``.
+
+    When ``state_path`` is provided, the event is also written to the
+    unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
+    This dual-write preserves the complete audit history beyond the 200-entry
+    convenience cap in ``state.json``'s ``events`` array. The write is
+    best-effort — instrumentation never breaks the core workflow.
+    """
     events = list(data.get("events", []))
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
     if len(events) > 200:
         events = events[-200:]
+    if state_path is not None:
+        from .instrumentation import log_event
+
+        log_event(state_path, kind, payload, repo=repo)
     return {**data, "events": events}
 
 
