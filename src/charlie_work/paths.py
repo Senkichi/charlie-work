@@ -4,7 +4,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import hidden_console_kwargs
 
 
 class RepoNotFoundError(ValueError):
@@ -46,7 +46,7 @@ def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
             text=True,
             capture_output=True,
             check=True,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         return Path(result.stdout.strip()).resolve()
     except (OSError, subprocess.CalledProcessError):
