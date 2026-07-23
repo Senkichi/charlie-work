@@ -547,6 +547,18 @@ def set_reviewer_quota_exhausted(
     return {**data, "reviewer_quota": quota}
 
 
+def mark_reviewer_quota_alerted(data: dict[str, Any]) -> dict[str, Any]:
+    """Record that the current quota-exhaustion episode has been alerted.
+
+    One attention digest per exhaustion episode: the marker is cleared with
+    the rest of the quota record when the probe succeeds, so a later episode
+    alerts again. Returns a new state dict; does not mutate ``data``.
+    """
+    quota = _reviewer_quota(data)
+    quota["alerted_at"] = utc_now()
+    return {**data, "reviewer_quota": quota}
+
+
 def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     """Clear reviewer quota exhaustion state.
 
@@ -557,4 +569,5 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
         return data
     quota.pop("throttled_until", None)
     quota.pop("probe_after", None)
+    quota.pop("alerted_at", None)
     return {**data, "reviewer_quota": quota}

@@ -30,10 +30,24 @@ from .janitor import _calculate_patch_id
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
-from .subprocess_runner import run_captured
+from .subprocess_runner import RunResult, run_captured
 from . import state as _state
 
 _DEFAULT_TIMEOUT_SECONDS = 60
+# Shorter timeout for network-touching git commands (ls-remote, fetch) so a
+# stalled remote call cannot consume the entire local dispatch budget.
+_REMOTE_TIMEOUT_SECONDS = 20
+
+
+def _run_remote_captured(command: list[str], cwd: Path) -> RunResult:
+    """Run a network-touching git command with a short, retryable timeout."""
+    result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
+    # Retry once on timeout: a transient network stall should not permanently
+    # block reclaim of a pristine worktree.
+    if result.timed_out:
+        result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
+    return result
+
 
 # Sentinel values for operator claim markers. The operator marker intentionally
 # does not encode the CLI invocation's transient PID; liveness is derived from
@@ -425,18 +439,20 @@ def _resolve_default_branch_ref(repo_root: Path) -> str:
     # origin/HEAD is unset on this clone; set-head persists it in-repo so both
     # future dispatches and operator git usage benefit. Failure surfaces via
     # the retried symref read below, not an exception (run_captured contract).
-    run_captured(
+    set_head_result = run_captured(
         ["git", "remote", "set-head", "origin", "--auto"],
         cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds=_REMOTE_TIMEOUT_SECONDS,
     )
     resolved = _read_origin_head_symref(repo_root)
     if resolved is not None:
         return resolved
 
+    detail = set_head_result.error or set_head_result.stderr
     raise RuntimeError(
         "Cannot resolve origin's default branch: refs/remotes/origin/HEAD is "
-        "unset and 'git remote set-head origin --auto' did not heal it. "
+        "unset and 'git remote set-head origin --auto' did not heal it"
+        f"{f' ({detail})' if detail else ''}. "
         "Refusing to base a fresh worktree on local HEAD (issue #239)."
     )
 
@@ -464,11 +480,13 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     - exists: exit 0 AND non-empty stdout
     - missing: exit 0 AND empty stdout
     - probe-failed: nonzero exit (e.g., network error, auth failure)
+
+    Uses the shorter network timeout so a stalled probe cannot consume the full
+    local dispatch budget.
     """
-    result = run_captured(
+    result = _run_remote_captured(
         ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
         cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not result.ok:
         # Probe failed (network error, auth failure, etc.)
@@ -763,19 +781,19 @@ def _worktree_refuse_to_reset_reason(
 
     Checks for:
       - uncommitted modifications in ``worktree_path`` (if it exists)
-      - local commits that are not present on the remote branch (``git ls-remote``
-        comparison, falling back to the merge-base with ``base_ref`` when the remote
-        branch does not exist)
+      - local commits that are not present on the remote branch
 
-    This is read-only: it never commits, fetches, or resets.
+    This is read-only: it never commits, fetches, or resets. It resolves ``base_ref``
+    locally and skips the ``git ls-remote`` probe entirely when the local tip is
+    already at or behind the base. The remote probe is only consulted when the
+    local branch has commits beyond ``base_ref``.
 
     Raises:
-        WorktreeProbeFailedError: if the ``git status --porcelain`` probe itself
-            fails (index lock, corruption, permissions). The reset is still
-            refused (we cannot confirm the worktree is clean), but this is
-            classified distinctly from a confirmed-dirty worktree — see the
-            class docstring for why callers must not conflate the two under
-            the same ``failure_kind``.
+        WorktreeProbeFailedError: if a probe (``git status --porcelain`` or
+            ``git ls-remote``) itself fails. The reset is still refused (we cannot
+            confirm the worktree is clean), but this is classified distinctly from
+            a confirmed-dirty worktree — see the class docstring for why callers
+            must not conflate the two under the same ``failure_kind``.
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
@@ -799,21 +817,51 @@ def _worktree_refuse_to_reset_reason(
 
     local_sha = local_tip_result.stdout.strip()
 
-    # Compare against the remote branch via git ls-remote.
-    remote_sha: str | None = None
-    if _has_origin_remote(repo_root):
-        ls_remote_result = run_captured(
-            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+    # Resolve the dispatch base ref locally. If the local tip is the base commit
+    # or an ancestor of it, the worktree has no commits beyond the base and is
+    # safe to reclaim without a network round-trip.
+    base = base_ref if base_ref else _resolve_default_branch_ref(repo_root)
+    base_sha_result = run_captured(
+        ["git", "rev-parse", "--verify", base],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if base_sha_result.ok and base_sha_result.stdout.strip():
+        base_sha = base_sha_result.stdout.strip()
+        if local_sha == base_sha:
+            return None
+        ancestor_result = run_captured(
+            ["git", "merge-base", "--is-ancestor", local_sha, base_sha],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
-        if ls_remote_result.ok and ls_remote_result.stdout.strip():
+        if ancestor_result.ok:
+            return None
+
+    # The local tip has commits beyond the base (or the base is unresolvable),
+    # so we must ask the remote whether those commits are already pushed.
+    remote_sha: str | None = None
+    if _has_origin_remote(repo_root):
+        ls_remote_result = _run_remote_captured(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=repo_root,
+        )
+        if ls_remote_result.timed_out:
+            raise WorktreeProbeFailedError(
+                f"git ls-remote origin refs/heads/{branch} timed out after "
+                f"{_REMOTE_TIMEOUT_SECONDS}s"
+            )
+        if not ls_remote_result.ok:
+            raise WorktreeProbeFailedError(
+                f"git ls-remote origin refs/heads/{branch} failed: "
+                f"{ls_remote_result.error or ls_remote_result.stderr}"
+            )
+        if ls_remote_result.stdout.strip():
             remote_sha = ls_remote_result.stdout.strip().split()[0]
 
     if remote_sha is None:
         # Branch does not exist on origin (or the probe failed). Any commits beyond
         # the base ref are unpushed and must not be discarded.
-        base = base_ref if base_ref else _resolve_default_branch_ref(repo_root)
         merge_base_result = run_captured(
             ["git", "merge-base", base, local_sha],
             cwd=repo_root,
@@ -879,6 +927,89 @@ def _worktree_dirty_reason(
     if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
         return "worktree has uncommitted modifications"
     return None
+
+
+def _is_pristine_orchestrator_worktree(
+    repo_root: Path,
+    worktree_path: Path,
+    base_ref: str,
+) -> bool:
+    """Return True after bringing an existing worktree to the current dispatch base.
+
+    A worktree created by the orchestrator and never handed to a worker is
+    pristine when it has no worker-authored uncommitted changes and its HEAD
+    is at the dispatch base. Remote-tracking base refs are fetched first so
+    the comparison uses the live origin tip rather than a stale local
+    remote-tracking ref. If the worktree is behind the fetched base it is
+    reset to that tip in-place and still considered reclaimable; if it is
+    ahead or diverged it is not reclaimable without a remote probe.
+
+    Such a worktree can be reclaimed directly without the remote
+    ``git ls-remote`` probe.
+    """
+    if not worktree_path.is_dir():
+        return False
+    # A truly pristine worktree has no uncommitted changes at all, including
+    # orchestrator-injected prompt files. Injected-only dirty worktrees are
+    # reclaimed by pruning and recreating, not by reuse (issue #381), while
+    # still avoiding the remote git probe because the subsequent reset guard
+    # runs the same local checks.
+    status_result = run_captured(
+        ["git", "status", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not status_result.ok or status_result.stdout.strip():
+        return False
+
+    head_result = run_captured(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok or not head_result.stdout.strip():
+        return False
+    head_sha = head_result.stdout.strip()
+
+    # For remote-tracking base refs, fetch first so we compare against the
+    # live origin tip rather than a stale local remote-tracking ref.
+    if base_ref.startswith("origin/") and _has_origin_remote(repo_root):
+        remote_branch = base_ref[len("origin/") :]
+        fetch_result = _run_remote_captured(
+            ["git", "fetch", "origin", remote_branch],
+            cwd=repo_root,
+        )
+        if not fetch_result.ok:
+            # Cannot verify base freshness; refuse to reuse a potentially stale worktree.
+            return False
+
+    base_sha_result = run_captured(
+        ["git", "rev-parse", "--verify", base_ref],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_sha_result.ok or not base_sha_result.stdout.strip():
+        return False
+    base_sha = base_sha_result.stdout.strip()
+
+    if head_sha == base_sha:
+        return True
+
+    # If the worktree is behind the fetched base, reset it in-place.
+    ancestor_result = run_captured(
+        ["git", "merge-base", "--is-ancestor", head_sha, base_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if ancestor_result.ok:
+        reset_result = run_captured(
+            ["git", "reset", "--hard", base_sha],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return reset_result.ok
+
+    return False
 
 
 def _salvage_worktree(repo_root: Path, worktree_path: Path, branch: str) -> str | None:
@@ -1424,22 +1555,6 @@ def create_worktree(
     if base_ref == "":
         resolved_base_ref = _resolve_default_branch_ref(repo_root)
 
-    # Fetch if the resolved base_ref is a remote-tracking ref (origin/<branch>)
-    # Only do this for fresh dispatch (not rework/recovery) to avoid moving existing tips
-    if not rework and recovery is None and resolved_base_ref.startswith("origin/"):
-        # Extract the branch name from "origin/<branch>"
-        remote_branch = resolved_base_ref[len("origin/") :]
-        fetch_result = run_captured(
-            ["git", "fetch", "origin", remote_branch],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if not fetch_result.ok:
-            raise RuntimeError(
-                f"Failed to fetch base ref {resolved_base_ref!r} before worktree creation: "
-                f"{fetch_result.error or fetch_result.stderr}"
-            )
-
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     worktree_path = target_dir / _slugify(branch)
@@ -1702,6 +1817,41 @@ def create_worktree(
     if rework:
         # Rework mode: branch already exists, reuse or attach to it
         existing_worktrees = list_worktrees(repo_root)
+
+        # Issue #461: a leftover worktree can occupy the target path DETACHED
+        # (crashed attempt, reboot mid-rework). `git worktree list --porcelain`
+        # emits no `branch` line for a detached worktree, so the branch-name
+        # match below can never see it — and the attach path's
+        # `git worktree add` against the still-registered directory then fails
+        # with exit 128 on every pass, forever. Reclaim by path first,
+        # mirroring the fresh-dispatch reclaim (issue #110) and the recovery
+        # path, before falling back to the branch-name lookup.
+        stale_at_path = next(
+            (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
+            None,
+        )
+        if stale_at_path is not None:
+            stale_branch = (stale_at_path.get("branch") or "").replace("refs/heads/", "")
+            if stale_branch != branch:
+                if not worktree_path.exists():
+                    # Directory missing but still registered: prune the record.
+                    run_captured(
+                        ["git", "worktree", "prune"],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                    )
+                else:
+                    # Refuse to clobber uncommitted or unpushed work — a dirty
+                    # leftover needs attention, not silent deletion. The branch
+                    # ref itself is never deleted here, only the checkout.
+                    _raise_if_unsafe_to_reset(worktree_path)
+                    if not remove_worktree(repo_root, worktree_path, force=True):
+                        raise RuntimeError(
+                            f"Failed to reclaim stale worktree {worktree_path} "
+                            f"for rework branch {branch!r}"
+                        )
+                existing_worktrees = list_worktrees(repo_root)
+
         # Branch names in git worktree list may have refs/heads/ prefix
         existing_wt = next(
             (
@@ -1718,10 +1868,9 @@ def create_worktree(
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
-                fetch_result = run_captured(
+                fetch_result = _run_remote_captured(
                     ["git", "fetch", "origin", branch],
                     cwd=repo_root,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
                 # Fast-forward inside the worktree if fetch succeeded
                 if fetch_result.ok:
@@ -1748,10 +1897,9 @@ def create_worktree(
                             else None
                         )
                         if base_branch and base_branch != branch:
-                            run_captured(
+                            _run_remote_captured(
                                 ["git", "fetch", "origin", base_branch],
                                 cwd=repo_root,
-                                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                             )
                         reset_reason = _rework_reset_reason(repo_root, branch, resolved_base_ref)
                         reset_result = run_captured(
@@ -1768,7 +1916,7 @@ def create_worktree(
                 # If fetch failed with origin present, raise (real network/error failure)
                 if not fetch_result.ok:
                     raise RuntimeError(
-                        f"Fetch failed for rework branch {branch!r}: "
+                        f"[git fetch origin {branch}] Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
             if recovery is None:
@@ -1803,15 +1951,14 @@ def create_worktree(
             # No existing worktree: attach to existing branch (no -b flag)
             # Fetch first to ensure we materialize at the origin tip, but only if origin exists
             if _has_origin_remote(repo_root):
-                fetch_result = run_captured(
+                fetch_result = _run_remote_captured(
                     ["git", "fetch", "origin", branch],
                     cwd=repo_root,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
                 # If fetch failed with origin present, raise (real network/error failure)
                 if not fetch_result.ok:
                     raise RuntimeError(
-                        f"Fetch failed for rework branch {branch!r}: "
+                        f"[git fetch origin {branch}] Fetch failed for rework branch {branch!r}: "
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
 
@@ -1830,10 +1977,9 @@ def create_worktree(
                         else None
                     )
                     if base_branch and base_branch != branch:
-                        run_captured(
+                        _run_remote_captured(
                             ["git", "fetch", "origin", base_branch],
                             cwd=repo_root,
-                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                         )
                     reclaimed = _rework_reset_reason(repo_root, branch, resolved_base_ref)
                 if not origin_is_ancestor:
@@ -1865,11 +2011,14 @@ def create_worktree(
     else:
         # Fresh dispatch: create new branch off base_ref
         # Issue #110: Stale worktree reclamation before git worktree add
+        # Issue #461: a pristine orchestrator-created leftover worktree can be
+        # reclaimed directly without a remote fetch or ls-remote probe.
         existing_worktrees = list_worktrees(repo_root)
         existing_wt = next(
             (wt for wt in existing_worktrees if Path(wt["worktree"]) == worktree_path),
             None,
         )
+        need_worktree_add = True
         if existing_wt:
             wt_path = Path(existing_wt["worktree"])
             if not wt_path.exists():
@@ -1880,7 +2029,15 @@ def create_worktree(
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
                 reclaimed = "pruned"
-            elif wt_path.exists():
+            elif _is_pristine_orchestrator_worktree(repo_root, wt_path, resolved_base_ref):
+                # Reuse the pristine leftover worktree directly. It is already
+                # at the current dispatch base (remote-tracking bases are
+                # fetched and reset in-place by the pristine check), and it has
+                # no worker-authored changes.
+                worktree_path = wt_path
+                reclaimed = "reused"
+                need_worktree_add = False
+            else:
                 # Refuse to reset a worktree that still contains local work.
                 # Partial/dirty worktrees are the redispatch case, not the fresh
                 # dispatch case (issue #257).
@@ -1888,43 +2045,57 @@ def create_worktree(
                 # Directory is clean and has no local commits: remove and recreate
                 if not remove_worktree(repo_root, wt_path, force=True):
                     raise RuntimeError(
-                        f"Failed to remove stale worktree {wt_path} for fresh dispatch"
+                        f"git worktree remove failed for stale worktree {wt_path} for fresh dispatch"
                     )
                 reclaimed = "pruned"
 
-        # Delete the branch if it exists (it might be leftover from a killed session)
-        branch_result = run_captured(
-            ["git", "branch", "--list", branch],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if branch_result.ok and branch_result.stdout.strip():
-            # Refuse to reset a branch that still contains local commits.
-            _raise_if_unsafe_to_reset(worktree_path)
-            # Leftover branch from a killed session may hold real, unpushed
-            # commits (e.g. it died between committing and pushing) — snapshot
-            # before reclaiming it, same as the fetch-fallback recovery path.
-            _snapshot_before_delete(branch)
-            branch_delete_result = run_captured(
-                ["git", "branch", "-D", branch],
+        if need_worktree_add:
+            # Delete the branch if it exists (it might be leftover from a killed session)
+            branch_result = run_captured(
+                ["git", "branch", "--list", branch],
                 cwd=repo_root,
                 timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
-            if not branch_delete_result.ok:
-                raise RuntimeError(
-                    f"Failed to delete branch {branch!r} for fresh dispatch: "
-                    f"{branch_delete_result.error or branch_delete_result.stderr}"
+            if branch_result.ok and branch_result.stdout.strip():
+                # Refuse to reset a branch that still contains local commits.
+                _raise_if_unsafe_to_reset(worktree_path)
+                # Leftover branch from a killed session may hold real, unpushed
+                # commits (e.g. it died between committing and pushing) — snapshot
+                # before reclaiming it, same as the fetch-fallback recovery path.
+                _snapshot_before_delete(branch)
+                branch_delete_result = run_captured(
+                    ["git", "branch", "-D", branch],
+                    cwd=repo_root,
+                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
+                if not branch_delete_result.ok:
+                    raise RuntimeError(
+                        f"git branch -D failed for branch {branch!r} for fresh dispatch: "
+                        f"{branch_delete_result.error or branch_delete_result.stderr}"
+                    )
 
-        result = run_captured(
-            ["git", "worktree", "add", "-b", branch, str(worktree_path), resolved_base_ref],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if not result.ok:
-            raise RuntimeError(
-                f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+            if resolved_base_ref.startswith("origin/"):
+                remote_branch = resolved_base_ref[len("origin/") :]
+                fetch_result = _run_remote_captured(
+                    ["git", "fetch", "origin", remote_branch],
+                    cwd=repo_root,
+                )
+                if not fetch_result.ok:
+                    raise RuntimeError(
+                        f"[git fetch origin {remote_branch}] Failed to fetch base ref "
+                        f"{resolved_base_ref!r} before worktree creation: "
+                        f"{fetch_result.error or fetch_result.stderr}"
+                    )
+
+            result = run_captured(
+                ["git", "worktree", "add", "-b", branch, str(worktree_path), resolved_base_ref],
+                cwd=repo_root,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
             )
+            if not result.ok:
+                raise RuntimeError(
+                    f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
+                )
 
     venv_junction: Path | None = None
     if venv_source is not None:
@@ -2054,6 +2225,16 @@ def _default_reviews_dir(repo_root: Path) -> Path:
     return repo_root / ".var" / "charlie-work" / "dispatches" / "reviews"
 
 
+def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
+    """True if ``sha`` resolves to a commit object already present locally."""
+    result = run_captured(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def create_review_checkout(
     repo_root: Path,
     pr_number: int,
@@ -2103,17 +2284,28 @@ def create_review_checkout(
     # Only fetch if an origin remote exists (mirrors create_worktree's own
     # guard). Pure-local repos (test fixtures) have no origin to fetch from —
     # the caller-supplied head_sha must already be reachable locally there.
-    if _has_origin_remote(repo_root):
-        fetch_result = run_captured(
+    # Skip the network round-trip entirely when the commit is already local.
+    if _has_origin_remote(repo_root) and not _commit_exists_locally(repo_root, head_sha):
+        fetch_result = _run_remote_captured(
             ["git", "fetch", "origin", head_sha],
             cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
         if not fetch_result.ok:
-            raise RuntimeError(
-                f"Failed to fetch head_sha {head_sha!r} for PR #{pr_number} review checkout: "
-                f"{fetch_result.error or fetch_result.stderr}"
+            # Raw-SHA fetches are refused by the server when the SHA is not
+            # currently advertised (e.g. read just before a push updated the
+            # branch). The PR head ref is always advertised — fall back to it
+            # so a transient race doesn't block the review checkout; the
+            # worktree add below still pins the exact caller-supplied head_sha.
+            _run_remote_captured(
+                ["git", "fetch", "origin", f"refs/pull/{pr_number}/head"],
+                cwd=repo_root,
             )
+            if not _commit_exists_locally(repo_root, head_sha):
+                raise RuntimeError(
+                    f"[git fetch origin {head_sha}] Failed to fetch head_sha {head_sha!r} "
+                    f"for PR #{pr_number} review checkout: "
+                    f"{fetch_result.error or fetch_result.stderr}"
+                )
 
     result = run_captured(
         ["git", "worktree", "add", "--detach", str(checkout_path), head_sha],
@@ -2269,10 +2461,9 @@ def push_branch(
     if not push_result.ok:
         return False, push_result.error or push_result.stderr or "git push failed"
 
-    ls_remote_result = run_captured(
+    ls_remote_result = _run_remote_captured(
         ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
         cwd=cwd,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not ls_remote_result.ok:
         return False, ls_remote_result.error or ls_remote_result.stderr or "git ls-remote failed"

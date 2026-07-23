@@ -314,6 +314,32 @@ class WorkerView:
                 session_id=self.session_id,
             )
             return is_worker_alive(record)
+        elif self.adapter_kind == "api":
+            # api workers are Claude Code CLI processes with provider env
+            # injected; their sidecar/record shape is identical to claude-code
+            # (issue-<n>.api.json via launch_claude_worker adapter_kind="api"),
+            # so liveness delegates to the same is_worker_alive probe.
+            record = ClaudeWorkerRecord(
+                issue_number=self.issue_number,
+                branch="",
+                worktree_path=self.worktree_path,
+                prompt_path="",
+                command=(),
+                pid=self.pid,
+                started_at=self.started_at,
+                log_path=self.log_path,
+                error=self.error,
+                failure_kind=self.failure_kind,
+                process_start_time=self.process_start_time,
+                reclaimed=self.reclaimed,
+                last_activity_at=self.last_activity_at,
+                log_bytes=self.log_bytes,
+                rate_limit_defer_until=self.rate_limit_defer_until,
+                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
+                session_id=self.session_id,
+                adapter_kind="api",
+            )
+            return is_worker_alive(record)
         else:
             # Unknown adapter kind - conservatively treat as dead
             return False
@@ -363,6 +389,11 @@ class WorkerView:
             sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
         elif self.adapter_kind == "claude-code":
             sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number)
+        elif self.adapter_kind == "api":
+            # api sidecars share the claude-code sidecar-path derivation,
+            # routed through the adapter_kind-aware _sidecar_path helper so the
+            # .api.json suffix is selected.
+            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, "api")
         else:
             # Unknown adapter kind - nothing to reap
             return
@@ -707,9 +738,16 @@ def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
 
 
 def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView:
-    """Convert a ClaudeWorkerRecord to a WorkerView."""
+    """Convert a ClaudeWorkerRecord to a WorkerView.
+
+    The record's own ``adapter_kind`` is honored so ``issue-<n>.api.json``
+    sidecars (written by the api adapter, which delegates to
+    ``launch_claude_worker`` with ``adapter_kind="api"``) surface as
+    ``adapter_kind == "api"`` rather than being mis-tagged ``claude-code``.
+    Plain claude-code records carry ``adapter_kind == "claude-code"``.
+    """
     return WorkerView(
-        adapter_kind="claude-code",
+        adapter_kind=record.adapter_kind,
         issue_number=record.issue_number,
         repo_key=repo_key,
         pid=record.pid,
@@ -751,6 +789,12 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
 
     # Read claude-code sidecars
     for record in read_worker_records(sessions_dir):
+        workers.append(_from_claude_record(record, repo_key))
+
+    # Read api-worker sidecars (issue-<n>.api.json). The api adapter delegates
+    # to launch_claude_worker with adapter_kind="api", so the records are
+    # ClaudeWorkerRecord instances surfaced via the #476 record reader.
+    for record in read_worker_records(sessions_dir, adapter_kind="api"):
         workers.append(_from_claude_record(record, repo_key))
 
     return workers
@@ -831,6 +875,8 @@ def update_worker_log_stat(
         sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
     elif worker.adapter_kind == "claude-code":
         sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number)
+    elif worker.adapter_kind == "api":
+        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, "api")
     else:
         # Unknown adapter kind - nothing to update
         return
@@ -881,7 +927,9 @@ def update_worker_log_stat(
         from .devin_shell import _write_json
 
         _write_json(sidecar_path, payload)
-    elif worker.adapter_kind == "claude-code":
+    elif worker.adapter_kind in ("claude-code", "api"):
+        # api sidecars share the claude-code atomic-write helper (same on-disk
+        # record shape, just a different filename suffix).
         from .claude_code import _write_json_atomic
 
         _write_json_atomic(sidecar_path, payload)

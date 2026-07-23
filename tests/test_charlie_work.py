@@ -2202,6 +2202,85 @@ def test_adapter_settings_launch_stagger_seconds_wired_from_dispatch_config(
     assert app._adapter_settings().launch_stagger_seconds == 17
 
 
+def test_adapter_settings_api_branch_carries_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """_adapter_settings() with devin.adapter='api' must carry the resolved
+    ApiWorkerConfig into AdapterSettings and reuse the claude-code
+    venv_source/worker_env. This is the single point that routes the provider
+    registry into the api dispatch lane; a regression here silently breaks all
+    api dispatches with no downstream error (the adapter raises an error
+    result only at dispatch time, by which point the misconfiguration is
+    already fleet-wide)."""
+    from charlie_work.config import (
+        ApiBudgetConfig,
+        ApiProviderConfig,
+        ApiWorkerConfig,
+    )
+
+    api_provider = ApiProviderConfig(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+    api_cfg = ApiWorkerConfig(
+        enabled=True,
+        provider="kimi-k3",
+        max_concurrent_sessions=2,
+        providers={"kimi-k3": api_provider},
+        budget=ApiBudgetConfig(max_usd_per_session=1.5),
+        fallback_adapter="claude-code",
+    )
+    claude_cfg = ClaudeCodeConfig(
+        venv_source=".venv",
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"},
+        tee_stream_json=True,
+    )
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="api"),
+        claude_code=claude_cfg,
+        api_worker=api_cfg,
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    settings = app._adapter_settings()
+    assert settings.adapter == "api"
+    # The api branch must carry the resolved ApiWorkerConfig (not None) so the
+    # api dispatch lane can resolve the provider. This is the regression guard:
+    # test_dispatch_sessions_api_adapter_end_to_end constructs AdapterSettings
+    # directly and bypasses this path, so without this test a broken wiring
+    # (e.g. dropping the api_worker_config= line) would go undetected.
+    assert settings.api_worker_config is api_cfg
+    # The api branch reuses the claude-code venv_source/worker_env resolution.
+    assert settings.venv_source == tmp_path / ".venv"
+    assert settings.worker_env == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"}
+    # tee_stream_json is read from claude_code config (launch_api_worker
+    # force-enables it internally, but AdapterSettings still carries the
+    # configured value for the manifest/results surface).
+    assert settings.tee_stream_json is True
+
+
+def test_adapter_settings_non_api_branches_omit_api_worker_config(
+    tmp_path: Path,
+) -> None:
+    """For devin-shell / claude-code / manual adapters, _adapter_settings()
+    must set api_worker_config=None so a stale config block cannot leak into a
+    non-api dispatch lane."""
+    for adapter in ("devin-shell", "claude-code", "manual"):
+        config = OrchestratorConfig(devin=DevinConfig(adapter=adapter))
+        paths = runtime_paths(tmp_path, config.runtime.state_dir)
+        app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+        settings = app._adapter_settings()
+        assert settings.adapter == adapter
+        assert settings.api_worker_config is None, (
+            f"adapter={adapter} must not carry api_worker_config"
+        )
+
+
 def test_find_config_path_prefers_explicit_then_repo_root(tmp_path: Path) -> None:
     explicit = tmp_path / "elsewhere.yaml"
     assert find_config_path(tmp_path, explicit) == explicit
@@ -2645,23 +2724,15 @@ def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: P
 # --- Issue #361: merged_pr_list() cost (field scope + transient-gateway retry)
 
 
-def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path) -> None:
-    """merged_pr_list()'s sole consumer (workflow._merged_pr_referenced_issue_numbers,
-    via linked_issue_number()/issue_numbers_mentioned_by_pr()) only reads
-    state/headRefName/title/body/isCrossRepository. It must not request the
-    broader PR_LIST_FIELDS set — in particular not `statusCheckRollup`, which
-    forces gh's GraphQL query to walk each PR's check-run connection and is
-    the root cause of intermittent gateway 502s at ~500-merged-PR scale.
+def test_github_merged_pr_list_uses_rest_pagination(monkeypatch, tmp_path: Path) -> None:
+    """merged_pr_list() now uses the REST pulls endpoint instead of the
+    GraphQL-backed `gh pr list --state merged`, avoiding expensive field sets
+    such as `statusCheckRollup` (issue #361).
     """
     captured_args: list[list[str]] = []
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         captured_args.append(cmd)
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
@@ -2669,45 +2740,28 @@ def test_github_merged_pr_list_uses_scoped_field_set(monkeypatch, tmp_path: Path
     gh = github_module.GitHub(tmp_path)
     gh.merged_pr_list()
 
-    assert len(captured_args) == 2
-    args = captured_args[1]
-    assert args[:5] == ["gh", "pr", "list", "--state", "merged"]
-    fields = args[args.index("--json") + 1].split(",")
-    assert set(fields) == set(github_module.MERGED_PR_LIST_FIELDS.split(","))
-    for unused_field in (
-        "statusCheckRollup",
-        "reviewDecision",
-        "labels",
-        "author",
-        "updatedAt",
-        "url",
-        "baseRefName",
-        "mergeStateStatus",
-        "headRefOid",
-        "isDraft",
-    ):
-        assert unused_field not in fields
+    assert len(captured_args) == 1
+    args = captured_args[0]
+    assert args[:2] == ["gh", "api"]
+    assert "pulls" in args[2]
+    assert "state=closed" in args[2]
+    assert not any(c[:2] == ["gh", "pr"] and "merged" in c for c in captured_args)
 
 
 def test_github_merged_pr_list_retries_on_transient_gateway_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """A transient 502/503/504 from the GraphQL-backed listing endpoint retries
+    """A transient 502/503/504 from the REST pulls endpoint retries
     in-pass (bounded) instead of immediately failing the whole fleet pass for
     that repo (issue #361). Succeeds on the 2nd attempt here.
     """
     call_count = 0
     sleeps: list[float] = []
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
-        if call_count == 2:
+        if call_count == 1:
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=1,
@@ -2723,7 +2777,7 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     result = gh.merged_pr_list()
 
     assert result == []
-    assert call_count == 3
+    assert call_count == 2
     assert len(sleeps) == 1
 
 
@@ -2733,15 +2787,10 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     on to the next repo.
     """
     call_count = 0
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=1,
@@ -2756,7 +2805,7 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 4
+    assert call_count == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -2766,15 +2815,10 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     than be swallowed into the transient-gateway retry loop.
     """
     call_count = 0
-    rate_limit_payload = json.dumps({"resources": {"graphql": {"remaining": 10000, "reset": 0}}})
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=rate_limit_payload, stderr=""
-            )
         return subprocess.CompletedProcess(
             args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
         )
@@ -2785,7 +2829,7 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 2
+    assert call_count == 1
 
 
 # --- Issue #15 regression: list limits must match reconcile and warn on truncation
@@ -8760,6 +8804,534 @@ def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
     assert result.ok is False
 
 
+def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
+    """A PR whose branch-derived issue number does not exist in this repo
+    (e.g. opened against the wrong fleet repo) is parked via
+    ``foreign_issue_ref`` instead of failing the pass every 5 minutes
+    forever. GitHubNotFoundError from issue_view is caught before the
+    general GitHubError handler, so it never lands in result.data["errors"]
+    and does not flip result.ok to False."""
+    from charlie_work.config import NotifyConfig
+    from charlie_work.github import GitHubNotFoundError
+
+    class ForeignIssueGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+            self.prs = [
+                {
+                    "number": 789,
+                    "title": "Fix #4242: foreign",
+                    "url": "https://example.test/pull/789",
+                    "headRefName": "agent/issue-4242-x",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-789",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #4242",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+            self.issue_view_calls = 0
+
+        def issue_view(self, number: int):
+            if number == 4242:
+                self.issue_view_calls += 1
+                raise GitHubNotFoundError("could not resolve to a Issue with the number 4242.")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=False),
+        notify=NotifyConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ForeignIssueGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    assert result.data["errors"] == []
+    assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 1
+    assert captured[0].transitions[0].health == "FOREIGN_ISSUE_REF"
+    assert captured[0].transitions[0].issue_number == 789
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+
+    # Second pass: the durable marker skips all per-PR work with zero GitHub
+    # calls and no repeat digest.
+    result2 = app.loop(limit=0)
+
+    assert result2.ok is True
+    assert result2.data["open_tracked_prs"] == 0
+    assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 1
+
+
+def test_clear_reviewer_quota_drops_alerted_at() -> None:
+    """clear_reviewer_quota must also pop alerted_at so a later exhaustion
+    episode alerts again instead of staying silently suppressed."""
+    from charlie_work.state import (
+        clear_reviewer_quota,
+        mark_reviewer_quota_alerted,
+        set_reviewer_quota_exhausted,
+    )
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    state = mark_reviewer_quota_alerted(state)
+    assert "alerted_at" in state["reviewer_quota"]
+
+    cleared = clear_reviewer_quota(state)
+
+    assert "alerted_at" not in cleared["reviewer_quota"]
+    assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The first deferred pass of a quota-exhaustion episode emits one
+    REVIEWER_QUOTA_EXHAUSTED digest and persists reviewer_quota.alerted_at;
+    subsequent deferred passes in the same episode emit nothing."""
+    from charlie_work.config import NotifyConfig
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+        notify=NotifyConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {"throttled_until": future, "probe_after": future}
+        save_state(app.paths.state_file, state)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.data.get("deferred_reason") == "reviewer_quota_probe_backoff"
+    assert len(captured) == 1
+    assert captured[0].transitions[0].health == "REVIEWER_QUOTA_EXHAUSTED"
+    state_after = load_state(app.paths.state_file)
+    assert state_after["reviewer_quota"].get("alerted_at") is not None
+
+    # Second deferred pass in the same episode: no new digest.
+    result2 = app.dispatch_reviews()
+
+    assert result2.data.get("deferred_reason") == "reviewer_quota_probe_backoff"
+    assert len(captured) == 1
+
+
+def test_dispatch_reviews_launch_success_clears_stale_review_dispatch_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A successful launch must clear a stale review_dispatch_error left over
+    from an earlier failed attempt; otherwise the last error string is
+    carried forward verbatim by the **pr_state spread forever."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_error": "old boom",
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["launched_count"] == 1
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_error"] is None
+
+
+def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue observed 07-22: a dead reviewer sidecar for a PR already
+    lifecycle-reaped to merged/closed (review_dispatch_status None) must be
+    silently reaped -- no review_dispatch_stalled event, no rewrite to
+    failed. A second, non-terminal PR in the same pass still gets the normal
+    reap-to-failed treatment, proving the terminal skip is scoped to that PR
+    only."""
+    from charlie_work.state import empty_state
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "status": "merged",
+        "review_dispatch_status": None,
+    }
+    state["prs"]["200"] = {
+        "number": 200,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    def _sidecar(pr_number: int, started_at: str) -> dict[str, Any]:
+        return {
+            "issue_number": pr_number,
+            "branch": f"agent/issue-{pr_number}-fix",
+            "worktree_path": str(reviews_dir / f"pr-{pr_number}"),
+            "prompt_path": str(reviews_dir / f"pr-{pr_number}" / ".orchestrator-prompt.md"),
+            "command": ["claude", "-p"],
+            "pid": 999999999,
+            "started_at": started_at,
+            "log_path": str(reviews_dir / f"issue-{pr_number}.claude.log"),
+            "error": None,
+            "process_start_time": 1.0,
+            "adapter_kind": "claude-code",
+        }
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar_100 = reviews_dir / "issue-100.claude.json"
+    sidecar_100.write_text(json.dumps(_sidecar(100, old_started)), encoding="utf-8")
+    sidecar_200 = reviews_dir / "issue-200.claude.json"
+    sidecar_200.write_text(json.dumps(_sidecar(200, old_started)), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert not sidecar_100.exists()
+    assert not sidecar_200.exists()
+    assert [entry["pr"] for entry in stalled] == [200]
+
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["review_dispatch_status"] is None
+    assert state_after["prs"]["100"]["status"] == "merged"
+    assert state_after["prs"]["200"]["review_dispatch_status"] == "review_dispatch_failed"
+
+    stalled_events = [
+        e for e in state_after.get("events", []) if e.get("kind") == "review_dispatch_stalled"
+    ]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["payload"]["pr_number"] == 200
+
+
+def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue observed 07-22: reaping a merged PR's checkout without reaping
+    its dead reviewer sidecar left the sidecar to resurrect as a phantom
+    failed claim on every subsequent stalled sweep, which re-reaped it --
+    an infinite ping-pong. The orphan sweep must delete the sidecar, and a
+    following stalled-sweep pass must then see nothing to reap."""
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == [100]
+    assert not sidecar_path.exists()
+
+    # A following stalled-sweep pass sees nothing left to reap: the sidecar
+    # is gone (iter_workers yields no worker for PR 100) and the state's
+    # review_dispatch_status is already None -- the ping-pong is dead.
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert stalled == []
+    state_after = load_state(state_file)
+    assert not any(
+        e.get("kind") == "review_dispatch_stalled" for e in state_after.get("events", [])
+    )
+
+
+def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: a genuine worktree-removal failure must not be silently
+    discarded; the stalled sweep emits a one-shot warning event and sets a
+    per-PR marker so the next pass can retry without flooding the event ring."""
+    from datetime import timedelta
+
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": old_dispatched,
+        "reviewer_pid": 12345,
+        "reviewer_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-100-fix",
+        "worktree_path": str(reviews_dir / "pr-100"),
+        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_dispatched,
+        "log_path": str(reviews_dir / "issue-100.claude.log"),
+        "error": None,
+        "process_start_time": 1.0,
+        "adapter_kind": "claude-code",
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert [entry["pr"] for entry in stalled] == [100]
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+    assert warning_events[0]["payload"]["pr_number"] == 100
+
+
+def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #526: when a merged PR's review checkout cannot be removed, the
+    orphan sweep must not silently discard the failure, must not append a
+    lifecycle-reaped event or claim the PR as reaped, and must emit only one
+    warning per failure episode. A later successful retry clears the marker
+    and records the reap."""
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    checkout_dir = reviews_dir / "pr-100"
+    checkout_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+        "reviewer_pid": 12345,
+        "review_process_start_time": 1.0,
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 100,
+            "title": "Fix #1",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-100-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "body": "Closes #1",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+
+    call_count = 0
+
+    def fake_remove_review_checkout(
+        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return False
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+    )
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    # First pass: failure is reported once, PR is not claimed as reaped.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 1
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"]["status"] == "merged"
+    assert state_after["prs"]["100"]["review_dispatch_status"] is None
+    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
+    assert not any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Second pass: retry without re-emitting the warning.
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == []
+    assert call_count == 2
+    state_after = load_state(state_file)
+    warning_events = [
+        e
+        for e in state_after.get("events", [])
+        if e.get("kind") == "review_checkout_removal_failed"
+    ]
+    assert len(warning_events) == 1
+
+    # Third pass succeeds: the marker is cleared and the reap is recorded.
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [100]
+    assert call_count == 2  # the lambda does not increment the nested counter
+    state_after = load_state(state_file)
+    assert state_after["prs"]["100"].get("review_checkout_removal_warned") is None
+    assert any(
+        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
+    )
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
@@ -11104,6 +11676,70 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
     assert "123" in payload["failures"]
     assert "command exited 1" in payload["failures"]["123"]
     assert result.data["failures"][123] == payload["failures"]["123"]
+
+
+def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> None:
+    """Issue #515: repeated failed rework-dispatch attempts must count toward the
+    redispatch cap and escalate instead of retrying forever.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    for i in range(2):
+        result = app.dispatch_rework()
+        assert result.ok is False
+        assert result.data["failed_count"] == 1
+        state = load_state(paths.state_file)
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        assert len(state["issues"]["123"].get("redispatch_at", [])) == i + 1
+
+    # Third failure exceeds the cap and escalates to human-needed.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 3
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
 def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
@@ -23782,31 +24418,30 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 
 
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
-    """Test that redispatch_at is only written by the three known call sites (issue #165)."""
+    """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework (workflow.py:2440-2472)
-    # 2. _classify_dead_sessions_and_update_throttle_state (workflow.py:468-504)
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2: the
-    #    rework lane must consult the same redispatch cap the other two
-    #    sites do, instead of preserving redispatch_at unchanged forever).
+    # 1. dispatch_rework success + escalation paths, and now the failure path
+    #    (issue #515: failed rework-dispatch attempts also append redispatch_at
+    #    so they count toward the cap).
+    # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
+    #    escalation + dead-session normal + dead-session escalation).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
     # No other code paths write to redispatch_at.
 
-    # Verify the two call sites exist in the code
     import charlie_work.workflow as workflow_module
     import inspect
 
     workflow_source = inspect.getsource(workflow_module)
 
-    # Count occurrences of redispatch_at assignments to entry
-    # We have 2 assignments in dispatch_rework (normal + escalation), 3 in
-    # _classify_dead_sessions_and_update_throttle_state (launch-failure
-    # escalation + dead-session normal + dead-session escalation), and 2 in
-    # _reap_restore_rework_requested (rework escalation + rework restore,
-    # issue #315).
-    # Total of 7 assignments is correct.
+    # Count occurrences of redispatch_at assignments to entry:
+    # dispatch_rework: 2 (success normal + escalation) +
+    #                  2 (failure normal + escalation, issue #515) = 4
+    # _classify_dead_sessions_and_update_throttle_state: 3
+    # _reap_restore_rework_requested: 2
+    # Total of 9 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 7, (
-        f"Expected 7 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 9, (
+        f"Expected 9 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
@@ -26047,6 +26682,45 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     payload = rework_events[-1]["payload"]
     assert "123" in payload["failures"]
     assert payload["failures"]["123"] == reason
+
+
+def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None:
+    """Issue #461: repeated dispatch failures are capped and then escalated."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=1),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First dispatch failure is recorded normally.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+
+    # Second failure exceeds the cap and escalates the issue.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    assert result2.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # Third dispatch no longer selects the escalated issue.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    assert result3.data["selected_count"] == 0
 
 
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
