@@ -1,15 +1,15 @@
-"""Tests for the per-issue adapter routing policy (issue #477).
+"""Tests for the per-issue adapter routing policy (issues #477, #481).
 
 Exhaustive rule-matrix coverage: every preflight failure reason, rework vs
-first-pass, enabled/disabled, determinism, and the immutable
-``record_adapter_choice`` state helper.
+first-pass, complexity-high first-pass routing, enabled/disabled,
+determinism, and the immutable ``record_adapter_choice`` state helper.
 """
 
 from __future__ import annotations
 
 from types import MappingProxyType
 
-from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
+from charlie_work.config import ApiProviderConfig, ApiWorkerConfig, LabelConfig
 from charlie_work.routing import (
     AdapterChoice,
     BudgetStatus,
@@ -25,6 +25,10 @@ PROVIDER = ApiProviderConfig(
     output_usd_per_mtok=15.0,
     cached_input_usd_per_mtok=0.30,
 )
+
+# The complexity-high label string comes from LabelConfig, never a literal in
+# test bodies — mirrors the production invariant (issue #481).
+COMPLEXITY_HIGH = LabelConfig().complexity_high
 
 
 def _api_config(
@@ -56,28 +60,51 @@ def _budget_ok() -> BudgetStatus:
     )
 
 
+def _select(
+    *,
+    rework: bool = False,
+    issue_labels: frozenset[str] | set[str] = frozenset(),
+    complexity_high_label: str = COMPLEXITY_HIGH,
+    api_config: ApiWorkerConfig | None = None,
+    budget: BudgetStatus | None = None,
+    api_key_present: bool = True,
+    provider_in_cooldown: bool = False,
+    live_api_sessions: int = 0,
+    default_adapter: str = "devin-shell",
+) -> AdapterChoice:
+    """Thin keyword-only wrapper so every test passes the complexity label.
+
+    The default ``complexity_high_label`` is read from ``LabelConfig`` so the
+    literal ``"complexity:high"`` never appears in a test body — the same
+    invariant enforced in production code.
+    """
+    return select_adapter(
+        rework=rework,
+        issue_labels=issue_labels,
+        complexity_high_label=complexity_high_label,
+        api_config=api_config or _api_config(),
+        budget=budget or _budget_ok(),
+        api_key_present=api_key_present,
+        provider_in_cooldown=provider_in_cooldown,
+        live_api_sessions=live_api_sessions,
+        default_adapter=default_adapter,
+    )
+
+
 # ---------------------------------------------------------------------------
-# select_adapter — first-pass (rework=False) always routes to default
+# select_adapter — first-pass (rework=False) without the complexity label
+# routes to default
 # ---------------------------------------------------------------------------
 
 
 def test_first_pass_routes_to_default() -> None:
-    choice = select_adapter(
-        rework=False,
-        issue_labels=frozenset(),
-        api_config=_api_config(),
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
-    )
+    choice = _select(rework=False, issue_labels=frozenset())
     assert choice == AdapterChoice("devin-shell", "", "policy:default")
 
 
 def test_first_pass_ignores_api_state() -> None:
     """First-pass default routing is independent of api preflight inputs."""
-    choice = select_adapter(
+    choice = _select(
         rework=False,
         issue_labels=frozenset(),
         api_config=_api_config(enabled=False),
@@ -90,19 +117,126 @@ def test_first_pass_ignores_api_state() -> None:
     assert choice == AdapterChoice("claude-code", "", "policy:default")
 
 
-def test_first_pass_with_labels_still_default() -> None:
-    """No complexity rule exists yet; labels do not affect first-pass routing."""
-    choice = select_adapter(
-        rework=False,
-        issue_labels=frozenset({"complexity:high", "agent:queued"}),
-        api_config=_api_config(),
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
-    )
+def test_first_pass_without_complexity_label_is_default() -> None:
+    """First pass with unrelated labels but no complexity:high -> default."""
+    choice = _select(rework=False, issue_labels=frozenset({"agent:queued"}))
     assert choice == AdapterChoice("devin-shell", "", "policy:default")
+
+
+# ---------------------------------------------------------------------------
+# select_adapter — complexity-high first-pass routing (issue #481)
+# ---------------------------------------------------------------------------
+
+
+def test_complexity_high_first_pass_routes_to_api() -> None:
+    """First pass + complexity:high label -> api with policy:complexity."""
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH, "agent:queued"}),
+    )
+    assert choice == AdapterChoice("api", "example", "policy:complexity")
+
+
+def test_complexity_high_label_among_other_labels_routes_to_api() -> None:
+    """The complexity label matches even when buried among other labels."""
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH, "agent:queued", "bug"}),
+    )
+    assert choice == AdapterChoice("api", "example", "policy:complexity")
+
+
+def test_complexity_high_uses_configured_label_string() -> None:
+    """A customized complexity_high label is honored, not the default literal."""
+    custom = "difficulty:hard"
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({custom}),
+        complexity_high_label=custom,
+    )
+    assert choice == AdapterChoice("api", "example", "policy:complexity")
+
+
+def test_complexity_high_with_rework_routes_to_api_with_rework_reason() -> None:
+    """rework rule fires first; label + rework -> api, reason reflects rework."""
+    choice = _select(
+        rework=True,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+    )
+    assert choice == AdapterChoice("api", "example", "policy:rework")
+
+
+def test_complexity_high_first_pass_with_concurrency_at_limit_minus_one() -> None:
+    """live_api_sessions strictly less than max -> complexity rule still passes."""
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_config=_api_config(max_concurrent_sessions=3),
+        live_api_sessions=2,
+    )
+    assert choice == AdapterChoice("api", "example", "policy:complexity")
+
+
+# ---------------------------------------------------------------------------
+# select_adapter — complexity-high preflight failure matrix (issue #481)
+# Each preflight failure surfaces the same fallback reason as the rework rule.
+# ---------------------------------------------------------------------------
+
+
+def test_complexity_high_disabled_fallback() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_config=_api_config(enabled=False),
+    )
+    assert choice == AdapterChoice("devin-shell", "", "fallback:disabled")
+
+
+def test_complexity_high_auth_fallback() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_key_present=False,
+    )
+    assert choice == AdapterChoice("devin-shell", "", "fallback:auth")
+
+
+def test_complexity_high_budget_fallback() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        budget=BudgetStatus(5.0, 0.0, daily_headroom=False, lifetime_headroom=True),
+    )
+    assert choice == AdapterChoice("devin-shell", "", "fallback:budget")
+
+
+def test_complexity_high_cooldown_fallback() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        provider_in_cooldown=True,
+    )
+    assert choice == AdapterChoice("devin-shell", "", "fallback:cooldown")
+
+
+def test_complexity_high_concurrency_fallback() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_config=_api_config(max_concurrent_sessions=1),
+        live_api_sessions=1,
+    )
+    assert choice == AdapterChoice("devin-shell", "", "fallback:concurrency")
+
+
+def test_complexity_high_fallback_adapter_is_configurable() -> None:
+    choice = _select(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_config=_api_config(fallback_adapter="claude-code"),
+        api_key_present=False,
+    )
+    assert choice == AdapterChoice("claude-code", "", "fallback:auth")
 
 
 # ---------------------------------------------------------------------------
@@ -111,31 +245,21 @@ def test_first_pass_with_labels_still_default() -> None:
 
 
 def test_rework_routes_to_api_when_preflight_passes() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
         api_config=_api_config(provider="example"),
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("api", "example", "policy:rework")
 
 
 def test_rework_api_with_concurrency_at_limit_minus_one() -> None:
     """live_api_sessions strictly less than max -> still passes."""
-    config = _api_config(max_concurrent_sessions=3)
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=config,
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
+        api_config=_api_config(max_concurrent_sessions=3),
         live_api_sessions=2,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("api", "example", "policy:rework")
 
@@ -146,102 +270,67 @@ def test_rework_api_with_concurrency_at_limit_minus_one() -> None:
 
 
 def test_preflight_disabled_fallback() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
         api_config=_api_config(enabled=False),
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:disabled")
 
 
 def test_preflight_auth_fallback() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
-        budget=_budget_ok(),
         api_key_present=False,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:auth")
 
 
 def test_preflight_budget_daily_fallback() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
         budget=BudgetStatus(5.0, 0.0, daily_headroom=False, lifetime_headroom=True),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:budget")
 
 
 def test_preflight_budget_lifetime_fallback() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
         budget=BudgetStatus(0.0, 15.0, daily_headroom=True, lifetime_headroom=False),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:budget")
 
 
 def test_preflight_cooldown_fallback() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
-        budget=_budget_ok(),
-        api_key_present=True,
         provider_in_cooldown=True,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:cooldown")
 
 
 def test_preflight_concurrency_fallback() -> None:
-    config = _api_config(max_concurrent_sessions=1)
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=config,
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
+        api_config=_api_config(max_concurrent_sessions=1),
         live_api_sessions=1,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:concurrency")
 
 
 def test_preflight_concurrency_at_exactly_max_fallback() -> None:
     """live_api_sessions == max_concurrent_sessions -> fallback (>= not >)."""
-    config = _api_config(max_concurrent_sessions=3)
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=config,
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
+        api_config=_api_config(max_concurrent_sessions=3),
         live_api_sessions=3,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("devin-shell", "", "fallback:concurrency")
 
@@ -253,57 +342,47 @@ def test_preflight_concurrency_at_exactly_max_fallback() -> None:
 
 def test_disabled_wins_over_auth() -> None:
     """disabled is checked before auth."""
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
         api_config=_api_config(enabled=False),
-        budget=_budget_ok(),
         api_key_present=False,
         provider_in_cooldown=True,
         live_api_sessions=99,
-        default_adapter="devin-shell",
     )
     assert choice.reason == "fallback:disabled"
 
 
 def test_auth_wins_over_budget() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
         budget=BudgetStatus(5.0, 15.0, False, False),
         api_key_present=False,
         provider_in_cooldown=True,
         live_api_sessions=99,
-        default_adapter="devin-shell",
     )
     assert choice.reason == "fallback:auth"
 
 
 def test_budget_wins_over_cooldown() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=_api_config(),
         budget=BudgetStatus(5.0, 15.0, False, False),
-        api_key_present=True,
         provider_in_cooldown=True,
         live_api_sessions=99,
-        default_adapter="devin-shell",
     )
     assert choice.reason == "fallback:budget"
 
 
 def test_cooldown_wins_over_concurrency() -> None:
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
         api_config=_api_config(max_concurrent_sessions=1),
-        budget=_budget_ok(),
-        api_key_present=True,
         provider_in_cooldown=True,
         live_api_sessions=99,
-        default_adapter="devin-shell",
     )
     assert choice.reason == "fallback:cooldown"
 
@@ -314,16 +393,11 @@ def test_cooldown_wins_over_concurrency() -> None:
 
 
 def test_fallback_adapter_is_configurable() -> None:
-    config = _api_config(fallback_adapter="claude-code")
-    choice = select_adapter(
+    choice = _select(
         rework=True,
         issue_labels=frozenset(),
-        api_config=config,
-        budget=_budget_ok(),
+        api_config=_api_config(fallback_adapter="claude-code"),
         api_key_present=False,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
     )
     assert choice == AdapterChoice("claude-code", "", "fallback:auth")
 
@@ -344,7 +418,9 @@ def test_determinism_same_inputs_same_choice() -> None:
         live_api_sessions=0,
         default_adapter="devin-shell",
     )
-    assert select_adapter(**kwargs) == select_adapter(**kwargs)
+    assert select_adapter(complexity_high_label=COMPLEXITY_HIGH, **kwargs) == select_adapter(
+        complexity_high_label=COMPLEXITY_HIGH, **kwargs
+    )
 
 
 def test_determinism_fallback_path() -> None:
@@ -358,7 +434,25 @@ def test_determinism_fallback_path() -> None:
         live_api_sessions=0,
         default_adapter="devin-shell",
     )
-    assert select_adapter(**kwargs) == select_adapter(**kwargs)
+    assert select_adapter(complexity_high_label=COMPLEXITY_HIGH, **kwargs) == select_adapter(
+        complexity_high_label=COMPLEXITY_HIGH, **kwargs
+    )
+
+
+def test_determinism_complexity_path() -> None:
+    kwargs = dict(
+        rework=False,
+        issue_labels=frozenset({COMPLEXITY_HIGH}),
+        api_config=_api_config(),
+        budget=_budget_ok(),
+        api_key_present=True,
+        provider_in_cooldown=False,
+        live_api_sessions=0,
+        default_adapter="devin-shell",
+    )
+    assert select_adapter(complexity_high_label=COMPLEXITY_HIGH, **kwargs) == select_adapter(
+        complexity_high_label=COMPLEXITY_HIGH, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,17 +461,14 @@ def test_determinism_fallback_path() -> None:
 
 
 def test_issue_labels_accepts_plain_set() -> None:
-    choice = select_adapter(
-        rework=False,
-        issue_labels={"agent:queued"},
-        api_config=_api_config(),
-        budget=_budget_ok(),
-        api_key_present=True,
-        provider_in_cooldown=False,
-        live_api_sessions=0,
-        default_adapter="devin-shell",
-    )
+    choice = _select(rework=False, issue_labels={"agent:queued"})
     assert choice == AdapterChoice("devin-shell", "", "policy:default")
+
+
+def test_issue_labels_accepts_plain_set_with_complexity_label() -> None:
+    """A plain (mutable) set carrying the complexity label still routes to api."""
+    choice = _select(rework=False, issue_labels={COMPLEXITY_HIGH, "agent:queued"})
+    assert choice == AdapterChoice("api", "example", "policy:complexity")
 
 
 # ---------------------------------------------------------------------------
