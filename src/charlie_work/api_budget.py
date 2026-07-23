@@ -485,6 +485,52 @@ def save_ledger(path: Path, ledger: Ledger) -> None:
     tmp_path.replace(path)
 
 
+def settle_session_to_disk(path: Path, entry: SessionEntry) -> bool:
+    """Atomically settle ``entry`` into the ledger at ``path`` under the advisory lock.
+
+    This is the locked read-modify-write primitive for the on-disk ledger:
+    ``load_ledger`` → ``settle_session`` → ``save_ledger`` happen entirely
+    inside ``state.advisory_file_lock(path)``, so concurrent reaps of different
+    api sessions cannot lose a settlement (the same lost-update hazard that
+    ``state_lock`` closes for ``state.json``). The per-path threading.Lock in
+    ``advisory_file_lock`` also serializes concurrent THREADS in this process.
+
+    Fail-as-a-value: if the advisory lock cannot be acquired within its budget
+    (``StateLockBusy``), the settlement is SKIPPED — logged as a warning and
+    ``False`` returned — never written unlocked. This mirrors the codebase
+    invariant that a writer which cannot acquire the lock fails that unit of
+    work as a value rather than degrading integrity. Settlement is best-effort
+    accounting (it must never break the reap that calls it), so a lock-contention
+    skip loses one settlement record but preserves ledger consistency.
+
+    Returns ``True`` if the entry was settled (or was already present —
+    idempotent no-op still returns ``True``), ``False`` if skipped due to lock
+    contention. Unexpected errors propagate to the caller.
+    """
+    from .state import StateLockBusy, advisory_file_lock
+
+    try:
+        # Ensure the ledger directory exists before acquiring the lock — the
+        # advisory lock touches a sibling ``.lock`` file whose parent must
+        # exist. state.json's parent always exists by the time state_lock runs,
+        # but the ledger may be settled into a fresh state_dir on the very first
+        # api reap. mkdir is idempotent and safe outside the lock.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with advisory_file_lock(path):
+            ledger = load_ledger(path)
+            ledger = settle_session(ledger, entry)
+            save_ledger(path, ledger)
+    except StateLockBusy:
+        logger.warning(
+            "api budget ledger lock busy at %s; skipping settlement of issue %s "
+            "(best-effort accounting — ledger consistency preserved, one record may be lost)",
+            path,
+            entry.issue,
+        )
+        return False
+    return True
+
+
 def ledger_path(state_dir: Path | str) -> Path:
     """Return the ledger path for a runtime ``state_dir`` root."""
     return Path(state_dir) / LEDGER_FILENAME
@@ -500,6 +546,7 @@ __all__ = [
     "cost_usd",
     "budget_status",
     "settle_session",
+    "settle_session_to_disk",
     "load_ledger",
     "save_ledger",
     "ledger_to_dict",

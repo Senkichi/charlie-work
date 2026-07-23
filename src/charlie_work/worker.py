@@ -446,9 +446,7 @@ class WorkerView:
             SessionEntry,
             cost_usd,
             ledger_path,
-            load_ledger,
-            save_ledger,
-            settle_session,
+            settle_session_to_disk,
             usage_from_events,
         )
         from .claude_code import iter_claude_events
@@ -493,10 +491,13 @@ class WorkerView:
                 duration_s=self.runtime_seconds(),
                 outcome=self.failure_kind or "reaped",
             )
-            path = ledger_path(state_dir)
-            ledger = load_ledger(path)
-            ledger = settle_session(ledger, entry)
-            save_ledger(path, ledger)
+            # Locked read-modify-write: load→settle→save happens inside
+            # advisory_file_lock so concurrent reaps of different api sessions
+            # cannot lose a settlement (issue #480 review — same lost-update
+            # hazard state_lock closes for state.json). Lock-contention skips
+            # as a value (logged inside settle_session_to_disk); the reap still
+            # completes below.
+            settle_session_to_disk(ledger_path(state_dir), entry)
         except Exception:
             logger.warning(
                 "api budget settlement failed for issue %s; reap continues",
