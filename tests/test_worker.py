@@ -624,6 +624,180 @@ def test_worker_view_reap_sidecar_unknown_adapter(tmp_path: Path) -> None:
     worker.reap_sidecar(sessions_dir)
 
 
+def test_worker_view_is_alive_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WorkerView.is_alive() for an api-kind view delegates to is_worker_alive
+    (api workers are Claude Code CLI processes with provider env injected)."""
+    worker = WorkerView(
+        adapter_kind="api",
+        issue_number=3,
+        repo_key="",
+        pid=54321,
+        started_at="2026-07-22T00:00:00Z",
+        process_start_time=1710000000.0,
+        log_path="/tmp/issue-3.claude.log",
+        worktree_path="/tmp/worktree-3",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    assert worker.is_alive() is True
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
+    assert worker.is_alive() is False
+
+
+def test_worker_view_reap_sidecar_api(tmp_path: Path) -> None:
+    """WorkerView.reap_sidecar() deletes the issue-<n>.api.json sidecar file
+    for a dead api worker session (issue #478 third-arm)."""
+    from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    issue_number = 3
+    sidecar_path = claude_sidecar_path(sessions_dir, issue_number, "api")
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 3,
+                "branch": "agent/issue-3",
+                "worktree_path": "/tmp/worktree-3",
+                "prompt_path": "/tmp/prompt-3.md",
+                "command": ["claude"],
+                "pid": 54321,
+                "started_at": "2026-07-22T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-3.claude.log"),
+                "error": None,
+                "failure_kind": None,
+                "process_start_time": 1710000000.0,
+                "reclaimed": None,
+                "adapter_kind": "api",
+                "provider": "kimi-k3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert sidecar_path.exists()
+
+    worker = WorkerView(
+        adapter_kind="api",
+        issue_number=issue_number,
+        repo_key="",
+        pid=54321,
+        started_at="2026-07-22T00:00:00Z",
+        process_start_time=1710000000.0,
+        log_path=str(sessions_dir / "issue-3.claude.log"),
+        worktree_path="/tmp/worktree-3",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    worker.reap_sidecar(sessions_dir)
+
+    assert not sidecar_path.exists()
+
+
+def test_iter_workers_surfaces_api_sidecars(tmp_path: Path) -> None:
+    """iter_workers reads issue-<n>.api.json sidecars and tags them
+    adapter_kind='api' (issue #478 third-arm)."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    api_sidecar = sessions_dir / "issue-4.api.json"
+    api_sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 4,
+                "branch": "agent/issue-4",
+                "worktree_path": "/tmp/worktree-4",
+                "prompt_path": "/tmp/prompt-4.md",
+                "command": ["claude"],
+                "pid": 44444,
+                "started_at": "2026-07-22T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-4.claude.log"),
+                "error": None,
+                "failure_kind": None,
+                "process_start_time": 1710000000.0,
+                "reclaimed": None,
+                "adapter_kind": "api",
+                "provider": "kimi-k3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    workers = iter_workers(sessions_dir)
+    api_workers = [w for w in workers if w.adapter_kind == "api"]
+    assert len(api_workers) == 1
+    assert api_workers[0].issue_number == 4
+    assert api_workers[0].adapter_kind == "api"
+
+
+def test_update_worker_log_stat_api_writes_api_sidecar(tmp_path: Path) -> None:
+    """update_worker_log_stat for an api-kind worker writes back to the
+    issue-<n>.api.json sidecar (not the .claude.json sidecar)."""
+    from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
+    from charlie_work.worker import update_worker_log_stat
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    issue_number = 5
+    log_path = sessions_dir / "issue-5.claude.log"
+    log_path.write_text("log content\n", encoding="utf-8")
+
+    sidecar_path = claude_sidecar_path(sessions_dir, issue_number, "api")
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 5,
+                "branch": "agent/issue-5",
+                "worktree_path": "/tmp/worktree-5",
+                "prompt_path": "/tmp/prompt-5.md",
+                "command": ["claude"],
+                "pid": 55555,
+                "started_at": "2026-07-22T00:00:00Z",
+                "log_path": str(log_path),
+                "error": None,
+                "failure_kind": None,
+                "process_start_time": 1710000000.0,
+                "reclaimed": None,
+                "adapter_kind": "api",
+                "provider": "kimi-k3",
+                "last_activity_at": None,
+                "log_bytes": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    worker = WorkerView(
+        adapter_kind="api",
+        issue_number=issue_number,
+        repo_key="",
+        pid=55555,
+        started_at="2026-07-22T00:00:00Z",
+        process_start_time=1710000000.0,
+        log_path=str(log_path),
+        worktree_path="/tmp/worktree-5",
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+    )
+
+    update_worker_log_stat(sessions_dir, worker)
+
+    # The .api.json sidecar was updated; no .claude.json sidecar was created.
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["last_activity_at"] is not None
+    assert payload["log_bytes"] is not None
+    assert not (sessions_dir / "issue-5.claude.json").exists()
+
+
 def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     """Integration test: _classify_dead_sessions_and_update_throttle_state reaps sidecars for dead sessions (issue #113)."""
     from charlie_work.config import (
