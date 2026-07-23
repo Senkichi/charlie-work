@@ -23,6 +23,7 @@ from charlie_work.claude_code import (
     read_worker_records,
     update_worker_record_with_failure_classification,
     _apply_model_pin,
+    _apply_effort_pin,
     _sanitize_review_command_template,
     _sidecar_path,
 )
@@ -2940,6 +2941,63 @@ def test_apply_model_pin_preserves_lookalike_token() -> None:
 
 def test_apply_model_pin_handles_empty_template() -> None:
     assert _apply_model_pin((), "claude-sonnet-5") == ("--model", "claude-sonnet-5")
+
+
+def test_apply_effort_pin_appends_to_template_without_effort() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--permission-mode", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_strips_existing_space_form_flag() -> None:
+    template = ("claude", "-p", "--effort", "high", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result.count("--effort") == 1
+    idx = result.index("--effort")
+    assert result[idx + 1] == "medium"
+    assert idx == len(result) - 2
+
+
+def test_apply_effort_pin_strips_equals_joined_flag() -> None:
+    template = ("claude", "-p", "--effort=high")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert not any(tok.startswith("--effort=") for tok in result)
+    assert result[-2:] == ("--effort", "medium")
+
+
+def test_apply_effort_pin_empty_effort_is_noop() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "")
+
+    assert result == template
+
+
+def test_apply_effort_pin_handles_bare_trailing_flag() -> None:
+    template = ("claude", "-p", "--effort")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--effort", "medium")
+
+
+def test_apply_effort_pin_preserves_lookalike_token() -> None:
+    template = ("claude", "-p", "--effortx", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert "--effortx" in result
+    assert result == ("claude", "-p", "--effortx", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_handles_empty_template() -> None:
+    assert _apply_effort_pin((), "medium") == ("--effort", "medium")
 
 
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(

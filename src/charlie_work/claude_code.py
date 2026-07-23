@@ -500,6 +500,30 @@ def _apply_model_pin(command_template: tuple[str, ...], model: str) -> tuple[str
     return tuple(filtered) + ("--model", model)
 
 
+def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[str, ...]:
+    """Hard-pin ``--effort {effort}`` onto ``command_template``.
+
+    Mirrors ``_apply_model_pin``: strips any existing ``--effort`` flag (both
+    space-separated and ``=``-joined forms) and appends a single authoritative
+    pin. An empty ``effort`` string is a no-op — the CLI uses its default.
+    """
+    if not effort:
+        return command_template
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--effort":
+            skip_next = True
+            continue
+        if token.startswith("--effort="):
+            continue
+        filtered.append(token)
+    return tuple(filtered) + ("--effort", effort)
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -605,6 +629,7 @@ def launch_claude_worker(
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
+    command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
 
     try:
         if review:

@@ -5,8 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from types import MappingProxyType
 
-from charlie_work.config import ConfigError, DispatchConfig, load_config
+from charlie_work.config import (
+    ApiBudgetConfig,
+    ApiProviderConfig,
+    ApiWorkerConfig,
+    ConfigError,
+    DispatchConfig,
+    OrchestratorConfig,
+    load_config,
+)
+from charlie_work.global_config import load_layered_config
 
 
 def _write_config(config_file: Path, content: str) -> None:
@@ -247,3 +257,564 @@ def test_load_config_readiness_no_ci_minutes_accepts_valid_int(tmp_path: Path) -
     )
     config = load_config(config_file)
     assert config.auto_merge.readiness_no_ci_minutes == 30
+
+
+def test_api_worker_config_defaults() -> None:
+    """An absent api_worker section yields safe defaults and no behavior change."""
+    config = load_config()
+    assert config.api_worker.enabled is False
+    assert config.api_worker.provider == ""
+    assert config.api_worker.max_concurrent_sessions == 1
+    assert config.api_worker.fallback_adapter == "devin-shell"
+    assert config.api_worker.worker_template == "worker_claude_code.md"
+    assert config.api_worker.rework_template == "rework.md"
+    assert isinstance(config.api_worker.providers, MappingProxyType)
+    assert len(config.api_worker.providers) == 0
+    assert isinstance(config.api_worker.budget, ApiBudgetConfig)
+    assert config.api_worker.budget.max_usd_per_session == 0.0
+    assert config.api_worker.budget.preflight_reserve_usd == 1.0
+    assert config.api_worker.budget.max_usd_per_day == 5.0
+    assert config.api_worker.budget.lifetime_usd == 15.0
+
+
+API_WORKER_SAMPLE = """api_worker:
+  enabled: false
+  provider: kimi-k3
+  max_concurrent_sessions: 1
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+  budget:
+    max_usd_per_session: 0
+    preflight_reserve_usd: 1.00
+    max_usd_per_day: 5.00
+    lifetime_usd: 15.00
+  fallback_adapter: devin-shell
+  worker_template: worker_claude_code.md
+  rework_template: rework.md
+"""
+
+
+def test_load_config_api_worker_parses_and_round_trips(tmp_path: Path) -> None:
+    """A complete api_worker block parses into the expected frozen dataclasses."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, API_WORKER_SAMPLE)
+    config = load_config(config_file)
+
+    assert config.api_worker.enabled is False
+    assert config.api_worker.provider == "kimi-k3"
+    assert isinstance(config.api_worker.providers, MappingProxyType)
+    assert len(config.api_worker.providers) == 1
+    assert "kimi-k3" in config.api_worker.providers
+    assert config.api_worker.providers["kimi-k3"] == ApiProviderConfig(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+    assert config.api_worker.budget == ApiBudgetConfig(
+        max_usd_per_session=0.0,
+        preflight_reserve_usd=1.0,
+        max_usd_per_day=5.0,
+        lifetime_usd=15.0,
+    )
+
+
+def test_api_worker_providers_mapping_is_immutable(tmp_path: Path) -> None:
+    """The providers registry is a MappingProxyType and cannot be mutated after load."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, API_WORKER_SAMPLE)
+    config = load_config(config_file)
+
+    with pytest.raises(TypeError):
+        config.api_worker.providers["new"] = ApiProviderConfig(
+            base_url="https://example.com",
+            api_key_env="KEY",
+            model="m",
+            input_usd_per_mtok=1.0,
+            output_usd_per_mtok=2.0,
+            cached_input_usd_per_mtok=0.1,
+        )
+
+
+def test_load_config_api_worker_enabled_validates_active_provider(tmp_path: Path) -> None:
+    """When enabled, the named provider must exist and have positive pricing."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+""",
+    )
+    config = load_config(config_file)
+    assert config.api_worker.enabled is True
+    assert config.api_worker.provider == "kimi-k3"
+
+
+def test_load_config_api_worker_enabled_rejects_unknown_provider(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: missing
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+""",
+    )
+    with pytest.raises(ConfigError, match="not a key in api_worker.providers"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_enabled_rejects_empty_api_key_env(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: ""
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+""",
+    )
+    with pytest.raises(ConfigError, match="api_key_env.*must be a non-empty string"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("input_usd_per_mtok", 0),
+        ("input_usd_per_mtok", -1.0),
+        ("output_usd_per_mtok", 0.0),
+        ("output_usd_per_mtok", -1.0),
+    ],
+)
+def test_load_config_api_worker_enabled_rejects_non_positive_pricing(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    """Active provider input/output pricing must be strictly positive."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    prices = {
+        "input_usd_per_mtok": 3.0,
+        "output_usd_per_mtok": 15.0,
+        "cached_input_usd_per_mtok": 0.30,
+    }
+    prices[field] = value
+    price_lines = "\n".join(f"      {k}: {v}" for k, v in prices.items())
+    provider_yaml = (
+        "      base_url: https://api.moonshot.ai/anthropic\n"
+        "      api_key_env: MOONSHOT_API_KEY\n"
+        f"      model: kimi-k3\n{price_lines}\n"
+    )
+    _write_config(
+        config_file,
+        f"""api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+{provider_yaml}""",
+    )
+    with pytest.raises(ConfigError, match=f"{field}.*must be > 0"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_enabled_accepts_zero_cached_input_pricing(
+    tmp_path: Path,
+) -> None:
+    """A provider with no cached-input discount may set cached_input_usd_per_mtok to 0."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.0
+""",
+    )
+    config = load_config(config_file)
+    assert config.api_worker.enabled is True
+    assert config.api_worker.providers["kimi-k3"].cached_input_usd_per_mtok == 0.0
+
+
+def test_load_config_api_worker_enabled_rejects_negative_cached_input_pricing(
+    tmp_path: Path,
+) -> None:
+    """Cached-input pricing must be non-negative."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: true
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: -0.1
+""",
+    )
+    with pytest.raises(ConfigError, match="cached_input_usd_per_mtok.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_rejects_missing_required_provider_key(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: false
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+""",
+    )
+    with pytest.raises(ConfigError, match="missing required key 'base_url'"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_rejects_unknown_top_level_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  unknown_key: value
+""",
+    )
+    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'api_worker'"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_rejects_unknown_provider_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: false
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+      extra: value
+""",
+    )
+    with pytest.raises(ConfigError, match=r"providers\.kimi-k3.*has unknown key\(s\)"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_load_config_api_worker_rejects_bool_max_concurrent_sessions(
+    tmp_path: Path, value: bool
+) -> None:
+    """Boolean values are not valid ints for max_concurrent_sessions."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        f"""api_worker:
+  max_concurrent_sessions: {str(value).lower()}
+""",
+    )
+    with pytest.raises(ConfigError, match="max_concurrent_sessions.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_rejects_invalid_types(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  enabled: "true"
+  max_concurrent_sessions: "one"
+  budget: not-a-mapping
+  providers:
+    - not-a-mapping
+""",
+    )
+    with pytest.raises(ConfigError, match="enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_load_config_api_worker_rejects_budget_negative(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """api_worker:
+  budget:
+    max_usd_per_session: -1.0
+""",
+    )
+    with pytest.raises(ConfigError, match="budget.max_usd_per_session.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_global_config_api_worker_layered_merge(tmp_path: Path) -> None:
+    """Fleet-level config sets api_worker; per-repo keys override it section-wise."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  enabled: true
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.api_worker.enabled is True
+    assert config.api_worker.provider == "kimi-k3"
+    assert "kimi-k3" in config.api_worker.providers
+    assert config.api_worker.providers["kimi-k3"].api_key_env == "MOONSHOT_API_KEY"
+    assert config.api_worker.budget.lifetime_usd == 15.0
+
+
+def test_global_config_api_worker_per_repo_overrides_scalar_and_keeps_global_providers(
+    tmp_path: Path,
+) -> None:
+    """Per-repo can override top-level api_worker keys without redeclaring providers."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  max_concurrent_sessions: 4
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.api_worker.max_concurrent_sessions == 4
+    assert config.api_worker.provider == "kimi-k3"
+    assert "kimi-k3" in config.api_worker.providers
+
+
+def test_global_config_api_worker_per_repo_partial_budget_keeps_other_caps(
+    tmp_path: Path,
+) -> None:
+    """A repo-level partial api_worker.budget override must not reset other caps."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  budget:
+    max_usd_per_session: 10.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.api_worker.budget.max_usd_per_session == 10.0
+    assert config.api_worker.budget.preflight_reserve_usd == 1.0
+    assert config.api_worker.budget.max_usd_per_day == 5.0
+    assert config.api_worker.budget.lifetime_usd == 15.0
+
+
+def test_global_config_api_worker_per_repo_partial_providers_keeps_global_providers(
+    tmp_path: Path,
+) -> None:
+    """A repo-level partial api_worker.providers override must not replace the whole registry."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(API_WORKER_SAMPLE, encoding="utf-8")
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """api_worker:
+  enabled: true
+  provider: local-k3
+  providers:
+    local-k3:
+      base_url: http://localhost:11434/v1
+      api_key_env: OLLAMA_API_KEY
+      model: local-k3
+      input_usd_per_mtok: 0.5
+      output_usd_per_mtok: 0.5
+      cached_input_usd_per_mtok: 0.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert "kimi-k3" in config.api_worker.providers
+    assert "local-k3" in config.api_worker.providers
+    assert config.api_worker.provider == "local-k3"
+    assert config.api_worker.providers["local-k3"].cached_input_usd_per_mtok == 0.0
+    assert config.api_worker.budget.preflight_reserve_usd == 1.0
+
+
+def test_global_config_non_api_worker_dict_section_is_replaced_not_merged(
+    tmp_path: Path,
+) -> None:
+    """Layered config only deep-merges api_worker; other sections keep old semantics."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text(
+        """claude_code:
+  worker_env:
+    GLOBAL: global
+""",
+        encoding="utf-8",
+    )
+
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text(
+        """claude_code:
+  worker_env:
+    REPO: repo
+""",
+        encoding="utf-8",
+    )
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.claude_code.worker_env == {"REPO": "repo"}
+
+
+def test_orchestrator_config_defaults_include_api_worker() -> None:
+    config = OrchestratorConfig()
+    assert isinstance(config.api_worker, ApiWorkerConfig)
+    assert config.api_worker.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# LabelConfig — complexity:high routing hint (issue #481)
+# ---------------------------------------------------------------------------
+
+
+def test_label_config_complexity_high_default() -> None:
+    from charlie_work.config import LabelConfig
+
+    assert LabelConfig().complexity_high == "complexity:high"
+
+
+def test_label_config_complexity_high_in_all_for_bootstrap() -> None:
+    """The hint is in ``all`` so bootstrap_labels creates it on GitHub."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.complexity_high in labels.all
+
+
+def test_label_config_complexity_high_not_in_active_set() -> None:
+    """The hint must never affect issue selection/exclusion (not in active)."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.complexity_high not in labels.active
+
+
+def test_label_config_complexity_high_not_in_terminal_set() -> None:
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.complexity_high not in labels.terminal
+
+
+def test_label_config_complexity_high_not_a_workflow_label() -> None:
+    """The hint is a routing hint, not a workflow state — not in workflow_labels."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.complexity_high not in labels.workflow_labels
+
+
+def test_label_config_complexity_high_is_overridable(tmp_path: Path) -> None:
+    """The hint string is configurable via the labels: section like every other label."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """labels:
+  complexity_high: difficulty:hard
+""",
+    )
+    config = load_config(config_file)
+    assert config.labels.complexity_high == "difficulty:hard"
+
+
+def test_label_config_is_frozen() -> None:
+    from dataclasses import FrozenInstanceError
+
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    with pytest.raises(FrozenInstanceError):
+        labels.complexity_high = "x"  # type: ignore[misc]

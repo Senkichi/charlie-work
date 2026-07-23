@@ -72,7 +72,7 @@ for the full dataclass list and defaults):
 
 | Key | Meaning |
 |---|---|
-| `labels.*` | The nine `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)). |
+| `labels.*` | The `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)), plus the `complexity_high` routing hint (not a workflow state — see [§4](#4-bootstrap-labels)). |
 | `dispatch.default_limit` / `branch_prefix` / `worker_template` | Wave size, branch-name prefix, which prompt template renders per-issue worker prompts (`worker.md` for Devin, `worker_claude_code.md` for Claude Code). |
 | `review.max_rework_cycles` | `request_changes` cycles allowed before escalating to `agent:human-needed` instead of dispatching another rework round. |
 | `auto_merge.required_checks` | CI check-run names that must be green before `ship-it` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
@@ -94,7 +94,7 @@ uv run charlie doctor
 `run_doctor` (in `doctor.py`) checks, in order: `gh` on PATH and
 authenticated, config file presence, `required_checks` configured (if
 `auto_merge.enabled`), each required check name matched against live
-`.github/workflows/*.yml` job names, all nine orchestration labels exist on
+`.github/workflows/*.yml` job names, all `LabelConfig.all` labels exist on
 the repo, the state file loads cleanly, the dispatch adapter is sane
 (`command` adapter requires a non-empty `dispatch_command`), the
 cross-family binary is on PATH (if `cross_family.enabled`), and the
@@ -111,14 +111,27 @@ called with `allow_failure=True`):
 uv run charlie bootstrap-labels
 ```
 
-Creates all nine labels from `LabelConfig.all` (`automated-ready`,
+Creates all labels from `LabelConfig.all` (`automated-ready`,
 `agent:queued`, `agent:in-progress`, `agent:pr-open`, `agent:reviewing`,
-`agent:needs-rework`, `agent:blocked`, `agent:done`, `agent:human-needed`)
-with descriptions.
+`agent:needs-rework`, `agent:blocked`, `agent:done`, `agent:human-needed`,
+plus the `complexity:high` routing hint) with descriptions.
+
+### Routing hint: `complexity:high`
+
+`complexity:high` is **not** a workflow state — it never affects issue
+selection or exclusion. It is a deterministic, human-applied routing hint
+read by `routing.select_adapter`: a first-pass issue carrying this label is
+sent to the paid `api` worker (the stronger tier) instead of the weaker
+default worker, subject to the same preflight/fallback chain as reworks.
+Apply `complexity:high` at filing time for multi-module changes,
+cross-cutting invariant work, or issues with prior escalation history. It is
+inert when `api_worker.enabled` is false (preflight returns
+`fallback:disabled` and the default adapter runs).
 
 ## 5. First cycle: intake → dispatch → review → merge
 
-Label a real issue `automated-ready` on GitHub, then run the loop by hand
+Label a real issue `automated-ready` on GitHub (add `complexity:high` too if
+it qualifies — see the routing-hint note above), then run the loop by hand
 (one step at a time, so you can see each artifact) or via `bash-rats` (all
 steps, one pass):
 
