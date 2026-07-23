@@ -9254,6 +9254,71 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     )
 
 
+# --- Issue #526: error-isolation hardening --------------------------------------
+
+
+def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A closed PR whose status was left as "reviewing" by the review pipeline
+    must have its status overwritten to "closed" by the lifecycle reaper.
+
+    Without this, the unclaimed-stalled sweep re-triggers every pass because
+    it matches ``status is None and pr_state.get("status") == "reviewing"``,
+    causing an infinite ping-pong with the lifecycle reaper.
+    """
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["200"] = {
+        "number": 200,
+        "issue_number": 199,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-01T00:00:00Z",
+        "reviewer_pid": 99999,
+        "reviewer_process_start_time": 1.0,
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "decision_path": str(tmp_path / "decision.json"),
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 200,
+            "title": "Fix #199",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-199-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "body": "Closes #199",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "CLOSED",
+        }
+    ]
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", lambda *a, **k: True
+    )
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [200]
+    state_after = load_state(state_file)
+    assert state_after["prs"]["200"]["status"] == "closed"
+    assert state_after["prs"]["200"]["review_dispatch_status"] is None
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
