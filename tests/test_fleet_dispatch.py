@@ -1788,3 +1788,84 @@ def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
     assert by_health["OK"].issue_number == 10
     assert by_health["ERROR"].last_log_line == "no parseable verdict"
     assert by_health["ERROR"].issue_number == 11
+
+
+def test_extract_attention_events_review_escalations() -> None:
+    """Issue #533: review-dispatch escalations surface in fleet attention events."""
+    result = CommandResult(
+        True,
+        "review dispatch: 0 launched, 0 failed",
+        {
+            "stalled": [],
+            "errors": [],
+            "escalated": [
+                {
+                    "pr": 100,
+                    "issue_number": 10,
+                    "attempt_count": 3,
+                    "reason": "max_review_dispatch_attempts_exceeded",
+                }
+            ],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    escalated = [e for e in events if e["type"] == "review_dispatch_escalated"]
+    assert len(escalated) == 1
+    assert escalated[0]["pr"] == 100
+    assert escalated[0]["issue_number"] == 10
+    assert escalated[0]["attempt_count"] == 3
+    assert escalated[0]["reason"] == "max_review_dispatch_attempts_exceeded"
+
+
+def test_extract_attention_events_nested_review_escalations() -> None:
+    """Issue #533: review escalation events in nested dispatch_reviews sub-results."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "dispatch_reviews": {
+                "escalated": [
+                    {
+                        "pr": 200,
+                        "issue_number": 20,
+                        "attempt_count": 3,
+                        "reason": "max_review_dispatch_attempts_exceeded",
+                    }
+                ],
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    escalated = [e for e in events if e["type"] == "review_dispatch_escalated"]
+    assert len(escalated) == 1
+    assert escalated[0]["pr"] == 200
+    assert escalated[0]["issue_number"] == 20
+
+
+def test_build_fleet_attention_digest_maps_review_escalation_events() -> None:
+    """Issue #533: review escalation events map to ESCALATED attention entries."""
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_dispatch_escalated",
+            "issue_number": 10,
+            "pr": 100,
+            "attempt_count": 3,
+            "reason": "max_review_dispatch_attempts_exceeded",
+        },
+    ]
+
+    digest = _build_fleet_attention_digest(events)
+
+    assert len(digest.transitions) == 1
+    entry = digest.transitions[0]
+    assert entry.health == "ESCALATED"
+    assert entry.issue_number == 10
+    assert "3 attempts" in entry.last_log_line
+    assert "PR 100" in entry.last_log_line

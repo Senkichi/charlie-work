@@ -333,6 +333,14 @@ def _extract_attention_events(
     verdict_events = _collect_review_verdict_events(repo_key, data)
     events.extend(verdict_events)
 
+    # Extract review-dispatch escalations (issue #533). `dispatch_reviews`
+    # carries an `escalated` list of PRs that exhausted their dispatch attempt
+    # cap; `loop()` nests it under the "dispatch_reviews" key. Surfacing these
+    # in the digest makes a silent crash-on-launch loop visible to the
+    # heartbeat instead of being buried in state.json only.
+    escalation_events = _collect_review_escalation_events(repo_key, data)
+    events.extend(escalation_events)
+
     # Extract health transitions (if present from #161/#165)
     health_transitions = data.get("health_transitions", [])
     for transition in health_transitions:
@@ -431,6 +439,45 @@ def _add_review_verdict_events(
                 "issue_number": verdict.get("issue") or verdict.get("pr"),
                 "pr": verdict.get("pr"),
                 "reason": verdict.get("reason", "verdict not recorded"),
+            }
+        )
+
+
+def _collect_review_escalation_events(repo_key: str, data: Any) -> list[dict[str, Any]]:
+    """Collect review-dispatch escalation events from a result and nested dispatch_reviews.
+
+    ``dispatch_reviews`` returns an ``escalated`` list of PRs that exhausted
+    their ``max_review_dispatch_attempts`` cap (issue #533); ``loop()`` nests
+    it under the ``dispatch_reviews`` key. Each escalation becomes an attention
+    event so a silent crash-on-launch loop is visible in the fleet digest
+    instead of being buried in state.json only.
+    """
+    events: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        _add_review_escalation_events(repo_key, data, events)
+        sub_data = data.get("dispatch_reviews")
+        if isinstance(sub_data, dict):
+            _add_review_escalation_events(repo_key, sub_data, events)
+    return events
+
+
+def _add_review_escalation_events(
+    repo_key: str,
+    data: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> None:
+    """Add review-dispatch escalation events from a flat result dict."""
+    for esc in data.get("escalated", []):
+        if not isinstance(esc, dict):
+            continue
+        events.append(
+            {
+                "repo_key": repo_key,
+                "type": "review_dispatch_escalated",
+                "issue_number": esc.get("issue_number"),
+                "pr": esc.get("pr"),
+                "attempt_count": esc.get("attempt_count"),
+                "reason": esc.get("reason", "max_review_dispatch_attempts_exceeded"),
             }
         )
 
@@ -614,6 +661,21 @@ def _build_fleet_attention_digest(
                     health="ERROR",
                     previous_health=None,
                     last_log_line=event.get("reason"),
+                    pid=None,
+                )
+            )
+        elif event_type == "review_dispatch_escalated":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event["repo_key"],
+                    health="ESCALATED",
+                    previous_health=None,
+                    last_log_line=(
+                        f"review dispatch escalated after "
+                        f"{event.get('attempt_count')} attempts: "
+                        f"{event.get('reason')} (PR {event.get('pr')})"
+                    ),
                     pid=None,
                 )
             )

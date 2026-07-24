@@ -1464,14 +1464,24 @@ def _detect_and_handle_stalled_reviews(
     """Detect reviewer processes that died without a verdict and free their claims.
 
     A reviewer is considered stalled/orphaned when its sidecar process is no
-    longer alive and the claim timestamp is past the stale-claim timeout (30
-    minutes, see ``state.is_claim_stale``). When that happens, the per-PR
-    ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
-    stale timestamp as ``review_dispatch_failed_at``. The next
-    ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
-    timeout elapses. Every reap path also tears down that PR's isolated review
-    checkout (``worktree.remove_review_checkout``) so a dead reviewer never
-    leaks its detached-HEAD checkout directory.
+    longer alive and the claim timestamp is past the dead-on-arrival grace
+    window (``review_doa_grace_minutes``, default 1 minute — issue #533) or
+    the stale-claim timeout (``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES``, 5 min)
+    as a fallback. When that happens, the per-PR ``review_dispatch_status`` is
+    moved to ``review_dispatch_failed`` with the stale timestamp as
+    ``review_dispatch_failed_at``. The next ``dispatch_reviews`` pass can then
+    re-dispatch the PR after the same stale-claim timeout elapses. Every reap
+    path also tears down that PR's isolated review checkout
+    (``worktree.remove_review_checkout``) so a dead reviewer never leaks its
+    detached-HEAD checkout directory.
+
+    The DOA grace window is shorter than the stale-claim timeout because the
+    process is already confirmed dead (``w.is_alive()`` returned False): there
+    is no reason to wait 5 minutes to reap a process that crashed within
+    seconds of launch. This shortens the re-dispatch cycle for crash-on-launch
+    failures (unpinned-model credit errors, missing-binary crashes, etc.) so
+    the ``max_review_dispatch_attempts`` cap is reached in minutes, not tens
+    of minutes, and the escalation surfaces an operator-visible signal sooner.
 
     A PR that reached ``status == "reviewing"`` but has no
     ``review_dispatch_status`` claim at all (a packet that was generated but
@@ -1496,10 +1506,18 @@ def _detect_and_handle_stalled_reviews(
         # A live reviewer needs no cleanup.
         if w.is_alive():
             continue
-        # Respect the stale-claim timeout so a very recently dead reviewer is
-        # not immediately re-dispatched (which can thrash if the underlying
-        # launch path is flaky). Old dead reviewers become re-dispatchable.
-        if not is_claim_stale(w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+        # Respect a grace window so a very recently dead reviewer is not
+        # immediately re-dispatched (which can thrash if the underlying launch
+        # path is flaky). Issue #533: the process is already confirmed dead
+        # (is_alive() returned False), so we use the shorter DOA grace window
+        # (review_doa_grace_minutes, default 1 min) instead of the full
+        # stale-claim timeout (5 min). This shortens the re-dispatch cycle for
+        # crash-on-launch failures so the max_review_dispatch_attempts cap is
+        # reached in minutes, not tens of minutes. When the DOA grace window
+        # is 0 (disabled), fall back to the stale-claim timeout.
+        doa_grace = config.review_dispatch.review_doa_grace_minutes
+        reap_timeout = doa_grace if doa_grace > 0 else _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+        if not is_claim_stale(w.started_at, timeout_minutes=reap_timeout):
             continue
 
         seen_pr_keys.add(pr_key)
@@ -1604,11 +1622,19 @@ def _detect_and_handle_stalled_reviews(
                 "pr_number": w.issue_number,
                 "pid": w.pid,
                 "started_at": w.started_at,
+                "reason": "dead_on_arrival",
             },
             state_path=state_file,
         )
         changed = True
-        stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
+        stalled.append(
+            {
+                "pr": w.issue_number,
+                "pid": w.pid,
+                "started_at": w.started_at,
+                "reason": "dead_on_arrival",
+            }
+        )
         state, _ = _remove_review_checkout_with_warning(
             state, repo_root, reviews_dir, w.issue_number, state_file=state_file
         )
@@ -5920,6 +5946,7 @@ class OrchestratorApp:
                     "attempted_count": 0,
                     "failed_count": 0,
                     "launched_count": 0,
+                    "escalated": [],
                 },
             )
 
@@ -5984,6 +6011,7 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_reason": "reviewer_quota_probe_backoff",
+                    "escalated": [],
                 },
             )
 
@@ -6035,12 +6063,14 @@ class OrchestratorApp:
                     "launched_count": 0,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "escalated": [],
                 },
             )
 
         # Filter out PRs that are already claimed or still have a live reviewer.
         # Also escalate PRs that have exhausted their dispatch attempt budget.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
+        escalated_prs: list[dict[str, Any]] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Escalate PRs whose dispatch attempt count has reached the cap.
@@ -6083,6 +6113,14 @@ class OrchestratorApp:
                         state_path=self.paths.state_file,
                     )
                     changed = True
+                    escalated_prs.append(
+                        {
+                            "pr": c["pr"],
+                            "issue_number": issue_num,
+                            "attempt_count": attempt_count,
+                            "reason": "max_review_dispatch_attempts_exceeded",
+                        }
+                    )
             if changed:
                 save_state(self.paths.state_file, state)
             dispatchable = [
@@ -6090,6 +6128,40 @@ class OrchestratorApp:
                 for c in candidates
                 if _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
             ]
+
+        # Issue #533: apply the agent:human-needed GitHub label for escalated
+        # PRs outside the state lock (network I/O). Without this, the escalation
+        # is invisible to operators on GitHub — the state.json change and event
+        # log entry are only visible to someone reading state directly. This
+        # mirrors the rework-cycle escalation pattern (transition via the
+        # "redispatch_escalated" edge). Label failures are recorded but do not
+        # block the dispatch pass.
+        for esc in escalated_prs:
+            issue_num = esc.get("issue_number")
+            if issue_num is None:
+                continue
+            result = transition(
+                self.gh,
+                self.config.labels,
+                issue_num,
+                "redispatch_escalated",
+            )
+            if result.outcome != TransitionOutcome.APPLIED:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    issue_entry = state["issues"].get(str(issue_num), {})
+                    if isinstance(issue_entry, dict):
+                        issue_entry = {
+                            **issue_entry,
+                            "label_error": {
+                                "edge": "redispatch_escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            },
+                        }
+                        state["issues"][str(issue_num)] = issue_entry
+                        save_state(self.paths.state_file, state)
 
         # Apply the local and provider-token caps. 0 means unlimited for both.
         max_local = self.config.review_dispatch.max_local_review_processes
@@ -6116,6 +6188,7 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_count": len(candidates) - len(selected),
+                    "escalated": escalated_prs,
                     **local_cap.report_fields(),
                 },
             )
@@ -6375,6 +6448,7 @@ class OrchestratorApp:
             "deferred_count": len(candidates) - len(dispatchable),
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
+            "escalated": escalated_prs,
         }
         data.update(local_cap.report_fields())
         return CommandResult(ok, message, data)

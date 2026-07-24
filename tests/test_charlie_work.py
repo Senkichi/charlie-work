@@ -7626,6 +7626,197 @@ def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
     )
 
 
+def test_detect_and_handle_stalled_reviews_reaps_doa_past_grace_window(
+    tmp_path: Path,
+) -> None:
+    """Issue #533: a dead reviewer past the DOA grace window (default 1 min)
+    but before the full stale-claim timeout (5 min) is reaped immediately,
+    not held for the full 5-minute timeout. The stalled event carries
+    reason="dead_on_arrival" so the crash-on-launch pattern is distinguishable
+    from a stale-claim reap."""
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text("Fable 5 requires usage credits.\n", encoding="utf-8")
+    # 2 minutes ago: past the 1-min DOA grace window, before the 5-min stale timeout
+    recent_started = (datetime.now(UTC) - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,  # not a real live pid
+        "started_at": recent_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": recent_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    # Reaped despite being only 2 minutes old (well under the 5-min stale timeout)
+    assert any(entry.get("pr") == 100 for entry in stalled)
+    assert any(
+        entry.get("reason") == "dead_on_arrival" for entry in stalled if entry.get("pr") == 100
+    )
+    state = _load_state(state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "dead_on_arrival"
+        for event in state.get("events", [])
+    )
+
+
+def test_detect_and_handle_stalled_reviews_skips_doa_within_grace_window(
+    tmp_path: Path,
+) -> None:
+    """Issue #533: a dead reviewer within the DOA grace window (default 1 min)
+    is NOT reaped — the grace window prevents thrash on flaky launch paths."""
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text("Fable 5 requires usage credits.\n", encoding="utf-8")
+    # 30 seconds ago: within the 1-min DOA grace window
+    very_recent_started = (
+        (datetime.now(UTC) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+    )
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": very_recent_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": very_recent_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    # Not reaped — within the DOA grace window
+    assert not any(entry.get("pr") == 100 for entry in stalled)
+    state = _load_state(state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_escalation_applies_human_needed_label(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #533: when a PR exhausts max_review_dispatch_attempts, the
+    escalation applies the agent:human-needed GitHub label (via the
+    redispatch_escalated transition edge) and surfaces the escalated PR in
+    the return data so it reaches the fleet attention digest."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Seed state with attempt_count at the cap (default 3).
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_attempt_count": 3,
+            "review_dispatch_failed_at": (
+                (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+            ),
+        }
+        state["issues"]["10"] = {"number": 10, "status": "in-progress"}
+        save_state(app.paths.state_file, state)
+
+    result = app.dispatch_reviews()
+
+    # The PR should be escalated, not dispatched.
+    assert result.data["launched_count"] == 0
+    escalated = result.data.get("escalated", [])
+    assert len(escalated) == 1
+    assert escalated[0]["pr"] == 100
+    assert escalated[0]["issue_number"] == 10
+    assert escalated[0]["attempt_count"] == 3
+
+    # The agent:human-needed label should have been applied to the issue.
+    assert (10, app.config.labels.human_needed) in app.gh.labels_added
+
+    # State should reflect the escalation.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["status"] == "escalated"
+    assert state["issues"]["10"]["status"] == "escalated"
+    assert any(
+        event.get("kind") == "review_dispatch_escalated"
+        and event.get("payload", {}).get("pr_number") == 100
+        for event in state.get("events", [])
+    )
+
+
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
     tmp_path: Path,
 ) -> None:

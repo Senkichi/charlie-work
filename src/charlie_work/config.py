@@ -257,6 +257,16 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
+    # Dead-on-arrival grace window (issue #533). A reviewer whose process is
+    # no longer alive AND whose claim age exceeds this window is reaped
+    # immediately as a dead-on-arrival dispatch, without waiting for the full
+    # ``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES`` (5 min). This shortens the
+    # re-dispatch cycle for reviewers that crash within seconds of launch
+    # (e.g. unpinned-model credit errors, missing-binary crashes), so the
+    # ``max_review_dispatch_attempts`` cap is reached in minutes, not tens of
+    # minutes. 1 minute is ample for a process that started and died; a
+    # reviewer that is still initializing will not have a dead PID yet.
+    review_doa_grace_minutes: int = 1
 
 
 @dataclass(frozen=True)
@@ -1140,6 +1150,19 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
+        )
+    rd_doa_grace = review_dispatch_data.get("review_doa_grace_minutes")
+    if rd_doa_grace is not None and (
+        isinstance(rd_doa_grace, bool) or not isinstance(rd_doa_grace, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_doa_grace_minutes' must be an int, "
+            f"got {type(rd_doa_grace).__name__}"
+        )
+    if rd_doa_grace is not None and rd_doa_grace < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_doa_grace_minutes' must be >= 0, "
+            f"got {rd_doa_grace}"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
