@@ -1261,6 +1261,22 @@ def test_sanitize_env_drops_github_tokens(tmp_path: Path, monkeypatch: pytest.Mo
     assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must be dropped"
 
 
+def test_sanitize_env_drops_enterprise_github_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sanitize_env must drop GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN so a worker cannot fall back on a GHES credential to merge (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "ghes-admin-token")
+    monkeypatch.setenv("GITHUB_ENTERPRISE_TOKEN", "ghes-admin-token")
+
+    env = sanitize_env(worktree_path)
+
+    assert "GH_ENTERPRISE_TOKEN" not in env, "GH_ENTERPRISE_TOKEN must be dropped"
+    assert "GITHUB_ENTERPRISE_TOKEN" not in env, "GITHUB_ENTERPRISE_TOKEN must be dropped"
+
+
 def test_sanitize_env_isolates_gh_config_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

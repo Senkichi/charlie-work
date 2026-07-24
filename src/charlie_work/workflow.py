@@ -9493,8 +9493,14 @@ class OrchestratorApp:
         # Issue #502: post-merge tripwire. Detect any merged worker PR that was
         # not approved by the orchestrator's adversarial review gate.
         # Reuse the merged PR list already fetched by dispatch() to avoid a
-        # second GraphQL call per loop pass.
+        # second GraphQL call per loop pass. dispatch() returns an empty list
+        # (not the fetched merged PRs) when there are no ready issues, so coerce
+        # an empty reuse list back to None — the tripwire must then fetch its
+        # own list to stay armed even when the queue is idle (a worker self-merge
+        # can land regardless of whether issues are ready).
         merged_prs_for_tripwire: list[dict[str, Any]] | None = dispatch.data.get("merged_prs")
+        if not merged_prs_for_tripwire:
+            merged_prs_for_tripwire = None
         for unauthorized in self._detect_unauthorized_merges(merged_prs_for_tripwire):
             reviewed_sha = unauthorized.get("reviewed_head_sha")
             live_sha = unauthorized.get("live_head_sha")

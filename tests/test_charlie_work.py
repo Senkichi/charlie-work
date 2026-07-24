@@ -8200,6 +8200,102 @@ def test_detect_unauthorized_merges_reuses_dispatch_merged_prs(tmp_path: Path) -
     assert detected[0]["pr"] == 501
 
 
+def test_loop_surfaces_unauthorized_merge_in_errors_bucket(tmp_path: Path) -> None:
+    """loop() must wire the post-merge tripwire into the errors bucket even when dispatch() had no ready issues and returned an empty merged_prs list (issue #502)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class CountingFakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.merged_pr_list_calls = 0
+
+        def merged_pr_list(self):
+            self.merged_pr_list_calls += 1
+            return super().merged_pr_list()
+
+    fake_gh = CountingFakeGitHub()
+    # No ready issues and no open PRs — only a merged worker PR the tripwire
+    # must catch. dispatch() will return merged_prs=[] (no ready issues), so
+    # the tripwire must fall back to fetching its own list to stay armed.
+    fake_gh.issues = []
+    fake_gh.prs = [
+        {
+            "number": 501,
+            "title": "fix: worker self-merge",
+            "url": "https://example.test/pull/501",
+            "headRefName": "agent/issue-494-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-501",
+            "state": "MERGED",
+            "isCrossRepository": False,
+            "body": "Closes #494",
+            "labels": [],
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.loop(merge=False)
+
+    # dispatch() returned an empty merged_prs list because there were no ready
+    # issues — the tripwire must NOT treat that as "no merged PRs to check".
+    assert result.data["dispatch"].get("merged_prs") == []
+    assert len(result.data["errors"]) == 1
+    error = result.data["errors"][0]
+    assert error["pr"] == 501
+    assert error["issue"] == 494
+    assert "MERGED" in error["error"]
+    assert "possible worker self-merge" in error["error"]
+    # The tripwire fetched its own list because the reused list was empty.
+    assert fake_gh.merged_pr_list_calls >= 1
+
+
+def test_loop_tripwire_silent_for_approved_matching_head(tmp_path: Path) -> None:
+    """loop() must not flag a merged worker PR whose approved review decision covers the merged head (issue #502)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [
+        {
+            "number": 502,
+            "title": "fix: approved merge",
+            "url": "https://example.test/pull/502",
+            "headRefName": "agent/issue-495-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-502",
+            "state": "MERGED",
+            "isCrossRepository": False,
+            "body": "Closes #495",
+            "labels": [],
+        },
+    ]
+
+    pr_dir = paths.prs / "pr-502"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-502"}),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.loop(merge=False)
+
+    tripwire_errors = [
+        e for e in result.data["errors"] if "possible worker self-merge" in e["error"]
+    ]
+    assert tripwire_errors == [], (
+        f"approved matching-head merge must not be flagged, got {tripwire_errors}"
+    )
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(

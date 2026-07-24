@@ -7,9 +7,10 @@ use the orchestrator's stored credentials. Used by claude_code, devin_shell,
 and cross_family adapters.
 
 Security (issue #502): workers must not inherit the orchestrator's
-admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` or ``gh`` stored credentials.
-These variables are stripped from the sanitized base environment, and
-``GH_CONFIG_DIR`` is forced to a worktree-local empty directory so ``gh``
+admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` (or the GHES equivalents
+``GH_ENTERPRISE_TOKEN``/``GITHUB_ENTERPRISE_TOKEN``) or ``gh`` stored
+credentials. These variables are stripped from the sanitized base environment,
+and ``GH_CONFIG_DIR`` is forced to a worktree-local empty directory so ``gh``
 cannot fall back to the orchestrator's ``gh auth login`` state. Operators who
 want workers to use ``gh`` must supply a scoped token via ``worker_env`` in the
 adapter config (``devin.worker_env`` or ``claude_code.worker_env``); the adapter
@@ -54,8 +55,15 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
         env.pop("VIRTUAL_ENV", None)
 
     # Issue #502: never inherit the orchestrator's GitHub auth tokens. Workers
-    # must use an operator-supplied scoped token via worker_env.GH_TOKEN.
-    for token_var in ("GH_TOKEN", "GITHUB_TOKEN"):
+    # must use an operator-supplied scoped token via worker_env.GH_TOKEN. Strip
+    # both the dotcom tokens and the GHES enterprise tokens so a worker cannot
+    # fall back on an enterprise-scoped credential to run ``gh pr merge``.
+    for token_var in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ):
         env.pop(token_var, None)
 
     # Issue #502: isolate gh's config directory so the worker cannot fall back
