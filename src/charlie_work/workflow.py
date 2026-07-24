@@ -1544,8 +1544,9 @@ def _detect_and_handle_stalled_reviews(
     """Detect reviewer processes that died without a verdict and free their claims.
 
     A reviewer is considered stalled/orphaned when its sidecar process is no
-    longer alive and the claim timestamp is past the stale-claim timeout (30
-    minutes, see ``state.is_claim_stale``). When that happens, the per-PR
+    longer alive and the claim timestamp is past the stale-claim timeout
+    (``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES``, currently 5 minutes -- see
+    ``state.is_claim_stale``). When that happens, the per-PR
     ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
     stale timestamp as ``review_dispatch_failed_at``. The next
     ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
