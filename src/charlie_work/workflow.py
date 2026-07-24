@@ -5026,15 +5026,35 @@ class OrchestratorApp:
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
-        live_worker_issue_numbers = {
-            result.issue_number
-            for result in dispatch_results
-            if not result.ok and result.failure_kind == "live_worker_redispatch_averted"
-        }
+        # Issue #523: a live_worker_redispatch_averted result claims the prior
+        # worker is still alive, but the adapter's probe (_probe_recovery_liveness)
+        # can fail closed on an inconclusive real-activity signal (probe_error) or
+        # report fresh sessions.db activity even when the recorded wrapper PID is
+        # dead/recycled. Verify the PID against the OS (with start-time identity)
+        # at the single point where live worker slots are counted — the same
+        # is_pid_alive + process_start_time check the review lane uses via
+        # _reviewer_pid_alive. A session whose recorded PID is dead is a phantom
+        # slot and is routed through the dead-session path below (sidecar reap,
+        # label repair) instead of starving fresh dispatch.
+        live_worker_issue_numbers: set[int] = set()
+        phantom_live_worker_issue_numbers: set[int] = set()
+        for result in dispatch_results:
+            if result.ok or result.failure_kind != "live_worker_redispatch_averted":
+                continue
+            if (
+                result.pid is not None
+                and result.pid > 0
+                and is_pid_alive(result.pid, result.process_start_time)
+            ):
+                live_worker_issue_numbers.add(result.issue_number)
+            else:
+                phantom_live_worker_issue_numbers.add(result.issue_number)
         failed_issue_numbers = {
             result.issue_number
             for result in dispatch_results
-            if not result.ok and result.issue_number not in live_worker_issue_numbers
+            if not result.ok
+            and result.issue_number not in live_worker_issue_numbers
+            and result.issue_number not in phantom_live_worker_issue_numbers
         }
         foreign_writer_issue_numbers = {
             result.issue_number
@@ -5051,6 +5071,11 @@ class OrchestratorApp:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
                 is_live_worker = request.issue_number in live_worker_issue_numbers
+                is_phantom_live_worker = request.issue_number in phantom_live_worker_issue_numbers
+                result = next(
+                    (r for r in dispatch_results if r.issue_number == request.issue_number),
+                    None,
+                )
                 prev_entry = state["issues"].get(str(request.issue_number), {})
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
@@ -5058,6 +5083,21 @@ class OrchestratorApp:
                 elif is_live_worker:
                     status = "dispatched"
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
+                elif is_phantom_live_worker:
+                    # Issue #523: the adapter reported a live worker, but the
+                    # recorded PID failed the OS-level liveness + identity
+                    # check. Route through the dead-session path (sidecar reap,
+                    # label repair) instead of keeping the phantom slot
+                    # occupied. The slot is freed and the issue becomes
+                    # dispatchable again without burning a redispatch attempt.
+                    status, dispatched_at, state = self._route_phantom_live_worker(
+                        state,
+                        request,
+                        result,
+                        full_issue,
+                        pr_by_issue,
+                        sessions_dir,
+                    )
                 else:
                     # Issue #461: bound dispatch_failed retries with the same
                     # redispatch-window cap used for rework.
@@ -5110,6 +5150,18 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     entry.pop("escalation_reason", None)
+                elif is_phantom_live_worker:
+                    # Issue #523: a phantom live worker is being routed as dead;
+                    # do not preserve a stale worker_pid that would keep the slot
+                    # occupied, and do not burn a redispatch attempt (the launch
+                    # was averted, not failed).
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    entry.pop("escalation_reason", None)
+                    entry.pop("worker_pid", None)
+                    entry.pop("worker_process_start_time", None)
                 elif status == "escalated":
                     entry["dispatch_failed_at"] = all_attempts
                     entry["escalation_reason"] = (
@@ -5281,6 +5333,7 @@ class OrchestratorApp:
                 {
                     "issue_numbers": sorted(successful_issue_numbers),
                     "live_worker_issue_numbers": sorted(live_worker_issue_numbers),
+                    "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
                     "label_errors": sorted(label_errors),
@@ -5308,12 +5361,18 @@ class OrchestratorApp:
             message += f" (skipped non-dispatchable: {skipped_issue_numbers})"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
+        if phantom_live_worker_issue_numbers:
+            message += (
+                f" (reaped phantom live worker slots: {sorted(phantom_live_worker_issue_numbers)})"
+            )
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
             "failures": dispatch_failure_map,
             "live_worker_count": len(live_worker_issue_numbers),
+            "phantom_live_worker_count": len(phantom_live_worker_issue_numbers),
+            "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
@@ -10606,6 +10665,117 @@ class OrchestratorApp:
             state = load_state_locked(self.paths.state_file)
             operator_claimed = operator_claimed_issues(state)
         return int(issue["number"]) not in operator_claimed
+
+    def _route_phantom_live_worker(
+        self,
+        state: dict[str, Any],
+        request: SessionRequest,
+        result: SessionDispatchResult | None,
+        full_issue: dict[str, Any],
+        pr_by_issue: dict[int, dict[str, Any]],
+        sessions_dir: Path,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        """Route a phantom ``live_worker_redispatch_averted`` result as dead.
+
+        The adapter reported a live worker, but the recorded PID failed the
+        OS-level liveness + identity check (issue #523). Remove the stale
+        sidecar/marker so the session no longer occupies a concurrency slot,
+        then route the issue using the same dead-worker rules the
+        ``_reap_dead_sessions`` lane uses:
+
+        * Open PR with a live ``request_changes`` verdict at the same head SHA
+          -> ``rework_requested`` (handed back to the rework lane).
+        * Otherwise strip active labels and restore ``automated-ready`` so the
+          issue is dispatchable again, recording a single
+          ``session_failed_relabeled`` attention event.
+
+        Returns ``(status, dispatched_at, state)``. The status is
+        ``"dispatch_failed"`` (or ``"rework_requested"``) so the caller's
+        entry-building frees the slot; ``dispatched_at`` is ``None`` because no
+        worker was actually launched.
+        """
+        issue_number = request.issue_number
+
+        # Reap the stale sidecar and matching worktree writer marker. Reuse
+        # WorkerView.reap_sidecar so the adapter-specific path derivation and
+        # session-id-gated marker removal stay in one place.
+        for w in iter_workers(sessions_dir):
+            if w.issue_number == issue_number:
+                w.reap_sidecar(sessions_dir)
+
+        # Route an open PR with a live request_changes verdict to rework,
+        # mirroring _reap_dead_sessions' open-PR branch.
+        pr_data = pr_by_issue.get(issue_number)
+        if pr_data is not None:
+            pr_number = int(pr_data["number"])
+            live_head_sha = pr_data.get("headRefOid")
+            pr_state = state.get("prs", {}).get(str(pr_number), {})
+            last_decision = pr_state.get("decision")
+            reviewed_head_sha = pr_state.get("reviewed_head_sha")
+            if (
+                last_decision == "request_changes"
+                and reviewed_head_sha is not None
+                and live_head_sha is not None
+                and reviewed_head_sha == live_head_sha
+            ):
+                transition(self.gh, self.config.labels, issue_number, "rework_requested")
+                state = append_event(
+                    state,
+                    "rework_requeued",
+                    {
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": "phantom_live_worker_pid_dead",
+                    },
+                    state_path=self.paths.state_file,
+                )
+                return "rework_requested", None, state
+
+        # No open PR (or not a clean request_changes case): strip active labels
+        # and ensure the ready label is present so the issue becomes
+        # dispatchable. This mirrors _reap_dead_sessions' no-open-PR relabel
+        # path, gated on an active label actually being present so a
+        # terminal-only issue is never given ``ready`` back spuriously.
+        issue_labels = label_names(full_issue)
+        active_labels = issue_labels & self.config.labels.active
+        if not active_labels:
+            state = append_event(
+                state,
+                "session_failed_relabeled",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": "live_worker_redispatch_averted",
+                    "reason": "phantom_live_worker_pid_dead",
+                    "removed_labels": [],
+                    "added_ready": False,
+                    "label_write_ok": True,
+                },
+                state_path=self.paths.state_file,
+            )
+            return "dispatch_failed", None, state
+
+        needs_ready = self.config.labels.ready not in issue_labels
+        label_write_ok = True
+        for label in sorted(active_labels):
+            if not self.gh.remove_issue_label(issue_number, label):
+                label_write_ok = False
+        if needs_ready:
+            if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
+                label_write_ok = False
+        state = append_event(
+            state,
+            "session_failed_relabeled",
+            {
+                "issue_number": issue_number,
+                "failure_kind": "live_worker_redispatch_averted",
+                "reason": "phantom_live_worker_pid_dead",
+                "removed_labels": sorted(active_labels),
+                "added_ready": needs_ready,
+                "label_write_ok": label_write_ok,
+            },
+            state_path=self.paths.state_file,
+        )
+        return "dispatch_failed", None, state
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.

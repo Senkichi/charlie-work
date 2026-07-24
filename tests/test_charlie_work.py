@@ -10079,6 +10079,13 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    # Issue #523: the live-worker slot count now verifies the recorded PID is
+    # actually alive at the OS level (is_pid_alive + process_start_time).
+    # Stub is_pid_alive so the dispatch-side result PID is treated as live,
+    # and stub _worker_pid_alive so the state.json worker_pid does not block
+    # candidate selection (the issue must be selectable to reach dispatch).
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -10108,6 +10115,123 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
         and event["payload"]["issue_number"] == 123
         for event in state.get("events", [])
     )
+
+
+def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #523: a live_worker_redispatch_averted result whose recorded PID is
+    dead must not count as a live worker slot. The phantom slot is freed, the
+    stale sidecar is reaped, active labels are stripped, ready is restored, and
+    the issue is re-dispatchable on the next pass."""
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=1_234_567.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    # Issue #523: the recorded PID is dead, so the result must not count as a
+    # live worker slot. This also makes _worker_pid_alive return False so the
+    # issue is selectable despite state.json recording a worker_pid.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    # Simulate stale label state: issue_list returns only ready (so the issue
+    # is selectable), but issue_view still reports the stale in-progress label
+    # that a previous dispatch left behind.
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    # Plant a stale claude-code sidecar for the dead worker.
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "agent/issue-123-fix-search",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 4242,
+                "started_at": "2026-07-02T00:00:00Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 1_234_567.0,
+                "session_id": "test-session-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 4242,
+        "worker_process_start_time": 1_234_567.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is not counted as a live slot.
+    assert result.data["live_worker_count"] == 0
+    assert result.data["phantom_live_worker_count"] == 1
+    assert result.data["attempted_count"] == 1
+    # The stale sidecar is reaped.
+    assert not sidecar_path.exists()
+    # The slot is freed: worker_pid cleared, status no longer "dispatched".
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert "worker_pid" not in state["issues"]["123"]
+    assert "worker_process_start_time" not in state["issues"]["123"]
+    # The stale in-progress label is removed; ready is not removed.
+    assert (123, "agent:in-progress") in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+    # A session_failed_relabeled attention event is emitted.
+    assert any(
+        event["kind"] == "session_failed_relabeled"
+        and event["payload"]["issue_number"] == 123
+        and event["payload"]["reason"] == "phantom_live_worker_pid_dead"
+        for event in state.get("events", [])
+    )
+
+    # A second dispatch pass can still select the issue (slot is free).
+    result2 = app.dispatch(limit=1)
+    assert result2.data["attempted_count"] == 1
+    assert result2.data["live_worker_count"] == 0
 
 
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
@@ -27742,6 +27866,9 @@ def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
         ]
 
     monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    # Issue #523: the live-worker slot count now verifies the recorded PID is
+    # actually alive at the OS level. Stub the probe so the result PID counts.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
 
     result = app.dispatch(limit=1)
 
