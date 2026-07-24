@@ -18,7 +18,13 @@ from .adapters import (
     SessionRequest,
     dispatch_sessions,
 )
-from .claude_code import _events_path, launch_claude_worker, parse_claude_events
+from .claude_code import (
+    _events_path,
+    extract_event_text,
+    iter_stream_json_events,
+    launch_claude_worker,
+    parse_claude_events,
+)
 from .checks import CheckSummary, summarize_checks
 from .config import (
     AutoMergeConfig,
@@ -1168,32 +1174,65 @@ def _is_review_dispatchable(
     return True
 
 
-def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
-    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
-    Looks for triple-backtick code fences in ``log_path`` and tries to parse
-    each one as JSON, starting from the last fence (the final output). Accepts
-    fences with or without a ``json`` language tag. A valid verdict block must
-    contain:
+# Absolute path ending in .md, as reviewers reference their summary files in
+# final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
+# quotes, and whitespace terminate the match so "path:line" refs don't bleed.
+_REVIEW_MD_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|~[\\/]|/)[^\s`\"'<>|*?:]+\.md")
+
+_REVIEW_FALLBACK_FILE_MAX_BYTES = 1024 * 1024
+_REVIEW_FALLBACK_MTIME_SLACK_S = 120
+_REVIEW_FALLBACK_MAX_CANDIDATES = 8
+
+
+def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
+    """Validate one decoded JSON candidate as a review verdict.
+
+    A valid verdict must contain:
 
     - ``decision`` in ``{"approved", "request_changes", "blocked"}``
     - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
       non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
     - ``required_changes`` is optional; if present it must be a list of strings
 
-    Returns the parsed dict on success, or ``None`` if no valid block is found.
-    Malformed/truncated logs and 0-byte logs both return ``None``.
+    Returns the normalized verdict dict, or ``None`` if invalid.
     """
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if not isinstance(data, dict):
         return None
 
-    matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", log_text, re.DOTALL))
-    if not matches:
+    decision = data.get("decision")
+    if decision not in {"approved", "request_changes", "blocked"}:
         return None
 
-    for match in reversed(matches):
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        return None
+    if decision in {"request_changes", "blocked"} and not summary.strip():
+        return None
+
+    required_changes = data.get("required_changes")
+    if required_changes is not None and not isinstance(required_changes, list):
+        return None
+    if required_changes is not None and not all(
+        isinstance(item, str) for item in required_changes
+    ):
+        return None
+
+    return {
+        "decision": decision,
+        "summary": summary,
+        "required_changes": required_changes if required_changes is not None else [],
+    }
+
+
+def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+    """Extract the last valid fenced JSON verdict block from plain text.
+
+    Accepts fences with or without a ``json`` language tag, scanning from the
+    last fence (the final output) backwards.
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
         candidate = match.group(1).strip()
         if not candidate:
             continue
@@ -1201,123 +1240,152 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
             data = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if not isinstance(data, dict):
-            continue
-
-        decision = data.get("decision")
-        if decision not in {"approved", "request_changes", "blocked"}:
-            continue
-
-        summary = data.get("summary")
-        if not isinstance(summary, str):
-            continue
-        if decision in {"request_changes", "blocked"} and not summary.strip():
-            continue
-
-        required_changes = data.get("required_changes")
-        if required_changes is not None and not isinstance(required_changes, list):
-            continue
-        if required_changes is not None and not all(
-            isinstance(item, str) for item in required_changes
-        ):
-            continue
-
-        return {
-            "decision": decision,
-            "summary": summary,
-            "required_changes": required_changes if required_changes is not None else [],
-        }
-
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
     return None
+
+
+def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
+    """Extract a verdict from tee'd stream-json JSONL text.
+
+    With ``tee_stream_json`` enabled the sidecar log is JSONL where every
+    fence lives *inside* a JSON string (``\\n`` as escape sequences), so a
+    regex over the raw text can never match. Decode each event's assistant
+    text first, then scan the decoded texts newest-first (the result event is
+    the last line, so the final output wins).
+    """
+    texts = [
+        text
+        for text in (extract_event_text(event) for event in iter_stream_json_events(raw_text))
+        if text
+    ]
+    for text in reversed(texts):
+        verdict = _extract_verdict_from_text(text)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
+    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+
+    Handles both log formats: plaintext logs (fences matched directly) and
+    stream-json JSONL logs produced by ``tee_stream_json`` (fences are
+    JSON-escaped inside event strings, so events are decoded first). Returns
+    the parsed dict on success, or ``None`` if no valid block is found.
+    Malformed/truncated logs and 0-byte logs both return ``None``.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    verdict = _extract_verdict_from_text(log_text)
+    if verdict is not None:
+        return verdict
+    return _extract_verdict_from_stream_json(log_text)
 
 
 def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
     """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
 
-    Fallback for when ``_parse_review_verdict_from_log`` fails: the plaintext
-    log may be truncated or the verdict block may be split across tee buffer
-    boundaries, but the structured stream-json events.jsonl contains the
-    assistant's message text in discrete JSONL lines. This scans
-    ``assistant_message`` events for the same fenced JSON verdict block.
+    Fallback for when ``_parse_review_verdict_from_log`` fails: the log may be
+    truncated or the verdict block split across tee buffer boundaries, but the
+    structured events.jsonl carries the assistant's text in discrete JSONL
+    lines. Decodes real stream-json events (``assistant``/``result``) as well
+    as the legacy ``assistant_message`` shape.
 
     Returns the parsed dict on success, or ``None`` if no valid block is found.
     """
-    if not events_path.exists():
-        return None
     try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        raw_text = events_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    return _extract_verdict_from_stream_json(raw_text)
 
-    # Scan in reverse: the verdict is in the final assistant message.
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
+
+def _parse_review_verdict_from_files(
+    log_path: Path,
+    packet_dir: Path,
+    started_at: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    """Last-resort verdict recovery from files the reviewer wrote (issue #566).
+
+    Reviewers sometimes write their review summary (verdict block included) to
+    a Markdown file and merely *reference* it in final output instead of
+    re-emitting the fenced JSON. Before counting a completed review as a
+    failed attempt, scan:
+
+    1. ``.md`` paths mentioned in the reviewer's decoded output text,
+       newest-mention-first, then
+    2. ``*.md`` files in the PR's packet directory.
+
+    Every candidate is mtime-gated to the reviewer session's ``started_at``
+    (minus slack): a stale review file from a previous round must never
+    resurrect an old verdict for a new head. Without a parseable
+    ``started_at`` there is no safe gate, so no fallback is attempted.
+
+    Returns ``(verdict, source_path)`` or ``None``.
+    """
+    if not started_at:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
+            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
+        )
+    except ValueError:
+        return None
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    texts = [
+        text
+        for text in (extract_event_text(event) for event in iter_stream_json_events(log_text))
+        if text
+    ]
+    if not texts and log_text:
+        texts = [log_text]
+    for text in reversed(texts):
+        for match in _REVIEW_MD_PATH_RE.finditer(text):
+            raw = match.group(0)
+            if raw not in seen:
+                seen.add(raw)
+                candidates.append(Path(raw).expanduser())
+
+    if packet_dir.is_dir():
+        for md_path in sorted(packet_dir.glob("*.md")):
+            key = str(md_path)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(md_path)
+
+    for candidate in candidates[:_REVIEW_FALLBACK_MAX_CANDIDATES]:
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        if stat.st_size > _REVIEW_FALLBACK_FILE_MAX_BYTES:
+            continue
+        if datetime.fromtimestamp(stat.st_mtime, tz=UTC) < cutoff:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") != "assistant_message":
-            continue
-
-        # The content may be a string or a list of content blocks.
-        content = event.get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text += str(block.get("text", ""))
-        elif isinstance(content, dict):
-            text = str(content.get("text", ""))
-
-        if not text:
-            continue
-
-        # Reuse the same fenced-JSON extraction logic.
-        matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL))
-        if not matches:
-            continue
-
-        for match in reversed(matches):
-            candidate = match.group(1).strip()
-            if not candidate:
-                continue
-            try:
-                data = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, dict):
-                continue
-
-            decision = data.get("decision")
-            if decision not in {"approved", "request_changes", "blocked"}:
-                continue
-
-            summary = data.get("summary")
-            if not isinstance(summary, str):
-                continue
-            if decision in {"request_changes", "blocked"} and not summary.strip():
-                continue
-
-            required_changes = data.get("required_changes")
-            if required_changes is not None and not isinstance(required_changes, list):
-                continue
-            if required_changes is not None and not all(
-                isinstance(item, str) for item in required_changes
-            ):
-                continue
-
-            return {
-                "decision": decision,
-                "summary": summary,
-                "required_changes": required_changes if required_changes is not None else [],
-            }
+        verdict = _extract_verdict_from_text(content)
+        if verdict is not None:
+            return verdict, str(candidate)
 
     return None
 
@@ -1345,49 +1413,32 @@ def _extract_review_session_summary(
 
     if events_path.exists():
         try:
-            with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") != "assistant_message":
-                        continue
-                    content = event.get("content")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text += str(block.get("text", ""))
-                    elif isinstance(content, dict):
-                        text = str(content.get("text", ""))
-                    if text.strip():
-                        assistant_texts.append(text.strip())
+            raw_events = events_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            raw_events = ""
+        for event in iter_stream_json_events(raw_events):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
 
-    # Fallback: if no events.jsonl, try extracting non-verdict text from the
-    # plaintext log. This is less structured but still preserves the reviewer's
-    # analysis for the human.
+    # Fallback: if no events.jsonl, try the log. When it is a stream-json
+    # tee, decode the events; otherwise keep the remaining prose lines with
+    # fenced code blocks stripped (those are verdict attempts, not analysis).
     if not assistant_texts:
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        # Strip fenced code blocks (those are verdict attempts, not analysis)
-        # and keep the remaining prose lines.
-        stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
-        for line in stripped.splitlines():
-            stripped_line = line.strip()
-            if stripped_line and not stripped_line.startswith((">", "#", "-")):
-                assistant_texts.append(stripped_line)
+        for event in iter_stream_json_events(log_text):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
+        if not assistant_texts:
+            stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+            for line in stripped.splitlines():
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith((">", "#", "-")):
+                    assistant_texts.append(stripped_line)
 
     if not assistant_texts:
         return None
@@ -6065,6 +6116,7 @@ class OrchestratorApp:
                     continue
                 issue_number = pr_state.get("issue_number")
 
+            verdict_source = "log"
             verdict = _parse_review_verdict_from_log(Path(w.log_path))
             if verdict is None:
                 # Fallback: parse the structured events.jsonl. The plaintext log
@@ -6072,7 +6124,22 @@ class OrchestratorApp:
                 # boundaries, but the stream-json events contain the assistant's
                 # message text in discrete JSONL lines.
                 events_path = _events_path(reviews_dir, pr_number, review=True)
+                verdict_source = "events"
                 verdict = _parse_review_verdict_from_events(events_path)
+            if verdict is None:
+                # Last resort (issue #566): the reviewer may have written its
+                # verdict to a Markdown file it referenced in final output
+                # instead of re-emitting the fenced block. mtime-gated to this
+                # session's started_at so stale files never resurrect old
+                # verdicts.
+                file_hit = _parse_review_verdict_from_files(
+                    Path(w.log_path),
+                    self.paths.prs / f"pr-{pr_number}",
+                    w.started_at,
+                )
+                if file_hit is not None:
+                    verdict, file_source = file_hit
+                    verdict_source = f"file:{file_source}"
             if verdict is None:
                 # No structured verdict found. Before discarding this reviewer's
                 # work, check if it did substantial analysis (e.g. hit the
@@ -6121,6 +6188,7 @@ class OrchestratorApp:
                         "pr": pr_number,
                         "issue": issue_number,
                         "decision": verdict["decision"],
+                        "verdict_source": verdict_source,
                     }
                 )
             else:

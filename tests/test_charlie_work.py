@@ -27972,7 +27972,9 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
 
     result = app._reap_review_verdicts(reviews_dir)
 
-    assert result["recorded"] == [{"pr": 100, "issue": 10, "decision": "request_changes"}]
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "request_changes", "verdict_source": "log"}
+    ]
     assert result["missed"] == []
 
     state = load_state(app.paths.state_file)
