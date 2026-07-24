@@ -93,7 +93,7 @@ helps the rework pass trust the rest of the feedback.
 
 ## Decision output
 
-Write your review summary to a Markdown file, then emit your final verdict as a fenced JSON object. The orchestrator will extract this block from your final output and record the verdict.
+Write your review summary to a Markdown file, then emit your final verdict as a fenced JSON object. The fenced JSON block **MUST appear verbatim in your final chat message itself** — do not only write it inside the Markdown file and reference the file. The orchestrator extracts the verdict from your final chat output; a verdict that appears only inside a file may be missed.
 
 ```json
 {
