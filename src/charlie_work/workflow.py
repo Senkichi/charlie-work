@@ -1570,6 +1570,16 @@ def _detect_and_handle_stalled_reviews(
     state = load_state_locked(state_file)
     changed = False
     seen_pr_keys: set[str] = set()
+    # One provider-throttle condition per sweep, no matter how many dead
+    # reviewers show the same limit signature: the exponential probe backoff
+    # counts consecutive failed PROBES, and a wave of N simultaneously
+    # throttled reviewers is one observation of the closed provider window,
+    # not N. Without this, a 2-reviewer wave incremented the counter twice
+    # per sweep and (combined with the un-reaped sidecars below) drove the
+    # backoff from its 15-minute base to the 4-hour cap within 40 minutes
+    # (observed live 2026-07-24: consecutive_probe_failures=14 from a single
+    # quota outage).
+    throttle_backoff_applied = False
 
     for w in iter_workers(reviews_dir):
         pr_key = str(w.issue_number)
@@ -1622,8 +1632,10 @@ def _detect_and_handle_stalled_reviews(
             throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
 
         if throttled:
-            now_dt = datetime.now(UTC)
-            state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+            if not throttle_backoff_applied:
+                now_dt = datetime.now(UTC)
+                state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+                throttle_backoff_applied = True
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
@@ -1659,6 +1671,17 @@ def _detect_and_handle_stalled_reviews(
                 }
             )
             remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            # Reap the sidecar like every other handled path in this sweep.
+            # The rolled-back claim is deliberately non-terminal (so the PR
+            # re-dispatches once the quota gate clears), which means neither
+            # terminal guard above will ever reap this sidecar -- without
+            # this line the same dead reviewer resurfaces every sweep, its
+            # log tail still matches the throttle signature, and each pass
+            # re-applies the exponential backoff for a session that died
+            # exactly once (observed live 2026-07-24: two dead reviewers
+            # re-counted across ~6 passes pushed probe_after 4 hours out
+            # while the provider window was already open again).
+            w.reap_sidecar(reviews_dir)
             continue
 
         state["prs"][pr_key] = {
