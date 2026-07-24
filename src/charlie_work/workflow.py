@@ -1080,6 +1080,36 @@ def _apply_local_review_cap(
     )
 
 
+def _windowed_redispatch_at(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return redispatch timestamps within the configured window, type-safely.
+
+    Normalizes ``entry["redispatch_at"]`` to a list of strings, filtering out
+    non-string entries and timestamps older than ``window_minutes`` from now.
+    This prevents crashes when the persisted value is corrupted (e.g., a string
+    instead of a list — ``list("abc")`` would yield individual characters that
+    crash ``datetime.fromisoformat``).
+    """
+    raw = entry.get("redispatch_at")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
 def _is_review_dispatchable(
     state: dict[str, Any],
     pr_number: int,
@@ -1561,8 +1591,15 @@ def _detect_and_handle_stalled_reviews(
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
             # re-dispatchable once the quota gate clears -- mirroring the
-            # launch-time quota_hit rollback in dispatch_reviews.
-            state["prs"][pr_key] = without_review_dispatch_claim(pr_state)
+            # launch-time quota_hit rollback in dispatch_reviews. Also
+            # decrement the attempt counter: the reviewer hit a provider
+            # limit, not a PR-specific failure, so this must not consume the
+            # per-PR dispatch attempt budget.
+            rolled_back = without_review_dispatch_claim(pr_state)
+            attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+            if attempt_count > 0:
+                rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
+            state["prs"][pr_key] = rolled_back
             state = append_event(
                 state,
                 "review_dispatch_stalled",
@@ -2545,14 +2582,9 @@ def _reap_restore_rework_requested(
         # Issue #315 finding 2: same window-filtered redispatch_at bookkeeping
         # the sibling lanes use (~line 950-961, ~4186-4194), so the cap below
         # is actually consulted instead of silently never growing.
-        now = datetime.now(UTC)
-        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
-        prior = [
-            t
-            for t in entry.get("redispatch_at", [])
-            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-        ]
-        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+        redispatch_at = _windowed_redispatch_at(
+            entry, window_minutes=config.watchdog.redispatch_window_minutes
+        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         should_escalate = (
@@ -2813,14 +2845,9 @@ def _route_dead_worker_to_pre_review_rework(
         if current_status in ("rework_requested", "escalated"):
             return None
 
-        now = datetime.now(UTC)
-        window_start = now - timedelta(minutes=config.watchdog.redispatch_window_minutes)
-        prior = [
-            t
-            for t in entry.get("redispatch_at", [])
-            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-        ]
-        redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+        redispatch_at = _windowed_redispatch_at(
+            entry, window_minutes=config.watchdog.redispatch_window_minutes
+        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
@@ -3038,18 +3065,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     entry = state["issues"].get(str(w.issue_number), {})
                     now = datetime.now(UTC)
-                    # Append to prior history within the redispatch window rather
-                    # than overwriting it, matching the dead-session lane below
-                    # (~line 1001-1006).
-                    window_start = now - timedelta(
-                        minutes=config.watchdog.redispatch_window_minutes
-                    )
-                    prior = [
-                        t
-                        for t in entry.get("redispatch_at", [])
-                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-                    ]
-                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    redispatch_at = _windowed_redispatch_at(
+                        entry, window_minutes=config.watchdog.redispatch_window_minutes
+                    ) + [now.isoformat().replace("+00:00", "Z")]
                     entry["status"] = "escalated"
                     entry["escalation_reason"] = failure_kind
                     entry["redispatch_at"] = redispatch_at
@@ -3289,15 +3307,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state = load_state(state_file)
                     entry = state["issues"].get(str(w.issue_number), {})
                     now = datetime.now(UTC)
-                    window_start = now - timedelta(
-                        minutes=config.watchdog.redispatch_window_minutes
-                    )
-                    prior = [
-                        t
-                        for t in entry.get("redispatch_at", [])
-                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-                    ]
-                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    redispatch_at = _windowed_redispatch_at(
+                        entry, window_minutes=config.watchdog.redispatch_window_minutes
+                    ) + [now.isoformat().replace("+00:00", "Z")]
                     # issue #261: a worker_blocked verdict (extracted from the
                     # Devin CLI's session store — see post_mortem.classify_and_record)
                     # means the worker was killed by a push-gate hook, not a
@@ -6305,8 +6317,16 @@ class OrchestratorApp:
                     state["prs"][str(pr_number)] = failed_state
                 else:
                     # Quota failure (or not reached due to break) — roll back
-                    # the pending claim so the PR stays dispatchable.
-                    state["prs"][str(pr_number)] = without_review_dispatch_claim(pr_state)
+                    # the pending claim so the PR stays dispatchable. Also
+                    # decrement the attempt counter: no reviewer actually ran,
+                    # so this global condition must not consume the per-PR
+                    # dispatch attempt budget (3 quota hits would otherwise
+                    # escalate a PR that was never reviewed).
+                    rolled_back = without_review_dispatch_claim(pr_state)
+                    attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                    if attempt_count > 0:
+                        rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
+                    state["prs"][str(pr_number)] = rolled_back
 
             if quota_hit:
                 now_dt = datetime.now(UTC)
@@ -9069,6 +9089,7 @@ class OrchestratorApp:
         head_check_state = load_state_locked(self.paths.state_file)
         routed_to_review: list[int] = []
         head_indeterminate: list[int] = []
+        no_op_rework_escalated: list[int] = []
         filtered_candidates = []
         for issue in candidates:
             issue_number = int(issue["number"])
@@ -9090,6 +9111,22 @@ class OrchestratorApp:
                 head_indeterminate.append(issue_number)
                 continue
             if live_head_sha == reviewed_head_sha:
+                # Head hasn't moved since request_changes. Check if previous
+                # rework attempts for this head already exhausted the
+                # redispatch cap — if so, escalate immediately instead of
+                # dispatching another worker that will also produce no
+                # changes. This is a safety net for cases where the restore
+                # path's escalation didn't stick (race/crash between the
+                # restore and the state write).
+                issue_entry = head_check_state.get("issues", {}).get(str(issue_number), {})
+                if isinstance(issue_entry, dict):
+                    prior_redispatch = _windowed_redispatch_at(
+                        issue_entry,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    if len(prior_redispatch) >= self.config.watchdog.max_auto_redispatch:
+                        no_op_rework_escalated.append(issue_number)
+                        continue
                 filtered_candidates.append(issue)
                 continue
 
@@ -9141,6 +9178,52 @@ class OrchestratorApp:
                 review_blocked_retry.append(routed_issue_number)
         routed_to_review = confirmed_routed_to_review
 
+        # Escalate no-op rework issues that have exhausted the redispatch cap
+        # without the PR head ever advancing. Each of these would have burned
+        # another worker session on an unchanged diff.
+        if no_op_rework_escalated:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number in no_op_rework_escalated:
+                    entry = state.get("issues", {}).get(str(issue_number), {})
+                    if not isinstance(entry, dict):
+                        entry = {}
+                    current_status = entry.get("status")
+                    if current_status == "escalated":
+                        continue
+                    redispatch_at = _windowed_redispatch_at(
+                        entry,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+                    entry = {
+                        **entry,
+                        "number": issue_number,
+                        "status": "escalated",
+                        "redispatch_at": redispatch_at,
+                        "escalation_reason": "redispatch_cap_exceeded",
+                        "dispatched_at": None,
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    state = append_event(
+                        state,
+                        "session_failed_escalated",
+                        {
+                            "issue_number": issue_number,
+                            "previous_status": "rework_requested",
+                            "reason": "no_op_rework_cap_exceeded",
+                            "redispatch_count": len(redispatch_at),
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                save_state(self.paths.state_file, state)
+            for issue_number in no_op_rework_escalated:
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "redispatch_escalated",
+                )
+
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
@@ -9167,6 +9250,7 @@ class OrchestratorApp:
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                "no_op_rework_escalated": sorted(no_op_rework_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -9227,6 +9311,7 @@ class OrchestratorApp:
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
+                "no_op_rework_escalated": sorted(no_op_rework_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -9317,6 +9402,7 @@ class OrchestratorApp:
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                "no_op_rework_escalated": sorted(no_op_rework_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -9400,15 +9486,9 @@ class OrchestratorApp:
                 if ok:
                     # Track redispatch count for escalation cap (issue #165)
                     now = datetime.now(UTC)
-                    window_start = now - timedelta(
-                        minutes=self.config.watchdog.redispatch_window_minutes
-                    )
-                    prior = [
-                        t
-                        for t in entry.get("redispatch_at", [])
-                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-                    ]
-                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
+                    redispatch_at = _windowed_redispatch_at(
+                        entry, window_minutes=self.config.watchdog.redispatch_window_minutes
+                    ) + [now.isoformat().replace("+00:00", "Z")]
                     if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
                         # Escalate to human review
                         entry["status"] = "escalated"
@@ -9465,21 +9545,26 @@ class OrchestratorApp:
                     # Failed attempts that repeat without ever succeeding
                     # eventually trip max_auto_redispatch and escalate instead of
                     # looping forever (issue #515).
-                    now = datetime.now(UTC)
-                    window_start = now - timedelta(
-                        minutes=self.config.watchdog.redispatch_window_minutes
+                    failed_result = next(
+                        (r for r in dispatch_results if r.issue_number == request.issue_number),
+                        None,
                     )
-                    prior = [
-                        t
-                        for t in entry.get("redispatch_at", [])
-                        if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start
-                    ]
-                    redispatch_at = prior + [now.isoformat().replace("+00:00", "Z")]
-                    if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
+                    failure_kind = failed_result.failure_kind if failed_result else None
+                    now = datetime.now(UTC)
+                    redispatch_at = _windowed_redispatch_at(
+                        entry, window_minutes=self.config.watchdog.redispatch_window_minutes
+                    ) + [now.isoformat().replace("+00:00", "Z")]
+                    terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    if (
+                        terminal_failure
+                        or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
+                    ):
                         # Escalate to human review
                         entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
-                        entry["escalation_reason"] = "redispatch_cap_exceeded"
+                        entry["escalation_reason"] = (
+                            failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        )
                         entry["dispatched_at"] = None
                         state["issues"][str(request.issue_number)] = entry
                         save_state(self.paths.state_file, state)
@@ -9555,6 +9640,7 @@ class OrchestratorApp:
             "skipped_head_indeterminate": sorted(head_indeterminate),
             "review_blocked_retry": sorted(review_blocked_retry),
             "operator_claimed_skipped": sorted(operator_claimed_skipped),
+            "no_op_rework_escalated": sorted(no_op_rework_escalated),
         }
         if gov.enabled or gov.fleet_enabled:
             data.update(gov.report_fields())

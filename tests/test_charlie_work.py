@@ -28044,3 +28044,270 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rework dispatch failure with a deterministic failure_kind (e.g.
+    rework_branch_conflict) must escalate immediately on the first occurrence,
+    not loop rework_requested → dispatch → fail until the redispatch cap is hit.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="rework branch conflicts with origin/main",
+                failure_kind="rework_branch_conflict",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "rework_branch_conflict"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
+    """A rework candidate whose PR head hasn't moved since the last
+    request_changes verdict, and whose redispatch_at count is already at the
+    cap, must be escalated immediately during candidate filtering instead of
+    dispatching another worker that will produce no changes.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("no_op_rework_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
+    """_windowed_redispatch_at must not crash when redispatch_at is corrupted
+    (e.g., a string instead of a list). A string value would cause
+    list("abc") → ['a', 'b', 'c'] which crashes datetime.fromisoformat.
+    """
+    from charlie_work.workflow import _windowed_redispatch_at
+
+    # String instead of list — must return empty, not crash
+    entry = {"redispatch_at": "2024-01-01T00:00:00Z"}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # None
+    entry = {"redispatch_at": None}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # Missing key
+    entry = {}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # List with non-string entries
+    entry = {"redispatch_at": [123, None, "not-a-date"]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # Valid list with recent timestamp
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    entry = {"redispatch_at": [now_iso]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == [now_iso]
+
+    # Valid list with old timestamp (outside window)
+    old_iso = (datetime.now(UTC) - timedelta(hours=10)).isoformat().replace("+00:00", "Z")
+    entry = {"redispatch_at": [old_iso]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+
+def test_review_dispatch_quota_failure_rolls_back_attempt_count(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A quota failure during review dispatch must not consume the per-PR
+    review_dispatch_attempt_count. Without this fix, 3 quota hits (where no
+    reviewer actually ran) would escalate a PR that was never reviewed.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error="usage limit exceeded",
+            process_start_time=1.0,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    assert result.data["launched_count"] == 0
+    assert result.data.get("quota_hit") is True
+    # Claim should be rolled back (not failed)
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+    # Attempt count should still be 0 (incremented at claim, then rolled back)
+    assert state["prs"]["100"].get("review_dispatch_attempt_count", 0) == 0
+
+
+def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path: Path) -> None:
+    """A throttled reviewer death in _detect_and_handle_stalled_reviews must
+    not consume the per-PR review_dispatch_attempt_count. The reviewer hit a
+    provider limit, not a PR-specific failure.
+    """
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(
+        reviews_dir, 100, "Error: usage limit exceeded; please try again later"
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    # Set attempt_count to 1 to simulate a prior dispatch
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"]["review_dispatch_attempt_count"] = 1
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, app.paths.state_file, app.config, repo_root
+    )
+    assert any(entry.get("pr") == 100 for entry in stalled)
+
+    state = load_state(app.paths.state_file)
+    # Attempt count should be 0 (rolled back from 1)
+    assert state["prs"]["100"].get("review_dispatch_attempt_count", 0) == 0
+    # Claim should be cleared (rolled back, not failed)
+    assert state["prs"]["100"].get("review_dispatch_status") is None
