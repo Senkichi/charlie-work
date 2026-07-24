@@ -8,11 +8,14 @@ the workflow was how stalled label states happened in production.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
 from .config import LabelConfig
 from .github import GitHub
+
+logger = logging.getLogger(__name__)
 
 
 class TransitionOutcome(Enum):
@@ -80,6 +83,15 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         ),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
+        # Operator re-arm (`charlie unescalate`) for an issue whose PR is
+        # still open: drop human-needed (and any other stale workflow state)
+        # and return to the passive pr-open state pending a fresh review.
+        "unescalated_pr_open": ((labels.pr_open,), _compute_remove((labels.pr_open,))),
+        # Operator re-arm with no live PR: strip every workflow label back to
+        # bare automated-ready so dispatch treats the issue as fresh. Never
+        # adds queued — queued is an ACTIVE label and would exclude the issue
+        # from dispatch, the exact trap this edge exists to avoid.
+        "unescalated_requeued": ((), tuple(sorted(labels.workflow_labels))),
         # Issue #203: a merged PR only *mentions* the issue in free text, with
         # no hijack-safe branch/closing-keyword binding. That never authorizes
         # a close — flag it for a human decision instead, same label as any
@@ -105,7 +117,27 @@ def transition(gh: GitHub, labels: LabelConfig, issue_number: int, event: str) -
             remove_failures.append((issue_number, label))
 
     if not add and not remove:
+        logger.info(
+            "label_transition issue=%d event=%s outcome=nothing_changed",
+            issue_number,
+            event,
+        )
         return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
     if add_failures or remove_failures:
+        logger.warning(
+            "label_transition issue=%d event=%s outcome=partial_failure "
+            "add_failures=%s remove_failures=%s",
+            issue_number,
+            event,
+            add_failures,
+            remove_failures,
+        )
         return TransitionResult(TransitionOutcome.PARTIAL_FAILURE, add_failures, remove_failures)
+    logger.info(
+        "label_transition issue=%d event=%s outcome=applied add=%s remove=%s",
+        issue_number,
+        event,
+        add,
+        remove,
+    )
     return TransitionResult(TransitionOutcome.APPLIED, [], [])

@@ -22,7 +22,7 @@ from charlie_work.worktree import (
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
-    ReworkBranchConflictError,
+    ReworkMergeConflict,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -458,8 +458,10 @@ def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
 
 
 def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
-    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
-    with the local base (no origin remote), and report the conflicted paths."""
+    """Rework mode must NOT abort the launch when the branch conflicts with the
+    local base (no origin remote): the merge is aborted internally and the
+    worktree is returned with a populated ``rework_conflict`` notice instead of
+    raising ReworkBranchConflictError (see worktree.ReworkMergeConflict)."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -468,6 +470,7 @@ def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
     (info1.path / "file.txt").write_text("feature line\n", encoding="utf-8")
     _git(info1.path, "add", "file.txt")
     _git(info1.path, "commit", "-m", "add feature")
+    pre_merge_head = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
 
     # Advance the local base branch with a conflicting edit.
     _git(repo_root, "checkout", "main")
@@ -475,17 +478,31 @@ def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
     _git(repo_root, "add", "file.txt")
     _git(repo_root, "commit", "-m", "advance main")
 
-    with pytest.raises(ReworkBranchConflictError) as exc_info:
-        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+    info2 = create_worktree(repo_root, branch_name, rework=True, base_ref="")
 
-    assert "file.txt" in exc_info.value.conflicted_paths
-    assert "main" in exc_info.value.base_ref or "HEAD" in exc_info.value.base_ref
+    assert isinstance(info2.rework_conflict, ReworkMergeConflict)
+    assert "file.txt" in info2.rework_conflict.conflicted_files
+    assert info2.rework_conflict.base_branch == "main"
+
+    # The branch head must be unchanged, and no merge left mid-flight.
+    post_merge_head = _git(info2.path, "rev-parse", "HEAD").stdout.strip()
+    assert post_merge_head == pre_merge_head
+    merge_head_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=info2.path,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_head_check.returncode != 0
+
     remove_worktree(repo_root, info1.path)
 
 
 def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
-    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
-    with the origin base, and report the conflicted paths."""
+    """Rework mode must NOT abort the launch when the branch conflicts with the
+    origin base: the merge is aborted internally and the worktree is returned
+    with a populated ``rework_conflict`` notice instead of raising
+    ReworkBranchConflictError (see worktree.ReworkMergeConflict)."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
     repo_root = tmp_path / "repo"
@@ -497,6 +514,7 @@ def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
     _git(info1.path, "add", "file.txt")
     _git(info1.path, "commit", "-m", "add feature")
     _git(repo_root, "push", "origin", branch_name)
+    pre_merge_head = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
 
     # Advance origin/main with a conflicting edit.
     _git(remote_repo, "checkout", "main")
@@ -505,11 +523,22 @@ def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
     _git(remote_repo, "commit", "-m", "advance main")
     _git(remote_repo, "checkout", branch_name)
 
-    with pytest.raises(ReworkBranchConflictError) as exc_info:
-        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+    info2 = create_worktree(repo_root, branch_name, rework=True, base_ref="")
 
-    assert "file.txt" in exc_info.value.conflicted_paths
-    assert "origin/main" in exc_info.value.base_ref
+    assert isinstance(info2.rework_conflict, ReworkMergeConflict)
+    assert "file.txt" in info2.rework_conflict.conflicted_files
+    assert info2.rework_conflict.base_branch == "main"
+
+    post_merge_head = _git(info2.path, "rev-parse", "HEAD").stdout.strip()
+    assert post_merge_head == pre_merge_head
+    merge_head_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=info2.path,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_head_check.returncode != 0
+
     remove_worktree(repo_root, info1.path)
 
 
@@ -3666,10 +3695,11 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
 
     # No logs/ directory at all -> devin_per_pid_log is silent too (its own
     # "not found" error), never a confirmed timestamp either way.
+    # No worker PID is recorded, so the probe is genuinely inconclusive.
     recovery_record = {
         "branch_name": branch_name,
         "status": "dispatched",
-        "worker_pid": 999999,
+        "worker_pid": None,
         "worker_process_start_time": 0.0,
         "started_at": now,
     }
@@ -3715,10 +3745,11 @@ def test_recovery_aborts_when_all_sources_errored(tmp_path: Path) -> None:
     )
 
     # No logs/ directory either -> devin_per_pid_log also errors.
+    # No worker PID is recorded, so the probe is genuinely inconclusive.
     recovery_record = {
         "branch_name": branch_name,
         "status": "dispatched",
-        "worker_pid": 999999,
+        "worker_pid": None,
         "worker_process_start_time": 0.0,
         "started_at": now,
     }
@@ -3785,7 +3816,7 @@ def test_recovery_aborts_on_fresh_per_pid_log_despite_sessions_db_error(tmp_path
     # its own) - the point of this regression test is that the fresh
     # devin_per_pid_log signal is never silently ignored just because it
     # isn't the sessions.db source.
-    assert exc_info.value.probe_result == "probe_error"
+    assert exc_info.value.probe_result == "devin_per_pid_log_activity"
     assert not worktree_path.exists()
     assert branch_name not in _git(repo_root, "branch", "--list").stdout
 
@@ -3872,10 +3903,12 @@ def test_recovery_increments_deferral_count_for_permanent_no_match(tmp_path: Pat
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
 
+    # No worker PID is recorded, so the permanent no-match is genuinely
+    # inconclusive and the deferral counter must advance.
     recovery_record = {
         "branch_name": branch_name,
         "status": "dispatched",
-        "worker_pid": 999999,
+        "worker_pid": None,
         "worker_process_start_time": 0.0,
         "started_at": now,
     }
@@ -3920,10 +3953,12 @@ def test_recovery_allows_permanent_no_match_after_deferral_cap(tmp_path: Path) -
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2),
     )
 
+    # No worker PID is recorded, so the deferral cap is the reason reset is
+    # allowed, not the confirmed-dead PID short-circuit.
     recovery_record = {
         "branch_name": branch_name,
         "status": "dispatched",
-        "worker_pid": 999999,
+        "worker_pid": None,
         "worker_process_start_time": 0.0,
         "started_at": now,
         "inconclusive_probe_deferred_count": 2,
@@ -3941,6 +3976,101 @@ def test_recovery_allows_permanent_no_match_after_deferral_cap(tmp_path: Path) -
     assert isinstance(result, WorktreeInfo)
     assert worktree_path.exists()
     assert branch_name in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_allows_reset_when_worker_pid_dead_and_probe_inconclusive(
+    tmp_path: Path,
+) -> None:
+    """Issue #506: a confirmed-dead worker PID overrides an inconclusive probe."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-dead-pid-inconclusive"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db exists but has no row for this worktree (permanent no-match).
+    db_path = tmp_path / "sessions.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT, working_directory TEXT, created_at TEXT)")
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    result = create_worktree(
+        repo_root,
+        branch_name,
+        base_ref="HEAD",
+        recovery=recovery_record,
+        config=config,
+    )
+
+    assert isinstance(result, WorktreeInfo)
+    assert worktree_path.exists()
+    assert branch_name in _git(repo_root, "branch", "--list").stdout
+
+
+def test_recovery_aborts_on_transient_probe_error_despite_dead_pid(
+    tmp_path: Path,
+) -> None:
+    """Issue #506 rework: a confirmed-dead PID does NOT override a probe that
+    contains transient errors (locked/corrupt DB, schema drift, I/O failures).
+    Only structurally permanent absence-of-record errors may be overridden by
+    a dead PID; transient errors remain fail-closed.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-dead-pid-transient-probe"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # sessions.db exists on disk but is not a valid SQLite file — a transient
+    # "failed to open sessions.db (locked or corrupt)" error, not a permanent
+    # no-match.
+    db_path = tmp_path / "sessions.db"
+    db_path.write_bytes(b"this is not a sqlite database")
+
+    now = datetime.now(UTC).isoformat()
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": now,
+    }
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch_name,
+            base_ref="HEAD",
+            recovery=recovery_record,
+            config=config,
+        )
+
+    assert exc_info.value.probe_result == "probe_error"
+    assert exc_info.value.inconclusive_probe_deferred_count == 1
+    assert not worktree_path.exists()
+    assert branch_name not in _git(repo_root, "branch", "--list").stdout
 
 
 def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:

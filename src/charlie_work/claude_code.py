@@ -47,6 +47,7 @@ from .worktree import (
     create_review_checkout,
     create_worktree,
     remove_review_checkout,
+    apply_rework_conflict_notice,
     remove_worktree,
     write_worktree_marker,
 )
@@ -188,6 +189,26 @@ def _log_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def _rotate_old_log(log_path: Path) -> None:
+    """Rename an existing log file to ``.1`` before a new launch overwrites it.
+
+    Preserves the previous session's log for post-mortem analysis when a
+    re-dispatch overwrites the same deterministic log path. Best-effort:
+    OSError is swallowed (the old log may not exist on a first dispatch, or
+    may be locked on Windows). Only one generation is kept (``.1``); an
+    existing ``.1`` file is removed first.
+    """
+    if not log_path.exists():
+        return
+    rotated = log_path.with_suffix(log_path.suffix + ".1")
+    try:
+        if rotated.exists():
+            rotated.unlink(missing_ok=True)
+        log_path.rename(rotated)
+    except OSError:
+        pass
+
+
 def _read_sidecar_inconclusive_count(
     sessions_dir: Path, issue_number: int, adapter_kind: str = "claude-code"
 ) -> int:
@@ -316,6 +337,8 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
 def _classify_session_failure(
     log_path: Path,
     throttle_error_markers: Sequence[str] | None = None,
+    *,
+    resume_margin_seconds: int = 0,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
@@ -324,6 +347,11 @@ def _classify_session_failure(
     - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
+
+    ``resume_margin_seconds`` is an extra safety margin past the provider's
+    reported reset (or fixed quota cooldown) time. Provider reset estimates are
+    floors, not guarantees, and dispatching at T+0 races the actual reset
+    (issue #499).
     """
     if not log_path.exists():
         return None, None
@@ -339,7 +367,7 @@ def _classify_session_failure(
     # Check for quota exhaustion first (more severe)
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
         # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
         throttled_until = datetime.now(UTC) + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -358,7 +386,8 @@ def _classify_session_failure(
         cooldown = timedelta(
             minutes=reset_minutes
             if reset_minutes is not None
-            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
+            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
+            seconds=resume_margin_seconds,
         )
         throttled_until = datetime.now(UTC) + cooldown
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
@@ -524,6 +553,31 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
     return tuple(filtered) + ("--effort", effort)
 
 
+def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> tuple[str, ...]:
+    """Hard-pin ``--max-turns {max_turns}`` onto ``command_template``.
+
+    Mirrors ``_apply_model_pin``: strips any existing ``--max-turns`` flag
+    (both space-separated and ``=``-joined forms) and appends a single
+    authoritative pin. A ``max_turns`` of 0 or less is a no-op — the CLI
+    uses its default (unlimited).
+    """
+    if max_turns <= 0:
+        return command_template
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--max-turns":
+            skip_next = True
+            continue
+        if token.startswith("--max-turns="):
+            continue
+        filtered.append(token)
+    return tuple(filtered) + ("--max-turns", str(max_turns))
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -607,6 +661,13 @@ def launch_claude_worker(
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
+    # Rotate the previous session's log before the new launch overwrites it.
+    # This preserves the old log for post-mortem analysis on re-dispatch.
+    _rotate_old_log(log_path)
+    # Also rotate the previous events.jsonl if it exists.
+    if tee_stream_json:
+        _events_path_old = _events_path(sessions_dir, issue_number, rework=rework, review=review)
+        _rotate_old_log(_events_path_old)
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
@@ -630,6 +691,12 @@ def launch_claude_worker(
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
     command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
+    if review:
+        # Cap agentic turns for reviewer sessions to prevent unbounded
+        # codebase exploration and runaway token spend. 0 = unlimited.
+        command_template = _apply_max_turns_pin(
+            command_template, resolved_config.review_dispatch.review_max_turns
+        )
 
     try:
         if review:
@@ -708,6 +775,14 @@ def launch_claude_worker(
     if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
         merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
 
+    # The rework pre-merge hit a real conflict (worktree.py's
+    # _merge_update_rework_branch): the worktree still launches, but the
+    # worker must resolve it before touching the review feedback. Append the
+    # notice to this session's disposable prompt file rather than failing
+    # closed (see worktree.ReworkMergeConflict).
+    if worktree.rework_conflict is not None:
+        prompt_text = apply_rework_conflict_notice(prompt_text, worktree.rework_conflict)
+
     def _teardown_on_launch_failure() -> None:
         # Review checkouts live in their own PR-keyed dir, never worktrees_dir,
         # so they must be torn down via remove_review_checkout — passing them
@@ -774,6 +849,14 @@ def launch_claude_worker(
     events_path = None
     if tee_stream_json:
         command = command + ("--output-format", "stream-json")
+        # The installed Claude Code CLI hard-rejects `--print` +
+        # `--output-format=stream-json` without `--verbose` ("Error: When
+        # using --print, --output-format=stream-json requires --verbose"),
+        # crashing the process before it does any work. Pair the flags
+        # unconditionally, but idempotently — a caller-supplied
+        # command_template may already carry --verbose.
+        if "--verbose" not in command:
+            command = command + ("--verbose",)
         events_path = _events_path(sessions_dir, issue_number, rework=rework, review=review)
 
     feed_stdin = "{prompt_path}" not in "".join(command_template)
@@ -1097,7 +1180,8 @@ def update_worker_record_with_failure_classification(
     never gets set and dispatch keeps relaunching workers into the same limit.
 
     ``config`` is optional for backward compatibility; when provided, its
-    ``runtime.throttle_error_markers`` are used instead of the defaults.
+    ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
+    are used instead of the defaults.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
@@ -1124,9 +1208,16 @@ def update_worker_record_with_failure_classification(
     throttled_until: str | None = None
     log_path_str = payload.get("log_path")
     if log_path_str:
-        throttle_markers = config.runtime.throttle_error_markers if config is not None else None
+        if config is not None:
+            throttle_markers = config.runtime.throttle_error_markers
+            resume_margin_seconds = config.runtime.throttle_resume_margin_s
+        else:
+            throttle_markers = None
+            resume_margin_seconds = 0
         classified_kind, throttled_until = _classify_session_failure(
-            Path(log_path_str), throttle_markers
+            Path(log_path_str),
+            throttle_markers,
+            resume_margin_seconds=resume_margin_seconds,
         )
 
     resolved_kind = classified_kind or fallback_kind
