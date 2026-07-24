@@ -58,7 +58,8 @@ should not need to be read to reason about it.
 | `cross_family.py` | `run_cross_family_review()` — runs a non-Claude model (codex via the Devin CLI, by default) against a PR diff or spec file and captures its findings as **leads, not verdicts**. Never raises; a timeout/missing-binary/non-zero exit becomes a `(UNAVAILABLE)` stub report and a not-ok result rather than aborting review-packet generation. |
 | `prompts.py` | `render_prompt()` / `resolve_template()` — `string.Template.safe_substitute` rendering of `.md` templates under `prompts/`, with repo-local `runtime.prompts_dir` overriding package defaults by filename. |
 | `paths.py` | `find_repo_root()` (via `git rev-parse --show-toplevel`, with a `.git`-walk fallback) and `runtime_paths()` — derives the `RuntimePaths` tree (`issues/`, `prs/`, `dispatches/`, `logs/`, `state.json`) under `runtime.state_dir`. |
-| `state.py` | `load_state()` / `save_state()` / `append_event()` — the `state.json` reader/writer. Atomic writes (temp-file + `Path.replace`). A corrupt/truncated file is quarantined to `state.json.corrupt-<timestamp>`, never crashed on and never silently discarded. |
+| `state.py` | `load_state()` / `save_state()` / `append_event()` — the `state.json` reader/writer. Atomic writes (temp-file + `Path.replace`). A corrupt/truncated file is quarantined to `state.json.corrupt-<timestamp>`, never crashed on and never silently discarded. `append_event()` dual-writes to `events.db` (SQLite) when `state_path` is provided. |
+| `instrumentation.py` | SQLite-backed append-only event log (`events.db`) with correlation ID support. `log_event()` (best-effort, never raises), `record_loop_pass()` (loop pass summary table), `correlation_context()` (thread-local ID per orchestration pass), `read_event_log()` / `events_by_correlation_id()` / `query_events()` / `event_counts_by_kind()` (retrieval and aggregation). WAL mode, indexed on kind/ts/correlation_id/pr_number/issue_number. Auto-migrates legacy `events.jsonl`. |
 | `doctor.py` | `run_doctor()` — preflight diagnostics: `gh` on PATH + authenticated, config file presence, `required_checks` configured and matched against live `.github/workflows/*.yml` job names, GitHub labels exist, state file loads, dispatch adapter configured, cross-family binary on PATH (if enabled), worker template resolves. |
 | `worktree.py` | Junction-safe git worktree lifecycle: `create_worktree()` (creates a worktree + optional `.venv` Windows-junction/symlink to a shared virtualenv) and `remove_worktree()` (unlinks the `.venv` reparse point *before* `git worktree remove`, so teardown never follows the junction into the shared venv and deletes its contents). See [Invariants](#invariants) below. |
 | `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()`, `is_session_alive()` (Windows liveness via ctypes `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on Windows; `os.kill` on POSIX), and `probe_devin()` (for `doctor --adapter-probe`) round out the module. Selected by `devin.adapter: devin-shell`. |
@@ -195,6 +196,56 @@ audit trail; `issues`/`prs` are best-effort mutable projections that
 missing or corrupt `state.json` never crashes the orchestrator: `load_state`
 quarantines an unparseable file to `state.json.corrupt-<UTC-timestamp>`
 (colons stripped) next to it and returns a fresh `empty_state()`.
+
+#### Append-only `events.db` SQLite audit log
+
+In addition to the capped `events` array in `state.json`, every event is
+dual-written to an **unlimited append-only** SQLite database (`events.db`)
+that lives next to `state.json`. This database is the primary audit trail
+for root-cause analysis — it never trims or loses entries the way the
+200-entry `state.json` buffer can.
+
+The `events` table has the following schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Auto-increment primary key |
+| `ts` | TEXT | ISO-8601 UTC timestamp (indexed) |
+| `kind` | TEXT | Event kind, same as `state.json` event kinds (indexed) |
+| `payload` | TEXT | Full event payload as JSON blob |
+| `repo` | TEXT | Repository name (when available) |
+| `correlation_id` | TEXT | Thread-local ID linking events from a single orchestration pass (indexed) |
+| `pr_number` | INTEGER | Extracted from payload for indexed querying |
+| `issue_number` | INTEGER | Extracted from payload for indexed querying |
+| `level` | TEXT | Auto-classified: `info`, `warning`, or `error` based on event kind |
+
+A `loop_passes` summary table records per-pass metadata (start/completion
+timestamps, ok status, elapsed time, error/merge/review counts).
+
+**Correlation IDs** (`instrumentation.py`) are thread-local UUIDs set at the
+start of each `loop()` pass via `correlation_context()`. All events emitted
+during that pass — intake, dispatch, review, merge, errors — share the same
+correlation ID, making it trivial to reconstruct the full sequence of
+operations for any given pass.
+
+The `instrumentation.py` module provides:
+- `log_event()` — best-effort insert into `events.db` (never raises)
+- `record_loop_pass()` — insert/update loop pass summary in `loop_passes` table
+- `correlation_context()` — context manager that sets/restores a correlation ID
+- `read_event_log()` — read events back, with optional `limit`
+- `events_by_correlation_id()` — retrieve all events from a specific pass
+- `query_events()` — structured query with filters on kind, correlation_id, pr_number, issue_number, repo, level, since/until, limit
+- `event_counts_by_kind()` — aggregation summary for quick dashboards
+
+The database uses **WAL mode** for concurrent reads during writes, with
+`PRAGMA synchronous=NORMAL` and `busy_timeout=5000` for reliability under
+concurrent access. Legacy `events.jsonl` files are automatically migrated
+into the SQLite database on first access.
+
+**Structured logging** is configured in `cli.py` `main()` with a `--verbose`
+flag for debug-level output. The `labels.py` `transition()` function logs
+every label state change at INFO level with issue number, event name, and
+outcome (applied/partial_failure/nothing_changed).
 
 The per-issue/PR artifact tree alongside `state.json`:
 

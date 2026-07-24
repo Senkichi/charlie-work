@@ -209,6 +209,19 @@ class ReviewConfig:
     max_rework_cycles: int = 2
     require_tests_or_rationale: bool = True
     require_issue_link: bool = True
+    # Enforced in review()'s janitor gate: past this many rework routes for a
+    # genuine merge conflict (mergeable=CONFLICTING or mergeStateStatus=DIRTY),
+    # the PR escalates to a human instead of looping forever. Without this cap
+    # a conflicting PR that a rework worker never actually rebases re-logs the
+    # identical janitor_gate failure every pass indefinitely (cost-spirals.md
+    # Finding 1).
+    max_conflict_rework_attempts: int = 2
+    # Same as max_conflict_rework_attempts, for the janitor's no-op-rework
+    # signal (a rework cycle that pushed no actual content change — same
+    # patch-id/head as the last request_changes verdict). Previously detected
+    # but never consumed by anything (pr-lifecycle.md "janitor_blocked zero
+    # readers" finding).
+    max_no_op_rework_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -230,14 +243,42 @@ class ReviewDispatchConfig:
     # simultaneously against the Claude usage budget. When a slot frees (a
     # reviewer finishes), the next poll dispatches another. 0 means unlimited.
     max_concurrent_reviews: int = 3
-    # Fixed interval between quota-probe attempts after a reviewer launch hits
+    # Base interval between quota-probe attempts after a reviewer launch hits
     # the usage wall. A probe is a single reviewer launch; this many minutes
-    # must elapse before the next probe. No escalation backoff.
+    # must elapse before the next probe. Each consecutive probe that hits the
+    # wall again doubles the interval (see quota_probe_max_interval_minutes)
+    # instead of relaunching a real reviewer session into the wall every
+    # ``quota_probe_interval_minutes`` for the duration of a live provider
+    # outage (cost-spirals.md Finding 2: "No escalation backoff").
     quota_probe_interval_minutes: int = 15
+    # Cap on the exponential probe backoff described above, in minutes. 240
+    # (4h) keeps the floor below quota_reset_hours's default 5h window so a
+    # probe is still attempted at least once before/around the window's
+    # natural expiry. 0 disables the cap (backoff grows unbounded).
+    quota_probe_max_interval_minutes: int = 240
     # Approximate provider usage-limit reset window in hours. When a reviewer
     # launch hits the wall, the global reviewer quota is held exhausted for at
     # least this long while probes run every ``quota_probe_interval_minutes``.
     quota_reset_hours: int = 5
+    # Maximum reviewer dispatch attempts per PR before escalating to a human.
+    # A dispatch attempt is counted each time a reviewer is launched; the
+    # counter resets when a verdict is recorded or a new packet is generated
+    # for an advanced head. Without this cap, a PR that never produces a
+    # verdict (e.g. every reviewer hits the session limit) is re-dispatched
+    # indefinitely, burning quota every stale-claim interval.
+    max_review_dispatch_attempts: int = 3
+    # Maximum agentic turns for a reviewer session. Caps token spend per
+    # review by limiting how many tool-call round-trips the reviewer can make.
+    # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
+    # a review (read diff, read tests, read a few source files, write verdict)
+    # but prevents unbounded codebase exploration.
+    review_max_turns: int = 40
+    # Diff line count above which the review prompt includes a diff-size
+    # warning and a per-file summary instead of encouraging the reviewer to
+    # read the entire diff in one shot. 0 disables the threshold (always
+    # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
+    # single-read budget; beyond that the reviewer should read file-by-file.
+    diff_line_threshold: int = 500
 
 
 @dataclass(frozen=True)
@@ -261,6 +302,11 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum minutes after the PR's last update (updatedAt) to wait for any
+    # required check run to appear before routing an approved PR to readiness
+    # rework. This catches invisible CI-never-started stalls (mergeStateStatus
+    # DIRTY or a missing CI trigger). 0 disables the guard.
+    readiness_no_ci_minutes: int = 15
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #
@@ -380,6 +426,16 @@ class RuntimeConfig:
         "rate limit",
         "too many requests",
         "usage limit",
+        # Claude Code CLI's own account-level session-limit phrasing (observed
+        # 2026-07-21 verbatim as "You've hit your session limit · resets
+        # 4:40pm (America/Los_Angeles)"). Distinct wording from "rate limit"/
+        # "usage limit" above, so it silently fell through _classify_session_
+        # failure's marker match and every downstream reap path: reviewer
+        # workers that died on this message got no throttled_until cooldown
+        # and were relaunched straight into the same limit every stale-claim
+        # interval (job-cannon PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
+        # hours in a redispatch loop before this was added).
+        "hit your session limit",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
@@ -392,6 +448,11 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: int = 1500
+    # Extra safety margin added to provider-reported rate-limit reset times
+    # when computing the ``throttled_until`` defer deadline. Provider reset
+    # estimates are floors, not guarantees; dispatching at T+0 races the
+    # provider's actual reset. Default 90 seconds.
+    throttle_resume_margin_s: int = 90
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1124,58 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
             f"got {rd_max_local}"
         )
+    rd_max_attempts = review_dispatch_data.get("max_review_dispatch_attempts")
+    if rd_max_attempts is not None and (
+        isinstance(rd_max_attempts, bool) or not isinstance(rd_max_attempts, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be an int, "
+            f"got {type(rd_max_attempts).__name__}"
+        )
+    if rd_max_attempts is not None and rd_max_attempts < 1:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
+            f"got {rd_max_attempts}"
+        )
+    rd_probe_max_interval = review_dispatch_data.get("quota_probe_max_interval_minutes")
+    if rd_probe_max_interval is not None and (
+        isinstance(rd_probe_max_interval, bool) or not isinstance(rd_probe_max_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
+            f"an int, got {type(rd_probe_max_interval).__name__}"
+        )
+    if rd_probe_max_interval is not None and rd_probe_max_interval < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
+            f">= 0, got {rd_probe_max_interval}"
+        )
+    rd_max_turns = review_dispatch_data.get("review_max_turns")
+    if rd_max_turns is not None and (
+        isinstance(rd_max_turns, bool) or not isinstance(rd_max_turns, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_max_turns' must be an int, "
+            f"got {type(rd_max_turns).__name__}"
+        )
+    if rd_max_turns is not None and rd_max_turns < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_max_turns' must be >= 0, "
+            f"got {rd_max_turns}"
+        )
+    rd_diff_threshold = review_dispatch_data.get("diff_line_threshold")
+    if rd_diff_threshold is not None and (
+        isinstance(rd_diff_threshold, bool) or not isinstance(rd_diff_threshold, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'diff_line_threshold' must be an int, "
+            f"got {type(rd_diff_threshold).__name__}"
+        )
+    if rd_diff_threshold is not None and rd_diff_threshold < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
+            f"got {rd_diff_threshold}"
+        )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
@@ -1102,6 +1215,19 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
             f"got {type(failed_attempt_alarm).__name__}"
         )
+    readiness_no_ci_minutes = auto_merge_data.get("readiness_no_ci_minutes")
+    if readiness_no_ci_minutes is not None:
+        if isinstance(readiness_no_ci_minutes, bool) or not isinstance(
+            readiness_no_ci_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'readiness_no_ci_minutes' must be an int, "
+                f"got {type(readiness_no_ci_minutes).__name__}"
+            )
+        if readiness_no_ci_minutes < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
+            )
     mergequeue_label = auto_merge_data.get("mergequeue_label")
     if mergequeue_label is not None:
         if not isinstance(mergequeue_label, str):
@@ -1157,6 +1283,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
                 f"got {graphql_rate_limit_threshold}"
+            )
+    throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
+    if throttle_resume_margin_s is not None:
+        if not isinstance(throttle_resume_margin_s, int):
+            raise ConfigError(
+                "config section 'runtime' key 'throttle_resume_margin_s' must be an int, "
+                f"got {type(throttle_resume_margin_s).__name__}"
+            )
+        if throttle_resume_margin_s < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
+                f"got {throttle_resume_margin_s}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

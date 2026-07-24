@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug-level logging")
     parser.add_argument(
         "--fleet-dir", type=str, default=None, help="Override fleet directory path"
     )
@@ -127,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--summary-file", type=Path, default=None)
     record.add_argument("--reviewed-head", default=None)
     record.add_argument("--comment", action="store_true")
+
+    unescalate = subparsers.add_parser("unescalate")
+    unescalate.add_argument("--pr", type=int, default=None)
+    unescalate.add_argument("--issue", type=int, default=None)
+    unescalate.add_argument("--dry-run", action="store_true")
 
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
@@ -857,6 +864,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
+    if args.command == "unescalate":
+        try:
+            return app.unescalate(args.pr, args.issue, dry_run=args.dry_run)
+        except OSError as exc:
+            return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "bash-rats":
@@ -904,6 +916,12 @@ def main(argv: list[str] | None = None) -> int:
     json_output = "--json" in raw_argv
     args = parser.parse_args([arg for arg in raw_argv if arg != "--json"])
     args.json_output = json_output or args.json_output
+
+    logging.basicConfig(
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
     try:
         if args.command == "doctor":
             result = run_doctor_command(args)

@@ -310,6 +310,23 @@ def _extract_attention_events(
     launch_failures = _collect_launch_failures(repo_key, data)
     events.extend(launch_failures)
 
+    # Extract live-worker redispatch averted outcomes (issue #506)
+    # These are reported at the top level for work_only dispatch() and nested
+    # under "dispatch" for full loop() results.
+    averted = data.get("live_worker_redispatch_averted", [])
+    if not averted and "dispatch" in data:
+        averted = data["dispatch"].get("live_worker_redispatch_averted", [])
+    for event in averted:
+        events.append(
+            {
+                "repo_key": repo_key,
+                "type": "live_worker_redispatch_averted",
+                "issue_number": event.get("issue_number"),
+                "reason": event.get("probe_result"),
+                "pid": event.get("pid"),
+                "adapter_kind": event.get("adapter_kind", "unknown"),
+            }
+        )
     # Extract review verdict reaper results. `dispatch_reviews` carries
     # `recorded_verdicts`/`missed_verdicts` lists; `loop()` nests them under the
     # "dispatch_reviews" key. Surfacing both recorded and missed verdicts in the
@@ -566,6 +583,17 @@ def _build_fleet_attention_digest(
                     previous_health=None,
                     last_log_line=event.get("reason"),
                     pid=None,
+                )
+            )
+        elif event_type == "live_worker_redispatch_averted":
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or -1,
+                    adapter_kind=event.get("adapter_kind", event["repo_key"]),
+                    health="DISPATCH_AVERTED",
+                    previous_health=None,
+                    last_log_line=event.get("reason"),
+                    pid=event.get("pid"),
                 )
             )
         elif event_type == "review_verdict_recorded":
