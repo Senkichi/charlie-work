@@ -2961,6 +2961,11 @@ class FakeGitHub:
     def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
         return (True, 10000, 0)
 
+    def invalidate_list_cache(self) -> None:
+        # The real GitHub clears its per-pass list cache here (called at the
+        # start of every loop pass); the fake has no cache, so this is a no-op.
+        self.list_cache_invalidations = getattr(self, "list_cache_invalidations", 0) + 1
+
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
         # Support both old signature (ready_label: str) and new (labels=None, state=None)

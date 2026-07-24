@@ -9388,6 +9388,14 @@ class OrchestratorApp:
             return result
 
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+        # Every pass must observe a fresh GitHub snapshot. The list cache
+        # dedupes calls within one pass, but a long-running supervisor
+        # (charlie fleet supervise) reuses this app -- and therefore one
+        # GitHub instance -- across many passes; without this, issues filed
+        # or PRs opened after the first pass stay invisible until the daemon
+        # restarts (observed live: intake frozen at a stale issue set for the
+        # daemon's entire lifetime).
+        self.gh.invalidate_list_cache()
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
