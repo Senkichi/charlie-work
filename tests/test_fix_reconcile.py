@@ -390,3 +390,219 @@ def test_active_state_statuses_is_valid_minus_deliberate_exclusions() -> None:
 
     deliberate_exclusions = {"closed", "approved", "blocked"}
     assert ACTIVE_STATE_STATUSES == VALID_ISSUE_STATUSES - deliberate_exclusions
+
+
+# ---------------------------------------------------------------------------
+# Issue #558: closed-unmerged PR state entry convergence
+# ---------------------------------------------------------------------------
+
+
+def test_closed_unmerged_pr_with_janitor_blocked_status_converges_to_closed() -> None:
+    """A state PR entry stuck in 'janitor_blocked' while GitHub reports the
+    PR CLOSED (unmerged) must converge to 'closed' so the janitor stops
+    re-fetching it every pass.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(528, "CLOSED", head_ref="agent/issue-100-x")],
+        issues=[_issue(100, [])],
+    )
+    state = empty_state()
+    state["prs"]["528"] = {"number": 528, "issue_number": 100, "status": "janitor_blocked"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+    assert drift[0].pr_number == 528
+    assert drift[0].new_status == "closed"
+
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["528"]["status"] == "closed"
+    assert new_state["prs"]["528"]["issue_number"] == 100
+
+
+def test_closed_unmerged_pr_with_rework_requested_status_converges_to_closed() -> None:
+    """A state PR entry stuck in 'rework_requested' while GitHub reports the
+    PR CLOSED (unmerged) must converge to 'closed'.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(500, "CLOSED", head_ref="agent/issue-495-x")],
+        issues=[_issue(495, [])],
+    )
+    state = empty_state()
+    state["prs"]["500"] = {"number": 500, "issue_number": 495, "status": "rework_requested"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+    assert drift[0].new_status == "closed"
+
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["500"]["status"] == "closed"
+
+
+def test_closed_unmerged_pr_with_reviewing_status_converges_to_closed() -> None:
+    """A state PR entry in 'reviewing' (the passive open-PR placeholder) while
+    GitHub reports the PR CLOSED (unmerged) must converge to 'closed'.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(700, "CLOSED", head_ref="agent/issue-200-x")],
+        issues=[_issue(200, [])],
+    )
+    state = empty_state()
+    state["prs"]["700"] = {"number": 700, "issue_number": 200, "status": "reviewing"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["700"]["status"] == "closed"
+
+
+def test_closed_unmerged_pr_with_escalated_status_converges_to_closed() -> None:
+    """A state PR entry stuck in 'escalated' while GitHub reports the PR
+    CLOSED (unmerged) must converge to 'closed'.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(800, "CLOSED", head_ref="agent/issue-300-x")],
+        issues=[_issue(300, [])],
+    )
+    state = empty_state()
+    state["prs"]["800"] = {"number": 800, "issue_number": 300, "status": "escalated"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["800"]["status"] == "closed"
+
+
+def test_merged_pr_is_not_touched_by_closed_unmerged_state_converged() -> None:
+    """A MERGED PR must never fire closed_unmerged_pr_state_converged -- that
+    is merged_outside_orchestrator's job.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(900, "MERGED", head_ref="agent/issue-400-x")],
+        issues=[_issue(400, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["prs"]["900"] = {"number": 900, "issue_number": 400, "status": "reviewing"}
+
+    drift = detect_drift(gh, state, config)
+    assert [item for item in drift if item.kind == "closed_unmerged_pr_state_converged"] == []
+    # merged_outside_orchestrator should fire instead
+    assert [item for item in drift if item.kind == "merged_outside_orchestrator"] != []
+
+
+def test_closed_pr_already_closed_status_is_no_op_idempotent() -> None:
+    """A state PR entry that is already 'closed' while GitHub reports the PR
+    CLOSED must NOT fire closed_unmerged_pr_state_converged -- it is already
+    converged (idempotent).
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(548, "CLOSED", head_ref="agent/issue-500-x")],
+        issues=[_issue(500, [])],
+    )
+    state = empty_state()
+    state["prs"]["548"] = {"number": 548, "issue_number": 500, "status": "closed"}
+
+    drift = detect_drift(gh, state, config)
+    assert [item for item in drift if item.kind == "closed_unmerged_pr_state_converged"] == []
+
+
+def test_closed_unmerged_pr_state_converged_preserves_other_fields() -> None:
+    """apply_fixes must preserve unrelated fields on the PR entry (e.g.
+    decision, reviewed_head_sha) while setting status to 'closed'.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(528, "CLOSED", head_ref="agent/issue-100-x")],
+        issues=[_issue(100, [])],
+    )
+    state = empty_state()
+    state["prs"]["528"] = {
+        "number": 528,
+        "issue_number": 100,
+        "status": "janitor_blocked",
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["528"]["status"] == "closed"
+    assert new_state["prs"]["528"]["decision"] == "request_changes"
+    assert new_state["prs"]["528"]["reviewed_head_sha"] == "abc123"
+
+
+def test_closed_unmerged_pr_state_converged_fires_alongside_active_labels() -> None:
+    """Both closed_unmerged_pr_active_labels (issue-side) and
+    closed_unmerged_pr_state_converged (PR-side) may fire for the same PR;
+    they are independent and must not suppress each other.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(528, "CLOSED", head_ref="agent/issue-100-x")],
+        issues=[_issue(100, [config.labels.pr_open, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["528"] = {"number": 528, "issue_number": 100, "status": "janitor_blocked"}
+
+    drift = detect_drift(gh, state, config)
+    kinds = {item.kind for item in drift}
+    assert "closed_unmerged_pr_active_labels" in kinds
+    assert "closed_unmerged_pr_state_converged" in kinds
+
+
+def test_closed_unmerged_pr_state_converged_second_pass_is_idempotent() -> None:
+    """After apply_fixes converges the status to 'closed', a second
+    detect_drift pass must not re-emit the drift item.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(528, "CLOSED", head_ref="agent/issue-100-x")],
+        issues=[_issue(100, [])],
+    )
+    state = empty_state()
+    state["prs"]["528"] = {"number": 528, "issue_number": 100, "status": "janitor_blocked"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["528"]["status"] == "closed"
+
+    # Second pass: no drift for this kind
+    second_drift = [
+        item
+        for item in detect_drift(gh, new_state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert second_drift == []

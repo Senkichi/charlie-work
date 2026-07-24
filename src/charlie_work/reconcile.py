@@ -258,6 +258,32 @@ def detect_drift(
                         remove_labels=tuple(sorted(issue_active_labels)),
                     )
                 )
+            # Issue #558: converge the state PR entry's own status to
+            # "closed" when GitHub reports the PR closed-unmerged. Without
+            # this, entries stuck in active statuses (janitor_blocked,
+            # rework_requested, reviewing, escalated, ...) are invisible to
+            # every terminal-status sweep and get re-fetched / re-evaluated
+            # every pass forever. This is the PR-side counterpart to the
+            # issue-side closed_unmerged_pr_active_labels above; the two are
+            # independent and may both fire for the same PR. The linked
+            # issue's disposition (label strip / carry-forward redispatch)
+            # is left entirely to the existing issue-side handling. MERGED
+            # PRs are excluded -- that is merged_outside_orchestrator's job.
+            state_status = (state_entry or {}).get("status")
+            if state_status is not None and state_status not in ("closed", "merged"):
+                drift.append(
+                    DriftItem(
+                        kind="closed_unmerged_pr_state_converged",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} is CLOSED (unmerged) on GitHub but "
+                            f"state status is {state_status!r}; converging to 'closed'"
+                        ),
+                        fix_actions=(f"set state prs[{pr_number}].status = 'closed'",),
+                        new_status="closed",
+                    )
+                )
         elif gh_state == "OPEN":
             # A PR record that the orchestrator is already tracking (has an
             # entry in state["prs"]) but that never got a status written --
@@ -1063,6 +1089,25 @@ def apply_fixes(
         elif item.kind == "state_pr_missing_on_github":
             if item.pr_number is not None:
                 new_prs.pop(str(item.pr_number), None)
+
+        elif item.kind == "closed_unmerged_pr_state_converged":
+            # Issue #558: converge the state PR entry's own status to
+            # "closed" when GitHub reports the PR closed-unmerged. Only the
+            # PR entry's status is touched; the linked issue's disposition
+            # is left to the existing closed-unmerged issue-side handling
+            # (closed_unmerged_pr_active_labels / state_active_status_issue_
+            # closed). Any stale review-dispatch claim is also cleared so a
+            # dead PR never retains a live-claim-shaped record.
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                new_prs[pr_key] = {
+                    **without_review_dispatch_claim(existing_pr),
+                    "number": item.pr_number,
+                    "status": "closed",
+                }
+                if item.issue_number is not None:
+                    new_prs[pr_key]["issue_number"] = item.issue_number
 
         elif item.kind in (
             "issue_active_label_no_open_pr",

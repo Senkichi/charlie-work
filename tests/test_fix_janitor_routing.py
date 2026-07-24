@@ -473,3 +473,99 @@ def test_clean_janitor_pass_with_unknown_mergeable_preserves_conflict_epoch(
     pr = state["prs"]["456"]
     assert pr["conflict_rework_attempts"] == 1
     assert pr["no_op_rework_attempts"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #558: single-point-of-enforcement -- review() converges a CLOSED
+# (unmerged) PR's state entry to "closed" at the janitor-gate boundary
+# instead of falling through to janitor_blocked bookkeeping.
+# ---------------------------------------------------------------------------
+
+
+def _force_pr_status(app: OrchestratorApp, pr_number: int, status: str) -> None:
+    state = load_state(app.paths.state_file)
+    record = {**state["prs"].get(str(pr_number), {}), "number": pr_number}
+    record["status"] = status
+    state["prs"][str(pr_number)] = record
+    save_state(app.paths.state_file, state)
+
+
+def test_review_converges_closed_unmerged_pr_janitor_blocked(tmp_path: Path) -> None:
+    """A PR that is CLOSED (unmerged) on GitHub with a 'janitor_blocked'
+    state status must be converged to 'closed' by review() at the janitor
+    gate boundary, not re-logged as janitor_blocked.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "janitor_blocked")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["closed_unmerged_converged"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+
+
+def test_review_converges_closed_unmerged_pr_rework_requested(tmp_path: Path) -> None:
+    """A PR that is CLOSED (unmerged) on GitHub with a 'rework_requested'
+    state status must be converged to 'closed' by review().
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "rework_requested")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["closed_unmerged_converged"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+
+
+def test_review_converges_closed_unmerged_pr_already_closed_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """A PR already converged to 'closed' must not re-emit the convergence
+    event on a second review() call (idempotent).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "closed")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data.get("closed_unmerged_converged") is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+
+
+def test_review_does_not_converge_merged_pr(tmp_path: Path) -> None:
+    """A MERGED PR must NOT be converged by the closed-unmerged path --
+    that is merged_outside_orchestrator's job. The janitor gate should
+    fall through to its normal failure handling for MERGED.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "MERGED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "reviewing")
+
+    result = app.review(456)
+
+    # MERGED is not CLOSED, so the closed-unmerged convergence must not fire.
+    assert result.data.get("closed_unmerged_converged") is None
+    state = load_state(app.paths.state_file)
+    # Status should not have been set to "closed" by this path.
+    assert state["prs"]["456"]["status"] != "closed"

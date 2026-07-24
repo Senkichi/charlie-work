@@ -5457,6 +5457,44 @@ class OrchestratorApp:
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            # Issue #558: a PR that is CLOSED (unmerged) on GitHub is dead --
+            # every other janitor failure is moot. Converge the state PR
+            # entry to "closed" at this boundary (single-point-of-enforcement)
+            # so the janitor stops re-fetching and re-evaluating it every
+            # pass. The reconcile rule (closed_unmerged_pr_state_converged)
+            # is the idempotent backstop for entries the janitor gate never
+            # observes (e.g. a PR that closed between passes, or one never
+            # routed through review()). MERGED PRs are left to
+            # merged_outside_orchestrator's reconcile rule. The linked
+            # issue's disposition is left to the existing closed-unmerged
+            # issue-side handling.
+            if str(pr.get("state") or "").upper() == "CLOSED":
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    existing_pr_state = state["prs"].get(str(pr_number), {})
+                    if existing_pr_state.get("status") != "closed":
+                        state["prs"][str(pr_number)] = {
+                            **without_review_dispatch_claim(existing_pr_state),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "closed",
+                        }
+                        state = self._record_event(
+                            state,
+                            "closed_unmerged_pr_state_converged",
+                            {"pr_number": pr_number, "issue_number": issue_number},
+                        )
+                        save_state(self.paths.state_file, state)
+                return CommandResult(
+                    True,
+                    f"PR #{pr_number} is CLOSED (unmerged) on GitHub; "
+                    f"converged state status to 'closed'",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "closed_unmerged_converged": True,
+                    },
+                )
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
