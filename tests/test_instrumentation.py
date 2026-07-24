@@ -428,3 +428,142 @@ def test_wal_mode_enabled(tmp_path: Path) -> None:
     cursor = conn.execute("PRAGMA journal_mode")
     mode = cursor.fetchone()[0]
     assert mode == "wal"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for issue #557: events.jsonl re-migrates on every start
+# ---------------------------------------------------------------------------
+
+
+def _write_jsonl(jsonl_path: Path, records: list[dict]) -> None:
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_jsonl_migration_one_shot_across_processes(tmp_path: Path) -> None:
+    """Two fresh connections (simulating two processes) must not duplicate rows."""
+    state_path = tmp_path / "state.json"
+    jsonl_path = state_path.parent / "events.jsonl"
+    migrated_path = state_path.parent / "events.jsonl.migrated"
+    records = [
+        {"ts": "2025-01-01T00:00:00Z", "kind": "dispatch", "payload": {"issue": 1}},
+        {"ts": "2025-01-01T00:01:00Z", "kind": "review", "payload": {"pr_number": 42}},
+        {"ts": "2025-01-01T00:02:00Z", "kind": "loop_completed", "payload": {"ok": True}},
+    ]
+    _write_jsonl(jsonl_path, records)
+
+    # First "process" — triggers migration and renames the file.
+    events = read_event_log(state_path)
+    assert len(events) == 3
+    assert not jsonl_path.exists()
+    assert migrated_path.exists()
+
+    # Second "process" — close the cached connection to simulate a new process.
+    close_db(state_path)
+    events2 = read_event_log(state_path)
+    assert len(events2) == 3
+
+    # Third "process" — still no duplicates.
+    close_db(state_path)
+    events3 = read_event_log(state_path)
+    assert len(events3) == 3
+
+
+def test_jsonl_migration_idempotent_if_rerun(tmp_path: Path) -> None:
+    """If migration runs again (crash before rename), no rows are duplicated."""
+    state_path = tmp_path / "state.json"
+    jsonl_path = state_path.parent / "events.jsonl"
+    migrated_path = state_path.parent / "events.jsonl.migrated"
+    records = [
+        {"ts": "2025-01-01T00:00:00Z", "kind": "dispatch", "payload": {"issue": 1}},
+        {"ts": "2025-01-01T00:01:00Z", "kind": "review", "payload": {"pr": 42}},
+    ]
+    _write_jsonl(jsonl_path, records)
+
+    # First migration.
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    assert migrated_path.exists()
+
+    # Simulate a crash-before-rename by restoring the legacy file.
+    close_db(state_path)
+    migrated_path.replace(jsonl_path)
+    assert jsonl_path.exists()
+
+    # Second migration must not duplicate any rows.
+    events2 = read_event_log(state_path)
+    assert len(events2) == 2
+    # And the file is renamed again.
+    assert not jsonl_path.exists()
+    assert migrated_path.exists()
+
+
+def test_dedupe_existing_duplicates_on_first_access(tmp_path: Path) -> None:
+    """One-time cleanup removes duplicate rows from prior pollution."""
+    state_path = tmp_path / "state.json"
+    db_path = state_path.parent / "events.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a polluted database directly: 4 identical rows + 1 unique row.
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+            repo TEXT, correlation_id TEXT, pr_number INTEGER,
+            issue_number INTEGER, level TEXT DEFAULT 'info'
+        );
+        """
+    )
+    payload_json = json.dumps({"issue": 1}, sort_keys=True)
+    for _ in range(4):
+        conn.execute(
+            """INSERT INTO events
+               (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+               VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'info')""",
+            ("2025-01-01T00:00:00Z", "dispatch", payload_json),
+        )
+    conn.execute(
+        """INSERT INTO events
+           (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+           VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'info')""",
+        ("2025-01-01T00:01:00Z", "review", json.dumps({"pr": 2}, sort_keys=True)),
+    )
+    conn.commit()
+    conn.close()
+
+    # First access triggers the user_version=1 dedupe migration.
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["dispatch", "review"]
+
+    # Re-opening must not re-run the dedupe (user_version guard).
+    close_db(state_path)
+    events2 = read_event_log(state_path)
+    assert len(events2) == 2
+
+
+def test_jsonl_migration_malformed_tolerance_preserved(tmp_path: Path) -> None:
+    """Malformed-line tolerance must be preserved alongside the new idempotency."""
+    state_path = tmp_path / "state.json"
+    jsonl_path = state_path.parent / "events.jsonl"
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": "2025-01-01T00:00:00Z", "kind": "good", "payload": {}}) + "\n")
+        f.write("not valid json\n")
+        f.write(
+            json.dumps({"ts": "2025-01-01T00:01:00Z", "kind": "also_good", "payload": {}}) + "\n"
+        )
+
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    assert events[0]["kind"] == "good"
+    assert events[1]["kind"] == "also_good"
+    # File renamed despite the malformed line.
+    assert not jsonl_path.exists()
+    assert (state_path.parent / "events.jsonl.migrated").exists()
