@@ -181,12 +181,27 @@ def _diff_size_section(diff: str, threshold: int, diff_path: Path) -> str:
 # bloat the reviewer's context without aiding the review: ``comments`` (can be
 # huge on active PRs), ``statusCheckRollup`` (separate checks.json is written),
 # and ``createdAt``/``updatedAt`` (not used by the review rubric).
-_PR_SLIM_FIELDS: frozenset[str] = frozenset({
-    "number", "title", "url", "body", "headRefOid", "baseRefName",
-    "headRefName", "isDraft", "state", "labels", "author",
-    "additions", "deletions", "mergeable", "mergeStateStatus",
-    "isCrossRepository", "reviewDecision",
-})
+_PR_SLIM_FIELDS: frozenset[str] = frozenset(
+    {
+        "number",
+        "title",
+        "url",
+        "body",
+        "headRefOid",
+        "baseRefName",
+        "headRefName",
+        "isDraft",
+        "state",
+        "labels",
+        "author",
+        "additions",
+        "deletions",
+        "mergeable",
+        "mergeStateStatus",
+        "isCrossRepository",
+        "reviewDecision",
+    }
+)
 
 
 def _slim_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
@@ -1066,8 +1081,11 @@ def _apply_local_review_cap(
 
 
 def _is_review_dispatchable(
-    state: dict[str, Any], pr_number: int, candidate: dict[str, Any],
-    *, max_attempts: int = 3,
+    state: dict[str, Any],
+    pr_number: int,
+    candidate: dict[str, Any],
+    *,
+    max_attempts: int = 3,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -1362,9 +1380,7 @@ def _extract_review_session_summary(
             f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
         )
     else:
-        parts.append(
-            "The automated reviewer did not produce a structured verdict.\n"
-        )
+        parts.append("The automated reviewer did not produce a structured verdict.\n")
 
     # Include the last few assistant messages — earlier turns are usually
     # tool-use planning; the final messages contain the analysis.
@@ -1610,7 +1626,9 @@ def _detect_and_handle_stalled_reviews(
         status = pr_state.get("review_dispatch_status")
         if status == "review_dispatch_pending":
             pending_at = pr_state.get("review_dispatch_pending_at")
-            if pending_at and is_claim_stale(pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+            if pending_at and is_claim_stale(
+                pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            ):
                 state["prs"][pr_key] = {
                     **pr_state,
                     "review_dispatch_status": "review_dispatch_failed",
@@ -1647,7 +1665,9 @@ def _detect_and_handle_stalled_reviews(
             if pid_alive:
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
-            if dispatched_at and is_claim_stale(dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+            if dispatched_at and is_claim_stale(
+                dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            ):
                 state["prs"][pr_key] = {
                     **pr_state,
                     "review_dispatch_status": "review_dispatch_failed",
@@ -6066,7 +6086,8 @@ class OrchestratorApp:
             if changed:
                 save_state(self.paths.state_file, state)
             dispatchable = [
-                c for c in candidates
+                c
+                for c in candidates
                 if _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
             ]
 

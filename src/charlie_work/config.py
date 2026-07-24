@@ -1103,7 +1103,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {rd_max_local}"
         )
     rd_max_attempts = review_dispatch_data.get("max_review_dispatch_attempts")
-    if rd_max_attempts is not None and (isinstance(rd_max_attempts, bool) or not isinstance(rd_max_attempts, int)):
+    if rd_max_attempts is not None and (
+        isinstance(rd_max_attempts, bool) or not isinstance(rd_max_attempts, int)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be an int, "
             f"got {type(rd_max_attempts).__name__}"
@@ -1114,7 +1116,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {rd_max_attempts}"
         )
     rd_max_turns = review_dispatch_data.get("review_max_turns")
-    if rd_max_turns is not None and (isinstance(rd_max_turns, bool) or not isinstance(rd_max_turns, int)):
+    if rd_max_turns is not None and (
+        isinstance(rd_max_turns, bool) or not isinstance(rd_max_turns, int)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'review_max_turns' must be an int, "
             f"got {type(rd_max_turns).__name__}"
@@ -1125,7 +1129,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {rd_max_turns}"
         )
     rd_diff_threshold = review_dispatch_data.get("diff_line_threshold")
-    if rd_diff_threshold is not None and (isinstance(rd_diff_threshold, bool) or not isinstance(rd_diff_threshold, int)):
+    if rd_diff_threshold is not None and (
+        isinstance(rd_diff_threshold, bool) or not isinstance(rd_diff_threshold, int)
+    ):
         raise ConfigError(
             "config section 'review_dispatch' key 'diff_line_threshold' must be an int, "
             f"got {type(rd_diff_threshold).__name__}"

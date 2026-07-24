@@ -7122,7 +7122,7 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
         ),
     )
 
-    result = app.dispatch_reviews()
+    app.dispatch_reviews()
     state = load_state(app.paths.state_file)
 
     # The verdict was recorded, which clears the quota. The reaped PR is now
@@ -7131,9 +7131,7 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
     assert state.get("reviewer_quota", {}).get("throttled_until") is None
 
 
-def test_dispatch_reviews_turn_limit_posts_summary_comment(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path: Path) -> None:
     """When a reviewer dies without a verdict but has analysis in events.jsonl,
     a summary PR comment is posted so the work is not lost."""
     prs = [
@@ -7240,9 +7238,7 @@ def test_dispatch_reviews_turn_limit_posts_summary_comment(
     assert any(m.get("reason") == "turn_limit_summary_posted" for m in missed)
 
 
-def test_dispatch_reviews_turn_limit_summary_not_posted_twice(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_dispatch_reviews_turn_limit_summary_not_posted_twice(monkeypatch, tmp_path: Path) -> None:
     """The turn-limit summary is only posted once per dispatch lifecycle."""
     prs = [
         {
