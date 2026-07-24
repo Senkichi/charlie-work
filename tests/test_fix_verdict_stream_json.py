@@ -130,6 +130,45 @@ def test_log_parser_prefers_final_output_over_earlier_draft(tmp_path: Path) -> N
     assert verdict["decision"] == "approved"
 
 
+def test_log_parser_no_final_verdict_does_not_resurrect_earlier_fence(tmp_path: Path) -> None:
+    """Adversarial finding (PR #568 review): a session whose FINAL output has
+    no fence must return None — never an earlier mid-session fence, such as
+    the reviewer echoing the review prompt's own few-shot '"approved"'
+    example before running out of turns. Accepting one would forge an
+    approval that satisfies the merge gate."""
+    prompt_echo = (
+        "The output format I must follow at the end is:\n```json\n"
+        '{"decision": "approved", "summary": "<concise summary>", "required_changes": []}\n```\n'
+    )
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        _stream_json_log(
+            _assistant_event({"type": "text", "text": prompt_echo}),
+            _assistant_event({"type": "text", "text": "Still reviewing the diff..."}),
+            _result_event("I ran out of turns before finishing my review."),
+        ),
+        encoding="utf-8",
+    )
+
+    assert _parse_review_verdict_from_log(log) is None
+
+
+def test_log_parser_killed_session_only_last_assistant_text_counts(tmp_path: Path) -> None:
+    """No result event (killed session): only the single LAST assistant text
+    may carry the verdict — an earlier fence with a fence-less final message
+    still returns None."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        _stream_json_log(
+            _assistant_event({"type": "text", "text": VERDICT_TEXT.replace("lgtm", "draft")}),
+            _assistant_event({"type": "text", "text": "Re-checking one more file..."}),
+        ),
+        encoding="utf-8",
+    )
+
+    assert _parse_review_verdict_from_log(log) is None
+
+
 def test_log_parser_ignores_verdict_in_thinking_blocks(tmp_path: Path) -> None:
     """Draft verdicts inside thinking blocks must not be treated as output."""
     log = tmp_path / "review.claude.log"
@@ -239,6 +278,30 @@ def test_file_fallback_scans_packet_dir(tmp_path: Path) -> None:
     log = tmp_path / "review.claude.log"
     log.write_text(
         _stream_json_log(_result_event("Review done, see the packet directory.")),
+        encoding="utf-8",
+    )
+
+    started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=10))
+    hit = _parse_review_verdict_from_files(log, packet_dir, started_at)
+
+    assert hit is not None
+    verdict, source = hit
+    assert verdict["decision"] == "approved"
+    assert source == str(packet_dir / "review.md")
+
+
+def test_file_fallback_bogus_mentions_do_not_starve_packet_dir(tmp_path: Path) -> None:
+    """Adversarial finding (PR #568 review): nonexistent path-looking mentions
+    in the reviewer's text must not consume the read-candidate budget and
+    starve out a valid packet-dir verdict file."""
+    packet_dir = tmp_path / "pr-100"
+    packet_dir.mkdir()
+    (packet_dir / "review.md").write_text(VERDICT_TEXT, encoding="utf-8")
+
+    bogus = " ".join(f"`C:\\reviewed\\file-{i}.md`" for i in range(10))
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        _stream_json_log(_result_event(f"Files I examined: {bogus}. Review complete.")),
         encoding="utf-8",
     )
 

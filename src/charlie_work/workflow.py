@@ -1251,19 +1251,32 @@ def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
 
     With ``tee_stream_json`` enabled the sidecar log is JSONL where every
     fence lives *inside* a JSON string (``\\n`` as escape sequences), so a
-    regex over the raw text can never match. Decode each event's assistant
-    text first, then scan the decoded texts newest-first (the result event is
-    the last line, so the final output wins).
+    regex over the raw text can never match. Decode the events and accept a
+    fence ONLY from the final output: the ``result`` event's text, or —
+    absent a usable one (session killed before the result line) — the single
+    last assistant text. Never scan further back: a mid-session draft or an
+    echo of the review prompt's own few-shot example (which contains a
+    literal ``"decision": "approved"`` fence) must not be recorded as the
+    session's verdict when the reviewer produced no final one. A fence-less
+    final output returns ``None`` so the caller's no-verdict path
+    (turn-limit summary + retry) handles it as designed.
     """
-    texts = [
-        text
-        for text in (extract_event_text(event) for event in iter_stream_json_events(raw_text))
-        if text
-    ]
-    for text in reversed(texts):
-        verdict = _extract_verdict_from_text(text)
-        if verdict is not None:
-            return verdict
+    result_text: str | None = None
+    last_assistant_text: str | None = None
+    for event in iter_stream_json_events(raw_text):
+        text = extract_event_text(event)
+        if not text:
+            continue
+        if event.get("type") == "result":
+            result_text = text
+        else:
+            last_assistant_text = text
+
+    for text in (result_text, last_assistant_text):
+        if text:
+            verdict = _extract_verdict_from_text(text)
+            if verdict is not None:
+                return verdict
     return None
 
 
@@ -1368,7 +1381,12 @@ def _parse_review_verdict_from_files(
                 seen.add(key)
                 candidates.append(md_path)
 
-    for candidate in candidates[:_REVIEW_FALLBACK_MAX_CANDIDATES]:
+    # Stat-filter BEFORE capping: the cap bounds expensive file reads, and
+    # spurious path-looking mentions in the reviewer's text (nonexistent,
+    # stale, oversized) must not starve the trusted packet-dir candidates
+    # out of the read budget.
+    readable: list[Path] = []
+    for candidate in candidates:
         try:
             stat = candidate.stat()
         except OSError:
@@ -1379,6 +1397,11 @@ def _parse_review_verdict_from_files(
             continue
         if datetime.fromtimestamp(stat.st_mtime, tz=UTC) < cutoff:
             continue
+        readable.append(candidate)
+        if len(readable) >= _REVIEW_FALLBACK_MAX_CANDIDATES:
+            break
+
+    for candidate in readable:
         try:
             content = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError:
