@@ -128,7 +128,15 @@ class LabelConfig:
 
     @property
     def workflow_labels(self) -> set[str]:
-        """All workflow labels (agent:* states) excluding the ready marker."""
+        """All workflow labels (agent:* states) excluding the ready marker.
+
+        ``merge_hold`` is intentionally excluded: it is a transient operator
+        signal, not a workflow state. Including it here would make every
+        non-terminal transition (``review_started``, ``rework_requested``, …)
+        strip the hold from the issue, violating the issue #496 persistence
+        requirement. Terminal transitions strip it explicitly via ``extra_remove``
+        (see ``labels._edges``).
+        """
         return {
             self.queued,
             self.in_progress,
@@ -138,7 +146,6 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
-            self.merge_hold,
         }
 
 

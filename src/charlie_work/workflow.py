@@ -7712,6 +7712,10 @@ class OrchestratorApp:
                 # Issue #496: an operator can park an approved PR by adding the
                 # configured merge-hold label to the PR or its linked issue.
                 # When the hold is present, skip the mergequeue re-add entirely.
+                # Scope note: this hold check runs only in mergequeue mode
+                # (when ``mergequeue_label`` is set). In direct-merge mode the
+                # hold label has no effect — the issue title scopes this to
+                # "the mergequeue re-add," so the self-merge branch is unchanged.
                 merge_hold = self.config.labels.merge_hold in label_names(pr)
                 if not merge_hold and issue_number is not None:
                     try:
