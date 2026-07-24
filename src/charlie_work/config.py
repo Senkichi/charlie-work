@@ -209,6 +209,19 @@ class ReviewConfig:
     max_rework_cycles: int = 2
     require_tests_or_rationale: bool = True
     require_issue_link: bool = True
+    # Enforced in review()'s janitor gate: past this many rework routes for a
+    # genuine merge conflict (mergeable=CONFLICTING or mergeStateStatus=DIRTY),
+    # the PR escalates to a human instead of looping forever. Without this cap
+    # a conflicting PR that a rework worker never actually rebases re-logs the
+    # identical janitor_gate failure every pass indefinitely (cost-spirals.md
+    # Finding 1).
+    max_conflict_rework_attempts: int = 2
+    # Same as max_conflict_rework_attempts, for the janitor's no-op-rework
+    # signal (a rework cycle that pushed no actual content change — same
+    # patch-id/head as the last request_changes verdict). Previously detected
+    # but never consumed by anything (pr-lifecycle.md "janitor_blocked zero
+    # readers" finding).
+    max_no_op_rework_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -230,10 +243,19 @@ class ReviewDispatchConfig:
     # simultaneously against the Claude usage budget. When a slot frees (a
     # reviewer finishes), the next poll dispatches another. 0 means unlimited.
     max_concurrent_reviews: int = 3
-    # Fixed interval between quota-probe attempts after a reviewer launch hits
+    # Base interval between quota-probe attempts after a reviewer launch hits
     # the usage wall. A probe is a single reviewer launch; this many minutes
-    # must elapse before the next probe. No escalation backoff.
+    # must elapse before the next probe. Each consecutive probe that hits the
+    # wall again doubles the interval (see quota_probe_max_interval_minutes)
+    # instead of relaunching a real reviewer session into the wall every
+    # ``quota_probe_interval_minutes`` for the duration of a live provider
+    # outage (cost-spirals.md Finding 2: "No escalation backoff").
     quota_probe_interval_minutes: int = 15
+    # Cap on the exponential probe backoff described above, in minutes. 240
+    # (4h) keeps the floor below quota_reset_hours's default 5h window so a
+    # probe is still attempted at least once before/around the window's
+    # natural expiry. 0 disables the cap (backoff grows unbounded).
+    quota_probe_max_interval_minutes: int = 240
     # Approximate provider usage-limit reset window in hours. When a reviewer
     # launch hits the wall, the global reviewer quota is held exhausted for at
     # least this long while probes run every ``quota_probe_interval_minutes``.
@@ -1114,6 +1136,19 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
             f"got {rd_max_attempts}"
+        )
+    rd_probe_max_interval = review_dispatch_data.get("quota_probe_max_interval_minutes")
+    if rd_probe_max_interval is not None and (
+        isinstance(rd_probe_max_interval, bool) or not isinstance(rd_probe_max_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
+            f"an int, got {type(rd_probe_max_interval).__name__}"
+        )
+    if rd_probe_max_interval is not None and rd_probe_max_interval < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
+            f">= 0, got {rd_probe_max_interval}"
         )
     rd_max_turns = review_dispatch_data.get("review_max_turns")
     if rd_max_turns is not None and (

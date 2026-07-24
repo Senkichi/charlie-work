@@ -23888,12 +23888,19 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     assert check_calls["n"] == 1
     assert result1.ok is True
 
-    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123
+    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123,
+    # and the rework_requested issue status the real record_review sets (the janitor gate's
+    # pending-rework guard reads it).
     state = load_state(app.paths.state_file)
     if "456" not in state["prs"]:
         state["prs"]["456"] = {}
     state["prs"]["456"]["decision"] = "request_changes"
     state["prs"]["456"]["reviewed_head_sha"] = "sha-abc123"
+    state["issues"]["123"] = {
+        **state["issues"].get("123", {}),
+        "number": 123,
+        "status": "rework_requested",
+    }
     save_state(app.paths.state_file, state)
 
     # Second review on same head: janitor gate blocks (no-op rework check)
