@@ -39,7 +39,14 @@ from .github import (
 )
 from .labels import TransitionOutcome, transition
 from .process_utils import kill_process_tree
-from .state import append_event, is_claim_stale, set_throttled_until, without_review_dispatch_claim
+from .state import (
+    PASSIVE_OPEN_STATUS,
+    VALID_ISSUE_STATUSES,
+    append_event,
+    is_claim_stale,
+    set_throttled_until,
+    without_review_dispatch_claim,
+)
 from .worktree import (
     WorktreeState,
     inspect_worktree_state,
@@ -62,14 +69,37 @@ class DriftItem:
     add_labels: tuple[str, ...] = ()
     branch: str | None = None
     base_branch: str | None = None
+    # Target value for a state["issues"/"prs"][n]["status"] rewrite. Only
+    # populated by drift kinds whose fix is a pure status recomputation
+    # (issue_active_label_with_open_pr, issue_status_normalized,
+    # pr_status_normalized) -- None means "clear the status key" for those
+    # kinds, and is simply unused (not "clear") for every other kind.
+    new_status: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
 # Any of these on a closed GitHub issue is a drift condition (issue #259).
 # "escalated" is included so a closed-while-escalated issue gets its state entry
 # finalized; the terminal human_needed label is intentionally preserved.
+# INVARIANT (guarded by test_fix_reconcile's coverage test): every
+# VALID_ISSUE_STATUSES member except the deliberate exclusions below must be
+# in this set. The status-normalization sweep skips anything in
+# VALID_ISSUE_STATUSES, so a valid status missing here is invisible to BOTH
+# sweeps -- a closed issue stuck in it would never be finalized (the exact
+# dead zone adding manifest_written/dispatch_failed to the valid set briefly
+# created). Deliberate exclusions: "closed" (already terminal), "approved"/
+# "blocked" (finalization of closed approved/blocked issues is owned by the
+# merged-PR finalization flow, pre-existing behavior).
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
-    {"dispatched", "dispatch_pending", "rework_requested", "reviewing", "escalated"}
+    {
+        "dispatched",
+        "dispatch_pending",
+        "manifest_written",
+        "dispatch_failed",
+        "rework_requested",
+        "reviewing",
+        "escalated",
+    }
 )
 
 
@@ -155,6 +185,11 @@ def detect_drift(
     # Track issues with live sessions to avoid false-positive drift detection
     # (issue #214: don't strip labels from workers that are still running)
     live_session_issue_numbers: set[int] = set()
+    # Track issues whose status was already recomputed by
+    # issue_active_label_with_open_pr below, so the status-normalization sweep
+    # doesn't also emit a second, duplicate drift item for the same issue in
+    # the same pass.
+    issues_status_repaired: set[int] = set()
 
     for pr in prs:
         pr_number = pr.get("number")
@@ -221,6 +256,31 @@ def detect_drift(
                             for label in sorted(issue_active_labels)
                         ),
                         remove_labels=tuple(sorted(issue_active_labels)),
+                    )
+                )
+        elif gh_state == "OPEN":
+            # A PR record that the orchestrator is already tracking (has an
+            # entry in state["prs"]) but that never got a status written --
+            # e.g. a review packet generation crashed between creating the
+            # entry and recording its first status -- is invisible to every
+            # status-driven selector. Normalize it to the same passive
+            # "reviewing" placeholder issues get in the sibling sweep below;
+            # never invent a status for a PR the orchestrator never tracked
+            # (state_entry is None) since that may not be one of ours.
+            if state_entry is not None and state_entry.get("status") is None:
+                drift.append(
+                    DriftItem(
+                        kind="pr_status_normalized",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} is tracked in state but has no status field; "
+                            f"normalizing to {PASSIVE_OPEN_STATUS!r}"
+                        ),
+                        fix_actions=(
+                            f"set state prs[{pr_number}].status = {PASSIVE_OPEN_STATUS!r}",
+                        ),
+                        new_status=PASSIVE_OPEN_STATUS,
                     )
                 )
 
@@ -541,11 +601,54 @@ def detect_drift(
         active_present = issue_labels & labels_cfg.active
         terminal_present = issue_labels & labels_cfg.terminal
 
+        # Escalation is terminal-until-human, and state.json is its ground
+        # truth: every escalation call site writes status="escalated" first,
+        # then applies the human_needed label as a separate step, so a crash
+        # or label-API failure between the two leaves an escalated issue
+        # with no workflow labels at all -- exactly the zero-label shape the
+        # open-PR self-heal below would otherwise silently re-arm (and the
+        # no-open-PR repair would relabel dispatchable). Converge the labels
+        # from state instead, and never self-heal an escalated issue; only
+        # `charlie unescalate` re-enters the machine.
+        tracked_entry = state.get("issues", {}).get(str(issue_number))
+        tracked_status = tracked_entry.get("status") if isinstance(tracked_entry, dict) else None
+        if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
+            needs_human_needed = labels_cfg.human_needed not in issue_labels
+            if needs_human_needed or active_present:
+                fix_actions = []
+                add_labels: tuple[str, ...] = ()
+                if needs_human_needed:
+                    fix_actions.append(
+                        f"add label '{labels_cfg.human_needed}' to issue #{issue_number}"
+                    )
+                    add_labels = (labels_cfg.human_needed,)
+                for label in sorted(active_present):
+                    fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
+                drift.append(
+                    DriftItem(
+                        kind="escalated_labels_converged",
+                        issue_number=issue_number,
+                        pr_number=None,
+                        detail=(
+                            f"issue #{issue_number} has status 'escalated' in state but "
+                            f"its labels {sorted(issue_labels)} do not reflect it; "
+                            "converging labels from state ground truth"
+                        ),
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=tuple(sorted(active_present)),
+                        add_labels=add_labels,
+                    )
+                )
+            continue
+
         # Skip issue_active_label_no_open_pr if already handled by session relabel
         # (both fire for dead-session-with-no-PR-ever scenario) or if the session
-        # is still alive (issue #214: don't strip labels from running workers)
+        # is still alive (issue #214: don't strip labels from running workers).
+        # Terminal-labeled issues are excluded: a repair pass must never make a
+        # human-needed/done issue dispatchable again by adding `ready` back.
         if (
             active_present
+            and not terminal_present
             and not prs_linking_issue.get(issue_number)
             and issue_number not in issues_handled_by_session_relabel
             and issue_number not in live_session_issue_numbers
@@ -581,23 +684,31 @@ def detect_drift(
                 )
             )
 
-        # Issue #515: an issue carrying stale active labels (needs_rework,
-        # in_progress, queued) while an OPEN PR already links to it is a
-        # self-healable drift. Move the labels back to pr_open so the normal
-        # review/merge lifecycle takes over instead of looping through failed
-        # rework dispatches.
+        # Issue #515 (generalized): an issue with an OPEN PR already linked to
+        # it is self-healable whenever its active labels don't already read
+        # exactly "pr_open" -- either because it carries a stale active label
+        # (needs_rework, in_progress, queued) left over from a failed rework
+        # loop, OR because it carries NO active label at all (e.g. a bare
+        # "automated-ready" label survives untouched while the PR that was
+        # actually opened for it goes unnoticed). The original gate only
+        # checked the first case (`stale_active` truthy); an issue with zero
+        # active labels made `stale_active` an empty (falsy) set and was
+        # invisible to this self-heal entirely, even though `needs_pr_open`
+        # was independently true. Both sub-cases move the labels to pr_open so
+        # the normal review/merge lifecycle takes over instead of looping
+        # through failed rework dispatches or sitting dispatch-invisible.
         open_prs = open_prs_by_issue.get(issue_number, [])
         if open_prs:
             stale_active = active_present - {labels_cfg.pr_open, labels_cfg.reviewing}
+            needs_pr_open = labels_cfg.pr_open not in issue_labels
             if (
-                stale_active
+                (stale_active or needs_pr_open)
                 and not terminal_present
                 and issue_number not in issues_handled_by_session_relabel
                 and issue_number not in live_session_issue_numbers
                 and _issue_state(issue) == "OPEN"
             ):
                 pr_number = min(int(pr["number"]) for pr in open_prs)
-                needs_pr_open = labels_cfg.pr_open not in issue_labels
                 fix_actions = [
                     f"remove label '{label}' from issue #{issue_number}"
                     for label in sorted(stale_active)
@@ -608,6 +719,9 @@ def detect_drift(
                         f"add label '{labels_cfg.pr_open}' to issue #{issue_number}"
                     )
                     add_labels = (labels_cfg.pr_open,)
+                fix_actions.append(
+                    f"set state issues[{issue_number}].status = {PASSIVE_OPEN_STATUS!r}"
+                )
                 drift.append(
                     DriftItem(
                         kind="issue_active_label_with_open_pr",
@@ -616,12 +730,19 @@ def detect_drift(
                         detail=(
                             f"issue #{issue_number} carries stale active labels "
                             f"{sorted(stale_active)} while open PR #{pr_number} links to it"
+                            if stale_active
+                            else (
+                                f"issue #{issue_number} has no active agent label while "
+                                f"open PR #{pr_number} links to it"
+                            )
                         ),
                         fix_actions=tuple(fix_actions),
                         remove_labels=tuple(sorted(stale_active)),
                         add_labels=add_labels,
+                        new_status=PASSIVE_OPEN_STATUS,
                     )
                 )
+                issues_status_repaired.add(issue_number)
 
         if terminal_present and active_present:
             drift.append(
@@ -703,6 +824,62 @@ def detect_drift(
                     ),
                     fix_actions=tuple(fix_actions),
                     remove_labels=remove_labels,
+                )
+            )
+
+        # A status value that no code path in workflow.py ever assigns (e.g.
+        # "ready", which is only ever a label default, never a status) is
+        # invisible to every status-driven selector: it doesn't read as
+        # dispatched/rework_requested (so it isn't mistaken for in-flight
+        # work) but it also doesn't read as escalated/closed (so
+        # state_active_status_issue_closed above never finalizes it either).
+        # A record with no "status" key at all falls in the same blind spot.
+        # Recompute from ground truth: closed on GitHub wins first, then an
+        # open tracked PR (the same passive placeholder issue_active_label_
+        # with_open_pr uses above), else the queued-equivalent baseline a
+        # never-dispatched issue naturally has -- which means simply having
+        # no status key, not a synthesized status string. Never writes
+        # "rework_requested": that would trigger a fresh worker dispatch
+        # purely from a repair pass. Only emits when the recomputed target
+        # actually differs from the current value, so a second pass over an
+        # already-normalized record (including the "no status key" baseline)
+        # is a no-op.
+        for issue_number_str, entry in state_issues.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                issue_number = int(issue_number_str)
+            except ValueError:
+                continue
+            if issue_number in issues_status_repaired:
+                continue  # already normalized by issue_active_label_with_open_pr above
+            current_status = entry.get("status")
+            if current_status in VALID_ISSUE_STATUSES:
+                continue
+            issue = issues_by_number.get(issue_number)
+            if issue is not None and _issue_state(issue) == "CLOSED":
+                target_status: str | None = "closed"
+            elif open_prs_by_issue.get(issue_number):
+                target_status = PASSIVE_OPEN_STATUS
+            else:
+                target_status = None
+            if target_status == current_status:
+                continue
+            drift.append(
+                DriftItem(
+                    kind="issue_status_normalized",
+                    issue_number=issue_number,
+                    pr_number=None,
+                    detail=(
+                        f"issue #{issue_number} has status {current_status!r}, which no "
+                        f"code path in the orchestrator ever assigns; normalizing to "
+                        f"{target_status!r}"
+                    ),
+                    fix_actions=(
+                        f"set state issues[{issue_number}].status = {target_status!r} "
+                        f"(was {current_status!r})",
+                    ),
+                    new_status=target_status,
                 )
             )
 
@@ -887,14 +1064,20 @@ def apply_fixes(
             if item.pr_number is not None:
                 new_prs.pop(str(item.pr_number), None)
 
-        elif item.kind in ("issue_active_label_no_open_pr", "done_label_with_active_labels"):
+        elif item.kind in (
+            "issue_active_label_no_open_pr",
+            "done_label_with_active_labels",
+            "escalated_labels_converged",
+        ):
             if item.issue_number is not None:
                 label_ok = True
                 for label in item.remove_labels:
                     if not gh.remove_issue_label(item.issue_number, label):
                         label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
-                # add_labels=(ready,) when the ready label is missing --
+                # add_labels=(ready,) when the ready label is missing;
+                # escalated_labels_converged carries add_labels=(human_needed,)
+                # when the escalation label never landed --
                 # done_label_with_active_labels never sets add_labels, so this
                 # loop is a no-op for that sibling kind.
                 for label in item.add_labels:
@@ -916,8 +1099,14 @@ def apply_fixes(
                     )
 
         elif item.kind == "issue_active_label_with_open_pr":
-            # Issue #515: repair the stale labels and mirror the fix into state
-            # so state-driven dispatch_rework stops selecting the issue.
+            # Issue #515 (generalized): repair the stale/missing active label
+            # and mirror the fix into state as the passive "reviewing"
+            # placeholder -- the same status the normal dispatch->pr-open flow
+            # writes once a PR is open and no verdict has landed -- so
+            # state-driven dispatch_rework stops selecting the issue without
+            # falsely implying a review verdict was actually recorded (the
+            # previous "approved" write here was itself wrong: no reviewer
+            # ever ran).
             if item.issue_number is not None:
                 label_ok = True
                 for label in item.remove_labels:
@@ -932,7 +1121,7 @@ def apply_fixes(
                 new_issue = {
                     **existing_issue,
                     "number": item.issue_number,
-                    "status": "approved",
+                    "status": item.new_status or PASSIVE_OPEN_STATUS,
                     "merge_alert": "OK",
                 }
                 new_issue.pop("worker_pid", None)
@@ -957,6 +1146,30 @@ def apply_fixes(
                 issue_key = str(item.issue_number)
                 # Clear the stale claim by removing the entry entirely
                 new_issues.pop(issue_key, None)
+
+        elif item.kind == "issue_status_normalized":
+            # A status outside VALID_ISSUE_STATUSES (or missing entirely) is
+            # recomputed from ground truth in detect_drift and carried here
+            # via item.new_status. None means "no status" (the baseline a
+            # never-dispatched issue naturally has) -- drop the key rather
+            # than write a synthesized placeholder string.
+            if item.issue_number is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                if item.new_status is None:
+                    new_issues[issue_key] = {
+                        k: v for k, v in existing_issue.items() if k != "status"
+                    }
+                else:
+                    new_issues[issue_key] = {**existing_issue, "status": item.new_status}
+
+        elif item.kind == "pr_status_normalized":
+            # A tracked PR record with no status field is normalized to the
+            # passive "reviewing" placeholder (item.new_status).
+            if item.pr_number is not None and item.new_status is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                new_prs[pr_key] = {**existing_pr, "status": item.new_status}
 
         elif item.kind == "state_active_status_issue_closed":
             # Issue #259: finalize the state entry and strip any active labels that

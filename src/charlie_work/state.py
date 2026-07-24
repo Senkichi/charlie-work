@@ -33,6 +33,46 @@ _STALE_CLAIM_TIMEOUT_MINUTES = 30
 # throttle, while still avoiding thrash on flaky launch paths.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
+# Every literal ever assigned to `issues[n]["status"]` across the
+# orchestrator's dispatch -> review -> rework -> merge lifecycle (workflow.py).
+# reconcile.py's status-normalization sweep treats any issue record whose
+# status is missing or falls outside this set as drift and recomputes it from
+# ground truth. Kept here rather than in reconcile.py so any future writer of
+# issue status has a single, importable source of truth to validate against --
+# the same reasoning that already put ``without_review_dispatch_claim`` here
+# instead of scattered across callers.
+VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
+    {
+        "dispatched",
+        "dispatch_pending",
+        # manual-adapter dispatch: manifest written, worker not yet confirmed
+        "manifest_written",
+        # non-terminal dispatch failure awaiting windowed redispatch (#461);
+        # omitting it here would let the normalization sweep strip the status
+        # and re-expose the issue as a fresh dispatch candidate past the cap
+        "dispatch_failed",
+        "reviewing",
+        "rework_requested",
+        "approved",
+        "blocked",
+        "escalated",
+        "closed",
+    }
+)
+
+# The status the normal dispatch -> PR-open flow writes once a PR exists (for
+# an issue) or a fresh review packet has been generated (for a PR) and no
+# reviewer verdict has landed yet -- see workflow.py's
+# dispatched/rework_requested -> "reviewing" transitions (e.g. the
+# orphaned-worker-routed-to-review and rework-already-pushed recovery paths)
+# and the PR-level "reviewing" status ``review()`` writes alongside its
+# ``review_started`` label transition. reconcile.py's self-heal and
+# status-normalization sweep reuse this same passive placeholder for both
+# issue and PR records so a drift-repair pass never resurrects an issue into
+# "rework_requested" -- which would trigger a fresh worker dispatch -- purely
+# by fixing a label or a corrupt status field.
+PASSIVE_OPEN_STATUS = "reviewing"
+
 logger = logging.getLogger(__name__)
 
 

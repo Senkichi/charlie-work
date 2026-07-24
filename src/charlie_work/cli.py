@@ -130,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--reviewed-head", default=None)
     record.add_argument("--comment", action="store_true")
 
+    unescalate = subparsers.add_parser("unescalate")
+    unescalate.add_argument("--pr", type=int, default=None)
+    unescalate.add_argument("--issue", type=int, default=None)
+    unescalate.add_argument("--dry-run", action="store_true")
+
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
     merge_group = merge_ready.add_mutually_exclusive_group()
@@ -857,6 +862,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
             )
+        except OSError as exc:
+            return CommandResult(False, f"OS error: {exc}", {})
+    if args.command == "unescalate":
+        try:
+            return app.unescalate(args.pr, args.issue, dry_run=args.dry_run)
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "ship-it":

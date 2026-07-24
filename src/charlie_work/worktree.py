@@ -141,12 +141,17 @@ class WorktreeForeignWriterError(RuntimeError):
 
 
 class ReworkBranchConflictError(RuntimeError):
-    """Raised when a rework worktree cannot be merge-updated onto the current
-    base because the branch conflicts with it.
+    """Raised when a rework worktree's failed pre-merge cannot even be
+    recovered from — ``git merge --abort`` itself failed, or a ``MERGE_HEAD``
+    is somehow still present afterward, leaving the worktree mid-merge and
+    unusable.
 
-    This is a deterministic finding: GitHub cannot build the merge ref for a
-    conflicting PR, so no ``pull_request`` CI will ever run. The launch shim
-    surfaces it as ``failure_kind="rework_branch_conflict"``, which sits in
+    An ordinary merge conflict (the pre-merge fails, but ``merge --abort``
+    cleanly restores the branch to its pre-merge tip) does NOT raise this —
+    see ``_merge_update_rework_branch``, which returns a ``ReworkMergeConflict``
+    notice instead so the rework worker launches and resolves it. Only the
+    genuinely unrecoverable case reaches here. The launch shim surfaces it as
+    ``failure_kind="rework_branch_conflict"``, which sits in
     ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a human
     on first occurrence.
     """
@@ -178,6 +183,26 @@ KNOWN_FLAG_KEYS = frozenset({"bare", "detached", "locked", "prunable"})
 
 
 @dataclass(frozen=True)
+class ReworkMergeConflict:
+    """Structured notice describing a rework pre-merge that hit real conflicts.
+
+    Populated on ``WorktreeInfo.rework_conflict`` when
+    ``_merge_update_rework_branch`` could not cleanly merge the base ref into
+    the rework branch: the merge was aborted (restoring the branch to its
+    pre-merge tip) and the worktree is otherwise usable, so the launch
+    proceeds and hands this notice to the worker instead of failing closed.
+
+    ``base_branch`` is bare (no ``origin/`` prefix), so callers can render
+    "merge origin/<base_branch>" consistently regardless of whether the
+    conflict was found against a local or remote-tracking base ref.
+    """
+
+    base_branch: str
+    base_sha: str
+    conflicted_files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WorktreeInfo:
     path: Path
     branch: str
@@ -192,6 +217,10 @@ class WorktreeInfo:
     # hardcoded list, and used to keep injected orchestrator-owned files from
     # appearing as dirty in git status / CI-parity clean-tree gates.
     materialized_paths: tuple[str, ...] = ()
+    # Set when the rework pre-merge step (_merge_update_rework_branch) hit a
+    # real, recoverable merge conflict against the base ref. None for every
+    # non-rework worktree and for a clean rework pre-merge.
+    rework_conflict: ReworkMergeConflict | None = None
 
 
 class WorktreeState(str, Enum):
@@ -538,24 +567,52 @@ def _resolve_merge_base_ref(repo_root: Path, base_ref: str) -> str:
     return base_ref
 
 
+def _merge_head_present(worktree_path: Path) -> bool:
+    """Return True if ``worktree_path`` is still mid-merge (MERGE_HEAD exists).
+
+    Uses ``git rev-parse --verify`` rather than reaching for the ``.git``
+    filesystem entry directly — a linked worktree's ``.git`` is a file
+    pointing at the real gitdir elsewhere, so plumbing is the only
+    worktree-agnostic way to ask this question.
+    """
+    result = run_captured(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def _merge_update_rework_branch(
     repo_root: Path,
     worktree_path: Path,
     branch: str,
     base_ref: str,
-) -> None:
+) -> ReworkMergeConflict | None:
     """Merge-update a checked-out rework branch onto the current base.
 
     Before a rework worker starts, merge the resolved base ref into the PR
     branch. If GitHub later tries to build ``refs/pull/N/merge`` it will see a
-    branch that already contains the latest base changes, which both avoids the
-    "DIRTY/no CI" stall and surfaces genuine unresolvable conflicts locally as
-    a deterministic escalation.
+    branch that already contains the latest base changes, which avoids the
+    "DIRTY/no CI" stall for the common case.
+
+    A real conflict does NOT abort worktree creation: launching a worker is
+    the only thing that can ever resolve it (nobody rebases a branch whose
+    worktree was never created — issue investigation "rework-conflict"). The
+    merge is aborted, restoring the branch to its pre-merge tip, and the
+    conflict is handed back as a ``ReworkMergeConflict`` so the caller can
+    brief the worker to merge and resolve it itself.
+
+    Returns:
+        None if the merge completed cleanly (including "already up to date").
+        A ``ReworkMergeConflict`` describing the aborted merge otherwise.
 
     Raises:
-        ReworkBranchConflictError: if ``git merge`` cannot complete without
-            conflicts. The worktree is left with the merge aborted and the
-            conflicted paths are included in the exception.
+        ReworkBranchConflictError: only when recovery from the failed merge
+            itself fails — ``git merge --abort`` reports an error, or a
+            ``MERGE_HEAD`` is somehow still present afterward. This leaves the
+            worktree mid-merge and unusable, so it escalates instead of
+            handing a worker a broken workspace.
         RuntimeError: if the base ref cannot be fetched or the merge command
             itself cannot be run.
     """
@@ -580,7 +637,7 @@ def _merge_update_rework_branch(
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if merge_result.ok:
-        return
+        return None
 
     # Read the unmerged paths while the merge is still in progress, then abort.
     diff_result = run_captured(
@@ -588,22 +645,103 @@ def _merge_update_rework_branch(
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    run_captured(
-        ["git", "merge", "--abort"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
     conflicted_paths: tuple[str, ...] = ()
     if diff_result.ok:
         conflicted_paths = tuple(p.strip() for p in diff_result.stdout.splitlines() if p.strip())
 
-    raise ReworkBranchConflictError(
-        worktree_path=worktree_path,
-        branch=branch,
-        base_ref=merge_base_ref,
-        conflicted_paths=conflicted_paths,
-        stderr=merge_result.stderr,
+    abort_result = run_captured(
+        ["git", "merge", "--abort"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
+    if not abort_result.ok or _merge_head_present(worktree_path):
+        # Genuinely unrecoverable: the worktree may still be mid-merge. Escalate
+        # rather than handing a worker a broken workspace.
+        raise ReworkBranchConflictError(
+            worktree_path=worktree_path,
+            branch=branch,
+            base_ref=merge_base_ref,
+            conflicted_paths=conflicted_paths,
+            stderr=abort_result.stderr or merge_result.stderr,
+        )
+
+    base_sha_result = run_captured(
+        ["git", "rev-parse", merge_base_ref],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    base_sha = base_sha_result.stdout.strip() if base_sha_result.ok else ""
+    base_branch = (
+        merge_base_ref[len("origin/") :]
+        if merge_base_ref.startswith("origin/")
+        else merge_base_ref
+    )
+    return ReworkMergeConflict(
+        base_branch=base_branch,
+        base_sha=base_sha,
+        conflicted_files=conflicted_paths,
+    )
+
+
+REWORK_CONFLICT_NOTICE_BEGIN = "<!-- charlie:rework-conflict-notice:begin -->"
+REWORK_CONFLICT_NOTICE_END = "<!-- charlie:rework-conflict-notice:end -->"
+_REWORK_CONFLICT_NOTICE_RE = re.compile(
+    re.escape(REWORK_CONFLICT_NOTICE_BEGIN) + r".*?" + re.escape(REWORK_CONFLICT_NOTICE_END),
+    re.DOTALL,
+)
+
+
+def render_rework_conflict_notice(conflict: ReworkMergeConflict) -> str:
+    """Render the prompt section appended when a rework worktree carries a
+    ``ReworkMergeConflict`` (see ``WorktreeInfo.rework_conflict``).
+
+    Single point of enforcement for this wording: every adapter launch site
+    (claude-code, api, devin-shell) appends this same text to its per-session
+    prompt file rather than composing its own phrasing. The sentinel pair
+    bounding the block exists so ``apply_rework_conflict_notice`` can excise
+    a previous attempt's notice from a prompt file that is mutated in place
+    across redispatches (devin_shell).
+    """
+    files = (
+        "\n".join(f"- {path}" for path in conflict.conflicted_files)
+        if conflict.conflicted_files
+        else "- (conflicted paths unavailable)"
+    )
+    short_sha = conflict.base_sha[:12] if conflict.base_sha else "unknown"
+    return (
+        "\n\n"
+        f"{REWORK_CONFLICT_NOTICE_BEGIN}\n"
+        "\n---\n"
+        "## ACTION REQUIRED: unresolved merge conflict with base branch\n\n"
+        f"This branch has unresolved merge conflicts with "
+        f"`{conflict.base_branch}`@`{short_sha}` in the following file(s):\n\n"
+        f"{files}\n\n"
+        f"FIRST: merge `origin/{conflict.base_branch}` into this branch and "
+        "resolve the conflicts faithfully, preserving both this PR's intent "
+        "and the base branch's changes. Push only after the conflicts are "
+        "fully resolved.\n\n"
+        "THEN: address the review feedback below.\n"
+        f"{REWORK_CONFLICT_NOTICE_END}\n"
+    )
+
+
+def apply_rework_conflict_notice(prompt_text: str, conflict: ReworkMergeConflict) -> str:
+    """Return ``prompt_text`` carrying exactly one, current conflict notice.
+
+    Idempotent by construction: any notice block from a previous dispatch
+    attempt (bounded by the sentinel pair) is removed before the fresh one is
+    appended. Without this, a redispatch over a caller-supplied prompt file
+    that was mutated in place (devin_shell -- the file is never regenerated
+    per attempt) stacks one notice per attempt, and the base branch can move
+    between attempts, so the stacked notices carry contradictory base SHAs.
+    """
+    stripped = _REWORK_CONFLICT_NOTICE_RE.sub("", prompt_text)
+    # A begin marker without its end (torn write from a crashed attempt) would
+    # otherwise survive the regex and leave garbage above the fresh notice.
+    dangling = stripped.find(REWORK_CONFLICT_NOTICE_BEGIN)
+    if dangling != -1:
+        stripped = stripped[:dangling]
+    return stripped.rstrip() + render_rework_conflict_notice(conflict)
 
 
 def _rework_patch_id(repo_root: Path, base_ref: str, head_ref: str) -> str:
@@ -1591,6 +1729,7 @@ def create_worktree(
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
     reclaimed: str | None = None
     attempt_snapshot: AttemptSnapshot | None = None
+    rework_conflict: ReworkMergeConflict | None = None
 
     def _snapshot_before_delete(target_branch: str) -> None:
         """Best-effort attempt-tip snapshot immediately before a branch reset.
@@ -1934,7 +2073,9 @@ def create_worktree(
                         f"{fetch_result.error or fetch_result.stderr}"
                     )
             if recovery is None:
-                _merge_update_rework_branch(repo_root, worktree_path, branch, resolved_base_ref)
+                rework_conflict = _merge_update_rework_branch(
+                    repo_root, worktree_path, branch, resolved_base_ref
+                )
             venv_link = worktree_path / ".venv"
             venv_junction: Path | None = None
             if venv_source is not None:
@@ -1960,6 +2101,7 @@ def create_worktree(
                 venv_junction=venv_junction,
                 reclaimed=reclaimed,
                 attempt_snapshot=attempt_snapshot,
+                rework_conflict=rework_conflict,
             )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
@@ -2021,7 +2163,9 @@ def create_worktree(
                     f"git worktree add failed for rework branch {branch!r}: {result.error or result.stderr}"
                 )
             if recovery is None:
-                _merge_update_rework_branch(repo_root, worktree_path, branch, resolved_base_ref)
+                rework_conflict = _merge_update_rework_branch(
+                    repo_root, worktree_path, branch, resolved_base_ref
+                )
     else:
         # Fresh dispatch: create new branch off base_ref
         # Issue #110: Stale worktree reclamation before git worktree add
@@ -2147,6 +2291,7 @@ def create_worktree(
         reclaimed=reclaimed,
         attempt_snapshot=attempt_snapshot,
         materialized_paths=tuple(materialized_paths),
+        rework_conflict=rework_conflict,
     )
 
 

@@ -47,6 +47,7 @@ from .worktree import (
     create_review_checkout,
     create_worktree,
     remove_review_checkout,
+    apply_rework_conflict_notice,
     remove_worktree,
     write_worktree_marker,
 )
@@ -774,6 +775,14 @@ def launch_claude_worker(
     if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
         merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
 
+    # The rework pre-merge hit a real conflict (worktree.py's
+    # _merge_update_rework_branch): the worktree still launches, but the
+    # worker must resolve it before touching the review feedback. Append the
+    # notice to this session's disposable prompt file rather than failing
+    # closed (see worktree.ReworkMergeConflict).
+    if worktree.rework_conflict is not None:
+        prompt_text = apply_rework_conflict_notice(prompt_text, worktree.rework_conflict)
+
     def _teardown_on_launch_failure() -> None:
         # Review checkouts live in their own PR-keyed dir, never worktrees_dir,
         # so they must be torn down via remove_review_checkout — passing them
@@ -840,6 +849,14 @@ def launch_claude_worker(
     events_path = None
     if tee_stream_json:
         command = command + ("--output-format", "stream-json")
+        # The installed Claude Code CLI hard-rejects `--print` +
+        # `--output-format=stream-json` without `--verbose` ("Error: When
+        # using --print, --output-format=stream-json requires --verbose"),
+        # crashing the process before it does any work. Pair the flags
+        # unconditionally, but idempotently — a caller-supplied
+        # command_template may already carry --verbose.
+        if "--verbose" not in command:
+            command = command + ("--verbose",)
         events_path = _events_path(sessions_dir, issue_number, rework=rework, review=review)
 
     feed_stdin = "{prompt_path}" not in "".join(command_template)

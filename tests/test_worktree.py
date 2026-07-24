@@ -22,7 +22,7 @@ from charlie_work.worktree import (
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
-    ReworkBranchConflictError,
+    ReworkMergeConflict,
     _default_worktrees_dir,
     _has_origin_remote,
     _resolve_default_branch_ref,
@@ -458,8 +458,10 @@ def test_rework_attaches_to_existing_branch(tmp_path: Path) -> None:
 
 
 def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
-    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
-    with the local base (no origin remote), and report the conflicted paths."""
+    """Rework mode must NOT abort the launch when the branch conflicts with the
+    local base (no origin remote): the merge is aborted internally and the
+    worktree is returned with a populated ``rework_conflict`` notice instead of
+    raising ReworkBranchConflictError (see worktree.ReworkMergeConflict)."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -468,6 +470,7 @@ def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
     (info1.path / "file.txt").write_text("feature line\n", encoding="utf-8")
     _git(info1.path, "add", "file.txt")
     _git(info1.path, "commit", "-m", "add feature")
+    pre_merge_head = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
 
     # Advance the local base branch with a conflicting edit.
     _git(repo_root, "checkout", "main")
@@ -475,17 +478,31 @@ def test_rework_merge_update_conflicts_with_local_base(tmp_path: Path) -> None:
     _git(repo_root, "add", "file.txt")
     _git(repo_root, "commit", "-m", "advance main")
 
-    with pytest.raises(ReworkBranchConflictError) as exc_info:
-        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+    info2 = create_worktree(repo_root, branch_name, rework=True, base_ref="")
 
-    assert "file.txt" in exc_info.value.conflicted_paths
-    assert "main" in exc_info.value.base_ref or "HEAD" in exc_info.value.base_ref
+    assert isinstance(info2.rework_conflict, ReworkMergeConflict)
+    assert "file.txt" in info2.rework_conflict.conflicted_files
+    assert info2.rework_conflict.base_branch == "main"
+
+    # The branch head must be unchanged, and no merge left mid-flight.
+    post_merge_head = _git(info2.path, "rev-parse", "HEAD").stdout.strip()
+    assert post_merge_head == pre_merge_head
+    merge_head_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=info2.path,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_head_check.returncode != 0
+
     remove_worktree(repo_root, info1.path)
 
 
 def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
-    """Rework mode must raise ReworkBranchConflictError when the branch conflicts
-    with the origin base, and report the conflicted paths."""
+    """Rework mode must NOT abort the launch when the branch conflicts with the
+    origin base: the merge is aborted internally and the worktree is returned
+    with a populated ``rework_conflict`` notice instead of raising
+    ReworkBranchConflictError (see worktree.ReworkMergeConflict)."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo)
     repo_root = tmp_path / "repo"
@@ -497,6 +514,7 @@ def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
     _git(info1.path, "add", "file.txt")
     _git(info1.path, "commit", "-m", "add feature")
     _git(repo_root, "push", "origin", branch_name)
+    pre_merge_head = _git(info1.path, "rev-parse", "HEAD").stdout.strip()
 
     # Advance origin/main with a conflicting edit.
     _git(remote_repo, "checkout", "main")
@@ -505,11 +523,22 @@ def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
     _git(remote_repo, "commit", "-m", "advance main")
     _git(remote_repo, "checkout", branch_name)
 
-    with pytest.raises(ReworkBranchConflictError) as exc_info:
-        create_worktree(repo_root, branch_name, rework=True, base_ref="")
+    info2 = create_worktree(repo_root, branch_name, rework=True, base_ref="")
 
-    assert "file.txt" in exc_info.value.conflicted_paths
-    assert "origin/main" in exc_info.value.base_ref
+    assert isinstance(info2.rework_conflict, ReworkMergeConflict)
+    assert "file.txt" in info2.rework_conflict.conflicted_files
+    assert info2.rework_conflict.base_branch == "main"
+
+    post_merge_head = _git(info2.path, "rev-parse", "HEAD").stdout.strip()
+    assert post_merge_head == pre_merge_head
+    merge_head_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=info2.path,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_head_check.returncode != 0
+
     remove_worktree(repo_root, info1.path)
 
 

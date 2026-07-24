@@ -47,6 +47,7 @@ from .worktree import (
     WorktreeUnsafeError,
     create_worktree,
     remove_worktree,
+    apply_rework_conflict_notice,
     write_worktree_marker,
 )
 
@@ -454,6 +455,38 @@ def launch_devin_session(
     # diagnosis it belongs to. Best-effort: never blocks or fails dispatch.
     if worktree.attempt_snapshot is not None and worktree.attempt_snapshot.ref_name is not None:
         merge_attempt_snapshot(sessions_dir, issue_number, worktree.attempt_snapshot)
+
+    # The rework pre-merge hit a real conflict (worktree.py's
+    # _merge_update_rework_branch): the worktree still launches, but the
+    # worker must resolve it before touching the review feedback. Append the
+    # notice to prompt_path in place -- it is caller-supplied and lives
+    # outside the worktree (never copied in, unlike claude-code), but it is
+    # still the exact file the devin CLI reads -- rather than failing closed
+    # (see worktree.ReworkMergeConflict).
+    if worktree.rework_conflict is not None:
+        try:
+            existing_prompt = prompt_path.read_text(encoding="utf-8")
+            prompt_path.write_text(
+                apply_rework_conflict_notice(existing_prompt, worktree.rework_conflict),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            remove_worktree(
+                repo_root, worktree.path, force=True, branch=None if rework else branch
+            )
+            record = SessionRecord(
+                issue_number=issue_number,
+                branch=branch,
+                worktree_path=str(worktree.path),
+                prompt_path=str(prompt_path),
+                command=command_template,
+                pid=None,
+                started_at=utc_now(),
+                log_path=str(log_path),
+                error=f"failed to append rework conflict notice to prompt file: {exc}",
+            )
+            _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+            return record
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     try:

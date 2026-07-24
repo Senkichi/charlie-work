@@ -21,6 +21,11 @@ review:
   # agent:human-needed instead of another rework dispatch — iteration past
   # ~2 rounds thrashes (wrong brief or unimplementable criteria).
   max_rework_cycles: 2
+  # Caps on janitor-gate rework routing: completed-but-still-failing rework
+  # CYCLES (head movement, never loop passes) a PR may burn on a merge
+  # conflict / no-op rework before escalating to agent:human-needed.
+  # max_conflict_rework_attempts: 2
+  # max_no_op_rework_attempts: 2
   require_tests_or_rationale: true
   require_issue_link: true
 
@@ -36,6 +41,11 @@ review_dispatch:
   # Local-only process bound. 0 means unlimited; raise only if local CPU/disk
   # from concurrent reviewer worktrees becomes a visible bottleneck.
   max_local_review_processes: 0
+  # Ceiling for the exponential reviewer-quota probe backoff (base interval
+  # doubles per consecutive failed probe, capped here; resets on any
+  # recorded verdict). Prevents a dead provider from being probed with a
+  # real reviewer launch every pass, forever.
+  # quota_probe_max_interval_minutes: 240
 
 auto_merge:
   enabled: true
