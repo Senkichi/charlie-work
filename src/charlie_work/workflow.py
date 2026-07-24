@@ -4792,7 +4792,13 @@ class OrchestratorApp:
         # the exclusion off the label instead would let a deliberate operator
         # requeue take effect, but it widens the blast radius (label-read
         # dependency in the candidate filter) and is left for a follow-up.
-        mention_state = load_state(self.paths.state_file)
+        # load_state_locked (not raw load_state) so the read holds the
+        # advisory state lock — required by the invariant enforced in
+        # test_no_unlocked_load_state_in_production_code. The authoritative
+        # timestamp write below is a separate locked critical section; this
+        # read is best-effort relative to it but must still hold the lock to
+        # avoid racing a concurrent tmp+replace writer (issue #310).
+        mention_state = load_state_locked(self.paths.state_file)
         already_flagged_mention_issues = {
             int(num)
             for num, entry in mention_state.get("issues", {}).items()
