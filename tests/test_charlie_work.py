@@ -4335,6 +4335,90 @@ def test_dispatch_flags_but_does_not_close_ready_issue_with_bare_mention(
     assert fake_gh.issue_view(123)["state"] == "OPEN"
 
 
+def test_dispatch_merged_pr_mention_flag_is_one_shot(tmp_path: Path) -> None:
+    """Issue #564: the merged-PR mention-only flag must fire exactly once per
+    issue, not every pass. Before the fix, dispatch_merged_pr_mention_flagged
+    re-fired on every pass for the same issue and the merged_pr_mention_flagged
+    label transition re-applied agent:human-needed every pass — so an operator
+    who removed the label could not win, and the event stream was spammed with
+    one event per pass while the mention persisted.
+
+    This pins the three required properties from issue #564:
+      1. The flag fires once (first pass): one event, one label transition.
+      2. A second pass with unchanged conditions emits no event and re-applies
+         no label.
+      3. An operator label removal survives subsequent passes: the label is
+         never re-applied once merged_pr_mention_flagged_at is recorded.
+
+    Re-flag semantics chosen (issue #564 point 3): keyed on the timestamp's
+    absence — never re-flag once flagged, even if a new merged PR mentions the
+    issue. Mutating the guard to re-fire on every pass makes this test fail.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    human_needed = config.labels.human_needed
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Merged PR #456 only *mentions* issue #123 in free text — no branch-prefix
+    # binding, no closing keyword — so only the loose mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    assert fake_gh.prs[0]["isCrossRepository"] is False
+
+    # --- Pass 1: flag fires once -------------------------------------------
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is True
+    assert result1.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, human_needed) in fake_gh.labels_added
+    state1 = load_state(paths.state_file)
+    assert state1["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    flagged_events_1 = [
+        e
+        for e in state1.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_1) == 1
+    assert flagged_events_1[0]["payload"]["issue_numbers"] == [123]
+    human_needed_adds_after_pass1 = fake_gh.labels_added.count((123, human_needed))
+
+    # --- Pass 2: unchanged conditions -> no re-flag, no re-event ------------
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    # No newly-flagged issues this pass.
+    assert result2.data["merged_pr_flagged_issue_numbers"] == []
+    # The human-needed label was NOT re-applied on the second pass.
+    assert fake_gh.labels_added.count((123, human_needed)) == human_needed_adds_after_pass1
+    state2 = load_state(paths.state_file)
+    flagged_events_2 = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_2) == 1  # still only the single pass-1 event
+
+    # --- Pass 3: operator removed agent:human-needed -> removal survives ----
+    # Simulate the operator's ruling: record a label removal and clear the
+    # add-tracking so any re-application would be observable. The one-shot
+    # guard keys off state, not the label, so the flag must not re-fire.
+    fake_gh.labels_removed.append((123, human_needed))
+    fake_gh.labels_added.clear()
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    assert result3.data["merged_pr_flagged_issue_numbers"] == []
+    # The operator's removal survives: human-needed is never re-applied.
+    assert (123, human_needed) not in fake_gh.labels_added
+    state3 = load_state(paths.state_file)
+    flagged_events_3 = [
+        e
+        for e in state3.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_3) == 1  # still only the single pass-1 event
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is

@@ -4768,7 +4768,40 @@ class OrchestratorApp:
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
         # redispatch it. Issue #432: capped to finalize_limit per pass.
-        for issue_number in finalizable_mention_issue_numbers:
+        #
+        # Issue #564: one-shot flagging. The flag must fire once per issue,
+        # not every pass — otherwise the operator's removal of
+        # agent:human-needed is overridden on the next pass and the event
+        # stream is spammed with one dispatch_merged_pr_mention_flagged event
+        # per pass while the mention persists. Skip issues whose state entry
+        # already records merged_pr_mention_flagged_at (set the first time
+        # this path flagged them). This follows the emit-on-change dedup
+        # pattern established in #556 for dispatch_skip_blocked/janitor_gate.
+        #
+        # Re-flag semantics: keyed on the timestamp's absence — once flagged,
+        # an issue is never re-flagged, even if a NEW merged PR mentions it.
+        # The simplest acceptable semantics per issue #564; pinned by
+        # test_dispatch_merged_pr_mention_flag_is_one_shot.
+        #
+        # Known limitation (issue #564 point 2, documented as out of scope):
+        # the mention-only *dispatch exclusion* still keys off the raw mention
+        # scan (merged_pr_issue_numbers below), not the label. So an operator
+        # who removes agent:human-needed to re-arm automation does NOT re-enter
+        # dispatch — the scan-based exclusion keeps blocking the issue until it
+        # closes or the mentioning PRs are no longer merged/referenced. Keying
+        # the exclusion off the label instead would let a deliberate operator
+        # requeue take effect, but it widens the blast radius (label-read
+        # dependency in the candidate filter) and is left for a follow-up.
+        mention_state = load_state(self.paths.state_file)
+        already_flagged_mention_issues = {
+            int(num)
+            for num, entry in mention_state.get("issues", {}).items()
+            if isinstance(entry, dict) and entry.get("merged_pr_mention_flagged_at")
+        }
+        newly_flagged_mention_issues = [
+            n for n in finalizable_mention_issue_numbers if n not in already_flagged_mention_issues
+        ]
+        for issue_number in newly_flagged_mention_issues:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
         # Issue #429/#433: closed-unmerged stripping is handled by
@@ -4813,7 +4846,11 @@ class OrchestratorApp:
             # check) can surface mention-only coverage without re-deriving
             # the mention scan. "status" is deliberately untouched — the
             # issue stays open and its normal state machine intact.
-            for issue_number in finalizable_mention_issue_numbers:
+            # Issue #564: only record/emit for issues flagged *this* pass
+            # (newly_flagged_mention_issues); already-flagged issues are
+            # skipped so the event fires once and the operator's label
+            # removal is not overridden on the next pass.
+            for issue_number in newly_flagged_mention_issues:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -4821,11 +4858,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if finalizable_mention_issue_numbers:
+            if newly_flagged_mention_issues:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": finalizable_mention_issue_numbers},
+                    {"issue_numbers": newly_flagged_mention_issues},
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
@@ -5312,7 +5349,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-                    "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+                    "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                     "failures": dispatch_failure_map,
                 },
                 state_path=self.paths.state_file,
@@ -5343,7 +5380,7 @@ class OrchestratorApp:
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-            "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+            "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
