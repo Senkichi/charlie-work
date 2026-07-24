@@ -24895,6 +24895,8 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
     #    escalation + dead-session normal + dead-session escalation).
     # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 4. dispatch_rework no-op rework escalation path (pre-dispatch check
+    #    that escalates issues whose redispatch cap is already exhausted).
     # No other code paths write to redispatch_at.
 
     import charlie_work.workflow as workflow_module
@@ -24904,13 +24906,14 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
 
     # Count occurrences of redispatch_at assignments to entry:
     # dispatch_rework: 2 (success normal + escalation) +
-    #                  2 (failure normal + escalation, issue #515) = 4
+    #                  2 (failure normal + escalation, issue #515) +
+    #                  1 (no-op rework escalation, pre-dispatch check) = 5
     # _classify_dead_sessions_and_update_throttle_state: 3
     # _reap_restore_rework_requested: 2
-    # Total of 9 assignments is correct.
+    # Total of 10 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 9, (
-        f"Expected 9 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 10, (
+        f"Expected 10 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
