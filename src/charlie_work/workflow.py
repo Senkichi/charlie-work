@@ -5923,6 +5923,39 @@ class OrchestratorApp:
                 },
             )
 
+        reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
+
+        # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
+        # gate so dead reviewers are reaped and stale claims are freed even
+        # during throttle periods. Without this ordering, a quota deferral
+        # returns early and leaves dead reviewer claims stuck — blocking
+        # re-dispatch after the quota resets. In dry-run mode we skip
+        # these sweeps to stay read-only.
+        verdict_result = {"recorded": [], "missed": []}
+        if not self.dry_run:
+            verdict_result = self._reap_review_verdicts(reviews_dir)
+            _detect_and_handle_stalled_reviews(
+                reviews_dir, self.paths.state_file, self.config, self.repo_root
+            )
+            _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
+            _reap_orphaned_review_checkouts(
+                self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
+            )
+
+        # Clear the reviewer quota if any verdicts were recorded from dead
+        # reviewers. This is the only proof the quota window is actually open:
+        # a process that merely *started* can still die seconds later from an
+        # asynchronous session-limit kill. Run before the quota gate so a
+        # successful reap clears the throttle and lets the pass proceed.
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+        if not self.dry_run and recorded_verdicts:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                if is_reviewer_quota_exhausted(state):
+                    state = clear_reviewer_quota(state)
+                    save_state(self.paths.state_file, state)
+
         # System-wide reviewer quota gate. If the quota is exhausted and we are
         # not yet due to probe again, defer without touching any PR state.
         # When the probe window opens, only one reviewer is launched until the
@@ -5984,43 +6017,10 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_reason": "reviewer_quota_probe_backoff",
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
                 },
             )
-
-        reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
-
-        # Run the verdict-reaper and orphan/stalled sweeps before selection so
-        # dead reviewers that produced a valid verdict have it recorded in-process,
-        # dead reviewers without a parseable verdict fall through to the existing
-        # failed-claim retry/backoff path, and completed/failed/merged/closed PRs
-        # have their isolated review checkouts torn down. In dry-run mode we skip
-        # these sweeps to stay read-only.
-        verdict_result = {"recorded": [], "missed": []}
-        if not self.dry_run:
-            verdict_result = self._reap_review_verdicts(reviews_dir)
-            _detect_and_handle_stalled_reviews(
-                reviews_dir, self.paths.state_file, self.config, self.repo_root
-            )
-            _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
-            _reap_orphaned_review_checkouts(
-                self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
-            )
-
-        # Clear the reviewer quota if any verdicts were recorded from dead
-        # reviewers. This is the only proof the quota window is actually open:
-        # a process that merely *started* can still die seconds later from an
-        # asynchronous session-limit kill. Moved here (before the queue check)
-        # so the quota is cleared even when the reaped PR was the only candidate
-        # and the queue is now empty — otherwise the early return at "no
-        # candidates" would skip the quota clearing and leave the fleet wedged.
-        recorded_verdicts = verdict_result.get("recorded", [])
-        missed_verdicts = verdict_result.get("missed", [])
-        if not self.dry_run and recorded_verdicts:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                if is_reviewer_quota_exhausted(state):
-                    state = clear_reviewer_quota(state)
-                    save_state(self.paths.state_file, state)
 
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
