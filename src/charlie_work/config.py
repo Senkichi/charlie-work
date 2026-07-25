@@ -289,6 +289,13 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
+    # Effort level pinned via --effort on reviewer session launches only —
+    # see claude_code._apply_effort_pin. Empty string means fall back to
+    # claude_code.effort (the worker/reviewer default). Exists so reviewer
+    # effort can be tuned independently of worker effort, pending an A/B
+    # comparison via the per-review session telemetry (review_session_metrics
+    # on record_review).
+    review_effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1196,12 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
+        )
+    rd_effort = review_dispatch_data.get("review_effort")
+    if rd_effort is not None and not isinstance(rd_effort, str):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort' must be a string, "
+            f"got {type(rd_effort).__name__}"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")

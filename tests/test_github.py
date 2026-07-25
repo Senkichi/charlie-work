@@ -579,3 +579,53 @@ def test_run_raises_plain_github_error_for_unrelated_terminal_error(
 )
 def test_is_not_found_gh_error_classifies_correctly(error: str, expected: bool) -> None:
     assert github_module._is_not_found_gh_error(error) is expected
+
+
+def test_compare_diff_hits_three_dot_compare_with_diff_media_type(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """compare_diff must call the three-dot compare endpoint with the diff
+    media type Accept header (not the default JSON compare metadata), and
+    return the raw response body unwrapped from GitHubRunResult."""
+    seen_cmd: list[str] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        seen_cmd.extend(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.compare_diff("sha-old", "sha-new")
+
+    assert seen_cmd[:2] == ["gh", "api"]
+    assert seen_cmd[2] == "repos/{owner}/{repo}/compare/sha-old...sha-new"
+    assert "-H" in seen_cmd
+    h_idx = seen_cmd.index("-H")
+    assert seen_cmd[h_idx + 1] == "Accept: application/vnd.github.v3.diff"
+    assert result == "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new"
+
+
+def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
+    """A failed compare (404, GC'd SHA, API error) must return None, never
+    raise — errors are returned as values, per the GitHub wrapper's pattern."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr="HTTP 404: Not Found",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=0))
+    result = gh.compare_diff("sha-old", "sha-new")
+
+    assert result is None
