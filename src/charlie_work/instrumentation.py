@@ -230,9 +230,13 @@ def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
     migration.
 
     The migration is idempotent: a row is only inserted if no existing
-    event shares its ``(ts, kind, payload)`` triple. This protects against
-    a crash between the commit and the post-migration rename re-inserting
-    the same legacy rows on the next process start.
+    event shares its full ``(ts, kind, payload, repo, correlation_id,
+    pr_number, issue_number)`` tuple. Using the complete meaningful row
+    (not just ``(ts, kind, payload)``) ensures that distinct events which
+    happen to share a timestamp/kind/payload but differ in ``repo``,
+    ``correlation_id``, or PR/issue references are all preserved. This
+    protects against a crash between the commit and the post-migration
+    rename re-inserting the same legacy rows on the next process start.
 
     After a successful commit the legacy file is atomically renamed to
     ``events.jsonl.migrated`` (kept for audit) so subsequent processes do
@@ -264,6 +268,8 @@ def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
                 ts = record.get("ts", _now_iso())
                 kind = record.get("kind", "unknown")
                 payload_json = json.dumps(payload, sort_keys=True, default=str)
+                repo_val = record.get("repo")
+                cid_val = record.get("correlation_id")
                 cursor = db_conn.execute(
                     """INSERT INTO events
                        (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
@@ -271,19 +277,27 @@ def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
                        WHERE NOT EXISTS (
                            SELECT 1 FROM events
                            WHERE ts = ? AND kind = ? AND payload = ?
+                             AND repo IS ?
+                             AND correlation_id IS ?
+                             AND pr_number IS ?
+                             AND issue_number IS ?
                        )""",
                     (
                         ts,
                         kind,
                         payload_json,
-                        record.get("repo"),
-                        record.get("correlation_id"),
+                        repo_val,
+                        cid_val,
                         pr_num,
                         issue_num,
                         _classify_level(kind),
                         ts,
                         kind,
                         payload_json,
+                        repo_val,
+                        cid_val,
+                        pr_num,
+                        issue_num,
                     ),
                 )
                 if cursor.rowcount > 0:
@@ -307,21 +321,33 @@ def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
 def _dedupe_events(db_conn: sqlite3.Connection) -> int:
     """Remove duplicate event rows, keeping the earliest inserted copy.
 
-    Duplicates are identified by the full tuple
-    ``(ts, kind, payload, correlation_id, pr_number, issue_number)``. The
-    row with the smallest ``id`` is retained. Returns the number of rows
-    deleted.
+    Duplicates are identified by the full meaningful row tuple
+    ``(ts, kind, payload, repo, correlation_id, pr_number, issue_number)``
+    — every indexed column except the autoincrement ``id``. The row with
+    the smallest ``id`` is retained. Returns the number of rows deleted.
+
+    Using the *complete* row (including ``repo``) as the deduplication key
+    is critical: ``_now_iso()`` truncates timestamps to 1-second precision,
+    so distinct events from different repos (or different correlation
+    contexts) can legitimately share ``(ts, kind, payload)`` within the
+    same second. A narrower key would silently and irreversibly delete
+    those distinct events from what this module calls its "complete audit
+    history" store — inconsistent with the rename-not-delete treatment of
+    ``events.jsonl``. Only rows that are identical across *all* meaningful
+    columns are collapsed, which is true deduplication, not data loss.
 
     This is a one-time cleanup for databases polluted by the pre-fix
     migration that re-inserted legacy ``events.jsonl`` rows on every
-    process start. It is guarded by ``PRAGMA user_version`` so it runs
-    exactly once per database file.
+    process start. The pollution produced true duplicates (the same JSONL
+    record re-inserted with identical values across every column), so they
+    are still caught by the full-row key. It is guarded by
+    ``PRAGMA user_version`` so it runs exactly once per database file.
     """
     cursor = db_conn.execute(
         """DELETE FROM events
            WHERE id NOT IN (
                SELECT MIN(id) FROM events
-               GROUP BY ts, kind, payload, correlation_id, pr_number, issue_number
+               GROUP BY ts, kind, payload, repo, correlation_id, pr_number, issue_number
            )"""
     )
     deleted = cursor.rowcount

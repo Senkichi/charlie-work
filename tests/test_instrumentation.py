@@ -549,6 +549,163 @@ def test_dedupe_existing_duplicates_on_first_access(tmp_path: Path) -> None:
     assert len(events2) == 2
 
 
+def test_dedupe_preserves_distinct_events_different_repo(tmp_path: Path) -> None:
+    """Distinct events that share (ts, kind, payload) but differ in repo must survive.
+
+    Regression for the review finding that the original dedupe key omitted
+    ``repo``.  ``_now_iso()`` truncates to 1-second precision, so two repos
+    logging the same kind in the same second is a realistic collision —
+    collapsing them would silently delete audit history.
+    """
+    state_path = tmp_path / "state.json"
+    db_path = state_path.parent / "events.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+            repo TEXT, correlation_id TEXT, pr_number INTEGER,
+            issue_number INTEGER, level TEXT DEFAULT 'info'
+        );
+        """
+    )
+    payload_json = json.dumps({}, sort_keys=True)
+    # Two rows identical except for ``repo`` — must both survive dedupe.
+    conn.execute(
+        """INSERT INTO events
+           (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+           VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'info')""",
+        ("2025-01-01T00:00:00Z", "loop_started", payload_json, "repo-a"),
+    )
+    conn.execute(
+        """INSERT INTO events
+           (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+           VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'info')""",
+        ("2025-01-01T00:00:00Z", "loop_started", payload_json, "repo-b"),
+    )
+    # Plus a true duplicate of the repo-a row (simulating old pollution).
+    conn.execute(
+        """INSERT INTO events
+           (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+           VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'info')""",
+        ("2025-01-01T00:00:00Z", "loop_started", payload_json, "repo-a"),
+    )
+    conn.commit()
+    conn.close()
+
+    events = read_event_log(state_path)
+    # 3 inserted, 1 true duplicate removed → 2 survive (repo-a, repo-b).
+    assert len(events) == 2
+    repos = sorted(e["repo"] for e in events)
+    assert repos == ["repo-a", "repo-b"]
+
+
+def test_dedupe_preserves_distinct_events_different_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """Distinct events that share (ts, kind, payload, repo) but differ in
+    correlation_id must survive — two loop passes starting in the same second
+    for the same repo is realistic given 1-second timestamp truncation."""
+    state_path = tmp_path / "state.json"
+    db_path = state_path.parent / "events.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+            repo TEXT, correlation_id TEXT, pr_number INTEGER,
+            issue_number INTEGER, level TEXT DEFAULT 'info'
+        );
+        """
+    )
+    payload_json = json.dumps({}, sort_keys=True)
+    for cid in ("pass-aaa", "pass-bbb"):
+        conn.execute(
+            """INSERT INTO events
+               (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
+               VALUES (?, ?, ?, ?, ?, NULL, NULL, 'info')""",
+            ("2025-01-01T00:00:00Z", "loop_started", payload_json, "same-repo", cid),
+        )
+    conn.commit()
+    conn.close()
+
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    cids = sorted(e["correlation_id"] for e in events)
+    assert cids == ["pass-aaa", "pass-bbb"]
+
+
+def test_jsonl_migration_preserves_distinct_events_different_repo(
+    tmp_path: Path,
+) -> None:
+    """Two JSONL records sharing (ts, kind, payload) but differing in repo
+    must both be migrated — the old ``(ts, kind, payload)`` idempotency key
+    would have silently dropped the second."""
+    state_path = tmp_path / "state.json"
+    jsonl_path = state_path.parent / "events.jsonl"
+    records = [
+        {
+            "ts": "2025-01-01T00:00:00Z",
+            "kind": "loop_started",
+            "payload": {},
+            "repo": "repo-a",
+        },
+        {
+            "ts": "2025-01-01T00:00:00Z",
+            "kind": "loop_started",
+            "payload": {},
+            "repo": "repo-b",
+        },
+    ]
+    _write_jsonl(jsonl_path, records)
+
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    repos = sorted(e["repo"] for e in events)
+    assert repos == ["repo-a", "repo-b"]
+
+
+def test_jsonl_migration_preserves_distinct_events_different_correlation_id(
+    tmp_path: Path,
+) -> None:
+    """Two JSONL records sharing (ts, kind, payload, repo) but differing in
+    correlation_id must both be migrated."""
+    state_path = tmp_path / "state.json"
+    jsonl_path = state_path.parent / "events.jsonl"
+    records = [
+        {
+            "ts": "2025-01-01T00:00:00Z",
+            "kind": "loop_started",
+            "payload": {},
+            "repo": "same-repo",
+            "correlation_id": "pass-aaa",
+        },
+        {
+            "ts": "2025-01-01T00:00:00Z",
+            "kind": "loop_started",
+            "payload": {},
+            "repo": "same-repo",
+            "correlation_id": "pass-bbb",
+        },
+    ]
+    _write_jsonl(jsonl_path, records)
+
+    events = read_event_log(state_path)
+    assert len(events) == 2
+    cids = sorted(e["correlation_id"] for e in events)
+    assert cids == ["pass-aaa", "pass-bbb"]
+
+
 def test_jsonl_migration_malformed_tolerance_preserved(tmp_path: Path) -> None:
     """Malformed-line tolerance must be preserved alongside the new idempotency."""
     state_path = tmp_path / "state.json"
