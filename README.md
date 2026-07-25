@@ -214,9 +214,11 @@ Without allocation, each repo's CI parallelism is pinned to however many
 runners were registered to it: a repo with a deep queue waits behind its own
 cap while another repo's runners idle on the same machine. Allocation removes
 that by making the *running listener* the unit that moves. A configured runner
-whose listener is stopped goes `offline` and keeps its registration, so a slot
-moves between repos in about a second — no registration token, no GitHub write,
-no package extraction.
+whose listener is stopped goes `offline` and keeps its registration, so *moving*
+a slot costs about a second — no registration token, no GitHub write, no package
+extraction. End-to-end responsiveness is bounded by how often the decision runs,
+not by the move: a repo that starts queuing waits until the next fleet pass (up
+to `full_pass_interval_seconds`, 5 min) to be granted a slot.
 
 Because it governs one physical host, this section belongs in the **global**
 fleet layer (`%LOCALAPPDATA%\charlie-work\config.yaml` on Windows), not in a
@@ -247,13 +249,32 @@ Behavior worth knowing:
 - **Capacity is a hard ceiling.** A repo can never run more listeners than it
   has runners registered. When demand exceeds that, the plan says so — use
   `runner_scaling` (or `config.cmd`) to register more directories.
-- **`max_running_runners` deserves calibration.** The `cores // 2` default
-  cannot see Devin workers or reviewers competing for the same host. Set it
-  explicitly, and preview with `charlie runners allocate --dry-run`.
+- **A repo whose demand cannot be read is pinned, not parked.** An API failure
+  holds that repo at its current slot count, since parking could strand work
+  that simply was not visible. Pins are the one way the host can sit *above*
+  `max_running_runners`; when that happens the plan says so explicitly.
+- **`max_running_runners` is a budget you assert, not one that is measured.**
+  The `cores // 2` default cannot see Devin workers or reviewers competing for
+  the same host, and a CI job here is a full pytest matrix entry — 8 concurrent
+  jobs on 16 cores is a deliberate choice about memory and cache pressure, not
+  a derived fact. Set it explicitly and preview with
+  `charlie runners allocate --dry-run` before raising it.
+- **Parking uses process termination, not a graceful drain.** A parked listener
+  is not-busy at the moment it is stopped, but GitHub can take tens of seconds
+  to mark it offline; a job assigned inside that window is re-queued and picked
+  up by another runner rather than lost. Listeners this code started are in
+  their own process group, so a `CTRL_BREAK_EVENT` drain is available if that
+  window ever proves costly.
 
 The fleet pass runs allocation as a prologue *before* autoscale: moving an idle
 slot to a starved repo is free, so it is tried before deciding the host needs
 more runners registered.
+
+**Only one thing may decide which listeners run.** The host's post-reboot script
+(`C:\actions-runners\start-runners.ps1`) delegates to `charlie runners allocate`
+and only falls back to starting every runner when allocation is unavailable.
+Anything that unconditionally starts all listeners while allocation is enabled
+gets undone on the next pass, at the cost of a full hysteresis window of churn.
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in

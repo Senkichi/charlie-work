@@ -339,6 +339,18 @@ def plan_allocation(
             f"{len(capacities) - len(pinned)} repo(s); hungriest served first"
         )
 
+    # Pins are the one way the host can sit above its budget: a repo whose
+    # demand we cannot read keeps its running slots, because parking them
+    # could strand work we simply failed to see. The allocator refuses to
+    # compound that (elastic repos get nothing), but silence would let the
+    # operator read an over-budget host as a healthy one.
+    allocated = sum(targets.values())
+    if allocated > budget:
+        notes.append(
+            f"{allocated} slot(s) running above the {budget}-slot budget, held by "
+            f"{len(pinned)} unmeasurable repo(s); no slot moves until demand reads again"
+        )
+
     # Someone is starved: their fair target is below what they could use.
     contended = any(
         targets.get(repo, 0) < min(demand_values[repo], capacities[repo]) for repo in by_repo

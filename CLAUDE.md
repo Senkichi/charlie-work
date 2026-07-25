@@ -74,6 +74,11 @@ Two safety properties must survive any change here:
   runner *service* at `C:\actions-runner` that must never be touched; safety
   comes from the traversal's shape, not from filtering names afterwards.
 
+`charlie runners allocate` is also the *only* thing allowed to decide which
+listeners run. Operator scripts and post-reboot procedures must delegate to it
+rather than starting every runner directly — a second controller silently undoes
+parking and burns a full `demand_idle_samples` hysteresis window reconverging.
+
 ### Adapters must not block on worker completion
 `devin_shell.launch_devin_session` and `claude_code.launch_claude_worker` both use
 `subprocess.Popen` and return immediately — they never call `process.wait()` or

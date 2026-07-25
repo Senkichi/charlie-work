@@ -239,6 +239,47 @@ def test_pinned_repos_hold_their_slots_and_shrink_the_elastic_budget() -> None:
     assert targets[JC] == 3
 
 
+def test_pins_can_exceed_the_budget_but_never_compound_it() -> None:
+    """Pins are the only path to an over-budget host — and they stop there.
+
+    Two unmeasurable repos holding 3 slots each add up to 6 against a budget of
+    4. The allocator cannot park them (unknown demand could mean unseen work),
+    but it must not hand the elastic repo slots on top of the overcommit.
+    """
+    targets = allocate_slots(
+        demands={CW: 0, JC: 0, PUB: 5},
+        capacities={CW: 3, JC: 3, PUB: 4},
+        budget=4,
+        min_per_repo=1,
+        pinned={CW: 3, JC: 3},
+    )
+    assert targets == {CW: 3, JC: 3, PUB: 0}
+    assert sum(targets.values()) == 6  # over budget, and entirely by pins
+
+
+def test_over_budget_pins_are_reported_to_the_operator() -> None:
+    """An over-budget host must not read as a healthy one."""
+    plan = plan_allocation(
+        _instances(
+            {
+                CW: [("cw-1", True, False), ("cw-2", True, False), ("cw-3", True, False)],
+                JC: [("jc-1", True, False), ("jc-2", True, False), ("jc-3", True, False)],
+            }
+        ),
+        {
+            CW: RepoDemand(CW, ok=False, error="403"),
+            JC: RepoDemand(JC, ok=False, error="403"),
+        },
+        budget=4,
+        budget_reason="configured",
+        min_per_repo=1,
+        idle_streaks={},
+        demand_idle_samples=3,
+    )
+    assert plan.changes == ()  # nothing moves while demand is unreadable
+    assert any("above the 4-slot budget" in note for note in plan.notes)
+
+
 def test_allocation_is_deterministic() -> None:
     """Same inputs, same plan — ties break on repo name."""
     args = dict(
