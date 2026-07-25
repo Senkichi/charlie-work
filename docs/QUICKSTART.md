@@ -168,9 +168,21 @@ uv run charlie bash-rats --limit 3
 Every command accepts `--json` (either before or after the subcommand — the
 CLI strips `--json` from `argv` before `argparse` sees it) for
 machine-readable output, and `--dry-run` to suppress **mutating** `gh` calls
-(the `_is_mutating` guard in `github.py`; note this does not suppress local
-state writes or adapter/model subprocess calls — see
-[WORKFLOWS.md](WORKFLOWS.md) for the exact scope).
+(the `_is_mutating` guard in `github.py`).
+
+`--dry-run` additionally suppresses these local mutations, each of which used to
+run during a "preview":
+
+- the `fleet bash-rats` / `fleet supervise` **self-deploy**, which otherwise
+  fast-forward-pulls `origin/main` into the running checkout and may `uv sync`
+  its venv (issue #613). Because moving that checkout's HEAD terminates a running
+  supervisor by design, an ungated preview could take the fleet down.
+- the runner **scale-event cooldown** write, which gates *both* scale directions
+  (issue #609), and the runner **pool-sample** write that feeds idle detection.
+
+It does **not** suppress local state writes in general, nor adapter/model
+subprocess calls. Treat any other state write as unsuppressed unless you have
+checked it — see [WORKFLOWS.md](WORKFLOWS.md) for the exact scope.
 
 ## 6. Choose a worker adapter profile
 

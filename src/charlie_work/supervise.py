@@ -261,6 +261,14 @@ class SelfDeployResult:
     message: str = ""
     error: str | None = None
     venv_repaired: bool = False
+    previewed: bool = False
+    """True when this was a ``dry_run`` preview and nothing was touched.
+
+    Callers print ``message`` on a notable outcome, and the existing conditions for
+    "notable" are ``synced`` and ``venv_repaired`` -- both False for a preview. Without
+    a flag of its own the preview would run silently, which is worse than useless: the
+    operator would see no output and conclude the deploy step did nothing at all.
+    """
 
 
 def _is_venv(path: Path) -> bool:
@@ -410,6 +418,78 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
     )
 
 
+def _self_deploy_preview(
+    repo_root: Path,
+    marker_path: Path,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> SelfDeployResult:
+    """Report what :func:`self_deploy` would do, touching nothing.
+
+    Read-only by construction: no ``git pull``, no ``uv sync``, and no venv
+    ``.pth`` repair.  ``origin/main`` is read from the existing remote-tracking
+    ref rather than fetched, so the answer is only as fresh as the last fetch --
+    that staleness is the deliberate price of not mutating the ref store.  A
+    preview that fetched would be more accurate and less honest.
+    """
+    head_res = run_command(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=timeout)
+    if not head_res.ok:
+        return SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error=head_res.error or head_res.stderr or "failed to read HEAD",
+        )
+    head_sha = head_res.stdout.strip()
+
+    target_res = run_command(
+        ["git", "rev-parse", "origin/main"], cwd=repo_root, timeout_seconds=timeout
+    )
+    if not target_res.ok:
+        return SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            from_sha=head_sha,
+            error=target_res.error or target_res.stderr or "failed to read origin/main",
+        )
+    target_sha = target_res.stdout.strip()
+
+    notes: list[str] = []
+    if head_sha == target_sha:
+        notes.append("no fast-forward pending (HEAD is at last-known origin/main)")
+    else:
+        notes.append(f"would fast-forward {head_sha[:12]}..{target_sha[:12]}")
+        diff_res = run_command(
+            ["git", "diff", "--name-only", f"{head_sha}..{target_sha}"],
+            cwd=repo_root,
+            timeout_seconds=timeout,
+        )
+        if not diff_res.ok:
+            notes.append("could not diff for dependency changes")
+        elif {
+            line.strip() for line in diff_res.stdout.splitlines() if line.strip()
+        } & _DEP_LOCK_FILES:
+            notes.append("would run `uv sync` (dependency files change)")
+
+    if marker_path.exists():
+        notes.append("a pending-sync marker exists, so a deferred `uv sync` would be retried")
+
+    return SelfDeployResult(
+        ok=True,
+        pulled=False,
+        changed=False,
+        synced=False,
+        from_sha=head_sha,
+        to_sha=target_sha,
+        message="dry run, nothing touched: " + "; ".join(notes),
+        previewed=True,
+    )
+
+
 def self_deploy(
     repo_root: Path,
     *,
@@ -417,6 +497,7 @@ def self_deploy(
     run_command: Callable[..., RunResult] = run_captured,
     pull_timeout: int = 60,
     sync_timeout: int = 300,
+    dry_run: bool = False,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -434,8 +515,20 @@ def self_deploy(
 
     All subprocess errors are returned as values (non-fatal); the function
     never raises.
+
+    ``dry_run`` reports what would happen and touches nothing.  The gate sits
+    above *every* mutating step, including ``_check_venv`` -- which repairs the
+    editable ``.pth`` as a side effect of checking it, and so is not safe to run
+    under a preview either.  Callers reached by the global ``--dry-run`` flag
+    must pass it: this function moves the deployed checkout's HEAD, and a HEAD
+    move terminates a running ``fleet supervise`` by design (drift exit), so an
+    ungated preview can end the fleet rather than describe it (issue #613).
     """
     marker_path = _pending_sync_marker_path(repo_root)
+    if dry_run:
+        return _self_deploy_preview(
+            repo_root, marker_path, run_command=run_command, timeout=pull_timeout
+        )
     try:
         venv_check = _check_venv(repo_root)
         if not venv_check.ok:

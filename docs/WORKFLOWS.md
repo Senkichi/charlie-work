@@ -8,7 +8,10 @@ All commands below assume you're in the consumer repo root with
 `orchestrator.config.yaml` present (or accept the dataclass defaults) and
 `charlie` resolved via `uv run charlie ...` (or a bare `charlie` if
 the venv is activated). Add `--json` for machine-readable output and
-`--dry-run` to suppress mutating `gh` calls (see the scope caveat in
+`--dry-run` to suppress mutating `gh` calls, the fleet self-deploy FF-pull and
+`uv sync`, and the runner scale-event and pool-sample writes. It does **not**
+suppress local state writes in general or adapter/model subprocesses (see the
+scope caveat in
 [QUICKSTART.md](QUICKSTART.md#5-first-cycle-intake--dispatch--review--merge)).
 
 ## (a) Devin manual adapter loop
