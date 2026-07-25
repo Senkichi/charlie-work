@@ -850,6 +850,75 @@ def scale_down_idle_runners(
     return removed_count, errors
 
 
+def launch_runner_listener(runner_path: Path, *, dry_run: bool = False) -> tuple[bool, str]:
+    """Launch a configured runner's listener process (single spawn site).
+
+    This is the *only* place a runner listener is started, so the
+    decontaminated environment and the hidden-console flags cannot drift
+    between callers (issue #403's single-point-spawn rule, issue #459's
+    inherited-hidden-console rule). Both ``ensure_runner_running`` (recovery)
+    and ``runner_allocation`` (elastic slot promotion) go through here.
+
+    Assumes the caller has already established that the runner is configured
+    and not currently running.
+
+    Args:
+        runner_path: Path to the configured runner directory
+        dry_run: If True, report what would be done without executing
+
+    Returns:
+        Tuple of (success, message) — never raises.
+    """
+    if sys.platform == "win32":
+        launch_script = runner_path / "run.cmd"
+    else:
+        launch_script = runner_path / "run.sh"
+
+    if not launch_script.exists():
+        return False, f"Launch script not found: {launch_script}"
+
+    if dry_run:
+        return True, f"Would launch runner: {launch_script}"
+
+    try:
+        # Launch the runner in a decontaminated environment
+        # Strip UV_*, VIRTUAL_ENV, PYTHON*, PIP_*, CLAUDE* to prevent dev-shell contamination
+        env = _sanitize_env()
+
+        # We use subprocess.Popen with detached flags to run as a background process
+        if sys.platform == "win32":
+            # Windows: allocate a hidden console for the long-lived runner so
+            # Runner.Worker and any cmd/powershell job steps inherit that
+            # hidden console instead of flashing their own visible windows.
+            proc = subprocess.Popen(
+                [str(launch_script)],
+                cwd=runner_path,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **hidden_console_kwargs(  # type: ignore
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                ),
+            )
+        else:
+            # Unix: use double-fork to daemonize
+            proc = subprocess.Popen(
+                [str(launch_script)],
+                cwd=runner_path,
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **no_console_window_kwargs(),
+            )
+
+        return True, f"Launched runner {runner_path.name} with PID {proc.pid}"
+    except Exception as e:
+        return False, f"Failed to launch runner: {e}"
+
+
 def ensure_runner_running(
     runner_dir: RunnerDir,
     config: RunnerScalingConfig,
@@ -878,56 +947,7 @@ def ensure_runner_running(
     if process is not None:
         return True, f"Runner {runner_dir.name} is already running"
 
-    # Runner is not running, relaunch it
-    # Determine the launch command based on platform
-    if sys.platform == "win32":
-        launch_script = runner_dir.path / "run.cmd"
-    else:
-        launch_script = runner_dir.path / "run.sh"
-
-    if not launch_script.exists():
-        return False, f"Launch script not found: {launch_script}"
-
-    if dry_run:
-        return True, f"Would launch runner: {launch_script}"
-
-    try:
-        # Launch the runner in a decontaminated environment
-        # Strip UV_*, VIRTUAL_ENV, PYTHON*, PIP_*, CLAUDE* to prevent dev-shell contamination
-        env = _sanitize_env()
-
-        # We use subprocess.Popen with detached flags to run as a background process
-        if sys.platform == "win32":
-            # Windows: allocate a hidden console for the long-lived runner so
-            # Runner.Worker and any cmd/powershell job steps inherit that
-            # hidden console instead of flashing their own visible windows.
-            proc = subprocess.Popen(
-                [str(launch_script)],
-                cwd=runner_dir.path,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                **hidden_console_kwargs(  # type: ignore
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                ),
-            )
-        else:
-            # Unix: use double-fork to daemonize
-            proc = subprocess.Popen(
-                [str(launch_script)],
-                cwd=runner_dir.path,
-                env=env,
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **no_console_window_kwargs(),
-            )
-
-        return True, f"Launched runner {runner_dir.name} with PID {proc.pid}"
-    except Exception as e:
-        return False, f"Failed to launch runner: {e}"
+    return launch_runner_listener(runner_dir.path, dry_run=dry_run)
 
 
 def ensure_runners_started(
@@ -1484,7 +1504,12 @@ def provision_runner(
             error=f"Insufficient RAM: {free_ram_gb:.2f}GB free, need {config.min_free_ram_gb:.2f}GB after provisioning",
         )
 
-    # Step 1: Mint registration token
+    # Step 1: Mint registration token.
+    # Bound unconditionally: the token is consumed in step 4, which is guarded
+    # by the same ``dry_run`` flag, so the real value can only be missing on a
+    # path that never reads it. Seeding it keeps a future reordering from
+    # turning that coupling into a NameError.
+    token = ""
     if dry_run:
         actions.append("Mint registration token via GitHub API")
     else:

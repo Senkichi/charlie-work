@@ -966,6 +966,66 @@ class RunnerScalingConfig:
 
 
 @dataclass(frozen=True)
+class RunnerAllocationConfig:
+    """Host-wide elastic allocation of self-hosted runner slots across repos.
+
+    Distinct from :class:`RunnerScalingConfig`, which scales *one* repo's pool
+    vertically by provisioning and deregistering runners (epic #231). This
+    section redistributes a fixed host-wide budget of *running listeners*
+    across every repo that already has runners registered under
+    ``managed_root``. Registration is left untouched — a slot moves between
+    repos by stopping an idle listener in one directory and starting an
+    already-configured one in another, so reallocation costs no registration
+    token, no GitHub write, and no package extraction.
+
+    Because this governs one physical host, it belongs in the **global** fleet
+    layer (``%LOCALAPPDATA%\\charlie-work\\config.yaml``) rather than a
+    per-repo ``orchestrator.config.yaml`` — three repos must not hold three
+    different opinions about how many jobs one machine can run.
+
+    ``enabled`` defaults False so an absent config block is a no-op.
+
+    ``max_running_runners`` is the host's total concurrent-CI-job budget. 0
+    means "derive from host CPU count" (see
+    ``runner_allocation.derive_budget``); set it explicitly once the host's
+    real ceiling is known, since CI jobs share the machine with Devin workers
+    and reviewers that this number cannot see.
+
+    ``min_running_per_repo`` is load-bearing, not cosmetic. A repo whose every
+    registered runner is offline has its queued jobs sit unclaimed until a
+    listener comes back (and GitHub fails them after 24h). Keeping one
+    listener alive per repo means a queued job is always picked up
+    immediately, and makes queue depth observable without waiting for the next
+    allocation pass. Lower it below 1 only if you accept that latency.
+
+    ``demand_idle_samples`` is the asymmetric-hysteresis knob: promotion to a
+    hotter repo happens on the first pass that sees demand, but demotion of an
+    over-allocated repo waits for this many consecutive passes of slack — a
+    single global cooldown would instead block helping a newly hot repo just
+    because a slot was parked elsewhere. Reclamation is immediate regardless
+    when another repo has unmet demand, since an idle slot someone else is
+    waiting on is exactly what this feature exists to move.
+
+    ``max_runs_scanned`` caps the per-repo Actions-runs page used to derive
+    demand; truncation is reported in the plan's notes rather than silently
+    under-counting.
+    """
+
+    enabled: bool = False
+    # Root directory holding the runner instance directories. Falls back to
+    # runner_scaling.managed_root when empty so the path is configured once.
+    managed_root: str = ""
+    # Host-wide cap on simultaneously running listeners. 0 = derive from cores.
+    max_running_runners: int = 0
+    # Listeners kept alive per repo regardless of demand (see docstring).
+    min_running_per_repo: int = 1
+    # Consecutive slack passes required before parking an over-allocated slot.
+    demand_idle_samples: int = 3
+    # Upper bound on Actions runs inspected per repo when measuring demand.
+    max_runs_scanned: int = 60
+
+
+@dataclass(frozen=True)
 class SupervisorConfig:
     """Configuration for the supervised infill loop (``charlie bash-rats`` default mode).
 
@@ -1079,6 +1139,7 @@ class OrchestratorConfig:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
+    runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
@@ -1915,6 +1976,40 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             f"got {type(enabled).__name__}"
         )
     runner_scaling = _build_section(RunnerScalingConfig, "runner_scaling", runner_scaling_data)
+    runner_allocation_data = _section(data, "runner_allocation")
+    for numeric_key in (
+        "max_running_runners",
+        "min_running_per_repo",
+        "demand_idle_samples",
+        "max_runs_scanned",
+    ):
+        value = runner_allocation_data.get(numeric_key)
+        # bool is an int subclass; reject it so `max_running_runners: true`
+        # fails loudly instead of silently allocating one slot.
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ConfigError(
+                f"config section 'runner_allocation' key '{numeric_key}' must be an int, "
+                f"got {type(value).__name__}"
+            )
+        if isinstance(value, int) and not isinstance(value, bool) and value < 0:
+            raise ConfigError(
+                f"config section 'runner_allocation' key '{numeric_key}' must be >= 0, got {value}"
+            )
+    managed_root_value = runner_allocation_data.get("managed_root")
+    if managed_root_value is not None and not isinstance(managed_root_value, str):
+        raise ConfigError(
+            "config section 'runner_allocation' key 'managed_root' must be a string, "
+            f"got {type(managed_root_value).__name__}"
+        )
+    allocation_enabled = runner_allocation_data.get("enabled")
+    if allocation_enabled is not None and not isinstance(allocation_enabled, bool):
+        raise ConfigError(
+            "config section 'runner_allocation' key 'enabled' must be a bool, "
+            f"got {type(allocation_enabled).__name__}"
+        )
+    runner_allocation = _build_section(
+        RunnerAllocationConfig, "runner_allocation", runner_allocation_data
+    )
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
@@ -2013,6 +2108,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         notify=notify,
         runners=runners,
         runner_scaling=runner_scaling,
+        runner_allocation=runner_allocation,
         supervisor=supervisor,
         post_mortem=post_mortem,
     )

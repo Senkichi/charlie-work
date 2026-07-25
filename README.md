@@ -122,6 +122,8 @@ predictable.
 | `charlie fleet status` | aggregate `roll-call` across every registered repo |
 | `charlie fleet work` | dispatch-only wave across all (or `--repos`-selected) registered repos, under one global concurrency budget |
 | `charlie fleet bash-rats` | full intake→work→review→merge pass across all registered repos, under one global budget |
+| `charlie runners status` | current runner-pool state for this repo (online/busy/idle, queue depth, host headroom) |
+| `charlie runners allocate` | rebalance this host's running runner listeners across every repo by live queue demand (`--dry-run` to preview) |
 
 ## Dependencies
 
@@ -195,8 +197,63 @@ escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `cross_family.*` (non-Claude adversarial pass), `test_adequacy.*` (opt-in
 test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
-(`global_max_concurrent_sessions` — cross-repo worker-count budget), and
-`notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file).
+(`global_max_concurrent_sessions` — cross-repo worker-count budget),
+`notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file), and
+`runner_allocation.*` (host-wide elastic CI-runner slots — see below).
+
+### Self-hosted runner allocation
+
+Two independent, opt-in features govern self-hosted runners:
+
+| Section | Scope | What it changes |
+|---|---|---|
+| `runner_scaling.*` | one repo, vertical | Provisions and deregisters runners for *this* repo from its own queue pressure — mints tokens, extracts packages, removes directories. |
+| `runner_allocation.*` | one host, horizontal | Redistributes a fixed budget of *running listeners* across every repo with runners registered under `managed_root`. Registration is never touched. |
+
+Without allocation, each repo's CI parallelism is pinned to however many
+runners were registered to it: a repo with a deep queue waits behind its own
+cap while another repo's runners idle on the same machine. Allocation removes
+that by making the *running listener* the unit that moves. A configured runner
+whose listener is stopped goes `offline` and keeps its registration, so a slot
+moves between repos in about a second — no registration token, no GitHub write,
+no package extraction.
+
+Because it governs one physical host, this section belongs in the **global**
+fleet layer (`%LOCALAPPDATA%\charlie-work\config.yaml` on Windows), not in a
+per-repo `orchestrator.config.yaml` — three repos must not hold three different
+opinions about one machine's capacity:
+
+```yaml
+runner_allocation:
+  enabled: true
+  managed_root: C:/actions-runners   # defaults to runner_scaling.managed_root
+  max_running_runners: 8             # host's concurrent-CI-job budget; 0 = cores // 2
+  min_running_per_repo: 1            # keep one listener alive per repo
+  demand_idle_samples: 3             # slack passes before parking a surplus slot
+```
+
+Behavior worth knowing:
+
+- **A running job is never interrupted.** Only listeners GitHub reports as
+  not-busy *and* with no local `Runner.Worker` child are parked. A repo that is
+  over-allocated but fully working keeps its slots, and the plan says so.
+- **`min_running_per_repo: 1` is load-bearing.** A repo whose every runner is
+  offline has queued jobs sit unclaimed (GitHub fails them after 24h). One live
+  listener keeps pickup latency at zero.
+- **Promotion is immediate, demotion is not.** A repo gains slots on the first
+  pass that shows demand; a surplus slot is only parked after
+  `demand_idle_samples` consecutive slack passes — unless another repo is
+  actively waiting for it, in which case it moves at once.
+- **Capacity is a hard ceiling.** A repo can never run more listeners than it
+  has runners registered. When demand exceeds that, the plan says so — use
+  `runner_scaling` (or `config.cmd`) to register more directories.
+- **`max_running_runners` deserves calibration.** The `cores // 2` default
+  cannot see Devin workers or reviewers competing for the same host. Set it
+  explicitly, and preview with `charlie runners allocate --dry-run`.
+
+The fleet pass runs allocation as a prologue *before* autoscale: moving an idle
+slot to a starved repo is free, so it is tried before deciding the host needs
+more runners registered.
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in

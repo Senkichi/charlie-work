@@ -57,6 +57,23 @@ All label strings must be read from a `LabelConfig` instance (default fields in
 `config.LabelConfig`). Never hard-code label strings like `"agent:queued"` in
 business logic — use `config.labels.queued`, `config.labels.in_progress`, etc.
 
+### Runner slots move by start/park — never by re-registration
+`runner_allocation`/`runner_slots` rebalance CI capacity across repos by
+starting and stopping *already-configured* listeners. A parked runner keeps its
+registration and reports `offline`. Never make reallocation mint a registration
+token, run `config.cmd remove`, or delete a runner directory — that is
+`runners.py`'s provisioning job, on a different (much slower) cadence.
+
+Two safety properties must survive any change here:
+- **Never stop a busy listener.** `park_runner_slot` re-checks for a live
+  `Runner.Worker` child immediately before terminating, because the plan is a
+  snapshot and GitHub's `busy` flag lags. Terminating a working listener aborts
+  a CI job.
+- **Never traverse outside `managed_root`.** `discover_runner_instances` walks
+  exactly the configured root, non-recursively. This host has an unrelated
+  runner *service* at `C:\actions-runner` that must never be touched; safety
+  comes from the traversal's shape, not from filtering names afterwards.
+
 ### Adapters must not block on worker completion
 `devin_shell.launch_devin_session` and `claude_code.launch_claude_worker` both use
 `subprocess.Popen` and return immediately — they never call `process.wait()` or
