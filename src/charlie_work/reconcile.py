@@ -342,6 +342,12 @@ def detect_drift(
         )
 
         sessions_dir = repo_root / config.devin.sessions_dir
+        # state_dir root (sibling of state.json) for api-budget ledger settlement
+        # on reap (issue #480). Resolved through runtime_paths so an absolute
+        # state_dir config is honored identically to state.json itself.
+        from .paths import runtime_paths
+
+        state_dir_root = runtime_paths(repo_root, config.runtime.state_dir).root
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
                 # Track live sessions to avoid false-positive drift detection (issue #214)
@@ -381,7 +387,11 @@ def detect_drift(
                             kill_process_tree(w.pid, w.process_start_time)
 
                         # Reap the sidecar to prevent phantom sessions
-                        w.reap_sidecar(sessions_dir)
+                        w.reap_sidecar(
+                            sessions_dir,
+                            api_config=config.api_worker,
+                            state_dir=state_dir_root,
+                        )
 
                         # Reconcile labels for launch_stalled sessions with no open PR
                         if w.issue_number not in open_prs_by_issue:
@@ -513,7 +523,11 @@ def detect_drift(
 
                     # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
                     # Delete the sidecar file after the session is detected as dead and classified
-                    w.reap_sidecar(sessions_dir)
+                    w.reap_sidecar(
+                        sessions_dir,
+                        api_config=config.api_worker,
+                        state_dir=state_dir_root,
+                    )
 
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # A dead worker with no open PR is recoverable and should be relabeled

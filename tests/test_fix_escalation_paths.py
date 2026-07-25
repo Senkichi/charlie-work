@@ -85,6 +85,76 @@ def test_dispatch_reviews_attempt_cap_escalates_with_label(tmp_path: Path) -> No
     assert escalated_events[0]["payload"]["reason"] == "max_review_dispatch_attempts_exceeded"
 
 
+def _seed_dispatched_at_cap(paths, pr_number: int, issue_number: int, count: int) -> None:
+    from datetime import UTC, datetime
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "review_dispatch_attempt_count": count,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            # Fresh claim: the reviewer launched moments ago and is mid-review.
+            "review_dispatched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "reviewer_pid": 424242,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(paths.state_file, state)
+
+
+def test_attempt_cap_never_escalates_over_live_reviewer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #573: a PR at the attempt cap whose dispatched reviewer is ALIVE
+    must not be escalated out from under it — the in-flight verdict would be
+    orphaned (the reaper only records verdicts for dispatched claims).
+    Observed live on PR #540 (2026-07-25 02:21Z): the guard nulled the pid
+    and marked the claim failed while the reviewer's log was still growing."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, max_review_dispatch_attempts=2)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(paths, 456, "sha-abc123")
+    _seed_dispatched_at_cap(paths, 456, 123, 2)
+    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: True)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "escalated"
+    assert state["prs"]["456"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert state["prs"]["456"]["reviewer_pid"] == 424242
+    assert _events(state, "review_dispatch_escalated") == []
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+
+
+def test_attempt_cap_still_escalates_dead_dispatched_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cap keeps escalating when the dispatched reviewer is dead — the
+    liveness guard must not shield corpses."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, max_review_dispatch_attempts=2)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(paths, 456, "sha-abc123")
+    _seed_dispatched_at_cap(paths, 456, 123, 2)
+    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: False)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert len(_events(state, "review_dispatch_escalated")) == 1
+
+
 def test_dispatch_reviews_attempt_cap_escalation_label_failure_records_error(
     tmp_path: Path,
 ) -> None:

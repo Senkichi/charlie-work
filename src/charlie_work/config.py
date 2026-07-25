@@ -92,6 +92,7 @@ class LabelConfig:
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
+    merge_hold: str = "agent:merge-hold"
     # Routing hint, NOT a workflow state (issue #481). Never a member of
     # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
     # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
@@ -121,12 +122,21 @@ class LabelConfig:
             self.done,
             self.human_needed,
             self.prose_only_deps,
+            self.merge_hold,
             self.complexity_high,
         ]
 
     @property
     def workflow_labels(self) -> set[str]:
-        """All workflow labels (agent:* states) excluding the ready marker."""
+        """All workflow labels (agent:* states) excluding the ready marker.
+
+        ``merge_hold`` is intentionally excluded: it is a transient operator
+        signal, not a workflow state. Including it here would make every
+        non-terminal transition (``review_started``, ``rework_requested``, …)
+        strip the hold from the issue, violating the issue #496 persistence
+        requirement. Terminal transitions strip it explicitly via ``extra_remove``
+        (see ``labels._edges``).
+        """
         return {
             self.queued,
             self.in_progress,
@@ -279,6 +289,37 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
+    # Effort level pinned via --effort on reviewer session launches. Empty
+    # string means fall back to claude_code.effort (the worker/reviewer
+    # default). Its MEANING depends on review_effort_experiment_fraction below:
+    #   - fraction == 0.0 (default, experiment disabled): review_effort, when
+    #     set, applies to ALL reviewer launches unconditionally — exactly the
+    #     pre-experiment behavior. This is the "just pin reviewer effort"
+    #     knob with no A/B semantics.
+    #   - fraction in (0.0, 1.0]: review_effort becomes the TREATMENT arm's
+    #     effort, applied only to the assigned fraction of PRs (see
+    #     claude_code._review_effort_arm / resolve_review_effort). The
+    #     remaining PRs (control) fall back to claude_code.effort as if
+    #     review_effort were unset. This lets the A/B be compared via the
+    #     per-review session telemetry (review_session_metrics /
+    #     review_effort_arm on record_review) without confounding from
+    #     concurrent pipeline changes (time-windowed A/B was replaced by this
+    #     per-PR randomized assignment for exactly that reason).
+    review_effort: str = ""
+    # Fraction (0.0-1.0) of PRs randomly (but deterministically, see
+    # claude_code._review_effort_arm) assigned to the review_effort
+    # "treatment" arm. 0.0 (default) disables the experiment: review_effort
+    # applies to every review when set, same as before this field existed.
+    # Assignment is a stateless hash of the PR number (+ salt below), so the
+    # same PR always lands in the same arm across rework rounds/re-dispatches
+    # — arm-hopping across rounds would contaminate the per-PR quality
+    # signal the experiment is trying to measure.
+    review_effort_experiment_fraction: float = 0.0
+    # Mixed into the per-PR assignment hash alongside the PR number. Change
+    # this to re-randomize arm assignment for a new experiment epoch (e.g.
+    # after a config change invalidates the current cohort) without needing
+    # to rename or remove the fraction field.
+    review_effort_experiment_salt: str = ""
 
 
 @dataclass(frozen=True)
@@ -448,6 +489,10 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: int = 1500
+    # Bounded in-memory event ring for state.json. A larger cap costs only a
+    # few hundred KB of JSON and preserves far more diagnostic history when a
+    # single sweep emits repetitive events. Tuned via config (issue #525).
+    event_ring_size: int = 2000
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
@@ -688,6 +733,48 @@ class CrossFamilyConfig:
         "{prompt_path}",
     )
     timeout_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class RescueConfig:
+    """Bounded strong-model rescue tier (issue #555).
+
+    Inserts exactly one Opus rework attempt + one cross-family (non-Claude)
+    review pass between "cheap-worker cap exhausted" and escalating to a
+    human. ``enabled`` defaults False so an absent config block is a no-op —
+    mirrors ``CrossFamilyConfig`` (config.py:236).
+
+    Only the three verdict-driven caps route through here
+    (``max_rework_cycles``, ``max_conflict_rework_attempts``,
+    ``max_no_op_rework_attempts``) — infra-driven caps (review-dispatch
+    attempt cap, ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``, dispatch-failed
+    cap) always escalate straight to a human; a stronger model cannot fix a
+    dead session or an unsafe worktree.
+
+    The rescue rework reuses the existing claude-code rework-dispatch path
+    (``_dispatch_rework_impl`` → ``adapters.dispatch_sessions`` →
+    ``claude_code.launch_claude_worker``) with ``claude_code.model``
+    overridden to ``worker_model`` for that one dispatch — never a parallel
+    launch path. ``worker_adapter`` is currently always ``"claude-code"``;
+    kept as an explicit field so a future adapter can be wired in by config
+    alone, matching the spec's named knobs.
+
+    The rescue review reuses ``cross_family.run_cross_family_review`` (the
+    existing blocking, one-shot cross-family invocation) rather than a new
+    polling worker session — ``reviewer_command`` empty means reuse
+    ``CrossFamilyConfig.command`` with ``model`` overridden to
+    ``reviewer_model``.
+    """
+
+    enabled: bool = False
+    worker_adapter: str = "claude-code"
+    worker_model: str = "claude-opus-4-1"
+    reviewer_adapter: str = "devin"
+    reviewer_model: str = "codex"
+    # Empty means reuse CrossFamilyConfig.command (model still overridden to
+    # reviewer_model above).
+    reviewer_command: str | tuple[str, ...] = ()
+    reviewer_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -985,6 +1072,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
+    rescue: RescueConfig = field(default_factory=RescueConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
@@ -1176,6 +1264,47 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
         )
+    rd_effort = review_dispatch_data.get("review_effort")
+    if rd_effort is not None and not isinstance(rd_effort, str):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort' must be a string, "
+            f"got {type(rd_effort).__name__}"
+        )
+    rd_experiment_fraction = review_dispatch_data.get("review_effort_experiment_fraction")
+    if rd_experiment_fraction is not None and (
+        isinstance(rd_experiment_fraction, bool)
+        or not isinstance(rd_experiment_fraction, (int, float))
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
+            f"must be a number, got {type(rd_experiment_fraction).__name__}"
+        )
+    if rd_experiment_fraction is not None and not (0.0 <= rd_experiment_fraction <= 1.0):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
+            f"must be in [0.0, 1.0], got {rd_experiment_fraction}"
+        )
+    rd_experiment_salt = review_dispatch_data.get("review_effort_experiment_salt")
+    if rd_experiment_salt is not None and not isinstance(rd_experiment_salt, str):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_salt' must be a "
+            f"string, got {type(rd_experiment_salt).__name__}"
+        )
+    # Cross-field check: a fraction > 0.0 enables the experiment, whose
+    # treatment arm IS review_effort verbatim (resolve_review_effort returns
+    # it unmodified). Enabling the experiment without a treatment effort
+    # would silently make "treatment" mean "no --effort pin at all" while
+    # "control" still gets claude_code.effort -- a corrupted, undocumented
+    # comparison that would run for the life of the experiment with no
+    # warning. Fail loud at load instead.
+    effective_fraction = rd_experiment_fraction if rd_experiment_fraction is not None else 0.0
+    effective_effort = rd_effort if rd_effort is not None else ""
+    if effective_fraction > 0.0 and not effective_effort:
+        raise ConfigError(
+            "config section 'review_dispatch': 'review_effort_experiment_fraction' is "
+            f"{effective_fraction} but 'review_effort' is unset -- set 'review_effort' to the "
+            "treatment effort string (e.g. 'high') before enabling the experiment"
+        )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
@@ -1283,6 +1412,23 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
                 f"got {graphql_rate_limit_threshold}"
+            )
+    event_ring_size = runtime_data.get("event_ring_size")
+    if event_ring_size is not None:
+        if not isinstance(event_ring_size, int):
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be an int, "
+                f"got {type(event_ring_size).__name__}"
+            )
+        # >= 1, not >= 0: append_event truncates via events[-max_size:], and
+        # -0 == 0 in Python, so max_size=0 would yield events[0:] (the FULL
+        # list) — no truncation, i.e. unbounded growth, the exact failure this
+        # cap exists to prevent. There is no sensible "disable" semantic for a
+        # bounded ring (unlike graphql_rate_limit_threshold: 0), so reject 0.
+        if event_ring_size < 1:
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be >= 1, "
+                f"got {event_ring_size}"
             )
     throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
     if throttle_resume_margin_s is not None:
@@ -1492,6 +1638,49 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "cross_family.command",
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
+    rescue_data = _section(data, "rescue")
+    rescue_enabled = rescue_data.get("enabled")
+    if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
+        raise ConfigError(
+            f"config section 'rescue' key 'enabled' must be a bool, "
+            f"got {type(rescue_enabled).__name__}"
+        )
+    for rescue_str_key in (
+        "worker_adapter",
+        "worker_model",
+        "reviewer_adapter",
+        "reviewer_model",
+    ):
+        rescue_str_value = rescue_data.get(rescue_str_key)
+        if rescue_str_value is not None and not isinstance(rescue_str_value, str):
+            raise ConfigError(
+                f"config section 'rescue' key '{rescue_str_key}' must be a string, "
+                f"got {type(rescue_str_value).__name__}"
+            )
+    rescue_command = rescue_data.get("reviewer_command")
+    if isinstance(rescue_command, list):
+        rescue_data["reviewer_command"] = tuple(str(item) for item in rescue_command)
+    rescue_command = rescue_data.get("reviewer_command")
+    if rescue_command:
+        _validate_command_placeholders(
+            rescue_command,
+            {"prompt_path", "model"},
+            "rescue.reviewer_command",
+        )
+    rescue_timeout = rescue_data.get("reviewer_timeout_seconds")
+    if rescue_timeout is not None and (
+        isinstance(rescue_timeout, bool) or not isinstance(rescue_timeout, int)
+    ):
+        raise ConfigError(
+            "config section 'rescue' key 'reviewer_timeout_seconds' must be an int, "
+            f"got {type(rescue_timeout).__name__}"
+        )
+    if rescue_timeout is not None and rescue_timeout < 0:
+        raise ConfigError(
+            "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
+            f"got {rescue_timeout}"
+        )
+    rescue = _build_section(RescueConfig, "rescue", rescue_data)
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
     if terminal_error_markers is not None:
@@ -1817,6 +2006,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         claude_code=claude_code,
         api_worker=api_worker,
         cross_family=cross_family,
+        rescue=rescue,
         watchdog=watchdog,
         test_adequacy=test_adequacy,
         fleet=fleet,
