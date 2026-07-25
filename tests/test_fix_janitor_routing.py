@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from charlie_work.config import OrchestratorConfig, ReviewConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WatchdogConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
@@ -473,3 +474,312 @@ def test_clean_janitor_pass_with_unknown_mergeable_preserves_conflict_epoch(
     pr = state["prs"]["456"]
     assert pr["conflict_rework_attempts"] == 1
     assert pr["no_op_rework_attempts"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #558: single-point-of-enforcement -- review() converges a CLOSED
+# (unmerged) PR's state entry to "closed" at the janitor-gate boundary
+# instead of falling through to janitor_blocked bookkeeping.
+# ---------------------------------------------------------------------------
+
+
+def _force_pr_status(app: OrchestratorApp, pr_number: int, status: str) -> None:
+    state = load_state(app.paths.state_file)
+    record = {**state["prs"].get(str(pr_number), {}), "number": pr_number}
+    record["status"] = status
+    state["prs"][str(pr_number)] = record
+    save_state(app.paths.state_file, state)
+
+
+def test_review_converges_closed_unmerged_pr_janitor_blocked(tmp_path: Path) -> None:
+    """A PR that is CLOSED (unmerged) on GitHub with a 'janitor_blocked'
+    state status must be converged to 'closed' by review() at the janitor
+    gate boundary, not re-logged as janitor_blocked.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "janitor_blocked")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["closed_unmerged_converged"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+
+
+def test_review_converges_closed_unmerged_pr_rework_requested(tmp_path: Path) -> None:
+    """A PR that is CLOSED (unmerged) on GitHub with a 'rework_requested'
+    state status must be converged to 'closed' by review().
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "rework_requested")
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["closed_unmerged_converged"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+
+
+def test_review_converges_closed_unmerged_pr_already_closed_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """A PR already converged to 'closed' must not re-emit the convergence
+    event on a second review() call (idempotent).
+
+    The idempotency guard in review() skips the state write AND the
+    ``closed_unmerged_pr_state_converged`` event when the PR status is
+    already ``"closed"``. Asserting only the return flag / final status
+    would pass even if that guard were deleted (the flag is returned
+    outside the guard, and writing ``"closed"`` over ``"closed"`` is a
+    value no-op), so this test pins the guard by counting convergence
+    events: exactly one must land on the first call, and zero on the
+    second.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "janitor_blocked")
+
+    # First call: status is janitor_blocked, so the guard writes and emits.
+    first = app.review(456)
+    assert first.ok is True
+    assert first.data.get("closed_unmerged_converged") is True
+    state_after_first = load_state(app.paths.state_file)
+    assert state_after_first["prs"]["456"]["status"] == "closed"
+    first_events = [
+        e
+        for e in state_after_first.get("events", [])
+        if e.get("kind") == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(first_events) == 1, "first call must emit the convergence event"
+
+    # Second call: status is already 'closed'. The guard must skip the
+    # write and the event -- deleting the guard would re-emit here.
+    second = app.review(456)
+    assert second.ok is True
+    assert second.data.get("closed_unmerged_converged") is True
+    state_after_second = load_state(app.paths.state_file)
+    assert state_after_second["prs"]["456"]["status"] == "closed"
+    second_events = [
+        e
+        for e in state_after_second.get("events", [])
+        if e.get("kind") == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(second_events) == 1, (
+        "second call on an already-closed PR must NOT re-emit the "
+        "convergence event (idempotency guard)"
+    )
+
+
+def test_review_does_not_converge_merged_pr(tmp_path: Path) -> None:
+    """A MERGED PR must NOT be converged by the closed-unmerged path --
+    that is merged_outside_orchestrator's job. The janitor gate should
+    fall through to its normal failure handling for MERGED.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "MERGED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _force_pr_status(app, 456, "reviewing")
+
+    result = app.review(456)
+
+    # MERGED is not CLOSED, so the closed-unmerged convergence must not fire.
+    assert result.data.get("closed_unmerged_converged") is None
+    state = load_state(app.paths.state_file)
+    # Status should not have been set to "closed" by this path.
+    assert state["prs"]["456"]["status"] != "closed"
+
+
+# ---------------------------------------------------------------------------
+# Issue #558 rework: review()'s closed-unmerged early return yields ok=True
+# with a ``closed_unmerged_converged`` data flag and NO packet. Two callers
+# gate a status->"reviewing" flip on ``review_result.ok && !routed_to_rework
+# && decision_unchanged`` after snapshotting the PR as OPEN earlier in the
+# same pass. If the PR closes in that window, the flip must NOT fire -- it
+# would strand the issue in an ACTIVE_STATE_STATUS no reconcile rule clears
+# while the GitHub issue itself stays open.
+# ---------------------------------------------------------------------------
+
+
+class _RaceClosedGitHub(FakeGitHub):
+    """Models the close-mid-pass race: ``pr_list`` (the snapshot taken
+    earlier in the pass) still sees the PR as OPEN, but ``pr_view`` (called
+    inside ``review()``) observes it as CLOSED. This is exactly the window
+    the rework finding describes.
+    """
+
+    def pr_list(self):
+        out = []
+        for pr in self.prs:
+            if pr["number"] != 456:
+                continue
+            pr_copy = dict(pr)
+            pr_copy["state"] = "OPEN"
+            if pr["number"] in self.pr_head_shas:
+                pr_copy["headRefOid"] = self.pr_head_shas[pr["number"]]
+            out.append(pr_copy)
+        return out
+
+    def pr_view(self, number: int):
+        for pr in self.prs:
+            if pr["number"] == number:
+                pr_copy = dict(pr)
+                pr_copy["state"] = "CLOSED"
+                if number in self.pr_head_shas:
+                    pr_copy["headRefOid"] = self.pr_head_shas[number]
+                return pr_copy
+        raise ValueError(f"PR {number} not found")
+
+
+def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
+    tmp_path: Path,
+) -> None:
+    """``_route_rework_candidate_to_review`` (reached via ``dispatch_rework``)
+    snapshots the PR as OPEN to detect a head-advance, then calls ``review()``
+    which observes the PR as CLOSED and converges it. The issue must stay
+    ``rework_requested`` -- NOT flip to ``reviewing`` -- because no fresh
+    packet was produced and the PR is dead. Flipping would strand the issue
+    in ``reviewing`` (an ACTIVE_STATE_STATUS) while the GitHub issue stays
+    open, with no reconcile rule to clear it.
+    """
+    import sys
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _RaceClosedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Head advances AND the diff content genuinely changes (so dispatch_rework
+    # routes to _route_rework_candidate_to_review). pr_list still reports OPEN.
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    # The issue was NOT confirmed as routed to review (no fresh packet).
+    assert result.data["routed_to_review"] == []
+    assert 123 in result.data["review_blocked_retry"]
+
+    state = load_state(paths.state_file)
+    # Issue stays rework_requested -- the dead-PR convergence is not a
+    # "reviewing" transition.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # PR state entry converged to "closed" by review()'s janitor gate.
+    assert state["prs"]["456"]["status"] == "closed"
+    # No reviewing label applied (that would desync from GitHub reality).
+    assert (123, app.config.labels.reviewing) not in fake_gh.labels_added
+
+    rework_events = [e for e in state["events"] if e["kind"] == "rework_already_pushed"]
+    assert len(rework_events) == 1
+    assert rework_events[0]["payload"]["routed"] is False
+    assert rework_events[0]["payload"]["review_ok"] is True
+
+
+def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
+    tmp_path: Path,
+) -> None:
+    """The dead-worker orphan sweep snapshots the PR as OPEN (via
+    ``pr_list``) to detect a head-advance, then calls ``review()`` which
+    observes the PR as CLOSED and converges it. The orphaned ``dispatched``
+    issue must stay ``dispatched`` -- NOT flip to ``reviewing`` and NOT get a
+    transient-block drift fingerprint -- because the PR is permanently dead,
+    not transiently blocked. The issue's disposition is left to the existing
+    closed-unmerged issue-side reconcile handling.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _RaceClosedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record a request_changes verdict so the orphan sweep sees a head-advance
+    # and routes to review(). reviewed_head_sha pins to the default head.
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    state = load_state(paths.state_file)
+    state["issues"]["123"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    # Head advances (pr_list snapshot sees OPEN + new head); pr_view will
+    # report CLOSED when review() runs.
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=app.review,
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    # Stays dispatched -- not flipped to "reviewing".
+    assert entry.get("status") == "dispatched"
+    # No transient-block drift fingerprint on a permanently-dead PR.
+    assert "orphan_drift_fingerprint" not in entry
+    # PR state entry converged to "closed" by review()'s janitor gate.
+    assert state["prs"]["456"]["status"] == "closed"
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 0
+    routed_events = [e for e in events if e.get("kind") == "orphaned_worker_routed_to_review"]
+    assert len(routed_events) == 1
+    assert routed_events[0]["payload"]["routed"] is False
+    assert routed_events[0]["payload"]["review_ok"] is True
