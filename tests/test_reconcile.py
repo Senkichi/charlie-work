@@ -2589,3 +2589,133 @@ def test_apply_fixes_closed_unmerged_pr_defers_reap_while_reviewer_alive(
     assert (20, config.labels.pr_open) in gh.labels_removed
     assert (20, config.labels.reviewing) in gh.labels_removed
     assert new_state["prs"]["2"]["review_dispatch_status"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #480: api-worker budget settlement wiring at the reconcile reap sites
+# ---------------------------------------------------------------------------
+#
+# detect_drift has two production reap_sidecar call sites that wire
+# ``api_config=config.api_worker, state_dir=state_dir_root`` so an api worker's
+# spend is settled into the ledger before its sidecar is unlinked:
+#   - the dead-session lane (~reconcile.py:440)
+#   - the launch_stalled lane (~reconcile.py:304)
+# Neither had any test coverage. A wiring regression at either site would
+# silently disable budget tracking with no test failing. These two tests drive
+# the real detect_drift path and assert the ledger is populated.
+
+
+def test_detect_drift_dead_api_session_settles_budget_ledger(tmp_path: Path) -> None:
+    """Dead api-worker session: detect_drift reaps and settles spend (issue #480).
+
+    Covers the dead-session reap call site (~reconcile.py:440). A wiring
+    regression that drops ``api_config``/``state_dir`` from that call leaves
+    the sidecar reaped but the ledger empty — this assertion fails.
+    """
+    from _api_budget_fixtures import (
+        api_worker_config,
+        ledger_entries,
+        write_api_events,
+        write_api_sidecar,
+    )
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        # Disable sessions.db post-mortem so the test does not touch a real
+        # sessions.db; the wiring under test is the budget reap, not post-mortem.
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 42, provider="example")
+    write_api_events(sessions_dir, 42)
+
+    state_dir_root = runtime_paths(tmp_path, config.runtime.state_dir).root
+
+    detect_drift(gh, state, config, repo_root=tmp_path)
+
+    sessions = ledger_entries(state_dir_root)
+    assert len(sessions) == 1, "dead api session must settle into the ledger"
+    entry = sessions[0]
+    assert entry.issue == 42
+    assert entry.provider == "example"
+    assert entry.model == "example-model"
+    # 1M*3 + 0.2M*15 + 0.5M*0.30 = 6.15
+    assert entry.usd == pytest.approx(6.15)
+
+
+def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch-stalled api-worker session: the launch_stalled reap settles spend.
+
+    Covers the launch_stalled reap call site (~reconcile.py:304). That lane
+    fires only for an alive-but-shim-frozen worker corroborated by a
+    conclusive-stale real-activity probe. We patch ``is_worker_alive`` to True
+    and ``real_activity_probe_for`` to a conclusive-stale probe so the lane
+    runs for an api sidecar without spawning a real process. A wiring
+    regression that drops the api kwargs from this call site leaves the ledger
+    empty — this assertion fails.
+    """
+    import os as _os
+
+    from _api_budget_fixtures import (
+        api_worker_config,
+        ledger_entries,
+        write_api_events,
+        write_api_sidecar,
+    )
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(55, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 55, provider="example")
+    write_api_events(sessions_dir, 55)
+
+    # A shim-frozen log: small, contains the marker, stale past the grace period.
+    log_path = sessions_dir / "issue-55.claude.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+    old_time = datetime.now(UTC) - timedelta(minutes=20)
+    _os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Force the api worker to read as alive so the launch_stalled lane runs.
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    # Conclusive-stale probe: has a timestamp (not inconclusive) but stale past
+    # the grace period (not fresh), so _log_is_stalled_at_shim returns True.
+    stale_source = ActivitySource(
+        name="test",
+        timestamp=old_time,
+        staleness_seconds=20 * 60,
+        error=None,
+    )
+    monkeypatch.setattr(
+        "charlie_work.worker.real_activity_probe_for",
+        lambda w, cfg, now: RealActivityProbe(sources=(stale_source,)),
+    )
+
+    state_dir_root = runtime_paths(tmp_path, config.runtime.state_dir).root
+
+    detect_drift(gh, state, config, repo_root=tmp_path)
+
+    sessions = ledger_entries(state_dir_root)
+    assert len(sessions) == 1, "launch_stalled api session must settle into the ledger"
+    entry = sessions[0]
+    assert entry.issue == 55
+    assert entry.provider == "example"
+    assert entry.usd == pytest.approx(6.15)

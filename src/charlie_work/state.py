@@ -316,27 +316,31 @@ def release_operator_claimed(data: dict[str, Any], issue_number: int) -> dict[st
 
 
 @contextmanager
-def state_lock(state_path: Path):
-    """Cross-process advisory lock for state.json read-modify-write cycles.
+def advisory_file_lock(path: Path):
+    """Cross-process advisory lock for a JSON file's read-modify-write cycle.
 
-    Uses platform-specific file locking (Windows: msvcrt.locking, POSIX: fcntl.flock)
-    on a lockfile alongside state.json. The lock is advisory and time-bounded to
-    prevent wedging on stale locks.
+    This is the generic primitive behind ``state_lock``. It serializes the
+    load→modify→save cycle on ANY atomic-JSON state file (``state.json``,
+    ``api-budget.json``, …) so concurrent writers cannot lose updates: the
+    file lock serializes across PROCESSES and a per-path ``threading.Lock``
+    serializes concurrent THREADS in this process (byte-range file locks are
+    owned by the process, not the thread — see ``_thread_lock_for``).
 
-    Deterministic: if the lock cannot be acquired within ``_LOCK_TIMEOUT_SECONDS``,
-    the context manager raises ``StateLockBusy``. A state writer that cannot acquire
-    the lock must fail that unit of work as a value (skip + event log), never write
+    Uses platform-specific file locking (Windows: ``msvcrt.locking``, POSIX:
+    ``fcntl.flock``) on a ``<path>.lock`` lockfile alongside the target. The
+    lock is advisory and time-bounded (``_LOCK_TIMEOUT_SECONDS``) to prevent
+    wedging on stale locks.
+
+    Deterministic: if the lock cannot be acquired within the timeout, the
+    context manager raises ``StateLockBusy``. A writer that cannot acquire the
+    lock must fail that unit of work as a value (skip + event log), never write
     unlocked.
-
-    A per-path threading.Lock is held around the whole critical section so that
-    concurrent THREADS in this process are serialized too (the file lock only
-    serializes across processes — see ``_thread_lock_for``).
     """
-    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_path = path.with_suffix(path.suffix + ".lock")
     lock_file = None
     acquired = False
 
-    thread_lock = _thread_lock_for(state_path)
+    thread_lock = _thread_lock_for(path)
     thread_lock.acquire()
     try:
         # Create the lock file if needed. touch() leaves it at 0 bytes, which
@@ -428,6 +432,19 @@ def state_lock(state_path: Path):
         # closed, so the next thread never observes a half-released critical
         # section. Always paired with the acquire() above the try.
         thread_lock.release()
+
+
+@contextmanager
+def state_lock(state_path: Path):
+    """Cross-process advisory lock for state.json read-modify-write cycles.
+
+    Thin wrapper over ``advisory_file_lock`` (the generic primitive) kept under
+    the original name so the many existing call sites are unchanged. See
+    ``advisory_file_lock`` for the locking semantics, timeout, and the
+    intra-process thread serialization rationale.
+    """
+    with advisory_file_lock(state_path):
+        yield
 
 
 def empty_state() -> dict[str, Any]:
