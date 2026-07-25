@@ -236,6 +236,14 @@ def _instructions(adapter: str) -> list[str]:
             "sessions directory; the provider env is injected into the child process",
             "only — the API key never appears in sidecars, logs, or argv.",
         ]
+    if adapter == "mixed":
+        return [
+            "This manifest combines sessions routed to multiple worker adapters",
+            "(e.g. api and devin-shell) by per-issue adapter routing (issue #482).",
+            "Each session's adapter is recorded in the dispatch results file, not in",
+            "this manifest's top-level adapter field. Consult the results file for",
+            "per-session adapter_kind, provider, and launch status.",
+        ]
     return [
         "Open one Devin worker session per request.",
         "Paste the prompt file contents as the worker task.",

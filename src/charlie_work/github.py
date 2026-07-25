@@ -751,6 +751,30 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def compare_diff(self, base: str, head: str) -> str | None:
+        """Return the plain unified-diff text between two commits (three-dot compare).
+
+        Wraps the same ``gh api repos/{owner}/{repo}/compare/{base}...{head}``
+        endpoint as :meth:`compare`, but requests the ``application/vnd.github.
+        v3.diff`` media type so the response body is a ready-to-write unified
+        diff (like :meth:`pr_diff`) instead of JSON compare metadata. Tolerates
+        a rebased/diverged/GC'd ``base`` the same way GitHub's three-dot
+        compare does. Returns ``None`` on any failure (404, API error, gh not
+        installed) — errors are returned as values, never raised.
+        """
+        result = self.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/compare/{base}...{head}",
+                "-H",
+                "Accept: application/vnd.github.v3.diff",
+            ],
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, str) else None
+        return result if isinstance(result, str) else None
+
     def validate_field_lists(self) -> None:
         """Validate the compile-time ``--json`` field lists against ``gh``.
 

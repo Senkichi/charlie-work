@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from charlie_work import claude_code
-from charlie_work.config import ClaudeCodeConfig, OrchestratorConfig, RuntimeConfig
+from charlie_work.config import (
+    ClaudeCodeConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+    RuntimeConfig,
+)
 from charlie_work.claude_code import (
     ClaudeProgress,
     ClaudeWorkerRecord,
@@ -21,9 +26,11 @@ from charlie_work.claude_code import (
     parse_claude_events,
     probe_claude,
     read_worker_records,
+    resolve_review_effort,
     update_worker_record_with_failure_classification,
     _apply_model_pin,
     _apply_effort_pin,
+    _review_effort_arm,
     _sanitize_review_command_template,
     _sidecar_path,
 )
@@ -2882,6 +2889,280 @@ def test_launch_claude_worker_review_pins_configured_model_by_default(
     assert "--model" in record.command
     idx = record.command.index("--model")
     assert record.command[idx + 1] == ClaudeCodeConfig().model
+
+
+def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path) -> None:
+    """A reviewer session must pin review_dispatch.review_effort over
+    claude_code.effort when review_effort is explicitly set."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+    )
+
+    record = launch_claude_worker(
+        503,
+        "agent/issue-503-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "high"
+
+
+def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset(
+    tmp_path: Path,
+) -> None:
+    """review_effort empty (the default) must fall back to claude_code.effort,
+    same as any other reviewer launch before this config knob existed."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="medium"),
+        review_dispatch=ReviewDispatchConfig(review_effort=""),
+    )
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "medium"
+
+
+def test_launch_claude_worker_worker_never_uses_review_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker (non-review) launch must never pick up review_effort, even
+    when it's set and differs from claude_code.effort."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+    )
+
+    record = launch_claude_worker(
+        43,
+        "agent/issue-43-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "low"
+
+
+def test_review_effort_arm_is_deterministic() -> None:
+    """Same inputs must always yield the same arm (stable across re-dispatches)."""
+    for pr_number in (1, 42, 999, 123456):
+        first = _review_effort_arm(pr_number, 0.5, "salt")
+        second = _review_effort_arm(pr_number, 0.5, "salt")
+        assert first == second
+
+
+def test_review_effort_arm_fraction_zero_never_treatment() -> None:
+    for pr_number in range(1, 200):
+        assert _review_effort_arm(pr_number, 0.0, "") is False
+
+
+def test_review_effort_arm_fraction_one_always_treatment() -> None:
+    for pr_number in range(1, 200):
+        assert _review_effort_arm(pr_number, 1.0, "") is True
+
+
+def test_review_effort_arm_salt_change_flips_some_assignments() -> None:
+    """Changing the salt re-randomizes arm assignment for a new epoch."""
+    prs = range(1, 500)
+    arms_a = {pr: _review_effort_arm(pr, 0.5, "epoch-1") for pr in prs}
+    arms_b = {pr: _review_effort_arm(pr, 0.5, "epoch-2") for pr in prs}
+    flipped = sum(1 for pr in prs if arms_a[pr] != arms_b[pr])
+    assert flipped > 0
+
+
+def test_review_effort_arm_distribution_sanity() -> None:
+    """Over many sequential PR numbers, treatment share should land near
+    the configured fraction (loose band to avoid test flakiness)."""
+    fraction = 0.5
+    prs = range(1, 1001)
+    treatment_count = sum(1 for pr in prs if _review_effort_arm(pr, fraction, "sanity-salt"))
+    share = treatment_count / len(prs)
+    assert 0.4 < share < 0.6
+
+
+def test_resolve_review_effort_disabled_uses_review_effort_unconditionally() -> None:
+    """fraction<=0.0 (default): review_effort, if set, applies to every PR ---
+    exactly the pre-experiment behavior. arm is None (experiment not running)."""
+    review_dispatch = ReviewDispatchConfig(review_effort="high")
+    claude_code_cfg = ClaudeCodeConfig(effort="low")
+    for pr_number in (1, 2, 3, 4, 5):
+        effort, arm = resolve_review_effort(pr_number, review_dispatch, claude_code_cfg)
+        assert effort == "high"
+        assert arm is None
+
+
+def test_resolve_review_effort_disabled_falls_back_when_review_effort_unset() -> None:
+    review_dispatch = ReviewDispatchConfig(review_effort="")
+    claude_code_cfg = ClaudeCodeConfig(effort="medium")
+    effort, arm = resolve_review_effort(101, review_dispatch, claude_code_cfg)
+    assert effort == "medium"
+    assert arm is None
+
+
+def test_resolve_review_effort_enabled_splits_treatment_and_control() -> None:
+    """fraction=1.0: every PR is treatment and gets review_effort. fraction=0.0-adjacent
+    control case is exercised via a PR known to hash to False for a tiny fraction."""
+    review_dispatch = ReviewDispatchConfig(
+        review_effort="high", review_effort_experiment_fraction=1.0
+    )
+    claude_code_cfg = ClaudeCodeConfig(effort="low")
+    effort, arm = resolve_review_effort(777, review_dispatch, claude_code_cfg)
+    assert (effort, arm) == ("high", "treatment")
+
+    # A vanishingly small fraction (but > 0.0, so the experiment IS enabled)
+    # makes control the overwhelmingly likely outcome for an arbitrary PR;
+    # assert against the deterministic arm function directly instead of
+    # relying on probability for a single PR.
+    tiny_fraction = 1e-9
+    salt = ""
+    is_treatment = _review_effort_arm(777, tiny_fraction, salt)
+    review_dispatch_tiny = ReviewDispatchConfig(
+        review_effort="high", review_effort_experiment_fraction=tiny_fraction
+    )
+    effort, arm = resolve_review_effort(777, review_dispatch_tiny, claude_code_cfg)
+    if is_treatment:
+        assert (effort, arm) == ("high", "treatment")
+    else:
+        assert (effort, arm) == ("low", "control")
+
+
+def test_launch_claude_worker_review_experiment_treatment_pins_review_effort(
+    tmp_path: Path,
+) -> None:
+    """Experiment enabled (fraction=1.0, so every PR is treatment) --> the
+    reviewer session pins review_effort, same as the always-on case."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(
+            review_effort="high", review_effort_experiment_fraction=1.0
+        ),
+    )
+
+    record = launch_claude_worker(
+        601,
+        "agent/issue-601-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "high"
+
+
+def test_launch_claude_worker_review_experiment_control_falls_back(tmp_path: Path) -> None:
+    """Experiment enabled with a vanishingly small fraction --> an arbitrary
+    PR is (deterministically) assigned control and falls back to
+    claude_code.effort instead of review_effort."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    pr_number = 602
+    tiny_fraction = 1e-9
+    assert _review_effort_arm(pr_number, tiny_fraction, "") is False
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(
+            review_effort="high", review_effort_experiment_fraction=tiny_fraction
+        ),
+    )
+
+    record = launch_claude_worker(
+        pr_number,
+        "agent/issue-602-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "low"
+
+
+def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
+    tmp_path: Path,
+) -> None:
+    """When the caller (dispatch_reviews) already resolved the review_effort
+    experiment arm at claim time and passes it via resolved_review_effort,
+    launch_claude_worker must use that value directly rather than
+    re-resolving from config -- this is the single-computation-site
+    invariant: the claim-time resolution is authoritative, not a preview."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    # Config alone would resolve to "high" (fraction=1.0, review_effort=high),
+    # but the passed-through resolved_review_effort deliberately differs so
+    # the test can distinguish "used the passthrough" from "recomputed".
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(
+            review_effort="high", review_effort_experiment_fraction=1.0
+        ),
+    )
+
+    record = launch_claude_worker(
+        603,
+        "agent/issue-603-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+        resolved_review_effort="medium",
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "medium"
 
 
 def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
