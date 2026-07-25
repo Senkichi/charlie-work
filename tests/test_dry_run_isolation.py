@@ -18,6 +18,7 @@ suite instead of shipping. That is the same shape as the parser-walk guard in
 from __future__ import annotations
 
 import ast
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
@@ -269,28 +270,72 @@ def test_cross_family_dry_run_creates_no_files(tmp_path: Path) -> None:
     assert result.ok is False, "the ok=False dry-run contract is relied on by callers"
 
 
+def _valid_stale_report(head_sha: str) -> str:
+    """A report that BOTH ``extract_head_ref_oid`` and ``report_body_is_valid`` accept.
+
+    Three conditions are load-bearing here and none of them is guessable:
+    the text must open with the exact orchestrator header (cross_family.py:88), the
+    SHA must sit in an HTML comment ``<!-- PR head SHA: ... -->`` rather than a bare
+    ``HEAD_REF_OID:`` line (cross_family.py:91), and the body after the ``---``
+    separator must carry a severity marker or a Verdict line or the staleness branch
+    treats it as "not a real review" and skips.
+
+    Getting any one of them wrong leaves ``old_head_sha`` as None, the guarded block
+    unentered, and the tests below passing against unfixed code. That is exactly how
+    the first version of this fixture was wrong.
+    """
+    return (
+        "# Cross-family adversarial review — `some-model`\n\n"
+        f"<!-- PR head SHA: {head_sha} -->\n\n"
+        "---\n\n"
+        "**MAJOR** the retry loop drops the last error.\n"
+    )
+
+
+def _osfail_runner(*_args: Any, **_kwargs: Any) -> Any:
+    raise OSError("no such binary")
+
+
 def test_cross_family_staleness_check_tolerates_a_missing_head(tmp_path: Path) -> None:
     """``head_ref_oid`` is optional, and the staleness warning subscripts it.
 
-    ``spec_review`` calls without a PR head at all, so a pre-existing report that
-    happens to carry a head SHA drove ``None[:12]`` -> TypeError, inside a function
-    documented to never raise. With no new head there is nothing to call stale.
+    ``spec_review`` calls without a PR head at all, so a pre-existing report carrying
+    a head SHA drove ``None[:12]`` -> TypeError. That block sits OUTSIDE every ``try``
+    in the function — the excepts begin below it and catch only OSError,
+    SubprocessError and TimeoutExpired — so pre-fix the TypeError escaped a function
+    whose docstring promises it never raises.
+
+    Reaching the runner at all is the proof the staleness block was survived.
     """
     kwargs = _cross_family_kwargs(tmp_path)
-    kwargs["report_path"].write_text(
-        "# Cross-family adversarial review\n\nHEAD_REF_OID: abcdef1234567890\n\nVERDICT: approved\n",
-        encoding="utf-8",
-    )
+    kwargs["report_path"].write_text(_valid_stale_report("abcdef1234567890"), encoding="utf-8")
 
-    def failing_runner(*_args: Any, **_kwargs: Any) -> Any:
-        raise FileNotFoundError("no such binary")
-
-    # head_ref_oid deliberately omitted. Reaching the runner at all proves the
-    # staleness block was survived; the contract is "returns a result, never raises".
-    result = run_cross_family_review(**kwargs, head_ref_oid=None, runner=failing_runner)
+    result = run_cross_family_review(**kwargs, head_ref_oid=None, runner=_osfail_runner)
 
     assert result.ok is False
-    assert result.error
+    assert "failed to start" in (result.error or ""), (
+        "expected to reach the runner; a different error means the staleness block "
+        "diverted us and this test is no longer pinning the None-head path"
+    )
+
+
+def test_cross_family_staleness_still_warns_when_both_heads_are_known(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The positive half of the same guard: a genuinely stale report must still warn.
+
+    The fix added an ``and head_ref_oid`` term to the staleness condition. Without this
+    test, tightening that condition to something always-False would keep the negative
+    test above green while staleness detection silently stopped working — the failure
+    mode where a report reviewed against old code is reused as if current.
+    """
+    kwargs = _cross_family_kwargs(tmp_path)
+    kwargs["report_path"].write_text(_valid_stale_report("aaaaaaaaaaaa1111"), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        run_cross_family_review(**kwargs, head_ref_oid="bbbbbbbbbbbb2222", runner=_osfail_runner)
+
+    assert "staleness detected" in caplog.text, caplog.text
 
 
 # ---------------------------------------------------------------------------

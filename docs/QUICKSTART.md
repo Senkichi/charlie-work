@@ -184,7 +184,11 @@ run during a "preview":
   `(UNAVAILABLE)` stub over `report_path` — so previewing a PR that already had a
   real cross-family review *destroyed* it, and the reports are keyed by PR, so
   there was no second copy. A preview now writes neither the report nor the
-  prompt and never spawns the reviewer.
+  prompt and never spawns the reviewer — but **only on the PR-review path**
+  (`why-charlie-hate --pr`), which is the one call site that passes the flag
+  down. The rescue-review and `why-charlie-hate-spec` paths still do not thread
+  `--dry-run`, so they continue to spawn the real reviewer and write a real
+  report. Those two are tracked separately and are *not* fixed by the above.
 
 It does **not** suppress local state writes in general. **Worker** adapter
 launches (`devin-shell` / `claude-code`) are a separate mechanism —
