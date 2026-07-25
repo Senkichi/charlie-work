@@ -6776,6 +6776,51 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
+def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """dispatch_reviews() must pass the live OrchestratorConfig into
+    launch_claude_worker so review-only pins (review_effort, review_max_turns,
+    the review_effort experiment) actually take effect. Without this, every
+    reviewer launch resolves effort/max-turns from a bare default
+    OrchestratorConfig() inside launch_claude_worker itself, silently
+    discarding whatever the operator configured."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        captured.append(kwargs)
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert len(captured) == 1
+    assert captured[0].get("config") is app.config
+
+
 def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
     """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
     unresolved npm ``.CMD`` shim) must not strand the PR at

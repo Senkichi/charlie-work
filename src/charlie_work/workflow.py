@@ -6962,9 +6962,21 @@ class OrchestratorApp:
                 # the read-only command template regardless of what is passed
                 # for command_template, so passing it through would be
                 # misleading dead code (PR #397 round-2 review).
+                #
+                # `config` IS forwarded (unlike the above): launch_claude_worker
+                # falls back to a bare default OrchestratorConfig() whenever
+                # config is omitted, which was silently discarding every
+                # review-only pin (review_effort, review_max_turns, and the
+                # review_effort experiment) at the one real dispatch_reviews()
+                # launch site — the effort/max-turns pins only ever worked in
+                # direct launch_claude_worker(config=...) unit tests, never in
+                # an actual dispatch pass. adapters.py's worker-dispatch path
+                # (_run_claude_code_adapter) already forwards config the same
+                # way.
                 launch_kwargs: dict[str, Any] = {
                     "repo_root": self.repo_root,
                     "sessions_dir": reviews_dir,
+                    "config": self.config,
                     "env": claude_cfg.worker_env,
                     "materialize_dirs": self.config.dispatch.materialize_dirs,
                     "review": True,
