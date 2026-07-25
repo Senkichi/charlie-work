@@ -17,6 +17,7 @@ sidecar so ``doctor``/reconcile code can treat both worker kinds uniformly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -31,7 +32,12 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
-from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
+from .config import (
+    CLAUDE_CODE_PROMPT_FILENAME,
+    ClaudeCodeConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+)
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
@@ -694,6 +700,53 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
     return tuple(filtered) + ("--effort", effort)
 
 
+def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:
+    """Deterministically assign a PR to the review_effort experiment's
+    treatment arm.
+
+    Pure function of ``(pr_number, fraction, salt)`` — no ``random``/``time``
+    involved — so the same PR always lands in the same arm across rework
+    rounds and re-dispatches (arm-hopping across rounds would contaminate
+    the per-PR quality signal the experiment measures). Hashes
+    ``f"{salt}:{pr_number}"`` with sha256 and maps the first 8 bytes to a
+    uniform float in [0, 1); the PR is "treatment" iff that value is below
+    ``fraction``.
+
+    Returns True for "treatment", False for "control".
+    """
+    digest = hashlib.sha256(f"{salt}:{pr_number}".encode()).digest()
+    point = int.from_bytes(digest[:8], "big") / 2**64
+    return point < fraction
+
+
+def resolve_review_effort(
+    pr_number: int,
+    review_dispatch: ReviewDispatchConfig,
+    claude_code: ClaudeCodeConfig,
+) -> tuple[str, str | None]:
+    """Resolve the ``--effort`` string for a reviewer session, plus which
+    review_effort_experiment arm (if any) the PR was assigned to.
+
+    Returns ``(effort, arm)``:
+      - When ``review_dispatch.review_effort_experiment_fraction <= 0.0``
+        (the default), the experiment is disabled: ``arm`` is ``None`` and
+        ``effort`` is ``review_dispatch.review_effort`` when set, else
+        ``claude_code.effort`` — exactly the pre-experiment behavior.
+      - Otherwise, ``arm`` is ``"treatment"`` or ``"control"`` per
+        ``_review_effort_arm``, and ``effort`` is ``review_dispatch.review_effort``
+        for treatment or ``claude_code.effort`` for control.
+
+    Only meaningful for reviewer (``review=True``) launches; callers must
+    gate on that themselves (worker launches always use ``claude_code.effort``).
+    """
+    fraction = review_dispatch.review_effort_experiment_fraction
+    if fraction <= 0.0:
+        return (review_dispatch.review_effort or claude_code.effort, None)
+    if _review_effort_arm(pr_number, fraction, review_dispatch.review_effort_experiment_salt):
+        return (review_dispatch.review_effort, "treatment")
+    return (claude_code.effort, "control")
+
+
 def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> tuple[str, ...]:
     """Hard-pin ``--max-turns {max_turns}`` onto ``command_template``.
 
@@ -832,14 +885,16 @@ def launch_claude_worker(
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
     # Reviewer sessions may pin their own effort independently of worker
-    # effort (empty string means fall back to claude_code.effort), so
-    # reviewer effort can be tuned via the per-review session telemetry
-    # (review_session_metrics) without touching worker dispatch.
-    effort = (
-        resolved_config.review_dispatch.review_effort
-        if (review and resolved_config.review_dispatch.review_effort)
-        else resolved_config.claude_code.effort
-    )
+    # effort (empty string means fall back to claude_code.effort), optionally
+    # split into a per-PR randomized treatment/control experiment — see
+    # resolve_review_effort. Worker (non-review) launches always use
+    # claude_code.effort unconditionally.
+    if review:
+        effort, _review_effort_arm_assigned = resolve_review_effort(
+            issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+        )
+    else:
+        effort = resolved_config.claude_code.effort
     command_template = _apply_effort_pin(command_template, effort)
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded

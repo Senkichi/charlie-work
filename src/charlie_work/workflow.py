@@ -26,6 +26,7 @@ from .claude_code import (
     iter_stream_json_events,
     launch_claude_worker,
     parse_claude_events,
+    resolve_review_effort,
 )
 from .checks import CheckSummary, summarize_checks
 from .config import (
@@ -6464,6 +6465,18 @@ class OrchestratorApp:
             session_metrics = _reviewer_session_metrics(
                 _events_path(reviews_dir, pr_number, review=True), verdict_source
             )
+            # Fold the review_effort experiment's arm/effort assignment (set
+            # at claim time in dispatch_reviews) into session_metrics so the
+            # record_review event alone is enough to split spend/quality by
+            # arm, without a join back to the dispatch event.
+            review_effort_arm = pr_state.get("review_effort_arm")
+            review_effort_used = pr_state.get("review_effort_used")
+            if review_effort_arm is not None or review_effort_used is not None:
+                session_metrics = {
+                    **(session_metrics or {}),
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
+                }
             result = self.record_review(
                 pr_number,
                 verdict["decision"],
@@ -6879,10 +6892,20 @@ class OrchestratorApp:
         now = utc_now()
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            review_effort_assignments: list[dict[str, Any]] = []
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                # Resolved (not launched) here, at claim time, so the arm is
+                # recorded on the PR's state entry and in the dispatch event
+                # even if the launch itself later fails/rolls back — the same
+                # pure function is re-evaluated inside launch_claude_worker
+                # for the actual --effort pin, so both call sites agree by
+                # construction (deterministic hash of pr_number/fraction/salt).
+                review_effort_used, review_effort_arm = resolve_review_effort(
+                    pr_number, self.config.review_dispatch, self.config.claude_code
+                )
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -6895,7 +6918,16 @@ class OrchestratorApp:
                     "reviewer_process_start_time": None,
                     "review_dispatch_attempt_count": attempt_count + 1,
                     "review_turn_limit_summary_posted": False,
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
                 }
+                review_effort_assignments.append(
+                    {
+                        "pr_number": pr_number,
+                        "review_effort_arm": review_effort_arm,
+                        "review_effort_used": review_effort_used,
+                    }
+                )
             if selected:
                 state = append_event(
                     state,
@@ -6903,6 +6935,7 @@ class OrchestratorApp:
                     {
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
+                        "review_effort_assignments": review_effort_assignments,
                     },
                     state_path=self.paths.state_file,
                 )
