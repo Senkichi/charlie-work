@@ -11293,9 +11293,7 @@ class OrchestratorApp:
                 # Route this non-rescue rework issue through the single
                 # enforcement point (issue #482).
                 if api_enabled and routing_inputs is not None:
-                    issue_labels = {
-                        label["name"] for label in full_issue.get("labels", [])
-                    }
+                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
                     choice = self._select_adapter_for_issue(
                         rework=True,
                         issue_labels=issue_labels,
@@ -11384,17 +11382,13 @@ class OrchestratorApp:
         normal_requests = [
             r for r in session_requests if r.issue_number not in rescue_issue_numbers
         ]
-        rescue_requests = [
-            r for r in session_requests if r.issue_number in rescue_issue_numbers
-        ]
+        rescue_requests = [r for r in session_requests if r.issue_number in rescue_issue_numbers]
         dispatch_results: list[SessionDispatchResult] = []
         if normal_requests:
             # adapter_choices only contains non-rescue issues (rescue issues
             # were never routed in the loop above), so the partition is
             # correct.
-            dispatch_results.extend(
-                self._dispatch_partitioned(normal_requests, adapter_choices)
-            )
+            dispatch_results.extend(self._dispatch_partitioned(normal_requests, adapter_choices))
         if rescue_requests:
             dispatch_results.extend(
                 dispatch_sessions(
@@ -11410,9 +11404,7 @@ class OrchestratorApp:
         # batch so the on-disk observability files
         # (session-manifest.json/session-results.json) reflect the full pass,
         # not just the last sub-call.
-        write_session_manifest(
-            manifest_path, session_requests, adapter=self.config.devin.adapter
-        )
+        write_session_manifest(manifest_path, session_requests, adapter=self.config.devin.adapter)
         write_session_results(results_path, dispatch_results)
 
         successful_issue_numbers = {
