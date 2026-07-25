@@ -392,6 +392,54 @@ def get_runner_listener_process(runner_dir: Path) -> subprocess.Popen[bytes] | N
     return None
 
 
+def get_runner_launcher_process(runner_dir: Path) -> subprocess.Popen[bytes] | None:
+    """Get the live launch-script wrapper for a runner directory, if any.
+
+    Starting a runner spawns the launch script (``cmd /c run.cmd`` on Windows,
+    ``run.sh`` on POSIX), and that wrapper spends several seconds bringing up
+    .NET before ``Runner.Listener.exe`` exists. During that window
+    :func:`get_runner_listener_process` reports nothing, so a caller deciding
+    whether to *start* a runner would launch a second copy of one already
+    coming up — two listeners then race for the same registration.
+
+    Callers deciding what to *terminate* must not use this: ``cmd /c`` does not
+    take its child down with it, so killing the wrapper would orphan a listener
+    that then comes online anyway.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+
+    script = runner_dir / ("run.cmd" if sys.platform == "win32" else "run.sh")
+    if not script.exists():
+        return None
+    needle = str(script).lower()
+
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = proc.info["cmdline"] or []
+            if any(needle in str(part).lower() for part in cmdline):
+                return proc  # type: ignore[return-value]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    return None
+
+
+def is_runner_launched(runner_dir: Path) -> bool:
+    """Whether a runner is running *or* mid-startup.
+
+    This is the question every start path must ask, so that a runner already
+    coming up is never launched a second time. It is deliberately broader than
+    :func:`get_runner_listener_process`, which answers the narrower "is there a
+    listener process to act on".
+    """
+    if get_runner_listener_process(runner_dir) is not None:
+        return True
+    return get_runner_launcher_process(runner_dir) is not None
+
+
 def mint_remove_token(gh: GitHub) -> tuple[bool, str]:
     """Mint a remove token for deregistering a runner.
 
@@ -942,9 +990,10 @@ def ensure_runner_running(
     if not runner_dir.is_managed:
         return False, f"Runner {runner_dir.name} is not charlie-managed (no marker file)"
 
-    # Check if the runner is already running by process path
-    process = get_runner_listener_process(runner_dir.path)
-    if process is not None:
+    # Check if the runner is already running by process path. A runner still
+    # bringing .NET up has no listener yet but must not be launched twice, so
+    # this asks the broader question.
+    if is_runner_launched(runner_dir.path):
         return True, f"Runner {runner_dir.name} is already running"
 
     return launch_runner_listener(runner_dir.path, dry_run=dry_run)

@@ -1235,7 +1235,17 @@ def run_fleet_supervise(
         global_config = load_layered_config(
             Path.cwd(), None, fleet_dir_override=fleet_dir_override
         )
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        # Falling back to defaults silently is how a whole feature disappears
+        # without a trace: every config-gated behavior (notify, labels, the
+        # runner prologues) reverts to off while passes keep reporting success.
+        # A typo in the global layer must be loud.
+        logger.warning(
+            "Fleet supervisor could not load config; running on DEFAULTS "
+            "(notify, labels and runner prologues are all off): %s",
+            exc,
+        )
+        print(f"config load failed, running on defaults: {exc}", flush=True)
         global_config = OrchestratorConfig()
 
     overrides: dict[str, int] = {}

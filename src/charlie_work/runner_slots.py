@@ -38,7 +38,12 @@ from .runner_allocation import (
     SlotChangeResult,
     repo_slug_from_github_url,
 )
-from .runners import get_runner_listener_process, launch_runner_listener
+from .runners import (
+    get_runner_launcher_process,
+    get_runner_listener_process,
+    is_runner_launched,
+    launch_runner_listener,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -120,7 +125,10 @@ def discover_runner_instances(
                 path=entry,
                 name=str(data.get("agentName") or entry.name),
                 repo=repo,
-                running=get_runner_listener_process(entry) is not None,
+                # Mid-startup counts as running: a runner whose launch script is
+                # still bringing .NET up has no listener process yet, and
+                # reporting it parked would have the planner start it again.
+                running=is_runner_launched(entry),
             )
         )
 
@@ -318,6 +326,12 @@ def park_runner_slot(
 
     process = get_runner_listener_process(instance.path)
     if process is None:
+        # A live launch script with no listener yet means the runner is mid
+        # startup. Killing the wrapper would not park it — ``cmd /c`` leaves its
+        # child behind, so the listener would come online orphaned. Decline and
+        # let the next pass park it properly; the plan is idempotent.
+        if get_runner_launcher_process(instance.path) is not None:
+            return False, f"{instance.name} is still starting up; will park on a later pass"
         return True, f"{instance.name} is already parked"
 
     if dry_run:
@@ -357,7 +371,11 @@ def apply_allocation(
             # Re-check liveness for the same reason park does: the plan was
             # built from an earlier snapshot, and launching a second listener
             # into a directory that already has one is a config conflict.
-            if get_runner_listener_process(change.path) is not None:
+            # This must count a runner that is still *starting* as running —
+            # otherwise two controllers acting seconds apart (a fleet pass and
+            # an operator running `runners allocate`) both launch it, and the
+            # two listeners race for one registration.
+            if is_runner_launched(change.path):
                 ok, message = True, f"{change.runner_name} was already running"
             else:
                 ok, message = launch_runner_listener(change.path, dry_run=dry_run)

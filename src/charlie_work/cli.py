@@ -327,10 +327,13 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     return fleet_loop(
@@ -355,10 +358,13 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     # Self-deploy before running the pass: FF-pull origin/main and sync

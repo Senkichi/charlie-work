@@ -18,6 +18,7 @@ from charlie_work.runner_allocation import (
     RepoDemand,
     RunnerInstance,
     SlotAction,
+    SlotChange,
     allocate_slots,
     annotate_busy,
     derive_budget,
@@ -28,6 +29,7 @@ from charlie_work.runner_allocation import (
 )
 from charlie_work.runner_allocation_pass import resolve_inputs
 from charlie_work.runner_slots import (
+    apply_allocation,
     discover_runner_instances,
     load_idle_streaks,
     park_runner_slot,
@@ -723,6 +725,61 @@ def test_park_is_a_noop_when_the_listener_is_already_stopped(
 
     assert ok is True
     assert "already parked" in message
+
+
+def test_park_declines_a_runner_that_is_still_starting_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live wrapper with no listener yet must not be "parked".
+
+    ``cmd /c`` does not take its child down, so killing the wrapper would leave
+    the listener to come online orphaned — a park that silently did not park.
+    """
+    monkeypatch.setattr("charlie_work.runner_slots.has_active_job", lambda _path: False)
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.get_runner_listener_process", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.get_runner_launcher_process", lambda _path: object()
+    )
+    instance = RunnerInstance(path=Path("/runners/cw-1"), name="cw-1", repo=CW, running=True)
+
+    ok, message = park_runner_slot(instance)
+
+    assert ok is False
+    assert "still starting up" in message
+
+
+def test_start_does_not_relaunch_a_runner_that_is_mid_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two controllers seconds apart must not both launch one runner.
+
+    ``Runner.Listener.exe`` appears several seconds after the launch script, so
+    liveness that only looks for the listener would let a fleet pass and an
+    operator's ``runners allocate`` each start the same runner — two listeners
+    then race for one registration.
+    """
+    launches: list[Path] = []
+    monkeypatch.setattr("charlie_work.runner_slots.is_runner_launched", lambda _path: True)
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.launch_runner_listener",
+        lambda path, dry_run=False: (launches.append(path), (True, "launched"))[1],
+    )
+    change = SlotChange(
+        repo=JC,
+        runner_name="jc-3",
+        path=Path("/runners/jc-3"),
+        action=SlotAction.START,
+        reason="demand 9",
+    )
+    plan = AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=(change,))
+
+    results = apply_allocation(plan)
+
+    assert launches == []
+    assert results[0].ok is True
+    assert "already running" in results[0].message
 
 
 # --------------------------------------------------------------------------
