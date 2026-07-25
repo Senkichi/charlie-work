@@ -554,7 +554,14 @@ def test_missing_repo_local_template_falls_back_to_package(tmp_path: Path) -> No
 
     prompt = render_prompt(
         "rework.md",
-        {"pr_number": 9, "pr_title": "t", "pr_url": "u", "issue_number": 1, "review_summary": "s"},
+        {
+            "pr_number": 9,
+            "pr_title": "t",
+            "pr_url": "u",
+            "issue_number": 1,
+            "review_summary": "s",
+            "branch_name": "agent/issue-1-t",
+        },
         search_dirs=(override_dir,),
     )
 
@@ -7433,15 +7440,30 @@ def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path
         encoding="utf-8",
     )
 
-    # Write events.jsonl with assistant messages and turn metrics.
+    # Write events.jsonl with assistant messages and turn metrics. The session
+    # must actually reach review_max_turns: since issue #588 a session short of
+    # the cap is classified died_mid_session, and one with no turns at all is a
+    # launch failure, so a turn-limit test has to seed a real turn-limit run.
     events_path = reviews_dir / "issue-100-review.events.jsonl"
+    max_turns = app.config.review_dispatch.review_max_turns
     events_lines = [
-        '{"type": "user_message", "tokens": 100}',
-        '{"type": "assistant_message", "content": "Let me read the diff first.", "tokens": 200}',
         '{"type": "tool_call", "tokens": 300}',
-        '{"type": "assistant_message", "content": "The changes look reasonable but I need more turns to verify the edge cases.", "tokens": 400}',
-        '{"type": "assistant_message", "content": "I was unable to complete the review within the turn limit.", "tokens": 500}',
+        '{"type": "assistant_message", "content": "Let me read the diff first.", "tokens": 200}',
     ]
+    # Pad to the turn cap, leaving the final two messages as the analysis the
+    # summary comment is expected to surface.
+    while len(events_lines) < max_turns - 1:
+        events_lines.append(
+            '{"type": "assistant_message", "content": "Checking another file.", "tokens": 200}'
+        )
+    events_lines.append(
+        '{"type": "assistant_message", "content": "The changes look reasonable but I '
+        'need more turns to verify the edge cases.", "tokens": 400}'
+    )
+    events_lines.append(
+        '{"type": "assistant_message", "content": "I was unable to complete the '
+        'review within the turn limit.", "tokens": 500}'
+    )
     events_path.write_text("\n".join(events_lines) + "\n", encoding="utf-8")
 
     sidecar_path = reviews_dir / "issue-100.claude.json"
@@ -29306,6 +29328,29 @@ def _make_dead_review_sidecar(
     return sidecar_path
 
 
+def _write_review_events(
+    reviews_dir: Path, pr_number: int, *, turns: int, tool_calls: int = 0
+) -> Path:
+    """Write a stream-json events sidecar for a reviewer that ran ``turns`` turns.
+
+    ``parse_claude_events`` counts one turn per ``assistant`` event and one tool
+    call per ``tool_use`` content block. Without this sidecar a dead reviewer
+    has zero turns and zero tool calls, which classifies as a launch failure
+    rather than a turn-limit death (issue #588) -- so any test asserting
+    turn-limit behaviour must seed real session telemetry.
+    """
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    events_path = reviews_dir / f"issue-{pr_number}-review.events.jsonl"
+    lines: list[str] = []
+    for index in range(turns):
+        content: list[dict[str, Any]] = [{"type": "text", "text": f"Analysis step {index + 1}."}]
+        if index < tool_calls:
+            content.append({"type": "tool_use", "id": f"t{index}", "name": "Read", "input": {}})
+        lines.append(json.dumps({"type": "assistant", "message": {"content": content}}))
+    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return events_path
+
+
 def _set_review_dispatched_state(
     app: OrchestratorApp,
     pr_number: int,
@@ -29700,6 +29745,12 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    # Seed a real turn-limit session: without event telemetry the reviewer has
+    # zero turns, which since issue #588 classifies as a launch failure rather
+    # than a turn-limit death.
+    _write_review_events(
+        reviews_dir, 100, turns=app.config.review_dispatch.review_max_turns, tool_calls=3
+    )
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
     monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
