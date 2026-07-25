@@ -1960,6 +1960,58 @@ def _detect_and_handle_stalled_reviews(
                 state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
                 throttle_backoff_applied = True
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+            # A session that exhausted its full turn budget did real
+            # PR-specific work -- its death is a PR-level outcome (the
+            # review didn't fit the budget) regardless of what killed the
+            # final API call. Only sessions that died WITHOUT such work
+            # qualify for the provider-throttle rollback. _reap_review_verdicts
+            # (which runs before this sweep) sets
+            # review_turn_limit_summary_posted on the pr-state when it
+            # extracted a turn-limit miss from this same dead session, and
+            # that flag is reset to False on every new claim -- so it is the
+            # single source of truth for "this dispatch lifecycle's session
+            # did substantial work then died". When it is set, still apply
+            # the global quota backoff (the throttle signal itself is real)
+            # but treat the death as a normal counted failure so the per-PR
+            # attempt cap can converge (issue #583: without this guard a PR
+            # whose reviews deterministically hit the turn cap got unlimited
+            # free retries whenever the account was near its limit, and the
+            # 3-attempt cap never fired).
+            if pr_state.get("review_turn_limit_summary_posted"):
+                state["prs"][pr_key] = {
+                    **pr_state,
+                    "number": w.issue_number,
+                    "review_dispatch_status": "review_dispatch_failed",
+                    "review_dispatch_failed_at": w.started_at,
+                    "review_dispatch_pending_at": None,
+                    "review_dispatched_at": None,
+                    "reviewer_pid": None,
+                    "reviewer_process_start_time": None,
+                }
+                state = append_event(
+                    state,
+                    "review_dispatch_stalled",
+                    {
+                        "pr_number": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                        "throttled_until": throttled_until,
+                    },
+                    state_path=state_file,
+                )
+                changed = True
+                stalled.append(
+                    {
+                        "pr": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                    }
+                )
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                w.reap_sidecar(reviews_dir)
+                continue
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
             # re-dispatchable once the quota gate clears -- mirroring the
