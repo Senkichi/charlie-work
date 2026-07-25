@@ -179,9 +179,17 @@ run during a "preview":
   supervisor by design, an ungated preview could take the fleet down.
 - the runner **scale-event cooldown** write, which gates *both* scale directions
   (issue #609), and the runner **pool-sample** write that feeds idle detection.
+- the **cross-family review report** write. This one was actively destructive: the
+  dry-run branch bailed out through the shared failure helper, which writes an
+  `(UNAVAILABLE)` stub over `report_path` — so previewing a PR that already had a
+  real cross-family review *destroyed* it, and the reports are keyed by PR, so
+  there was no second copy. A preview now writes neither the report nor the
+  prompt and never spawns the reviewer.
 
-It does **not** suppress local state writes in general, nor adapter/model
-subprocess calls. Treat any other state write as unsuppressed unless you have
+It does **not** suppress local state writes in general. **Worker** adapter
+launches (`devin-shell` / `claude-code`) are a separate mechanism —
+`AdapterSettings.dry_run`, threaded from the same flag — and are not covered by
+the audit above. Treat any other state write as unsuppressed unless you have
 checked it — see [WORKFLOWS.md](WORKFLOWS.md) for the exact scope.
 
 ## 6. Choose a worker adapter profile

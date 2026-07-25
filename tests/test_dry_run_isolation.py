@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 import pytest
 
+from charlie_work.cross_family import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import self_deploy
 
@@ -206,6 +207,90 @@ def test_self_deploy_real_run_is_not_marked_previewed(tmp_path: Path) -> None:
     result = self_deploy(tmp_path, run_command=runner, dry_run=False)
 
     assert result.previewed is False
+
+
+# ---------------------------------------------------------------------------
+# run_cross_family_review (issue #613)
+#
+# This one is the sharpest member of the class: the bug was *inside* the dry-run
+# branch, not at the call sites. The branch bailed out via ``_fail``, which mkdirs
+# and write_text()s an "(UNAVAILABLE)" stub -- so previewing destroyed a real report.
+# A call site that correctly threaded ``dry_run`` was therefore still destructive,
+# which is why the AST guard alone could never have caught this.
+# ---------------------------------------------------------------------------
+
+
+def _cross_family_kwargs(tmp_path: Path) -> dict[str, Any]:
+    """Minimal valid kwargs for run_cross_family_review."""
+    return {
+        "model": "some-model",
+        "command": ["some-cli", "--prompt", "{prompt_path}"],
+        "repo_root": tmp_path,
+        "prompt_text": "review this",
+        "prompt_path": tmp_path / "prompt.md",
+        "report_path": tmp_path / "report.md",
+        "timeout_seconds": 30,
+    }
+
+
+def _exploding_runner(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("dry_run must not spawn the cross-family subprocess")
+
+
+def test_cross_family_dry_run_does_not_clobber_an_existing_report(tmp_path: Path) -> None:
+    """Previewing must not overwrite a real prior report with a DRY-RUN stub.
+
+    The reports are keyed by PR, so the destroyed file is *the* cross-family review
+    for that PR -- there is no second copy. This is the regression that matters most:
+    the pre-fix behaviour lost real review output on a command whose entire promise
+    is that it changes nothing.
+    """
+    kwargs = _cross_family_kwargs(tmp_path)
+    report_path = kwargs["report_path"]
+    real_report = "# Cross-family adversarial review\n\nVERDICT: request_changes\n"
+    report_path.write_text(real_report, encoding="utf-8")
+
+    result = run_cross_family_review(**kwargs, dry_run=True, runner=_exploding_runner)
+
+    assert report_path.read_text(encoding="utf-8") == real_report
+    assert "DRY-RUN" in (result.error or "")
+
+
+def test_cross_family_dry_run_creates_no_files(tmp_path: Path) -> None:
+    """A preview writes neither the report nor the prompt, and spawns nothing."""
+    kwargs = _cross_family_kwargs(tmp_path)
+
+    result = run_cross_family_review(**kwargs, dry_run=True, runner=_exploding_runner)
+
+    assert not kwargs["report_path"].exists()
+    # The prompt file is written before the subprocess runs, so it is a separate
+    # write the dry-run branch has to short-circuit past.
+    assert not kwargs["prompt_path"].exists()
+    assert result.ok is False, "the ok=False dry-run contract is relied on by callers"
+
+
+def test_cross_family_staleness_check_tolerates_a_missing_head(tmp_path: Path) -> None:
+    """``head_ref_oid`` is optional, and the staleness warning subscripts it.
+
+    ``spec_review`` calls without a PR head at all, so a pre-existing report that
+    happens to carry a head SHA drove ``None[:12]`` -> TypeError, inside a function
+    documented to never raise. With no new head there is nothing to call stale.
+    """
+    kwargs = _cross_family_kwargs(tmp_path)
+    kwargs["report_path"].write_text(
+        "# Cross-family adversarial review\n\nHEAD_REF_OID: abcdef1234567890\n\nVERDICT: approved\n",
+        encoding="utf-8",
+    )
+
+    def failing_runner(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError("no such binary")
+
+    # head_ref_oid deliberately omitted. Reaching the runner at all proves the
+    # staleness block was survived; the contract is "returns a result, never raises".
+    result = run_cross_family_review(**kwargs, head_ref_oid=None, runner=failing_runner)
+
+    assert result.ok is False
+    assert result.error
 
 
 # ---------------------------------------------------------------------------
