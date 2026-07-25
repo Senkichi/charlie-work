@@ -1290,6 +1290,21 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'review_effort_experiment_salt' must be a "
             f"string, got {type(rd_experiment_salt).__name__}"
         )
+    # Cross-field check: a fraction > 0.0 enables the experiment, whose
+    # treatment arm IS review_effort verbatim (resolve_review_effort returns
+    # it unmodified). Enabling the experiment without a treatment effort
+    # would silently make "treatment" mean "no --effort pin at all" while
+    # "control" still gets claude_code.effort -- a corrupted, undocumented
+    # comparison that would run for the life of the experiment with no
+    # warning. Fail loud at load instead.
+    effective_fraction = rd_experiment_fraction if rd_experiment_fraction is not None else 0.0
+    effective_effort = rd_effort if rd_effort is not None else ""
+    if effective_fraction > 0.0 and not effective_effort:
+        raise ConfigError(
+            "config section 'review_dispatch': 'review_effort_experiment_fraction' is "
+            f"{effective_fraction} but 'review_effort' is unset -- set 'review_effort' to the "
+            "treatment effort string (e.g. 'high') before enabling the experiment"
+        )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")

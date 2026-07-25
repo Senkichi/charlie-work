@@ -264,6 +264,49 @@ def test_load_config_review_effort_experiment_fraction_rejects_out_of_range(
         load_config(config_file)
 
 
+def test_load_config_review_effort_experiment_fraction_without_effort_rejected(
+    tmp_path: Path,
+) -> None:
+    """fraction > 0.0 with review_effort unset (default '') must fail loud at
+    load time -- treatment would otherwise silently mean 'no --effort pin'."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort_experiment_fraction: 0.25
+""",
+    )
+    with pytest.raises(
+        ConfigError,
+        match="review_effort_experiment_fraction.*is 0.25 but 'review_effort' is unset",
+    ):
+        load_config(config_file)
+
+
+def test_load_config_review_effort_experiment_fraction_with_effort_accepted(
+    tmp_path: Path,
+) -> None:
+    """fraction > 0.0 WITH review_effort set is a valid, accepted config."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort: high
+  review_effort_experiment_fraction: 0.25
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.review_effort == "high"
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.25
+
+
+def test_load_config_review_effort_experiment_fraction_zero_without_effort_accepted() -> None:
+    """The default config (fraction=0.0, review_effort unset) must keep loading."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.0
+    assert config.review_dispatch.review_effort == ""
+
+
 def test_load_config_review_effort_experiment_salt_rejects_non_str(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
