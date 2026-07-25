@@ -8,6 +8,7 @@ Covers the pure allocator (runner_allocation.py), the host/GitHub layer
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -832,3 +833,142 @@ def test_resolve_inputs_is_quiet_when_the_budget_is_configured(tmp_path: Path) -
     assert inputs is not None
     assert inputs.budget == 8
     assert inputs.notes == ()
+
+
+# --------------------------------------------------------------------------
+# Busy detection (real body)
+# --------------------------------------------------------------------------
+#
+# Every other test in this file monkeypatches ``has_active_job`` wholesale, so
+# the function guarding SAFETY A ("never stop a busy listener") had no coverage
+# of its own: inverting its result would have kept the suite green. These drive
+# the real body by faking the process tree one level down instead.
+
+
+def _fake_process_tree(monkeypatch: pytest.MonkeyPatch, children: list[object]) -> None:
+    """Point ``has_active_job`` at a synthetic listener with ``children``."""
+    psutil = pytest.importorskip("psutil")
+
+    class _FakeListener:
+        pid = 4242
+
+    class _FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def children(self, recursive: bool = False) -> list[object]:
+            return list(children)
+
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.get_runner_listener_process",
+        lambda _path: _FakeListener(),
+    )
+    # ``has_active_job`` imports psutil inside the function, binding this same
+    # module object, so patching the attribute here reaches it.
+    monkeypatch.setattr(psutil, "Process", _FakeProcess)
+
+
+class _FakeChild:
+    def __init__(self, name: str = "", raises: BaseException | None = None) -> None:
+        self._name = name
+        self._raises = raises
+
+    def name(self) -> str:
+        if self._raises is not None:
+            raise self._raises
+        return self._name
+
+
+def test_busy_detection_finds_a_worker_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    from charlie_work.runner_slots import has_active_job
+
+    _fake_process_tree(monkeypatch, [_FakeChild("conhost.exe"), _FakeChild("Runner.Worker.exe")])
+
+    assert has_active_job(Path("/runners/cw-1")) is True
+
+
+def test_busy_detection_reports_idle_when_no_child_is_a_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from charlie_work.runner_slots import has_active_job
+
+    _fake_process_tree(monkeypatch, [_FakeChild("conhost.exe"), _FakeChild("cmd.exe")])
+
+    assert has_active_job(Path("/runners/cw-1")) is False
+
+
+def test_busy_detection_fails_closed_when_a_child_name_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable child cannot be ruled out as the worker.
+
+    The docstring promises fail-closed and the outer handler honours it; this
+    pins the per-child path, where treating AccessDenied as "not a worker"
+    would let a park terminate a listener mid-job and abort a CI run.
+    """
+    psutil = pytest.importorskip("psutil")
+    from charlie_work.runner_slots import has_active_job
+
+    _fake_process_tree(monkeypatch, [_FakeChild(raises=psutil.AccessDenied(pid=99))])
+
+    assert has_active_job(Path("/runners/cw-1")) is True
+
+
+def test_busy_detection_keeps_scanning_past_a_child_that_vanished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that exited cannot hold a job, but its siblings still can."""
+    psutil = pytest.importorskip("psutil")
+    from charlie_work.runner_slots import has_active_job
+
+    _fake_process_tree(
+        monkeypatch,
+        [
+            _FakeChild(raises=psutil.NoSuchProcess(pid=99)),
+            _FakeChild("Runner.Worker.exe"),
+        ],
+    )
+
+    assert has_active_job(Path("/runners/cw-1")) is True
+
+
+# --------------------------------------------------------------------------
+# Traversal containment
+# --------------------------------------------------------------------------
+
+
+def test_discovery_skips_a_directory_that_resolves_outside_managed_root(
+    tmp_path: Path,
+) -> None:
+    """``is_dir()`` follows junctions, so containment needs the resolved path.
+
+    The real hazard on this host is the unrelated runner *service* at
+    C:\actions-runner: a junction under managed_root pointing at it would make
+    it start/park-eligible.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir()
+    outsider = tmp_path / "elsewhere" / "actions-runner"
+    outsider.mkdir(parents=True)
+    (outsider / "run.cmd").write_text("", encoding="utf-8")
+    (outsider / ".runner").write_text(
+        json.dumps({"gitHubUrl": f"https://github.com/{CW}"}), encoding="utf-8"
+    )
+    link = managed_root / "sneaky"
+    # Prefer a junction on Windows: unlike a symlink it needs no elevation or
+    # Developer Mode, so this test actually runs on the self-hosted CI host
+    # rather than skipping exactly where the hazard lives.
+    try:
+        if sys.platform == "win32":
+            import _winapi
+
+            _winapi.CreateJunction(str(outsider), str(link))
+        else:
+            link.symlink_to(outsider, target_is_directory=True)
+    except (OSError, AttributeError, ImportError, NotImplementedError):
+        pytest.skip("cannot create a directory link on this host")
+
+    instances, notes = discover_runner_instances(managed_root, platform="win32")
+
+    assert instances == []
+    assert any("resolves outside managed_root" in note for note in notes)

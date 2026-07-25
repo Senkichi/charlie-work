@@ -96,8 +96,19 @@ def discover_runner_instances(
     instances: list[RunnerInstance] = []
     notes: list[str] = []
 
+    resolved_root = managed_root.resolve()
+
     for entry in sorted(managed_root.iterdir(), key=lambda p: p.name):
         if not entry.is_dir():
+            continue
+        # ``is_dir()`` follows junctions and symlinks, so the traversal's shape
+        # (one level, non-recursive) bounds how *deep* discovery reaches but not
+        # *which directory* an entry names. A junction under managed_root would
+        # hand back a tree somewhere else entirely — including the unrelated
+        # runner service at C:\actions-runner — and make it start/park-eligible.
+        # Enforce containment on the resolved path rather than trusting shape.
+        if not entry.resolve().is_relative_to(resolved_root):
+            notes.append(f"{entry.name}: resolves outside managed_root, skipped")
             continue
         if not (entry / script_name).exists():
             continue
@@ -159,8 +170,17 @@ def has_active_job(runner_path: Path) -> bool:
             try:
                 if _WORKER_PROCESS_HINT in (child.name() or "").lower():
                     return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                # A child that exited between enumeration and inspection cannot be
+                # a worker with a job in flight; keep scanning its siblings.
                 continue
+            except psutil.AccessDenied:
+                # Unreadable name means this child cannot be *ruled out* as the
+                # worker, and the docstring's fail-closed contract has to hold on
+                # this path too — the outer handler already fails closed for the
+                # same reason. Treating it as "not a worker" is what would let
+                # park_runner_slot terminate a listener mid-job and abort CI.
+                return True
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
     except psutil.AccessDenied:
