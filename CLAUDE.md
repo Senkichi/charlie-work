@@ -67,3 +67,7 @@ will deadlock the orchestrator. Preserve this invariant in any new adapter.
 `subprocess_runner.run_captured` and the launch functions return result objects
 (`RunResult`, `SessionRecord`) with `ok`/`error` fields. They never raise on
 non-zero exit codes or missing binaries. Callers check `.ok` or `.error`.
+
+The `api` adapter (`api_worker.launch_api_worker`) is subject to both invariants
+above: it delegates to `launch_claude_worker` (`Popen`, non-blocking) and returns
+launch failures as `ClaudeWorkerRecord` values with `.error` set — it never raises.
