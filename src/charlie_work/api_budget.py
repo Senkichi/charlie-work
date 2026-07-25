@@ -462,13 +462,21 @@ def load_ledger(path: Path) -> Ledger:
     try:
         with path.open("r", encoding="utf-8-sig") as handle:
             data = json.load(handle)
-    except (json.JSONDecodeError, LookupError, ValueError) as exc:
+        # ``_ledger_from_dict`` coerces ``usd`` / ``lifetime_usd`` / ``duration_s``
+        # via ``float()``; a syntactically-valid JSON file with a wrong-typed
+        # (non-numeric, non-falsy) field raises ``TypeError`` / ``ValueError``
+        # here. Wrapping it inside the same guard sends that structural
+        # corruption through the quarantine path (forensic log + preserved
+        # original) instead of propagating uncaught and wedging every future
+        # settlement — consistent with the per-session-entry loop in
+        # ``_ledger_from_dict`` which already drops bad entries of this class.
+        return _ledger_from_dict(data)
+    except (json.JSONDecodeError, LookupError, ValueError, TypeError) as exc:
         _quarantine_ledger(path, exc)
         return Ledger()
     except OSError as exc:
         _quarantine_ledger(path, exc)
         return Ledger()
-    return _ledger_from_dict(data)
 
 
 def save_ledger(path: Path, ledger: Ledger) -> None:

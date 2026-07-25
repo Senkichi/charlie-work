@@ -465,7 +465,15 @@ class WorkerView:
             if provider_cfg is None:
                 # No pricing for the resolved provider → cannot compute cost.
                 # Skip settlement rather than recording a zero-cost entry that
-                # would understate spend.
+                # would understate spend. Logged so the drop is visible (a
+                # silent accounting gap is inconsistent with the ledger's
+                # "accounting data is never silently destroyed" guarantee).
+                logger.warning(
+                    "api budget settlement skipped for issue %s: no pricing "
+                    "configured for provider %r (session cost not recorded)",
+                    self.issue_number,
+                    provider_name or "",
+                )
                 return
 
             events_path = _events_path_from_log(Path(self.log_path))

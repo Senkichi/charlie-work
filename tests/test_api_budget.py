@@ -514,6 +514,68 @@ def test_load_ledger_partial_json_preserves_original(tmp_path: Path) -> None:
     assert list(tmp_path.glob("api-budget.json.corrupt-*"))
 
 
+def test_load_ledger_wrong_typed_lifetime_usd_quarantines(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Valid JSON with a wrong-typed (non-numeric) ``lifetime_usd`` is structural
+    corruption: ``_ledger_from_dict``'s ``float()`` coercion raises, and the
+    file must go through the quarantine path (forensic log + preserved original)
+    rather than propagating uncaught and wedging every future settlement.
+
+    Regression guard for the review-#540 finding that ``load_ledger``'s guard
+    only wrapped ``json.load`` and left ``_ledger_from_dict`` outside it.
+    """
+    path = ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"lifetime_usd": "not-a-number", "days": {}, "sessions": []}'
+    path.write_text(original, encoding="utf-8")
+    with caplog.at_level("ERROR", logger="charlie_work.api_budget"):
+        ledger = load_ledger(path)
+    assert ledger == Ledger()
+    # Quarantined — original preserved on disk for forensics.
+    remaining = list(tmp_path.glob("api-budget.json.corrupt-*"))
+    assert len(remaining) == 1
+    assert remaining[0].read_text(encoding="utf-8") == original
+    assert not path.exists()
+    assert any("unrecoverable" in rec.message for rec in caplog.records)
+
+
+def test_load_ledger_wrong_typed_day_bucket_usd_quarantines(tmp_path: Path) -> None:
+    """A wrong-typed ``usd`` inside a day bucket is the same structural
+    corruption class and must also quarantine (not wedge)."""
+    path = ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"lifetime_usd": 1.0, "days": {"2026-07-22": {"usd": ["bad"]}}, "sessions": []}',
+        encoding="utf-8",
+    )
+    ledger = load_ledger(path)
+    assert ledger == Ledger()
+    assert list(tmp_path.glob("api-budget.json.corrupt-*"))
+
+
+def test_load_ledger_wrong_typed_session_usd_drops_entry_leniently(tmp_path: Path) -> None:
+    """A wrong-typed ``usd`` on a session entry is caught by the per-entry
+    try/except in ``_ledger_from_dict`` (which guards this exact failure class
+    by dropping the bad entry, per the review-#540 note) — so it does NOT
+    quarantine; the entry is dropped and the rest of the ledger loads.
+
+    This documents the intentional split: per-entry malformation = drop the
+    entry; structural (top-level / day-bucket) malformation = quarantine.
+    """
+    path = ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"lifetime_usd": 0.0, "days": {}, "sessions": ['
+        '{"issue": 1, "session_id": "s", "usd": {"x": 1}}]}',
+        encoding="utf-8",
+    )
+    ledger = load_ledger(path)
+    # Bad entry dropped leniently; no quarantine (the file is otherwise valid).
+    assert ledger == Ledger()
+    assert not list(tmp_path.glob("api-budget.json.corrupt-*"))
+
+
 def test_load_ledger_lenient_on_missing_keys(tmp_path: Path) -> None:
     path = ledger_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
