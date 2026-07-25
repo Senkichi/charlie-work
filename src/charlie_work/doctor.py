@@ -8,6 +8,7 @@ config, but its validity is never asserted by hand.
 
 from __future__ import annotations
 
+import datetime
 import json
 import shutil
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from .github import (
     RECONCILE_PR_FIELDS,
 )
 from .paths import RuntimePaths
+from .runner_slots import ALLOCATION_STATE_FILENAME
 from .prompts import resolve_template
 from .supervise import try_acquire_supervisor_lock
 
@@ -352,6 +354,84 @@ def _surface_post_mortems(
             "; ".join(lines),
             severity="warning",
         )
+
+
+def _check_runner_allocation(
+    add: Any, config: OrchestratorConfig, fleet_dir_override: str | None = None
+) -> None:
+    """Report whether host-wide runner allocation is actually running (issue #590).
+
+    Every way the allocation prologue can decline to act is silent by nature: a
+    false ``enabled`` flag, a config object built by code that predates the
+    section, or a registry with no reachable repo root all make it return without
+    doing anything — and a converged host looks exactly like one where allocation
+    never ran at all. Logs cannot settle it either: the daemon's stderr has proven
+    lossy in practice, so the absence of a log line is not evidence.
+
+    ``run_allocation_pass`` rewrites ``runner-allocation.json`` on every non-dry
+    pass even when no slot moves, which makes that file's ``updated_at`` the only
+    positive evidence that a pass happened. Compare its age against the interval
+    allocation is supposed to run at, so a feature that is configured-but-inert is
+    reported instead of inferred.
+    """
+    allocation = getattr(config, "runner_allocation", None)
+    if allocation is None or not allocation.enabled:
+        return
+
+    state_path = fleet_dir(override=fleet_dir_override) / ALLOCATION_STATE_FILENAME
+    interval = max(config.supervisor.full_pass_interval_seconds, 1)
+    # Three intervals: one missed pass is normal jitter (a pass can run long), a
+    # sustained gap is not.
+    stale_after = interval * 3
+
+    if not state_path.exists():
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {allocation.max_running_runners}) but has never run: "
+            f"{state_path} absent, expected a pass every {interval}s",
+            severity="warning",
+        )
+        return
+
+    updated_at: datetime.datetime | None = None
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        stamp = raw.get("updated_at") if isinstance(raw, dict) else None
+        if isinstance(stamp, str):
+            updated_at = datetime.datetime.fromisoformat(stamp)
+    except (OSError, ValueError):
+        updated_at = None
+
+    if updated_at is None:
+        add(
+            "runner allocation",
+            False,
+            f"enabled but {state_path.name} has no readable updated_at stamp",
+            severity="warning",
+        )
+        return
+
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=datetime.timezone.utc)
+    age = int((datetime.datetime.now(datetime.timezone.utc) - updated_at).total_seconds())
+
+    if age > stale_after:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {allocation.max_running_runners}) but the last pass was "
+            f"{age}s ago, over the {stale_after}s staleness bound — allocation is "
+            f"configured but is not running unattended (issue #590)",
+            severity="warning",
+        )
+        return
+
+    add(
+        "runner allocation",
+        True,
+        f"last pass {age}s ago, budget {allocation.max_running_runners}",
+    )
 
 
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
@@ -773,6 +853,11 @@ def run_doctor(
 
     # -- fleet supervisor ----------------------------------------------------
     _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
+
+    # -- host-wide runner allocation (issue #590) ----------------------------
+    # Read-only: compares the allocation state file's age against the pass
+    # interval. Never starts, parks, or plans anything.
+    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

@@ -2421,3 +2421,28 @@ def test_allocation_prologue_warns_when_the_config_lacks_the_section(
 
     assert events == []
     assert any("no runner_allocation" in record.message for record in caplog.records)
+
+
+def test_disabled_allocation_prologue_is_visible_at_info(tmp_path, caplog) -> None:
+    """The disabled branch must log at INFO, not DEBUG.
+
+    Regression guard for issue #590: the daemon runs at INFO, so a DEBUG line here
+    is never written at all, which made a host where allocation never ran
+    indistinguishable from a converged one. The message must also name the fleet
+    directory, since that identifies which config.yaml governs the decision.
+    """
+    import logging
+    from dataclasses import replace
+
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.fleet_dispatch import _run_fleet_allocation_prologue
+
+    base = OrchestratorConfig()
+    config = replace(base, runner_allocation=replace(base.runner_allocation, enabled=False))
+
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path), config, True)
+
+    assert events == []
+    assert "runner_allocation.enabled is false" in caplog.text
+    assert str(tmp_path) in caplog.text

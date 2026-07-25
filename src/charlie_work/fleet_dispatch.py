@@ -289,7 +289,19 @@ def _run_fleet_allocation_prologue(
         )
         return events
     if not allocation.enabled:
-        logger.debug("Fleet allocation prologue: disabled in config")
+        # INFO, not DEBUG. This is the branch that makes the entire feature inert,
+        # and the daemon runs at INFO, so a DEBUG line here is never written at
+        # all: during issue #590 a host where allocation never ran was
+        # indistinguishable from a converged one, and the absence of a log line
+        # could not be used as evidence either way.
+        # Name the fleet directory too — it identifies *which* config.yaml
+        # governs, which is the thing an operator gets wrong when they set a
+        # host-wide knob in a per-repo layer.
+        logger.info(
+            "Fleet allocation prologue: not run — runner_allocation.enabled is false "
+            "in the resolved config (fleet dir: %s)",
+            fleet_dir(override=fleet_dir_override),
+        )
         return events
 
     # Any existing repo root works as the gh working directory: the allocation
@@ -335,11 +347,17 @@ def _run_fleet_allocation_prologue(
         )
         return events
 
+    # Report the inputs alongside the outcome: "started=0 parked=0" is the correct
+    # result for a converged host *and* for one pointed at the wrong managed_root
+    # or running under a budget the operator did not intend. Without the budget and
+    # root, a healthy no-op and a misconfigured no-op read identically.
     logger.info(
-        "Fleet allocation prologue: started=%d parked=%d notes=%d",
+        "Fleet allocation prologue: started=%d parked=%d notes=%d (budget=%d, managed_root=%s)",
         result.started,
         result.parked,
         len(result.notes),
+        allocation.max_running_runners,
+        allocation.managed_root or getattr(runner_scaling, "managed_root", "") or "(unset)",
     )
 
     # Only surface an event when something actually moved or a bound was hit;
