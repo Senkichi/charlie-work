@@ -2943,6 +2943,7 @@ class FakeGitHub:
         # the merge-base freshness gate.
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
         self._record_pr_heads(self.prs)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -3303,6 +3304,12 @@ class FakeGitHub:
             "base_commit": {"sha": base_head},
             "merge_base_commit": {"sha": base_head},
         }
+
+    def compare_diff(self, base: str, head: str) -> str | None:
+        override = self.compare_diff_overrides.get((base, head), "_unset")
+        if override != "_unset":
+            return override
+        return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -10233,6 +10240,118 @@ def test_review_ci_status_section_lists_failing_non_required_checks(tmp_path: Pa
     packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
     assert "Non-required/informational check(s) currently failing" in packet
     assert "Codecov" in packet
+
+
+def test_review_first_round_has_no_prior_review_section(tmp_path: Path) -> None:
+    """No review-decision.json on disk yet: this is a first-round review, so
+    $prior_review_section must render empty."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+    assert not (paths.prs / "pr-456" / "interdiff.patch").exists()
+
+
+def test_review_prior_verdict_pending_has_no_prior_review_section(tmp_path: Path) -> None:
+    """A pending (never-recorded) prior decision must not be treated as round-2
+    findings, even if it carries a reviewed_head_sha from a template write."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "sha-old"}),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+
+
+def test_review_round2_successful_compare_includes_prior_findings_and_interdiff(
+    tmp_path: Path,
+) -> None:
+    """Round-2 review (prior terminal verdict on an earlier head): the packet
+    must surface round-1 decision/summary/required_changes and write/reference
+    an interdiff between the prior reviewed head and the live head."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "fix the null check in validate()",
+                "required_changes": ["add null check", "handle empty list"],
+                "reviewed_head_sha": "sha-old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "sha-old" in packet
+    assert "fix the null check in validate()" in packet
+    assert "add null check" in packet
+    assert "handle empty list" in packet
+    assert "still in scope" in packet  # anti-anchoring instruction
+
+    interdiff_path = decision_dir / "interdiff.patch"
+    assert interdiff_path.exists()
+    interdiff_text = interdiff_path.read_text(encoding="utf-8")
+    assert "sha-old" in interdiff_text
+    assert "sha-abc123" in interdiff_text
+    assert str(interdiff_path) in packet
+
+
+def test_review_round2_failed_compare_omits_interdiff(tmp_path: Path) -> None:
+    """When the prior-head comparison fails (404/GC'd SHA/API error), the
+    packet must still carry the round-1 findings but state that no interdiff
+    could be generated — it must never block packet generation."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    fake_gh.compare_diff_overrides[("sha-old", "sha-abc123")] = None
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "fix the null check",
+                "required_changes": ["add null check"],
+                "reviewed_head_sha": "sha-old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "unavailable" in packet.lower()
+    assert not (decision_dir / "interdiff.patch").exists()
 
 
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:

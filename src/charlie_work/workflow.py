@@ -5911,12 +5911,33 @@ class OrchestratorApp:
             enabled=cross_family,
         )
         prompt_path = pr_dir / "review-prompt.md"
+        decision_path = pr_dir / "review-decision.json"
         diff_size_section = _diff_size_section(
             diff, self.config.review_dispatch.diff_line_threshold, diff_path
         )
         ci_status_section = _ci_status_section(
             checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
         )
+
+        # Single read of review-decision.json, BEFORE rendering: reused both to
+        # build the round-2 $prior_review_section below and, after rendering,
+        # by the stale-verdict reset a few lines down. Previously that reset
+        # was the only reader, and it ran after the prompt was already
+        # rendered — so a prior round's verdict/summary/required_changes were
+        # on disk at render time but never surfaced to the reviewer.
+        existing_decision = self._review_decision(pr_number)
+        prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
+        is_round2_review = (
+            existing_decision.get("decision") not in ("pending", None, "missing", "invalid")
+            and prior_reviewed_head_sha
+            and prior_reviewed_head_sha != pr.get("headRefOid")
+        )
+        prior_review_section = (
+            self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
+            if is_round2_review
+            else ""
+        )
+
         prompt = self._render(
             "review.md",
             {
@@ -5933,6 +5954,7 @@ class OrchestratorApp:
                 "test_adequacy_section": test_adequacy_section,
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
+                "prior_review_section": prior_review_section,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -5944,7 +5966,6 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_at": None,
         }
-        decision_path = pr_dir / "review-decision.json"
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
         else:
@@ -5955,10 +5976,8 @@ class OrchestratorApp:
             # equally stale when the head has advanced, and carrying forward its
             # summary/required_changes misleads the reviewer into re-issuing the
             # same verdict without examining the new diff.
-            existing_decision = self._review_decision(pr_number)
-            reviewed_head_sha = existing_decision.get("reviewed_head_sha")
             if existing_decision.get("decision") not in ("pending", None) and (
-                reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
+                prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
         with state_lock(self.paths.state_file):
@@ -8494,6 +8513,76 @@ class OrchestratorApp:
             head_ref_oid=pr.get("headRefOid"),
         )
         return self._cross_family_section(result.report_path), result
+
+    def _build_prior_review_section(
+        self,
+        pr_dir: Path,
+        prior_decision: dict[str, Any],
+        new_head_sha: str | None,
+    ) -> str:
+        """Render ``$prior_review_section`` for a round-2+ review packet.
+
+        Only called when the prior decision is a terminal, non-pending
+        verdict recorded against a head that differs from the live PR head
+        (a genuine rework round, not a first-round review). Surfaces round-1
+        findings (decision/summary/required changes) plus an interdiff
+        (prior reviewed head -> new head) so the reviewer has somewhere to
+        start, without losing sight of the full diff: the interdiff is
+        "start here," never "only look here" -- the full diff stays
+        attached and remains authoritative for findings outside it.
+
+        Fail-safe posture mirrors janitor.py's patch-id carry-forward
+        (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
+        here (``compare_diff``) already returns errors as values (``None``),
+        never raises, so a failed/unavailable comparison (404, GC'd SHA,
+        rebase/divergence, gh failure) just omits the interdiff and says so
+        -- it never blocks packet generation.
+        """
+        prior_head_sha = prior_decision.get("reviewed_head_sha")
+        decision = prior_decision.get("decision") or "unknown"
+        summary = str(prior_decision.get("summary") or "").strip()
+        required_changes = prior_decision.get("required_changes")
+        if not isinstance(required_changes, list):
+            required_changes = []
+
+        lines = [
+            "",
+            "## Prior review (round 1, earlier head)",
+            "",
+            f"A previous review round on an earlier head (`{prior_head_sha}`) "
+            f"recorded decision **{decision}**. These are round-1 findings on "
+            "a DIFFERENT diff than the one you are reviewing now -- verify "
+            "each one against the current code, don't assume it still applies.",
+            "",
+        ]
+        if summary:
+            lines.append(f"Round-1 summary: {summary}")
+            lines.append("")
+        if required_changes:
+            lines.append("Round-1 required changes:")
+            lines.extend(f"- {change}" for change in required_changes)
+            lines.append("")
+
+        interdiff_text = None
+        if prior_head_sha and new_head_sha:
+            interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
+        if interdiff_text and interdiff_text.strip():
+            interdiff_path = pr_dir / "interdiff.patch"
+            interdiff_path.write_text(interdiff_text, encoding="utf-8")
+            lines.append(
+                f"Interdiff (round-1 head to this head): `{interdiff_path}`. Verify "
+                "each required change above is addressed there first -- but the "
+                "full diff remains authoritative; findings outside the interdiff "
+                "are still in scope."
+            )
+        else:
+            lines.append(
+                "Prior-head comparison was unavailable (rebase, divergence, or an "
+                "API error) -- no interdiff could be generated. Review the full "
+                "diff as usual, with the round-1 findings above in mind."
+            )
+        lines.append("")
+        return "\n".join(lines)
 
     def reconcile(self, *, fix: bool = False) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the
