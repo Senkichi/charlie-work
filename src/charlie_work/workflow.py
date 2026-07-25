@@ -910,6 +910,7 @@ def _detect_and_handle_stalled_sessions(
     from .post_mortem import classify_and_record
     from .worker import (
         _next_inconclusive_probe_deferred_count,
+        _api_session_over_budget,
         classify_worker_health,
         iter_workers,
         real_activity_probe_for,
@@ -970,6 +971,67 @@ def _detect_and_handle_stalled_sessions(
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
         update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+
+        # Issue #484: in-flight api per-session budget kill. Independent of the
+        # STALLED/DEAD classification below — an api worker over its
+        # ``max_usd_per_session`` cap is killed immediately and sidecar-marked
+        # ``budget_exceeded``. The killed session then flows through the
+        # EXISTING dead-worker reconciliation on the next pass (with-PR ->
+        # review/rework; without-PR -> re-dispatch via select_adapter, whose
+        # preflight naturally decides api-again vs fallback). When the cap is
+        # 0/unset the check is entirely dormant. Non-api workers are never
+        # budget-evaluated. The kill uses the shared ``kill_process_tree``
+        # helper (no-console-window discipline on Windows, full process tree
+        # reaped) — not reimplemented here.
+        if w.adapter_kind == "api" and _api_session_over_budget(w, config):
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            orphan_pids_budget: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
+                for orphan in orphan_processes:
+                    _kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids_budget = [o["pid"] for o in orphan_processes]
+
+            # Set failure_kind="budget_exceeded" on the sidecar via the shared
+            # atomic-write helper. Written directly (not through
+            # update_worker_record_with_failure_classification) so the
+            # budget-exceeded verdict is not overridden by a coincidental
+            # throttle/auth log-tail match. The dead-session lane's
+            # classification call then short-circuits on the already-set
+            # failure_kind.
+            from .claude_code import _sidecar_path as _api_sidecar_path
+            from .claude_code import _write_json_atomic as _api_write_json_atomic
+
+            api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
+            try:
+                with api_sidecar.open("r", encoding="utf-8") as handle:
+                    api_payload = json.load(handle)
+                if isinstance(api_payload, dict):
+                    api_payload["failure_kind"] = "budget_exceeded"
+                    _api_write_json_atomic(api_sidecar, api_payload)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "session_budget_exceeded",
+                    {
+                        "issue_number": w.issue_number,
+                        "pid": w.pid,
+                        "process_start_time": w.process_start_time,
+                        "killed_pids": killed_pids,
+                        "orphan_pids": orphan_pids_budget if orphan_pids_budget else None,
+                        "provider": w.provider,
+                    },
+                    state_path=state_file,
+                )
+                save_state(state_file, state)
+
+            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
+            continue
 
         # If a stalled-looking worker is still within a previously stored rate-limit
         # defer window, skip it. The deadline is re-derived from the sidecar each pass.
@@ -1054,6 +1116,20 @@ def _detect_and_handle_stalled_sessions(
                         w.issue_number,
                         fallback_kind="stalled",
                         config=config,
+                    )
+                )
+            elif w.adapter_kind == "api":
+                # api sidecars share the claude-code classification helper but
+                # land as issue-<n>.api.json and get provider-auth classification
+                # (issue #484). adapter_kind="api" selects both the sidecar
+                # suffix and the auth-pattern check inside _classify_session_failure.
+                resolved_failure_kind, throttled_until = (
+                    update_worker_record_with_failure_classification(
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="stalled",
+                        config=config,
+                        adapter_kind="api",
                     )
                 )
 
@@ -3377,6 +3453,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     fallback_kind=failure_kind,
                     config=config,
                 )
+            elif w.adapter_kind == "api":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    adapter_kind="api",
+                )
             if failure_kind and throttled_until:
                 # A throttle-caused launch failure must persist its window just
                 # like the dead-session branch below — otherwise the governor
@@ -3541,6 +3625,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                         )
                     )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            adapter_kind="api",
+                        )
+                    )
                 else:
                     failure_kind, throttled_until = None, None
                 # Diagnostic post-mortem; its worker_blocked verdict is ignored
@@ -3565,6 +3659,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                        )
+                    )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            adapter_kind="api",
                         )
                     )
                 else:
@@ -5241,7 +5345,46 @@ class OrchestratorApp:
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
         # redispatch it. Issue #432: capped to finalize_limit per pass.
-        for issue_number in finalizable_mention_issue_numbers:
+        #
+        # Issue #564: one-shot flagging. The flag must fire once per issue,
+        # not every pass — otherwise the operator's removal of
+        # agent:human-needed is overridden on the next pass and the event
+        # stream is spammed with one dispatch_merged_pr_mention_flagged event
+        # per pass while the mention persists. Skip issues whose state entry
+        # already records merged_pr_mention_flagged_at (set the first time
+        # this path flagged them). This follows the emit-on-change dedup
+        # pattern established in #556 for dispatch_skip_blocked/janitor_gate.
+        #
+        # Re-flag semantics: keyed on the timestamp's absence — once flagged,
+        # an issue is never re-flagged, even if a NEW merged PR mentions it.
+        # The simplest acceptable semantics per issue #564; pinned by
+        # test_dispatch_merged_pr_mention_flag_is_one_shot.
+        #
+        # Known limitation (issue #564 point 2, documented as out of scope):
+        # the mention-only *dispatch exclusion* still keys off the raw mention
+        # scan (merged_pr_issue_numbers below), not the label. So an operator
+        # who removes agent:human-needed to re-arm automation does NOT re-enter
+        # dispatch — the scan-based exclusion keeps blocking the issue until it
+        # closes or the mentioning PRs are no longer merged/referenced. Keying
+        # the exclusion off the label instead would let a deliberate operator
+        # requeue take effect, but it widens the blast radius (label-read
+        # dependency in the candidate filter) and is left for a follow-up.
+        # load_state_locked (not raw load_state) so the read holds the
+        # advisory state lock — required by the invariant enforced in
+        # test_no_unlocked_load_state_in_production_code. The authoritative
+        # timestamp write below is a separate locked critical section; this
+        # read is best-effort relative to it but must still hold the lock to
+        # avoid racing a concurrent tmp+replace writer (issue #310).
+        mention_state = load_state_locked(self.paths.state_file)
+        already_flagged_mention_issues = {
+            int(num)
+            for num, entry in mention_state.get("issues", {}).items()
+            if isinstance(entry, dict) and entry.get("merged_pr_mention_flagged_at")
+        }
+        newly_flagged_mention_issues = [
+            n for n in finalizable_mention_issue_numbers if n not in already_flagged_mention_issues
+        ]
+        for issue_number in newly_flagged_mention_issues:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
         # Issue #429/#433: closed-unmerged stripping is handled by
@@ -5286,7 +5429,11 @@ class OrchestratorApp:
             # check) can surface mention-only coverage without re-deriving
             # the mention scan. "status" is deliberately untouched — the
             # issue stays open and its normal state machine intact.
-            for issue_number in finalizable_mention_issue_numbers:
+            # Issue #564: only record/emit for issues flagged *this* pass
+            # (newly_flagged_mention_issues); already-flagged issues are
+            # skipped so the event fires once and the operator's label
+            # removal is not overridden on the next pass.
+            for issue_number in newly_flagged_mention_issues:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -5294,11 +5441,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if finalizable_mention_issue_numbers:
+            if newly_flagged_mention_issues:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": finalizable_mention_issue_numbers},
+                    {"issue_numbers": newly_flagged_mention_issues},
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
@@ -5861,7 +6008,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-                    "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+                    "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                     "failures": dispatch_failure_map,
                 },
                 state_path=self.paths.state_file,
@@ -5898,7 +6045,7 @@ class OrchestratorApp:
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-            "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+            "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),

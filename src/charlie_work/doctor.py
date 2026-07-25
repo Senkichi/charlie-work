@@ -284,12 +284,22 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
         quota_exhausted = [
             r for r in records if getattr(r, "failure_kind", None) == "quota_exhausted"
         ]
+        provider_auth = [r for r in records if getattr(r, "failure_kind", None) == "provider_auth"]
+        budget_exceeded = [
+            r for r in records if getattr(r, "failure_kind", None) == "budget_exceeded"
+        ]
         if rate_limited:
             rl_issues = sorted({r.issue_number for r in rate_limited})
             detail += f" | rate-limited: {rl_issues}"
         if quota_exhausted:
             qe_issues = sorted({r.issue_number for r in quota_exhausted})
             detail += f" | quota-exhausted: {qe_issues}"
+        if provider_auth:
+            pa_issues = sorted({r.issue_number for r in provider_auth})
+            detail += f" | provider-auth: {pa_issues}"
+        if budget_exceeded:
+            be_issues = sorted({r.issue_number for r in budget_exceeded})
+            detail += f" | budget-exceeded: {be_issues}"
 
     add("launched sessions", not failed, detail, severity="warning")
 
