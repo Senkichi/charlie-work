@@ -289,13 +289,37 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
-    # Effort level pinned via --effort on reviewer session launches only —
-    # see claude_code._apply_effort_pin. Empty string means fall back to
-    # claude_code.effort (the worker/reviewer default). Exists so reviewer
-    # effort can be tuned independently of worker effort, pending an A/B
-    # comparison via the per-review session telemetry (review_session_metrics
-    # on record_review).
+    # Effort level pinned via --effort on reviewer session launches. Empty
+    # string means fall back to claude_code.effort (the worker/reviewer
+    # default). Its MEANING depends on review_effort_experiment_fraction below:
+    #   - fraction == 0.0 (default, experiment disabled): review_effort, when
+    #     set, applies to ALL reviewer launches unconditionally — exactly the
+    #     pre-experiment behavior. This is the "just pin reviewer effort"
+    #     knob with no A/B semantics.
+    #   - fraction in (0.0, 1.0]: review_effort becomes the TREATMENT arm's
+    #     effort, applied only to the assigned fraction of PRs (see
+    #     claude_code._review_effort_arm / resolve_review_effort). The
+    #     remaining PRs (control) fall back to claude_code.effort as if
+    #     review_effort were unset. This lets the A/B be compared via the
+    #     per-review session telemetry (review_session_metrics /
+    #     review_effort_arm on record_review) without confounding from
+    #     concurrent pipeline changes (time-windowed A/B was replaced by this
+    #     per-PR randomized assignment for exactly that reason).
     review_effort: str = ""
+    # Fraction (0.0-1.0) of PRs randomly (but deterministically, see
+    # claude_code._review_effort_arm) assigned to the review_effort
+    # "treatment" arm. 0.0 (default) disables the experiment: review_effort
+    # applies to every review when set, same as before this field existed.
+    # Assignment is a stateless hash of the PR number (+ salt below), so the
+    # same PR always lands in the same arm across rework rounds/re-dispatches
+    # — arm-hopping across rounds would contaminate the per-PR quality
+    # signal the experiment is trying to measure.
+    review_effort_experiment_fraction: float = 0.0
+    # Mixed into the per-PR assignment hash alongside the PR number. Change
+    # this to re-randomize arm assignment for a new experiment epoch (e.g.
+    # after a config change invalidates the current cohort) without needing
+    # to rename or remove the fraction field.
+    review_effort_experiment_salt: str = ""
 
 
 @dataclass(frozen=True)
@@ -1245,6 +1269,41 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'review_effort' must be a string, "
             f"got {type(rd_effort).__name__}"
+        )
+    rd_experiment_fraction = review_dispatch_data.get("review_effort_experiment_fraction")
+    if rd_experiment_fraction is not None and (
+        isinstance(rd_experiment_fraction, bool)
+        or not isinstance(rd_experiment_fraction, (int, float))
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
+            f"must be a number, got {type(rd_experiment_fraction).__name__}"
+        )
+    if rd_experiment_fraction is not None and not (0.0 <= rd_experiment_fraction <= 1.0):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
+            f"must be in [0.0, 1.0], got {rd_experiment_fraction}"
+        )
+    rd_experiment_salt = review_dispatch_data.get("review_effort_experiment_salt")
+    if rd_experiment_salt is not None and not isinstance(rd_experiment_salt, str):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'review_effort_experiment_salt' must be a "
+            f"string, got {type(rd_experiment_salt).__name__}"
+        )
+    # Cross-field check: a fraction > 0.0 enables the experiment, whose
+    # treatment arm IS review_effort verbatim (resolve_review_effort returns
+    # it unmodified). Enabling the experiment without a treatment effort
+    # would silently make "treatment" mean "no --effort pin at all" while
+    # "control" still gets claude_code.effort -- a corrupted, undocumented
+    # comparison that would run for the life of the experiment with no
+    # warning. Fail loud at load instead.
+    effective_fraction = rd_experiment_fraction if rd_experiment_fraction is not None else 0.0
+    effective_effort = rd_effort if rd_effort is not None else ""
+    if effective_fraction > 0.0 and not effective_effort:
+        raise ConfigError(
+            "config section 'review_dispatch': 'review_effort_experiment_fraction' is "
+            f"{effective_fraction} but 'review_effort' is unset -- set 'review_effort' to the "
+            "treatment effort string (e.g. 'high') before enabling the experiment"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     auto_merge_data = _section(data, "auto_merge")
