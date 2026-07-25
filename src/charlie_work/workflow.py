@@ -1489,6 +1489,29 @@ def _parse_review_verdict_from_files(
     return None
 
 
+def _reviewer_session_metrics(events_path: Path, verdict_source: str) -> dict[str, Any] | None:
+    """Parse reviewer session telemetry for a recorded verdict (perf/spend visibility).
+
+    Returns a dict of ``tokens``/``cost_usd``/``turn_count``/``tool_call_count``/
+    ``verdict_source`` for ``record_review`` to fold into the ``record_review``
+    event and the PR's state entry, or ``None`` when the events.jsonl sidecar
+    is missing or unparseable (devin workers, or a claude-code session launched
+    without tee_stream_json). Never raises: ``parse_claude_events`` already
+    tolerates a missing/malformed file, and a missing telemetry file must never
+    block recording the verdict itself.
+    """
+    progress = parse_claude_events(events_path)
+    if progress is None:
+        return None
+    return {
+        "tokens": progress.tokens,
+        "cost_usd": progress.cost_usd,
+        "turn_count": progress.turn_count,
+        "tool_call_count": progress.tool_call_count,
+        "verdict_source": verdict_source,
+    }
+
+
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
@@ -6319,12 +6342,16 @@ class OrchestratorApp:
                 continue
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
+            session_metrics = _reviewer_session_metrics(
+                _events_path(reviews_dir, pr_number, review=True), verdict_source
+            )
             result = self.record_review(
                 pr_number,
                 verdict["decision"],
                 summary=verdict["summary"],
                 reviewed_head=packet_head_sha,
                 required_changes=verdict["required_changes"],
+                session_metrics=session_metrics,
             )
             if result.ok:
                 recorded.append(
@@ -6944,6 +6971,7 @@ class OrchestratorApp:
         comment: bool = False,
         reviewed_head: str | None = None,
         required_changes: Sequence[str] | None = None,
+        session_metrics: dict[str, Any] | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -7139,6 +7167,14 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reviewer session token/cost telemetry (best-effort): merge-update
+                # so a call without metrics (e.g. a manual `charlie verdict`)
+                # never clobbers metrics recorded by an earlier automated reap.
+                "review_session_metrics": (
+                    session_metrics
+                    if session_metrics is not None
+                    else pr_state.get("review_session_metrics")
+                ),
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
@@ -7181,11 +7217,14 @@ class OrchestratorApp:
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
                     state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-            state = self._record_event(
-                state,
-                "record_review",
-                {"pr_number": pr_number, "decision": decision, "escalated": escalated},
-            )
+            event_payload: dict[str, Any] = {
+                "pr_number": pr_number,
+                "decision": decision,
+                "escalated": escalated,
+            }
+            if session_metrics is not None:
+                event_payload["session_metrics"] = session_metrics
+            state = self._record_event(state, "record_review", event_payload)
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # decision above is the authority; a label failure is reported, not fatal.
