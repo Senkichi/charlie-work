@@ -891,8 +891,12 @@ def scale_down_idle_runners(
         else:
             errors.append(f"Failed to remove {runner_dir.name}: {error}")
 
-    # Record scale event if we removed any runners
-    if removed_count > 0:
+    # Never under dry_run.  gracefully_remove_runner reports success without
+    # removing anything when previewing, so removed_count counts removals that did
+    # not happen -- and the cooldown timestamp this writes is read by
+    # decide_autoscale *before* it branches up-vs-down, so one preview would
+    # suppress real scaling in BOTH directions for cooldown_minutes (issue #609).
+    if removed_count > 0 and not dry_run:
         record_scale_event(state_dir, "down")
 
     return removed_count, errors
@@ -1058,6 +1062,7 @@ def observe_runner_pool(
     workflow_filename: str | None = None,
     default_branch: str | None = None,
     state_dir: Path | None = None,
+    dry_run: bool = False,
 ) -> RunnerPoolState:
     """Observe runner pool state for a repository.
 
@@ -1162,8 +1167,12 @@ def observe_runner_pool(
 
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Save pool sample for idle detection if state_dir is provided
-    if state_dir is not None:
+    # Save pool sample for idle detection if state_dir is provided.  Skipped under
+    # dry_run: these samples are the input to is_pool_idle_for_minutes, so a preview
+    # that wrote them would inject observations into the real idle-detection history
+    # and could tip a later scale decision.  This function took no dry_run at all
+    # before, which meant no caller *could* gate it (issue #609).
+    if state_dir is not None and not dry_run:
         sample = PoolSample(
             timestamp=timestamp,
             busy=busy_runners > 0,

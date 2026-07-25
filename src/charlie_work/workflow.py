@@ -4589,7 +4589,12 @@ class OrchestratorApp:
             from .runners import format_runner_pool_state, observe_runner_pool
 
             try:
-                pool_state = observe_runner_pool(self.gh, self.config.runner_scaling)
+                # No state_dir here, so nothing is written either way today --
+                # threaded anyway so the call site stays honest if one is ever
+                # added, and so the dry-run call-site guard stays a bright line.
+                pool_state = observe_runner_pool(
+                    self.gh, self.config.runner_scaling, dry_run=self.gh.dry_run
+                )
                 runners_data = format_runner_pool_state(pool_state)
             except Exception:
                 # Don't fail status() if runner observation fails

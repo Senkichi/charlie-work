@@ -391,11 +391,17 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
-    deploy = self_deploy(orchestrator_root(), fleet_dir_override=args.fleet_dir)
+    deploy = self_deploy(
+        orchestrator_root(), fleet_dir_override=args.fleet_dir, dry_run=args.dry_run
+    )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
         notify_config = getattr(global_config, "notify", None) if global_config else None
-        if notify_config is not None and getattr(notify_config, "enabled", False):
+        if (
+            deploy.alertable
+            and notify_config is not None
+            and getattr(notify_config, "enabled", False)
+        ):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
                 repo="fleet",
@@ -411,6 +417,8 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
                 ),
             )
             emit_digest(notify_config, attention_digest)
+    elif deploy.previewed:
+        print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.synced:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
@@ -575,7 +583,9 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
 
     try:
-        pool_state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+        pool_state = observe_runner_pool(
+            gh, config.runner_scaling, state_dir=paths.root, dry_run=args.dry_run
+        )
         formatted = format_runner_pool_state(pool_state)
         return CommandResult(
             ok=True,
@@ -739,7 +749,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
-    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root, dry_run=dry_run)
 
     # Load fleet-wide totals if requested
     fleet_totals: FleetTotals | None = None

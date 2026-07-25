@@ -522,7 +522,7 @@ def _run_fleet_autoscale_prologue(
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
-    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root, dry_run=dry_run)
 
     # Check cooldown and idle duration
     in_cooldown = is_in_cooldown(paths.root, config.runner_scaling.cooldown_minutes)
@@ -1423,14 +1423,20 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(orchestrator_root(), fleet_dir_override=fleet_dir_override)
+            deploy = self_deploy(
+                orchestrator_root(), fleet_dir_override=fleet_dir_override, dry_run=dry_run
+            )
             if not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",
                     flush=True,
                 )
                 notify_config = getattr(global_config, "notify", None)
-                if notify_config is not None and getattr(notify_config, "enabled", False):
+                if (
+                    deploy.alertable
+                    and notify_config is not None
+                    and getattr(notify_config, "enabled", False)
+                ):
                     attention_digest = AttentionDigest(
                         generated_at=utc_now(),
                         repo="fleet",
@@ -1446,6 +1452,8 @@ def run_fleet_supervise(
                         ),
                     )
                     emit_digest(notify_config, attention_digest)
+            elif deploy.previewed:
+                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.synced:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.venv_repaired:
