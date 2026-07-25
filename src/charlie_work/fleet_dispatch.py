@@ -133,6 +133,7 @@ def _api_worker_configured(config: OrchestratorConfig) -> bool:
 def compute_api_worker_fleet_report(
     *,
     fleet_dir_override: str | None = None,
+    preloaded_configs: dict[str, OrchestratorConfig] | None = None,
 ) -> ApiWorkerFleetReport | None:
     """Compute the fleet-wide api-worker report line (issue #483).
 
@@ -141,8 +142,21 @@ def compute_api_worker_fleet_report(
     ``ApiWorkerFleetReport`` with spend from a representative repo's ledger and
     a fleet-wide live-worker count.
 
-    Read-only: never mutates the ledger or state. All errors surface as report
-    values (zeroed spend, zero live), never raised.
+    ``preloaded_configs`` is an optional ``repo_key -> config`` mapping for
+    repos whose layered config the caller already loaded (e.g. ``fleet_loop``
+    loads each selected repo's config for dispatch). When a repo_key is present
+    in this map, its config is reused instead of re-loading from disk — this
+    avoids a redundant per-repo config reload on every fleet pass. Repos absent
+    from the map (unselected, or callers that don't preload) fall back to
+    ``load_layered_config``. The preloaded config must be the raw layered
+    config (the report only reads ``api_worker`` fields, so a caller-side
+    ``replace(...)`` on unrelated fields is harmless).
+
+    Near read-only: never settles or writes the ledger itself, but
+    ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
+    a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
+    filesystem mutation. All errors surface as report values (zeroed spend,
+    zero live), never raised.
     """
     from datetime import UTC, datetime
 
@@ -163,15 +177,17 @@ def compute_api_worker_fleet_report(
         repo_root = Path(entry.get("repo_root", ""))
         if not repo_root.is_dir():
             continue
-        try:
-            explicit_cfg = entry.get("config_path")
-            config = load_layered_config(
-                repo_root,
-                Path(explicit_cfg) if explicit_cfg else None,
-                fleet_dir_override=fleet_dir_override,
-            )
-        except (ConfigError, GitHubError, OSError):
-            continue
+        config = preloaded_configs.get(repo_key) if preloaded_configs else None
+        if config is None:
+            try:
+                explicit_cfg = entry.get("config_path")
+                config = load_layered_config(
+                    repo_root,
+                    Path(explicit_cfg) if explicit_cfg else None,
+                    fleet_dir_override=fleet_dir_override,
+                )
+            except (ConfigError, GitHubError, OSError):
+                continue
         if not _api_worker_configured(config):
             continue
         configured_m += 1
@@ -818,6 +834,12 @@ def fleet_loop(
     per_repo_results: dict[str, CommandResult] = {}
     attention_events: list[dict[str, Any]] = []
     orphan_sweep_calls = 0
+    # Collect each selected repo's raw layered config so the api-worker fleet
+    # report below can reuse it instead of re-loading every config each pass
+    # (issue #483 review: redundant per-repo config reload each fleet pass).
+    # The raw config is captured before the notify-silencing replace() below;
+    # the report only reads api_worker fields, which that replace never touches.
+    loaded_configs: dict[str, OrchestratorConfig] = {}
 
     # Run autoscale prologue if enabled (only for full loop, not work-only)
     if not work_only:
@@ -846,6 +868,9 @@ def fleet_loop(
                 Path(explicit_cfg) if explicit_cfg else None,
                 fleet_dir_override=fleet_dir_override,
             )
+            # Cache the raw layered config for the api-worker fleet report
+            # (captured before the notify-silencing replace below).
+            loaded_configs[repo_key] = config
             # Fleet mode is the single notification authority: the aggregate
             # digest below emits once for the whole pass. Silence per-repo
             # dispatch()/loop() emission so one health transition doesn't fire
@@ -955,8 +980,13 @@ def fleet_loop(
         repo_data["message"] = r.message  # Surface per-repo failure message
         repos_data[k] = repo_data
 
-    # api-worker fleet report line (issue #483): read-only, never raises.
-    api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=fleet_dir_override)
+    # api-worker fleet report line (issue #483): near read-only, never raises.
+    # Reuse the configs already loaded this pass instead of re-loading every
+    # repo config (review: redundant per-repo config reload each fleet pass).
+    api_worker_report = compute_api_worker_fleet_report(
+        fleet_dir_override=fleet_dir_override,
+        preloaded_configs=loaded_configs,
+    )
 
     return CommandResult(
         ok,

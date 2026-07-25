@@ -2042,3 +2042,184 @@ def test_api_worker_fleet_report_no_hardcoded_lists() -> None:
     assert "enabled 3/7 repos" in line
     # No hardcoded provider names like "kimi-k3" or "moonshot" in the format.
     assert "moonshot" not in line
+
+
+def test_compute_api_worker_fleet_report_uses_preloaded_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """preloaded_configs skips load_layered_config for those repos (no redundant reload).
+
+    Review finding: fleet_loop reloaded every repo's config each pass even
+    though it had already loaded the selected repos' configs for dispatch.
+    This test verifies the optimization: a repo present in preloaded_configs
+    reuses that config and load_layered_config is NOT called for it, while a
+    repo absent from the map still falls back to load_layered_config.
+    """
+    from charlie_work.global_config import load_layered_config as real_load
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repo1 = _make_repo(tmp_path, "repo1", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(repo0 / ".var" / "charlie-work"),
+        },
+        "owner/repo1": {
+            "repo_root": str(repo1),
+            "config_path": str(repo1 / "orchestrator.config.yaml"),
+            "state_dir": str(repo1 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Preload repo0's config exactly as fleet_loop would (raw layered config).
+    preloaded = {
+        "owner/repo0": real_load(repo0, repo0 / "orchestrator.config.yaml"),
+    }
+
+    calls: list[str] = []
+
+    def _spy(repo_root: Path, explicit: Path | None, *, fleet_dir_override: str | None = None):
+        calls.append(str(repo_root))
+        return real_load(repo_root, explicit, fleet_dir_override=fleet_dir_override)
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.load_layered_config", _spy)
+
+    report = compute_api_worker_fleet_report(
+        fleet_dir_override=str(fleet_dir), preloaded_configs=preloaded
+    )
+
+    assert report is not None
+    assert report.enabled_m == 2
+    assert report.enabled_k == 2
+    # load_layered_config called only for repo1 (repo0 was preloaded).
+    assert calls == [str(repo1)]
+
+
+def test_compute_api_worker_fleet_report_preloaded_overrides_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preloaded config wins over what disk would load for that repo_key.
+
+    This pins the contract: preloaded_configs is an override, not a hint. If
+    the caller passes a default (unconfigured) config for a repo whose disk
+    config has api_worker enabled, the report uses the preloaded view.
+    """
+    from charlie_work.config import ApiWorkerConfig, OrchestratorConfig as _OC
+    from charlie_work.global_config import load_layered_config as real_load
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(repo0 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Sanity: disk config has api_worker configured.
+    disk_config = real_load(repo0, repo0 / "orchestrator.config.yaml")
+    assert disk_config.api_worker != ApiWorkerConfig()
+
+    # Preload a default (unconfigured) config to prove override semantics.
+    preloaded = {"owner/repo0": _OC()}
+
+    report = compute_api_worker_fleet_report(
+        fleet_dir_override=str(fleet_dir), preloaded_configs=preloaded
+    )
+
+    # The preloaded default (unconfigured) wins → no repo configures the section.
+    assert report is None
+
+
+@patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_threads_api_worker_report_into_data(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_compute_report: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop places compute_api_worker_fleet_report's dict into CommandResult.data.
+
+    The standalone compute function is covered by the tests above; this
+    verifies the fleet_loop wiring (the api_worker_report key in the returned
+    CommandResult.data) so a silent breakage in the key-lookup path can't ship
+    undetected. An empty registry means no per-repo work runs.
+    """
+    mock_load_registry.return_value = {"repos": {}}
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=1.50,
+        lifetime_usd=7.25,
+        cap_usd=15.00,
+        live=2,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    mock_compute_report.return_value = report
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+
+    assert result.ok is True
+    assert result.data["api_worker_report"] == report.to_dict()
+    assert result.data["api_worker_report"]["provider"] == "kimi-k3"
+    assert "line" in result.data["api_worker_report"]
+    # The compute function is called with the fleet_dir override and the
+    # configs fleet_loop already loaded this pass (no redundant reload).
+    mock_compute_report.assert_called_once_with(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        preloaded_configs={},
+    )
+
+
+@patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_api_worker_report_none_when_unconfigured(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_compute_report: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop sets api_worker_report to None when no repo configures the section."""
+    mock_load_registry.return_value = {"repos": {}}
+    mock_compute_report.return_value = None
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+
+    assert result.ok is True
+    assert result.data["api_worker_report"] is None

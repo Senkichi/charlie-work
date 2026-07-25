@@ -136,7 +136,7 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
 
 
 def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig) -> None:
-    """Read-only observability probes for the paid ``api`` worker tier (issue #483).
+    """Observability probes for the paid ``api`` worker tier (issue #483).
 
     When the ``api_worker`` section is configured (non-default):
 
@@ -148,9 +148,10 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
     * ``enabled: false`` — a single notice line so a built-but-dormant feature
       stays visible in every doctor run (rollout insurance).
 
-    Read-only: the ledger is loaded via ``api_budget.load_ledger`` which
-    quarantines a corrupt file, but this probe never settles or writes. Errors
-    surface as check details, never raised.
+    Near read-only: this probe never settles or writes the ledger itself, but
+    ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
+    a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
+    filesystem mutation. Errors surface as check details, never raised.
     """
     # ``configured`` = the section is not the package default. A bare
     # ``api_worker: {enabled: false}`` with no providers/budget is the default
@@ -169,6 +170,7 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
         )
         return
 
+    import os
     from datetime import UTC, datetime
 
     from .api_budget import budget_status, ledger_path, load_ledger
@@ -186,7 +188,7 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
         return
 
     # 1. api_key_env present in the environment (NAME only, never the value).
-    key_present = bool(__import__("os").environ.get(provider.api_key_env))
+    key_present = bool(os.environ.get(provider.api_key_env))
     add(
         "api_worker api key",
         key_present,

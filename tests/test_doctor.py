@@ -1193,12 +1193,17 @@ def test_doctor_api_worker_headroom_exhausted(tmp_path: Path, monkeypatch) -> No
     by_name = {check.name: check for check in checks}
     headroom = by_name["api_worker budget headroom"]
     assert headroom.ok is False
-    assert "exhausted" in headroom.detail
-    # Headroom is a warning, so it doesn't block ok by itself — but the
-    # daily exhaustion means the api key check etc. still pass. The headroom
-    # check is warning severity, so ok should still be True unless another
-    # error-severity check fails.
+    # Both daily and lifetime are exhausted in this fixture; the detail must
+    # report each leg's exhaustion, not just one occurrence of the word.
+    assert headroom.detail.count("exhausted") >= 2
+    assert "$4.50 spent today" in headroom.detail
+    assert "$0.50 remaining" in headroom.detail  # max(0, 5.0 - 4.50)
+    assert "$15.00 spent lifetime" in headroom.detail
+    assert "$0.00 remaining" in headroom.detail  # max(0, 15.0 - 15.00)
+    # Headroom is warning severity, so it does not block the overall ok —
+    # the api key / base url / ledger checks all pass, so ok stays True.
     assert headroom.severity == "warning"
+    assert ok is True
 
 
 def test_doctor_api_worker_no_secret_in_output(tmp_path: Path, monkeypatch) -> None:
