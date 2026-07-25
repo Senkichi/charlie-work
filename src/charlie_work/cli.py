@@ -38,6 +38,26 @@ from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
 
 
+def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+    """Add a subcommand-level ``--dry-run`` that does not clobber the global one.
+
+    ``--dry-run`` also exists on the top-level parser, so an operator may write it
+    either before or after the subcommand. Both must work, and the plain idiom does
+    not: without ``SUPPRESS`` the subparser applies its own ``False`` default *after*
+    the top-level flag was parsed, silently overwriting it. ``charlie --dry-run
+    runners allocate`` therefore ran for real — and for ``allocate`` "for real"
+    means starting and terminating live CI listeners during what the operator
+    believes is a simulation. Observed on the live host: a global-flag dry run
+    launched a listener and reported its PID.
+
+    ``SUPPRESS`` makes the subparser set the attribute only when the flag is
+    actually present, so the global value stands when it is not. The top-level flag
+    keeps its ``False`` default, so ``args.dry_run`` always exists. Route every new
+    subcommand-level flag through here rather than repeating the idiom.
+    """
+    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
     parser.add_argument("--config", type=Path, default=None)
@@ -135,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     unescalate = subparsers.add_parser("unescalate")
     unescalate.add_argument("--pr", type=int, default=None)
     unescalate.add_argument("--issue", type=int, default=None)
-    unescalate.add_argument("--dry-run", action="store_true")
+    _add_dry_run(unescalate)
 
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
@@ -238,11 +258,11 @@ def build_parser() -> argparse.ArgumentParser:
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
     ensure_started_parser = runners_sub.add_parser("ensure-started")
-    ensure_started_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(ensure_started_parser)
     scale_down_parser = runners_sub.add_parser("scale-down")
-    scale_down_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(scale_down_parser)
     autoscale_parser = runners_sub.add_parser("autoscale")
-    autoscale_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(autoscale_parser)
     autoscale_parser.add_argument(
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
@@ -253,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
             "with runners registered under managed_root, by live queue demand"
         ),
     )
-    allocate_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(allocate_parser)
 
     subparsers.add_parser("worktree-clean")
 
@@ -883,7 +903,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         )
 
     dry_run = getattr(args, "dry_run", False)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=False)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     result = run_allocation_pass(
         gh,
