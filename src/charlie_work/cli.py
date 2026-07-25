@@ -21,6 +21,8 @@ from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .state import StateLockBusy, load_state_locked, utc_now
 from .supervise import orchestrator_root, self_deploy
+from .runner_allocation import plan_summary
+from .runner_allocation_pass import run_allocation_pass
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -244,6 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
     autoscale_parser.add_argument(
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
+    allocate_parser = runners_sub.add_parser(
+        "allocate",
+        help=(
+            "Rebalance this host's running runner listeners across every repo "
+            "with runners registered under managed_root, by live queue demand"
+        ),
+    )
+    allocate_parser.add_argument("--dry-run", action="store_true")
 
     subparsers.add_parser("worktree-clean")
 
@@ -317,10 +327,13 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     return fleet_loop(
@@ -345,10 +358,13 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
@@ -706,6 +722,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
 
     # Load fleet-wide totals if requested
     fleet_totals: FleetTotals | None = None
+    skipped_repos: list[str] = []
     if fleet_wide:
         total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
             args.fleet_dir, runtime=config.runtime
@@ -745,6 +762,10 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
                 "fleet_totals": {
                     "total_runners": fleet_totals.total_runners if fleet_totals else 0,
                     "total_busy_runners": fleet_totals.total_busy_runners if fleet_totals else 0,
+                    # Repos whose runner count could not be read are an
+                    # undercount in the guardrail above, so name them rather
+                    # than letting the totals look authoritative.
+                    "skipped_repos": skipped_repos,
                 }
                 if fleet_totals
                 else None,
@@ -837,6 +858,78 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
                 },
             },
         )
+
+
+def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
+    """Rebalance running runner listeners across repos by live queue demand.
+
+    Unlike ``runners autoscale``, which grows or shrinks *this* repo's pool,
+    this command is host-wide: it discovers every repo with runners registered
+    under ``managed_root`` and redistributes one shared budget of running
+    listeners between them. Registration is never touched — slots move by
+    starting and stopping already-configured listeners.
+
+    Returns an error if the runner_allocation feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    if not config.runner_allocation.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_allocation feature is not enabled in config",
+            data={},
+        )
+
+    dry_run = getattr(args, "dry_run", False)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=False)
+
+    result = run_allocation_pass(
+        gh,
+        config.runner_allocation,
+        managed_root_fallback=config.runner_scaling.managed_root,
+        fleet_dir_override=args.fleet_dir,
+        state_path=paths.state_file,
+        dry_run=dry_run,
+    )
+
+    if result.error:
+        return CommandResult(ok=False, message=f"allocate: {result.error}", data={})
+
+    data: dict[str, Any] = {
+        "dry_run": dry_run,
+        "notes": list(result.notes),
+        "applied": [
+            {
+                "repo": r.change.repo,
+                "runner": r.change.runner_name,
+                "action": r.change.action.value,
+                "ok": r.ok,
+                "message": r.message,
+            }
+            for r in result.results
+        ],
+    }
+    if result.plan is not None:
+        data["plan"] = plan_summary(result.plan)
+
+    if result.skipped:
+        return CommandResult(
+            ok=True,
+            message=f"allocate: no action - {'; '.join(result.notes) or 'nothing to do'}",
+            data=data,
+        )
+
+    prefix = "would " if dry_run else ""
+    return CommandResult(
+        ok=result.ok,
+        message=(
+            f"allocate: {prefix}start {result.started}, {prefix}park {result.parked} "
+            f"(budget {result.plan.budget if result.plan else 0})"
+        ),
+        data=data,
+    )
 
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
@@ -967,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_runners_scale_down(args)
             elif args.runners_command == "autoscale":
                 result = run_runners_autoscale(args)
+            elif args.runners_command == "allocate":
+                result = run_runners_allocate(args)
             else:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}

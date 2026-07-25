@@ -7,18 +7,32 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
+from charlie_work.config import (
+    OrchestratorConfig,
+    RunnerAllocationConfig,
+    RunnerScalingConfig,
+    RuntimeConfig,
+    SupervisorConfig,
+)
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
     _build_fleet_attention_digest,
     _extract_attention_events,
     _is_fleet_pass_active,
+    _run_fleet_allocation_prologue,
     _select_repos,
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
 )
 from charlie_work.fleet_registry import count_fleet_runners
+from charlie_work.runner_allocation import (
+    AllocationPlan,
+    SlotAction,
+    SlotChange,
+    SlotChangeResult,
+)
+from charlie_work.runner_allocation_pass import AllocationPassResult
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -2223,3 +2237,187 @@ def test_fleet_loop_api_worker_report_none_when_unconfigured(
 
     assert result.ok is True
     assert result.data["api_worker_report"] is None
+
+
+# --------------------------------------------------------------------------
+# Runner-allocation prologue (the path the 5-minute fleet pass actually takes)
+# --------------------------------------------------------------------------
+
+
+def _allocation_config(**overrides: Any) -> OrchestratorConfig:
+    """A global config with the allocation section populated."""
+    return OrchestratorConfig(
+        runner_allocation=RunnerAllocationConfig(**overrides),
+        runner_scaling=RunnerScalingConfig(managed_root="C:/fallback-root"),
+    )
+
+
+def test_allocation_prologue_is_inert_when_disabled(tmp_path: Path) -> None:
+    """Default-off must mean off: no registry read, no gh client, no events."""
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass") as pass_mock:
+        events = _run_fleet_allocation_prologue(
+            str(tmp_path / "fleet"),
+            _allocation_config(enabled=False),
+            dry_run=False,
+        )
+
+    assert events == []
+    pass_mock.assert_not_called()
+
+
+def test_allocation_prologue_skips_when_no_repo_root_is_usable(tmp_path: Path) -> None:
+    """Without a real directory to anchor the gh client, skip rather than guess."""
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/gone": {"repo_root": str(tmp_path / "vanished"), "state_dir": ""}},
+    )
+
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass") as pass_mock:
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert events == []
+    pass_mock.assert_not_called()
+
+
+def test_allocation_prologue_anchors_on_a_live_repo_and_passes_config_through(
+    tmp_path: Path,
+) -> None:
+    """The prologue's whole job: find an anchor, hand the pass its wiring."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        },
+    )
+
+    plan = AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=())
+    result = AllocationPassResult(ok=True, plan=plan, notes=("cw: pinned",))
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=result) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub") as gh_mock,
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir),
+            _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+            dry_run=True,
+        )
+
+    assert gh_mock.call_args.kwargs["repo_root"] == repo
+    kwargs = pass_mock.call_args.kwargs
+    assert kwargs["managed_root_fallback"] == "C:/fallback-root"
+    assert kwargs["fleet_dir_override"] == str(fleet_dir)
+    assert kwargs["state_path"] == repo / ".var" / "charlie-work" / "state.json"
+    assert kwargs["dry_run"] is True
+
+    # A note alone is enough to surface an event; a balanced host stays quiet.
+    assert [event["type"] for event in events] == ["runner_allocation"]
+    assert events[0]["budget"] == 8
+    assert events[0]["dry_run"] is True
+
+
+def test_allocation_prologue_stays_quiet_when_nothing_moves(tmp_path: Path) -> None:
+    """A balanced host must not add a line to every 5-minute digest."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+    balanced = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+    )
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=balanced),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert events == []
+
+
+def test_allocation_prologue_surfaces_errors_and_failed_slots(tmp_path: Path) -> None:
+    """Config typos and refused parks both have to reach the operator."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+
+    failed = AllocationPassResult(ok=False, error="managed_root does not exist: C:/nope")
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=failed),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+    assert [event["type"] for event in events] == ["runner_allocation_error"]
+    assert "does not exist" in events[0]["error"]
+
+    change = SlotChange(
+        repo="owner/anchor",
+        runner_name="cw-2",
+        path=tmp_path / "cw-2",
+        action=SlotAction.PARK,
+        reason="idle 3 passes",
+    )
+    with (
+        patch(
+            "charlie_work.fleet_dispatch.run_allocation_pass",
+            return_value=AllocationPassResult(
+                ok=True,
+                plan=AllocationPlan(
+                    budget=8, budget_reason="configured", targets=(), changes=(change,)
+                ),
+                results=(SlotChangeResult(change=change, ok=False, message="job in flight"),),
+            ),
+        ),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert [event["type"] for event in events] == ["runner_allocation_slot_error"]
+    assert events[0]["runner"] == "cw-2"
+    assert events[0]["action"] == "park"
+
+
+def test_allocation_prologue_warns_when_the_config_lacks_the_section(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """A config object without the section means code/config disagree.
+
+    That is a different failure from "the operator left it off" — it happens
+    when a load failure already fell back to defaults, or when the process is
+    holding a config built by other code — and it must not look like a
+    deliberate opt-out.
+    """
+    import logging
+
+    class _NoSection:
+        pass
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
+
+    assert events == []
+    assert any("no runner_allocation" in record.message for record in caplog.records)

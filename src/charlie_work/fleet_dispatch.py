@@ -22,6 +22,7 @@ from .supervise import (
     take_snapshot,
     try_acquire_supervisor_lock,
 )
+from .runner_allocation_pass import run_allocation_pass
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -246,6 +247,129 @@ def compute_api_worker_fleet_report(
         enabled_k=enabled_k,
         enabled_m=configured_m,
     )
+
+
+def _run_fleet_allocation_prologue(
+    fleet_dir_override: str | None,
+    global_config: Any,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    """Rebalance the host's running runner listeners across repos by demand.
+
+    Runs before the autoscale prologue on purpose: reallocating existing
+    capacity is free and instant, so it should be tried before deciding that
+    the host needs *more* runners registered. A repo that looks starved often
+    only needs a slot another repo is sitting on idle.
+
+    This is host-wide rather than per-repo — the repo set comes from the
+    ``.runner`` files under the managed root, not from the fleet registry, so a
+    repo with runners on this host is covered whether or not it is registered
+    for dispatch. Gated on ``runner_allocation.enabled``.
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+        global_config: Global fleet configuration.
+        dry_run: If True, plan without starting or parking anything.
+
+    Returns:
+        A list of attention event dicts for aggregation into the fleet digest.
+    """
+    events: list[dict[str, Any]] = []
+
+    allocation = getattr(global_config, "runner_allocation", None)
+    if allocation is None:
+        # The config object has no such section at all. That is not "the
+        # operator left it off" — it means this process is holding a config
+        # built by different code, or a load failure already fell back to
+        # defaults. Either way the feature is silently absent, so say so.
+        logger.warning(
+            "Fleet allocation prologue: config object has no runner_allocation "
+            "section (%s); allocation cannot run in this process",
+            type(global_config).__name__,
+        )
+        return events
+    if not allocation.enabled:
+        logger.debug("Fleet allocation prologue: disabled in config")
+        return events
+
+    # Any existing repo root works as the gh working directory: the allocation
+    # pass addresses every repo by explicit owner/name slug, so the cwd's git
+    # identity is irrelevant. Only auth and a valid directory are needed.
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    anchor_root: Path | None = None
+    anchor_state: Path | None = None
+    for entry in registry.get("repos", {}).values():
+        candidate = Path(entry.get("repo_root", ""))
+        if candidate.is_dir():
+            anchor_root = candidate
+            state_dir = entry.get("state_dir")
+            anchor_state = Path(state_dir) / "state.json" if state_dir else None
+            break
+
+    if anchor_root is None:
+        logger.info("Fleet allocation prologue: no usable repo root in registry, skipping")
+        return events
+
+    runtime = getattr(global_config, "runtime", None)
+    runner_scaling = getattr(global_config, "runner_scaling", None)
+    gh = GitHub(repo_root=anchor_root, runtime=runtime, dry_run=False)
+
+    result = run_allocation_pass(
+        gh,
+        allocation,
+        managed_root_fallback=getattr(runner_scaling, "managed_root", "") or "",
+        fleet_dir_override=fleet_dir_override,
+        state_path=anchor_state,
+        dry_run=dry_run,
+    )
+
+    if result.error:
+        logger.warning("Fleet allocation prologue: %s", result.error)
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation_error",
+                "error": result.error,
+            }
+        )
+        return events
+
+    logger.info(
+        "Fleet allocation prologue: started=%d parked=%d notes=%d",
+        result.started,
+        result.parked,
+        len(result.notes),
+    )
+
+    # Only surface an event when something actually moved or a bound was hit;
+    # a balanced host should not add noise to every digest.
+    if result.started or result.parked or result.notes:
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation",
+                "started": result.started,
+                "parked": result.parked,
+                "budget": result.plan.budget if result.plan else 0,
+                "notes": list(result.notes),
+                "dry_run": dry_run,
+            }
+        )
+
+    for slot in result.results:
+        if not slot.ok:
+            events.append(
+                {
+                    "repo_key": "fleet",
+                    "type": "runner_allocation_slot_error",
+                    "runner": slot.change.runner_name,
+                    "action": slot.change.action.value,
+                    "message": slot.message,
+                }
+            )
+
+    return events
 
 
 def _run_fleet_autoscale_prologue(
@@ -841,15 +965,23 @@ def fleet_loop(
     # the report only reads api_worker fields, which that replace never touches.
     loaded_configs: dict[str, OrchestratorConfig] = {}
 
-    # Run autoscale prologue if enabled (only for full loop, not work-only)
+    # Run runner prologues if enabled (only for full loop, not work-only).
+    # Allocation first: moving an idle slot to a starved repo is free, so it
+    # runs before autoscale decides the host needs more runners registered.
     if not work_only:
+        attention_events.extend(
+            _run_fleet_allocation_prologue(fleet_dir_override, global_config, dry_run)
+        )
         autoscale_events = _run_fleet_autoscale_prologue(
             fleet_dir_override, global_config, dry_run
         )
         attention_events.extend(autoscale_events)
 
     for repo_key, entry in selected:
-        repo_root = Path(entry.get("repo_root"))
+        # Default to "" rather than None: a registry entry missing repo_root
+        # entirely would make Path(None) raise, where the is_dir() check below
+        # already has the right answer for a bad path.
+        repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
             # Tolerate vanished/moved repo (#169 precedent)
             per_repo_results[repo_key] = CommandResult(
@@ -1115,7 +1247,17 @@ def run_fleet_supervise(
         global_config = load_layered_config(
             Path.cwd(), None, fleet_dir_override=fleet_dir_override
         )
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        # Falling back to defaults silently is how a whole feature disappears
+        # without a trace: every config-gated behavior (notify, labels, the
+        # runner prologues) reverts to off while passes keep reporting success.
+        # A typo in the global layer must be loud.
+        logger.warning(
+            "Fleet supervisor could not load config; running on DEFAULTS "
+            "(notify, labels and runner prologues are all off): %s",
+            exc,
+        )
+        print(f"config load failed, running on defaults: {exc}", flush=True)
         global_config = OrchestratorConfig()
 
     overrides: dict[str, int] = {}
@@ -1240,17 +1382,14 @@ def run_fleet_supervise(
             # call: no dispatch/state mutation has happened yet this
             # iteration, and state.json is disk-persisted, not in-memory, so
             # the next process resumes from exactly where this one left off.
-            head_changed = bool(
-                deploy.ok
-                and deploy.pulled
-                and deploy.from_sha
-                and deploy.to_sha
-                and deploy.from_sha != deploy.to_sha
-            )
-            if head_changed:
+            # Bind the shas to locals so the non-None guard survives into the
+            # message below; folding the check into a bool() loses it.
+            from_sha = deploy.from_sha
+            to_sha = deploy.to_sha
+            if deploy.ok and deploy.pulled and from_sha and to_sha and from_sha != to_sha:
                 print(
-                    f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
-                    f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
+                    f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
                     flush=True,
                 )
                 break
