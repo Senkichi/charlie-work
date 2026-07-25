@@ -439,6 +439,135 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
     )
 
 
+def _ci_status_section(
+    checks: list[dict[str, Any]] | None,
+    required: tuple[str, ...],
+    checks_json_path: Path,
+) -> str:
+    """Render the $ci_status_section packet block from already-fetched CI data.
+
+    ``run_janitor`` deterministically verifies required checks BEFORE a review
+    packet is ever generated: a definitive required-check failure short-
+    circuits ``review()`` long before this function is reached (see the
+    ``janitor_blocked`` branch). So a reviewer re-reading ``checks.json`` to
+    re-confirm what the gate already verified is pure token waste. This
+    section states that verification result inline instead, while still
+    surfacing everything the gate does NOT resolve: unfetchable CI data, an
+    unconfigured required-check list (the gate is a no-op in that case),
+    still-pending required checks, and failing non-required/informational
+    checks (the gate never blocks on those).
+
+    Pure and I/O-free like ``_janitor_section`` — safe to call every pass.
+    """
+    if checks is None:
+        return (
+            "CI status could not be fetched by the orchestrator (`gh` failure). "
+            f"Do not assume checks are green — inspect `{checks_json_path}` "
+            "directly if CI status matters to this review.\n"
+        )
+
+    if not required:
+        return (
+            "No required checks are configured for this repo, so CI status was "
+            "not deterministically verified before dispatch. Inspect "
+            f"`{checks_json_path}` if CI status is relevant to your review.\n"
+        )
+
+    summary = summarize_checks(checks, required)
+    lines: list[str] = []
+    if summary.passed:
+        lines.append(
+            f"Required check(s) passing — verified deterministically by the "
+            f"orchestrator before dispatch: {', '.join(summary.passed)}. Do "
+            "not spend turns re-inspecting these."
+        )
+    if summary.pending:
+        lines.append(
+            f"Required check(s) still pending, not yet confirmed: {', '.join(summary.pending)}."
+        )
+    lines.append(f"`checks.json` is available at `{checks_json_path}` if a specific doubt arises.")
+
+    non_required_failing, non_required_cancelled = _non_required_check_findings(checks, required)
+    if non_required_failing:
+        lines.append(
+            "Non-required/informational check(s) currently failing (the "
+            "janitor gate does not block on these — weigh them yourself): "
+            + ", ".join(non_required_failing)
+        )
+    if non_required_cancelled:
+        lines.append(
+            "Non-required/informational check(s) cancelled (often infra-transient, "
+            "not necessarily a code failure — weigh them yourself): "
+            + ", ".join(non_required_cancelled)
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _non_required_check_findings(
+    checks: list[dict[str, Any]], required: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Classify non-required checks into (failing, cancelled) name lists.
+
+    Deliberately does NOT reuse ``summarize_checks`` here: its ``else:
+    name_failed = True`` catch-all (checks.py) is correct for REQUIRED checks
+    (any non-passing/non-pending/non-infra state should gate the janitor) but
+    wrong for informational awareness of non-required checks, where it
+    silently swept SKIPPED and NEUTRAL conclusions (a path-filtered or
+    matrix-conditional job that correctly did not run) into "failed", making
+    every such PR's packet falsely claim an unrelated check was "currently
+    failing". ``summarize_checks`` itself must not change — it is the
+    janitor's required-check semantics — so this classifies non-required
+    checks directly from their raw per-run state/bucket instead.
+
+    A genuine failure is FAILURE, INFRA_FAILURE, or any other unrecognized
+    terminal state (e.g. TIMED_OUT, ACTION_REQUIRED) — the same "anything
+    else is a real failure" posture ``summarize_checks`` takes, minus the
+    SKIPPED/NEUTRAL carve-out. CANCELLED is reported separately (worded as
+    "cancelled," never "failing") since it is frequently an infra hiccup
+    rather than a code problem. Multiple runs sharing a name use worst-of
+    semantics, mirroring ``summarize_checks``.
+    """
+    required_set = set(required)
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for check in checks:
+        name = str(check.get("name") or "")
+        if not name or name in required_set:
+            continue
+        by_name.setdefault(name, []).append(check)
+
+    failing: list[str] = []
+    cancelled: list[str] = []
+    for name, runs in by_name.items():
+        name_failed = False
+        name_cancelled = False
+        for check in runs:
+            state = str(check.get("state") or "").upper()
+            bucket = str(check.get("bucket") or "").lower()
+            if state == "SUCCESS" or bucket == "pass":
+                continue
+            if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
+                continue
+            if not state and not bucket:
+                continue
+            if state in {"SKIPPED", "NEUTRAL"}:
+                # Legitimate non-outcomes (path-filtered/matrix-conditional
+                # jobs) — never a failure.
+                continue
+            if state == "CANCELLED":
+                name_cancelled = True
+                continue
+            # FAILURE, INFRA_FAILURE, or any other unrecognized state
+            # (TIMED_OUT, ACTION_REQUIRED, ...): a genuine failure.
+            name_failed = True
+        if name_failed:
+            failing.append(name)
+        elif name_cancelled:
+            cancelled.append(name)
+
+    return tuple(sorted(failing)), tuple(sorted(cancelled))
+
+
 def render_test_adequacy_section(
     facts: TestAdequacyFacts | None, warnings: tuple[str, ...]
 ) -> str:
@@ -1422,6 +1551,29 @@ def _parse_review_verdict_from_files(
             return verdict, str(candidate)
 
     return None
+
+
+def _reviewer_session_metrics(events_path: Path, verdict_source: str) -> dict[str, Any] | None:
+    """Parse reviewer session telemetry for a recorded verdict (perf/spend visibility).
+
+    Returns a dict of ``tokens``/``cost_usd``/``turn_count``/``tool_call_count``/
+    ``verdict_source`` for ``record_review`` to fold into the ``record_review``
+    event and the PR's state entry, or ``None`` when the events.jsonl sidecar
+    is missing or unparseable (devin workers, or a claude-code session launched
+    without tee_stream_json). Never raises: ``parse_claude_events`` already
+    tolerates a missing/malformed file, and a missing telemetry file must never
+    block recording the verdict itself.
+    """
+    progress = parse_claude_events(events_path)
+    if progress is None:
+        return None
+    return {
+        "tokens": progress.tokens,
+        "cost_usd": progress.cost_usd,
+        "turn_count": progress.turn_count,
+        "tool_call_count": progress.tool_call_count,
+        "verdict_source": verdict_source,
+    }
 
 
 def _extract_review_session_summary(
@@ -5823,9 +5975,33 @@ class OrchestratorApp:
             enabled=cross_family,
         )
         prompt_path = pr_dir / "review-prompt.md"
+        decision_path = pr_dir / "review-decision.json"
         diff_size_section = _diff_size_section(
             diff, self.config.review_dispatch.diff_line_threshold, diff_path
         )
+        ci_status_section = _ci_status_section(
+            checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
+        )
+
+        # Single read of review-decision.json, BEFORE rendering: reused both to
+        # build the round-2 $prior_review_section below and, after rendering,
+        # by the stale-verdict reset a few lines down. Previously that reset
+        # was the only reader, and it ran after the prompt was already
+        # rendered — so a prior round's verdict/summary/required_changes were
+        # on disk at render time but never surfaced to the reviewer.
+        existing_decision = self._review_decision(pr_number)
+        prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
+        is_round2_review = (
+            existing_decision.get("decision") not in ("pending", None, "missing", "invalid")
+            and prior_reviewed_head_sha
+            and prior_reviewed_head_sha != pr.get("headRefOid")
+        )
+        prior_review_section = (
+            self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
+            if is_round2_review
+            else ""
+        )
+
         prompt = self._render(
             "review.md",
             {
@@ -5836,12 +6012,13 @@ class OrchestratorApp:
                 "issue_title": issue.get("title", "UNKNOWN"),
                 "issue_url": issue.get("url", ""),
                 "pr_json_path": pr_dir / "pr.json",
-                "checks_json_path": pr_dir / "checks.json",
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
                 "diff_size_section": diff_size_section,
+                "ci_status_section": ci_status_section,
+                "prior_review_section": prior_review_section,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -5853,7 +6030,6 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_at": None,
         }
-        decision_path = pr_dir / "review-decision.json"
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
         else:
@@ -5864,10 +6040,8 @@ class OrchestratorApp:
             # equally stale when the head has advanced, and carrying forward its
             # summary/required_changes misleads the reviewer into re-issuing the
             # same verdict without examining the new diff.
-            existing_decision = self._review_decision(pr_number)
-            reviewed_head_sha = existing_decision.get("reviewed_head_sha")
             if existing_decision.get("decision") not in ("pending", None) and (
-                reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
+                prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
         with state_lock(self.paths.state_file):
@@ -6251,12 +6425,16 @@ class OrchestratorApp:
                 continue
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
+            session_metrics = _reviewer_session_metrics(
+                _events_path(reviews_dir, pr_number, review=True), verdict_source
+            )
             result = self.record_review(
                 pr_number,
                 verdict["decision"],
                 summary=verdict["summary"],
                 reviewed_head=packet_head_sha,
                 required_changes=verdict["required_changes"],
+                session_metrics=session_metrics,
             )
             if result.ok:
                 recorded.append(
@@ -6876,6 +7054,7 @@ class OrchestratorApp:
         comment: bool = False,
         reviewed_head: str | None = None,
         required_changes: Sequence[str] | None = None,
+        session_metrics: dict[str, Any] | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -7071,6 +7250,14 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reviewer session token/cost telemetry (best-effort): merge-update
+                # so a call without metrics (e.g. a manual `charlie verdict`)
+                # never clobbers metrics recorded by an earlier automated reap.
+                "review_session_metrics": (
+                    session_metrics
+                    if session_metrics is not None
+                    else pr_state.get("review_session_metrics")
+                ),
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
@@ -7113,11 +7300,14 @@ class OrchestratorApp:
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
                     state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-            state = self._record_event(
-                state,
-                "record_review",
-                {"pr_number": pr_number, "decision": decision, "escalated": escalated},
-            )
+            event_payload: dict[str, Any] = {
+                "pr_number": pr_number,
+                "decision": decision,
+                "escalated": escalated,
+            }
+            if session_metrics is not None:
+                event_payload["session_metrics"] = session_metrics
+            state = self._record_event(state, "record_review", event_payload)
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # decision above is the authority; a label failure is reported, not fatal.
@@ -8387,6 +8577,76 @@ class OrchestratorApp:
             head_ref_oid=pr.get("headRefOid"),
         )
         return self._cross_family_section(result.report_path), result
+
+    def _build_prior_review_section(
+        self,
+        pr_dir: Path,
+        prior_decision: dict[str, Any],
+        new_head_sha: str | None,
+    ) -> str:
+        """Render ``$prior_review_section`` for a round-2+ review packet.
+
+        Only called when the prior decision is a terminal, non-pending
+        verdict recorded against a head that differs from the live PR head
+        (a genuine rework round, not a first-round review). Surfaces round-1
+        findings (decision/summary/required changes) plus an interdiff
+        (prior reviewed head -> new head) so the reviewer has somewhere to
+        start, without losing sight of the full diff: the interdiff is
+        "start here," never "only look here" -- the full diff stays
+        attached and remains authoritative for findings outside it.
+
+        Fail-safe posture mirrors janitor.py's patch-id carry-forward
+        (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
+        here (``compare_diff``) already returns errors as values (``None``),
+        never raises, so a failed/unavailable comparison (404, GC'd SHA,
+        rebase/divergence, gh failure) just omits the interdiff and says so
+        -- it never blocks packet generation.
+        """
+        prior_head_sha = prior_decision.get("reviewed_head_sha")
+        decision = prior_decision.get("decision") or "unknown"
+        summary = str(prior_decision.get("summary") or "").strip()
+        required_changes = prior_decision.get("required_changes")
+        if not isinstance(required_changes, list):
+            required_changes = []
+
+        lines = [
+            "",
+            "## Prior review (round 1, earlier head)",
+            "",
+            f"A previous review round on an earlier head (`{prior_head_sha}`) "
+            f"recorded decision **{decision}**. These are round-1 findings on "
+            "a DIFFERENT diff than the one you are reviewing now -- verify "
+            "each one against the current code, don't assume it still applies.",
+            "",
+        ]
+        if summary:
+            lines.append(f"Round-1 summary: {summary}")
+            lines.append("")
+        if required_changes:
+            lines.append("Round-1 required changes:")
+            lines.extend(f"- {change}" for change in required_changes)
+            lines.append("")
+
+        interdiff_text = None
+        if prior_head_sha and new_head_sha:
+            interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
+        if interdiff_text and interdiff_text.strip():
+            interdiff_path = pr_dir / "interdiff.patch"
+            interdiff_path.write_text(interdiff_text, encoding="utf-8")
+            lines.append(
+                f"Interdiff (round-1 head to this head): `{interdiff_path}`. Verify "
+                "each required change above is addressed there first -- but the "
+                "full diff remains authoritative; findings outside the interdiff "
+                "are still in scope."
+            )
+        else:
+            lines.append(
+                "Prior-head comparison was unavailable (rebase, divergence, or an "
+                "API error) -- no interdiff could be generated. Review the full "
+                "diff as usual, with the round-1 findings above in mind."
+            )
+        lines.append("")
+        return "\n".join(lines)
 
     def reconcile(self, *, fix: bool = False) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the

@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from charlie_work import claude_code
-from charlie_work.config import ClaudeCodeConfig, OrchestratorConfig, RuntimeConfig
+from charlie_work.config import (
+    ClaudeCodeConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+    RuntimeConfig,
+)
 from charlie_work.claude_code import (
     ClaudeProgress,
     ClaudeWorkerRecord,
@@ -2882,6 +2887,92 @@ def test_launch_claude_worker_review_pins_configured_model_by_default(
     assert "--model" in record.command
     idx = record.command.index("--model")
     assert record.command[idx + 1] == ClaudeCodeConfig().model
+
+
+def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path) -> None:
+    """A reviewer session must pin review_dispatch.review_effort over
+    claude_code.effort when review_effort is explicitly set."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+    )
+
+    record = launch_claude_worker(
+        503,
+        "agent/issue-503-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "high"
+
+
+def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset(
+    tmp_path: Path,
+) -> None:
+    """review_effort empty (the default) must fall back to claude_code.effort,
+    same as any other reviewer launch before this config knob existed."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="medium"),
+        review_dispatch=ReviewDispatchConfig(review_effort=""),
+    )
+
+    record = launch_claude_worker(
+        504,
+        "agent/issue-504-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "medium"
+
+
+def test_launch_claude_worker_worker_never_uses_review_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker (non-review) launch must never pick up review_effort, even
+    when it's set and differs from claude_code.effort."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+    )
+
+    record = launch_claude_worker(
+        43,
+        "agent/issue-43-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "low"
 
 
 def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
