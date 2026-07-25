@@ -6198,6 +6198,16 @@ class OrchestratorApp:
                                 **ps,
                                 "review_turn_limit_summary_posted": True,
                             }
+                            state = append_event(
+                                state,
+                                "review_verdict_missed",
+                                {
+                                    "pr_number": pr_number,
+                                    "issue_number": issue_number,
+                                    "reason": "turn_limit_summary_posted",
+                                },
+                                state_path=self.paths.state_file,
+                            )
                             save_state(self.paths.state_file, state)
                         missed.append(
                             {
@@ -6226,11 +6236,25 @@ class OrchestratorApp:
                     }
                 )
             else:
+                reason = result.message or "record_review failed"
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "review_verdict_missed",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": reason,
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
                 missed.append(
                     {
                         "pr": pr_number,
                         "issue": issue_number,
-                        "reason": result.message or "record_review failed",
+                        "reason": reason,
                     }
                 )
 
@@ -6397,6 +6421,7 @@ class OrchestratorApp:
         # Also escalate PRs that have exhausted their dispatch attempt budget.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
         escalated_for_labels: list[tuple[int, int | None]] = []
+        escalated_skipped: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Escalate PRs whose dispatch attempt count has reached the cap.
@@ -6407,6 +6432,35 @@ class OrchestratorApp:
             for c in candidates:
                 pr_key = str(c["pr"])
                 pr_state = state["prs"].get(pr_key, {})
+                # Escalation gate (issue #575): a PR whose pr-state status is
+                # "escalated", or whose linked issue's state status is
+                # "escalated", is awaiting a human and must never be
+                # re-dispatched or re-escalated -- record_review's escalation
+                # guard (~line 6823) refuses the verdict anyway, so dispatching
+                # here only burns provider quota on a session whose result is
+                # thrown away and then silently lost (the live incident behind
+                # this fix: issue #480/PR #540). This must run BEFORE the
+                # attempt-cap escalation below too: an issue that gets
+                # escalated by an independent path (not this attempt-cap
+                # branch) while its PR is already sitting at the cap must not
+                # trigger a second, bogus "max_review_dispatch_attempts_exceeded"
+                # escalation on top of it. No per-pass event is emitted for the
+                # skip itself (see review_dispatch_escalated below for the
+                # human-facing signal) because this condition holds every pass
+                # while a human has not yet resolved the escalation; emitting a
+                # duplicate event each pass would spam the event log.
+                issue_num_gate = pr_state.get("issue_number") or c.get("issue")
+                issue_state_gate = (
+                    state["issues"].get(str(issue_num_gate), {})
+                    if issue_num_gate is not None
+                    else {}
+                )
+                if (
+                    pr_state.get("status") == "escalated"
+                    or issue_state_gate.get("status") == "escalated"
+                ):
+                    escalated_skipped.append(c["pr"])
+                    continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 if pr_state.get(
                     "review_dispatch_status"
@@ -6455,10 +6509,17 @@ class OrchestratorApp:
                     escalated_for_labels.append((int(c["pr"]), issue_num))
             if changed:
                 save_state(self.paths.state_file, state)
+            # The escalation gate above already filtered out escalated
+            # candidates (and recorded them in escalated_skipped) before any
+            # attempt-count or claim mutation ran for them; here we only need
+            # to exclude those same PR numbers so this second pass over
+            # candidates doesn't re-select them via _is_review_dispatchable.
+            escalated_skipped_set = set(escalated_skipped)
             dispatchable = [
                 c
                 for c in candidates
-                if _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
+                if c["pr"] not in escalated_skipped_set
+                and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
             ]
 
         # Apply the human-needed label edge for each fresh escalation, outside
@@ -6522,6 +6583,7 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_count": len(candidates) - len(selected),
+                    "escalated_skipped": escalated_skipped,
                     **local_cap.report_fields(),
                 },
             )
@@ -6766,6 +6828,7 @@ class OrchestratorApp:
             "probe_mode": probe_mode,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
+            "escalated_skipped": escalated_skipped,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
         }
