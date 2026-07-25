@@ -14,6 +14,7 @@ from charlie_work.config import (
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RuntimeConfig,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -196,6 +197,189 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+
+
+def test_load_config_review_effort_experiment_defaults() -> None:
+    """review_effort_experiment_fraction/salt default to disabled (0.0/'')."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.0
+    assert config.review_dispatch.review_effort_experiment_salt == ""
+
+
+def test_load_config_review_effort_experiment_override(tmp_path: Path) -> None:
+    """review_effort_experiment_fraction/salt are read from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort: medium
+  review_effort_experiment_fraction: 0.25
+  review_effort_experiment_salt: epoch-2
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.review_effort == "medium"
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.25
+    assert config.review_dispatch.review_effort_experiment_salt == "epoch-2"
+
+
+def test_load_config_review_effort_experiment_fraction_rejects_bool(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort_experiment_fraction: true
+""",
+    )
+    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+        load_config(config_file)
+
+
+def test_load_config_review_effort_experiment_fraction_rejects_non_number(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort_experiment_fraction: "0.5"
+""",
+    )
+    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, 2, -1])
+def test_load_config_review_effort_experiment_fraction_rejects_out_of_range(
+    tmp_path: Path, value: float
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        f"""review_dispatch:
+  review_effort_experiment_fraction: {value}
+""",
+    )
+    with pytest.raises(
+        ConfigError, match=r"review_effort_experiment_fraction.*must be in \[0.0, 1.0\]"
+    ):
+        load_config(config_file)
+
+
+def test_load_config_review_effort_experiment_fraction_without_effort_rejected(
+    tmp_path: Path,
+) -> None:
+    """fraction > 0.0 with review_effort unset (default '') must fail loud at
+    load time -- treatment would otherwise silently mean 'no --effort pin'."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort_experiment_fraction: 0.25
+""",
+    )
+    with pytest.raises(
+        ConfigError,
+        match="review_effort_experiment_fraction.*is 0.25 but 'review_effort' is unset",
+    ):
+        load_config(config_file)
+
+
+def test_load_config_review_effort_experiment_fraction_with_effort_accepted(
+    tmp_path: Path,
+) -> None:
+    """fraction > 0.0 WITH review_effort set is a valid, accepted config."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort: high
+  review_effort_experiment_fraction: 0.25
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.review_effort == "high"
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.25
+
+
+def test_load_config_review_effort_experiment_fraction_zero_without_effort_accepted() -> None:
+    """The default config (fraction=0.0, review_effort unset) must keep loading."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.review_dispatch.review_effort_experiment_fraction == 0.0
+    assert config.review_dispatch.review_effort == ""
+
+
+def test_load_config_review_effort_experiment_salt_rejects_non_str(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  review_effort_experiment_salt: 123
+""",
+    )
+    with pytest.raises(ConfigError, match="review_effort_experiment_salt.*must be a string"):
+        load_config(config_file)
+
+
+def test_runtime_config_event_ring_size_default() -> None:
+    """Issue #525: RuntimeConfig.event_ring_size defaults to 2000."""
+    assert RuntimeConfig().event_ring_size == 2000
+
+
+def test_load_config_event_ring_size_override(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size is configurable from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 5000
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.event_ring_size == 5000
+
+
+def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size must be an int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: "lots"
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_zero(tmp_path: Path) -> None:
+    """Issue #525: event_ring_size=0 is rejected — it would disable truncation.
+
+    append_event truncates via events[-max_size:]; because -0 == 0 in Python,
+    max_size=0 yields events[0:] (the FULL list), causing unbounded growth —
+    the exact failure the cap exists to prevent. There is no sensible "disable"
+    semantic for a bounded ring, so 0 is invalid.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
+    """Issue #525: negative event_ring_size is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: -5
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
 
 
 def test_load_config_runtime_throttle_resume_margin_default() -> None:
