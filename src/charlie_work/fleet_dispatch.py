@@ -277,6 +277,49 @@ def _run_fleet_allocation_prologue(
     events: list[dict[str, Any]] = []
 
     allocation = getattr(global_config, "runner_allocation", None)
+
+    # Unconditional, before any branch. This line is the whole difference
+    # between "the prologue ran and declined" and "the prologue was never
+    # reached" — and #590 stayed unisolated for hours precisely because every
+    # skip path lived inside a branch, so an absent log line was consistent
+    # with both readings and could not be used as evidence either way. Logging
+    # the resolved decision inputs here, where nothing can short-circuit past
+    # them, means the next occurrence names its own cause.
+    logger.info(
+        "Fleet allocation prologue: entered (enabled=%s, budget=%s, managed_root=%s, "
+        "fleet_dir=%s, dry_run=%s)",
+        getattr(allocation, "enabled", None),
+        getattr(allocation, "max_running_runners", None),
+        getattr(allocation, "managed_root", None) or "(unset)",
+        fleet_dir(override=fleet_dir_override),
+        dry_run,
+    )
+
+    def skipped(reason: str) -> list[dict[str, Any]]:
+        """Record an anomalous skip in the digest, not only in the log.
+
+        The log is a host-local file that rotates and has been demonstrably
+        lossy here; the digest is the structured surface operators actually
+        read. A prologue that cannot act for a reason nobody chose belongs in
+        the same place its errors go.
+        """
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation_skipped",
+                "reason": reason,
+            }
+        )
+        return events
+
+    if global_config is None:
+        # No global fleet config supplied at all — this is the documented default
+        # of fleet_loop's parameter, not a disagreement between code and config,
+        # so it must not be reported as an anomaly. Host-wide allocation has
+        # nothing to read here; the entry line above already records that the
+        # prologue was reached, which is the distinction #590 needed.
+        logger.info("Fleet allocation prologue: not run — no global fleet config was supplied")
+        return events
     if allocation is None:
         # The config object has no such section at all. That is not "the
         # operator left it off" — it means this process is holding a config
@@ -287,7 +330,9 @@ def _run_fleet_allocation_prologue(
             "section (%s); allocation cannot run in this process",
             type(global_config).__name__,
         )
-        return events
+        return skipped(
+            f"config object has no runner_allocation section ({type(global_config).__name__})"
+        )
     if not allocation.enabled:
         # INFO, not DEBUG. This is the branch that makes the entire feature inert,
         # and the daemon runs at INFO, so a DEBUG line here is never written at
@@ -297,6 +342,11 @@ def _run_fleet_allocation_prologue(
         # Name the fleet directory too — it identifies *which* config.yaml
         # governs, which is the thing an operator gets wrong when they set a
         # host-wide knob in a per-repo layer.
+        # Deliberately log-only, unlike the other early returns: this is a state
+        # the operator chose, so a digest entry every pass would be recurring
+        # noise on any host that simply runs without allocation. The entry line
+        # above already distinguishes it from "never reached", which was the
+        # evidence gap that mattered.
         logger.info(
             "Fleet allocation prologue: not run — runner_allocation.enabled is false "
             "in the resolved config (fleet dir: %s)",
@@ -321,7 +371,7 @@ def _run_fleet_allocation_prologue(
 
     if anchor_root is None:
         logger.info("Fleet allocation prologue: no usable repo root in registry, skipping")
-        return events
+        return skipped("no usable repo root in the fleet registry")
 
     runtime = getattr(global_config, "runtime", None)
     runner_scaling = getattr(global_config, "runner_scaling", None)
@@ -926,6 +976,23 @@ def _build_fleet_attention_digest(
                     previous_health=None,
                     last_log_line=event.get("reason"),
                     pid=None,
+                )
+            )
+        else:
+            # Visible by default. This chain used to end here, so any event type
+            # without an explicit branch was dropped silently — which is how the
+            # prologue's own ``runner_allocation_error`` never reached the digest
+            # despite being emitted correctly (issue #590). Making the fallback
+            # generic means adding an event type can no longer make it invisible;
+            # forgetting a branch costs a less specific entry, not a lost signal.
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event.get("repo_key", "fleet"),
+                    health="ERROR" if "error" in event_type else "INFO",
+                    previous_health=None,
+                    last_log_line=event.get("error") or event.get("reason") or event_type,
+                    pid=event.get("pid"),
                 )
             )
 
