@@ -5365,10 +5365,6 @@ class OrchestratorApp:
                 ok = request.issue_number in successful_issue_numbers
                 is_live_worker = request.issue_number in live_worker_issue_numbers
                 is_phantom_live_worker = request.issue_number in phantom_live_worker_issue_numbers
-                result = next(
-                    (r for r in dispatch_results if r.issue_number == request.issue_number),
-                    None,
-                )
                 prev_entry = state["issues"].get(str(request.issue_number), {})
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
@@ -5383,12 +5379,14 @@ class OrchestratorApp:
                     # label repair) instead of keeping the phantom slot
                     # occupied. The slot is freed and the issue becomes
                     # dispatchable again without burning a redispatch attempt.
+                    # A dispatched request's issue can never have an open
+                    # tracked PR -- candidate selection excludes every issue in
+                    # pr_by_issue -- so the rework-routing case is handled by
+                    # the dead-session reaper lane, not here.
                     status, dispatched_at, state = self._route_phantom_live_worker(
                         state,
                         request,
-                        result,
                         full_issue,
-                        pr_by_issue,
                         sessions_dir,
                     )
                 else:
@@ -11219,9 +11217,7 @@ class OrchestratorApp:
         self,
         state: dict[str, Any],
         request: SessionRequest,
-        result: SessionDispatchResult | None,
         full_issue: dict[str, Any],
-        pr_by_issue: dict[int, dict[str, Any]],
         sessions_dir: Path,
     ) -> tuple[str, str | None, dict[str, Any]]:
         """Route a phantom ``live_worker_redispatch_averted`` result as dead.
@@ -11229,19 +11225,22 @@ class OrchestratorApp:
         The adapter reported a live worker, but the recorded PID failed the
         OS-level liveness + identity check (issue #523). Remove the stale
         sidecar/marker so the session no longer occupies a concurrency slot,
-        then route the issue using the same dead-worker rules the
-        ``_reap_dead_sessions`` lane uses:
+        then strip active labels and restore ``automated-ready`` so the issue
+        is dispatchable again, recording a single
+        ``session_failed_relabeled`` attention event.
 
-        * Open PR with a live ``request_changes`` verdict at the same head SHA
-          -> ``rework_requested`` (handed back to the rework lane).
-        * Otherwise strip active labels and restore ``automated-ready`` so the
-          issue is dispatchable again, recording a single
-          ``session_failed_relabeled`` attention event.
+        This mirrors ``_classify_dead_sessions_and_update_throttle_state``'s
+        no-open-PR relabel path. The open-PR/rework-routing case is
+        intentionally NOT handled here: a dispatched request's issue can never
+        have an open tracked PR, because ``_dispatch_impl`` builds
+        ``pr_by_issue`` once and candidate selection excludes every issue in
+        it (so ``request.issue_number`` is never in ``pr_by_issue``). A phantom
+        worker whose issue later opens a PR is routed to rework by the
+        dead-session reaper lane, not by dispatch.
 
         Returns ``(status, dispatched_at, state)``. The status is
-        ``"dispatch_failed"`` (or ``"rework_requested"``) so the caller's
-        entry-building frees the slot; ``dispatched_at`` is ``None`` because no
-        worker was actually launched.
+        ``"dispatch_failed"`` so the caller's entry-building frees the slot;
+        ``dispatched_at`` is ``None`` because no worker was actually launched.
         """
         issue_number = request.issue_number
 
@@ -11252,38 +11251,10 @@ class OrchestratorApp:
             if w.issue_number == issue_number:
                 w.reap_sidecar(sessions_dir)
 
-        # Route an open PR with a live request_changes verdict to rework,
-        # mirroring _reap_dead_sessions' open-PR branch.
-        pr_data = pr_by_issue.get(issue_number)
-        if pr_data is not None:
-            pr_number = int(pr_data["number"])
-            live_head_sha = pr_data.get("headRefOid")
-            pr_state = state.get("prs", {}).get(str(pr_number), {})
-            last_decision = pr_state.get("decision")
-            reviewed_head_sha = pr_state.get("reviewed_head_sha")
-            if (
-                last_decision == "request_changes"
-                and reviewed_head_sha is not None
-                and live_head_sha is not None
-                and reviewed_head_sha == live_head_sha
-            ):
-                transition(self.gh, self.config.labels, issue_number, "rework_requested")
-                state = append_event(
-                    state,
-                    "rework_requeued",
-                    {
-                        "issue_number": issue_number,
-                        "pr_number": pr_number,
-                        "reason": "phantom_live_worker_pid_dead",
-                    },
-                    state_path=self.paths.state_file,
-                )
-                return "rework_requested", None, state
-
-        # No open PR (or not a clean request_changes case): strip active labels
-        # and ensure the ready label is present so the issue becomes
-        # dispatchable. This mirrors _reap_dead_sessions' no-open-PR relabel
-        # path, gated on an active label actually being present so a
+        # Strip active labels and ensure the ready label is present so the
+        # issue becomes dispatchable. This mirrors
+        # _classify_dead_sessions_and_update_throttle_state's no-open-PR
+        # relabel path, gated on an active label actually being present so a
         # terminal-only issue is never given ``ready`` back spuriously.
         issue_labels = label_names(full_issue)
         active_labels = issue_labels & self.config.labels.active

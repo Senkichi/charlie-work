@@ -10275,6 +10275,122 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     assert result2.data["live_worker_count"] == 0
 
 
+def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #523: a phantom live worker whose issue carries only a terminal
+    label (no active labels) must still free the slot and reap the sidecar,
+    but must NOT strip any label or add ``ready`` back -- the issue is
+    terminal-only and spurious relabeling would resurrect it. A
+    ``session_failed_relabeled`` event with empty ``removed_labels`` and
+    ``added_ready=False`` is still recorded so the slot-free is observable."""
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / "wt"),
+            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=5353,
+            started_at="2026-07-03T00:00:00Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=2_345_678.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    # issue_list returns only ``automated-ready`` so the issue is selectable
+    # (_is_dispatchable is label-only on the list view). issue_view -- the
+    # full_issue the phantom router reads -- reports only a terminal label,
+    # simulating an issue that was already escalated to a human while a stale
+    # dispatched sidecar lingered.
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [{"name": "agent:human-needed"}],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "agent/issue-123-fix-search",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 5353,
+                "started_at": "2026-07-03T00:00:00Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 2_345_678.0,
+                "session_id": "test-session-5353",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 5353,
+        "worker_process_start_time": 2_345_678.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is not counted as a live slot.
+    assert result.data["live_worker_count"] == 0
+    assert result.data["phantom_live_worker_count"] == 1
+    # The stale sidecar is reaped regardless of label state.
+    assert not sidecar_path.exists()
+    # The slot is freed: worker_pid cleared, status no longer "dispatched".
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert "worker_pid" not in state["issues"]["123"]
+    assert "worker_process_start_time" not in state["issues"]["123"]
+    # No labels are touched: the terminal label is not stripped and ready is
+    # not added back (the issue is terminal-only).
+    assert fake_gh.labels_removed == []
+    assert (123, "automated-ready") not in fake_gh.labels_added
+    # A session_failed_relabeled event is still emitted with empty
+    # removed_labels and added_ready=False so the slot-free is observable.
+    relabel_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_pid_dead"
+    ]
+    assert len(relabel_events) == 1
+    payload = relabel_events[0]["payload"]
+    assert payload["removed_labels"] == []
+    assert payload["added_ready"] is False
+    assert payload["label_write_ok"] is True
+
+
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
