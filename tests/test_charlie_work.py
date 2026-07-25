@@ -10899,6 +10899,144 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     assert persisted["status"] != "merged"
 
 
+def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: an approved PR carrying the configured merge-hold label
+    must not be swept back into the mergequeue on subsequent passes."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["labels"] = [{"name": config.labels.merge_hold}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "left alone" in result.message
+    assert load_state(paths.state_file)["prs"]["456"].get("status") != "mergequeue"
+
+
+def test_merge_ready_mergequeue_hold_label_on_issue_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: the merge-hold label on the linked issue is also a
+    valid operator signal and must keep the PR out of the mergequeue."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.merge_hold},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path) -> None:
+    """Issue #496: removing the merge-hold label restores normal
+    auto-merge behavior on the next pass."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    hold_label = config.labels.merge_hold
+    fake_gh.prs[0]["labels"] = [{"name": hold_label}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    held = app.merge_ready(456, merge=True)
+    assert held.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+
+    # Operator removes the hold label
+    fake_gh.prs[0]["labels"] = []
+    resumed = app.merge_ready(456, merge=True)
+
+    assert resumed.data["merge_hold"] is False
+    assert resumed.data["mergequeue_label_applied"] is True
+    assert (456, "mergequeue") in fake_gh.pr_labels_added
+
+
+def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_path: Path) -> None:
+    """Issue #496 regression: if issue_view fails while checking for the
+    merge-hold label on the linked issue, the PR must not be handed to the
+    mergequeue. The failure is reported as merge_hold_check_unavailable and
+    must not be treated as a mergequeue handoff failure (no failed-attempt
+    alarm side effects)."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewFailGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                raise _GitHubError("transient gh issue view failure")
+            return super().issue_view(number)
+
+    fake_gh = IssueViewFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "merge-hold check unavailable" in result.message
+    assert "not handed off to Aviator" in result.message
+    pr_state = load_state(paths.state_file)["prs"]["456"]
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("consecutive_failed_merge_attempts", 0) == 0
+
+
+@pytest.mark.parametrize("degraded_payload", [{}, {"number": 123}])
+def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
+    tmp_path: Path,
+    degraded_payload: dict[str, Any],
+) -> None:
+    """Issue #496 regression: a degraded gh issue view payload (empty dict or
+    missing labels) must be treated as unavailable, not as "no hold"."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewDegradedGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                return degraded_payload
+            return super().issue_view(number)
+
+    fake_gh = IssueViewDegradedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+
+
 def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
     """An unapproved PR must never be labeled for the merge queue — the
     approval gate (can_merge) is upstream of the mergequeue branch, exactly as

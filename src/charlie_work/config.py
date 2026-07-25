@@ -92,6 +92,7 @@ class LabelConfig:
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
+    merge_hold: str = "agent:merge-hold"
     # Routing hint, NOT a workflow state (issue #481). Never a member of
     # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
     # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
@@ -121,12 +122,21 @@ class LabelConfig:
             self.done,
             self.human_needed,
             self.prose_only_deps,
+            self.merge_hold,
             self.complexity_high,
         ]
 
     @property
     def workflow_labels(self) -> set[str]:
-        """All workflow labels (agent:* states) excluding the ready marker."""
+        """All workflow labels (agent:* states) excluding the ready marker.
+
+        ``merge_hold`` is intentionally excluded: it is a transient operator
+        signal, not a workflow state. Including it here would make every
+        non-terminal transition (``review_started``, ``rework_requested``, …)
+        strip the hold from the issue, violating the issue #496 persistence
+        requirement. Terminal transitions strip it explicitly via ``extra_remove``
+        (see ``labels._edges``).
+        """
         return {
             self.queued,
             self.in_progress,

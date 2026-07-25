@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from charlie_work.config import OrchestratorConfig, PostMortemConfig
+from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
 from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
@@ -24,6 +24,10 @@ from charlie_work.reconcile import (
 from charlie_work.state import empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
 from charlie_work.workflow import OrchestratorApp
+
+# Module-level default label config for parametrize decorators that need
+# label strings at collection time (before any test creates an OrchestratorConfig).
+_config_labels = LabelConfig()
 
 
 class FakeGitHub:
@@ -1674,6 +1678,79 @@ def test_terminal_transition_clears_sibling_workflow_labels() -> None:
 
     # Verify agent:done was NOT removed (it's the target state)
     assert (852, config.labels.done) not in gh.labels_removed
+
+
+def test_merged_transition_removes_merge_hold_label() -> None:
+    """Issue #496: merge-hold is a transient operator control and must be
+    stripped when an issue reaches the terminal merged state."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(10, [config.labels.merge_hold, config.labels.in_progress])],
+    )
+
+    result = transition(gh, config.labels, 10, "merged")
+
+    assert result.outcome == TO.APPLIED
+    assert (10, config.labels.done) in gh.labels_added
+    assert (10, config.labels.merge_hold) in gh.labels_removed
+    assert (10, config.labels.in_progress) in gh.labels_removed
+
+
+def test_closed_unmerged_transition_removes_merge_hold_label() -> None:
+    """Issue #496: merge-hold must also be stripped when an issue is closed
+    without merging, matching the transient-operator model."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[
+            _issue(10, [config.labels.merge_hold, config.labels.pr_open, config.labels.ready])
+        ],
+    )
+
+    result = transition(gh, config.labels, 10, "closed_unmerged")
+
+    assert result.outcome == TO.APPLIED
+    assert (10, config.labels.merge_hold) in gh.labels_removed
+    assert (10, config.labels.pr_open) in gh.labels_removed
+    assert (10, config.labels.ready) in gh.labels_removed
+
+
+@pytest.mark.parametrize(
+    "event,expected_add",
+    [
+        ("review_started", (_config_labels.pr_open, _config_labels.reviewing)),
+        ("rework_requested", (_config_labels.needs_rework,)),
+        ("review_approved", (_config_labels.pr_open,)),
+        ("escalated", (_config_labels.human_needed,)),
+    ],
+)
+def test_non_terminal_transition_preserves_merge_hold_label(
+    event: str, expected_add: tuple[str, ...]
+) -> None:
+    """Issue #496 regression: a non-terminal transition must NOT strip the
+    merge-hold label from the issue. If it did, an operator's hold on the
+    linked issue would be silently removed by the next review/rework cycle,
+    and the PR would be swept back into the mergequeue."""
+    from charlie_work.labels import transition, TransitionOutcome as TO
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(10, [config.labels.merge_hold, config.labels.in_progress])],
+    )
+
+    result = transition(gh, config.labels, 10, event)
+
+    assert result.outcome == TO.APPLIED
+    for label in expected_add:
+        assert (10, label) in gh.labels_added
+    # The hold must survive — it must never appear in labels_removed.
+    assert (10, config.labels.merge_hold) not in gh.labels_removed
 
 
 def test_apply_fixes_multi_item_with_one_failed_label_write() -> None:
