@@ -33,6 +33,18 @@ _STALE_CLAIM_TIMEOUT_MINUTES = 30
 # throttle, while still avoiding thrash on flaky launch paths.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
+# Orphan backstop for dead-reviewer claims at the CLAIM stage (issue #571).
+# A dispatched claim whose reviewer has died must be dispositioned by the
+# stalled-review sweep first (throttle classification, probe-failure count,
+# sidecar reap, events) — the claim stage racing it on the same 5-minute
+# timeout measured later in the pass produced a deterministic livelock:
+# every relaunch reset the clock just after the sweep looked, so the sweep
+# never saw a stale claim and quota backoff never engaged. 3x the stale
+# timeout gives the sweep three windows of first refusal while still
+# self-healing true orphans (e.g. a crash before the sidecar was written,
+# which the worker-iterating sweep cannot see).
+_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES = _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES * 3
+
 # Every literal ever assigned to `issues[n]["status"]` across the
 # orchestrator's dispatch -> review -> rework -> merge lifecycle (workflow.py).
 # reconcile.py's status-normalization sweep treats any issue record whose

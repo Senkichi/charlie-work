@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -248,6 +248,75 @@ def _events_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def iter_stream_json_events(text: str) -> Iterator[dict[str, Any]]:
+    """Yield parsed stream-json events from tee'd JSONL text.
+
+    Claude Code's ``--output-format stream-json`` emits one JSON object per
+    line. Both the plaintext ``.log`` and the ``.events.jsonl`` sidecar carry
+    this format when ``tee_stream_json`` is enabled. Non-JSON lines (plain
+    stderr noise, truncated tails) are skipped, not raised.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def extract_event_text(event: dict[str, Any]) -> str:
+    """Assistant-visible text carried by one stream-json event.
+
+    Real stream-json shapes (``--output-format stream-json``):
+
+    - ``{"type": "assistant", "message": {"content": [{"type": "text", ...}]}}``
+      — concatenates ``text`` blocks. ``thinking`` blocks are deliberately
+      excluded: they can contain draft verdicts the model later revised.
+    - ``{"type": "result", "result": "<final output text>"}``
+
+    Legacy/simplified shape (``{"type": "assistant_message", "content": ...}``
+    with string, block-list, or dict content) is still honored so any adapter
+    emitting it keeps working. Returns ``""`` for events carrying no text.
+    """
+    event_type = event.get("type")
+
+    if event_type == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return ""
+
+    if event_type == "result":
+        result = event.get("result")
+        return result if isinstance(result, str) else ""
+
+    if event_type == "assistant_message":
+        content = event.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        if isinstance(content, dict):
+            return str(content.get("text", ""))
+
+    return ""
+
+
 @dataclass(frozen=True)
 class ClaudeProgress:
     """Progress metrics parsed from Claude Code's stream-json events.
@@ -304,15 +373,59 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
                 if not isinstance(event, dict):
                     continue
 
-                # Count tool calls
-                if event.get("type") == "tool_call":
-                    tool_call_count += 1
+                event_type = event.get("type")
 
-                # Count turns (user/assistant exchanges)
-                if event.get("type") in ("user_message", "assistant_message"):
+                # Real stream-json schema (--output-format stream-json):
+                # assistant events carry message.content blocks; tool calls
+                # appear as tool_use blocks; the final result event reports
+                # authoritative num_turns / total_cost_usd / usage.
+                if event_type == "assistant":
                     turn_count += 1
+                    message = event.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if isinstance(content, list):
+                        tool_call_count += sum(
+                            1
+                            for block in content
+                            if isinstance(block, dict) and block.get("type") == "tool_use"
+                        )
+                    usage = message.get("usage") if isinstance(message, dict) else None
+                    if isinstance(usage, dict):
+                        per_request = sum(
+                            v
+                            for v in (
+                                usage.get("input_tokens"),
+                                usage.get("output_tokens"),
+                            )
+                            if isinstance(v, int)
+                        )
+                        if per_request:
+                            tokens = (tokens or 0) + per_request
+                elif event_type == "result":
+                    num_turns = event.get("num_turns")
+                    if isinstance(num_turns, int) and num_turns > 0:
+                        turn_count = max(turn_count, num_turns)
+                    total_cost = event.get("total_cost_usd")
+                    if isinstance(total_cost, (int, float)):
+                        cost_usd = float(total_cost)
+                    usage = event.get("usage")
+                    if isinstance(usage, dict):
+                        final_tokens = sum(
+                            v
+                            for v in (
+                                usage.get("input_tokens"),
+                                usage.get("output_tokens"),
+                            )
+                            if isinstance(v, int)
+                        )
+                        if final_tokens:
+                            tokens = final_tokens
 
-                # Extract cumulative usage fields (take last-seen value)
+                # Legacy/simplified schema kept for adapters that emit it.
+                if event_type == "tool_call":
+                    tool_call_count += 1
+                if event_type in ("user_message", "assistant_message"):
+                    turn_count += 1
                 if "tokens" in event and isinstance(event["tokens"], int):
                     tokens = event["tokens"]
                 if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):

@@ -18,7 +18,13 @@ from .adapters import (
     SessionRequest,
     dispatch_sessions,
 )
-from .claude_code import _events_path, launch_claude_worker, parse_claude_events
+from .claude_code import (
+    _events_path,
+    extract_event_text,
+    iter_stream_json_events,
+    launch_claude_worker,
+    parse_claude_events,
+)
 from .checks import CheckSummary, summarize_checks
 from .config import (
     AutoMergeConfig,
@@ -81,6 +87,7 @@ from .worktree import (
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
+    _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
     clear_reviewer_quota,
@@ -1153,9 +1160,18 @@ def _is_review_dispatchable(
     if status == "review_dispatch_dispatched":
         if _reviewer_pid_alive(pr_state):
             return False
+        # Dead reviewer: the stalled-review sweep must disposition this claim
+        # first — it classifies throttle tails, counts probe failures, reaps
+        # the sidecar, and emits events; freeing here does none of that.
+        # Racing the sweep on the same 5-minute timeout measured later in the
+        # pass livelocked probes during closed quota windows (issue #571):
+        # each silent relaunch reset the clock just after the sweep looked,
+        # so backoff never engaged and a 429'd probe launched every pass.
+        # The longer backstop frees only true orphans the sweep cannot see
+        # (e.g. died before its sidecar was written).
         dispatched_at = pr_state.get("review_dispatched_at")
         return dispatched_at is None or is_claim_stale(
-            dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES
         )
 
     if status == "review_dispatch_failed":
@@ -1168,32 +1184,65 @@ def _is_review_dispatchable(
     return True
 
 
-def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
-    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
-    Looks for triple-backtick code fences in ``log_path`` and tries to parse
-    each one as JSON, starting from the last fence (the final output). Accepts
-    fences with or without a ``json`` language tag. A valid verdict block must
-    contain:
+# Absolute path ending in .md, as reviewers reference their summary files in
+# final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
+# quotes, and whitespace terminate the match so "path:line" refs don't bleed.
+_REVIEW_MD_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|~[\\/]|/)[^\s`\"'<>|*?:]+\.md")
+
+_REVIEW_FALLBACK_FILE_MAX_BYTES = 1024 * 1024
+_REVIEW_FALLBACK_MTIME_SLACK_S = 120
+_REVIEW_FALLBACK_MAX_CANDIDATES = 8
+
+
+def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
+    """Validate one decoded JSON candidate as a review verdict.
+
+    A valid verdict must contain:
 
     - ``decision`` in ``{"approved", "request_changes", "blocked"}``
     - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
       non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
     - ``required_changes`` is optional; if present it must be a list of strings
 
-    Returns the parsed dict on success, or ``None`` if no valid block is found.
-    Malformed/truncated logs and 0-byte logs both return ``None``.
+    Returns the normalized verdict dict, or ``None`` if invalid.
     """
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if not isinstance(data, dict):
         return None
 
-    matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", log_text, re.DOTALL))
-    if not matches:
+    decision = data.get("decision")
+    if decision not in {"approved", "request_changes", "blocked"}:
         return None
 
-    for match in reversed(matches):
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        return None
+    if decision in {"request_changes", "blocked"} and not summary.strip():
+        return None
+
+    required_changes = data.get("required_changes")
+    if required_changes is not None and not isinstance(required_changes, list):
+        return None
+    if required_changes is not None and not all(
+        isinstance(item, str) for item in required_changes
+    ):
+        return None
+
+    return {
+        "decision": decision,
+        "summary": summary,
+        "required_changes": required_changes if required_changes is not None else [],
+    }
+
+
+def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+    """Extract the last valid fenced JSON verdict block from plain text.
+
+    Accepts fences with or without a ``json`` language tag, scanning from the
+    last fence (the final output) backwards.
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
         candidate = match.group(1).strip()
         if not candidate:
             continue
@@ -1201,123 +1250,175 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
             data = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if not isinstance(data, dict):
-            continue
-
-        decision = data.get("decision")
-        if decision not in {"approved", "request_changes", "blocked"}:
-            continue
-
-        summary = data.get("summary")
-        if not isinstance(summary, str):
-            continue
-        if decision in {"request_changes", "blocked"} and not summary.strip():
-            continue
-
-        required_changes = data.get("required_changes")
-        if required_changes is not None and not isinstance(required_changes, list):
-            continue
-        if required_changes is not None and not all(
-            isinstance(item, str) for item in required_changes
-        ):
-            continue
-
-        return {
-            "decision": decision,
-            "summary": summary,
-            "required_changes": required_changes if required_changes is not None else [],
-        }
-
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
     return None
+
+
+def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
+    """Extract a verdict from tee'd stream-json JSONL text.
+
+    With ``tee_stream_json`` enabled the sidecar log is JSONL where every
+    fence lives *inside* a JSON string (``\\n`` as escape sequences), so a
+    regex over the raw text can never match. Decode the events and accept a
+    fence ONLY from the final output: the ``result`` event's text, or —
+    absent a usable one (session killed before the result line) — the single
+    last assistant text. Never scan further back: a mid-session draft or an
+    echo of the review prompt's own few-shot example (which contains a
+    literal ``"decision": "approved"`` fence) must not be recorded as the
+    session's verdict when the reviewer produced no final one. A fence-less
+    final output returns ``None`` so the caller's no-verdict path
+    (turn-limit summary + retry) handles it as designed.
+    """
+    result_text: str | None = None
+    last_assistant_text: str | None = None
+    for event in iter_stream_json_events(raw_text):
+        text = extract_event_text(event)
+        if not text:
+            continue
+        if event.get("type") == "result":
+            result_text = text
+        else:
+            last_assistant_text = text
+
+    for text in (result_text, last_assistant_text):
+        if text:
+            verdict = _extract_verdict_from_text(text)
+            if verdict is not None:
+                return verdict
+    return None
+
+
+def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
+    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+
+    Handles both log formats: plaintext logs (fences matched directly) and
+    stream-json JSONL logs produced by ``tee_stream_json`` (fences are
+    JSON-escaped inside event strings, so events are decoded first). Returns
+    the parsed dict on success, or ``None`` if no valid block is found.
+    Malformed/truncated logs and 0-byte logs both return ``None``.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    verdict = _extract_verdict_from_text(log_text)
+    if verdict is not None:
+        return verdict
+    return _extract_verdict_from_stream_json(log_text)
 
 
 def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
     """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
 
-    Fallback for when ``_parse_review_verdict_from_log`` fails: the plaintext
-    log may be truncated or the verdict block may be split across tee buffer
-    boundaries, but the structured stream-json events.jsonl contains the
-    assistant's message text in discrete JSONL lines. This scans
-    ``assistant_message`` events for the same fenced JSON verdict block.
+    Fallback for when ``_parse_review_verdict_from_log`` fails: the log may be
+    truncated or the verdict block split across tee buffer boundaries, but the
+    structured events.jsonl carries the assistant's text in discrete JSONL
+    lines. Decodes real stream-json events (``assistant``/``result``) as well
+    as the legacy ``assistant_message`` shape.
 
     Returns the parsed dict on success, or ``None`` if no valid block is found.
     """
-    if not events_path.exists():
-        return None
     try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        raw_text = events_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    return _extract_verdict_from_stream_json(raw_text)
 
-    # Scan in reverse: the verdict is in the final assistant message.
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
+
+def _parse_review_verdict_from_files(
+    log_path: Path,
+    packet_dir: Path,
+    started_at: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    """Last-resort verdict recovery from files the reviewer wrote (issue #566).
+
+    Reviewers sometimes write their review summary (verdict block included) to
+    a Markdown file and merely *reference* it in final output instead of
+    re-emitting the fenced JSON. Before counting a completed review as a
+    failed attempt, scan:
+
+    1. ``.md`` paths mentioned in the reviewer's decoded output text,
+       newest-mention-first, then
+    2. ``*.md`` files in the PR's packet directory.
+
+    Every candidate is mtime-gated to the reviewer session's ``started_at``
+    (minus slack): a stale review file from a previous round must never
+    resurrect an old verdict for a new head. Without a parseable
+    ``started_at`` there is no safe gate, so no fallback is attempted.
+
+    Returns ``(verdict, source_path)`` or ``None``.
+    """
+    if not started_at:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
+            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
+        )
+    except ValueError:
+        return None
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    texts = [
+        text
+        for text in (extract_event_text(event) for event in iter_stream_json_events(log_text))
+        if text
+    ]
+    if not texts and log_text:
+        texts = [log_text]
+    for text in reversed(texts):
+        for match in _REVIEW_MD_PATH_RE.finditer(text):
+            raw = match.group(0)
+            if raw not in seen:
+                seen.add(raw)
+                candidates.append(Path(raw).expanduser())
+
+    if packet_dir.is_dir():
+        for md_path in sorted(packet_dir.glob("*.md")):
+            key = str(md_path)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(md_path)
+
+    # Stat-filter BEFORE capping: the cap bounds expensive file reads, and
+    # spurious path-looking mentions in the reviewer's text (nonexistent,
+    # stale, oversized) must not starve the trusted packet-dir candidates
+    # out of the read budget.
+    readable: list[Path] = []
+    for candidate in candidates:
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            stat = candidate.stat()
+        except OSError:
             continue
-        if not isinstance(event, dict):
+        if not candidate.is_file():
             continue
-        if event.get("type") != "assistant_message":
+        if stat.st_size > _REVIEW_FALLBACK_FILE_MAX_BYTES:
             continue
-
-        # The content may be a string or a list of content blocks.
-        content = event.get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text += str(block.get("text", ""))
-        elif isinstance(content, dict):
-            text = str(content.get("text", ""))
-
-        if not text:
+        if datetime.fromtimestamp(stat.st_mtime, tz=UTC) < cutoff:
             continue
+        readable.append(candidate)
+        if len(readable) >= _REVIEW_FALLBACK_MAX_CANDIDATES:
+            break
 
-        # Reuse the same fenced-JSON extraction logic.
-        matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL))
-        if not matches:
+    for candidate in readable:
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
-
-        for match in reversed(matches):
-            candidate = match.group(1).strip()
-            if not candidate:
-                continue
-            try:
-                data = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, dict):
-                continue
-
-            decision = data.get("decision")
-            if decision not in {"approved", "request_changes", "blocked"}:
-                continue
-
-            summary = data.get("summary")
-            if not isinstance(summary, str):
-                continue
-            if decision in {"request_changes", "blocked"} and not summary.strip():
-                continue
-
-            required_changes = data.get("required_changes")
-            if required_changes is not None and not isinstance(required_changes, list):
-                continue
-            if required_changes is not None and not all(
-                isinstance(item, str) for item in required_changes
-            ):
-                continue
-
-            return {
-                "decision": decision,
-                "summary": summary,
-                "required_changes": required_changes if required_changes is not None else [],
-            }
+        verdict = _extract_verdict_from_text(content)
+        if verdict is not None:
+            return verdict, str(candidate)
 
     return None
 
@@ -1345,49 +1446,32 @@ def _extract_review_session_summary(
 
     if events_path.exists():
         try:
-            with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") != "assistant_message":
-                        continue
-                    content = event.get("content")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text += str(block.get("text", ""))
-                    elif isinstance(content, dict):
-                        text = str(content.get("text", ""))
-                    if text.strip():
-                        assistant_texts.append(text.strip())
+            raw_events = events_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            raw_events = ""
+        for event in iter_stream_json_events(raw_events):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
 
-    # Fallback: if no events.jsonl, try extracting non-verdict text from the
-    # plaintext log. This is less structured but still preserves the reviewer's
-    # analysis for the human.
+    # Fallback: if no events.jsonl, try the log. When it is a stream-json
+    # tee, decode the events; otherwise keep the remaining prose lines with
+    # fenced code blocks stripped (those are verdict attempts, not analysis).
     if not assistant_texts:
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        # Strip fenced code blocks (those are verdict attempts, not analysis)
-        # and keep the remaining prose lines.
-        stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
-        for line in stripped.splitlines():
-            stripped_line = line.strip()
-            if stripped_line and not stripped_line.startswith((">", "#", "-")):
-                assistant_texts.append(stripped_line)
+        for event in iter_stream_json_events(log_text):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
+        if not assistant_texts:
+            stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+            for line in stripped.splitlines():
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith((">", "#", "-")):
+                    assistant_texts.append(stripped_line)
 
     if not assistant_texts:
         return None
@@ -1544,8 +1628,9 @@ def _detect_and_handle_stalled_reviews(
     """Detect reviewer processes that died without a verdict and free their claims.
 
     A reviewer is considered stalled/orphaned when its sidecar process is no
-    longer alive and the claim timestamp is past the stale-claim timeout (30
-    minutes, see ``state.is_claim_stale``). When that happens, the per-PR
+    longer alive and the claim timestamp is past the stale-claim timeout
+    (``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES``, currently 5 minutes -- see
+    ``state.is_claim_stale``). When that happens, the per-PR
     ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
     stale timestamp as ``review_dispatch_failed_at``. The next
     ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
@@ -1570,6 +1655,16 @@ def _detect_and_handle_stalled_reviews(
     state = load_state_locked(state_file)
     changed = False
     seen_pr_keys: set[str] = set()
+    # One provider-throttle condition per sweep, no matter how many dead
+    # reviewers show the same limit signature: the exponential probe backoff
+    # counts consecutive failed PROBES, and a wave of N simultaneously
+    # throttled reviewers is one observation of the closed provider window,
+    # not N. Without this, a 2-reviewer wave incremented the counter twice
+    # per sweep and (combined with the un-reaped sidecars below) drove the
+    # backoff from its 15-minute base to the 4-hour cap within 40 minutes
+    # (observed live 2026-07-24: consecutive_probe_failures=14 from a single
+    # quota outage).
+    throttle_backoff_applied = False
 
     for w in iter_workers(reviews_dir):
         pr_key = str(w.issue_number)
@@ -1622,8 +1717,10 @@ def _detect_and_handle_stalled_reviews(
             throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
 
         if throttled:
-            now_dt = datetime.now(UTC)
-            state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+            if not throttle_backoff_applied:
+                now_dt = datetime.now(UTC)
+                state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+                throttle_backoff_applied = True
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
@@ -1659,6 +1756,17 @@ def _detect_and_handle_stalled_reviews(
                 }
             )
             remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            # Reap the sidecar like every other handled path in this sweep.
+            # The rolled-back claim is deliberately non-terminal (so the PR
+            # re-dispatches once the quota gate clears), which means neither
+            # terminal guard above will ever reap this sidecar -- without
+            # this line the same dead reviewer resurfaces every sweep, its
+            # log tail still matches the throttle signature, and each pass
+            # re-applies the exponential backoff for a session that died
+            # exactly once (observed live 2026-07-24: two dead reviewers
+            # re-counted across ~6 passes pushed probe_after 4 hours out
+            # while the provider window was already open again).
+            w.reap_sidecar(reviews_dir)
             continue
 
         state["prs"][pr_key] = {
@@ -4039,6 +4147,7 @@ class OrchestratorApp:
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
             self.config.labels.complexity_high: (
                 "Routing hint: route this first-pass issue to the api worker "
                 "(multi-module, cross-cutting invariant, or prior escalation)."
@@ -6041,6 +6150,7 @@ class OrchestratorApp:
                     continue
                 issue_number = pr_state.get("issue_number")
 
+            verdict_source = "log"
             verdict = _parse_review_verdict_from_log(Path(w.log_path))
             if verdict is None:
                 # Fallback: parse the structured events.jsonl. The plaintext log
@@ -6048,7 +6158,22 @@ class OrchestratorApp:
                 # boundaries, but the stream-json events contain the assistant's
                 # message text in discrete JSONL lines.
                 events_path = _events_path(reviews_dir, pr_number, review=True)
+                verdict_source = "events"
                 verdict = _parse_review_verdict_from_events(events_path)
+            if verdict is None:
+                # Last resort (issue #566): the reviewer may have written its
+                # verdict to a Markdown file it referenced in final output
+                # instead of re-emitting the fenced block. mtime-gated to this
+                # session's started_at so stale files never resurrect old
+                # verdicts.
+                file_hit = _parse_review_verdict_from_files(
+                    Path(w.log_path),
+                    self.paths.prs / f"pr-{pr_number}",
+                    w.started_at,
+                )
+                if file_hit is not None:
+                    verdict, file_source = file_hit
+                    verdict_source = f"file:{file_source}"
             if verdict is None:
                 # No structured verdict found. Before discarding this reviewer's
                 # work, check if it did substantial analysis (e.g. hit the
@@ -6097,6 +6222,7 @@ class OrchestratorApp:
                         "pr": pr_number,
                         "issue": issue_number,
                         "decision": verdict["decision"],
+                        "verdict_source": verdict_source,
                     }
                 )
             else:
@@ -6282,6 +6408,19 @@ class OrchestratorApp:
                 pr_key = str(c["pr"])
                 pr_state = state["prs"].get(pr_key, {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                if pr_state.get(
+                    "review_dispatch_status"
+                ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
+                    # Never escalate over a LIVE in-flight reviewer (issue
+                    # #573): the cap can be reached by attempts that predate
+                    # the current launch (e.g. quota deaths whose rollback
+                    # decrement was bypassed), and killing the claim
+                    # mid-review orphans the imminent verdict — the reaper
+                    # only records verdicts for dispatched claims. Let the
+                    # review finish: a recorded verdict resets the counter;
+                    # a death is dispositioned by the stalled sweep, after
+                    # which the cap escalates honestly on a dead claim.
+                    continue
                 if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state["prs"][pr_key] = {
@@ -7687,6 +7826,8 @@ class OrchestratorApp:
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
+        merge_hold: bool = False
+        merge_hold_check_unavailable: bool = False
         if can_merge and should_merge:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
@@ -7705,7 +7846,31 @@ class OrchestratorApp:
                 # reconcile.py's merged_outside_orchestrator drift path
                 # reconciles status to "merged" and runs the "merged" label
                 # transition — no new post-merge bookkeeping is added here.
-                mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
+                #
+                # Issue #496: an operator can park an approved PR by adding the
+                # configured merge-hold label to the PR or its linked issue.
+                # When the hold is present, skip the mergequeue re-add entirely.
+                # Scope note: this hold check runs only in mergequeue mode
+                # (when ``mergequeue_label`` is set). In direct-merge mode the
+                # hold label has no effect — the issue title scopes this to
+                # "the mergequeue re-add," so the self-merge branch is unchanged.
+                merge_hold = self.config.labels.merge_hold in label_names(pr)
+                if not merge_hold and issue_number is not None:
+                    try:
+                        issue = self.gh.issue_view(issue_number)
+                    except (GitHubError, ValueError):
+                        merge_hold_check_unavailable = True
+                        issue = None
+                    if not merge_hold_check_unavailable and (
+                        not isinstance(issue, dict) or "labels" not in issue
+                    ):
+                        merge_hold_check_unavailable = True
+                        issue = None
+                    if not merge_hold_check_unavailable:
+                        issue_labels = label_names(issue) if issue else set()
+                        merge_hold = self.config.labels.merge_hold in issue_labels
+                if not merge_hold and not merge_hold_check_unavailable:
+                    mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
@@ -7919,13 +8084,20 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            if approved and can_merge and merge_output is None and not mergequeue_handoff_failed:
+            if (
+                approved
+                and can_merge
+                and merge_output is None
+                and not mergequeue_handoff_failed
+                and not merge_hold_check_unavailable
+            ):
                 # merge=False / auto_merge.enabled=False: can_merge recovered but no
                 # merge was attempted. Clear the merge alert so a subsequent
                 # degradation can re-fire the digest (last_health == current_health
                 # dedup would otherwise drop it). Excluded when the mergequeue
-                # handoff itself failed — that is a genuine problem, not a
-                # benign evaluation-only pass, and must not be masked as OK.
+                # handoff itself failed or the merge-hold issue check was
+                # unavailable — both are genuine problems, not benign
+                # evaluation-only passes, and must not be masked as OK.
                 if issue_number is not None:
                     _issue_key = str(issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
@@ -7949,6 +8121,8 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "can_merge": can_merge,
                     "merged": bool(merge_output),
+                    "merge_hold": merge_hold,
+                    "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
@@ -7977,12 +8151,20 @@ class OrchestratorApp:
             "cross_pr_revert_reason": cross_pr_revert_reason,
             "cross_pr_revert_routed": cross_pr_revert_routed,
             "mergequeue_label_applied": mergequeue_label_applied,
+            "merge_hold": merge_hold,
+            "merge_hold_check_unavailable": merge_hold_check_unavailable,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif merge_hold_check_unavailable:
+            message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
+        elif merge_hold:
+            message += (
+                f" (merge-hold label {self.config.labels.merge_hold!r} present — left alone)"
+            )
         elif mergequeue_label_applied is False:
             message += (
                 f" (mergequeue label {self.config.auto_merge.mergequeue_label!r} FAILED to "
@@ -7996,7 +8178,9 @@ class OrchestratorApp:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
         elif label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
-        return CommandResult(not checks_unavailable, message, data)
+        return CommandResult(
+            not (checks_unavailable or merge_hold_check_unavailable), message, data
+        )
 
     @_guard_state_lock
     def spec_review(self, artifact_path: Path) -> CommandResult:
@@ -9282,8 +9466,10 @@ class OrchestratorApp:
         errors: list[dict[str, Any]],
         merges: list[dict[str, Any]],
     ) -> None:
-        """Append a merge_ready result to merges or errors if checks are unavailable."""
-        if merge_result.data.get("checks_unavailable"):
+        """Append a merge_ready result to merges or errors if a gh check failed."""
+        if merge_result.data.get("checks_unavailable") or merge_result.data.get(
+            "merge_hold_check_unavailable"
+        ):
             errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
         else:
             merges.append(merge_result.data)
@@ -9366,6 +9552,14 @@ class OrchestratorApp:
             return result
 
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+        # Every pass must observe a fresh GitHub snapshot. The list cache
+        # dedupes calls within one pass, but a long-running supervisor
+        # (charlie fleet supervise) reuses this app -- and therefore one
+        # GitHub instance -- across many passes; without this, issues filed
+        # or PRs opened after the first pass stay invisible until the daemon
+        # restarts (observed live: intake frozen at a stale issue set for the
+        # daemon's entire lifetime).
+        self.gh.invalidate_list_cache()
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
