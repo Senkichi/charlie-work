@@ -17,7 +17,12 @@ from .adapters import (
     SessionDispatchResult,
     SessionRequest,
     dispatch_sessions,
+    write_session_manifest,
+    write_session_results,
 )
+from .api_budget import budget_status as _api_budget_status
+from .api_budget import ledger_path as _api_ledger_path
+from .api_budget import load_ledger as _api_load_ledger
 from .claude_code import (
     _events_path,
     extract_event_text,
@@ -113,6 +118,7 @@ from .instrumentation import correlation_context, log_event, record_loop_pass
 from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
+from .routing import AdapterChoice, record_adapter_choice, select_adapter
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -3884,19 +3890,19 @@ class OrchestratorApp:
         # both repo-relative and absolute config paths.
         return self.repo_root / value
 
-    def _adapter_settings(self) -> AdapterSettings:
+    def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         claude = self.config.claude_code
         devin = self.config.devin
         api_worker = self.config.api_worker
-        adapter = devin.adapter
+        resolved_adapter = adapter if adapter is not None else devin.adapter
         # Use adapter-specific venv_source and worker_env
-        if adapter == "devin-shell":
+        if resolved_adapter == "devin-shell":
             venv_source = self._resolve(devin.venv_source) if devin.venv_source else None
             worker_env = devin.worker_env
-        elif adapter == "claude-code":
+        elif resolved_adapter == "claude-code":
             venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
             worker_env = claude.worker_env
-        elif adapter == "api":
+        elif resolved_adapter == "api":
             # api workers are Claude Code CLI processes with provider env
             # injected, so they reuse the claude-code venv/env resolution
             # (shared venv junction, worker_env overrides). The provider
@@ -3909,7 +3915,7 @@ class OrchestratorApp:
             venv_source = None
             worker_env = {}
         return AdapterSettings(
-            adapter=adapter,
+            adapter=resolved_adapter,
             dispatch_command=devin.dispatch_command,
             command_timeout_seconds=devin.command_timeout_seconds,
             sessions_dir=self._resolve(devin.sessions_dir),
@@ -3924,9 +3930,132 @@ class OrchestratorApp:
             base_ref=self.config.dispatch.base_ref,
             tee_stream_json=claude.tee_stream_json,
             launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
-            api_worker_config=api_worker if adapter == "api" else None,
+            api_worker_config=api_worker if resolved_adapter == "api" else None,
             config=self.config,
         )
+
+    def _routing_inputs(self) -> tuple[Any, bool, bool, int]:
+        """Compute pass-level routing inputs shared across all issues (issue #482).
+
+        Returns ``(budget, api_key_present, provider_in_cooldown,
+        live_api_sessions)`` — the inputs to ``routing.select_adapter`` that
+        are constant across all issues in one dispatch pass. Per-issue inputs
+        (``rework``, ``issue_labels``) are supplied by the caller.
+
+        * ``budget``: ``routing.BudgetStatus`` from ``api_budget.budget_status``
+          over the loaded ledger.
+        * ``api_key_present``: whether the active provider's ``api_key_env``
+          names a non-empty environment variable.
+        * ``provider_in_cooldown``: from the existing ``throttled_until`` state
+          mechanism (``state.is_throttled``). The dispatch-level throttle gate
+          already defers when this is True, so this is defense-in-depth for the
+          future api-specific cooldown (issue ⑦ in the design decomposition).
+        * ``live_api_sessions``: alive workers with ``adapter_kind == "api"``
+          counted via ``worker.iter_workers``.
+        """
+        api_config = self.config.api_worker
+        # Budget status from the on-disk spend ledger (atomic load with
+        # corrupt-file recovery; missing file = empty ledger).
+        ledger = _api_load_ledger(_api_ledger_path(self.paths.state_file.parent))
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        budget = _api_budget_status(ledger, api_config.budget, today)
+        # API key present from the environment (name from the active provider).
+        provider = api_config.providers.get(api_config.provider)
+        api_key_present = bool(provider and os.environ.get(provider.api_key_env))
+        # Provider in cooldown from the existing throttle-cooldown state.
+        state = load_state_locked(self.paths.state_file)
+        provider_in_cooldown = is_throttled(state)
+        # Live api sessions counted via iter_workers filtered to adapter_kind == "api".
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        live_api_sessions = sum(
+            1 for w in iter_workers(sessions_dir) if w.adapter_kind == "api" and w.is_alive()
+        )
+        return budget, api_key_present, provider_in_cooldown, live_api_sessions
+
+    def _select_adapter_for_issue(
+        self,
+        *,
+        rework: bool,
+        issue_labels: set[str],
+        routing_inputs: tuple[Any, bool, bool, int],
+    ) -> AdapterChoice:
+        """Call ``routing.select_adapter`` for one issue (issue #482).
+
+        The single point of adapter routing enforcement: no inline
+        adapter-choice conditionals live in workflow.py. Per-issue inputs
+        (``rework``, ``issue_labels``) are passed in; pass-level inputs come
+        from ``_routing_inputs``.
+        """
+        budget, api_key_present, provider_in_cooldown, live_api_sessions = routing_inputs
+        return select_adapter(
+            rework=rework,
+            issue_labels=issue_labels,
+            complexity_high_label=self.config.labels.complexity_high,
+            api_config=self.config.api_worker,
+            budget=budget,
+            api_key_present=api_key_present,
+            provider_in_cooldown=provider_in_cooldown,
+            live_api_sessions=live_api_sessions,
+            default_adapter=self.config.devin.adapter,
+        )
+
+    def _dispatch_partitioned(
+        self,
+        session_requests: list[SessionRequest],
+        adapter_choices: dict[int, AdapterChoice],
+    ) -> list[SessionDispatchResult]:
+        """Partition requests by ``AdapterChoice.kind`` and dispatch per group (issue #482).
+
+        When ``adapter_choices`` is empty (api disabled), dispatches all
+        requests as a single group with the default ``AdapterSettings`` —
+        byte-identical to the pre-#482 behavior. When non-empty, partitions
+        by kind and invokes ``dispatch_sessions`` once per non-empty group
+        with that group's ``AdapterSettings`` (built via ``_adapter_settings``
+        parameterized by kind). ``launch_stagger_seconds`` applies within each
+        group as today.
+
+        After all groups are dispatched, a combined session manifest and
+        results file are written to the standard paths so the on-disk
+        artifacts reflect every session in the pass (per-group calls each
+        overwrite these files; the combined write at the end is authoritative).
+        """
+        manifest_path = self.repo_root / self.config.devin.session_manifest
+        results_path = self.repo_root / self.config.devin.session_results
+
+        if not adapter_choices:
+            # No routing (api disabled) — single group, today's behavior.
+            return dispatch_sessions(
+                self.repo_root,
+                manifest_path,
+                results_path,
+                self._adapter_settings(),
+                session_requests,
+            )
+
+        # Partition by adapter kind, preserving the original request order
+        # within each group (stable partition).
+        groups: dict[str, list[SessionRequest]] = {}
+        for req in session_requests:
+            kind = adapter_choices[req.issue_number].kind
+            groups.setdefault(kind, []).append(req)
+
+        all_results: list[SessionDispatchResult] = []
+        for kind, group_requests in groups.items():
+            group_results = dispatch_sessions(
+                self.repo_root,
+                manifest_path,
+                results_path,
+                self._adapter_settings(adapter=kind),
+                group_requests,
+            )
+            all_results.extend(group_results)
+
+        # Write combined manifest and results reflecting all sessions in the
+        # pass. Per-group dispatch_sessions calls each overwrite these files;
+        # this final write is the authoritative on-disk artifact.
+        write_session_manifest(manifest_path, session_requests, adapter="mixed")
+        write_session_results(results_path, all_results)
+        return all_results
 
     def _apply_concurrency_governor(
         self, dispatch_limit: int, *, live_count: int | None = None
@@ -4729,11 +4858,28 @@ class OrchestratorApp:
             # Compute would-be SessionRequests without state mutation
             session_requests: list[SessionRequest] = []
             full_issues: dict[int, dict[str, Any]] = {}
+            # Issue #482: compute would-be adapter choices (read-only).
+            adapter_choices: dict[int, AdapterChoice] = {}
+            api_enabled = self.config.api_worker.enabled
+            routing_inputs = self._routing_inputs() if api_enabled else None
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
-                prompt_path = self._write_worker_prompt(full_issue)
                 branch_name = self._branch_name(full_issue)
+
+                template: str | None = None
+                if api_enabled and routing_inputs is not None:
+                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                    choice = self._select_adapter_for_issue(
+                        rework=False,
+                        issue_labels=issue_labels,
+                        routing_inputs=routing_inputs,
+                    )
+                    adapter_choices[issue_number] = choice
+                    if choice.kind == "api":
+                        template = self.config.api_worker.worker_template
+
+                prompt_path = self._write_worker_prompt(full_issue, template=template)
 
                 # Check if this is a dead-worker recovery (same logic as real dispatch)
                 recovery_record: dict[str, Any] | None = None
@@ -4765,6 +4911,10 @@ class OrchestratorApp:
                 ),
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
+                "adapter_choices": {
+                    str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
+                    for n, c in sorted(adapter_choices.items())
+                },
                 "dispatch_results": [],
                 "blocked": [
                     {"issue": issue_number, "blockers": blockers}
@@ -5106,11 +5256,35 @@ class OrchestratorApp:
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
+        # Issue #482: per-issue adapter routing. When api_worker is enabled,
+        # select_adapter is called once per issue to route it to the api or
+        # fallback adapter. When disabled, adapter_choices stays empty and
+        # _dispatch_partitioned falls back to a single-group dispatch
+        # byte-identical to the pre-#482 behavior.
+        adapter_choices: dict[int, AdapterChoice] = {}
+        api_enabled = self.config.api_worker.enabled
+        routing_inputs = self._routing_inputs() if api_enabled else None
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
-            prompt_path = self._write_worker_prompt(full_issue)
             branch_name = self._branch_name(full_issue)
+
+            # Determine the adapter for this issue (single point of enforcement:
+            # routing.select_adapter). The prompt template follows the choice
+            # so the api worker gets the claude-code-flavored prompt.
+            template: str | None = None
+            if api_enabled and routing_inputs is not None:
+                issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                choice = self._select_adapter_for_issue(
+                    rework=False,
+                    issue_labels=issue_labels,
+                    routing_inputs=routing_inputs,
+                )
+                adapter_choices[issue_number] = choice
+                if choice.kind == "api":
+                    template = self.config.api_worker.worker_template
+
+            prompt_path = self._write_worker_prompt(full_issue, template=template)
 
             # Check if this is a dead-worker recovery: the issue has a previous
             # dispatch record with the same branch name (i.e., our own crashed attempt)
@@ -5131,15 +5305,9 @@ class OrchestratorApp:
                     recovery=recovery_record,
                 )
             )
+        dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
-        dispatch_results = dispatch_sessions(
-            self.repo_root,
-            manifest_path,
-            results_path,
-            self._adapter_settings(),
-            session_requests,
-        )
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
@@ -5248,6 +5416,13 @@ class OrchestratorApp:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
                 state["issues"][str(request.issue_number)] = entry
+                # Issue #482: record the adapter choice (including fallback
+                # choices) into adapter_history so every routing decision is
+                # auditable. record_adapter_choice returns a new state dict
+                # (immutable helper); chain it before the atomic save.
+                choice = adapter_choices.get(request.issue_number)
+                if choice is not None:
+                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 # Persist the launched worker BEFORE touching GitHub labels: a
                 # transient label-write failure (or crash) must never leave a live
                 # worker unrecorded and therefore re-dispatchable next wave. The
@@ -10365,6 +10540,15 @@ class OrchestratorApp:
         full_issues: dict[int, dict[str, Any]] = {}
         skipped_issue_numbers: list[int] = []
         missing_prompt_failures: dict[int, str] = {}
+        # Issue #482: per-issue adapter routing for rework. Rework issues
+        # route to the api adapter when preflight passes (policy:rework),
+        # falling back to the default adapter on any preflight failure.
+        # The rework prompt is already on disk (written during the review
+        # flow with config.dispatch.rework_template); api_worker.rework_template
+        # defaults to the same "rework.md", so no re-render is needed here.
+        adapter_choices: dict[int, AdapterChoice] = {}
+        api_enabled = self.config.api_worker.enabled
+        routing_inputs = self._routing_inputs() if api_enabled else None
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -10382,6 +10566,15 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
+            # Route this rework issue through the single enforcement point.
+            if api_enabled and routing_inputs is not None:
+                issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                choice = self._select_adapter_for_issue(
+                    rework=True,
+                    issue_labels=issue_labels,
+                    routing_inputs=routing_inputs,
+                )
+                adapter_choices[issue_number] = choice
             session_requests.append(
                 SessionRequest(
                     issue_number=issue_number,
@@ -10451,15 +10644,9 @@ class OrchestratorApp:
                 data,
             )
 
+        dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
-        dispatch_results = dispatch_sessions(
-            self.repo_root,
-            manifest_path,
-            results_path,
-            self._adapter_settings(),
-            session_requests,
-        )
 
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
@@ -10493,6 +10680,12 @@ class OrchestratorApp:
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
+                # Issue #482: record the adapter choice into adapter_history
+                # before constructing the entry, so the {**entry} spread below
+                # preserves the adapter_history field.
+                choice = adapter_choices.get(request.issue_number)
+                if choice is not None:
+                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 entry = {
                     **state["issues"].get(str(request.issue_number), {}),
                     "number": request.issue_number,
@@ -11071,13 +11264,13 @@ class OrchestratorApp:
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
-    def _write_worker_prompt(self, issue: dict[str, Any]) -> Path:
+    def _write_worker_prompt(self, issue: dict[str, Any], *, template: str | None = None) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         issue_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = issue_dir / "worker-prompt.md"
         prompt = self._render(
-            self.config.dispatch.worker_template,
+            template or self.config.dispatch.worker_template,
             {
                 "issue_number": issue_number,
                 "issue_title": issue.get("title", ""),
