@@ -665,13 +665,13 @@ def test_discovery_uses_the_platform_launch_script(tmp_path: Path) -> None:
 
 
 def test_idle_streaks_round_trip(tmp_path: Path) -> None:
-    save_idle_streaks(tmp_path, {CW: 2, JC: 0})
+    save_idle_streaks(tmp_path, {CW: 2, JC: 0}, source="prologue")
     assert load_idle_streaks(tmp_path) == {CW: 2, JC: 0}
 
 
 def test_idle_streak_write_is_atomic(tmp_path: Path) -> None:
     """Temp-file + replace, per the project's JSON-write invariant."""
-    save_idle_streaks(tmp_path, {CW: 1})
+    save_idle_streaks(tmp_path, {CW: 1}, source="prologue")
     assert list(tmp_path.glob("*.tmp")) == []
     payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
     assert payload["version"] == 1
@@ -972,3 +972,49 @@ def test_discovery_skips_a_directory_that_resolves_outside_managed_root(
 
     assert instances == []
     assert any("resolves outside managed_root" in note for note in notes)
+
+
+def test_saved_state_records_which_path_wrote_it(tmp_path: Path) -> None:
+    """Provenance is what lets the doctor probe distinguish daemon from operator."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    save_idle_streaks(tmp_path, {CW: 1}, source="cli")
+    payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
+    assert payload["source"] == "cli"
+
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.source == "cli"
+    assert stamp.updated_at is not None
+    assert stamp.updated_at.tzinfo is not None
+
+
+def test_allocation_stamp_is_none_when_no_pass_has_run(tmp_path: Path) -> None:
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    assert load_allocation_stamp(tmp_path) is None
+
+
+def test_allocation_stamp_distinguishes_unreadable_from_absent(tmp_path: Path) -> None:
+    """A corrupt file must not look like never-ran; the two need different reports."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    (tmp_path / "runner-allocation.json").write_text("{not json", encoding="utf-8")
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.updated_at is None
+    assert stamp.source is None
+
+
+def test_allocation_stamp_treats_a_naive_timestamp_as_utc(tmp_path: Path) -> None:
+    """Ages are computed against an aware now; a naive stamp must not raise."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    (tmp_path / "runner-allocation.json").write_text(
+        json.dumps({"version": 1, "updated_at": "2026-07-25T12:00:00", "repos": {}}),
+        encoding="utf-8",
+    )
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.updated_at is not None
+    assert stamp.updated_at.tzinfo is not None

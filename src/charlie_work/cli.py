@@ -23,6 +23,7 @@ from .state import StateLockBusy, load_state_locked, utc_now
 from .supervise import orchestrator_root, self_deploy
 from .runner_allocation import plan_summary
 from .runner_allocation_pass import run_allocation_pass
+from .runner_slots import CLI_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -912,6 +913,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         fleet_dir_override=args.fleet_dir,
         state_path=paths.state_file,
         dry_run=dry_run,
+        source=CLI_ALLOCATION_SOURCE,
     )
 
     if result.error:

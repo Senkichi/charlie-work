@@ -23,6 +23,7 @@ from .supervise import (
     try_acquire_supervisor_lock,
 )
 from .runner_allocation_pass import run_allocation_pass
+from .runner_slots import UNATTENDED_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -277,6 +278,49 @@ def _run_fleet_allocation_prologue(
     events: list[dict[str, Any]] = []
 
     allocation = getattr(global_config, "runner_allocation", None)
+
+    # Unconditional, before any branch. This line is the whole difference
+    # between "the prologue ran and declined" and "the prologue was never
+    # reached" — and #590 stayed unisolated for hours precisely because every
+    # skip path lived inside a branch, so an absent log line was consistent
+    # with both readings and could not be used as evidence either way. Logging
+    # the resolved decision inputs here, where nothing can short-circuit past
+    # them, means the next occurrence names its own cause.
+    logger.info(
+        "Fleet allocation prologue: entered (enabled=%s, budget=%s, managed_root=%s, "
+        "fleet_dir=%s, dry_run=%s)",
+        getattr(allocation, "enabled", None),
+        getattr(allocation, "max_running_runners", None),
+        getattr(allocation, "managed_root", None) or "(unset)",
+        fleet_dir(override=fleet_dir_override),
+        dry_run,
+    )
+
+    def skipped(reason: str) -> list[dict[str, Any]]:
+        """Record an anomalous skip in the digest, not only in the log.
+
+        The log is a host-local file that rotates and has been demonstrably
+        lossy here; the digest is the structured surface operators actually
+        read. A prologue that cannot act for a reason nobody chose belongs in
+        the same place its errors go.
+        """
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation_skipped",
+                "reason": reason,
+            }
+        )
+        return events
+
+    if global_config is None:
+        # No global fleet config supplied at all — this is the documented default
+        # of fleet_loop's parameter, not a disagreement between code and config,
+        # so it must not be reported as an anomaly. Host-wide allocation has
+        # nothing to read here; the entry line above already records that the
+        # prologue was reached, which is the distinction #590 needed.
+        logger.info("Fleet allocation prologue: not run — no global fleet config was supplied")
+        return events
     if allocation is None:
         # The config object has no such section at all. That is not "the
         # operator left it off" — it means this process is holding a config
@@ -287,9 +331,28 @@ def _run_fleet_allocation_prologue(
             "section (%s); allocation cannot run in this process",
             type(global_config).__name__,
         )
-        return events
+        return skipped(
+            f"config object has no runner_allocation section ({type(global_config).__name__})"
+        )
     if not allocation.enabled:
-        logger.debug("Fleet allocation prologue: disabled in config")
+        # INFO, not DEBUG. This is the branch that makes the entire feature inert,
+        # and the daemon runs at INFO, so a DEBUG line here is never written at
+        # all: during issue #590 a host where allocation never ran was
+        # indistinguishable from a converged one, and the absence of a log line
+        # could not be used as evidence either way.
+        # Name the fleet directory too — it identifies *which* config.yaml
+        # governs, which is the thing an operator gets wrong when they set a
+        # host-wide knob in a per-repo layer.
+        # Deliberately log-only, unlike the other early returns: this is a state
+        # the operator chose, so a digest entry every pass would be recurring
+        # noise on any host that simply runs without allocation. The entry line
+        # above already distinguishes it from "never reached", which was the
+        # evidence gap that mattered.
+        logger.info(
+            "Fleet allocation prologue: not run — runner_allocation.enabled is false "
+            "in the resolved config (fleet dir: %s)",
+            fleet_dir(override=fleet_dir_override),
+        )
         return events
 
     # Any existing repo root works as the gh working directory: the allocation
@@ -309,7 +372,7 @@ def _run_fleet_allocation_prologue(
 
     if anchor_root is None:
         logger.info("Fleet allocation prologue: no usable repo root in registry, skipping")
-        return events
+        return skipped("no usable repo root in the fleet registry")
 
     runtime = getattr(global_config, "runtime", None)
     runner_scaling = getattr(global_config, "runner_scaling", None)
@@ -322,6 +385,7 @@ def _run_fleet_allocation_prologue(
         fleet_dir_override=fleet_dir_override,
         state_path=anchor_state,
         dry_run=dry_run,
+        source=UNATTENDED_ALLOCATION_SOURCE,
     )
 
     if result.error:
@@ -335,11 +399,17 @@ def _run_fleet_allocation_prologue(
         )
         return events
 
+    # Report the inputs alongside the outcome: "started=0 parked=0" is the correct
+    # result for a converged host *and* for one pointed at the wrong managed_root
+    # or running under a budget the operator did not intend. Without the budget and
+    # root, a healthy no-op and a misconfigured no-op read identically.
     logger.info(
-        "Fleet allocation prologue: started=%d parked=%d notes=%d",
+        "Fleet allocation prologue: started=%d parked=%d notes=%d (budget=%d, managed_root=%s)",
         result.started,
         result.parked,
         len(result.notes),
+        allocation.max_running_runners,
+        allocation.managed_root or getattr(runner_scaling, "managed_root", "") or "(unset)",
     )
 
     # Only surface an event when something actually moved or a bound was hit;
@@ -908,6 +978,38 @@ def _build_fleet_attention_digest(
                     previous_health=None,
                     last_log_line=event.get("reason"),
                     pid=None,
+                )
+            )
+        elif event_type == "runner_allocation":
+            # Deliberately not in the digest — unlike the accidental drops the
+            # fallback below exists to prevent. This is the allocator's *success*
+            # event, and the attention digest is for things needing attention.
+            #
+            # It also cannot be left to the fallback: the prologue emits it when
+            # anything moved *or any note was produced*, and the notes include
+            # standing advisory conditions that persist for as long as the condition
+            # does ("holding 4 surplus slot(s) — slack for 0/3 pass(es)", "demand 7
+            # exceeds its 2 registered runner(s)"). Verified against this host's
+            # events.db: every recorded pass carried a note while moving no slots, so
+            # rendering it would put a near-identical entry in every 5-minute digest.
+            # The event stays in events.db and the prologue logs its inputs at INFO,
+            # which is where standing conditions belong.
+            continue
+        else:
+            # Visible by default. This chain used to end here, so any event type
+            # without an explicit branch was dropped silently — which is how the
+            # prologue's own ``runner_allocation_error`` never reached the digest
+            # despite being emitted correctly (issue #590). Making the fallback
+            # generic means adding an event type can no longer make it invisible;
+            # forgetting a branch costs a less specific entry, not a lost signal.
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event.get("repo_key", "fleet"),
+                    health="ERROR" if "error" in event_type else "INFO",
+                    previous_health=None,
+                    last_log_line=event.get("error") or event.get("reason") or event_type,
+                    pid=event.get("pid"),
                 )
             )
 

@@ -8,6 +8,7 @@ config, but its validity is never asserted by hand.
 
 from __future__ import annotations
 
+import datetime
 import json
 import shutil
 from dataclasses import dataclass
@@ -33,6 +34,12 @@ from .github import (
 )
 from .paths import RuntimePaths
 from .prompts import resolve_template
+from .runner_slots import (
+    ALLOCATION_STATE_FILENAME,
+    CLI_ALLOCATION_SOURCE,
+    UNATTENDED_ALLOCATION_SOURCE,
+    load_allocation_stamp,
+)
 from .supervise import try_acquire_supervisor_lock
 
 
@@ -352,6 +359,114 @@ def _surface_post_mortems(
             "; ".join(lines),
             severity="warning",
         )
+
+
+def _allocation_writer_label(source: str | None) -> str:
+    """Describe which path wrote an allocation state file, for probe output.
+
+    An unrecognised value is echoed rather than collapsed into "unknown": if a
+    future writer forgets to extend ``AllocationSource``, the probe should name
+    what it actually found instead of hiding it.
+    """
+    if source is None:
+        return "writer unrecorded — file predates provenance tracking"
+    if source == UNATTENDED_ALLOCATION_SOURCE:
+        return "unattended fleet pass"
+    if source == CLI_ALLOCATION_SOURCE:
+        return "a manual `charlie runners allocate`"
+    return f"an unrecognised writer {source!r}"
+
+
+def _check_runner_allocation(
+    add: Any, config: OrchestratorConfig, fleet_dir_override: str | None = None
+) -> None:
+    """Report whether host-wide runner allocation is actually running (issue #590).
+
+    Every way the allocation prologue can decline to act is silent by nature: a
+    false ``enabled`` flag, a config object built by code that predates the
+    section, or a registry with no reachable repo root all make it return without
+    doing anything — and a converged host looks exactly like one where allocation
+    never ran at all. Logs cannot settle it either: the daemon's stderr has proven
+    lossy in practice, so the absence of a log line is not evidence.
+
+    ``run_allocation_pass`` rewrites ``runner-allocation.json`` on every non-dry
+    pass even when no slot moves, which makes that file's ``updated_at`` the only
+    positive evidence that a pass happened.
+
+    Age alone is not enough, though. ``charlie runners allocate`` writes the same
+    host-wide file, and CLAUDE.md *requires* post-reboot procedures to call exactly
+    that — so an operator's manual run would otherwise make this probe read healthy
+    for three intervals, during the very window someone is diagnosing #590. Each
+    pass records which path wrote it and only the unattended one is accepted as
+    evidence here; a manual write is reported as "cannot confirm" rather than
+    "fine", because the file keeps just the latest write.
+    """
+    allocation = getattr(config, "runner_allocation", None)
+    if allocation is None or not allocation.enabled:
+        return
+
+    state_dir = fleet_dir(override=fleet_dir_override)
+    interval = max(config.supervisor.full_pass_interval_seconds, 1)
+    # Three intervals: one missed pass is normal jitter (a pass can run long), a
+    # sustained gap is not.
+    stale_after = interval * 3
+    budget = allocation.max_running_runners
+
+    stamp = load_allocation_stamp(state_dir)
+    if stamp is None:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but has never run: "
+            f"{state_dir / ALLOCATION_STATE_FILENAME} absent, "
+            f"expected a pass every {interval}s",
+            severity="warning",
+        )
+        return
+
+    if stamp.updated_at is None:
+        add(
+            "runner allocation",
+            False,
+            f"enabled but {ALLOCATION_STATE_FILENAME} has no readable updated_at stamp",
+            severity="warning",
+        )
+        return
+
+    # Clock skew or a hand-edited stamp can date the write in the future. A
+    # negative age is not freshness evidence, so clamp it instead of reporting
+    # "last pass -42s ago" as healthy.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    age = max(0, int((now - stamp.updated_at).total_seconds()))
+    writer = _allocation_writer_label(stamp.source)
+
+    if age > stale_after:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but the last pass ({writer}) was {age}s ago, "
+            f"over the {stale_after}s staleness bound — allocation is configured but "
+            f"is not running unattended (issue #590)",
+            severity="warning",
+        )
+        return
+
+    if stamp.source != UNATTENDED_ALLOCATION_SOURCE:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but the most recent pass {age}s ago was "
+            f"{writer}, which overwrites the same file the unattended pass uses — "
+            f"this cannot confirm the daemon is rebalancing (issue #590)",
+            severity="warning",
+        )
+        return
+
+    add(
+        "runner allocation",
+        True,
+        f"last unattended pass {age}s ago, budget {budget}",
+    )
 
 
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
@@ -773,6 +888,11 @@ def run_doctor(
 
     # -- fleet supervisor ----------------------------------------------------
     _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
+
+    # -- host-wide runner allocation (issue #590) ----------------------------
+    # Read-only: compares the allocation state file's age against the pass
+    # interval. Never starts, parks, or plans anything.
+    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

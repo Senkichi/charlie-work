@@ -1225,3 +1225,187 @@ def test_doctor_api_worker_no_secret_in_output(tmp_path: Path, monkeypatch) -> N
             assert secret not in check.detail, (
                 f"Secret leaked in check {check.name!r}: {check.detail}"
             )
+
+
+# --- host-wide runner allocation staleness probe (issue #590) ---------------
+#
+# The probe exists because every way the allocation prologue can decline to act is
+# silent, so "configured but inert" has to be *detected* rather than inferred from
+# logs that have proven lossy.
+
+
+def _doctor_allocation_config(*, enabled: bool = True, budget: int = 8) -> Any:
+    from dataclasses import replace
+
+    from charlie_work.config import OrchestratorConfig
+
+    base = OrchestratorConfig()
+    return replace(
+        base,
+        runner_allocation=replace(
+            base.runner_allocation, enabled=enabled, max_running_runners=budget
+        ),
+    )
+
+
+def _collect_allocation_checks(config: Any, fleet_dir: Path) -> list[tuple[str, bool, str]]:
+    from charlie_work.doctor import _check_runner_allocation
+
+    collected: list[tuple[str, bool, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        collected.append((name, ok, detail))
+
+    _check_runner_allocation(add, config, fleet_dir_override=str(fleet_dir))
+    return collected
+
+
+def test_allocation_probe_is_silent_when_the_feature_is_disabled(tmp_path: Path) -> None:
+    checks = _collect_allocation_checks(_doctor_allocation_config(enabled=False), tmp_path)
+    assert checks == []
+
+
+def test_allocation_probe_reports_enabled_but_never_run(tmp_path: Path) -> None:
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    name, ok, detail = checks[0]
+    assert name == "runner allocation"
+    assert ok is False
+    assert "never run" in detail
+
+
+def test_allocation_probe_passes_on_a_fresh_pass(tmp_path: Path) -> None:
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
+        json.dumps({"version": 1, "updated_at": now, "source": "prologue", "repos": {}}),
+        encoding="utf-8",
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is True
+    assert "budget 8" in detail
+    # Only an unattended write is evidence, so the ok line has to say which it saw.
+    assert "unattended" in detail
+
+
+def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
+    """A configured-but-inert allocator is the exact shape of issue #590."""
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    config = _doctor_allocation_config()
+    stale_by = config.supervisor.full_pass_interval_seconds * 3 + 60
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=stale_by)
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
+        json.dumps(
+            {"version": 1, "updated_at": old.isoformat(), "source": "prologue", "repos": {}}
+        ),
+        encoding="utf-8",
+    )
+    checks = _collect_allocation_checks(config, tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "not running unattended" in detail
+
+
+def test_allocation_probe_survives_a_corrupt_state_file(tmp_path: Path) -> None:
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text("{not json", encoding="utf-8")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "updated_at" in detail
+
+
+def _write_allocation_stamp(fleet_dir: Path, *, age_seconds: float, source: Any) -> None:
+    """Write a state file aged ``age_seconds`` (negative = future-dated)."""
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    when = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age_seconds)
+    payload: dict[str, Any] = {"version": 1, "updated_at": when.isoformat(), "repos": {}}
+    if source is not None:
+        payload["source"] = source
+    (fleet_dir / ALLOCATION_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_allocation_probe_does_not_accept_a_manual_pass_as_evidence(tmp_path: Path) -> None:
+    """A fresh manual allocate must not make the probe read healthy.
+
+    CLAUDE.md requires post-reboot procedures to delegate to `charlie runners
+    allocate`, so this is the routine case -- and it writes the same host-wide file
+    the unattended pass does. Treating its timestamp as proof would blind the probe
+    for three intervals during exactly the window an operator is diagnosing #590.
+    """
+    _write_allocation_stamp(tmp_path, age_seconds=5, source="cli")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "manual" in detail
+    assert "cannot confirm" in detail
+
+
+def test_allocation_probe_reports_unrecorded_provenance_rather_than_assuming(
+    tmp_path: Path,
+) -> None:
+    """A file written before provenance tracking is unknown, not unattended."""
+    _write_allocation_stamp(tmp_path, age_seconds=5, source=None)
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "unrecorded" in detail
+
+
+def test_allocation_probe_names_an_unrecognised_writer(tmp_path: Path) -> None:
+    """A future writer that forgets to extend AllocationSource is named, not hidden."""
+    _write_allocation_stamp(tmp_path, age_seconds=5, source="some-new-path")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "some-new-path" in detail
+
+
+def test_allocation_probe_clamps_a_future_dated_stamp(tmp_path: Path) -> None:
+    """Clock skew must not print a negative age, and must not read as stale."""
+    _write_allocation_stamp(tmp_path, age_seconds=-600, source="prologue")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is True
+    assert "-" not in detail
+    assert "0s ago" in detail
+
+
+def test_run_doctor_wires_the_allocation_probe(tmp_path: Path) -> None:
+    """Pin the wiring, not just the probe body.
+
+    Every other allocation test calls ``_check_runner_allocation`` directly, so
+    deleting its call in ``run_doctor`` would leave them all green while the probe
+    silently stopped running for operators.
+    """
+    config = _doctor_allocation_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    _, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(tmp_path)
+    )
+
+    allocation_checks = [c for c in checks if c.name == "runner allocation"]
+    assert len(allocation_checks) == 1
+    # No state file was written, so the probe should report the never-run case.
+    assert allocation_checks[0].ok is False
+    assert "never run" in allocation_checks[0].detail
+    # Warning-only: the probe must never change doctor's exit code.
+    assert allocation_checks[0].severity == "warning"

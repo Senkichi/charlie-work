@@ -2279,7 +2279,10 @@ def test_allocation_prologue_skips_when_no_repo_root_is_usable(tmp_path: Path) -
             str(fleet_dir), _allocation_config(enabled=True), dry_run=False
         )
 
-    assert events == []
+    # Visible, not silent: an unusable registry is nobody's deliberate choice,
+    # so it reaches the digest rather than only the log (issue #590).
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert "registry" in events[0]["reason"]
     pass_mock.assert_not_called()
 
 
@@ -2419,5 +2422,216 @@ def test_allocation_prologue_warns_when_the_config_lacks_the_section(
     with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
         events = _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
 
-    assert events == []
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert "NoSection" in events[0]["reason"]
     assert any("no runner_allocation" in record.message for record in caplog.records)
+
+
+def test_disabled_allocation_prologue_is_visible_at_info(tmp_path, caplog) -> None:
+    """The disabled branch must log at INFO, not DEBUG.
+
+    Regression guard for issue #590: the daemon runs at INFO, so a DEBUG line here
+    is never written at all, which made a host where allocation never ran
+    indistinguishable from a converged one. The message must also name the fleet
+    directory, since that identifies which config.yaml governs the decision.
+    """
+    import logging
+    from dataclasses import replace
+
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.fleet_dispatch import _run_fleet_allocation_prologue
+
+    base = OrchestratorConfig()
+    config = replace(base, runner_allocation=replace(base.runner_allocation, enabled=False))
+
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path), config, True)
+
+    assert events == []
+    assert "runner_allocation.enabled is false" in caplog.text
+    assert str(tmp_path) in caplog.text
+
+
+def test_allocation_prologue_logs_its_inputs_before_any_branch(tmp_path: Any, caplog: Any) -> None:
+    """The entry line must be unconditional.
+
+    Regression guard for the evidence gap that kept #590 unisolated: every skip
+    path used to log from *inside* a branch, so an absent log line was equally
+    consistent with "reached and declined" and "never reached". One line before
+    the first branch separates those two readings, which is the only thing that
+    distinguishes a misconfigured host from an unreached call site.
+    """
+    import logging
+
+    class _NoSection:
+        pass
+
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
+
+    # Logged even in the most degenerate case, where there is no section to read.
+    assert "prologue: entered" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        _run_fleet_allocation_prologue(
+            str(tmp_path / "fleet"),
+            _allocation_config(enabled=False, managed_root="C:/actions-runners", **{}),
+            False,
+        )
+
+    assert "prologue: entered" in caplog.text
+    assert "enabled=False" in caplog.text
+    assert "C:/actions-runners" in caplog.text
+
+
+def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
+    """An unmapped event type must not vanish.
+
+    The mapper was an if/elif chain with no else, so the prologue's own
+    ``runner_allocation_error`` was emitted correctly and then dropped on the
+    floor — the digest could not show the one signal that mattered for #590.
+    """
+    events = [
+        {"repo_key": "fleet", "type": "runner_allocation_error", "error": "managed_root missing"},
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_skipped",
+            "reason": "no usable repo root",
+        },
+    ]
+
+    digest = _build_fleet_attention_digest(events)
+
+    assert len(digest.transitions) == 2
+    rendered = {entry.health: entry.last_log_line for entry in digest.transitions}
+    assert rendered["ERROR"] == "managed_root missing"
+    assert rendered["INFO"] == "no usable repo root"
+
+
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_actually_reaches_the_allocation_pass(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Pin the wiring, not just the pieces.
+
+    Every prologue test calls ``_run_fleet_allocation_prologue`` directly and
+    every ``run_fleet_supervise`` test patches ``fleet_loop`` out, so nothing
+    asserted that a real fleet pass reaches allocation at all. This drives
+    ``fleet_loop`` unmocked and patches only one level below the prologue.
+
+    Scope, so this does not misdirect the next triage: it covers ``fleet_loop``
+    only. ``run_fleet_supervise``'s own ``load_layered_config(Path.cwd(), ...)``
+    and the HEAD-drift and self-deploy steps that run *before* ``fleet_loop`` are
+    still unexercised, and #590 could live in any of them.
+    """
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=(),
+    )
+
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=_allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    from charlie_work.runner_slots import UNATTENDED_ALLOCATION_SOURCE
+
+    mock_run_allocation_pass.assert_called_once()
+    assert mock_run_allocation_pass.call_args.kwargs["dry_run"] is False
+    # The daemon must identify itself as the unattended writer: the doctor probe
+    # accepts only this value as evidence that allocation runs without an operator.
+    assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE
+
+
+def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
+    """A healthy rebalance must not put an entry in every 5-minute digest.
+
+    The prologue emits `runner_allocation` when anything moved OR any note was
+    produced, and the notes include standing advisory conditions that persist as long
+    as the condition does. Verified against this host's events.db: every recorded pass
+    carried such a note while moving zero slots. So routing this event through the
+    generic fallback would render a near-identical attention entry on every pass.
+
+    Precise about what this does and does not assert. It pins the *entry*: none is
+    rendered for a converged pass. It does not assert the digest sink stays untouched,
+    because the envelope is emitted every pass either way -- `fleet_loop`'s notify gate
+    tests the raw event list rather than the built digest, so `emit_digest` is called
+    with `transitions=()` on a converged pass. That gate/digest mismatch predates this
+    PR (unchanged since #591) and is tracked separately in issue #610; it is not
+    something this branch introduced or fixes.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    converged = [
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation",
+            "started": 0,
+            "parked": 0,
+            "budget": 8,
+            "notes": ["Senkichi/job-cannon: holding 4 surplus slot(s) - slack for 0/3 pass(es)"],
+            "dry_run": False,
+        }
+    ]
+    digest = _build_fleet_attention_digest(converged)
+    assert digest.transitions == ()
+
+
+def test_digest_still_surfaces_allocation_failures() -> None:
+    """Dropping the success event must not also drop the errors and skips."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    failures = [
+        {"repo_key": "fleet", "type": "runner_allocation_error", "error": "managed_root missing"},
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_slot_error",
+            "runner": "cw-2",
+            "action": "park",
+            "message": "still busy",
+        },
+        {"repo_key": "fleet", "type": "runner_allocation_skipped", "reason": "no registry anchor"},
+    ]
+    digest = _build_fleet_attention_digest(failures)
+    assert len(digest.transitions) == 3
+    healths = {e.health for e in digest.transitions}
+    # Both error types must reach the desktop-eligible severity set, not just the log.
+    assert "ERROR" in healths
+    reasons = " ".join(str(e.last_log_line) for e in digest.transitions)
+    assert "managed_root missing" in reasons
+    assert "no registry anchor" in reasons

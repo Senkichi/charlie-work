@@ -25,9 +25,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
+from typing import Literal, Mapping
 
 from .github import GitHub, GitHubError
 from .runner_allocation import (
@@ -50,6 +51,22 @@ logger = logging.getLogger(__name__)
 
 # Persistent per-repo slack tracking for demotion hysteresis.
 ALLOCATION_STATE_FILENAME = "runner-allocation.json"
+
+# Which code path persisted an allocation pass. Both paths write the same
+# host-wide state file, so the timestamp alone cannot distinguish "the daemon is
+# rebalancing on its own" from "a human just ran `charlie runners allocate`" —
+# and only the first answers issue #590. Recording the writer keeps that
+# distinction in the artifact instead of leaving it to be guessed from age.
+AllocationSource = Literal["prologue", "cli"]
+
+# The two writers, named once here so that what the daemon stamps, what the CLI
+# stamps, and what the doctor probe tests for cannot drift apart. Every writer and
+# every reader spells them this way; a bare string literal at a call site would
+# reintroduce exactly the drift the ``Literal`` type is meant to prevent, since
+# ``Literal`` constrains the value but nothing keeps three separate copies of it
+# in agreement.
+UNATTENDED_ALLOCATION_SOURCE: AllocationSource = "prologue"
+CLI_ALLOCATION_SOURCE: AllocationSource = "cli"
 
 # Label that marks a job as targeting this host's runners rather than
 # GitHub-hosted ones. This is GitHub's own reserved label, not a local
@@ -306,13 +323,71 @@ def load_idle_streaks(fleet_dir: Path) -> dict[str, int]:
     return streaks
 
 
-def save_idle_streaks(fleet_dir: Path, streaks: Mapping[str, int]) -> None:
-    """Persist slack streaks using the project's atomic temp-file + replace."""
+@dataclass(frozen=True)
+class AllocationStamp:
+    """Provenance of the last persisted allocation pass.
+
+    ``source`` is ``None`` for a file written before provenance was recorded,
+    which is reported as unknown rather than assumed to be either path.
+    """
+
+    updated_at: datetime | None
+    source: str | None
+
+
+def load_allocation_stamp(fleet_dir: Path) -> AllocationStamp | None:
+    """Read when the last allocation pass ran and which path wrote it.
+
+    Returns ``None`` when the state file is absent — the caller distinguishes
+    "never ran" from "ran but wrote something unreadable", which is why an
+    unparseable file yields a stamp with empty fields instead of ``None``.
+
+    This is the only reader of the state file's top-level shape outside
+    ``save_idle_streaks``; keeping it here means a change to the payload does not
+    have to be mirrored into the doctor probe.
+    """
+    path = fleet_dir / ALLOCATION_STATE_FILENAME
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return AllocationStamp(updated_at=None, source=None)
+    if not isinstance(raw, dict):
+        return AllocationStamp(updated_at=None, source=None)
+
+    updated_at: datetime | None = None
+    stamp = raw.get("updated_at")
+    if isinstance(stamp, str):
+        try:
+            updated_at = datetime.fromisoformat(stamp)
+        except ValueError:
+            updated_at = None
+    if updated_at is not None and updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+
+    source = raw.get("source")
+    return AllocationStamp(
+        updated_at=updated_at,
+        source=source if isinstance(source, str) else None,
+    )
+
+
+def save_idle_streaks(
+    fleet_dir: Path, streaks: Mapping[str, int], *, source: AllocationSource
+) -> None:
+    """Persist slack streaks using the project's atomic temp-file + replace.
+
+    ``source`` is required rather than defaulted: every writer has to say which
+    path it is, because a caller that silently inherited the unattended default
+    would make the state file assert that the daemon ran when it did not.
+    """
     fleet_dir.mkdir(parents=True, exist_ok=True)
     path = fleet_dir / ALLOCATION_STATE_FILENAME
     payload = {
         "version": 1,
         "updated_at": datetime.now(UTC).isoformat(),
+        "source": source,
         "repos": {repo: {"idle_streak": streak} for repo, streak in sorted(streaks.items())},
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
