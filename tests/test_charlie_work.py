@@ -21264,6 +21264,64 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
     assert result.data["sessions"][0]["issue_number"] == 123
 
 
+def test_dispatch_rework_skips_issue_view_for_rework_requested_issue_with_closed_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #558: dispatch_rework's candidate scan must NOT call
+    gh.issue_view() for a rework_requested issue whose PR is closed-unmerged.
+    pr_list() returns only OPEN PRs, so an issue with a closed-unmerged PR is
+    absent from the open-PR index; the per-issue gh.issue_view fetch is the
+    permanent per-pass cost this gate exists to eliminate. Verifying the fetch
+    is skipped (not just that selected_count is 0) pins the reorder directly.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewRecordingGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # PR 456 linked to issue 123, but CLOSED-unmerged on GitHub.
+            self.prs[0]["state"] = "CLOSED"
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            return super().issue_view(number)
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = IssueViewRecordingGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    # The whole point: no per-issue gh.issue_view fetch for the
+    # closed-unmerged-PR issue.
+    assert 123 not in fake_gh.issue_view_calls
+    assert fake_gh.issue_view_calls == []
+
+
 def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
     """Issue #85 acceptance test: two rework_requested issues, loop(limit=1) dispatches different issues.
 
