@@ -31,6 +31,7 @@ from charlie_work.config import (
     DispatchConfig,
     FleetConfig,
     LabelConfig,
+    NotifyConfig,
     OrchestratorConfig,
     PostMortemConfig,
     ReviewConfig,
@@ -2959,6 +2960,11 @@ class FakeGitHub:
 
     def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
         return (True, 10000, 0)
+
+    def invalidate_list_cache(self) -> None:
+        # The real GitHub clears its per-pass list cache here (called at the
+        # start of every loop pass); the fake has no cache, so this is a no-op.
+        self.list_cache_invalidations = getattr(self, "list_cache_invalidations", 0) + 1
 
     def issue_list(self, labels=None, state=None):
         # Honor the label filter: return only issues with the ready label
@@ -7033,7 +7039,13 @@ def test_dispatch_reviews_defers_when_reviewer_quota_exhausted(tmp_path: Path) -
 
 
 def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_path: Path) -> None:
-    """A successful reviewer launch while in probe mode clears the global reviewer quota."""
+    """A successful reviewer verdict from a probe clears the global reviewer quota.
+
+    Fix 1.1: the quota is cleared only when a verdict is actually recorded from
+    a dead reviewer, not when a probe process merely starts. A session-limited
+    reviewer starts successfully but dies seconds later — clearing on start
+    caused a hot redispatch loop.
+    """
     from datetime import UTC, datetime, timedelta
 
     prs = [
@@ -7061,7 +7073,51 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
             "throttled_until": future_throttle,
             "probe_after": past_probe,
         }
+        # Simulate a prior dispatched reviewer that has died with a verdict in
+        # its log — _reap_review_verdicts will record this verdict before the
+        # dispatch pass, and the recorded verdict is what clears the quota.
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
         save_state(app.paths.state_file, state)
+
+    # Write a sidecar + log with a verdict so _reap_review_verdicts finds it.
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        'Review complete.\n```json\n{"decision": "approved", "summary": "LGTM"}\n```',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(
         "charlie_work.workflow.launch_claude_worker",
@@ -7071,12 +7127,201 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
         ),
     )
 
+    app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    # The verdict was recorded, which clears the quota. The reaped PR is now
+    # completed, so the queue is empty and dispatch returns early — but the
+    # quota clearing happens before the queue check (fix 1.1).
+    assert state.get("reviewer_quota", {}).get("throttled_until") is None
+
+
+def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path: Path) -> None:
+    """When a reviewer dies without a verdict but has analysis in events.jsonl,
+    a summary PR comment is posted so the work is not lost."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
+        save_state(app.paths.state_file, state)
+
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a log with NO verdict block (simulates turn-limit exhaustion).
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "I reviewed the diff and checked the tests.\n"
+        "The changes look reasonable but I need more turns to verify.\n",
+        encoding="utf-8",
+    )
+
+    # Write events.jsonl with assistant messages and turn metrics.
+    events_path = reviews_dir / "issue-100-review.events.jsonl"
+    events_lines = [
+        '{"type": "user_message", "tokens": 100}',
+        '{"type": "assistant_message", "content": "Let me read the diff first.", "tokens": 200}',
+        '{"type": "tool_call", "tokens": 300}',
+        '{"type": "assistant_message", "content": "The changes look reasonable but I need more turns to verify the edge cases.", "tokens": 400}',
+        '{"type": "assistant_message", "content": "I was unable to complete the review within the turn limit.", "tokens": 500}',
+    ]
+    events_path.write_text("\n".join(events_lines) + "\n", encoding="utf-8")
+
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Capture PR comments.
+    captured_comments: list[tuple[int, str]] = []
+
+    class _CapturingGitHub(type(app.gh)):  # type: ignore[misc]
+        def pr_comment(self, number: int, body_file: Path) -> None:
+            captured_comments.append((number, body_file.read_text(encoding="utf-8")))
+
+    app.gh = _CapturingGitHub()
+
     result = app.dispatch_reviews()
     state = load_state(app.paths.state_file)
 
-    assert result.data["launched_count"] == 1
-    assert result.data.get("quota_hit") is False
-    assert state.get("reviewer_quota", {}).get("throttled_until") is None
+    # A summary comment should have been posted.
+    assert len(captured_comments) == 1
+    assert captured_comments[0][0] == 100
+    comment_body = captured_comments[0][1]
+    assert "no verdict produced" in comment_body
+    assert "Recent analysis" in comment_body
+
+    # The state flag should be set to prevent duplicate comments.
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
+
+    # The missed list should include the turn_limit_summary_posted reason.
+    missed = result.data.get("missed_verdicts", [])
+    assert any(m.get("reason") == "turn_limit_summary_posted" for m in missed)
+
+
+def test_dispatch_reviews_turn_limit_summary_not_posted_twice(monkeypatch, tmp_path: Path) -> None:
+    """The turn-limit summary is only posted once per dispatch lifecycle."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+            "review_turn_limit_summary_posted": True,
+        }
+        save_state(app.paths.state_file, state)
+
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text("Some analysis without a verdict.\n", encoding="utf-8")
+    events_path = reviews_dir / "issue-100-review.events.jsonl"
+    events_path.write_text(
+        '{"type": "assistant_message", "content": "Some analysis.", "tokens": 100}\n',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured_comments: list[tuple[int, str]] = []
+
+    class _CapturingGitHub(type(app.gh)):  # type: ignore[misc]
+        def pr_comment(self, number: int, body_file: Path) -> None:
+            captured_comments.append((number, body_file.read_text(encoding="utf-8")))
+
+    app.gh = _CapturingGitHub()
+
+    app.dispatch_reviews()
+
+    # No comment should be posted — the flag was already set.
+    assert len(captured_comments) == 0
 
 
 def test_dispatch_reviews_probe_failure_sets_reviewer_quota_and_rolls_back(
@@ -7242,6 +7487,84 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
         text=True,
     )
     assert str(checkout.path) not in result.stdout
+
+
+def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log(
+    tmp_path: Path,
+) -> None:
+    """A dead reviewer whose own log shows a provider throttle signature
+    (e.g. Claude Code CLI's "You've hit your session limit ...") must set the
+    global reviewer-quota cooldown and roll back the claim, not mark it
+    review_dispatch_failed. Marking it failed lets the next dispatch_reviews
+    pass relaunch straight into the same limit -- job-cannon PRs #1342,
+    #1343, #1344, #1346 hot-looped for 5.5-20+ hours this way on 2026-07-21
+    before this reap path also learned to log-tail classify."""
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,  # not a real live pid
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
+    )
+
+    state = _load_state(state_file)
+    pr_state = state["prs"]["100"]
+    # Rolled back, not failed -- the claim is immediately re-dispatchable
+    # once the reviewer-quota gate clears.
+    assert pr_state.get("review_dispatch_status") is None
+    assert pr_state.get("reviewer_pid") is None
+
+    quota = state.get("reviewer_quota", {})
+    assert quota.get("throttled_until")
+    assert quota.get("probe_after")
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        for event in state.get("events", [])
+    )
 
 
 def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
@@ -9254,6 +9577,69 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     )
 
 
+# --- Issue #526: error-isolation hardening --------------------------------------
+
+
+def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A closed PR whose status was left as "reviewing" by the review pipeline
+    must have its status overwritten to "closed" by the lifecycle reaper.
+
+    Without this, the unclaimed-stalled sweep re-triggers every pass because
+    it matches ``status is None and pr_state.get("status") == "reviewing"``,
+    causing an infinite ping-pong with the lifecycle reaper.
+    """
+    from charlie_work.state import empty_state
+    from charlie_work.workflow import _reap_orphaned_review_checkouts
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir()
+    state_file = tmp_path / "state.json"
+
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["200"] = {
+        "number": 200,
+        "issue_number": 199,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-01T00:00:00Z",
+        "reviewer_pid": 99999,
+        "reviewer_process_start_time": 1.0,
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "decision_path": str(tmp_path / "decision.json"),
+    }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 200,
+            "title": "Fix #199",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-199-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "body": "Closes #199",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "CLOSED",
+        }
+    ]
+
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    assert reaped == [200]
+    state_after = load_state(state_file)
+    assert state_after["prs"]["200"]["status"] == "closed"
+    assert state_after["prs"]["200"]["review_dispatch_status"] is None
+
+
 # --- Issue #14: error-isolation hardening --------------------------------------
 
 
@@ -10511,6 +10897,144 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     persisted = load_state(paths.state_file)["prs"]["456"]
     assert persisted["status"] == "mergequeue"
     assert persisted["status"] != "merged"
+
+
+def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: an approved PR carrying the configured merge-hold label
+    must not be swept back into the mergequeue on subsequent passes."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["labels"] = [{"name": config.labels.merge_hold}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "left alone" in result.message
+    assert load_state(paths.state_file)["prs"]["456"].get("status") != "mergequeue"
+
+
+def test_merge_ready_mergequeue_hold_label_on_issue_prevents_re_add(tmp_path: Path) -> None:
+    """Issue #496: the merge-hold label on the linked issue is also a
+    valid operator signal and must keep the PR out of the mergequeue."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.merge_hold},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path) -> None:
+    """Issue #496: removing the merge-hold label restores normal
+    auto-merge behavior on the next pass."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    hold_label = config.labels.merge_hold
+    fake_gh.prs[0]["labels"] = [{"name": hold_label}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    held = app.merge_ready(456, merge=True)
+    assert held.data["merge_hold"] is True
+    assert fake_gh.pr_labels_added == []
+
+    # Operator removes the hold label
+    fake_gh.prs[0]["labels"] = []
+    resumed = app.merge_ready(456, merge=True)
+
+    assert resumed.data["merge_hold"] is False
+    assert resumed.data["mergequeue_label_applied"] is True
+    assert (456, "mergequeue") in fake_gh.pr_labels_added
+
+
+def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_path: Path) -> None:
+    """Issue #496 regression: if issue_view fails while checking for the
+    merge-hold label on the linked issue, the PR must not be handed to the
+    mergequeue. The failure is reported as merge_hold_check_unavailable and
+    must not be treated as a mergequeue handoff failure (no failed-attempt
+    alarm side effects)."""
+    from charlie_work.github import GitHubError as _GitHubError
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewFailGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                raise _GitHubError("transient gh issue view failure")
+            return super().issue_view(number)
+
+    fake_gh = IssueViewFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    assert "merge-hold check unavailable" in result.message
+    assert "not handed off to Aviator" in result.message
+    pr_state = load_state(paths.state_file)["prs"]["456"]
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("consecutive_failed_merge_attempts", 0) == 0
+
+
+@pytest.mark.parametrize("degraded_payload", [{}, {"number": 123}])
+def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
+    tmp_path: Path,
+    degraded_payload: dict[str, Any],
+) -> None:
+    """Issue #496 regression: a degraded gh issue view payload (empty dict or
+    missing labels) must be treated as unavailable, not as "no hold"."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewDegradedGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            if number == 123:
+                return degraded_payload
+            return super().issue_view(number)
+
+    fake_gh = IssueViewDegradedGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merge_hold"] is False
+    assert result.data["merge_hold_check_unavailable"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert result.data["merge_attempt_alarm"] is False
+    assert result.data["merge_attempt_warning"] is None
+    assert result.ok is False
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
 
 
 def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -> None:
@@ -11867,6 +12391,99 @@ def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) ->
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     assert state["issues"]["123"]["merge_alert"] == "OK"
+
+
+def test_merge_ready_readiness_gate_escalates_no_ci_stall(tmp_path: Path) -> None:
+    """Issue #474: an approved PR with no CI check runs after the configured
+    readiness timeout is routed to rework instead of waiting silently.
+
+    Expected checks are derived from ``auto_merge.required_checks``; no check
+    names are hard-coded in the assertion.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+            readiness_no_ci_minutes=15,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    # Simulate a head push well beyond the no-CI timeout.
+    stale_updated = (datetime.now(UTC) - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fake_gh.prs[0]["updatedAt"] = stale_updated
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data.get("readiness_no_ci_stall") is True
+    assert result.data.get("merge_attempt_alarm") is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    no_ci_events = [e for e in state["events"] if e["kind"] == "readiness_no_ci_rework_requested"]
+    assert len(no_ci_events) == 1
+    missing = no_ci_events[0]["payload"]["missing_checks"]
+    assert set(missing) == set(required)
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    for check in required:
+        assert check in prompt_text
+
+
+def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
+    """Issue #474: a PR reporting mergeStateStatus=DIRTY escalates to rework."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "UNKNOWN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    fake_gh._record_pr_heads(fake_gh.prs)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert result.data.get("merge_attempt_alarm") is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert (paths.prs / "pr-456" / "rework-prompt.md").exists()
 
 
 def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Path) -> None:
@@ -13771,9 +14388,11 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
 
-    # Verify the cooldown reflects the parsed 10 minutes
+    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    expected_time = datetime.now(UTC) + timedelta(
+        minutes=10, seconds=config.runtime.throttle_resume_margin_s
+    )
     # Allow 2 second tolerance for test execution time
     assert abs((throttle_time - expected_time).total_seconds()) < 2
 
@@ -13964,11 +14583,13 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
     assert not sidecar_path.exists()
 
     # The throttle window from the classifier is persisted, same as the
-    # dead-session lane
+    # dead-session lane, including the resume margin.
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=10)
+    expected_time = datetime.now(UTC) + timedelta(
+        minutes=10, seconds=config.runtime.throttle_resume_margin_s
+    )
     assert abs((throttle_time - expected_time).total_seconds()) < 5
 
 
@@ -14688,7 +15309,15 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     assert (123, config.labels.in_progress) in fake_gh.labels_removed
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
 
-    # Next dispatch_rework should re-select the issue.
+    # Next dispatch_rework should re-select the issue. Clear the throttle
+    # window first so the test verifies the rework restore path, not the
+    # provider-throttle deferral behavior (issue #499 adds a resume margin
+    # that makes a "0 minutes" reset window a real 90-second deferral).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state.pop("throttled_until", None)
+        save_state(paths.state_file, state)
+
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch_rework()
     assert result.ok is True
@@ -17417,6 +18046,64 @@ def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
     alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
     assert len(alarm_events) == 1
     assert "merge conflict" in alarm_events[0]["payload"]["message"].lower()
+
+
+def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> None:
+    """Regression: a PR that exceeded the failed_attempt_alarm threshold must
+    still be routed to rework, not silently stuck.
+
+    If the initial rework dispatch at the threshold failed to transition the
+    issue (e.g. label transition error), the counter keeps incrementing past
+    the threshold.  With ``==`` the rework condition never matches again,
+    permanently orphaning the PR.  ``>=`` ensures it retries.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=3,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Pre-seed the state with attempt count *past* the threshold (simulates
+    # a prior rework dispatch that failed to transition the issue).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"]["consecutive_failed_merge_attempts"] = 5
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
 
 
 def test_merge_ready_conflict_no_linked_issue_alarm_is_honest(tmp_path: Path) -> None:
@@ -22364,11 +23051,13 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     assert updated_sidecar["failure_kind"] == "rate_limited"
 
     # throttled_until must be persisted to state.json, roughly now + 7 minutes
+    # plus the resume margin.
     state = load_state(paths.state_file)
     throttled_until = state.get("throttled_until")
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8)
+    margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8) + margin
 
     # session_stalled event must carry the resolved failure_kind
     events = state.get("events", [])
@@ -22418,7 +23107,8 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     throttled_until = state.get("throttled_until")
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+    margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25) + margin
 
     events = state.get("events", [])
     stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
@@ -23341,12 +24031,19 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     assert check_calls["n"] == 1
     assert result1.ok is True
 
-    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123
+    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123,
+    # and the rework_requested issue status the real record_review sets (the janitor gate's
+    # pending-rework guard reads it).
     state = load_state(app.paths.state_file)
     if "456" not in state["prs"]:
         state["prs"]["456"] = {}
     state["prs"]["456"]["decision"] = "request_changes"
     state["prs"]["456"]["reviewed_head_sha"] = "sha-abc123"
+    state["issues"]["123"] = {
+        **state["issues"].get("123", {}),
+        "number": 123,
+        "status": "rework_requested",
+    }
     save_state(app.paths.state_file, state)
 
     # Second review on same head: janitor gate blocks (no-op rework check)
@@ -24348,6 +25045,8 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
     #    escalation + dead-session normal + dead-session escalation).
     # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 4. dispatch_rework no-op rework escalation path (pre-dispatch check
+    #    that escalates issues whose redispatch cap is already exhausted).
     # No other code paths write to redispatch_at.
 
     import charlie_work.workflow as workflow_module
@@ -24357,13 +25056,14 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
 
     # Count occurrences of redispatch_at assignments to entry:
     # dispatch_rework: 2 (success normal + escalation) +
-    #                  2 (failure normal + escalation, issue #515) = 4
+    #                  2 (failure normal + escalation, issue #515) +
+    #                  1 (no-op rework escalation, pre-dispatch check) = 5
     # _classify_dead_sessions_and_update_throttle_state: 3
     # _reap_restore_rework_requested: 2
-    # Total of 9 assignments is correct.
+    # Total of 10 assignments is correct.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 9, (
-        f"Expected 9 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 10, (
+        f"Expected 10 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
@@ -26411,6 +27111,67 @@ def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_c
     assert _is_pre_review_rework_candidate(checks_pr, config, now) == (False, "")
 
 
+def test_is_pr_updated_at_older_than() -> None:
+    """The shared updatedAt threshold helper parses, tz-normalizes, and compares."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.workflow import _is_pr_updated_at_older_than
+
+    now = datetime.now(UTC)
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+    assert _is_pr_updated_at_older_than({"updatedAt": stale}, now, 15) is True
+    assert _is_pr_updated_at_older_than({"updatedAt": fresh}, now, 15) is False
+    assert _is_pr_updated_at_older_than({}, now, 15) is False
+    assert _is_pr_updated_at_older_than({"updatedAt": "not-a-date"}, now, 15) is False
+
+    # Naive datetimes are normalized to UTC before comparison.
+    naive_now = datetime.now()
+    naive_updated = (naive_now - timedelta(minutes=20)).replace(microsecond=0)
+    assert (
+        _is_pr_updated_at_older_than({"updatedAt": naive_updated.isoformat()}, naive_now, 15)
+        is True
+    )
+
+
+def test_is_readiness_no_ci_stall() -> None:
+    """Issue #474: the readiness no-CI gate escalates only when required checks are missing and updatedAt is stale."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import AutoMergeConfig
+    from charlie_work.workflow import _is_readiness_no_ci_stall
+
+    now = datetime.now(UTC)
+    required = ("Tests passed", "Lint & Format")
+    stale = (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+    fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    config = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=15)
+
+    # Missing required checks and stale updatedAt.
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], config, now) is True
+
+    # A required check has appeared.
+    assert (
+        _is_readiness_no_ci_stall({"updatedAt": stale}, [{"name": "Tests passed"}], config, now)
+        is False
+    )
+
+    # Missing checks but the PR was updated recently.
+    assert _is_readiness_no_ci_stall({"updatedAt": fresh}, [], config, now) is False
+
+    # Gate disabled by zero minutes.
+    disabled = AutoMergeConfig(required_checks=required, readiness_no_ci_minutes=0)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], disabled, now) is False
+
+    # No required checks configured: there is nothing to be missing.
+    no_required = AutoMergeConfig(required_checks=(), readiness_no_ci_minutes=15)
+    assert _is_readiness_no_ci_stall({"updatedAt": stale}, [], no_required, now) is False
+
+    # Missing or malformed updatedAt is treated as not stale.
+    assert _is_readiness_no_ci_stall({}, [], config, now) is False
+
+
 def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None:
     """Issue #439: a dead worker with a CONFLICTING open PR is routed to rework."""
     from datetime import UTC, datetime
@@ -27132,6 +27893,210 @@ def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> Non
     assert len(orphan_calls) == 0, "dispatch_rework must not re-run orphaned-worker detection"
 
 
+def test_dispatch_fresh_candidates_take_priority_over_recovery_retry(
+    tmp_path: Path,
+) -> None:
+    """Issue #506: a stuck recovery-retry candidate must not starve fresh candidates.
+
+    With dispatch_limit=1, the fresh candidate must dispatch and the recovery
+    retry must not consume the only slot.
+    """
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["1317"] = {
+        "number": 1317,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1317-fix-stuck",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+    }
+    save_state(paths.state_file, state)
+
+    class FreshAndStuckGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1317,
+                    "title": "Fix stuck",
+                    "url": "https://example.test/issues/1317",
+                    "body": "Stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:00:00Z",
+                },
+                {
+                    "number": 1322,
+                    "title": "Fix fresh",
+                    "url": "https://example.test/issues/1322",
+                    "body": "Fresh",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T01:00:00Z",
+                },
+            ]
+            self.prs = []
+
+    fake_gh = FreshAndStuckGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    sessions = result.data["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["issue_number"] == 1322
+    assert sessions[0].get("recovery") is None
+
+
+def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #506: a live-worker redispatch averted outcome surfaces in the digest."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.state import empty_state, load_state, save_state
+
+    digest_path = tmp_path / "digest.jsonl"
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
+        devin=DevinConfig(adapter="manual"),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=str(digest_path)),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="manual",
+                ok=False,
+                error="pid_alive",
+                failure_kind="live_worker_redispatch_averted",
+                pid=12345,
+                process_start_time=1_234_567.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["live_worker_count"] == 1
+
+    digest_lines = digest_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(digest_lines) == 1
+    digest = json.loads(digest_lines[0])
+    transitions = digest["transitions"]
+    assert len(transitions) == 1
+    assert transitions[0]["issue_number"] == 123
+    assert transitions[0]["health"] == "DISPATCH_AVERTED"
+    assert transitions[0]["terminal_reason"] == "pid_alive"
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["dispatch_alert"] == "DISPATCH_AVERTED"
+
+
+def test_dispatch_only_issues_preserves_mixed_fresh_recovery_order(
+    tmp_path: Path,
+) -> None:
+    """Issue #506: --only-issues preserves operator order for mixed fresh/recovery.
+
+    When an operator explicitly lists recovery candidates before fresh work,
+    the requested order is honored, but recovery retries are still capped at
+    one per pass so a backlog of stuck recovery issues cannot consume the
+    budget.
+    """
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(default_limit=3),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = empty_state()
+    state["issues"]["1317"] = {
+        "number": 1317,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1317-fix-stuck",
+    }
+    state["issues"]["1323"] = {
+        "number": 1323,
+        "status": "dispatched",
+        "branch_name": "agent/issue-1323-fix-stuck-too",
+    }
+    save_state(paths.state_file, state)
+
+    class MixedOrderGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1317,
+                    "title": "Fix stuck",
+                    "url": "https://example.test/issues/1317",
+                    "body": "Stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:00:00Z",
+                },
+                {
+                    "number": 1323,
+                    "title": "Fix stuck too",
+                    "url": "https://example.test/issues/1323",
+                    "body": "Also stuck",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:01:00Z",
+                },
+                {
+                    "number": 1322,
+                    "title": "Fix fresh",
+                    "url": "https://example.test/issues/1322",
+                    "body": "Fresh",
+                    "labels": [{"name": config.labels.ready}],
+                    "state": "OPEN",
+                    "createdAt": "2026-07-19T00:02:00Z",
+                },
+            ]
+            self.prs = []
+
+    fake_gh = MixedOrderGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(only_issues="1317,1323,1322")
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    selected_numbers = [s["issue_number"] for s in result.data["sessions"]]
+    assert selected_numbers == [1317, 1322]
+    assert result.data["deferred_by_concurrency"] == [1323]
+    assert result.data["skipped_issue_numbers"] == []
+
+
 # --- Issue #507: record review verdicts from dead reviewer logs -------------
 
 
@@ -27261,7 +28226,9 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
 
     result = app._reap_review_verdicts(reviews_dir)
 
-    assert result["recorded"] == [{"pr": 100, "issue": 10, "decision": "request_changes"}]
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "request_changes", "verdict_source": "log"}
+    ]
     assert result["missed"] == []
 
     state = load_state(app.paths.state_file)
@@ -27311,7 +28278,10 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
 
     reap = app._reap_review_verdicts(reviews_dir)
     assert reap["recorded"] == []
-    assert reap["missed"] == []
+    # The reviewer had prose in its log (no verdict), so a turn-limit summary
+    # comment is posted and the miss is recorded with that reason.
+    assert len(reap["missed"]) == 1
+    assert reap["missed"][0]["reason"] == "turn_limit_summary_posted"
 
     # State should still be dispatched (reaper does not mark failed) and
     # _detect_and_handle_stalled_reviews should then move it to failed.
@@ -27345,3 +28315,270 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rework dispatch failure with a deterministic failure_kind (e.g.
+    rework_branch_conflict) must escalate immediately on the first occurrence,
+    not loop rework_requested → dispatch → fail until the redispatch cap is hit.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="rework branch conflicts with origin/main",
+                failure_kind="rework_branch_conflict",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "rework_branch_conflict"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
+    """A rework candidate whose PR head hasn't moved since the last
+    request_changes verdict, and whose redispatch_at count is already at the
+    cap, must be escalated immediately during candidate filtering instead of
+    dispatching another worker that will produce no changes.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("no_op_rework_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
+    """_windowed_redispatch_at must not crash when redispatch_at is corrupted
+    (e.g., a string instead of a list). A string value would cause
+    list("abc") → ['a', 'b', 'c'] which crashes datetime.fromisoformat.
+    """
+    from charlie_work.workflow import _windowed_redispatch_at
+
+    # String instead of list — must return empty, not crash
+    entry = {"redispatch_at": "2024-01-01T00:00:00Z"}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # None
+    entry = {"redispatch_at": None}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # Missing key
+    entry = {}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # List with non-string entries
+    entry = {"redispatch_at": [123, None, "not-a-date"]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+    # Valid list with recent timestamp
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    entry = {"redispatch_at": [now_iso]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == [now_iso]
+
+    # Valid list with old timestamp (outside window)
+    old_iso = (datetime.now(UTC) - timedelta(hours=10)).isoformat().replace("+00:00", "Z")
+    entry = {"redispatch_at": [old_iso]}
+    result = _windowed_redispatch_at(entry, window_minutes=240)
+    assert result == []
+
+
+def test_review_dispatch_quota_failure_rolls_back_attempt_count(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A quota failure during review dispatch must not consume the per-PR
+    review_dispatch_attempt_count. Without this fix, 3 quota hits (where no
+    reviewer actually ran) would escalate a PR that was never reviewed.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at="2026-07-20T12:00:00Z",
+            log_path="/fake/log.log",
+            error="usage limit exceeded",
+            process_start_time=1.0,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    assert result.data["launched_count"] == 0
+    assert result.data.get("quota_hit") is True
+    # Claim should be rolled back (not failed)
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+    # Attempt count should still be 0 (incremented at claim, then rolled back)
+    assert state["prs"]["100"].get("review_dispatch_attempt_count", 0) == 0
+
+
+def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path: Path) -> None:
+    """A throttled reviewer death in _detect_and_handle_stalled_reviews must
+    not consume the per-PR review_dispatch_attempt_count. The reviewer hit a
+    provider limit, not a PR-specific failure.
+    """
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(
+        reviews_dir, 100, "Error: usage limit exceeded; please try again later"
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    # Set attempt_count to 1 to simulate a prior dispatch
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"]["review_dispatch_attempt_count"] = 1
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, app.paths.state_file, app.config, repo_root
+    )
+    assert any(entry.get("pr") == 100 for entry in stalled)
+
+    state = load_state(app.paths.state_file)
+    # Attempt count should be 0 (rolled back from 1)
+    assert state["prs"]["100"].get("review_dispatch_attempt_count", 0) == 0
+    # Claim should be cleared (rolled back, not failed)
+    assert state["prs"]["100"].get("review_dispatch_status") is None

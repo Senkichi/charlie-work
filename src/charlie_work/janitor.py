@@ -31,7 +31,11 @@ from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
-from charlie_work.subprocess_runner import no_console_window_kwargs, run_captured
+from charlie_work.subprocess_runner import (
+    hidden_console_kwargs,
+    no_console_window_kwargs,
+    run_captured,
+)
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -140,6 +144,10 @@ class JanitorVerdict:
     is_check_failure_block: bool = False
     rerun_run_ids: tuple[int, ...] = ()
     check_rerun_attempts: dict[str, Any] = field(default_factory=dict)
+    # Structured flag for _check_no_op_rework's finding (either variant:
+    # patch-id or head-SHA unchanged since the last request_changes verdict).
+    # Consumers must branch on this, never on the failure-message text.
+    is_no_op_rework: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -309,8 +317,9 @@ def run_janitor(
         warnings.extend(check_stub_tests(pr_diff, config.test_adequacy))
 
     # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
+    is_no_op_rework = False
     if repo_root is not None:
-        _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
+        is_no_op_rework = _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
     is_check_failure_block = bool(failed_required_checks) and not failures
 
@@ -343,6 +352,7 @@ def run_janitor(
         is_check_failure_block=is_check_failure_block,
         rerun_run_ids=rerun_run_ids,
         check_rerun_attempts=check_rerun_attempts,
+        is_no_op_rework=is_no_op_rework,
     )
 
 
@@ -542,7 +552,7 @@ def _check_no_op_rework(
     warnings: list[str],
     repo_root: Path,
     pr_diff: str | None = None,
-) -> None:
+) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
     When a PR has a request_changes verdict in its state, compare the current
@@ -554,14 +564,19 @@ def _check_no_op_rework(
 
     Falls back to head SHA comparison if patch-id is not available (for backwards
     compatibility with old verdicts).
+
+    Returns True when a no-op-rework failure was appended (any variant), so
+    ``run_janitor`` can expose the finding as the structured
+    ``JanitorVerdict.is_no_op_rework`` flag instead of consumers matching on
+    failure-message text.
     """
     if not pr_state:
-        return
+        return False
 
     # Check if the most recent verdict was request_changes
     decision = pr_state.get("decision")
     if decision != "request_changes":
-        return
+        return False
 
     # Primary check: compare patch-ids when both are available
     reviewed_patch_id = pr_state.get("reviewed_patch_id")
@@ -587,18 +602,19 @@ def _check_no_op_rework(
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
 
             failures.append(failure_msg)
-        # Patch-id check ran (match or not) — skip SHA fallback
-        return
+            return True
+        # Patch-id check ran (no match) — skip SHA fallback
+        return False
 
     # Fallback: head SHA comparison (only when patch-id check could not run)
 
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:
-        return
+        return False
 
     current_head_sha = pr.get("headRefOid")
     if not current_head_sha:
-        return
+        return False
 
     # If heads match exactly, it's a no-op rework
     if current_head_sha == reviewed_head_sha:
@@ -619,7 +635,7 @@ def _check_no_op_rework(
             failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
 
         failures.append(failure_msg)
-        return
+        return True
 
     # Criterion 2: detect merge-only advances (e.g., from ship-it's update_open_prs)
     # Fetch the PR head ref and check if any non-merge commits exist since the verdict
@@ -628,7 +644,7 @@ def _check_no_op_rework(
     if not head_ref:
         # Can't check merge-only case without ref name; fall back to SHA equality check
         # (which already passed above, so no failure here)
-        return
+        return False
 
     try:
         # Fetch both the PR head ref and base ref from origin
@@ -642,7 +658,7 @@ def _check_no_op_rework(
             capture_output=True,
             check=True,
             text=True,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         # Count non-merge commits since the reviewed head, excluding base-reachable commits
         # The ^ syntax excludes commits reachable from the given refs
@@ -680,6 +696,7 @@ def _check_no_op_rework(
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
 
             failures.append(failure_msg)
+            return True
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         # Git failed (no network, unknown ref, shallow history, or parse error)
         # Fall back to SHA equality result and append a warning
@@ -688,6 +705,7 @@ def _check_no_op_rework(
             f"included non-merge commits; git fetch/rev-list failed. "
             f"If the advance was only base-update merges, this may be a no-op rework."
         )
+    return False
 
 
 def _get_unpushed_commit_info(
@@ -796,7 +814,7 @@ def detect_cross_pr_revert(
             capture_output=True,
             text=True,
             check=False,
-            **no_console_window_kwargs(),
+            **hidden_console_kwargs(),
         )
         if fetch.returncode != 0:
             return None

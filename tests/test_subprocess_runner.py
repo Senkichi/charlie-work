@@ -145,7 +145,7 @@ class TestRunCapturedUsesHelper:
         )
         with (
             patch(
-                "charlie_work.subprocess_runner.no_console_window_kwargs",
+                "charlie_work.subprocess_runner.hidden_console_kwargs",
                 return_value=sentinel,
             ) as mock_kwargs,
             patch(
@@ -166,7 +166,7 @@ class TestRunCapturedUsesHelper:
         )
         with (
             patch(
-                "charlie_work.subprocess_runner.no_console_window_kwargs",
+                "charlie_work.subprocess_runner.hidden_console_kwargs",
                 return_value=sentinel,
             ),
             patch(

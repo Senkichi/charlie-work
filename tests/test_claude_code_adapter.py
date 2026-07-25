@@ -23,6 +23,7 @@ from charlie_work.claude_code import (
     read_worker_records,
     update_worker_record_with_failure_classification,
     _apply_model_pin,
+    _apply_effort_pin,
     _sanitize_review_command_template,
     _sidecar_path,
 )
@@ -1044,6 +1045,28 @@ def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
     assert "Z" in throttled_until
 
 
+def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None:
+    """Issue #499: killed-worker rate-limit classification must include the resume margin."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Your limit will reset in 3 minutes.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC)
+    failure_kind, throttled_until = _classify_session_failure(log_path, resume_margin_seconds=90)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = now + timedelta(minutes=3, seconds=90)
+    assert abs((parsed - expected).total_seconds()) < 1
+
+
 def test_update_worker_record_with_failure_classification(tmp_path: Path) -> None:
     """Test that worker records are updated with failure classification."""
     sessions_dir = tmp_path / "sessions"
@@ -1086,6 +1109,52 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
     # Verify the sidecar was updated
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_update_worker_record_with_failure_classification_includes_resume_margin(
+    tmp_path: Path,
+) -> None:
+    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s."""
+    from datetime import UTC, datetime, timedelta
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Your limit will reset in 5 minutes.\n",
+        encoding="utf-8",
+    )
+
+    config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, config=config
+    )
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+    now = datetime.now(UTC)
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = now + timedelta(minutes=5, seconds=90)
+    assert abs((parsed - expected).total_seconds()) < 1
 
 
 def _make_worker_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:
@@ -2940,6 +3009,63 @@ def test_apply_model_pin_preserves_lookalike_token() -> None:
 
 def test_apply_model_pin_handles_empty_template() -> None:
     assert _apply_model_pin((), "claude-sonnet-5") == ("--model", "claude-sonnet-5")
+
+
+def test_apply_effort_pin_appends_to_template_without_effort() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--permission-mode", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_strips_existing_space_form_flag() -> None:
+    template = ("claude", "-p", "--effort", "high", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result.count("--effort") == 1
+    idx = result.index("--effort")
+    assert result[idx + 1] == "medium"
+    assert idx == len(result) - 2
+
+
+def test_apply_effort_pin_strips_equals_joined_flag() -> None:
+    template = ("claude", "-p", "--effort=high")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert not any(tok.startswith("--effort=") for tok in result)
+    assert result[-2:] == ("--effort", "medium")
+
+
+def test_apply_effort_pin_empty_effort_is_noop() -> None:
+    template = ("claude", "-p", "--permission-mode", "plan")
+
+    result = _apply_effort_pin(template, "")
+
+    assert result == template
+
+
+def test_apply_effort_pin_handles_bare_trailing_flag() -> None:
+    template = ("claude", "-p", "--effort")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert result == ("claude", "-p", "--effort", "medium")
+
+
+def test_apply_effort_pin_preserves_lookalike_token() -> None:
+    template = ("claude", "-p", "--effortx", "plan")
+
+    result = _apply_effort_pin(template, "medium")
+
+    assert "--effortx" in result
+    assert result == ("claude", "-p", "--effortx", "plan", "--effort", "medium")
+
+
+def test_apply_effort_pin_handles_empty_template() -> None:
+    assert _apply_effort_pin((), "medium") == ("--effort", "medium")
 
 
 def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
