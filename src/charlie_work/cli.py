@@ -903,7 +903,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         )
 
     dry_run = getattr(args, "dry_run", False)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=False)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     result = run_allocation_pass(
         gh,

@@ -747,6 +747,16 @@ def test_every_subcommand_dry_run_flag_defers_to_the_global_one() -> None:
         action = _dry_run_action(sub)
         if action is not None and action.default is not argparse.SUPPRESS:
             offenders.append(" ".join(path))
+        elif "dry_run" in sub._defaults:
+            # argparse seeds a namespace from two places -- action defaults and
+            # the parser's own ``_defaults`` (what ``set_defaults`` writes) -- and
+            # a subparser parses into a *fresh* namespace, then copies every key
+            # onto the parent's. So ``set_defaults(dry_run=False)`` overwrites the
+            # already-parsed global True exactly like an action default does,
+            # while leaving ``action.default is SUPPRESS`` and this test green.
+            # Checking both is what makes this guard complete rather than a patch
+            # over the one mechanism that happened to bite us.
+            offenders.append(" ".join(path) + " (via set_defaults)")
 
     assert offenders == [], (
         "these subcommands clobber the global --dry-run; route them through "
@@ -755,6 +765,28 @@ def test_every_subcommand_dry_run_flag_defers_to_the_global_one() -> None:
 
     # The top-level flag must keep a real default so args.dry_run always exists.
     assert _dry_run_action(parser).default is False
+
+
+def test_set_defaults_clobbers_a_global_flag_too() -> None:
+    """Pins the argparse behaviour that the guard above's second check exists for.
+
+    Stdlib-only, no repo coupling: a subparser that never declares ``--dry-run``
+    but calls ``set_defaults(dry_run=False)`` still overwrites an already-parsed
+    global ``--dry-run``. That is the blind spot in checking ``action.default``
+    alone -- there is no action here to inspect.
+
+    If a future Python stops copying subparser defaults over values the parent
+    already parsed, this test fails and the guard's ``_defaults`` branch can go.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    leaf = parser.add_subparsers(dest="command").add_parser("leaf")
+    leaf.set_defaults(dry_run=False)
+
+    assert _dry_run_action(leaf) is None, "no action to inspect -- that is the point"
+    assert parser.parse_args(["--dry-run", "leaf"]).dry_run is False
 
 
 def test_global_dry_run_reaches_runners_allocate_in_either_position() -> None:
