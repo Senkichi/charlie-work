@@ -17,18 +17,18 @@ You are the senior orchestrator performing a critical, adversarial review. Do no
 ## Local artifacts
 
 - PR JSON: `$pr_json_path`
-- Checks JSON: `$checks_json_path`
 - Diff patch: `$diff_path`
 $diff_size_section$cross_family_section$janitor_section
+## CI status
+$ci_status_section
 ## Review procedure
 
 1. Read the original issue and acceptance intent.
 2. Read the PR body and commits.
 3. Inspect the full diff from `$diff_path`.
 4. Inspect changed tests and verification evidence.
-5. Inspect CI status from `$checks_json_path`.
-6. Compare the implementation against project invariants in `CLAUDE.md`.
-7. Look for subtle bugs, edge cases, security risks, data-loss risks, migration risks, Windows/macOS/Linux differences, flaky tests, and unrelated changes.
+5. Compare the implementation against project invariants in `CLAUDE.md`.
+6. Look for subtle bugs, edge cases, security risks, data-loss risks, migration risks, Windows/macOS/Linux differences, flaky tests, and unrelated changes.
 
 ## Do not trust the PR's self-report
 
@@ -71,7 +71,9 @@ Approve only if all of these are true:
 - The diff is minimal and relevant.
 - Tests or a strong no-test rationale are present.
 - Every non-exempt changed behavior has a genuine regression test.
-- Required CI checks are passing or will be gated before merge.
+- Required CI checks are passing (see `## CI status` above — the orchestrator
+  verifies these deterministically before dispatch) or will be gated before
+  merge.
 - No high or medium severity concern remains.
 - The PR body links the issue with `Closes #$issue_number` or equivalent.
 

@@ -439,6 +439,71 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
     )
 
 
+def _ci_status_section(
+    checks: list[dict[str, Any]] | None,
+    required: tuple[str, ...],
+    checks_json_path: Path,
+) -> str:
+    """Render the $ci_status_section packet block from already-fetched CI data.
+
+    ``run_janitor`` deterministically verifies required checks BEFORE a review
+    packet is ever generated: a definitive required-check failure short-
+    circuits ``review()`` long before this function is reached (see the
+    ``janitor_blocked`` branch). So a reviewer re-reading ``checks.json`` to
+    re-confirm what the gate already verified is pure token waste. This
+    section states that verification result inline instead, while still
+    surfacing everything the gate does NOT resolve: unfetchable CI data, an
+    unconfigured required-check list (the gate is a no-op in that case),
+    still-pending required checks, and failing non-required/informational
+    checks (the gate never blocks on those).
+
+    Pure and I/O-free like ``_janitor_section`` — safe to call every pass.
+    """
+    if checks is None:
+        return (
+            "CI status could not be fetched by the orchestrator (`gh` failure). "
+            f"Do not assume checks are green — inspect `{checks_json_path}` "
+            "directly if CI status matters to this review.\n"
+        )
+
+    if not required:
+        return (
+            "No required checks are configured for this repo, so CI status was "
+            "not deterministically verified before dispatch. Inspect "
+            f"`{checks_json_path}` if CI status is relevant to your review.\n"
+        )
+
+    summary = summarize_checks(checks, required)
+    lines: list[str] = []
+    if summary.passed:
+        lines.append(
+            f"Required check(s) passing — verified deterministically by the "
+            f"orchestrator before dispatch: {', '.join(summary.passed)}. Do "
+            "not spend turns re-inspecting these."
+        )
+    if summary.pending:
+        lines.append(
+            f"Required check(s) still pending, not yet confirmed: {', '.join(summary.pending)}."
+        )
+    lines.append(f"`checks.json` is available at `{checks_json_path}` if a specific doubt arises.")
+
+    all_names = tuple(dict.fromkeys(str(check.get("name") or "") for check in checks))
+    all_names = tuple(name for name in all_names if name)
+    if all_names:
+        all_summary = summarize_checks(checks, all_names)
+        non_required_failing = sorted(
+            (set(all_summary.failed) | set(all_summary.infra_failed)) - set(required)
+        )
+        if non_required_failing:
+            lines.append(
+                "Non-required/informational check(s) currently failing (the "
+                "janitor gate does not block on these — weigh them yourself): "
+                + ", ".join(non_required_failing)
+            )
+
+    return "\n".join(lines) + "\n"
+
+
 def render_test_adequacy_section(
     facts: TestAdequacyFacts | None, warnings: tuple[str, ...]
 ) -> str:
@@ -5826,6 +5891,9 @@ class OrchestratorApp:
         diff_size_section = _diff_size_section(
             diff, self.config.review_dispatch.diff_line_threshold, diff_path
         )
+        ci_status_section = _ci_status_section(
+            checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
+        )
         prompt = self._render(
             "review.md",
             {
@@ -5836,12 +5904,12 @@ class OrchestratorApp:
                 "issue_title": issue.get("title", "UNKNOWN"),
                 "issue_url": issue.get("url", ""),
                 "pr_json_path": pr_dir / "pr.json",
-                "checks_json_path": pr_dir / "checks.json",
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
                 "diff_size_section": diff_size_section,
+                "ci_status_section": ci_status_section,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")

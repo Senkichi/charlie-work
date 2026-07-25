@@ -10151,6 +10151,90 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     assert state["prs"]["456"]["janitor_warnings"]
 
 
+def test_review_ci_status_section_reports_checks_unavailable(tmp_path: Path) -> None:
+    """No required checks configured + gh pr checks failure: the CI status section
+    must warn that CI could not be fetched, never claim green (issue: reviewer
+    token efficiency)."""
+    config = OrchestratorConfig()  # default: required_checks == ()
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## CI status" in packet
+    assert "could not be fetched" in packet
+    assert "checks.json" in packet
+    # Never claim CI is green when it was unfetchable.
+    assert "verified deterministically" not in packet
+
+
+def test_review_ci_status_section_reports_no_required_checks_configured(
+    tmp_path: Path,
+) -> None:
+    """When required_checks is empty, the janitor never verifies CI at all — the
+    section must say so rather than implying a deterministic pass."""
+    config = OrchestratorConfig()  # default: required_checks == ()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # default pr_checks() returns 3 passing checks
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "No required checks are configured" in packet
+    assert "verified deterministically" not in packet
+
+
+def test_review_ci_status_section_reports_all_required_passing(tmp_path: Path) -> None:
+    """All required checks green: the reviewer should be told not to re-inspect,
+    without needing to open checks.json."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # default pr_checks() returns the 3 required checks, all passing
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "verified deterministically by the orchestrator before dispatch" in packet
+    assert "Tests passed" in packet
+    assert "do not spend turns re-inspecting" in packet.lower()
+
+
+def test_review_ci_status_section_lists_failing_non_required_checks(tmp_path: Path) -> None:
+    """A failing check that is NOT in the required set must not block review
+    (janitor only gates required checks), but should be surfaced by name so the
+    reviewer can weigh it without reading checks.json."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Codecov", "state": "FAILURE"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" in packet
+    assert "Codecov" in packet
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
