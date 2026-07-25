@@ -25,6 +25,11 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
+# Default event ring cap. OrchestratorApp sets EVENT_RING_SIZE from
+# RuntimeConfig at startup so the bound is config-driven (issue #525).
+DEFAULT_EVENT_RING_SIZE = 2000
+EVENT_RING_SIZE = DEFAULT_EVENT_RING_SIZE
+
 # Reviewer-specific stale claim timeout (minutes). Session-limit kills are
 # detectable within seconds (the reviewer dies and prints the limit message to
 # its log), so the 30-minute worker timeout is far too long for review
@@ -32,6 +37,18 @@ _STALE_CLAIM_TIMEOUT_MINUTES = 30
 # minutes is ample for a reviewer that started successfully but died from a
 # throttle, while still avoiding thrash on flaky launch paths.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
+
+# Orphan backstop for dead-reviewer claims at the CLAIM stage (issue #571).
+# A dispatched claim whose reviewer has died must be dispositioned by the
+# stalled-review sweep first (throttle classification, probe-failure count,
+# sidecar reap, events) — the claim stage racing it on the same 5-minute
+# timeout measured later in the pass produced a deterministic livelock:
+# every relaunch reset the clock just after the sweep looked, so the sweep
+# never saw a stale claim and quota backoff never engaged. 3x the stale
+# timeout gives the sweep three windows of first refusal while still
+# self-healing true orphans (e.g. a crash before the sidecar was written,
+# which the worker-iterating sweep cannot see).
+_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES = _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES * 3
 
 # Every literal ever assigned to `issues[n]["status"]` across the
 # orchestrator's dispatch -> review -> rework -> merge lifecycle (workflow.py).
@@ -299,27 +316,31 @@ def release_operator_claimed(data: dict[str, Any], issue_number: int) -> dict[st
 
 
 @contextmanager
-def state_lock(state_path: Path):
-    """Cross-process advisory lock for state.json read-modify-write cycles.
+def advisory_file_lock(path: Path):
+    """Cross-process advisory lock for a JSON file's read-modify-write cycle.
 
-    Uses platform-specific file locking (Windows: msvcrt.locking, POSIX: fcntl.flock)
-    on a lockfile alongside state.json. The lock is advisory and time-bounded to
-    prevent wedging on stale locks.
+    This is the generic primitive behind ``state_lock``. It serializes the
+    load→modify→save cycle on ANY atomic-JSON state file (``state.json``,
+    ``api-budget.json``, …) so concurrent writers cannot lose updates: the
+    file lock serializes across PROCESSES and a per-path ``threading.Lock``
+    serializes concurrent THREADS in this process (byte-range file locks are
+    owned by the process, not the thread — see ``_thread_lock_for``).
 
-    Deterministic: if the lock cannot be acquired within ``_LOCK_TIMEOUT_SECONDS``,
-    the context manager raises ``StateLockBusy``. A state writer that cannot acquire
-    the lock must fail that unit of work as a value (skip + event log), never write
+    Uses platform-specific file locking (Windows: ``msvcrt.locking``, POSIX:
+    ``fcntl.flock``) on a ``<path>.lock`` lockfile alongside the target. The
+    lock is advisory and time-bounded (``_LOCK_TIMEOUT_SECONDS``) to prevent
+    wedging on stale locks.
+
+    Deterministic: if the lock cannot be acquired within the timeout, the
+    context manager raises ``StateLockBusy``. A writer that cannot acquire the
+    lock must fail that unit of work as a value (skip + event log), never write
     unlocked.
-
-    A per-path threading.Lock is held around the whole critical section so that
-    concurrent THREADS in this process are serialized too (the file lock only
-    serializes across processes — see ``_thread_lock_for``).
     """
-    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_path = path.with_suffix(path.suffix + ".lock")
     lock_file = None
     acquired = False
 
-    thread_lock = _thread_lock_for(state_path)
+    thread_lock = _thread_lock_for(path)
     thread_lock.acquire()
     try:
         # Create the lock file if needed. touch() leaves it at 0 bytes, which
@@ -411,6 +432,19 @@ def state_lock(state_path: Path):
         # closed, so the next thread never observes a half-released critical
         # section. Always paired with the acquire() above the try.
         thread_lock.release()
+
+
+@contextmanager
+def state_lock(state_path: Path):
+    """Cross-process advisory lock for state.json read-modify-write cycles.
+
+    Thin wrapper over ``advisory_file_lock`` (the generic primitive) kept under
+    the original name so the many existing call sites are unchanged. See
+    ``advisory_file_lock`` for the locking semantics, timeout, and the
+    intra-process thread serialization rationale.
+    """
+    with advisory_file_lock(state_path):
+        yield
 
 
 def empty_state() -> dict[str, Any]:
@@ -511,22 +545,30 @@ def append_event(
     data: dict[str, Any],
     kind: str,
     payload: dict[str, Any],
+    max_size: int | None = None,
     *,
     state_path: Path | None = None,
     repo: str | None = None,
 ) -> dict[str, Any]:
     """Return a new state dict with the event appended; do not mutate ``data``.
 
+    ``max_size`` defaults to the module-level ``EVENT_RING_SIZE``, which
+    OrchestratorApp sets from ``RuntimeConfig.event_ring_size`` at startup.
+    Callers (including tests) may pass an explicit cap to pin the truncation
+    behavior they are validating.
+
     When ``state_path`` is provided, the event is also written to the
     unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
-    This dual-write preserves the complete audit history beyond the 200-entry
+    This dual-write preserves the complete audit history beyond the bounded
     convenience cap in ``state.json``'s ``events`` array. The write is
     best-effort — instrumentation never breaks the core workflow.
     """
+    if max_size is None:
+        max_size = EVENT_RING_SIZE
     events = list(data.get("events", []))
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
-    if len(events) > 200:
-        events = events[-200:]
+    if len(events) > max_size:
+        events = events[-max_size:]
     if state_path is not None:
         from .instrumentation import log_event
 

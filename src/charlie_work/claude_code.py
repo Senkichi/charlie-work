@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -248,6 +248,75 @@ def _events_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def iter_stream_json_events(text: str) -> Iterator[dict[str, Any]]:
+    """Yield parsed stream-json events from tee'd JSONL text.
+
+    Claude Code's ``--output-format stream-json`` emits one JSON object per
+    line. Both the plaintext ``.log`` and the ``.events.jsonl`` sidecar carry
+    this format when ``tee_stream_json`` is enabled. Non-JSON lines (plain
+    stderr noise, truncated tails) are skipped, not raised.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def extract_event_text(event: dict[str, Any]) -> str:
+    """Assistant-visible text carried by one stream-json event.
+
+    Real stream-json shapes (``--output-format stream-json``):
+
+    - ``{"type": "assistant", "message": {"content": [{"type": "text", ...}]}}``
+      — concatenates ``text`` blocks. ``thinking`` blocks are deliberately
+      excluded: they can contain draft verdicts the model later revised.
+    - ``{"type": "result", "result": "<final output text>"}``
+
+    Legacy/simplified shape (``{"type": "assistant_message", "content": ...}``
+    with string, block-list, or dict content) is still honored so any adapter
+    emitting it keeps working. Returns ``""`` for events carrying no text.
+    """
+    event_type = event.get("type")
+
+    if event_type == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return ""
+
+    if event_type == "result":
+        result = event.get("result")
+        return result if isinstance(result, str) else ""
+
+    if event_type == "assistant_message":
+        content = event.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        if isinstance(content, dict):
+            return str(content.get("text", ""))
+
+    return ""
+
+
 @dataclass(frozen=True)
 class ClaudeProgress:
     """Progress metrics parsed from Claude Code's stream-json events.
@@ -262,11 +331,61 @@ class ClaudeProgress:
     cost_usd: float | None = None
 
 
+def iter_claude_events(events_path: Path) -> Iterator[dict[str, Any]]:
+    """Yield parsed JSON event dicts from a Claude Code stream-json events file.
+
+    This is the single parsing primitive for ``events.jsonl``: it owns the
+    tolerant line-by-line read (partial/trailing lines and malformed JSON are
+    skipped, never raised; a missing file yields nothing). Higher-level
+    consumers — ``parse_claude_events`` (progress metrics) and
+    ``api_budget.usage_from_events`` (token usage for spend accounting) —
+    iterate this generator so the JSONL parsing logic is implemented once and
+    reused, never duplicated.
+
+    Args:
+        events_path: Path to the events.jsonl file.
+
+    Yields:
+        Each parsed JSON object that is a dict. Non-dict JSON values are
+        skipped.
+    """
+    if not events_path.exists():
+        return
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines (including partial trailing lines
+                    # written while the file is being appended to live).
+                    continue
+                if isinstance(event, dict):
+                    yield event
+    except OSError:
+        # File read error — treat as no events (absence is not an error).
+        return
+
+
 def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     """Parse Claude Code's stream-json events file and extract progress metrics.
 
-    Reads the events.jsonl file line-by-line, accumulating tool_call_count and
-    turn_count, and taking the last-seen cumulative usage fields (tokens, cost_usd).
+    Reads the events.jsonl file via ``iter_claude_events`` (the shared parsing
+    primitive), accumulating tool_call_count and turn_count, and taking the
+    last-seen cumulative usage fields (tokens, cost_usd).
+
+    Two schemas are handled:
+
+    * The real ``--output-format stream-json`` schema: ``assistant`` events
+      carry ``message.content`` blocks (tool calls appear as ``tool_use``
+      blocks); the terminal ``result`` event reports authoritative
+      ``num_turns`` / ``total_cost_usd`` / ``usage``.
+    * A legacy/simplified schema (``tool_call`` / ``user_message`` /
+      ``assistant_message`` event types and top-level ``tokens`` / ``cost_usd``
+      fields), kept for adapters that emit it.
 
     Tolerates partial/incomplete final lines (file is being appended to live).
     Malformed/unparseable lines are skipped, not raised.
@@ -280,47 +399,69 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     Returns:
         ClaudeProgress with accumulated metrics, or None if file doesn't exist
     """
-    if not events_path.exists():
-        return None
-
     tool_call_count = 0
     turn_count = 0
     tokens = None
     cost_usd = None
 
-    try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
+    for event in iter_claude_events(events_path):
+        event_type = event.get("type")
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
-                    continue
+        # Real stream-json schema (--output-format stream-json):
+        # assistant events carry message.content blocks; tool calls
+        # appear as tool_use blocks; the final result event reports
+        # authoritative num_turns / total_cost_usd / usage.
+        if event_type == "assistant":
+            turn_count += 1
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                tool_call_count += sum(
+                    1
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                )
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                per_request = sum(
+                    v
+                    for v in (
+                        usage.get("input_tokens"),
+                        usage.get("output_tokens"),
+                    )
+                    if isinstance(v, int)
+                )
+                if per_request:
+                    tokens = (tokens or 0) + per_request
+        elif event_type == "result":
+            num_turns = event.get("num_turns")
+            if isinstance(num_turns, int) and num_turns > 0:
+                turn_count = max(turn_count, num_turns)
+            total_cost = event.get("total_cost_usd")
+            if isinstance(total_cost, (int, float)):
+                cost_usd = float(total_cost)
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                final_tokens = sum(
+                    v
+                    for v in (
+                        usage.get("input_tokens"),
+                        usage.get("output_tokens"),
+                    )
+                    if isinstance(v, int)
+                )
+                if final_tokens:
+                    tokens = final_tokens
 
-                if not isinstance(event, dict):
-                    continue
-
-                # Count tool calls
-                if event.get("type") == "tool_call":
-                    tool_call_count += 1
-
-                # Count turns (user/assistant exchanges)
-                if event.get("type") in ("user_message", "assistant_message"):
-                    turn_count += 1
-
-                # Extract cumulative usage fields (take last-seen value)
-                if "tokens" in event and isinstance(event["tokens"], int):
-                    tokens = event["tokens"]
-                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
-                    cost_usd = float(event["cost_usd"])
-
-    except OSError:
-        # File read error - treat as no progress data
-        return None
+        # Legacy/simplified schema kept for adapters that emit it.
+        if event_type == "tool_call":
+            tool_call_count += 1
+        if event_type in ("user_message", "assistant_message"):
+            turn_count += 1
+        if "tokens" in event and isinstance(event["tokens"], int):
+            tokens = event["tokens"]
+        if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+            cost_usd = float(event["cost_usd"])
 
     # If we parsed no valid events, return None
     if tool_call_count == 0 and turn_count == 0 and tokens is None and cost_usd is None:
@@ -690,7 +831,16 @@ def launch_claude_worker(
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
-    command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
+    # Reviewer sessions may pin their own effort independently of worker
+    # effort (empty string means fall back to claude_code.effort), so
+    # reviewer effort can be tuned via the per-review session telemetry
+    # (review_session_metrics) without touching worker dispatch.
+    effort = (
+        resolved_config.review_dispatch.review_effort
+        if (review and resolved_config.review_dispatch.review_effort)
+        else resolved_config.claude_code.effort
+    )
+    command_template = _apply_effort_pin(command_template, effort)
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
@@ -1240,5 +1390,6 @@ __all__ = [
     "_sidecar_path",
     "ClaudeProgress",
     "parse_claude_events",
+    "iter_claude_events",
     "_events_path",
 ]

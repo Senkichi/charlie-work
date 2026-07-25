@@ -6,12 +6,14 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 """
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
+from typing import Any
 
 from .claude_code import (
     ClaudeWorkerRecord,
@@ -31,6 +33,8 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Shim marker that indicates successful infra materialization (issue #221)
@@ -373,7 +377,13 @@ class WorkerView:
         except (OSError, json.JSONDecodeError):
             pass
 
-    def reap_sidecar(self, sessions_dir: Path) -> None:
+    def reap_sidecar(
+        self,
+        sessions_dir: Path,
+        *,
+        api_config: Any = None,
+        state_dir: Path | str | None = None,
+    ) -> None:
         """Delete the sidecar file for this worker to prevent phantom sessions.
 
         Dispatches to the adapter-specific sidecar path function based on adapter_kind.
@@ -384,6 +394,14 @@ class WorkerView:
 
         This is called after a session is detected as dead and classified to prevent
         phantom sessions from PID recycling (issue #113).
+
+        For ``adapter_kind == "api"`` (issue #480), when ``api_config`` and
+        ``state_dir`` are supplied, the session's spend is settled into the
+        api-budget ledger BEFORE the sidecar is unlinked (so the sidecar's
+        provider field can still be read). Settlement is best-effort accounting:
+        any failure is logged and swallowed so it can never break the reap.
+        Callers without api context (legacy callers, tests, review-lane reaps)
+        omit the kwargs and skip settlement — the unlink still happens.
         """
         if self.adapter_kind == "devin":
             sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
@@ -394,6 +412,9 @@ class WorkerView:
             # routed through the adapter_kind-aware _sidecar_path helper so the
             # .api.json suffix is selected.
             sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, "api")
+            # Best-effort spend settlement before the sidecar is unlinked (issue #480).
+            if api_config is not None and state_dir is not None:
+                self._settle_api_budget(sidecar_path, api_config, state_dir)
         else:
             # Unknown adapter kind - nothing to reap
             return
@@ -405,6 +426,92 @@ class WorkerView:
             pass
 
         self._remove_writer_marker()
+
+    def _settle_api_budget(
+        self,
+        sidecar_path: Path,
+        api_config: Any,
+        state_dir: Path | str,
+    ) -> None:
+        """Best-effort spend settlement for an api worker session (issue #480).
+
+        Reads the sidecar for the provider name, parses the session's
+        events.jsonl for token usage (via the shared ``iter_claude_events``
+        primitive), computes USD from the provider's configured pricing, and
+        atomically settles the entry into the api-budget ledger. Never raises
+        — settlement is accounting, not enforcement, and must not break the
+        sidecar reap that prevents phantom sessions.
+        """
+        from .api_budget import (
+            SessionEntry,
+            cost_usd,
+            ledger_path,
+            settle_session_to_disk,
+            usage_from_events,
+        )
+        from .claude_code import iter_claude_events
+
+        try:
+            provider_name = ""
+            try:
+                with sidecar_path.open("r", encoding="utf-8") as handle:
+                    sidecar = json.load(handle)
+                if isinstance(sidecar, dict):
+                    provider_name = str(sidecar.get("provider") or "")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            provider_cfg = api_config.providers.get(provider_name) if provider_name else None
+            if provider_cfg is None:
+                # No pricing for the resolved provider → cannot compute cost.
+                # Skip settlement rather than recording a zero-cost entry that
+                # would understate spend. Logged so the drop is visible (a
+                # silent accounting gap is inconsistent with the ledger's
+                # "accounting data is never silently destroyed" guarantee).
+                logger.warning(
+                    "api budget settlement skipped for issue %s: no pricing "
+                    "configured for provider %r (session cost not recorded)",
+                    self.issue_number,
+                    provider_name or "",
+                )
+                return
+
+            events_path = _events_path_from_log(Path(self.log_path))
+            usage = usage_from_events(iter_claude_events(events_path))
+            usd = cost_usd(usage, provider_cfg)
+            ended_at = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            entry = SessionEntry(
+                issue=self.issue_number,
+                session_id=self.session_id or "",
+                provider=provider_name,
+                model=provider_cfg.model,
+                started_at=self.started_at,
+                ended_at=ended_at,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cached_tokens=usage.cached_tokens,
+                usd=usd,
+                duration_s=self.runtime_seconds(),
+                outcome=self.failure_kind or "reaped",
+            )
+            # Locked read-modify-write: load→settle→save happens inside
+            # advisory_file_lock so concurrent reaps of different api sessions
+            # cannot lose a settlement (issue #480 review — same lost-update
+            # hazard state_lock closes for state.json). Lock-contention skips
+            # as a value (logged inside settle_session_to_disk); the reap still
+            # completes below.
+            settle_session_to_disk(ledger_path(state_dir), entry)
+        except Exception:
+            logger.warning(
+                "api budget settlement failed for issue %s; reap continues",
+                self.issue_number,
+                exc_info=True,
+            )
 
     def runtime_seconds(self) -> float:
         """Calculate runtime in seconds from started_at to now.

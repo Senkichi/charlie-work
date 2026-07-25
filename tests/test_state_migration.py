@@ -176,7 +176,7 @@ def test_save_state_refreshes_generated_at_but_keeps_everything_else(tmp_path: P
 
 
 def test_append_event_caps_at_200_keeping_newest() -> None:
-    """append_event bounds the audit trail to the most recent 200 entries.
+    """append_event bounds the audit trail to the most recent ``max_size`` entries.
 
     This is the truncation the durable per-PR rework counter had to be moved
     off of (see test_rework_cap_survives_event_log_truncation) — pin the exact
@@ -184,7 +184,7 @@ def test_append_event_caps_at_200_keeping_newest() -> None:
     """
     state = empty_state()
     for index in range(205):
-        state = append_event(state, "dispatch", {"seq": index})
+        state = append_event(state, "dispatch", {"seq": index}, max_size=200)
 
     events = state["events"]
     assert len(events) == 200
@@ -192,6 +192,18 @@ def test_append_event_caps_at_200_keeping_newest() -> None:
     assert events[0]["payload"]["seq"] == 5
     assert events[-1]["payload"]["seq"] == 204
     assert [event["payload"]["seq"] for event in events] == list(range(5, 205))
+
+
+def test_append_event_default_cap_is_2000() -> None:
+    """Issue #525: the default event ring size is raised to 2000 entries."""
+    state = empty_state()
+    for index in range(2005):
+        state = append_event(state, "dispatch", {"seq": index})
+
+    events = state["events"]
+    assert len(events) == 2000
+    assert events[0]["payload"]["seq"] == 5
+    assert events[-1]["payload"]["seq"] == 2004
 
 
 def test_append_event_below_cap_keeps_all() -> None:
