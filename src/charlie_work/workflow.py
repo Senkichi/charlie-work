@@ -6407,6 +6407,19 @@ class OrchestratorApp:
                 pr_key = str(c["pr"])
                 pr_state = state["prs"].get(pr_key, {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                if pr_state.get(
+                    "review_dispatch_status"
+                ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
+                    # Never escalate over a LIVE in-flight reviewer (issue
+                    # #573): the cap can be reached by attempts that predate
+                    # the current launch (e.g. quota deaths whose rollback
+                    # decrement was bypassed), and killing the claim
+                    # mid-review orphans the imminent verdict — the reaper
+                    # only records verdicts for dispatched claims. Let the
+                    # review finish: a recorded verdict resets the counter;
+                    # a death is dispositioned by the stalled sweep, after
+                    # which the cap escalates honestly on a dead claim.
+                    continue
                 if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state["prs"][pr_key] = {
