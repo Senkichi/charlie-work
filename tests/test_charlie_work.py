@@ -27537,6 +27537,315 @@ def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
     assert entry.usd == pytest.approx(6.15)
 
 
+# ---------------------------------------------------------------------------
+# Issue #484 review finding: regression tests for the orchestration wiring
+# (the budget-kill block in _detect_and_handle_stalled_sessions and the
+# ``elif w.adapter_kind == "api"`` branches threaded through workflow.py /
+# reconcile.py). The pure helpers (_classify_session_failure,
+# _api_session_over_budget) are tested in test_claude_code_adapter.py /
+# test_worker_health.py; these tests exercise the production call sites so a
+# wiring regression that drops the api branch or the budget-kill block is
+# caught.
+# ---------------------------------------------------------------------------
+
+
+def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
+    """Issue #484 review finding: the in-flight budget-kill block in
+    ``_detect_and_handle_stalled_sessions`` (workflow.py) fires for an api
+    worker whose accumulated session cost exceeds ``max_usd_per_session``:
+    the process tree is killed, ``failure_kind="budget_exceeded"`` is written
+    directly to the api sidecar, and a ``session_budget_exceeded`` event is
+    emitted. A wiring regression that drops this block leaves the sidecar
+    unmarked and the event unemitted — this assertion fails.
+    """
+    import os as _os
+
+    from _api_budget_fixtures import (
+        api_provider,
+        write_api_events,
+        write_api_sidecar,
+    )
+    from charlie_work.config import ApiBudgetConfig, ApiWorkerConfig
+
+    config = OrchestratorConfig(
+        api_worker=ApiWorkerConfig(
+            enabled=True,
+            provider="example",
+            providers={"example": api_provider()},
+            budget=ApiBudgetConfig(max_usd_per_session=5.0),
+        ),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 4801, provider="example", pid=99999)
+    write_api_events(sessions_dir, 4801)  # 6.15 USD > 5.0 cap
+
+    # Stale log mtime so classify_worker_health does not short-circuit on a
+    # fresh log; the budget block fires regardless of health.
+    log_path = sessions_dir / "issue-4801.claude.log"
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    _os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    killed_pids: list[int] = []
+    with (
+        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch(
+            "charlie_work.workflow.kill_process_tree",
+            side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
+        ),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    # The budget-killed session is reported in the stalled entries.
+    assert any(entry["issue"] == 4801 for entry in result)
+    # kill_process_tree was invoked on the api worker's pid.
+    assert 99999 in killed_pids
+
+    # The api sidecar is marked budget_exceeded directly (not via the
+    # log-tail classification helper, so a coincidental throttle/auth match
+    # cannot override the verdict).
+    from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
+
+    sidecar = json.loads(_api_sidecar_path(sessions_dir, 4801, "api").read_text(encoding="utf-8"))
+    assert sidecar["failure_kind"] == "budget_exceeded"
+
+    # A session_budget_exceeded event was emitted with the issue + provider.
+    state = load_state(paths.state_file)
+    budget_events = [
+        e for e in state.get("events", []) if e.get("kind") == "session_budget_exceeded"
+    ]
+    assert len(budget_events) == 1
+    assert budget_events[0]["payload"]["issue_number"] == 4801
+    assert budget_events[0]["payload"]["provider"] == "example"
+
+
+def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
+    """Issue #484 review finding: the ``elif w.adapter_kind == "api"`` branch in
+    ``_detect_and_handle_stalled_sessions`` (workflow.py stall lane) classifies
+    a stalled api worker whose log tail contains a 401 signature as
+    ``provider_auth`` with a 24h cooldown — not the generic ``stalled``
+    fallback. A wiring regression that drops this branch leaves the sidecar
+    classified ``stalled`` and ``throttled_until`` unset.
+    """
+    import os as _os
+
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+
+    # No budget cap (dormant) so the budget-kill block does not fire; the
+    # worker is STALLED and flows into the classification block.
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 4802, provider="example", pid=99998)
+
+    # Write a 401 log tail and stale the mtime so the worker is STALLED.
+    log_path = sessions_dir / "issue-4802.claude.log"
+    log_path.write_text(
+        "Working...\nError: 401 Unauthorized. Invalid API key.\n", encoding="utf-8"
+    )
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    _os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    before = datetime.now(UTC)
+    with (
+        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch("charlie_work.workflow.kill_process_tree", return_value=[99998]),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
+
+    sidecar = json.loads(_api_sidecar_path(sessions_dir, 4802, "api").read_text(encoding="utf-8"))
+    assert sidecar["failure_kind"] == "provider_auth"
+
+    # 24h cooldown persisted to state.json.
+    state = load_state(paths.state_file)
+    throttled_until = state.get("throttled_until")
+    assert throttled_until is not None
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+
+
+def test_classify_dead_sessions_api_provider_auth_classification(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: the ``elif w.adapter_kind == "api"`` branch in
+    ``_classify_dead_sessions_and_update_throttle_state`` (workflow.py
+    dead-session lane) classifies a dead api worker with a 401 log tail as
+    ``provider_auth`` with a 24h cooldown. A wiring regression that drops this
+    branch leaves the failure_kind as the fallback and ``throttled_until``
+    unset. The sidecar is reaped by this lane, so the classification is
+    asserted via the function's returned reaped-entry and the persisted
+    ``throttled_until``.
+    """
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    write_api_sidecar(sessions_dir, 4803, provider="example", pid=99997)
+
+    # 401 log tail — the dead-session lane classifies it.
+    log_path = sessions_dir / "issue-4803.claude.log"
+    log_path.write_text("Error: 403 Forbidden. Authentication failed.\n", encoding="utf-8")
+
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 4803,
+            "title": "Test issue",
+            "url": "https://example.test/issues/4803",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+
+    before = datetime.now(UTC)
+    with patch("charlie_work.worker.is_worker_alive", return_value=False):
+        reaped = _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, state_file, gh, config
+        )
+
+    # The reaped entry carries the resolved failure_kind (provider_auth, not
+    # the fallback "stalled"/"unpublished_work").
+    api_reaped = [r for r in reaped if r["issue_number"] == 4803]
+    assert len(api_reaped) == 1
+    assert api_reaped[0]["failure_kind"] == "provider_auth"
+    assert api_reaped[0]["adapter_kind"] == "api"
+
+    # 24h cooldown persisted to state.json.
+    state = load_state(state_file)
+    throttled_until = state.get("throttled_until")
+    assert throttled_until is not None
+    throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+
+
+def test_classify_dead_sessions_launch_failed_api_provider_auth(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: the ``elif w.adapter_kind == "api"`` branch in
+    the launch-failure lane of ``_classify_dead_sessions_and_update_throttle_state``
+    (workflow.py) classifies a launch-failed api sidecar (pid=None, error set)
+    whose log tail contains a 401 signature as ``provider_auth``. A wiring
+    regression that drops this branch leaves the launch failure classified as
+    the generic ``launch_failed`` fallback. The sidecar is reaped by this lane,
+    so the classification is asserted via the returned reaped-entry.
+    """
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    # pid=None + error set → launch-failure lane.
+    write_api_sidecar(sessions_dir, 4804, provider="example", pid=None, error="launch failed")
+
+    # 401 log tail — the launch-failure lane classifies it before reaping.
+    log_path = sessions_dir / "issue-4804.claude.log"
+    log_path.write_text("Error: 401 Unauthorized\n", encoding="utf-8")
+
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 4804,
+            "title": "Test issue",
+            "url": "https://example.test/issues/4804",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=False):
+        reaped = _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, state_file, gh, config
+        )
+
+    api_reaped = [r for r in reaped if r["issue_number"] == 4804]
+    assert len(api_reaped) == 1
+    assert api_reaped[0]["failure_kind"] == "provider_auth"
+    assert api_reaped[0]["adapter_kind"] == "api"
+
+
+def test_detect_drift_api_dead_session_provider_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #484 review finding: the ``elif w.adapter_kind == "api"`` branch in
+    ``reconcile.detect_drift``'s dead-session lane classifies a dead api
+    worker with a 401 log tail as ``provider_auth`` and emits a
+    ``provider_throttle_detected`` drift item. A wiring regression that drops
+    this branch leaves no throttle drift item. The sidecar is reaped by this
+    lane, so the classification is asserted via the drift list.
+    """
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+    from charlie_work.reconcile import detect_drift
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 4805,
+            "title": "Test issue",
+            "url": "https://example.test/issues/4805",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+    state = empty_state()
+
+    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 4805, provider="example", pid=99996)
+
+    log_path = sessions_dir / "issue-4805.claude.log"
+    log_path.write_text("Error: 401 Unauthorized. Invalid API key.\n", encoding="utf-8")
+
+    # The dead-session lane fires only when the worker is not alive.
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # A provider_throttle_detected drift item is emitted with provider_auth.
+    throttle_items = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert len(throttle_items) == 1
+    assert throttle_items[0].issue_number == 4805
+    assert "provider_auth" in throttle_items[0].detail
+
+
 def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) -> None:
     """Independent dispatch() calls across two repos sharing a fleet cap cannot
     over-dispatch. Without the fleet lock, both repos could read a stale live

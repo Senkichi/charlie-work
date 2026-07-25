@@ -80,9 +80,17 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
 # generic throttles: they are classified as ``provider_auth`` and enter the
 # existing ``throttled_until`` cooldown so routing preflight falls back until
 # the key is fixed (a dead key will not self-heal in minutes).
+#
+# The bare HTTP status codes 401/403 are anchored with word boundaries (\b) so
+# a coincidental numeric substring in an unrelated log tail (e.g. "error code
+# 14013", "4034 files processed", "issue #4019") cannot trip a false-positive
+# 24h cooldown. Every other pattern in this file (throttle markers, quota
+# phrases) matches natural-language substrings; the bare codes are the only
+# numeric tokens and would otherwise be the sole false-positive vector.
 _PROVIDER_AUTH_PATTERN = re.compile(
-    r"401|403|authentication(?:\s+failed)?|unauthorized|invalid[-\s]?api[-\s]?key|"
-    r"invalid[-\s]?authentication|permission_denied|auth(?:entication)?\s+error",
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
     re.IGNORECASE,
 )
 

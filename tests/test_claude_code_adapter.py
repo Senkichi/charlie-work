@@ -3723,3 +3723,63 @@ def test_update_worker_record_api_sidecar_path_correct(tmp_path: Path) -> None:
     assert api_updated["failure_kind"] == "provider_auth"
     claude_updated = json.loads(claude_sidecar.read_text(encoding="utf-8"))
     assert "failure_kind" not in claude_updated
+
+
+def test_classify_session_failure_provider_auth_numeric_substring_no_false_positive(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: the bare 401/403 codes are anchored with word
+    boundaries so a coincidental numeric substring in an unrelated log tail
+    (e.g. "error code 14013", "4034 files processed", "issue #4019") cannot
+    trip a false-positive 24h provider_auth cooldown. Every other pattern in
+    the file matches natural-language phrases; without \\b the bare codes were
+    the sole false-positive vector.
+    """
+    from charlie_work.claude_code import _classify_session_failure
+
+    # Each tail contains "401" or "403" only as a substring of a larger number,
+    # with no standalone HTTP status code and no auth-related phrasing.
+    false_positive_tails = [
+        "Processed 4034 files in 14013 ms.\n",
+        "Error code 14013: connection reset by peer.\n",
+        "Issue #4019 closed, PR #4032 merged.\n",
+        "Remaining tokens: 4019, cache hits: 4031.\n",
+    ]
+    for tail in false_positive_tails:
+        log_path = tmp_path / "session.claude.log"
+        log_path.write_text(tail, encoding="utf-8")
+
+        failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+        assert failure_kind is None, (
+            f"numeric substring falsely matched provider_auth for tail: {tail!r}"
+        )
+        assert throttled_until is None
+
+
+def test_classify_session_failure_provider_auth_word_boundary_still_matches(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: word boundaries must not regress the real
+    matches — a standalone 401/403 (delimited by non-word characters: spaces,
+    punctuation, start/end of string) still classifies as provider_auth.
+    """
+    from charlie_work.claude_code import _classify_session_failure
+
+    real_auth_tails = [
+        "Error: 401 Unauthorized\n",
+        "HTTP 403 Forbidden\n",
+        "status=401, message=invalid key\n",
+        "401\n",
+        "code:403\n",
+    ]
+    for tail in real_auth_tails:
+        log_path = tmp_path / "session.claude.log"
+        log_path.write_text(tail, encoding="utf-8")
+
+        failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+        assert failure_kind == "provider_auth", (
+            f"real auth tail no longer matched for tail: {tail!r}"
+        )
+        assert throttled_until is not None
