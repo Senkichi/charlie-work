@@ -7,7 +7,7 @@ import re
 import signal
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -40,6 +40,7 @@ from .config import (
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
@@ -4252,6 +4253,39 @@ class OrchestratorApp:
         write_session_results(results_path, all_results)
         return all_results
 
+    def _rescue_adapter_settings(self) -> AdapterSettings:
+        """AdapterSettings for a rescue-tier rework dispatch (issue #555).
+
+        Mirrors the "claude-code" branch of ``_adapter_settings()`` exactly
+        (same venv/worker_env/command resolution), but forces
+        ``adapter="claude-code"`` regardless of the primary configured
+        ``devin.adapter`` — the rescue tier always uses the claude-code
+        adapter — and overrides ``claude_code.model`` to
+        ``rescue.worker_model`` via a one-off config copy. This is the
+        "adapter/model overridden from RescueConfig" the rescue rework
+        reuses the existing rework-dispatch path with, never a parallel
+        launch path.
+        """
+        claude = self.config.claude_code
+        rescue_config = dataclasses_replace(
+            self.config,
+            claude_code=dataclasses_replace(claude, model=self.config.rescue.worker_model),
+        )
+        return AdapterSettings(
+            adapter="claude-code",
+            sessions_dir=self._resolve(self.config.devin.sessions_dir),
+            claude_command=claude.command,
+            worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
+            venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
+            worker_env=claude.worker_env,
+            materialize_dirs=self.config.dispatch.materialize_dirs,
+            dry_run=self.dry_run,
+            base_ref=self.config.dispatch.base_ref,
+            tee_stream_json=claude.tee_stream_json,
+            launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
+            config=rescue_config,
+        )
+
     def _apply_concurrency_governor(
         self, dispatch_limit: int, *, live_count: int | None = None
     ) -> ConcurrencyGovernorResult:
@@ -6791,6 +6825,18 @@ class OrchestratorApp:
                         ),
                     ),
                 )
+            # Rescue tier (issue #555): the quota gate above governs Claude-
+            # family reviewer launches only. Rescue reviews run on the
+            # cross-family (Devin) adapter via _process_rescue_review and do
+            # not consume Claude quota, so a Claude quota deferral must not
+            # freeze them. Still compute the queue and process the rescue
+            # partition here; the deferred result below covers normal
+            # candidates only, unchanged from before this fix.
+            deferred_queue_result = self.review_queue()
+            deferred_candidates = deferred_queue_result.data.get("queue", [])
+            _deferred_normal, deferred_rescue_results = self._partition_rescue_candidates(
+                deferred_candidates
+            )
             return CommandResult(
                 True,
                 "review dispatch deferred: reviewer quota exhausted, probe not ready",
@@ -6802,6 +6848,7 @@ class OrchestratorApp:
                     "deferred_reason": "reviewer_quota_probe_backoff",
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "rescue_review_results": deferred_rescue_results,
                 },
             )
 
@@ -6818,6 +6865,31 @@ class OrchestratorApp:
                     "launched_count": 0,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                },
+            )
+
+        # Rescue tier (issue #555): a rescue-marked PR's review must run
+        # through the cross-family rescue reviewer (_process_rescue_review),
+        # never a normal same-family Claude reviewer -- the exit-to-human-on-
+        # request_changes rule only holds if this replaces, rather than
+        # precedes, the normal dispatch below. Partitioned out here, before
+        # any of the normal claim/quota machinery runs on these PRs. Routing
+        # keys on the durable rescue_attempted marker alone (never on
+        # self.config.rescue.enabled -- see _partition_rescue_candidates).
+        candidates, rescue_review_results = self._partition_rescue_candidates(candidates)
+        if not candidates:
+            return CommandResult(
+                True,
+                f"review dispatch: {len(rescue_review_results)} rescue review(s) "
+                "processed, no normal candidates",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                    "rescue_review_results": rescue_review_results,
                 },
             )
 
@@ -7235,9 +7307,195 @@ class OrchestratorApp:
             "escalated_skipped": escalated_skipped,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
+            "rescue_review_results": rescue_review_results,
         }
         data.update(local_cap.report_fields())
         return CommandResult(ok, message, data)
+
+    def _partition_rescue_candidates(
+        self, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split ``review_queue()`` candidates into normal vs rescue-marked
+        (issue #555), and process the rescue ones via ``_process_rescue_review``.
+
+        Routing keys on the durable ``rescue_attempted`` marker ALONE, never
+        on ``self.config.rescue.enabled``: an operator flipping ``enabled``
+        off while a rescue is in flight must not cause an already-marked PR
+        to fall through to a normal same-family reviewer, or (on a later
+        request_changes) to the legacy escalation path without the two
+        rescue artifacts. ``enabled`` only gates NEW rescue entry at the
+        three cap sites (record_review / _route_janitor_gate_failure_to_
+        rework) — routing of PRs that already carry the marker is
+        unconditional.
+
+        A rescue-marked PR whose ``pr_state["status"] == "escalated"`` is
+        dropped entirely — not processed again, not returned as a normal
+        candidate either. ``_process_rescue_review``'s escalation write does
+        not advance the review packet's recorded decision, so
+        ``review_queue()`` would otherwise keep requeuing it every pass,
+        re-running the (blocking, up to ``reviewer_timeout_seconds``)
+        cross-family review, reposting the escalation PR comment, and
+        re-firing ``rescue_review_escalated`` forever.
+        """
+        rescue_snapshot = load_state_locked(self.paths.state_file)
+        normal_candidates: list[dict[str, Any]] = []
+        rescue_review_results: list[dict[str, Any]] = []
+        for c in candidates:
+            pr_state = rescue_snapshot.get("prs", {}).get(str(c["pr"]), {})
+            if not pr_state.get("rescue_attempted"):
+                normal_candidates.append(c)
+                continue
+            if pr_state.get("status") == "escalated":
+                continue
+            result = self._process_rescue_review(c)
+            rescue_review_results.append({"pr": c["pr"], **result.data})
+        return normal_candidates, rescue_review_results
+
+    def _process_rescue_review(self, candidate: dict[str, Any]) -> CommandResult:
+        """Run the cross-family rescue review for one rescue-marked PR
+        (issue #555) and apply the rescue tier's exit semantics.
+
+        Called from ``dispatch_reviews()`` INSTEAD of the normal Claude
+        reviewer dispatch for any candidate whose PR record already carries
+        ``rescue_attempted`` — i.e. its rescue rework was already dispatched
+        (via the normal rework-dispatch path, just adapter/model-overridden;
+        see ``_rescue_adapter_settings``) and has since pushed a new head.
+
+        Synchronous and one-shot (mirrors ``run_cross_family_review``'s own
+        contract): no new polling/reaping machinery is introduced. Exit
+        semantics per the issue spec:
+
+        - ``approved`` -> recorded through the SAME entry point normal
+          reviews use (``record_review``), so the existing ship-it/merge
+          path takes over exactly as it would for a normal approval.
+        - ``request_changes``/``blocked``/unparseable report -> escalates to
+          a human immediately (never loops back into another rework cycle):
+          both artifacts (the rescue PR/diff — this PR's current branch and
+          head SHA, since the rescue worker pushed directly to it — and the
+          cross-family report path) are attached to the escalation event
+          payload and posted as a PR comment.
+        """
+        pr_number = int(candidate["pr"])
+        issue_number = candidate.get("issue")
+        pr = self.gh.pr_view(pr_number)
+        head_sha = str(pr.get("headRefOid") or "")
+        branch = str(pr.get("headRefName") or "")
+        pr_state = load_state_locked(self.paths.state_file).get("prs", {}).get(str(pr_number), {})
+        cause = str(pr_state.get("rescue_cause") or "unknown")
+
+        pr_dir = self.paths.prs / f"pr-{pr_number}"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        diff_text = self.gh.pr_diff(pr_number) or ""
+        prompt_text = rescue_helpers.build_rescue_review_prompt(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            branch=branch,
+            diff_text=diff_text,
+            cause=cause,
+        )
+        prompt_path = pr_dir / "rescue-review-prompt.md"
+        report_path = pr_dir / "rescue-review-report.md"
+        cfg = self.config.rescue
+        cf_result = run_cross_family_review(
+            model=cfg.reviewer_model,
+            command=cfg.reviewer_command or self.config.cross_family.command,
+            repo_root=self.repo_root,
+            prompt_text=prompt_text,
+            prompt_path=prompt_path,
+            report_path=report_path,
+            timeout_seconds=cfg.reviewer_timeout_seconds,
+            head_ref_oid=head_sha,
+        )
+
+        verdict: dict[str, Any] | None = None
+        if cf_result.ok and report_path.exists():
+            report_text = extract_report_body(report_path.read_text(encoding="utf-8"))
+            verdict = _extract_verdict_from_text(report_text)
+
+        if verdict is not None and verdict["decision"] == "approved":
+            result = self.record_review(
+                pr_number,
+                "approved",
+                summary=verdict["summary"],
+                reviewed_head=head_sha,
+                required_changes=verdict["required_changes"],
+            )
+            return CommandResult(
+                True,
+                f"PR #{pr_number} rescue review approved — {result.message}",
+                {
+                    "rescue_review_decision": "approved",
+                    "cross_family_report": str(report_path),
+                    "record_review": result.data,
+                },
+            )
+
+        # request_changes / blocked / unparseable report -> escalate to a
+        # human immediately. Never re-enter the rework loop: this PR already
+        # spent its one rescue attempt (rescue_attempted stays durably set).
+        verdict_summary = verdict["summary"] if verdict else (cf_result.error or "")
+        comment_body = rescue_helpers.build_rescue_escalation_comment(
+            cause=cause,
+            rescue_branch=branch,
+            rescue_head_sha=head_sha,
+            cross_family_report_path=str(report_path),
+            verdict_summary=verdict_summary,
+        )
+        label_error: dict[str, Any] | None = None
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "escalated",
+            }
+            if issue_number is not None:
+                state["issues"][str(issue_number)] = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "status": "escalated",
+                    "merge_alert": "OK",
+                }
+            state = self._record_event(
+                state,
+                "rescue_review_escalated",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "cause": cause,
+                    "rescue_branch": branch,
+                    "rescue_head_sha": head_sha,
+                    "cross_family_report": str(report_path),
+                    "cross_family_ok": cf_result.ok,
+                    "verdict_decision": verdict["decision"] if verdict else None,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        if issue_number is not None:
+            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            if result.outcome != TransitionOutcome.APPLIED:
+                label_error = {
+                    "edge": "escalated",
+                    "outcome": result.outcome.value,
+                    "add_failures": result.add_failures,
+                    "remove_failures": result.remove_failures,
+                }
+        try:
+            self._comment_pr(pr_number, comment_body)
+        except GitHubError as exc:
+            label_error = {**(label_error or {}), "comment_error": str(exc)}
+        return CommandResult(
+            True,
+            f"PR #{pr_number} rescue review did not approve — escalated to human",
+            {
+                "rescue_review_decision": verdict["decision"] if verdict else "unparseable",
+                "cross_family_report": str(report_path),
+                "cross_family_ok": cf_result.ok,
+                "escalated": True,
+                "label_error": label_error,
+            },
+        )
 
     def record_review(
         self,
@@ -7401,6 +7659,7 @@ class OrchestratorApp:
             pr_state = state["prs"].get(str(pr_number), {})
             rework_path: str | None = None
             escalated = False
+            rescue_dispatched = False
             # Durable per-PR rework counter — NOT derived from the global events
             # log, which append_event truncates to the last 200 entries: on a busy
             # repo that eviction silently reset the count and defeated the cap
@@ -7411,6 +7670,20 @@ class OrchestratorApp:
                 # thrashes (wrong brief or unimplementable criteria) — escalate to
                 # a human instead of dispatching another cycle.
                 escalated = request_changes_count >= self.config.review.max_rework_cycles
+                # Rescue tier (issue #555): a cap exceedance here is one of the
+                # three verdict-driven ("cheap model wasn't good enough")
+                # causes the rescue tier is gated on. If enabled and this PR
+                # has not already spent its one rescue attempt, route to a
+                # bounded Opus rework instead of escalating — never a second
+                # rescue for the same PR (rescue_attempted is durable, cleared
+                # only by `charlie unescalate`).
+                if (
+                    escalated
+                    and self.config.rescue.enabled
+                    and not pr_state.get("rescue_attempted")
+                ):
+                    escalated = False
+                    rescue_dispatched = True
                 # Only count a rework cycle when the PR head has actually advanced.
                 # If the head is unchanged, the prior cycle's attempt was never
                 # delivered (e.g., worker died orphaned), so re-issuing request_changes
@@ -7419,9 +7692,23 @@ class OrchestratorApp:
                 if not escalated and head_advanced:
                     request_changes_count += 1
                 if not escalated:
-                    rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
+                    rework_summary = (
+                        rescue_helpers.build_rescue_rework_summary(
+                            "rework_cycle_cap", summary_text
+                        )
+                        if rescue_dispatched
+                        else summary_text
+                    )
+                    rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             decision_payload["escalated"] = escalated
             self._write_json(decision_path, decision_payload)
+            rescue_fields = (
+                rescue_helpers.build_rescue_dataclass_kwargs("rework_cycle_cap")
+                if rescue_dispatched
+                else {}
+            )
+            if rescue_dispatched:
+                rescue_fields["rescue_dispatched_at"] = utc_now()
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,
@@ -7434,6 +7721,7 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
                 "consecutive_failed_merge_attempts": 0,
+                **rescue_fields,
                 # The reviewer agent has recorded its verdict. The hub no longer
                 # needs to treat this PR as having an in-flight reviewer; the next
                 # stale-head review-queue entry will re-dispatch cleanly.
@@ -7502,6 +7790,16 @@ class OrchestratorApp:
             if session_metrics is not None:
                 event_payload["session_metrics"] = session_metrics
             state = self._record_event(state, "record_review", event_payload)
+            if rescue_dispatched:
+                state = self._record_event(
+                    state,
+                    "rescue_dispatched",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "cause": "rework_cycle_cap",
+                    },
+                )
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # decision above is the authority; a label failure is reported, not fatal.
@@ -7550,12 +7848,18 @@ class OrchestratorApp:
                 else:
                     label_error["comment_error"] = str(exc)
         source_note = f"head from {reviewed_head_source}"
-        message = (
-            f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
-            f"escalated to human ({source_note})"
-            if escalated
-            else f"review recorded ({source_note})"
-        )
+        if rescue_dispatched:
+            message = (
+                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) "
+                f"reached, rescue tier dispatched instead of escalating ({source_note})"
+            )
+        elif escalated:
+            message = (
+                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
+                f"escalated to human ({source_note})"
+            )
+        else:
+            message = f"review recorded ({source_note})"
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(
@@ -7571,6 +7875,7 @@ class OrchestratorApp:
                 "packet_head_sha": packet_head_sha,
                 "rework_path": rework_path,
                 "escalated": escalated,
+                "rescue_dispatched": rescue_dispatched,
                 "request_changes_count": request_changes_count,
                 "label_error": label_error,
             },
@@ -7601,6 +7906,12 @@ class OrchestratorApp:
         "janitor_warnings",
         "escalation_reason",
         "label_error",
+        # Rescue tier (issue #555): rescue_attempted is the durable "used my
+        # one shot" marker. Only charlie unescalate clears it (this tuple) —
+        # every other code path treats a present marker as permanent.
+        "rescue_attempted",
+        "rescue_cause",
+        "rescue_dispatched_at",
     )
     # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
     _UNESCALATE_ISSUE_RESET_FIELDS = (
@@ -9551,6 +9862,90 @@ class OrchestratorApp:
                 return None
         attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
 
+        if (
+            max_attempts > 0
+            and attempts > max_attempts
+            and self.config.rescue.enabled
+            and not existing_pr_state.get("rescue_attempted")
+        ):
+            # Rescue tier (issue #555): conflict-rework and no-op-rework caps
+            # are both eligible ("cheap model wasn't good enough") causes.
+            # Route to a bounded Opus rework via the SAME router this
+            # function already uses for the non-cap-exceeded routing path
+            # below, instead of escalating — never a second rescue for the
+            # same PR (rescue_attempted is durable, cleared only by
+            # `charlie unescalate`).
+            #
+            # Ordering note (reviewed, deliberate): the marker is committed
+            # under this lock BEFORE `router(...)` runs its own separate
+            # state_lock write below. A crash in that narrow window leaves
+            # `rescue_attempted=True` with no rework actually dispatched —
+            # the PR's one rescue slot is spent for nothing and the NEXT cap
+            # exceedance escalates straight to a human instead of retrying
+            # the rescue. This is intentional, not an oversight: the
+            # alternative (write the marker AFTER `router()` succeeds) fails
+            # the other way — a crash between a successful `router()` write
+            # and the marker write leaves the PR eligible for a SECOND
+            # rescue attempt on the next cap exceedance, violating the "one
+            # rescue per PR" invariant the whole feature is built around
+            # (issue #555: "no upward-migrating cost spiral"). Under-rescue
+            # (safe, wasteful) is a strictly better failure mode than
+            # over-rescue (invariant violation) here, so marker-first is
+            # kept. This mirrors this same function's pre-existing,
+            # explicitly-accepted two-lock deviation for `attempts_key`
+            # itself (see the docstring above and the comment at the
+            # `snapshot = load_state_locked(...)` read a few lines up) —
+            # not a new risk introduced by the rescue tier, the same
+            # "self-corrects, at worst delays by one cycle" tradeoff this
+            # function already makes elsewhere. Making this fully atomic
+            # would require plumbing an extra_payload-style rescue-marker
+            # parameter through `_request_merge_conflict_rework`/
+            # `_request_no_op_rework_repair` (both also called from
+            # merge_ready's approved+alarm-threshold path with no rescue
+            # concept), which is a larger blast-radius change than this
+            # fix-forward warrants; revisit only if the wasted-slot case is
+            # ever observed live.
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    attempts_key: attempts,
+                    **rescue_helpers.build_rescue_dataclass_kwargs(reason),
+                    "rescue_dispatched_at": utc_now(),
+                }
+                state = self._record_event(
+                    state,
+                    "rescue_dispatched",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "cause": reason,
+                        "attempts": attempts,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+            decision = self._review_decision(pr_number)
+            route_extra_state: dict[str, Any] = {attempts_key: attempts}
+            if head_sha:
+                route_extra_state[last_head_key] = head_sha
+            label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
+            return CommandResult(
+                True,
+                f"PR #{pr_number} janitor {reason} rework cap exceeded "
+                f"({attempts}/{max_attempts}); rescue tier dispatched instead of escalating",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "janitor_ok": False,
+                    "routed_to_rework": True,
+                    "rescue_dispatched": True,
+                    "rework_reason": reason,
+                    "label_error": label_error,
+                },
+            )
+
         if max_attempts > 0 and attempts > max_attempts:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -10852,6 +11247,24 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Rescue tier (issue #555): an issue is rescue-marked when the rescue
+        # interception sites (record_review / _route_janitor_gate_failure_to_
+        # rework) already stamped `rescue_attempted` on its PR record instead
+        # of escalating. Those issues must launch via the claude-code adapter
+        # pinned to `rescue.worker_model`, regardless of the primary
+        # configured `devin.adapter` — tracked separately here so the SAME
+        # candidate-selection/session-request/state-bookkeeping code below
+        # handles them, only the final dispatch_sessions() call differs.
+        #
+        # Always loaded (never gated on self.config.rescue.enabled): routing
+        # of a PR that already carries the durable marker must not depend on
+        # the current config value. If an operator flips rescue.enabled off
+        # while a rescue rework is queued (rework_requested + marker set,
+        # worker not yet launched), it must still launch via the rescue
+        # adapter/model -- enabled only gates NEW rescue entry at the three
+        # cap sites, never routing of an already-marked PR.
+        rescue_issue_numbers: set[int] = set()
+        rescue_state_snapshot = load_state_locked(self.paths.state_file)
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -10869,15 +11282,26 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
-            # Route this rework issue through the single enforcement point.
-            if api_enabled and routing_inputs is not None:
-                issue_labels = {label["name"] for label in full_issue.get("labels", [])}
-                choice = self._select_adapter_for_issue(
-                    rework=True,
-                    issue_labels=issue_labels,
-                    routing_inputs=routing_inputs,
-                )
-                adapter_choices[issue_number] = choice
+            # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
+            # adapter routing — they always launch via the claude-code adapter
+            # pinned to rescue.worker_model, regardless of the primary
+            # configured devin.adapter or api_worker routing preflight.
+            pr_state_for_rescue = rescue_state_snapshot.get("prs", {}).get(str(pr_number), {})
+            if pr_state_for_rescue.get("rescue_attempted"):
+                rescue_issue_numbers.add(issue_number)
+            else:
+                # Route this non-rescue rework issue through the single
+                # enforcement point (issue #482).
+                if api_enabled and routing_inputs is not None:
+                    issue_labels = {
+                        label["name"] for label in full_issue.get("labels", [])
+                    }
+                    choice = self._select_adapter_for_issue(
+                        rework=True,
+                        issue_labels=issue_labels,
+                        routing_inputs=routing_inputs,
+                    )
+                    adapter_choices[issue_number] = choice
             session_requests.append(
                 SessionRequest(
                     issue_number=issue_number,
@@ -10947,9 +11371,49 @@ class OrchestratorApp:
                 data,
             )
 
-        dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
+        # Rescue tier (issue #555) + per-issue routing (issue #482): split
+        # the batch so rescue-marked issues launch via the claude-code adapter
+        # pinned to rescue.worker_model (see _rescue_adapter_settings),
+        # while every other candidate is dispatched via the per-issue routing
+        # partition (_dispatch_partitioned). Rescue issues bypass routing
+        # entirely — they always use the rescue adapter/model. Reuses the
+        # same dispatch_sessions()/launch_claude_worker() path for both; the
+        # only difference is which AdapterSettings/config is passed in.
+        normal_requests = [
+            r for r in session_requests if r.issue_number not in rescue_issue_numbers
+        ]
+        rescue_requests = [
+            r for r in session_requests if r.issue_number in rescue_issue_numbers
+        ]
+        dispatch_results: list[SessionDispatchResult] = []
+        if normal_requests:
+            # adapter_choices only contains non-rescue issues (rescue issues
+            # were never routed in the loop above), so the partition is
+            # correct.
+            dispatch_results.extend(
+                self._dispatch_partitioned(normal_requests, adapter_choices)
+            )
+        if rescue_requests:
+            dispatch_results.extend(
+                dispatch_sessions(
+                    self.repo_root,
+                    manifest_path,
+                    results_path,
+                    self._rescue_adapter_settings(),
+                    rescue_requests,
+                )
+            )
+        # _dispatch_partitioned and dispatch_sessions each overwrite
+        # manifest/results on each call; rewrite once more with the combined
+        # batch so the on-disk observability files
+        # (session-manifest.json/session-results.json) reflect the full pass,
+        # not just the last sub-call.
+        write_session_manifest(
+            manifest_path, session_requests, adapter=self.config.devin.adapter
+        )
+        write_session_results(results_path, dispatch_results)
 
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
