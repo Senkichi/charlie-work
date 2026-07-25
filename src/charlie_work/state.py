@@ -25,6 +25,11 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
 
+# Default event ring cap. OrchestratorApp sets EVENT_RING_SIZE from
+# RuntimeConfig at startup so the bound is config-driven (issue #525).
+DEFAULT_EVENT_RING_SIZE = 2000
+EVENT_RING_SIZE = DEFAULT_EVENT_RING_SIZE
+
 # Reviewer-specific stale claim timeout (minutes). Session-limit kills are
 # detectable within seconds (the reviewer dies and prints the limit message to
 # its log), so the 30-minute worker timeout is far too long for review
@@ -540,22 +545,30 @@ def append_event(
     data: dict[str, Any],
     kind: str,
     payload: dict[str, Any],
+    max_size: int | None = None,
     *,
     state_path: Path | None = None,
     repo: str | None = None,
 ) -> dict[str, Any]:
     """Return a new state dict with the event appended; do not mutate ``data``.
 
+    ``max_size`` defaults to the module-level ``EVENT_RING_SIZE``, which
+    OrchestratorApp sets from ``RuntimeConfig.event_ring_size`` at startup.
+    Callers (including tests) may pass an explicit cap to pin the truncation
+    behavior they are validating.
+
     When ``state_path`` is provided, the event is also written to the
     unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
-    This dual-write preserves the complete audit history beyond the 200-entry
+    This dual-write preserves the complete audit history beyond the bounded
     convenience cap in ``state.json``'s ``events`` array. The write is
     best-effort — instrumentation never breaks the core workflow.
     """
+    if max_size is None:
+        max_size = EVENT_RING_SIZE
     events = list(data.get("events", []))
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
-    if len(events) > 200:
-        events = events[-200:]
+    if len(events) > max_size:
+        events = events[-max_size:]
     if state_path is not None:
         from .instrumentation import log_event
 

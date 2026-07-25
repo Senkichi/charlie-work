@@ -225,12 +225,27 @@ def _extract_payload_refs(payload: dict[str, Any]) -> tuple[int | None, int | No
 def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
     """Migrate existing events.jsonl entries into the SQLite database.
 
-    Returns the number of migrated rows. Each line is parsed and inserted
-    individually so a malformed line doesn't abort the whole migration.
+    Returns the number of newly inserted rows. Each line is parsed and
+    inserted individually so a malformed line doesn't abort the whole
+    migration.
+
+    The migration is idempotent: a row is only inserted if no existing
+    event shares its full ``(ts, kind, payload, repo, correlation_id,
+    pr_number, issue_number)`` tuple. Using the complete meaningful row
+    (not just ``(ts, kind, payload)``) ensures that distinct events which
+    happen to share a timestamp/kind/payload but differ in ``repo``,
+    ``correlation_id``, or PR/issue references are all preserved. This
+    protects against a crash between the commit and the post-migration
+    rename re-inserting the same legacy rows on the next process start.
+
+    After a successful commit the legacy file is atomically renamed to
+    ``events.jsonl.migrated`` (kept for audit) so subsequent processes do
+    not re-run the migration. The rename uses ``Path.replace`` for the same
+    atomic-rename discipline as other state writes.
     """
     if not jsonl.exists():
         return 0
-    migrated = 0
+    inserted = 0
     try:
         with open(jsonl, encoding="utf-8") as f:
             for line in f:
@@ -250,28 +265,112 @@ def _migrate_jsonl(db_conn: sqlite3.Connection, jsonl: Path) -> int:
                 if not isinstance(payload, dict):
                     payload = {}
                 pr_num, issue_num = _extract_payload_refs(payload)
-                db_conn.execute(
-                    """INSERT OR IGNORE INTO events
+                ts = record.get("ts", _now_iso())
+                kind = record.get("kind", "unknown")
+                payload_json = json.dumps(payload, sort_keys=True, default=str)
+                repo_val = record.get("repo")
+                cid_val = record.get("correlation_id")
+                cursor = db_conn.execute(
+                    """INSERT INTO events
                        (ts, kind, payload, repo, correlation_id, pr_number, issue_number, level)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM events
+                           WHERE ts = ? AND kind = ? AND payload = ?
+                             AND repo IS ?
+                             AND correlation_id IS ?
+                             AND pr_number IS ?
+                             AND issue_number IS ?
+                       )""",
                     (
-                        record.get("ts", _now_iso()),
-                        record.get("kind", "unknown"),
-                        json.dumps(payload, sort_keys=True, default=str),
-                        record.get("repo"),
-                        record.get("correlation_id"),
+                        ts,
+                        kind,
+                        payload_json,
+                        repo_val,
+                        cid_val,
                         pr_num,
                         issue_num,
-                        _classify_level(record.get("kind", "unknown")),
+                        _classify_level(kind),
+                        ts,
+                        kind,
+                        payload_json,
+                        repo_val,
+                        cid_val,
+                        pr_num,
+                        issue_num,
                     ),
                 )
-                migrated += 1
+                if cursor.rowcount > 0:
+                    inserted += 1
         db_conn.commit()
     except OSError as exc:
         logger.warning("Failed to migrate events.jsonl at %s: %s", jsonl, exc)
-    if migrated:
-        logger.info("Migrated %d events from events.jsonl to events.db", migrated)
-    return migrated
+        return inserted
+    # Atomically rename the legacy file so the migration is one-shot.
+    # The file is retained (as .migrated) for audit; it is never deleted.
+    migrated_path = jsonl.with_suffix(jsonl.suffix + ".migrated")
+    try:
+        jsonl.replace(migrated_path)
+    except OSError as exc:
+        logger.warning("Failed to rename events.jsonl to %s: %s", migrated_path, exc)
+    if inserted:
+        logger.info("Migrated %d events from events.jsonl to events.db", inserted)
+    return inserted
+
+
+def _dedupe_events(db_conn: sqlite3.Connection) -> int:
+    """Remove duplicate event rows, keeping the earliest inserted copy.
+
+    Duplicates are identified by the full meaningful row tuple
+    ``(ts, kind, payload, repo, correlation_id, pr_number, issue_number)``
+    — every indexed column except the autoincrement ``id``. The row with
+    the smallest ``id`` is retained. Returns the number of rows deleted.
+
+    Using the *complete* row (including ``repo``) as the deduplication key
+    is critical: ``_now_iso()`` truncates timestamps to 1-second precision,
+    so distinct events from different repos (or different correlation
+    contexts) can legitimately share ``(ts, kind, payload)`` within the
+    same second. A narrower key would silently and irreversibly delete
+    those distinct events from what this module calls its "complete audit
+    history" store — inconsistent with the rename-not-delete treatment of
+    ``events.jsonl``. Only rows that are identical across *all* meaningful
+    columns are collapsed, which is true deduplication, not data loss.
+
+    This is a one-time cleanup for databases polluted by the pre-fix
+    migration that re-inserted legacy ``events.jsonl`` rows on every
+    process start. The pollution produced true duplicates (the same JSONL
+    record re-inserted with identical values across every column), so they
+    are still caught by the full-row key. It is guarded by
+    ``PRAGMA user_version`` so it runs exactly once per database file.
+    """
+    cursor = db_conn.execute(
+        """DELETE FROM events
+           WHERE id NOT IN (
+               SELECT MIN(id) FROM events
+               GROUP BY ts, kind, payload, repo, correlation_id, pr_number, issue_number
+           )"""
+    )
+    deleted = cursor.rowcount
+    db_conn.commit()
+    if deleted:
+        logger.info("Deduplicated %d duplicate event rows from events.db", deleted)
+    return deleted
+
+
+def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
+    """Run one-time database migrations guarded by ``PRAGMA user_version``.
+
+    Each migration step bumps the version so it never re-runs on the same
+    database file. This is the single enforcement point for historical
+    cleanup of pollution caused by the pre-fix ``events.jsonl`` migration.
+    """
+    cursor = db_conn.execute("PRAGMA user_version")
+    version = cursor.fetchone()[0]
+    if version < 1:
+        # Migration v1: dedupe rows polluted by the re-migrating jsonl
+        # importer (issue #557). Runs once per database file.
+        _dedupe_events(db_conn)
+        db_conn.execute("PRAGMA user_version = 1")
 
 
 def _get_db(state_path: Path) -> sqlite3.Connection | None:
@@ -307,6 +406,9 @@ def _get_db(state_path: Path) -> sqlite3.Connection | None:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.row_factory = sqlite3.Row
             conn.executescript(_SCHEMA_SQL)
+
+            # Run one-time migrations (e.g. historical duplicate cleanup).
+            _run_db_migrations(conn)
 
             # Migrate legacy events.jsonl if it exists
             jsonl = _jsonl_path(state_path)

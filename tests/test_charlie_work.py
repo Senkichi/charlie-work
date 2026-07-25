@@ -57,6 +57,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
     append_event,
+    empty_state,
     is_throttled,
     load_state,
     save_state,
@@ -68,8 +69,10 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _append_sweep_events,
     _detect_and_handle_stalled_reviews,
     _parse_review_verdict_from_log,
+    _reap_orphaned_review_checkouts,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -2940,6 +2943,7 @@ class FakeGitHub:
         # the merge-base freshness gate.
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
         self._record_pr_heads(self.prs)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -3300,6 +3304,12 @@ class FakeGitHub:
             "base_commit": {"sha": base_head},
             "merge_base_commit": {"sha": base_head},
         }
+
+    def compare_diff(self, base: str, head: str) -> str | None:
+        override = self.compare_diff_overrides.get((base, head), "_unset")
+        if override != "_unset":
+            return override
+        return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -8455,6 +8465,32 @@ def test_config_rejects_merge_flags_scalar(tmp_path: Path) -> None:
     assert "must be a list" in message
 
 
+def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    path.write_text("review_dispatch:\n  review_effort: 3\n", encoding="utf-8")
+
+    try:
+        load_config(path)
+        raise AssertionError("expected ConfigError")
+    except ConfigError as exc:
+        message = str(exc)
+
+    assert "review_effort" in message
+    assert "review_dispatch" in message
+    assert "must be a string" in message
+
+
+def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("review_dispatch:\n  review_effort: high\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.review_dispatch.review_effort == "high"
+
+
 def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}
@@ -10148,6 +10184,299 @@ def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:
     assert state["prs"]["456"]["janitor_warnings"]
 
 
+def test_review_ci_status_section_reports_checks_unavailable(tmp_path: Path) -> None:
+    """No required checks configured + gh pr checks failure: the CI status section
+    must warn that CI could not be fetched, never claim green (issue: reviewer
+    token efficiency)."""
+    config = OrchestratorConfig()  # default: required_checks == ()
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## CI status" in packet
+    assert "could not be fetched" in packet
+    assert "checks.json" in packet
+    # Never claim CI is green when it was unfetchable.
+    assert "verified deterministically" not in packet
+
+
+def test_review_ci_status_section_reports_no_required_checks_configured(
+    tmp_path: Path,
+) -> None:
+    """When required_checks is empty, the janitor never verifies CI at all — the
+    section must say so rather than implying a deterministic pass."""
+    config = OrchestratorConfig()  # default: required_checks == ()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # default pr_checks() returns 3 passing checks
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "No required checks are configured" in packet
+    assert "verified deterministically" not in packet
+
+
+def test_review_ci_status_section_reports_all_required_passing(tmp_path: Path) -> None:
+    """All required checks green: the reviewer should be told not to re-inspect,
+    without needing to open checks.json."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # default pr_checks() returns the 3 required checks, all passing
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "verified deterministically by the orchestrator before dispatch" in packet
+    assert "Tests passed" in packet
+    assert "do not spend turns re-inspecting" in packet.lower()
+
+
+def test_review_ci_status_section_lists_failing_non_required_checks(tmp_path: Path) -> None:
+    """A failing check that is NOT in the required set must not block review
+    (janitor only gates required checks), but should be surfaced by name so the
+    reviewer can weigh it without reading checks.json."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Codecov", "state": "FAILURE"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" in packet
+    assert "Codecov" in packet
+
+
+def test_review_ci_status_section_skipped_non_required_check_not_listed_as_failing(
+    tmp_path: Path,
+) -> None:
+    """A SKIPPED non-required check (path-filtered/matrix-conditional job that
+    legitimately did not run) must never be reported as 'currently failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Optional Job", "state": "SKIPPED"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" not in packet
+    assert "Optional Job" not in packet
+
+
+def test_review_ci_status_section_neutral_non_required_check_not_listed_as_failing(
+    tmp_path: Path,
+) -> None:
+    """A NEUTRAL non-required check conclusion is neither pass nor fail and
+    must never be reported as 'currently failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Advisory Job", "state": "NEUTRAL"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" not in packet
+    assert "Advisory Job" not in packet
+
+
+def test_review_ci_status_section_cancelled_non_required_check_worded_distinctly(
+    tmp_path: Path,
+) -> None:
+    """A CANCELLED non-required check (often an infra hiccup, not a code
+    failure) must be surfaced with distinct wording, never called 'failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Flaky Job", "state": "CANCELLED"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" in packet
+    assert "Flaky Job" in packet
+
+
+def test_review_first_round_has_no_prior_review_section(tmp_path: Path) -> None:
+    """No review-decision.json on disk yet: this is a first-round review, so
+    $prior_review_section must render empty."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+    assert not (paths.prs / "pr-456" / "interdiff.patch").exists()
+
+
+def test_review_prior_verdict_pending_has_no_prior_review_section(tmp_path: Path) -> None:
+    """A pending (never-recorded) prior decision must not be treated as round-2
+    findings, even if it carries a reviewed_head_sha from a template write."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "sha-old"}),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+
+
+def test_review_round2_successful_compare_includes_prior_findings_and_interdiff(
+    tmp_path: Path,
+) -> None:
+    """Round-2 review (prior terminal verdict on an earlier head): the packet
+    must surface round-1 decision/summary/required_changes and write/reference
+    an interdiff between the prior reviewed head and the live head."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "fix the null check in validate()",
+                "required_changes": ["add null check", "handle empty list"],
+                "reviewed_head_sha": "sha-old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "sha-old" in packet
+    assert "fix the null check in validate()" in packet
+    assert "add null check" in packet
+    assert "handle empty list" in packet
+    assert "still in scope" in packet  # anti-anchoring instruction
+
+    interdiff_path = decision_dir / "interdiff.patch"
+    assert interdiff_path.exists()
+    interdiff_text = interdiff_path.read_text(encoding="utf-8")
+    assert "sha-old" in interdiff_text
+    assert "sha-abc123" in interdiff_text
+    assert str(interdiff_path) in packet
+
+
+def test_review_round2_failed_compare_omits_interdiff(tmp_path: Path) -> None:
+    """When the prior-head comparison fails (404/GC'd SHA/API error), the
+    packet must still carry the round-1 findings but state that no interdiff
+    could be generated — it must never block packet generation."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    fake_gh.compare_diff_overrides[("sha-old", "sha-abc123")] = None
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "fix the null check",
+                "required_changes": ["add null check"],
+                "reviewed_head_sha": "sha-old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "unavailable" in packet.lower()
+    assert not (decision_dir / "interdiff.patch").exists()
+
+
+def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Path) -> None:
+    """A corrupted review-decision.json (_review_decision returns
+    {"decision": "invalid"}) must not be mistaken for round-2 findings --
+    pins the "invalid" member of the exclusion tuple in review()."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text("{not valid json", encoding="utf-8")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
@@ -11423,7 +11752,7 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
     for i in range(300):
-        state = _append(state, "review_packet", {"pr_number": 90000 + i})
+        state = _append(state, "review_packet", {"pr_number": 90000 + i}, max_size=200)
     save_state(paths.state_file, state)
     assert not any(  # prove the earlier request_changes events are gone
         e.get("kind") == "record_review" for e in load_state(paths.state_file)["events"]
@@ -28244,6 +28573,194 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
     assert decision["reviewed_head_sha"] == "sha-100"
 
 
+def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Path) -> None:
+    """A dead reviewer's events.jsonl telemetry (tokens/cost/turns/tool-calls) must
+    flow into the record_review event payload and the PR's state entry."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    verdict_log = (
+        "Final verdict:\n```json\n{\n"
+        '  "decision": "approved",\n'
+        '  "summary": "lgtm",\n'
+        '  "required_changes": []\n'
+        "}\n```\n"
+    )
+    _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
+    _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
+
+    events_path = reviews_dir / "issue-100-review.events.jsonl"
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use"}]}},
+        {
+            "type": "result",
+            "num_turns": 4,
+            "total_cost_usd": 1.25,
+            "usage": {"input_tokens": 900, "output_tokens": 100},
+        },
+    ]
+    events_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "approved", "verdict_source": "log"}
+    ]
+
+    state = load_state(app.paths.state_file)
+    metrics = state["prs"]["100"]["review_session_metrics"]
+    assert metrics == {
+        "tokens": 1000,
+        "cost_usd": 1.25,
+        "turn_count": 4,
+        "tool_call_count": 2,
+        "verdict_source": "log",
+    }
+
+    record_events = [e for e in state["events"] if e["kind"] == "record_review"]
+    assert record_events, "expected a record_review event"
+    assert record_events[-1]["payload"]["session_metrics"] == metrics
+
+
+def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metrics(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A missing/unparseable events.jsonl sidecar must never block verdict
+    recording — session_metrics is simply absent."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    verdict_log = (
+        "Final verdict:\n```json\n{\n"
+        '  "decision": "approved",\n'
+        '  "summary": "lgtm",\n'
+        '  "required_changes": []\n'
+        "}\n```\n"
+    )
+    _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
+    _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
+    # Deliberately do not create issue-100-review.events.jsonl.
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "approved", "verdict_source": "log"}
+    ]
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["status"] == "approved"
+    assert state["prs"]["100"].get("review_session_metrics") is None
+    record_events = [e for e in state["events"] if e["kind"] == "record_review"]
+    assert record_events
+    assert "session_metrics" not in record_events[-1]["payload"]
+
+
+def test_record_review_session_metrics_none_preserves_prior_metrics(tmp_path: Path) -> None:
+    """A manual `charlie verdict` call (cli.py's record_review invocation shape)
+    passes session_metrics=None -- this must never clobber metrics recorded by
+    an earlier automated reap (the merge-update guard in record_review)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prior_metrics = {
+        "tokens": 500,
+        "cost_usd": 0.5,
+        "turn_count": 2,
+        "tool_call_count": 1,
+        "verdict_source": "log",
+    }
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "review_session_metrics": prior_metrics,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.record_review(456, "approved", summary="lgtm", session_metrics=None)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_session_metrics"] == prior_metrics
+
+
+def test_record_review_session_metrics_replaces_prior_metrics(tmp_path: Path) -> None:
+    """A fresh non-None session_metrics call (the automated reap shape) DOES
+    replace whatever metrics were recorded previously."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prior_metrics = {
+        "tokens": 500,
+        "cost_usd": 0.5,
+        "turn_count": 2,
+        "tool_call_count": 1,
+        "verdict_source": "log",
+    }
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "review_session_metrics": prior_metrics,
+        }
+        save_state(paths.state_file, state)
+
+    new_metrics = {
+        "tokens": 900,
+        "cost_usd": 0.9,
+        "turn_count": 3,
+        "tool_call_count": 2,
+        "verdict_source": "events",
+    }
+    result = app.record_review(456, "approved", summary="lgtm", session_metrics=new_metrics)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_session_metrics"] == new_metrics
+
+
 def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -28315,6 +28832,156 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #525: multiple stalled reviewer claims in one pass become one sweep event."""
+    from charlie_work.worker import WorkerView
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    prs = [100, 200, 300]
+    old = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state = empty_state()
+    for pr in prs:
+        state["prs"][str(pr)] = {
+            "number": pr,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+    save_state(state_file, state)
+
+    for pr in prs:
+        _make_dead_review_sidecar(reviews_dir, pr, "no verdict")
+
+    monkeypatch.setattr(WorkerView, "is_alive", lambda self: False)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert {entry["pr"] for entry in stalled} == set(prs)
+    state_after = load_state(state_file)
+    events = state_after["events"]
+    sweep = [e for e in events if e.get("kind") == "review_dispatch_stalled_sweep"]
+    assert len(sweep) == 1
+    assert sweep[0]["payload"]["count"] == len(prs)
+    assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
+
+
+def test_reap_orphaned_review_checkouts_aggregates_same_pass_events(
+    tmp_path: Path,
+) -> None:
+    """Issue #525: multiple lifecycle-reaped PRs in one pass become one sweep event."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    reviews_dir = tmp_path / "reviews"
+    state_file = tmp_path / "state.json"
+    config = OrchestratorConfig()
+
+    prs = [100, 200, 300]
+    state = empty_state()
+    for pr in prs:
+        state["prs"][str(pr)] = {
+            "number": pr,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": "2026-07-20T00:00:00Z",
+            "reviewer_pid": 12345,
+            "reviewer_process_start_time": 1.0,
+        }
+    save_state(state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": pr,
+            "title": f"Fix #{pr}",
+            "url": f"https://example.test/pull/{pr}",
+            "headRefName": f"agent/issue-{pr}-fix",
+            "baseRefName": "main",
+            "headRefOid": f"sha-{pr}",
+            "body": f"Closes #{pr}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+        for pr in prs
+    ]
+
+    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+
+    assert reaped == prs
+    state_after = load_state(state_file)
+    sweep = [
+        e
+        for e in state_after["events"]
+        if e.get("kind") == "review_dispatch_lifecycle_reaped_sweep"
+    ]
+    assert len(sweep) == 1
+    assert sweep[0]["payload"]["count"] == len(prs)
+    assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
+
+
+def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
+    """Issue #525: a repeating per-pass noise loop cannot evict unrelated events.
+
+    Simulates 5 ghost reviewer sessions x 2 events per pass for 250 passes.
+    Without aggregation the events array would hold 2501 entries and evict the
+    diagnostic event; with per-kind aggregation it stays at 501.
+    """
+    state = empty_state()
+    state = append_event(state, "diagnostic_event", {"note": "keep me"}, max_size=2000)
+
+    prs = list(range(1, 6))
+    passes = 250
+    for _ in range(passes):
+        sweep_events = [
+            ("review_dispatch_stalled", {"pr_number": pr, "status": "dispatched"}) for pr in prs
+        ] + [
+            (
+                "review_dispatch_lifecycle_reaped",
+                {"pr_number": pr, "github_state": "merged"},
+            )
+            for pr in prs
+        ]
+        state = _append_sweep_events(state, sweep_events, max_size=2000)
+
+    diagnostic = [e for e in state["events"] if e.get("kind") == "diagnostic_event"]
+    assert len(diagnostic) == 1
+    assert len(state["events"]) == 1 + (passes * 2)
+    stalled_sweeps = [
+        e for e in state["events"] if e.get("kind") == "review_dispatch_stalled_sweep"
+    ]
+    assert len(stalled_sweeps) == passes
+    assert all(e["payload"]["count"] == len(prs) for e in stalled_sweeps)
+
+
+def test_orchestrator_app_init_wires_event_ring_size_from_config(tmp_path: Path) -> None:
+    """Issue #525: OrchestratorApp.__init__ sets state.EVENT_RING_SIZE from
+    RuntimeConfig.event_ring_size so the default append_event cap is
+    config-driven. A regression here silently leaves the ring at the hardcoded
+    default regardless of operator config."""
+    from charlie_work.config import RuntimeConfig
+
+    custom_size = 7777
+    config = OrchestratorConfig(runtime=RuntimeConfig(event_ring_size=custom_size))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    # Snapshot the module global before construction and restore it after so
+    # the test does not leak the override into other tests in the same process.
+    saved = state_module.EVENT_RING_SIZE
+    try:
+        OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+        assert state_module.EVENT_RING_SIZE == custom_size
+    finally:
+        state_module.EVENT_RING_SIZE = saved
 
 
 def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
