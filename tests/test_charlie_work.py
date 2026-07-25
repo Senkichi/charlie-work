@@ -29162,3 +29162,256 @@ def test_dispatch_partitioned_writes_combined_manifest_for_mixed_adapters(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
     assert session_issue_numbers == {123, 124}
+    # The combined manifest's adapter label is "mixed" and its instructions
+    # text explains the multi-adapter partition (not the generic fallback).
+    assert manifest["adapter"] == "mixed"
+    assert "multiple worker adapters" in " ".join(manifest["instructions"])
+
+
+def _two_complexity_high_issues_github(config: Any) -> Any:
+    """Build a FakeGitHub with two complexity:high issues (123, 124) and closed PRs."""
+
+    class TwoComplexityHighGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [
+                {"name": "automated-ready"},
+                {"name": config.labels.complexity_high},
+            ]
+            self.issues.append(
+                {
+                    "number": 124,
+                    "title": "Another complex issue",
+                    "url": "https://example.test/issues/124",
+                    "body": "Body",
+                    "labels": [
+                        {"name": "automated-ready"},
+                        {"name": config.labels.complexity_high},
+                    ],
+                    "state": "OPEN",
+                }
+            )
+            self.prs.append(
+                {
+                    "number": 457,
+                    "title": "Fix #124",
+                    "url": "https://example.test/pull/457",
+                    "headRefName": "agent/issue-124-another-complex-issue",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-def456",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #124",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "CLOSED",
+                }
+            )
+
+    return TwoComplexityHighGitHub()
+
+
+def test_dispatch_concurrency_cap_defers_second_api_issue_in_same_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482 review fix: when multiple api-eligible (complexity:high) issues
+    are selected in the same dispatch pass and ``max_concurrent_sessions`` is 1,
+    the first routes to api and the second falls back to the default adapter
+    with ``fallback:concurrency`` — the in-pass running counter prevents both
+    from bypassing the cap simultaneously."""
+    from charlie_work import api_worker, devin_shell
+    from charlie_work.claude_code import ClaudeWorkerRecord
+    from charlie_work.worktree import WorktreeInfo
+
+    def _fake_create_worktree(repo_root, branch, **kwargs):
+        wt = tmp_path / "worktrees" / branch.replace("/", "-")
+        wt.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
+
+    api_launches: list[int] = []
+
+    def _fake_api_launch(issue_number, branch, prompt_text, **kwargs):
+        api_launches.append(issue_number)
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(tmp_path / f"wt-api-{issue_number}"),
+            prompt_path=str(tmp_path / f"wt-api-{issue_number}" / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=5000 + issue_number,
+            started_at="2026-07-02T00:00:00Z",
+            log_path=str(tmp_path / f"log-api-{issue_number}"),
+        )
+
+    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_api_launch)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        ),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = _two_complexity_high_issues_github(config)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    # Exactly one issue routed to api (the cap is 1, 0 live sessions).
+    assert len(api_launches) == 1
+    # The adapter_history for each issue records the routing decision.
+    state = load_state(paths.state_file)
+    hist_123 = state["issues"]["123"].get("adapter_history", [])
+    hist_124 = state["issues"]["124"].get("adapter_history", [])
+    all_kinds = {h["kind"] for h in hist_123 + hist_124}
+    all_reasons = {h["reason"] for h in hist_123 + hist_124}
+    assert "api" in all_kinds
+    assert "devin-shell" in all_kinds
+    assert "fallback:concurrency" in all_reasons
+
+
+def test_dispatch_concurrency_cap_dry_run_defers_second_api_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482 review fix: the in-pass running counter also applies in
+    dry-run, so adapter_choices in the dry-run result reflect the cap."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = _two_complexity_high_issues_github(config)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    choices = result.data["adapter_choices"]
+    kinds = {choices[str(n)]["kind"] for n in (123, 124)}
+    reasons = {choices[str(n)]["reason"] for n in (123, 124)}
+    assert kinds == {"api", "devin-shell"}
+    assert "fallback:concurrency" in reasons
+
+
+def test_dispatch_falls_back_on_exhausted_daily_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482 review fix: a complexity:high issue falls back to the default
+    adapter when the daily budget is exhausted (preflight budget failure), and
+    the adapter_history records the ``fallback:budget`` reason. This exercises
+    the budget wiring path end-to-end (ledger on disk -> budget_status ->
+    routing preflight -> dispatch)."""
+    from charlie_work import devin_shell
+    from charlie_work.api_budget import DayBucket, Ledger, ledger_path, save_ledger
+    from charlie_work.worktree import WorktreeInfo
+
+    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    def _fake_create_worktree(repo_root, branch, **kwargs):
+        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        ),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Write a ledger with today's spend at the daily cap so headroom is False.
+    # Defaults: max_usd_per_day=5.0, preflight_reserve_usd=1.0 (max_usd_per_session=0).
+    # spent_today=5.0 -> 5.0 + 1.0 = 6.0 > 5.0 -> daily_headroom=False.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ledger = Ledger(
+        days={today: DayBucket(usd=5.0)},
+        lifetime_usd=5.0,
+    )
+    paths.root.mkdir(parents=True, exist_ok=True)
+    save_ledger(ledger_path(paths.state_file.parent), ledger)
+
+    class ComplexityHighGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [
+                {"name": "automated-ready"},
+                {"name": config.labels.complexity_high},
+            ]
+
+    fake_gh = ComplexityHighGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
+    state = load_state(paths.state_file)
+    history = state["issues"]["123"].get("adapter_history", [])
+    assert len(history) == 1
+    assert history[0]["kind"] == "devin-shell"
+    assert history[0]["reason"] == "fallback:budget"
+
+
+def test_dispatch_falls_back_on_provider_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #482 review fix: a complexity:high issue falls back to the default
+    adapter when the provider is in cooldown (preflight cooldown failure), with
+    a ``fallback:cooldown`` reason. This exercises the cooldown wiring path
+    (throttled_until in state -> _routing_inputs -> is_throttled -> routing
+    preflight -> _select_adapter_for_issue).
+
+    The routing-level cooldown check is defense-in-depth: the dispatch-level
+    throttle gate intercepts first and defers the entire pass when
+    ``is_throttled`` is True. So this test exercises the routing wiring through
+    ``_routing_inputs`` + ``_select_adapter_for_issue`` directly — the full
+    wiring path from state to routing decision — without the dispatch-level
+    gate short-circuiting it."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Set throttled_until to a future timestamp so is_throttled returns True.
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state = set_throttled_until(state, future)
+        save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Exercise the full wiring path: _routing_inputs reads throttled_until from
+    # state and computes provider_in_cooldown via is_throttled; the routing
+    # preflight then fails on cooldown and falls back to the default adapter.
+    routing_inputs = app._routing_inputs()
+    _, _, provider_in_cooldown, _ = routing_inputs
+    assert provider_in_cooldown is True
+    choice = app._select_adapter_for_issue(
+        rework=False,
+        issue_labels={config.labels.complexity_high},
+        routing_inputs=routing_inputs,
+    )
+    assert choice.kind == "devin-shell"
+    assert choice.reason == "fallback:cooldown"

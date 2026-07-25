@@ -3958,13 +3958,13 @@ class OrchestratorApp:
             config=self.config,
         )
 
-    def _routing_inputs(self) -> tuple[Any, bool, bool, int]:
+    def _routing_inputs(self) -> tuple[Any, bool, bool, list[int]]:
         """Compute pass-level routing inputs shared across all issues (issue #482).
 
         Returns ``(budget, api_key_present, provider_in_cooldown,
-        live_api_sessions)`` — the inputs to ``routing.select_adapter`` that
-        are constant across all issues in one dispatch pass. Per-issue inputs
-        (``rework``, ``issue_labels``) are supplied by the caller.
+        live_api_sessions)`` — the inputs to ``routing.select_adapter`` for one
+        dispatch pass. Per-issue inputs (``rework``, ``issue_labels``) are
+        supplied by the caller.
 
         * ``budget``: ``routing.BudgetStatus`` from ``api_budget.budget_status``
           over the loaded ledger.
@@ -3974,8 +3974,15 @@ class OrchestratorApp:
           mechanism (``state.is_throttled``). The dispatch-level throttle gate
           already defers when this is True, so this is defense-in-depth for the
           future api-specific cooldown (issue ⑦ in the design decomposition).
-        * ``live_api_sessions``: alive workers with ``adapter_kind == "api"``
-          counted via ``worker.iter_workers``.
+        * ``live_api_sessions``: a **mutable** one-element list ``[count]``
+          holding the number of in-flight api workers (alive workers with
+          ``adapter_kind == "api"`` counted via ``worker.iter_workers``). The
+          list is mutated in place by ``_select_adapter_for_issue``: each issue
+          routed to the api adapter increments ``live_api_sessions[0]`` so that
+          subsequent issues in the same pass see the updated in-flight count and
+          fall back when ``max_concurrent_sessions`` is reached. Without this
+          running increment, every api-eligible issue in a batch would see the
+          same stale count and all bypass the concurrency cap simultaneously.
         """
         api_config = self.config.api_worker
         # Budget status from the on-disk spend ledger (atomic load with
@@ -3990,18 +3997,20 @@ class OrchestratorApp:
         state = load_state_locked(self.paths.state_file)
         provider_in_cooldown = is_throttled(state)
         # Live api sessions counted via iter_workers filtered to adapter_kind == "api".
+        # Wrapped in a mutable list so _select_adapter_for_issue can increment it
+        # as issues are routed to api within the same pass (concurrency cap fix).
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
         live_api_sessions = sum(
             1 for w in iter_workers(sessions_dir) if w.adapter_kind == "api" and w.is_alive()
         )
-        return budget, api_key_present, provider_in_cooldown, live_api_sessions
+        return budget, api_key_present, provider_in_cooldown, [live_api_sessions]
 
     def _select_adapter_for_issue(
         self,
         *,
         rework: bool,
         issue_labels: set[str],
-        routing_inputs: tuple[Any, bool, bool, int],
+        routing_inputs: tuple[Any, bool, bool, list[int]],
     ) -> AdapterChoice:
         """Call ``routing.select_adapter`` for one issue (issue #482).
 
@@ -4009,9 +4018,16 @@ class OrchestratorApp:
         adapter-choice conditionals live in workflow.py. Per-issue inputs
         (``rework``, ``issue_labels``) are passed in; pass-level inputs come
         from ``_routing_inputs``.
+
+        When the choice resolves to the api adapter, the mutable
+        ``live_api_sessions`` counter inside ``routing_inputs`` is incremented
+        in place so the next issue in the same pass sees the updated in-flight
+        count. This prevents a whole batch of api-eligible issues from all
+        passing the concurrency preflight against a stale count and exceeding
+        ``max_concurrent_sessions``.
         """
         budget, api_key_present, provider_in_cooldown, live_api_sessions = routing_inputs
-        return select_adapter(
+        choice = select_adapter(
             rework=rework,
             issue_labels=issue_labels,
             complexity_high_label=self.config.labels.complexity_high,
@@ -4019,9 +4035,12 @@ class OrchestratorApp:
             budget=budget,
             api_key_present=api_key_present,
             provider_in_cooldown=provider_in_cooldown,
-            live_api_sessions=live_api_sessions,
+            live_api_sessions=live_api_sessions[0],
             default_adapter=self.config.devin.adapter,
         )
+        if choice.kind == "api":
+            live_api_sessions[0] += 1
+        return choice
 
     def _dispatch_partitioned(
         self,
