@@ -267,10 +267,10 @@ def test_attention_digest_transition_uses_dedicated_issue_field_not_event_log(tm
 
     state_file = tmp_path / "state.json"
 
-    # Initialize state with 250 unrelated events (exceeds the 200-entry cap)
+    # Initialize state with 250 unrelated events (exceeds a 200-entry cap)
     state = empty_state()
     for i in range(250):
-        state = append_event(state, "unrelated_event", {"index": i})
+        state = append_event(state, "unrelated_event", {"index": i}, max_size=200)
 
     # Save the state with the bloated events log
     save_state(state_file, state)

@@ -458,6 +458,10 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: int = 1500
+    # Bounded in-memory event ring for state.json. A larger cap costs only a
+    # few hundred KB of JSON and preserves far more diagnostic history when a
+    # single sweep emits repetitive events. Tuned via config (issue #525).
+    event_ring_size: int = 2000
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
@@ -1293,6 +1297,23 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
                 f"got {graphql_rate_limit_threshold}"
+            )
+    event_ring_size = runtime_data.get("event_ring_size")
+    if event_ring_size is not None:
+        if not isinstance(event_ring_size, int):
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be an int, "
+                f"got {type(event_ring_size).__name__}"
+            )
+        # >= 1, not >= 0: append_event truncates via events[-max_size:], and
+        # -0 == 0 in Python, so max_size=0 would yield events[0:] (the FULL
+        # list) — no truncation, i.e. unbounded growth, the exact failure this
+        # cap exists to prevent. There is no sensible "disable" semantic for a
+        # bounded ring (unlike graphql_rate_limit_threshold: 0), so reject 0.
+        if event_ring_size < 1:
+            raise ConfigError(
+                "config section 'runtime' key 'event_ring_size' must be >= 1, "
+                f"got {event_ring_size}"
             )
     throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
     if throttle_resume_margin_s is not None:

@@ -14,6 +14,7 @@ from charlie_work.config import (
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RuntimeConfig,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -196,6 +197,69 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.enabled is True
     assert config.review_dispatch.reviews_dir == ".var/reviews"
     assert config.review_dispatch.max_local_review_processes == 4
+
+
+def test_runtime_config_event_ring_size_default() -> None:
+    """Issue #525: RuntimeConfig.event_ring_size defaults to 2000."""
+    assert RuntimeConfig().event_ring_size == 2000
+
+
+def test_load_config_event_ring_size_override(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size is configurable from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 5000
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.event_ring_size == 5000
+
+
+def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
+    """Issue #525: runtime.event_ring_size must be an int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: "lots"
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_zero(tmp_path: Path) -> None:
+    """Issue #525: event_ring_size=0 is rejected — it would disable truncation.
+
+    append_event truncates via events[-max_size:]; because -0 == 0 in Python,
+    max_size=0 yields events[0:] (the FULL list), causing unbounded growth —
+    the exact failure the cap exists to prevent. There is no sensible "disable"
+    semantic for a bounded ring, so 0 is invalid.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
+    """Issue #525: negative event_ring_size is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: -5
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+        load_config(config_file)
 
 
 def test_load_config_runtime_throttle_resume_margin_default() -> None:
