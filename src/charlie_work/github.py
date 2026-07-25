@@ -185,9 +185,21 @@ class GitHub:
         return _DEFAULT_GH_RETRY_BASE_SECONDS
 
     def __post_init__(self) -> None:
-        # Cache expensive list results within a single GitHub instance lifetime
-        # (typically one fleet pass) to avoid repeated GraphQL calls.
+        # Cache expensive list results within a single orchestrator pass to
+        # avoid repeated GraphQL calls. NOT valid across passes: long-running
+        # processes (charlie fleet supervise) reuse one GitHub instance for
+        # many passes, so each pass must call invalidate_list_cache() or newly
+        # filed issues and freshly opened/merged PRs stay invisible until the
+        # process restarts.
         object.__setattr__(self, "_list_cache", {})
+
+    def invalidate_list_cache(self) -> None:
+        """Drop cached list results so the next call refetches from GitHub.
+
+        Called at the start of every orchestrator pass (``loop()``); the
+        cache dedupes list calls within one pass, never across passes.
+        """
+        self._list_cache.clear()
 
     def _normalize_rest_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
         """Map a PR object from the REST pulls endpoint to the shape expected
