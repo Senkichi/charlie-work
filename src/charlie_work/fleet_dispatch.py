@@ -979,6 +979,21 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+        elif event_type == "runner_allocation":
+            # Deliberately not in the digest — unlike the accidental drops the
+            # fallback below exists to prevent. This is the allocator's *success*
+            # event, and the attention digest is for things needing attention.
+            #
+            # It also cannot be left to the fallback: the prologue emits it when
+            # anything moved *or any note was produced*, and the notes include
+            # standing advisory conditions that persist for as long as the condition
+            # does ("holding 4 surplus slot(s) — slack for 0/3 pass(es)", "demand 7
+            # exceeds its 2 registered runner(s)"). Verified against this host's
+            # events.db: every recorded pass carried a note while moving no slots, so
+            # rendering it would put a near-identical entry in every 5-minute digest.
+            # The event stays in events.db and the prologue logs its inputs at INFO,
+            # which is where standing conditions belong.
+            continue
         else:
             # Visible by default. This chain used to end here, so any event type
             # without an explicit branch was dropped silently — which is how the

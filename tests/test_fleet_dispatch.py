@@ -2576,3 +2576,55 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
     # The daemon must identify itself as the unattended writer: the doctor probe
     # accepts only this value as evidence that allocation runs without an operator.
     assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE
+
+
+def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
+    """A healthy rebalance must not put an entry in every 5-minute digest.
+
+    The prologue emits `runner_allocation` when anything moved OR any note was
+    produced, and the notes include standing advisory conditions that persist as long
+    as the condition does. Verified against this host's events.db: every recorded pass
+    carried such a note while moving zero slots. So a generic fallback would render a
+    near-identical attention entry on every pass -- turning a previously silent drop
+    into recurring noise.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    converged = [
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation",
+            "started": 0,
+            "parked": 0,
+            "budget": 8,
+            "notes": ["Senkichi/job-cannon: holding 4 surplus slot(s) - slack for 0/3 pass(es)"],
+            "dry_run": False,
+        }
+    ]
+    digest = _build_fleet_attention_digest(converged)
+    assert digest.transitions == ()
+
+
+def test_digest_still_surfaces_allocation_failures() -> None:
+    """Dropping the success event must not also drop the errors and skips."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    failures = [
+        {"repo_key": "fleet", "type": "runner_allocation_error", "error": "managed_root missing"},
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_slot_error",
+            "runner": "cw-2",
+            "action": "park",
+            "message": "still busy",
+        },
+        {"repo_key": "fleet", "type": "runner_allocation_skipped", "reason": "no registry anchor"},
+    ]
+    digest = _build_fleet_attention_digest(failures)
+    assert len(digest.transitions) == 3
+    healths = {e.health for e in digest.transitions}
+    # Both error types must reach the desktop-eligible severity set, not just the log.
+    assert "ERROR" in healths
+    reasons = " ".join(str(e.last_log_line) for e in digest.transitions)
+    assert "managed_root missing" in reasons
+    assert "no registry anchor" in reasons
