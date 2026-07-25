@@ -11241,7 +11241,37 @@ class OrchestratorApp:
         operator_claimed = operator_claimed_issues(state)
         operator_claimed_skipped: list[int] = []
 
-        # Find issues with rework_requested status
+        # Build the open-PR index BEFORE any per-issue gh.issue_view() fetch.
+        # pr_list() returns only OPEN PRs by contract (--state open), so an
+        # issue whose PR is closed-unmerged (or that never had one) is absent
+        # from pr_by_issue. Issue #558: without this ordering, the candidate
+        # scan below called gh.issue_view() for every rework_requested issue
+        # every pass -- including issues whose PR closed-unmerged between
+        # reconcile sweeps -- a permanent per-pass GitHub fetch with no
+        # terminal exit (the exact slow-cost-spiral shape #556/#558 exist to
+        # eliminate). Filtering by open PR first cuts the fetch to genuine
+        # candidates only. pr_list() is cached within a pass, so calling it
+        # here vs. later is the same GitHub call.
+        prs = self.gh.pr_list()
+        pr_by_issue: dict[int, dict[str, Any]] = {}
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None:
+                # If multiple PRs link to the same issue, keep the lowest PR number
+                if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                    pr_by_issue[issue_number]["number"]
+                ):
+                    pr_by_issue[issue_number] = pr
+
+        # Find issues with rework_requested status. Only fetch the full issue
+        # from GitHub for issues that actually have an open PR -- a
+        # rework_requested issue with no open PR is not a launch candidate
+        # (the PR was closed-unmerged or never existed), so the per-issue
+        # gh.issue_view fetch is skipped entirely.
         rework_issues = []
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
@@ -11251,6 +11281,11 @@ class OrchestratorApp:
                 # Issue #400: operator-claimed issues are not rework-dispatchable.
                 if issue_number in operator_claimed:
                     operator_claimed_skipped.append(issue_number)
+                    continue
+                # Issue #558: skip the gh.issue_view fetch for issues with no
+                # open PR -- not a rework candidate, and the fetch is the
+                # permanent per-pass cost this gate exists to eliminate.
+                if issue_number not in pr_by_issue:
                     continue
                 # Fetch the full issue from GitHub to get labels and other metadata
                 try:
@@ -11286,24 +11321,11 @@ class OrchestratorApp:
                     data,
                 )
 
-        # Filter to issues with open PRs
-        prs = self.gh.pr_list()
-        pr_by_issue = {}
-        for pr in prs:
-            issue_number = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=self.config.dispatch.branch_prefix,
-            )
-            if issue_number is not None:
-                # If multiple PRs link to the same issue, keep the lowest PR number
-                if issue_number not in pr_by_issue or int(pr["number"]) < int(
-                    pr_by_issue[issue_number]["number"]
-                ):
-                    pr_by_issue[issue_number] = pr
-
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
+        # rework_issues already contains only issues with an open PR (the
+        # fetch loop above skipped issues absent from pr_by_issue), so this
+        # filter is now a no-op kept for clarity/defense-in-depth.
         candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         # Issue #339: a rework worker relaunched onto a PR whose rework was

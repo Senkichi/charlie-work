@@ -269,8 +269,18 @@ def detect_drift(
             # issue's disposition (label strip / carry-forward redispatch)
             # is left entirely to the existing issue-side handling. MERGED
             # PRs are excluded -- that is merged_outside_orchestrator's job.
+            #
+            # A tracked PR (state_entry is not None) whose status key is
+            # missing is the same blind spot the sibling OPEN-PR repair
+            # branch (pr_status_normalized below) covers for OPEN PRs: it
+            # normalizes a None status to the passive placeholder. The
+            # symmetric convergence here covers a tracked CLOSED-unmerged
+            # PR with no status key, so the entry does not linger as a
+            # status-less record the closed sweep skips (Minor symmetry gap
+            # vs the OPEN branch). Untracked PRs (state_entry is None) are
+            # still never invented an entry for.
             state_status = (state_entry or {}).get("status")
-            if state_status is not None and state_status not in ("closed", "merged"):
+            if state_entry is not None and state_status not in ("closed", "merged"):
                 drift.append(
                     DriftItem(
                         kind="closed_unmerged_pr_state_converged",
@@ -284,6 +294,46 @@ def detect_drift(
                         new_status="closed",
                     )
                 )
+
+            # Issue #558 (issue-side counterpart): converge the linked
+            # issue's state status away from any ACTIVE_STATE_STATUS when
+            # its PR is closed-unmerged and the GitHub issue itself is
+            # still OPEN. Without this, an issue stuck in
+            # "rework_requested" (or "reviewing", "escalated", ...) is
+            # selected by dispatch_rework's state-driven candidate scan
+            # every loop pass, which calls gh.issue_view() on it before
+            # any open-PR filtering -- a permanent per-pass GitHub fetch
+            # with no terminal exit, the exact slow-cost-spiral shape
+            # #556/#558 exist to eliminate. The existing
+            # closed_unmerged_pr_active_labels rule only strips GitHub
+            # labels and never touches state["issues"][n]["status"], and
+            # state_active_status_issue_closed only fires when the GitHub
+            # issue itself is CLOSED -- so an OPEN issue with a
+            # closed-unmerged PR is invisible to both. Converge to the
+            # dormant baseline (drop the status key, the same target
+            # issue_status_normalized uses for a never-dispatched issue)
+            # so the issue drops out of every status-driven selector until
+            # a human re-arms it. The linked issue's label disposition
+            # remains owned by closed_unmerged_pr_active_labels; the two
+            # are independent and may both fire for the same PR.
+            if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
+                issue_entry = state.get("issues", {}).get(str(issue_number))
+                issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
+                if issue_status in ACTIVE_STATE_STATUSES:
+                    drift.append(
+                        DriftItem(
+                            kind="closed_unmerged_pr_issue_state_converged",
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            detail=(
+                                f"PR #{pr_number} is CLOSED (unmerged) on GitHub but "
+                                f"linked issue #{issue_number} state status is "
+                                f"{issue_status!r}; converging to dormant (no status)"
+                            ),
+                            fix_actions=(f"drop status key for issues[{issue_number}]",),
+                            new_status=None,
+                        )
+                    )
         elif gh_state == "OPEN":
             # A PR record that the orchestrator is already tracking (has an
             # entry in state["prs"]) but that never got a status written --
@@ -1150,6 +1200,20 @@ def apply_fixes(
                 }
                 if item.issue_number is not None:
                     new_prs[pr_key]["issue_number"] = item.issue_number
+
+        elif item.kind == "closed_unmerged_pr_issue_state_converged":
+            # Issue #558 (issue-side): drop the linked issue's active
+            # status key so dispatch_rework's state-driven candidate scan
+            # stops selecting it (and calling gh.issue_view every loop
+            # pass). The issue's label disposition is owned by
+            # closed_unmerged_pr_active_labels; this only touches the
+            # state status, converging to the dormant baseline (no status
+            # key) that issue_status_normalized also uses for a
+            # never-dispatched issue. Other fields are preserved.
+            if item.issue_number is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                new_issues[issue_key] = {k: v for k, v in existing_issue.items() if k != "status"}
 
         elif item.kind in (
             "issue_active_label_no_open_pr",

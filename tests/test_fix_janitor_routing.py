@@ -535,20 +535,52 @@ def test_review_converges_closed_unmerged_pr_already_closed_is_idempotent(
 ) -> None:
     """A PR already converged to 'closed' must not re-emit the convergence
     event on a second review() call (idempotent).
+
+    The idempotency guard in review() skips the state write AND the
+    ``closed_unmerged_pr_state_converged`` event when the PR status is
+    already ``"closed"``. Asserting only the return flag / final status
+    would pass even if that guard were deleted (the flag is returned
+    outside the guard, and writing ``"closed"`` over ``"closed"`` is a
+    value no-op), so this test pins the guard by counting convergence
+    events: exactly one must land on the first call, and zero on the
+    second.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.prs[0]["state"] = "CLOSED"
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    _force_pr_status(app, 456, "closed")
+    _force_pr_status(app, 456, "janitor_blocked")
 
-    result = app.review(456)
+    # First call: status is janitor_blocked, so the guard writes and emits.
+    first = app.review(456)
+    assert first.ok is True
+    assert first.data.get("closed_unmerged_converged") is True
+    state_after_first = load_state(app.paths.state_file)
+    assert state_after_first["prs"]["456"]["status"] == "closed"
+    first_events = [
+        e
+        for e in state_after_first.get("events", [])
+        if e.get("kind") == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(first_events) == 1, "first call must emit the convergence event"
 
-    assert result.ok is True
-    assert result.data.get("closed_unmerged_converged") is True
-    state = load_state(app.paths.state_file)
-    assert state["prs"]["456"]["status"] == "closed"
+    # Second call: status is already 'closed'. The guard must skip the
+    # write and the event -- deleting the guard would re-emit here.
+    second = app.review(456)
+    assert second.ok is True
+    assert second.data.get("closed_unmerged_converged") is True
+    state_after_second = load_state(app.paths.state_file)
+    assert state_after_second["prs"]["456"]["status"] == "closed"
+    second_events = [
+        e
+        for e in state_after_second.get("events", [])
+        if e.get("kind") == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(second_events) == 1, (
+        "second call on an already-closed PR must NOT re-emit the "
+        "convergence event (idempotency guard)"
+    )
 
 
 def test_review_does_not_converge_merged_pr(tmp_path: Path) -> None:
