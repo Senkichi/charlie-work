@@ -8465,6 +8465,32 @@ def test_config_rejects_merge_flags_scalar(tmp_path: Path) -> None:
     assert "must be a list" in message
 
 
+def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    path = tmp_path / "c.yaml"
+    path.write_text("review_dispatch:\n  review_effort: 3\n", encoding="utf-8")
+
+    try:
+        load_config(path)
+        raise AssertionError("expected ConfigError")
+    except ConfigError as exc:
+        message = str(exc)
+
+    assert "review_effort" in message
+    assert "review_dispatch" in message
+    assert "must be a string" in message
+
+
+def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("review_dispatch:\n  review_effort: high\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.review_dispatch.review_effort == "high"
+
+
 def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
     app = _cross_family_app(tmp_path, enabled=True)
     calls = {"n": 0}

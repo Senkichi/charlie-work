@@ -831,7 +831,16 @@ def launch_claude_worker(
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
-    command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
+    # Reviewer sessions may pin their own effort independently of worker
+    # effort (empty string means fall back to claude_code.effort), so
+    # reviewer effort can be tuned via the per-review session telemetry
+    # (review_session_metrics) without touching worker dispatch.
+    effort = (
+        resolved_config.review_dispatch.review_effort
+        if (review and resolved_config.review_dispatch.review_effort)
+        else resolved_config.claude_code.effort
+    )
+    command_template = _apply_effort_pin(command_template, effort)
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
