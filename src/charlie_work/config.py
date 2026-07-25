@@ -701,6 +701,48 @@ class CrossFamilyConfig:
 
 
 @dataclass(frozen=True)
+class RescueConfig:
+    """Bounded strong-model rescue tier (issue #555).
+
+    Inserts exactly one Opus rework attempt + one cross-family (non-Claude)
+    review pass between "cheap-worker cap exhausted" and escalating to a
+    human. ``enabled`` defaults False so an absent config block is a no-op —
+    mirrors ``CrossFamilyConfig`` (config.py:236).
+
+    Only the three verdict-driven caps route through here
+    (``max_rework_cycles``, ``max_conflict_rework_attempts``,
+    ``max_no_op_rework_attempts``) — infra-driven caps (review-dispatch
+    attempt cap, ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``, dispatch-failed
+    cap) always escalate straight to a human; a stronger model cannot fix a
+    dead session or an unsafe worktree.
+
+    The rescue rework reuses the existing claude-code rework-dispatch path
+    (``_dispatch_rework_impl`` → ``adapters.dispatch_sessions`` →
+    ``claude_code.launch_claude_worker``) with ``claude_code.model``
+    overridden to ``worker_model`` for that one dispatch — never a parallel
+    launch path. ``worker_adapter`` is currently always ``"claude-code"``;
+    kept as an explicit field so a future adapter can be wired in by config
+    alone, matching the spec's named knobs.
+
+    The rescue review reuses ``cross_family.run_cross_family_review`` (the
+    existing blocking, one-shot cross-family invocation) rather than a new
+    polling worker session — ``reviewer_command`` empty means reuse
+    ``CrossFamilyConfig.command`` with ``model`` overridden to
+    ``reviewer_model``.
+    """
+
+    enabled: bool = False
+    worker_adapter: str = "claude-code"
+    worker_model: str = "claude-opus-4-1"
+    reviewer_adapter: str = "devin"
+    reviewer_model: str = "codex"
+    # Empty means reuse CrossFamilyConfig.command (model still overridden to
+    # reviewer_model above).
+    reviewer_command: str | tuple[str, ...] = ()
+    reviewer_timeout_seconds: int = 300
+
+
+@dataclass(frozen=True)
 class WatchdogConfig:
     """Stall watchdog for detecting live-PID-but-dead-agent zombies.
 
@@ -995,6 +1037,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
+    rescue: RescueConfig = field(default_factory=RescueConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
@@ -1502,6 +1545,49 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "cross_family.command",
         )
     cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
+    rescue_data = _section(data, "rescue")
+    rescue_enabled = rescue_data.get("enabled")
+    if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
+        raise ConfigError(
+            f"config section 'rescue' key 'enabled' must be a bool, "
+            f"got {type(rescue_enabled).__name__}"
+        )
+    for rescue_str_key in (
+        "worker_adapter",
+        "worker_model",
+        "reviewer_adapter",
+        "reviewer_model",
+    ):
+        rescue_str_value = rescue_data.get(rescue_str_key)
+        if rescue_str_value is not None and not isinstance(rescue_str_value, str):
+            raise ConfigError(
+                f"config section 'rescue' key '{rescue_str_key}' must be a string, "
+                f"got {type(rescue_str_value).__name__}"
+            )
+    rescue_command = rescue_data.get("reviewer_command")
+    if isinstance(rescue_command, list):
+        rescue_data["reviewer_command"] = tuple(str(item) for item in rescue_command)
+    rescue_command = rescue_data.get("reviewer_command")
+    if rescue_command:
+        _validate_command_placeholders(
+            rescue_command,
+            {"prompt_path", "model"},
+            "rescue.reviewer_command",
+        )
+    rescue_timeout = rescue_data.get("reviewer_timeout_seconds")
+    if rescue_timeout is not None and (
+        isinstance(rescue_timeout, bool) or not isinstance(rescue_timeout, int)
+    ):
+        raise ConfigError(
+            "config section 'rescue' key 'reviewer_timeout_seconds' must be an int, "
+            f"got {type(rescue_timeout).__name__}"
+        )
+    if rescue_timeout is not None and rescue_timeout < 0:
+        raise ConfigError(
+            "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
+            f"got {rescue_timeout}"
+        )
+    rescue = _build_section(RescueConfig, "rescue", rescue_data)
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
     if terminal_error_markers is not None:
@@ -1827,6 +1913,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         claude_code=claude_code,
         api_worker=api_worker,
         cross_family=cross_family,
+        rescue=rescue,
         watchdog=watchdog,
         test_adequacy=test_adequacy,
         fleet=fleet,
