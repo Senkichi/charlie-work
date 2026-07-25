@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-from .config import OrchestratorConfig
+from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry
 from .github import (
@@ -133,6 +133,127 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             f"adapter `{adapter}` launches nothing itself — no CLI probe applies",
             severity="warning",
         )
+
+
+def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig) -> None:
+    """Read-only observability probes for the paid ``api`` worker tier (issue #483).
+
+    When the ``api_worker`` section is configured (non-default):
+
+    * ``enabled: true``  — four checks: the active provider's ``api_key_env``
+      names a variable present in the environment (the NAME only is reported,
+      never any value), ``base_url`` parses as an https URL, the ledger file
+      ``<state_dir>/api-budget.json`` is absent-or-parsable, and remaining
+      daily/lifetime budget headroom is surfaced from ``api_budget.budget_status``.
+    * ``enabled: false`` — a single notice line so a built-but-dormant feature
+      stays visible in every doctor run (rollout insurance).
+
+    Read-only: the ledger is loaded via ``api_budget.load_ledger`` which
+    quarantines a corrupt file, but this probe never settles or writes. Errors
+    surface as check details, never raised.
+    """
+    # ``configured`` = the section is not the package default. A bare
+    # ``api_worker: {enabled: false}`` with no providers/budget is the default
+    # and carries nothing to report; a section with providers set but
+    # ``enabled: false`` is the built-but-dormant case the notice targets.
+    if config.api_worker == ApiWorkerConfig():
+        return
+
+    if not config.api_worker.enabled:
+        add(
+            "api_worker configured but disabled",
+            True,
+            "api_worker section is configured but disabled (enabled is false) — "
+            "flip enabled to true to activate the paid api worker tier",
+            severity="warning",
+        )
+        return
+
+    from datetime import UTC, datetime
+
+    from .api_budget import budget_status, ledger_path, load_ledger
+
+    provider_name = config.api_worker.provider
+    provider = config.api_worker.providers.get(provider_name)
+    if provider is None:
+        # Config load validates this, but a directly-constructed config must
+        # still get a value, not a raise.
+        add(
+            "api_worker provider",
+            False,
+            f"active provider {provider_name!r} is not in api_worker.providers",
+        )
+        return
+
+    # 1. api_key_env present in the environment (NAME only, never the value).
+    key_present = bool(__import__("os").environ.get(provider.api_key_env))
+    add(
+        "api_worker api key",
+        key_present,
+        f"env var {provider.api_key_env!r} is set"
+        if key_present
+        else f"env var {provider.api_key_env!r} is NOT set — api worker cannot launch",
+    )
+
+    # 2. base_url parses as an https URL.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(provider.base_url)
+    url_ok = parsed.scheme == "https" and bool(parsed.netloc)
+    add(
+        "api_worker base url",
+        url_ok,
+        f"{provider.base_url} (https)"
+        if url_ok
+        else f"base_url {provider.base_url!r} is not a valid https URL",
+    )
+
+    # 3. Ledger file absent-or-parsable. load_ledger quarantines a corrupt file
+    #    and returns an empty ledger — we detect corruption by checking for a
+    #    freshly-created .corrupt sibling. Read-only: no settlement or write.
+    ledger_file = ledger_path(paths.root)
+    corrupt_before = (
+        set(ledger_file.parent.glob(f"{ledger_file.name}.corrupt-*"))
+        if ledger_file.parent.exists()
+        else set()
+    )
+    ledger = load_ledger(ledger_file)
+    corrupt_after = (
+        set(ledger_file.parent.glob(f"{ledger_file.name}.corrupt-*"))
+        if ledger_file.parent.exists()
+        else set()
+    )
+    newly_quarantined = corrupt_after - corrupt_before
+    if newly_quarantined:
+        names = ", ".join(p.name for p in sorted(newly_quarantined))
+        add(
+            "api_worker budget ledger",
+            False,
+            f"ledger {ledger_file} was corrupt and quarantined: {names}",
+        )
+    else:
+        add(
+            "api_worker budget ledger",
+            True,
+            f"{ledger_file} ({'present, parsable' if ledger_file.exists() else 'not yet created'})",
+        )
+
+    # 4. Remaining daily/lifetime budget headroom.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    status = budget_status(ledger, config.api_worker.budget, today)
+    daily_remaining = max(0.0, config.api_worker.budget.max_usd_per_day - status.spent_today_usd)
+    lifetime_remaining = max(
+        0.0, config.api_worker.budget.lifetime_usd - status.lifetime_spent_usd
+    )
+    add(
+        "api_worker budget headroom",
+        status.daily_headroom and status.lifetime_headroom,
+        f"${status.spent_today_usd:.2f} spent today / ${config.api_worker.budget.max_usd_per_day:.2f} cap "
+        f"(${daily_remaining:.2f} remaining, {'ok' if status.daily_headroom else 'exhausted'}); "
+        f"${status.lifetime_spent_usd:.2f} spent lifetime / ${config.api_worker.budget.lifetime_usd:.2f} cap "
+        f"(${lifetime_remaining:.2f} remaining, {'ok' if status.lifetime_headroom else 'exhausted'})",
+        severity="warning",
+    )
 
 
 def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
@@ -594,6 +715,11 @@ def run_doctor(
             else f"claude_code.venv_source does not exist: {venv} "
             "(set it to null to disable venv sharing)",
         )
+
+    # -- api worker observability (issue #483) ------------------------------
+    # Always runs (not gated on --adapter-probe): these are config/environment
+    # checks, not external CLI probes. Read-only — never mutates the ledger.
+    _probe_api_worker(add, paths, config)
 
     if adapter_probe:
         _probe_adapter(add, repo_root, config)

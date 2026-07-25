@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ConfigError, OrchestratorConfig
+from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
@@ -77,6 +77,159 @@ def _select_repos(
 
         all_repos.sort(key=last_seen_key)
         return all_repos
+
+
+@dataclass(frozen=True)
+class ApiWorkerFleetReport:
+    """Fleet-wide api-worker observability line (issue #483).
+
+    Read-only snapshot rendered in the fleet status / pass summary. The
+    ``provider``, ``today_usd``, ``lifetime_usd``, and ``cap_usd`` fields come
+    from a representative repo (the first enabled repo, or the first configured
+    repo when none are enabled). ``live`` is the fleet-wide count of alive
+    ``adapter_kind == "api"`` workers. ``enabled_k``/``enabled_m`` is the
+    fleet-wide enablement ratio across all repos that configure the section.
+    """
+
+    provider: str
+    today_usd: float
+    lifetime_usd: float
+    cap_usd: float
+    live: int
+    enabled_k: int
+    enabled_m: int
+
+    def format_line(self) -> str:
+        return (
+            f"api-worker: {self.provider}, "
+            f"${self.today_usd:.2f} today / ${self.lifetime_usd:.2f} lifetime "
+            f"of ${self.cap_usd:.2f}, {self.live} live, "
+            f"enabled {self.enabled_k}/{self.enabled_m} repos"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "today_usd": self.today_usd,
+            "lifetime_usd": self.lifetime_usd,
+            "cap_usd": self.cap_usd,
+            "live": self.live,
+            "enabled_k": self.enabled_k,
+            "enabled_m": self.enabled_m,
+            "line": self.format_line(),
+        }
+
+
+def _api_worker_configured(config: OrchestratorConfig) -> bool:
+    """Return True when the api_worker section is non-default (configured).
+
+    A bare ``api_worker: {enabled: false}`` with no providers/budget is the
+    package default and carries nothing to report. A section with providers
+    set but ``enabled: false`` is the built-but-dormant case.
+    """
+    return config.api_worker != ApiWorkerConfig()
+
+
+def compute_api_worker_fleet_report(
+    *,
+    fleet_dir_override: str | None = None,
+) -> ApiWorkerFleetReport | None:
+    """Compute the fleet-wide api-worker report line (issue #483).
+
+    Returns ``None`` when no registered repo configures the ``api_worker``
+    section (the line is omitted entirely in that case). Otherwise returns an
+    ``ApiWorkerFleetReport`` with spend from a representative repo's ledger and
+    a fleet-wide live-worker count.
+
+    Read-only: never mutates the ledger or state. All errors surface as report
+    values (zeroed spend, zero live), never raised.
+    """
+    from datetime import UTC, datetime
+
+    from .api_budget import budget_status, ledger_path, load_ledger
+    from .worker import iter_workers
+
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+    if not repos:
+        return None
+
+    enabled_k = 0
+    configured_m = 0
+    representative: tuple[str, OrchestratorConfig, dict[str, Any]] | None = None
+
+    for repo_key, entry in repos.items():
+        repo_root = Path(entry.get("repo_root", ""))
+        if not repo_root.is_dir():
+            continue
+        try:
+            explicit_cfg = entry.get("config_path")
+            config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+        except (ConfigError, GitHubError, OSError):
+            continue
+        if not _api_worker_configured(config):
+            continue
+        configured_m += 1
+        if config.api_worker.enabled:
+            enabled_k += 1
+            if representative is None:
+                representative = (repo_key, config, entry)
+        elif representative is None:
+            representative = (repo_key, config, entry)
+
+    if configured_m == 0:
+        return None
+
+    assert representative is not None  # configured_m > 0 guarantees this
+    _, rep_config, rep_entry = representative
+    provider_name = rep_config.api_worker.provider
+
+    # Spend from the representative repo's ledger (read-only).
+    state_dir_str = rep_entry.get("state_dir")
+    today_usd = 0.0
+    lifetime_usd = 0.0
+    cap_usd = rep_config.api_worker.budget.lifetime_usd
+    if state_dir_str:
+        try:
+            ledger_file = ledger_path(Path(state_dir_str))
+            ledger = load_ledger(ledger_file)
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            status = budget_status(ledger, rep_config.api_worker.budget, today)
+            today_usd = status.spent_today_usd
+            lifetime_usd = status.lifetime_spent_usd
+        except Exception:
+            pass
+
+    # Fleet-wide live api worker count.
+    live = 0
+    for _repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            continue
+        sessions_dir = Path(state_dir_str) / "dispatches" / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        try:
+            for w in iter_workers(sessions_dir):
+                if w.adapter_kind == "api" and w.is_alive():
+                    live += 1
+        except Exception:
+            pass
+
+    return ApiWorkerFleetReport(
+        provider=provider_name,
+        today_usd=today_usd,
+        lifetime_usd=lifetime_usd,
+        cap_usd=cap_usd,
+        live=live,
+        enabled_k=enabled_k,
+        enabled_m=configured_m,
+    )
 
 
 def _run_fleet_autoscale_prologue(
@@ -802,12 +955,18 @@ def fleet_loop(
         repo_data["message"] = r.message  # Surface per-repo failure message
         repos_data[k] = repo_data
 
+    # api-worker fleet report line (issue #483): read-only, never raises.
+    api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=fleet_dir_override)
+
     return CommandResult(
         ok,
         message,
         {
             "repos": repos_data,
             "digest": digest,
+            "api_worker_report": api_worker_report.to_dict()
+            if api_worker_report is not None
+            else None,
         },
     )
 
@@ -1114,6 +1273,13 @@ def run_fleet_supervise(
                 f"{attention_count} attention event(s)",
                 flush=True,
             )
+
+            # api-worker fleet report line (issue #483): one line per pass
+            # when any repo configures the section, keeping partial rollout
+            # visible until fleet-wide enablement completes.
+            api_worker_report = data.get("api_worker_report") if isinstance(data, dict) else None
+            if isinstance(api_worker_report, dict) and api_worker_report.get("line"):
+                print(f"[{now_str}] {api_worker_report['line']}", flush=True)
 
             # Snapshot after the pass becomes the baseline for the next delta
             # check; this avoids a spurious extra pass when this pass's own

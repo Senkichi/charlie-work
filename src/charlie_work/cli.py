@@ -12,7 +12,7 @@ import yaml
 from . import CLI_NAME
 from .config import ConfigError, find_config_path
 from .doctor import run_doctor
-from .fleet_dispatch import fleet_loop, run_fleet_supervise
+from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
@@ -461,10 +461,19 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
         except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
             errors.append({"repo_key": repo_key, "error": str(exc)})
 
+    # api-worker fleet report line (issue #483): read-only, never raises.
+    api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=args.fleet_dir)
+
     return CommandResult(
         ok=not errors,
         message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
-        data={"repos": per_repo, "errors": errors},
+        data={
+            "repos": per_repo,
+            "errors": errors,
+            "api_worker_report": api_worker_report.to_dict()
+            if api_worker_report is not None
+            else None,
+        },
     )
 
 
@@ -900,6 +909,17 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     return CommandResult(False, f"unknown command: {args.command}", {})
 
 
+def _render_api_worker_report(data: dict[str, Any]) -> None:
+    """Print the api-worker fleet report line when present (issue #483).
+
+    The line is omitted entirely when no registered repo configures the
+    ``api_worker`` section (``api_worker_report`` is ``None`` in that case).
+    """
+    report = data.get("api_worker_report")
+    if isinstance(report, dict) and report.get("line"):
+        print(f"  {report['line']}")
+
+
 def print_result(result: CommandResult, *, json_output: bool) -> None:
     payload: dict[str, Any] = {"ok": result.ok, "message": result.message, "data": result.data}
     if json_output:
@@ -993,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Errors:")
                 for error in errors:
                     print(f"  {error['repo_key']}: {error['error']}")
+            _render_api_worker_report(result.data)
         elif args.fleet_command in ("work", "bash-rats"):
             repos = result.data.get("repos", {})
             for repo_key, repo_data in sorted(repos.items()):
@@ -1010,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  Digest: {event_count} attention event(s), {orphan_sweep_calls} orphan sweep call(s)"
             )
+            _render_api_worker_report(result.data)
     elif args.command == "runners" and not json_output:
         print(result.message)
         if args.runners_command == "status" and result.ok:

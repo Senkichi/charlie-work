@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as _json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -8,10 +9,12 @@ import pytest
 
 from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import (
+    ApiWorkerFleetReport,
     _build_fleet_attention_digest,
     _extract_attention_events,
     _is_fleet_pass_active,
     _select_repos,
+    compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
 )
@@ -1788,3 +1791,254 @@ def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
     assert by_health["OK"].issue_number == 10
     assert by_health["ERROR"].last_log_line == "no parseable verdict"
     assert by_health["ERROR"].issue_number == 11
+
+
+# ---------------------------------------------------------------------------
+# api-worker fleet report (issue #483)
+# ---------------------------------------------------------------------------
+
+_API_WORKER_YAML = """\
+api_worker:
+  enabled: {enabled}
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+  budget:
+    max_usd_per_day: 5.0
+    lifetime_usd: 15.0
+"""
+
+_BASE_YAML = """\
+labels:
+  ready: automated-ready
+  queued: agent:queued
+  in_progress: agent:in-progress
+runtime:
+  state_dir: .var/charlie-work
+"""
+
+
+def _make_repo(tmp_path: Path, name: str, *, api_worker: str | None) -> Path:
+    """Create a repo dir with a config file. api_worker is the YAML snippet or None."""
+    repo = tmp_path / name
+    repo.mkdir(parents=True)
+    config = repo / "orchestrator.config.yaml"
+    content = _BASE_YAML
+    if api_worker is not None:
+        content += "\n" + api_worker
+    config.write_text(content, encoding="utf-8")
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+    return repo
+
+
+def _make_fleet_json(tmp_path: Path, fleet_dir: Path, repos: dict[str, dict[str, Any]]) -> None:
+    fleet_json = fleet_dir / "fleet.json"
+    fleet_json.parent.mkdir(parents=True, exist_ok=True)
+    registry = {"version": 1, "repos": repos}
+    fleet_json.write_text(_json.dumps(registry, indent=2), encoding="utf-8")
+
+
+def test_api_worker_fleet_report_no_repos_configured(tmp_path: Path) -> None:
+    """0 repos configured → report is None (line omitted entirely)."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        repo = _make_repo(tmp_path, f"repo{i}", api_worker=None)
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None
+
+
+def test_api_worker_fleet_report_partial_enablement(tmp_path: Path) -> None:
+    """1/4 enabled → report shows enabled 1/4 repos."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        enabled = i == 0  # Only repo0 enabled
+        repo = _make_repo(
+            tmp_path,
+            f"repo{i}",
+            api_worker=_API_WORKER_YAML.format(enabled="true" if enabled else "false"),
+        )
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 1
+    assert report.enabled_m == 4
+    assert report.provider == "kimi-k3"
+    assert report.live == 0
+    assert report.cap_usd == 15.0
+    line = report.format_line()
+    assert "enabled 1/4 repos" in line
+    assert "kimi-k3" in line
+    assert "$15.00" in line
+
+
+def test_api_worker_fleet_report_all_enabled(tmp_path: Path) -> None:
+    """4/4 enabled → report shows enabled 4/4 repos."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        repo = _make_repo(tmp_path, f"repo{i}", api_worker=_API_WORKER_YAML.format(enabled="true"))
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 4
+    assert report.enabled_m == 4
+    line = report.format_line()
+    assert "enabled 4/4 repos" in line
+
+
+def test_api_worker_fleet_report_all_disabled_but_configured(tmp_path: Path) -> None:
+    """All configured but none enabled → line still renders (rollout insurance)."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(2):
+        repo = _make_repo(
+            tmp_path, f"repo{i}", api_worker=_API_WORKER_YAML.format(enabled="false")
+        )
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 0
+    assert report.enabled_m == 2
+    line = report.format_line()
+    assert "enabled 0/2 repos" in line
+
+
+def test_api_worker_fleet_report_line_format() -> None:
+    """The format_line method produces the exact required format."""
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=1.50,
+        lifetime_usd=7.25,
+        cap_usd=15.00,
+        live=2,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    line = report.format_line()
+    assert (
+        line == "api-worker: kimi-k3, $1.50 today / $7.25 lifetime of $15.00, "
+        "2 live, enabled 1/4 repos"
+    )
+
+
+def test_api_worker_fleet_report_to_dict() -> None:
+    """to_dict includes all fields plus the formatted line."""
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=0.0,
+        lifetime_usd=0.0,
+        cap_usd=15.0,
+        live=0,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    d = report.to_dict()
+    assert d["provider"] == "kimi-k3"
+    assert d["today_usd"] == 0.0
+    assert d["lifetime_usd"] == 0.0
+    assert d["cap_usd"] == 15.0
+    assert d["live"] == 0
+    assert d["enabled_k"] == 1
+    assert d["enabled_m"] == 4
+    assert "line" in d
+    assert "api-worker:" in d["line"]
+
+
+def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
+    """The report reads spend from the representative (enabled) repo's ledger."""
+    from datetime import UTC, datetime
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repo1 = _make_repo(tmp_path, "repo1", api_worker=_API_WORKER_YAML.format(enabled="false"))
+    state_dir0 = repo0 / ".var" / "charlie-work"
+
+    # Write a ledger with today's spend.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ledger_data = {
+        "days": {today: {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "usd": 2.25}},
+        "lifetime_usd": 8.75,
+        "sessions": [],
+    }
+    (state_dir0 / "api-budget.json").write_text(_json.dumps(ledger_data), encoding="utf-8")
+
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(state_dir0),
+        },
+        "owner/repo1": {
+            "repo_root": str(repo1),
+            "config_path": str(repo1 / "orchestrator.config.yaml"),
+            "state_dir": str(repo1 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.today_usd == 2.25
+    assert report.lifetime_usd == 8.75
+    line = report.format_line()
+    assert "$2.25 today" in line
+    assert "$8.75 lifetime" in line
+
+
+def test_api_worker_fleet_report_no_hardcoded_lists() -> None:
+    """The report line must not contain any hardcoded repo or provider names
+    beyond what is derived from the actual fleet config. This is a sanity
+    check that the format string uses only the report's own fields."""
+    report = ApiWorkerFleetReport(
+        provider="custom-provider",
+        today_usd=0.0,
+        lifetime_usd=0.0,
+        cap_usd=100.0,
+        live=0,
+        enabled_k=3,
+        enabled_m=7,
+    )
+    line = report.format_line()
+    # The provider name comes from the report field, not a hardcoded list.
+    assert "custom-provider" in line
+    assert "enabled 3/7 repos" in line
+    # No hardcoded provider names like "kimi-k3" or "moonshot" in the format.
+    assert "moonshot" not in line
