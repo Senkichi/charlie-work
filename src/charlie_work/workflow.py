@@ -26,6 +26,7 @@ from .claude_code import (
     iter_stream_json_events,
     launch_claude_worker,
     parse_claude_events,
+    resolve_review_effort,
 )
 from .checks import CheckSummary, summarize_checks
 from .config import (
@@ -6521,6 +6522,18 @@ class OrchestratorApp:
             session_metrics = _reviewer_session_metrics(
                 _events_path(reviews_dir, pr_number, review=True), verdict_source
             )
+            # Fold the review_effort experiment's arm/effort assignment (set
+            # at claim time in dispatch_reviews) into session_metrics so the
+            # record_review event alone is enough to split spend/quality by
+            # arm, without a join back to the dispatch event.
+            review_effort_arm = pr_state.get("review_effort_arm")
+            review_effort_used = pr_state.get("review_effort_used")
+            if review_effort_arm is not None or review_effort_used is not None:
+                session_metrics = {
+                    **(session_metrics or {}),
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
+                }
             result = self.record_review(
                 pr_number,
                 verdict["decision"],
@@ -6936,10 +6949,21 @@ class OrchestratorApp:
         now = utc_now()
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            review_effort_assignments: list[dict[str, Any]] = []
+            # Single source of truth for the review_effort experiment arm:
+            # resolved ONCE here at claim time and threaded through to the
+            # launch call below via resolved_review_effort, so the launch
+            # uses exactly this value instead of re-deriving it (agreement
+            # by construction, not by convention).
+            resolved_review_efforts: dict[int, str] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                review_effort_used, review_effort_arm = resolve_review_effort(
+                    pr_number, self.config.review_dispatch, self.config.claude_code
+                )
+                resolved_review_efforts[pr_number] = review_effort_used
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -6952,7 +6976,16 @@ class OrchestratorApp:
                     "reviewer_process_start_time": None,
                     "review_dispatch_attempt_count": attempt_count + 1,
                     "review_turn_limit_summary_posted": False,
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
                 }
+                review_effort_assignments.append(
+                    {
+                        "pr_number": pr_number,
+                        "review_effort_arm": review_effort_arm,
+                        "review_effort_used": review_effort_used,
+                    }
+                )
             if selected:
                 state = append_event(
                     state,
@@ -6960,6 +6993,7 @@ class OrchestratorApp:
                     {
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
+                        "review_effort_assignments": review_effort_assignments,
                     },
                     state_path=self.paths.state_file,
                 )
@@ -7019,9 +7053,21 @@ class OrchestratorApp:
                 # the read-only command template regardless of what is passed
                 # for command_template, so passing it through would be
                 # misleading dead code (PR #397 round-2 review).
+                #
+                # `config` IS forwarded (unlike the above): launch_claude_worker
+                # falls back to a bare default OrchestratorConfig() whenever
+                # config is omitted, which was silently discarding every
+                # review-only pin (review_effort, review_max_turns, and the
+                # review_effort experiment) at the one real dispatch_reviews()
+                # launch site — the effort/max-turns pins only ever worked in
+                # direct launch_claude_worker(config=...) unit tests, never in
+                # an actual dispatch pass. adapters.py's worker-dispatch path
+                # (_run_claude_code_adapter) already forwards config the same
+                # way.
                 launch_kwargs: dict[str, Any] = {
                     "repo_root": self.repo_root,
                     "sessions_dir": reviews_dir,
+                    "config": self.config,
                     "env": claude_cfg.worker_env,
                     "materialize_dirs": self.config.dispatch.materialize_dirs,
                     "review": True,
@@ -7032,6 +7078,11 @@ class OrchestratorApp:
                     # benefit from the structured output because their verdict
                     # extraction depends on it.
                     "tee_stream_json": True,
+                    # The review_effort experiment arm was already resolved
+                    # once, above, at claim time (and persisted to state/
+                    # telemetry) -- pass it through so launch_claude_worker
+                    # uses this value directly instead of re-resolving it.
+                    "resolved_review_effort": resolved_review_efforts.get(pr_number),
                 }
 
                 record = launch_claude_worker(
