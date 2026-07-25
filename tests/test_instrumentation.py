@@ -152,7 +152,7 @@ def test_append_event_200_cap_preserved(tmp_path: Path) -> None:
     state = empty_state()
 
     for i in range(250):
-        state = append_event(state, f"event_{i}", {}, state_path=state_path)
+        state = append_event(state, f"event_{i}", {}, max_size=200, state_path=state_path)
 
     # state.json events array capped at 200
     assert len(state["events"]) == 200
