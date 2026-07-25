@@ -10458,6 +10458,25 @@ def test_review_round2_failed_compare_omits_interdiff(tmp_path: Path) -> None:
     assert not (decision_dir / "interdiff.patch").exists()
 
 
+def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Path) -> None:
+    """A corrupted review-decision.json (_review_decision returns
+    {"decision": "invalid"}) must not be mistaken for round-2 findings --
+    pins the "invalid" member of the exclusion tuple in review()."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text("{not valid json", encoding="utf-8")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" not in packet
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
@@ -28672,6 +28691,74 @@ def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metric
     record_events = [e for e in state["events"] if e["kind"] == "record_review"]
     assert record_events
     assert "session_metrics" not in record_events[-1]["payload"]
+
+
+def test_record_review_session_metrics_none_preserves_prior_metrics(tmp_path: Path) -> None:
+    """A manual `charlie verdict` call (cli.py's record_review invocation shape)
+    passes session_metrics=None -- this must never clobber metrics recorded by
+    an earlier automated reap (the merge-update guard in record_review)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prior_metrics = {
+        "tokens": 500,
+        "cost_usd": 0.5,
+        "turn_count": 2,
+        "tool_call_count": 1,
+        "verdict_source": "log",
+    }
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "review_session_metrics": prior_metrics,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.record_review(456, "approved", summary="lgtm", session_metrics=None)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_session_metrics"] == prior_metrics
+
+
+def test_record_review_session_metrics_replaces_prior_metrics(tmp_path: Path) -> None:
+    """A fresh non-None session_metrics call (the automated reap shape) DOES
+    replace whatever metrics were recorded previously."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prior_metrics = {
+        "tokens": 500,
+        "cost_usd": 0.5,
+        "turn_count": 2,
+        "tool_call_count": 1,
+        "verdict_source": "log",
+    }
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "review_session_metrics": prior_metrics,
+        }
+        save_state(paths.state_file, state)
+
+    new_metrics = {
+        "tokens": 900,
+        "cost_usd": 0.9,
+        "turn_count": 3,
+        "tool_call_count": 2,
+        "verdict_source": "events",
+    }
+    result = app.record_review(456, "approved", summary="lgtm", session_metrics=new_metrics)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_session_metrics"] == new_metrics
 
 
 def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
