@@ -6776,6 +6776,161 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
+def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """dispatch_reviews() must pass the live OrchestratorConfig into
+    launch_claude_worker so review-only pins (review_effort, review_max_turns,
+    the review_effort experiment) actually take effect. Without this, every
+    reviewer launch resolves effort/max-turns from a bare default
+    OrchestratorConfig() inside launch_claude_worker itself, silently
+    discarding whatever the operator configured."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        captured.append(kwargs)
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert len(captured) == 1
+    assert captured[0].get("config") is app.config
+
+
+def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The review_effort experiment's per-PR arm/effort assignment must be
+    recorded on the PR's state entry and in the review_dispatch_claim event
+    at claim time (so it's analyzable even if the launch itself later fails)."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(
+            enabled=True,
+            review_effort="high",
+            review_effort_experiment_fraction=1.0,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *a, **kw: _fake_claude_worker_record(
+            kw.get("issue_number") or a[0], kw.get("branch") or a[1]
+        ),
+    )
+
+    result = app.dispatch_reviews()
+    assert result.ok is True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_effort_arm"] == "treatment"
+    assert state["prs"]["100"]["review_effort_used"] == "high"
+
+    claim_events = [e for e in state["events"] if e.get("kind") == "review_dispatch_claim"]
+    assert len(claim_events) == 1
+    assignments = claim_events[0]["payload"]["review_effort_assignments"]
+    assert assignments == [
+        {"pr_number": 100, "review_effort_arm": "treatment", "review_effort_used": "high"}
+    ]
+
+
+def test_dispatch_reviews_experiment_disabled_records_no_arm(monkeypatch, tmp_path: Path) -> None:
+    """fraction=0.0 (default): review_effort still applies to all PRs, but
+    since there's no experiment, no arm is recorded."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, review_effort="high"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *a, **kw: _fake_claude_worker_record(
+            kw.get("issue_number") or a[0], kw.get("branch") or a[1]
+        ),
+    )
+
+    result = app.dispatch_reviews()
+    assert result.ok is True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_effort_arm"] is None
+    assert state["prs"]["100"]["review_effort_used"] == "high"
+
+
 def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
     """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
     unresolved npm ``.CMD`` shim) must not strand the PR at
@@ -28641,6 +28796,68 @@ def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Pat
     record_events = [e for e in state["events"] if e["kind"] == "record_review"]
     assert record_events, "expected a record_review event"
     assert record_events[-1]["payload"]["session_metrics"] == metrics
+
+
+def test_reap_review_verdicts_folds_review_effort_arm_into_session_metrics(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The review_effort experiment's arm/effort (recorded on pr_state at
+    dispatch/claim time) must be folded into session_metrics at reap time, so
+    the record_review event alone is enough to split spend/quality by arm."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    verdict_log = (
+        "Final verdict:\n```json\n{\n"
+        '  "decision": "approved",\n'
+        '  "summary": "lgtm",\n'
+        '  "required_changes": []\n'
+        "}\n```\n"
+    )
+    _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
+    _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            **state["prs"]["100"],
+            "review_effort_arm": "treatment",
+            "review_effort_used": "high",
+        }
+        save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "approved", "verdict_source": "log"}
+    ]
+
+    state = load_state(app.paths.state_file)
+    metrics = state["prs"]["100"]["review_session_metrics"]
+    assert metrics["review_effort_arm"] == "treatment"
+    assert metrics["review_effort_used"] == "high"
+
+    record_events = [e for e in state["events"] if e["kind"] == "record_review"]
+    assert record_events, "expected a record_review event"
+    assert record_events[-1]["payload"]["session_metrics"]["review_effort_arm"] == "treatment"
+    assert record_events[-1]["payload"]["session_metrics"]["review_effort_used"] == "high"
 
 
 def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metrics(
