@@ -156,6 +156,7 @@ class WorkerHealth(Enum):
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    6.5. in-flight api per-session budget (api only) → RUNAWAY (issue #484)
     7. (none of the above) → HEALTHY
 
     SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
@@ -267,6 +268,7 @@ class WorkerView:
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
     session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
+    provider: str = ""  # api provider name (issue #484); empty for non-api adapters
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -659,6 +661,7 @@ def classify_worker_health(
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    6.5. in-flight api per-session budget (api only) → RUNAWAY (issue #484)
     7. (none of the above) → HEALTHY
 
     Signals 1 and 3 are corroborated against ``real_activity_probe`` (issues #280,
@@ -817,8 +820,60 @@ def classify_worker_health(
                     else:
                         return WorkerHealth.SLOW
 
+    # Signal 6.5: in-flight api per-session budget kill (issue #484)
+    # Only applies to api workers. Claude Code's self-reported cost_usd (Signal
+    # 6) is WRONG against non-Anthropic endpoints, so api cost is derived from
+    # token usage times the configured provider pricing via api_budget. When
+    # ``max_usd_per_session`` is 0/unset the check is entirely dormant
+    # (calibration window): no cost computation side effects beyond what the
+    # ledger already does at settlement. Non-api workers are never
+    # budget-evaluated here.
+    if _api_session_over_budget(view, config):
+        return WorkerHealth.RUNAWAY
+
     # Signal 7: (none of the above)
     return WorkerHealth.HEALTHY
+
+
+def _api_session_over_budget(view: WorkerView, config: OrchestratorConfig) -> bool:
+    """Return True when an api worker's accumulated cost exceeds the per-session cap.
+
+    Pure check (no side effects beyond reading the session's events.jsonl):
+    accumulates token usage via ``api_budget.usage_from_events`` over the
+    session's events.jsonl and computes USD via ``api_budget.cost_usd`` with
+    the active provider's configured pricing. Returns False (dormant) when:
+
+    * the worker is not ``adapter_kind == "api"`` (non-api workers are never
+      budget-evaluated — issue #484 acceptance criterion),
+    * ``max_usd_per_session`` is 0/unset (calibration window — the check is
+      entirely dormant with no cost computation side effects beyond what the
+      ledger already does at settlement),
+    * the worker has no resolved provider name, or the provider is not in the
+      registry (no pricing → cannot compute cost),
+    * the events.jsonl file does not exist yet (a young session that has not
+      emitted any usage).
+
+    Shared by ``classify_worker_health`` (Signal 6.5) and the supervision
+    path's budget-kill block so the cost computation is implemented once.
+    """
+    if view.adapter_kind != "api":
+        return False
+    cap = config.api_worker.budget.max_usd_per_session
+    if cap <= 0 or not view.provider:
+        return False
+    provider_cfg = config.api_worker.providers.get(view.provider)
+    if provider_cfg is None:
+        return False
+    events_path = _events_path_from_log(Path(view.log_path))
+    if not events_path.exists():
+        return False
+    from .api_budget import cost_usd as _api_cost_usd
+    from .api_budget import usage_from_events as _api_usage_from_events
+    from .claude_code import iter_claude_events
+
+    api_usage = _api_usage_from_events(iter_claude_events(events_path))
+    session_cost = _api_cost_usd(api_usage, provider_cfg)
+    return session_cost > cap
 
 
 def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
@@ -871,6 +926,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         rate_limit_defer_until=record.rate_limit_defer_until,
         inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
         session_id=record.session_id,
+        provider=record.provider,
     )
 
 
