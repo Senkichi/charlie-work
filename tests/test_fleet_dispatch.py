@@ -2584,9 +2584,16 @@ def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
     The prologue emits `runner_allocation` when anything moved OR any note was
     produced, and the notes include standing advisory conditions that persist as long
     as the condition does. Verified against this host's events.db: every recorded pass
-    carried such a note while moving zero slots. So a generic fallback would render a
-    near-identical attention entry on every pass -- turning a previously silent drop
-    into recurring noise.
+    carried such a note while moving zero slots. So routing this event through the
+    generic fallback would render a near-identical attention entry on every pass.
+
+    Precise about what this does and does not assert. It pins the *entry*: none is
+    rendered for a converged pass. It does not assert the digest sink stays untouched,
+    because the envelope is emitted every pass either way -- `fleet_loop`'s notify gate
+    tests the raw event list rather than the built digest, so `emit_digest` is called
+    with `transitions=()` on a converged pass. That gate/digest mismatch predates this
+    PR (unchanged since #591) and is tracked separately in issue #610; it is not
+    something this branch introduced or fixes.
     """
     from charlie_work.fleet_dispatch import _build_fleet_attention_digest
 

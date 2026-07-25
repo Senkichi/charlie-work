@@ -23,6 +23,7 @@ from .supervise import (
     try_acquire_supervisor_lock,
 )
 from .runner_allocation_pass import run_allocation_pass
+from .runner_slots import UNATTENDED_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -384,7 +385,7 @@ def _run_fleet_allocation_prologue(
         fleet_dir_override=fleet_dir_override,
         state_path=anchor_state,
         dry_run=dry_run,
-        source="prologue",
+        source=UNATTENDED_ALLOCATION_SOURCE,
     )
 
     if result.error:

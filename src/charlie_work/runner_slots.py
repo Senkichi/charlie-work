@@ -59,9 +59,14 @@ ALLOCATION_STATE_FILENAME = "runner-allocation.json"
 # distinction in the artifact instead of leaving it to be guessed from age.
 AllocationSource = Literal["prologue", "cli"]
 
-# The unattended path. Named once here so the doctor probe's notion of
-# "allocation is running by itself" cannot drift from what the daemon writes.
+# The two writers, named once here so that what the daemon stamps, what the CLI
+# stamps, and what the doctor probe tests for cannot drift apart. Every writer and
+# every reader spells them this way; a bare string literal at a call site would
+# reintroduce exactly the drift the ``Literal`` type is meant to prevent, since
+# ``Literal`` constrains the value but nothing keeps three separate copies of it
+# in agreement.
 UNATTENDED_ALLOCATION_SOURCE: AllocationSource = "prologue"
+CLI_ALLOCATION_SOURCE: AllocationSource = "cli"
 
 # Label that marks a job as targeting this host's runners rather than
 # GitHub-hosted ones. This is GitHub's own reserved label, not a local

@@ -36,6 +36,7 @@ from .paths import RuntimePaths
 from .prompts import resolve_template
 from .runner_slots import (
     ALLOCATION_STATE_FILENAME,
+    CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
     load_allocation_stamp,
 )
@@ -371,7 +372,7 @@ def _allocation_writer_label(source: str | None) -> str:
         return "writer unrecorded — file predates provenance tracking"
     if source == UNATTENDED_ALLOCATION_SOURCE:
         return "unattended fleet pass"
-    if source == "cli":
+    if source == CLI_ALLOCATION_SOURCE:
         return "a manual `charlie runners allocate`"
     return f"an unrecognised writer {source!r}"
 
