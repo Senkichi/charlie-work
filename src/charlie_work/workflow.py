@@ -3242,7 +3242,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                     )
                     save_state(state_file, state)
 
-            w.reap_sidecar(sessions_dir)
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
             reaped.append(
                 {
                     "issue_number": w.issue_number,
@@ -3393,7 +3397,11 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
-            w.reap_sidecar(sessions_dir)
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
             reaped.append(
                 {
                     "issue_number": w.issue_number,
