@@ -487,21 +487,85 @@ def _ci_status_section(
         )
     lines.append(f"`checks.json` is available at `{checks_json_path}` if a specific doubt arises.")
 
-    all_names = tuple(dict.fromkeys(str(check.get("name") or "") for check in checks))
-    all_names = tuple(name for name in all_names if name)
-    if all_names:
-        all_summary = summarize_checks(checks, all_names)
-        non_required_failing = sorted(
-            (set(all_summary.failed) | set(all_summary.infra_failed)) - set(required)
+    non_required_failing, non_required_cancelled = _non_required_check_findings(checks, required)
+    if non_required_failing:
+        lines.append(
+            "Non-required/informational check(s) currently failing (the "
+            "janitor gate does not block on these — weigh them yourself): "
+            + ", ".join(non_required_failing)
         )
-        if non_required_failing:
-            lines.append(
-                "Non-required/informational check(s) currently failing (the "
-                "janitor gate does not block on these — weigh them yourself): "
-                + ", ".join(non_required_failing)
-            )
+    if non_required_cancelled:
+        lines.append(
+            "Non-required/informational check(s) cancelled (often infra-transient, "
+            "not necessarily a code failure — weigh them yourself): "
+            + ", ".join(non_required_cancelled)
+        )
 
     return "\n".join(lines) + "\n"
+
+
+def _non_required_check_findings(
+    checks: list[dict[str, Any]], required: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Classify non-required checks into (failing, cancelled) name lists.
+
+    Deliberately does NOT reuse ``summarize_checks`` here: its ``else:
+    name_failed = True`` catch-all (checks.py) is correct for REQUIRED checks
+    (any non-passing/non-pending/non-infra state should gate the janitor) but
+    wrong for informational awareness of non-required checks, where it
+    silently swept SKIPPED and NEUTRAL conclusions (a path-filtered or
+    matrix-conditional job that correctly did not run) into "failed", making
+    every such PR's packet falsely claim an unrelated check was "currently
+    failing". ``summarize_checks`` itself must not change — it is the
+    janitor's required-check semantics — so this classifies non-required
+    checks directly from their raw per-run state/bucket instead.
+
+    A genuine failure is FAILURE, INFRA_FAILURE, or any other unrecognized
+    terminal state (e.g. TIMED_OUT, ACTION_REQUIRED) — the same "anything
+    else is a real failure" posture ``summarize_checks`` takes, minus the
+    SKIPPED/NEUTRAL carve-out. CANCELLED is reported separately (worded as
+    "cancelled," never "failing") since it is frequently an infra hiccup
+    rather than a code problem. Multiple runs sharing a name use worst-of
+    semantics, mirroring ``summarize_checks``.
+    """
+    required_set = set(required)
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for check in checks:
+        name = str(check.get("name") or "")
+        if not name or name in required_set:
+            continue
+        by_name.setdefault(name, []).append(check)
+
+    failing: list[str] = []
+    cancelled: list[str] = []
+    for name, runs in by_name.items():
+        name_failed = False
+        name_cancelled = False
+        for check in runs:
+            state = str(check.get("state") or "").upper()
+            bucket = str(check.get("bucket") or "").lower()
+            if state == "SUCCESS" or bucket == "pass":
+                continue
+            if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
+                continue
+            if not state and not bucket:
+                continue
+            if state in {"SKIPPED", "NEUTRAL"}:
+                # Legitimate non-outcomes (path-filtered/matrix-conditional
+                # jobs) — never a failure.
+                continue
+            if state == "CANCELLED":
+                name_cancelled = True
+                continue
+            # FAILURE, INFRA_FAILURE, or any other unrecognized state
+            # (TIMED_OUT, ACTION_REQUIRED, ...): a genuine failure.
+            name_failed = True
+        if name_failed:
+            failing.append(name)
+        elif name_cancelled:
+            cancelled.append(name)
+
+    return tuple(sorted(failing)), tuple(sorted(cancelled))
 
 
 def render_test_adequacy_section(

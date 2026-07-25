@@ -10268,6 +10268,84 @@ def test_review_ci_status_section_lists_failing_non_required_checks(tmp_path: Pa
     assert "Codecov" in packet
 
 
+def test_review_ci_status_section_skipped_non_required_check_not_listed_as_failing(
+    tmp_path: Path,
+) -> None:
+    """A SKIPPED non-required check (path-filtered/matrix-conditional job that
+    legitimately did not run) must never be reported as 'currently failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Optional Job", "state": "SKIPPED"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" not in packet
+    assert "Optional Job" not in packet
+
+
+def test_review_ci_status_section_neutral_non_required_check_not_listed_as_failing(
+    tmp_path: Path,
+) -> None:
+    """A NEUTRAL non-required check conclusion is neither pass nor fail and
+    must never be reported as 'currently failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Advisory Job", "state": "NEUTRAL"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" not in packet
+    assert "Advisory Job" not in packet
+
+
+def test_review_ci_status_section_cancelled_non_required_check_worded_distinctly(
+    tmp_path: Path,
+) -> None:
+    """A CANCELLED non-required check (often an infra hiccup, not a code
+    failure) must be surfaced with distinct wording, never called 'failing'."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+            {"name": "Flaky Job", "state": "CANCELLED"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (paths.prs / "pr-456" / "review-prompt.md").read_text(encoding="utf-8")
+    assert "Non-required/informational check(s) currently failing" not in packet
+    assert "Non-required/informational check(s) cancelled" in packet
+    assert "Flaky Job" in packet
+
+
 def test_review_first_round_has_no_prior_review_section(tmp_path: Path) -> None:
     """No review-decision.json on disk yet: this is a first-round review, so
     $prior_review_section must render empty."""
