@@ -2528,10 +2528,13 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
 
     Every prologue test calls ``_run_fleet_allocation_prologue`` directly and
     every ``run_fleet_supervise`` test patches ``fleet_loop`` out, so nothing
-    asserted that a real fleet pass reaches allocation at all. That is exactly
-    the gap #590 lives in: on the live host the daemon reports healthy passes
-    while allocation never runs. This drives ``fleet_loop`` unmocked and patches
-    only one level below the prologue.
+    asserted that a real fleet pass reaches allocation at all. This drives
+    ``fleet_loop`` unmocked and patches only one level below the prologue.
+
+    Scope, so this does not misdirect the next triage: it covers ``fleet_loop``
+    only. ``run_fleet_supervise``'s own ``load_layered_config(Path.cwd(), ...)``
+    and the HEAD-drift and self-deploy steps that run *before* ``fleet_loop`` are
+    still unexercised, and #590 could live in any of them.
     """
     repo = _make_repo(tmp_path, "anchor", api_worker=None)
     mock_load_registry.return_value = {
@@ -2566,5 +2569,10 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
         work_only=False,
     )
 
+    from charlie_work.runner_slots import UNATTENDED_ALLOCATION_SOURCE
+
     mock_run_allocation_pass.assert_called_once()
     assert mock_run_allocation_pass.call_args.kwargs["dry_run"] is False
+    # The daemon must identify itself as the unattended writer: the doctor probe
+    # accepts only this value as evidence that allocation runs without an operator.
+    assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE

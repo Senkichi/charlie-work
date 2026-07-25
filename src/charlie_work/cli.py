@@ -892,6 +892,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         fleet_dir_override=args.fleet_dir,
         state_path=paths.state_file,
         dry_run=dry_run,
+        source="cli",
     )
 
     if result.error:

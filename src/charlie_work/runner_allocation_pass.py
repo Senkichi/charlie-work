@@ -45,6 +45,7 @@ from .runner_slots import (
     fetch_busy_runner_names,
     load_idle_streaks,
     measure_repo_demand,
+    AllocationSource,
     save_idle_streaks,
 )
 
@@ -142,6 +143,7 @@ def run_allocation_pass(
     fleet_dir_override: str | None = None,
     state_path: Path | None = None,
     dry_run: bool = False,
+    source: AllocationSource,
 ) -> AllocationPassResult:
     """Rebalance this host's running runner listeners across repos by demand.
 
@@ -155,6 +157,10 @@ def run_allocation_pass(
         state_path: Optional ``state.json`` path; when given, the plan is
             recorded to the event log.
         dry_run: Plan and report without starting, parking, or persisting.
+        source: Which path is running this pass. Persisted with the state file so
+            the doctor probe can tell an unattended pass from an operator's
+            manual ``charlie runners allocate`` — both write the same file, and
+            only the former is evidence the daemon is rebalancing (issue #590).
 
     Returns:
         AllocationPassResult — never raises.
@@ -215,11 +221,13 @@ def run_allocation_pass(
         save_idle_streaks(
             state_dir,
             next_idle_streaks(observed, demands, previous_streaks),
+            source=source,
         )
 
     if state_path is not None:
         summary = plan_summary(plan)
         summary["dry_run"] = dry_run
+        summary["source"] = source
         summary["applied"] = [
             {"runner": r.change.runner_name, "ok": r.ok, "message": r.message} for r in results
         ]

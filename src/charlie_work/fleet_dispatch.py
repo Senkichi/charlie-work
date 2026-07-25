@@ -384,6 +384,7 @@ def _run_fleet_allocation_prologue(
         fleet_dir_override=fleet_dir_override,
         state_path=anchor_state,
         dry_run=dry_run,
+        source="prologue",
     )
 
     if result.error:
