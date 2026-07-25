@@ -701,3 +701,65 @@ def test_cli_fleet_work_main_omits_line_when_unconfigured(
     assert rc == 0
     out = capsys.readouterr().out
     assert "api-worker:" not in out
+
+
+# --------------------------------------------------------------------------
+# Global --dry-run must survive subcommand parsing
+# --------------------------------------------------------------------------
+
+
+def _iter_subparsers(parser: Any, prefix: tuple[str, ...] = ()) -> Any:
+    """Yield (argv_prefix, parser) for every subparser, recursively."""
+    import argparse
+
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, sub in action.choices.items():
+                yield (*prefix, name), sub
+                yield from _iter_subparsers(sub, (*prefix, name))
+
+
+def _dry_run_action(parser: Any) -> Any:
+    for action in parser._actions:
+        if "--dry-run" in getattr(action, "option_strings", ()):
+            return action
+    return None
+
+
+def test_every_subcommand_dry_run_flag_defers_to_the_global_one() -> None:
+    """A subcommand-level --dry-run must not clobber the top-level one.
+
+    ``--dry-run`` exists on the top-level parser, so an operator may write it
+    before or after the subcommand and both must work. argparse applies a
+    subparser's own default *after* the global flag was parsed, so a plain
+    ``action="store_true"`` on a subparser silently overwrites True with False.
+    Discovered on the live host: ``charlie --dry-run runners allocate`` launched a
+    real runner listener and reported its PID.
+
+    Derived from the parser itself rather than a hand-maintained list, so a new
+    subcommand that repeats the plain idiom fails this test.
+    """
+    import argparse
+
+    parser = cli.build_parser()
+    offenders = []
+    for path, sub in _iter_subparsers(parser):
+        action = _dry_run_action(sub)
+        if action is not None and action.default is not argparse.SUPPRESS:
+            offenders.append(" ".join(path))
+
+    assert offenders == [], (
+        "these subcommands clobber the global --dry-run; route them through "
+        f"cli._add_dry_run: {offenders}"
+    )
+
+    # The top-level flag must keep a real default so args.dry_run always exists.
+    assert _dry_run_action(parser).default is False
+
+
+def test_global_dry_run_reaches_runners_allocate_in_either_position() -> None:
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["--dry-run", "runners", "allocate"]).dry_run is True
+    assert parser.parse_args(["runners", "allocate", "--dry-run"]).dry_run is True
+    assert parser.parse_args(["runners", "allocate"]).dry_run is False
