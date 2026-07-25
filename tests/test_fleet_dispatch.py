@@ -2399,3 +2399,25 @@ def test_allocation_prologue_surfaces_errors_and_failed_slots(tmp_path: Path) ->
     assert [event["type"] for event in events] == ["runner_allocation_slot_error"]
     assert events[0]["runner"] == "cw-2"
     assert events[0]["action"] == "park"
+
+
+def test_allocation_prologue_warns_when_the_config_lacks_the_section(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """A config object without the section means code/config disagree.
+
+    That is a different failure from "the operator left it off" — it happens
+    when a load failure already fell back to defaults, or when the process is
+    holding a config built by other code — and it must not look like a
+    deliberate opt-out.
+    """
+    import logging
+
+    class _NoSection:
+        pass
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
+
+    assert events == []
+    assert any("no runner_allocation" in record.message for record in caplog.records)

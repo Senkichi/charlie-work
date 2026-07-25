@@ -277,7 +277,19 @@ def _run_fleet_allocation_prologue(
     events: list[dict[str, Any]] = []
 
     allocation = getattr(global_config, "runner_allocation", None)
-    if allocation is None or not allocation.enabled:
+    if allocation is None:
+        # The config object has no such section at all. That is not "the
+        # operator left it off" — it means this process is holding a config
+        # built by different code, or a load failure already fell back to
+        # defaults. Either way the feature is silently absent, so say so.
+        logger.warning(
+            "Fleet allocation prologue: config object has no runner_allocation "
+            "section (%s); allocation cannot run in this process",
+            type(global_config).__name__,
+        )
+        return events
+    if not allocation.enabled:
+        logger.debug("Fleet allocation prologue: disabled in config")
         return events
 
     # Any existing repo root works as the gh working directory: the allocation
