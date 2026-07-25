@@ -30,6 +30,66 @@ _STALE_CLAIM_TIMEOUT_MINUTES = 30
 DEFAULT_EVENT_RING_SIZE = 2000
 EVENT_RING_SIZE = DEFAULT_EVENT_RING_SIZE
 
+# Reviewer-specific stale claim timeout (minutes). Session-limit kills are
+# detectable within seconds (the reviewer dies and prints the limit message to
+# its log), so the 30-minute worker timeout is far too long for review
+# dispatches: it extends the hot-redispatch loop cycle unnecessarily. 5
+# minutes is ample for a reviewer that started successfully but died from a
+# throttle, while still avoiding thrash on flaky launch paths.
+_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
+
+# Orphan backstop for dead-reviewer claims at the CLAIM stage (issue #571).
+# A dispatched claim whose reviewer has died must be dispositioned by the
+# stalled-review sweep first (throttle classification, probe-failure count,
+# sidecar reap, events) — the claim stage racing it on the same 5-minute
+# timeout measured later in the pass produced a deterministic livelock:
+# every relaunch reset the clock just after the sweep looked, so the sweep
+# never saw a stale claim and quota backoff never engaged. 3x the stale
+# timeout gives the sweep three windows of first refusal while still
+# self-healing true orphans (e.g. a crash before the sidecar was written,
+# which the worker-iterating sweep cannot see).
+_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES = _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES * 3
+
+# Every literal ever assigned to `issues[n]["status"]` across the
+# orchestrator's dispatch -> review -> rework -> merge lifecycle (workflow.py).
+# reconcile.py's status-normalization sweep treats any issue record whose
+# status is missing or falls outside this set as drift and recomputes it from
+# ground truth. Kept here rather than in reconcile.py so any future writer of
+# issue status has a single, importable source of truth to validate against --
+# the same reasoning that already put ``without_review_dispatch_claim`` here
+# instead of scattered across callers.
+VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
+    {
+        "dispatched",
+        "dispatch_pending",
+        # manual-adapter dispatch: manifest written, worker not yet confirmed
+        "manifest_written",
+        # non-terminal dispatch failure awaiting windowed redispatch (#461);
+        # omitting it here would let the normalization sweep strip the status
+        # and re-expose the issue as a fresh dispatch candidate past the cap
+        "dispatch_failed",
+        "reviewing",
+        "rework_requested",
+        "approved",
+        "blocked",
+        "escalated",
+        "closed",
+    }
+)
+
+# The status the normal dispatch -> PR-open flow writes once a PR exists (for
+# an issue) or a fresh review packet has been generated (for a PR) and no
+# reviewer verdict has landed yet -- see workflow.py's
+# dispatched/rework_requested -> "reviewing" transitions (e.g. the
+# orphaned-worker-routed-to-review and rework-already-pushed recovery paths)
+# and the PR-level "reviewing" status ``review()`` writes alongside its
+# ``review_started`` label transition. reconcile.py's self-heal and
+# status-normalization sweep reuse this same passive placeholder for both
+# issue and PR records so a drift-repair pass never resurrects an issue into
+# "rework_requested" -- which would trigger a fresh worker dispatch -- purely
+# by fixing a label or a corrupt status field.
+PASSIVE_OPEN_STATUS = "reviewing"
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,10 +208,12 @@ def _canonical_started_at(started_at: Any, process_start_time: Any | None = None
     )
 
 
-def is_claim_stale(claim_timestamp: str | None) -> bool:
+def is_claim_stale(
+    claim_timestamp: str | None, *, timeout_minutes: int = _STALE_CLAIM_TIMEOUT_MINUTES
+) -> bool:
     """Check if a dispatch_pending claim is stale and should be re-dispatchable.
 
-    A claim is stale if it's older than _STALE_CLAIM_TIMEOUT_MINUTES.
+    A claim is stale if it's older than ``timeout_minutes``.
     This prevents crashed phase-2 processes from wedging issues permanently.
     """
     if not claim_timestamp:
@@ -159,7 +221,7 @@ def is_claim_stale(claim_timestamp: str | None) -> bool:
     try:
         claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
         age = datetime.now(UTC) - claim_time
-        return age > timedelta(minutes=_STALE_CLAIM_TIMEOUT_MINUTES)
+        return age > timedelta(minutes=timeout_minutes)
     except (ValueError, TypeError):
         # Malformed timestamp — treat as stale to be safe
         return True
@@ -467,6 +529,9 @@ def append_event(
     kind: str,
     payload: dict[str, Any],
     max_size: int | None = None,
+    *,
+    state_path: Path | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Return a new state dict with the event appended; do not mutate ``data``.
 
@@ -474,6 +539,12 @@ def append_event(
     OrchestratorApp sets from ``RuntimeConfig.event_ring_size`` at startup.
     Callers (including tests) may pass an explicit cap to pin the truncation
     behavior they are validating.
+
+    When ``state_path`` is provided, the event is also written to the
+    unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
+    This dual-write preserves the complete audit history beyond the bounded
+    convenience cap in ``state.json``'s ``events`` array. The write is
+    best-effort — instrumentation never breaks the core workflow.
     """
     if max_size is None:
         max_size = EVENT_RING_SIZE
@@ -481,6 +552,10 @@ def append_event(
     events.append({"at": utc_now(), "kind": kind, "payload": payload})
     if len(events) > max_size:
         events = events[-max_size:]
+    if state_path is not None:
+        from .instrumentation import log_event
+
+        log_event(state_path, kind, payload, repo=repo)
     return {**data, "events": events}
 
 

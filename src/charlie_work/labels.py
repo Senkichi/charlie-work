@@ -8,11 +8,14 @@ the workflow was how stalled label states happened in production.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
 from .config import LabelConfig
 from .github import GitHub
+
+logger = logging.getLogger(__name__)
 
 
 class TransitionOutcome(Enum):
@@ -65,19 +68,33 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         "blocked": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
         # Issue #427: finalization must also drop the ready marker; a closed
         # issue with a stale automated-ready label pollutes roll-call/metrics.
+        # Issue #496: merge-hold is a transient operator signal, not a workflow
+        # state, so it is not in ``workflow_labels`` and must be stripped
+        # explicitly here. Non-terminal transitions preserve it.
         "merged": (
             (labels.done,),
-            _compute_remove((labels.done,), extra_remove=(labels.ready,)),
+            _compute_remove((labels.done,), extra_remove=(labels.ready, labels.merge_hold)),
         ),
         # Issue #429: a closed ready issue with no merged PR binding it is stale
         # (e.g. human-closed not-planned/duplicate). Strip the ready marker and
         # any active labels so it drops out of future --state all fetches.
+        # Issue #496: the merge-hold label is also transient and must not persist
+        # on a closed issue.
         "closed_unmerged": (
             (),
-            tuple(sorted(labels.active | {labels.ready})),
+            tuple(sorted(labels.active | {labels.ready, labels.merge_hold})),
         ),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
+        # Operator re-arm (`charlie unescalate`) for an issue whose PR is
+        # still open: drop human-needed (and any other stale workflow state)
+        # and return to the passive pr-open state pending a fresh review.
+        "unescalated_pr_open": ((labels.pr_open,), _compute_remove((labels.pr_open,))),
+        # Operator re-arm with no live PR: strip every workflow label back to
+        # bare automated-ready so dispatch treats the issue as fresh. Never
+        # adds queued — queued is an ACTIVE label and would exclude the issue
+        # from dispatch, the exact trap this edge exists to avoid.
+        "unescalated_requeued": ((), tuple(sorted(labels.workflow_labels))),
         # Issue #203: a merged PR only *mentions* the issue in free text, with
         # no hijack-safe branch/closing-keyword binding. That never authorizes
         # a close — flag it for a human decision instead, same label as any
@@ -103,7 +120,27 @@ def transition(gh: GitHub, labels: LabelConfig, issue_number: int, event: str) -
             remove_failures.append((issue_number, label))
 
     if not add and not remove:
+        logger.info(
+            "label_transition issue=%d event=%s outcome=nothing_changed",
+            issue_number,
+            event,
+        )
         return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
     if add_failures or remove_failures:
+        logger.warning(
+            "label_transition issue=%d event=%s outcome=partial_failure "
+            "add_failures=%s remove_failures=%s",
+            issue_number,
+            event,
+            add_failures,
+            remove_failures,
+        )
         return TransitionResult(TransitionOutcome.PARTIAL_FAILURE, add_failures, remove_failures)
+    logger.info(
+        "label_transition issue=%d event=%s outcome=applied add=%s remove=%s",
+        issue_number,
+        event,
+        add,
+        remove,
+    )
     return TransitionResult(TransitionOutcome.APPLIED, [], [])

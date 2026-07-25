@@ -262,6 +262,118 @@ def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
         load_config(config_file)
 
 
+def test_load_config_runtime_throttle_resume_margin_default() -> None:
+    """RuntimeConfig.throttle_resume_margin_s defaults to 90 seconds."""
+    from charlie_work.config import RuntimeConfig
+
+    config = RuntimeConfig()
+    assert config.throttle_resume_margin_s == 90
+
+
+def test_load_config_runtime_throttle_resume_margin_override(tmp_path: Path) -> None:
+    """runtime.throttle_resume_margin_s is read from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: 120
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.throttle_resume_margin_s == 120
+
+
+def test_load_config_runtime_throttle_resume_margin_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """runtime.throttle_resume_margin_s must be an int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: "90"
+""",
+    )
+    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_runtime_throttle_resume_margin_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    """runtime.throttle_resume_margin_s must be >= 0."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  throttle_resume_margin_s: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_readiness_no_ci_minutes_rejects_bool_true(tmp_path: Path) -> None:
+    """Issue #474: YAML boolean true is not a valid integer timeout."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """auto_merge:
+  readiness_no_ci_minutes: true
+""",
+    )
+    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_readiness_no_ci_minutes_rejects_bool_false(tmp_path: Path) -> None:
+    """Issue #474: YAML boolean false silently disables the gate if treated as 0."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """auto_merge:
+  readiness_no_ci_minutes: false
+""",
+    )
+    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_readiness_no_ci_minutes_rejects_negative(tmp_path: Path) -> None:
+    """Issue #474: negative timeout is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """auto_merge:
+  readiness_no_ci_minutes: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_readiness_no_ci_minutes_accepts_valid_int(tmp_path: Path) -> None:
+    """Issue #474: zero disables the gate; positive integers enable it."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """auto_merge:
+  readiness_no_ci_minutes: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.readiness_no_ci_minutes == 0
+
+    _write_config(
+        config_file,
+        """auto_merge:
+  readiness_no_ci_minutes: 30
+""",
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.readiness_no_ci_minutes == 30
+
+
 def test_api_worker_config_defaults() -> None:
     """An absent api_worker section yields safe defaults and no behavior change."""
     config = load_config()
