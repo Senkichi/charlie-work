@@ -381,6 +381,14 @@ def detect_drift(
                                 fallback_kind="launch_stalled",
                                 config=config,
                             )
+                        elif w.adapter_kind == "api":
+                            update_worker_record_with_failure_classification(
+                                sessions_dir,
+                                w.issue_number,
+                                fallback_kind="launch_stalled",
+                                config=config,
+                                adapter_kind="api",
+                            )
 
                         # Kill the process tree to free the slot
                         if w.pid is not None:
@@ -474,6 +482,16 @@ def detect_drift(
                                     config=config,
                                 )
                             )
+                        elif w.adapter_kind == "api":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind="unpublished_work",
+                                    config=config,
+                                    adapter_kind="api",
+                                )
+                            )
                         else:
                             failure_kind, throttled_until = None, None
                         # Diagnostic post-mortem; its worker_blocked verdict is ignored
@@ -500,6 +518,16 @@ def detect_drift(
                                     w.issue_number,
                                     fallback_kind=fallback_kind,
                                     config=config,
+                                )
+                            )
+                        elif w.adapter_kind == "api":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind=fallback_kind,
+                                    config=config,
+                                    adapter_kind="api",
                                 )
                             )
                         else:

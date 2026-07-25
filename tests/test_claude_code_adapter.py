@@ -3522,3 +3522,264 @@ def test_claude_worker_record_from_dict_defaults_legacy_keys() -> None:
 
     assert record.adapter_kind == "claude-code"
     assert record.provider == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue #484: provider-auth classification for api workers
+# ---------------------------------------------------------------------------
+
+
+def test_classify_session_failure_provider_auth_401(tmp_path: Path) -> None:
+    """Issue #484: a 401 error in an api session log classifies as provider_auth."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\nError: 401 Unauthorized. Invalid API key.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_auth"
+    assert throttled_until is not None
+    assert "T" in throttled_until
+    assert "Z" in throttled_until
+
+
+def test_classify_session_failure_provider_auth_403(tmp_path: Path) -> None:
+    """Issue #484: a 403 error in an api session log classifies as provider_auth."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\nError: 403 Forbidden. Authentication failed.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_auth"
+    assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_auth_invalid_key(tmp_path: Path) -> None:
+    """Issue #484: an invalid-api-key error classifies as provider_auth."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\nError: invalid api key provided. Please check your configuration.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_auth"
+    assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_auth_not_for_claude_code(
+    tmp_path: Path,
+) -> None:
+    """Issue #484: auth patterns must NOT fire for claude-code sessions (only api)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\nError: 401 Unauthorized. Invalid API key.\n",
+        encoding="utf-8",
+    )
+
+    # Default adapter_kind="claude-code" — auth patterns are not checked.
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_throttle_not_misclassified_as_auth(
+    tmp_path: Path,
+) -> None:
+    """Issue #484: a generic throttle log still classifies as rate_limited, not
+    provider_auth, even for api sessions."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_auth_cooldown_24h(tmp_path: Path) -> None:
+    """Issue #484: provider_auth cooldown reuses the 24h quota-exhaustion constant."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text("Error: 401 Unauthorized\n", encoding="utf-8")
+
+    now = datetime.now(UTC)
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_auth"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = now + timedelta(hours=24)
+    # Allow a few seconds of slack for test execution time.
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_update_worker_record_api_provider_auth_classification(
+    tmp_path: Path,
+) -> None:
+    """Issue #484: update_worker_record_with_failure_classification with
+    adapter_kind='api' reads the api sidecar and classifies an auth failure."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.api.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+                "adapter_kind": "api",
+                "provider": "example",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text("Error: 403 Forbidden. Authentication failed.\n", encoding="utf-8")
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, adapter_kind="api"
+    )
+
+    assert failure_kind == "provider_auth"
+    assert throttled_until is not None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "provider_auth"
+
+
+def test_update_worker_record_api_sidecar_path_correct(tmp_path: Path) -> None:
+    """Issue #484: adapter_kind='api' reads issue-<n>.api.json, not .claude.json."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Write BOTH a claude-code and api sidecar for issue-42; the api call must
+    # read the api one.
+    claude_sidecar = sessions_dir / "issue-42.claude.json"
+    claude_sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    api_sidecar = sessions_dir / "issue-42.api.json"
+    api_sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text("Error: 401 Unauthorized\n", encoding="utf-8")
+
+    failure_kind, _ = update_worker_record_with_failure_classification(
+        sessions_dir, 42, adapter_kind="api"
+    )
+
+    assert failure_kind == "provider_auth"
+    # The api sidecar was updated; the claude-code sidecar was not.
+    api_updated = json.loads(api_sidecar.read_text(encoding="utf-8"))
+    assert api_updated["failure_kind"] == "provider_auth"
+    claude_updated = json.loads(claude_sidecar.read_text(encoding="utf-8"))
+    assert "failure_kind" not in claude_updated
+
+
+def test_classify_session_failure_provider_auth_numeric_substring_no_false_positive(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: the bare 401/403 codes are anchored with word
+    boundaries so a coincidental numeric substring in an unrelated log tail
+    (e.g. "error code 14013", "4034 files processed", "issue #4019") cannot
+    trip a false-positive 24h provider_auth cooldown. Every other pattern in
+    the file matches natural-language phrases; without \\b the bare codes were
+    the sole false-positive vector.
+    """
+    from charlie_work.claude_code import _classify_session_failure
+
+    # Each tail contains "401" or "403" only as a substring of a larger number,
+    # with no standalone HTTP status code and no auth-related phrasing.
+    false_positive_tails = [
+        "Processed 4034 files in 14013 ms.\n",
+        "Error code 14013: connection reset by peer.\n",
+        "Issue #4019 closed, PR #4032 merged.\n",
+        "Remaining tokens: 4019, cache hits: 4031.\n",
+    ]
+    for tail in false_positive_tails:
+        log_path = tmp_path / "session.claude.log"
+        log_path.write_text(tail, encoding="utf-8")
+
+        failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+        assert failure_kind is None, (
+            f"numeric substring falsely matched provider_auth for tail: {tail!r}"
+        )
+        assert throttled_until is None
+
+
+def test_classify_session_failure_provider_auth_word_boundary_still_matches(
+    tmp_path: Path,
+) -> None:
+    """Issue #484 review finding: word boundaries must not regress the real
+    matches — a standalone 401/403 (delimited by non-word characters: spaces,
+    punctuation, start/end of string) still classifies as provider_auth.
+    """
+    from charlie_work.claude_code import _classify_session_failure
+
+    real_auth_tails = [
+        "Error: 401 Unauthorized\n",
+        "HTTP 403 Forbidden\n",
+        "status=401, message=invalid key\n",
+        "401\n",
+        "code:403\n",
+    ]
+    for tail in real_auth_tails:
+        log_path = tmp_path / "session.claude.log"
+        log_path.write_text(tail, encoding="utf-8")
+
+        failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+        assert failure_kind == "provider_auth", (
+            f"real auth tail no longer matched for tail: {tail!r}"
+        )
+        assert throttled_until is not None
