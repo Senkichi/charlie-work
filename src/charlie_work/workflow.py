@@ -1416,9 +1416,20 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     A valid verdict must contain:
 
     - ``decision`` in ``{"approved", "request_changes", "blocked"}``
-    - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
-      non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
+    - ``summary`` as a non-empty string, for EVERY decision including
+      ``approved`` (issue #597), and not an unfilled ``<...>`` template
+      placeholder
     - ``required_changes`` is optional; if present it must be a list of strings
+
+    ``approved`` used to be exempt from the non-empty-summary rule, on the
+    reasoning that ``record_review`` only rejects empty summaries where a
+    reason is actionable. That exemption is what let a contentless approval
+    through: an approval with no stated reason is indistinguishable from a
+    reviewer that never formed an opinion, and approvals are the one decision
+    that leads directly to a merge. Requiring a reason costs a reviewer one
+    sentence; not requiring it cost ten unreviewed merges. A rejected verdict
+    is fail-safe here -- the caller records no verdict and the review is
+    retried, rather than merging on a verdict nobody stands behind.
 
     Returns the normalized verdict dict, or ``None`` if invalid.
     """
@@ -1432,7 +1443,12 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     summary = data.get("summary")
     if not isinstance(summary, str):
         return None
-    if decision in {"request_changes", "blocked"} and not summary.strip():
+    stripped_summary = summary.strip()
+    if not stripped_summary:
+        return None
+    # An unfilled template placeholder ("<concise summary of the review>") is
+    # prompt boilerplate that leaked into the verdict, never a real summary.
+    if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
         return None
 
     required_changes = data.get("required_changes")
@@ -1552,11 +1568,26 @@ def _parse_review_verdict_from_files(
     Reviewers sometimes write their review summary (verdict block included) to
     a Markdown file and merely *reference* it in final output instead of
     re-emitting the fenced JSON. Before counting a completed review as a
-    failed attempt, scan:
+    failed attempt, scan ``.md`` paths mentioned in the reviewer's decoded
+    output text, newest-mention-first.
 
-    1. ``.md`` paths mentioned in the reviewer's decoded output text,
-       newest-mention-first, then
-    2. ``*.md`` files in the PR's packet directory.
+    **Nothing inside ``packet_dir`` is ever a candidate (issue #597).** Review
+    sessions launch with a hard-pinned ``--permission-mode plan`` (see
+    ``claude_code._force_review_permission_mode``), so a reviewer cannot write
+    any file, anywhere — every file in the packet directory is authored by the
+    orchestrator itself. ``review-prompt.md`` is one of them, and it embeds an
+    example verdict block. Globbing ``packet_dir`` for ``*.md`` therefore did
+    not recover reviewer verdicts; it parsed the orchestrator's own
+    instructions and recorded whatever the example said. Because the example
+    read ``"decision": "approved"``, a reviewer that emitted no verdict had an
+    approval manufactured for it, which then took the merge label. Ten PRs
+    across two repos merged unreviewed that way. ``_extract_verdict_from_stream_json``
+    already guarded against this exact echo; this path was added later and
+    bypassed that guard.
+
+    ``packet_dir`` is still taken as a parameter because it defines the
+    exclusion zone: a reviewer that *mentions* a packet path in its prose must
+    not pull the prompt back in through the mention branch either.
 
     Every candidate is mtime-gated to the reviewer session's ``started_at``
     (minus slack): a stale review file from a previous round must never
@@ -1598,19 +1629,29 @@ def _parse_review_verdict_from_files(
                 seen.add(raw)
                 candidates.append(Path(raw).expanduser())
 
-    if packet_dir.is_dir():
-        for md_path in sorted(packet_dir.glob("*.md")):
-            key = str(md_path)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(md_path)
+    # Issue #597: the packet directory is orchestrator-authored territory (see
+    # this function's docstring). Never read anything inside it -- not via a
+    # glob, and not via a path the reviewer happened to mention in its prose.
+    try:
+        excluded_root = packet_dir.resolve()
+    except OSError:
+        excluded_root = packet_dir
+
+    def _inside_packet_dir(candidate: Path) -> bool:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        return resolved == excluded_root or excluded_root in resolved.parents
 
     # Stat-filter BEFORE capping: the cap bounds expensive file reads, and
     # spurious path-looking mentions in the reviewer's text (nonexistent,
-    # stale, oversized) must not starve the trusted packet-dir candidates
-    # out of the read budget.
+    # stale, oversized) must not starve genuine candidates out of the read
+    # budget.
     readable: list[Path] = []
     for candidate in candidates:
+        if _inside_packet_dir(candidate):
+            continue
         try:
             stat = candidate.stat()
         except OSError:
