@@ -26697,6 +26697,122 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     assert events[0]["payload"].get("salvage_failed") is True
 
 
+# ---------------------------------------------------------------------------
+# Issue #480: api-worker budget settlement wiring at the workflow reap sites
+# ---------------------------------------------------------------------------
+#
+# _classify_dead_sessions_and_update_throttle_state has two production
+# reap_sidecar call sites that wire ``api_config=config.api_worker,
+# state_dir=state_file.parent`` so an api worker's spend is settled into the
+# ledger before its sidecar is unlinked:
+#   - the launch-failure lane (~workflow.py:2497, pid=None + error set)
+#   - the confirmed-dead lane (~workflow.py:2652)
+# Neither had any test coverage. A wiring regression at either site would
+# silently disable budget tracking with no test failing. These two tests drive
+# the real classification lane and assert the ledger is populated.
+
+
+def test_classify_dead_sessions_dead_api_session_settles_budget_ledger(
+    tmp_path: Path,
+) -> None:
+    """Confirmed-dead api-worker session: the dead lane reaps and settles spend.
+
+    Covers the dead-session reap call site (~workflow.py:2652). A wiring
+    regression that drops ``api_config``/``state_dir`` from that call leaves
+    the sidecar reaped but the ledger empty — this assertion fails.
+    """
+    from _api_budget_fixtures import (
+        api_worker_config,
+        ledger_entries,
+        write_api_events,
+        write_api_sidecar,
+    )
+    from charlie_work.config import PostMortemConfig
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    write_api_sidecar(sessions_dir, 42, provider="example")
+    write_api_events(sessions_dir, 42)
+
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 42,
+            "title": "Test issue",
+            "url": "https://example.test/issues/42",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    sessions = ledger_entries(state_file.parent)
+    assert len(sessions) == 1, "dead api session must settle into the ledger"
+    entry = sessions[0]
+    assert entry.issue == 42
+    assert entry.provider == "example"
+    assert entry.model == "example-model"
+    # 1M*3 + 0.2M*15 + 0.5M*0.30 = 6.15
+    assert entry.usd == pytest.approx(6.15)
+
+
+def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
+    tmp_path: Path,
+) -> None:
+    """Launch-failed api-worker sidecar: the launch-failure lane settles spend.
+
+    Covers the launch-failure reap call site (~workflow.py:2497), which fires
+    for a sidecar with ``pid is None`` and a non-null ``error``. A wiring
+    regression that drops the api kwargs from that call leaves the ledger
+    empty — this assertion fails.
+    """
+    from _api_budget_fixtures import (
+        api_worker_config,
+        ledger_entries,
+        write_api_events,
+        write_api_sidecar,
+    )
+    from charlie_work.config import PostMortemConfig
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    write_api_sidecar(sessions_dir, 43, provider="example", error="launch failed", pid=None)
+    write_api_events(sessions_dir, 43)
+
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 43,
+            "title": "Test issue",
+            "url": "https://example.test/issues/43",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    sessions = ledger_entries(state_file.parent)
+    assert len(sessions) == 1, "launch-failed api session must settle into the ledger"
+    entry = sessions[0]
+    assert entry.issue == 43
+    assert entry.provider == "example"
+    assert entry.usd == pytest.approx(6.15)
+
+
 def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) -> None:
     """Independent dispatch() calls across two repos sharing a fleet cap cannot
     over-dispatch. Without the fleet lock, both repos could read a stale live
