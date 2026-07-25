@@ -3126,6 +3126,45 @@ def test_launch_claude_worker_review_experiment_control_falls_back(tmp_path: Pat
     assert record.command[idx + 1] == "low"
 
 
+def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
+    tmp_path: Path,
+) -> None:
+    """When the caller (dispatch_reviews) already resolved the review_effort
+    experiment arm at claim time and passes it via resolved_review_effort,
+    launch_claude_worker must use that value directly rather than
+    re-resolving from config -- this is the single-computation-site
+    invariant: the claim-time resolution is authoritative, not a preview."""
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    # Config alone would resolve to "high" (fraction=1.0, review_effort=high),
+    # but the passed-through resolved_review_effort deliberately differs so
+    # the test can distinguish "used the passthrough" from "recomputed".
+    config = OrchestratorConfig(
+        claude_code=ClaudeCodeConfig(effort="low"),
+        review_dispatch=ReviewDispatchConfig(
+            review_effort="high", review_effort_experiment_fraction=1.0
+        ),
+    )
+
+    record = launch_claude_worker(
+        603,
+        "agent/issue-603-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        review=True,
+        head_sha=head_sha,
+        config=config,
+        resolved_review_effort="medium",
+    )
+
+    assert record.command.count("--effort") == 1
+    idx = record.command.index("--effort")
+    assert record.command[idx + 1] == "medium"
+
+
 def test_sanitize_review_command_template_strips_duplicate_space_form_flags() -> None:
     """Round-3 review (PR #397): a template with duplicate space-form
     `--permission-mode` flags must not let the trailing occurrence survive —

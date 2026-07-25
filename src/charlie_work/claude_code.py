@@ -810,6 +810,7 @@ def launch_claude_worker(
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
     provider: str = "",
+    resolved_review_effort: str | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -852,6 +853,16 @@ def launch_claude_worker(
     ``issue-<n>.claude.json``, ``api`` -> ``issue-<n>.api.json``). ``provider``
     is recorded on the sidecar but does not change the launch command in this
     issue; it is reserved for future adapter-specific command rendering.
+
+    ``resolved_review_effort``, when provided on a ``review=True`` launch, is
+    used verbatim as the ``--effort`` pin instead of re-deriving it via
+    ``resolve_review_effort``. Callers that already computed the
+    review_effort_experiment arm at claim time (e.g. ``dispatch_reviews``,
+    which persists the arm to state/telemetry before launching) should pass
+    it through here so there is exactly ONE computation of the arm on the
+    production path, rather than two calls to the same pure function that
+    merely agree by convention. When omitted (direct callers, unit tests),
+    the effort is resolved internally as a fallback.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -888,10 +899,17 @@ def launch_claude_worker(
     # effort (empty string means fall back to claude_code.effort), optionally
     # split into a per-PR randomized treatment/control experiment — see
     # resolve_review_effort. Worker (non-review) launches always use
-    # claude_code.effort unconditionally.
+    # claude_code.effort unconditionally. When the caller already resolved
+    # the arm at claim time (resolved_review_effort passed), use it directly
+    # so the arm is computed exactly once on the production path; only
+    # direct callers/tests that don't pass it fall back to resolving here.
     if review:
-        effort, _review_effort_arm_assigned = resolve_review_effort(
-            issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+        effort = (
+            resolved_review_effort
+            if resolved_review_effort is not None
+            else resolve_review_effort(
+                issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+            )[0]
         )
     else:
         effort = resolved_config.claude_code.effort

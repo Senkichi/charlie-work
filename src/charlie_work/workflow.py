@@ -6893,19 +6893,20 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             review_effort_assignments: list[dict[str, Any]] = []
+            # Single source of truth for the review_effort experiment arm:
+            # resolved ONCE here at claim time and threaded through to the
+            # launch call below via resolved_review_effort, so the launch
+            # uses exactly this value instead of re-deriving it (agreement
+            # by construction, not by convention).
+            resolved_review_efforts: dict[int, str] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
-                # Resolved (not launched) here, at claim time, so the arm is
-                # recorded on the PR's state entry and in the dispatch event
-                # even if the launch itself later fails/rolls back — the same
-                # pure function is re-evaluated inside launch_claude_worker
-                # for the actual --effort pin, so both call sites agree by
-                # construction (deterministic hash of pr_number/fraction/salt).
                 review_effort_used, review_effort_arm = resolve_review_effort(
                     pr_number, self.config.review_dispatch, self.config.claude_code
                 )
+                resolved_review_efforts[pr_number] = review_effort_used
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -7020,6 +7021,11 @@ class OrchestratorApp:
                     # benefit from the structured output because their verdict
                     # extraction depends on it.
                     "tee_stream_json": True,
+                    # The review_effort experiment arm was already resolved
+                    # once, above, at claim time (and persisted to state/
+                    # telemetry) -- pass it through so launch_claude_worker
+                    # uses this value directly instead of re-resolving it.
+                    "resolved_review_effort": resolved_review_efforts.get(pr_number),
                 }
 
                 record = launch_claude_worker(
