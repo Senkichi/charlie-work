@@ -73,6 +73,19 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern for provider authentication failures (issue #484). Matched against the
+# log tail of api-kind sessions only — a dead/invalid API key against a custom
+# Anthropic-compatible endpoint surfaces as 401/403 or an explicit
+# authentication/invalid-api-key error. Auth failures must NOT masquerade as
+# generic throttles: they are classified as ``provider_auth`` and enter the
+# existing ``throttled_until`` cooldown so routing preflight falls back until
+# the key is fixed (a dead key will not self-heal in minutes).
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"401|403|authentication(?:\s+failed)?|unauthorized|invalid[-\s]?api[-\s]?key|"
+    r"invalid[-\s]?authentication|permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
@@ -99,7 +112,9 @@ class ClaudeWorkerRecord:
     started_at: str
     log_path: str
     error: str | None = None
-    failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
+    failure_kind: str | None = (
+        None  # "rate_limited" | "quota_exhausted" | "provider_auth" | "budget_exceeded" | ...
+    )
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
@@ -486,11 +501,12 @@ def _classify_session_failure(
     throttle_error_markers: Sequence[str] | None = None,
     *,
     resume_margin_seconds: int = 0,
+    adapter_kind: str = "claude-code",
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | None
+    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" | None
     - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
@@ -499,6 +515,13 @@ def _classify_session_failure(
     reported reset (or fixed quota cooldown) time. Provider reset estimates are
     floors, not guarantees, and dispatching at T+0 races the actual reset
     (issue #499).
+
+    ``adapter_kind`` selects provider-auth classification (issue #484): when
+    ``"api"``, the log tail is also matched against 401/403/authentication
+    patterns. Auth failures are checked BEFORE throttle markers so a dead API
+    key does not masquerade as a generic throttle. On a ``provider_auth`` match,
+    the cooldown reuses the existing quota-exhaustion constant (24h) — a dead
+    key needs human intervention, not a 15-minute retry window.
     """
     if not log_path.exists():
         return None, None
@@ -510,6 +533,17 @@ def _classify_session_failure(
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Provider-auth classification (api only, issue #484). Checked before
+    # quota/throttle so an auth failure is never relabeled as a generic
+    # throttle. A dead API key reuses the quota-exhaustion cooldown (24h)
+    # rather than the short rate-limit cooldown — the key will not self-heal.
+    if adapter_kind == "api" and _PROVIDER_AUTH_PATTERN.search(tail):
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
+        throttled_until = datetime.now(UTC) + cooldown
+        return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
     # Check for quota exhaustion first (more severe)
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
@@ -1385,6 +1419,7 @@ def update_worker_record_with_failure_classification(
     *,
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
+    adapter_kind: str = "claude-code",
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1393,24 +1428,30 @@ def update_worker_record_with_failure_classification(
 
     Log-tail classification (``_classify_session_failure``) always runs first.
     If it detects a provider throttle signature (``rate_limited`` /
-    ``quota_exhausted``), that classification wins — including its computed
+    ``quota_exhausted``) or a provider-auth failure (``provider_auth``, api
+    only — issue #484), that classification wins — including its computed
     ``throttled_until`` cooldown — regardless of ``fallback_kind``. Only when
-    the log shows no throttle signature does ``fallback_kind`` apply (e.g. the
-    stall watchdog's "stalled" default, or the launch-stall watchdog's
-    "launch_stalled" default). This ordering matters: a worker that dies
-    because it hit a provider rate limit must be classified as such even when
-    the caller only knows "this looked stalled" — otherwise ``throttled_until``
-    never gets set and dispatch keeps relaunching workers into the same limit.
+    the log shows no throttle/auth signature does ``fallback_kind`` apply
+    (e.g. the stall watchdog's "stalled" default, or the launch-stall
+    watchdog's "launch_stalled" default). This ordering matters: a worker
+    that dies because it hit a provider rate limit or a dead API key must be
+    classified as such even when the caller only knows "this looked stalled"
+    — otherwise ``throttled_until`` never gets set and dispatch keeps
+    relaunching workers into the same limit.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
     are used instead of the defaults.
 
+    ``adapter_kind`` selects the sidecar filename suffix (``issue-<n>.api.json``
+    for ``"api"``) and enables provider-auth classification (issue #484).
+    Defaults to ``"claude-code"`` for backward compatibility.
+
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
-    when log-tail classification actually matched a throttle signature.
+    when log-tail classification actually matched a throttle/auth signature.
     """
-    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    sidecar_path = _sidecar_path(sessions_dir, issue_number, adapter_kind)
     if not sidecar_path.exists():
         return None, None
 
@@ -1441,6 +1482,7 @@ def update_worker_record_with_failure_classification(
             Path(log_path_str),
             throttle_markers,
             resume_margin_seconds=resume_margin_seconds,
+            adapter_kind=adapter_kind,
         )
 
     resolved_kind = classified_kind or fallback_kind

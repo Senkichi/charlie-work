@@ -910,6 +910,7 @@ def _detect_and_handle_stalled_sessions(
     from .post_mortem import classify_and_record
     from .worker import (
         _next_inconclusive_probe_deferred_count,
+        _api_session_over_budget,
         classify_worker_health,
         iter_workers,
         real_activity_probe_for,
@@ -970,6 +971,67 @@ def _detect_and_handle_stalled_sessions(
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
         update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+
+        # Issue #484: in-flight api per-session budget kill. Independent of the
+        # STALLED/DEAD classification below — an api worker over its
+        # ``max_usd_per_session`` cap is killed immediately and sidecar-marked
+        # ``budget_exceeded``. The killed session then flows through the
+        # EXISTING dead-worker reconciliation on the next pass (with-PR ->
+        # review/rework; without-PR -> re-dispatch via select_adapter, whose
+        # preflight naturally decides api-again vs fallback). When the cap is
+        # 0/unset the check is entirely dormant. Non-api workers are never
+        # budget-evaluated. The kill uses the shared ``kill_process_tree``
+        # helper (no-console-window discipline on Windows, full process tree
+        # reaped) — not reimplemented here.
+        if w.adapter_kind == "api" and _api_session_over_budget(w, config):
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            orphan_pids_budget: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
+                for orphan in orphan_processes:
+                    _kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids_budget = [o["pid"] for o in orphan_processes]
+
+            # Set failure_kind="budget_exceeded" on the sidecar via the shared
+            # atomic-write helper. Written directly (not through
+            # update_worker_record_with_failure_classification) so the
+            # budget-exceeded verdict is not overridden by a coincidental
+            # throttle/auth log-tail match. The dead-session lane's
+            # classification call then short-circuits on the already-set
+            # failure_kind.
+            from .claude_code import _sidecar_path as _api_sidecar_path
+            from .claude_code import _write_json_atomic as _api_write_json_atomic
+
+            api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
+            try:
+                with api_sidecar.open("r", encoding="utf-8") as handle:
+                    api_payload = json.load(handle)
+                if isinstance(api_payload, dict):
+                    api_payload["failure_kind"] = "budget_exceeded"
+                    _api_write_json_atomic(api_sidecar, api_payload)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "session_budget_exceeded",
+                    {
+                        "issue_number": w.issue_number,
+                        "pid": w.pid,
+                        "process_start_time": w.process_start_time,
+                        "killed_pids": killed_pids,
+                        "orphan_pids": orphan_pids_budget if orphan_pids_budget else None,
+                        "provider": w.provider,
+                    },
+                    state_path=state_file,
+                )
+                save_state(state_file, state)
+
+            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
+            continue
 
         # If a stalled-looking worker is still within a previously stored rate-limit
         # defer window, skip it. The deadline is re-derived from the sidecar each pass.
@@ -1054,6 +1116,20 @@ def _detect_and_handle_stalled_sessions(
                         w.issue_number,
                         fallback_kind="stalled",
                         config=config,
+                    )
+                )
+            elif w.adapter_kind == "api":
+                # api sidecars share the claude-code classification helper but
+                # land as issue-<n>.api.json and get provider-auth classification
+                # (issue #484). adapter_kind="api" selects both the sidecar
+                # suffix and the auth-pattern check inside _classify_session_failure.
+                resolved_failure_kind, throttled_until = (
+                    update_worker_record_with_failure_classification(
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="stalled",
+                        config=config,
+                        adapter_kind="api",
                     )
                 )
 
@@ -3377,6 +3453,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     fallback_kind=failure_kind,
                     config=config,
                 )
+            elif w.adapter_kind == "api":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    adapter_kind="api",
+                )
             if failure_kind and throttled_until:
                 # A throttle-caused launch failure must persist its window just
                 # like the dead-session branch below — otherwise the governor
@@ -3541,6 +3625,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                         )
                     )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            adapter_kind="api",
+                        )
+                    )
                 else:
                     failure_kind, throttled_until = None, None
                 # Diagnostic post-mortem; its worker_blocked verdict is ignored
@@ -3565,6 +3659,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                        )
+                    )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            adapter_kind="api",
                         )
                     )
                 else:
