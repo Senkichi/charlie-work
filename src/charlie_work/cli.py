@@ -397,7 +397,11 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
         notify_config = getattr(global_config, "notify", None) if global_config else None
-        if notify_config is not None and getattr(notify_config, "enabled", False):
+        if (
+            deploy.alertable
+            and notify_config is not None
+            and getattr(notify_config, "enabled", False)
+        ):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
                 repo="fleet",

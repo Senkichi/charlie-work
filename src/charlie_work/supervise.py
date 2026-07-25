@@ -262,6 +262,25 @@ class SelfDeployResult:
     error: str | None = None
     venv_repaired: bool = False
     previewed: bool = False
+
+    @property
+    def alertable(self) -> bool:
+        """True when this failure warrants a durable, operator-facing alert.
+
+        A preview never qualifies, and callers must consult this rather than
+        ``ok`` before emitting a digest.  ``emit_digest``'s file sink mkdirs and
+        *appends* to ``digest.jsonl``, so alerting on a previewed failure is a
+        real persistent write performed by ``--dry-run`` -- and the entry it
+        writes is indistinguishable from a genuine self-deploy failure, so it
+        misleads the operator as well as mutating state.
+
+        Read failures are reachable under preview precisely because the preview
+        deliberately does not fetch: a stale or absent ``origin/main`` tracking
+        ref makes ``git rev-parse origin/main`` fail on a checkout where the real
+        self-deploy would have succeeded.
+        """
+        return not self.ok and not self.previewed
+
     """True when this was a ``dry_run`` preview and nothing was touched.
 
     Callers print ``message`` on a notable outcome, and the existing conditions for
@@ -435,12 +454,17 @@ def _self_deploy_preview(
     """
     head_res = run_command(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=timeout)
     if not head_res.ok:
+        # previewed=True on the failure paths too: the flag means "this result came
+        # from the preview", not "the preview succeeded". Leaving it False here let a
+        # dry run fall into the callers' `if not deploy.ok:` alert arm and append a
+        # real ERROR entry to the notify sink -- see SelfDeployResult.alertable.
         return SelfDeployResult(
             ok=False,
             pulled=False,
             changed=False,
             synced=False,
             error=head_res.error or head_res.stderr or "failed to read HEAD",
+            previewed=True,
         )
     head_sha = head_res.stdout.strip()
 
@@ -455,6 +479,7 @@ def _self_deploy_preview(
             synced=False,
             from_sha=head_sha,
             error=target_res.error or target_res.stderr or "failed to read origin/main",
+            previewed=True,
         )
     target_sha = target_res.stdout.strip()
 

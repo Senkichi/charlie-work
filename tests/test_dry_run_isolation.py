@@ -26,7 +26,7 @@ import pytest
 
 from charlie_work.cross_family import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
-from charlie_work.supervise import self_deploy
+from charlie_work.supervise import SelfDeployResult, self_deploy
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
 
@@ -208,6 +208,67 @@ def test_self_deploy_real_run_is_not_marked_previewed(tmp_path: Path) -> None:
     result = self_deploy(tmp_path, run_command=runner, dry_run=False)
 
     assert result.previewed is False
+
+
+@pytest.mark.parametrize(
+    ("responses", "label"),
+    [
+        ([RunResult(1, "", "fatal: not a git repository")], "HEAD"),
+        (
+            [RunResult(0, "abc123\n", ""), RunResult(1, "", "fatal: bad revision")],
+            "origin/main",
+        ),
+    ],
+)
+def test_self_deploy_preview_read_failure_is_not_alertable(
+    tmp_path: Path, responses: list[RunResult], label: str
+) -> None:
+    """A preview that cannot read a ref stays a preview, and raises no alert.
+
+    Both failure returns are genuinely reachable under ``--dry-run``: the preview
+    deliberately does not fetch, so an absent or stale ``origin/main`` tracking ref
+    fails ``rev-parse`` on a checkout where the real deploy would have succeeded.
+
+    Without ``previewed=True`` on these returns, the callers' ``if not deploy.ok:``
+    arm fires and appends an ERROR entry to the notify sink -- a real, persistent
+    write performed by a dry run, and one an operator cannot tell apart from a
+    genuine self-deploy failure.
+    """
+    runner, _commands = _make_fake_runner(responses)
+
+    result = self_deploy(tmp_path, run_command=runner, dry_run=True)
+
+    assert result.ok is False, f"the {label} read was supposed to fail"
+    assert result.previewed is True, "a preview failure is still a preview"
+    assert result.alertable is False, "a preview must never raise a durable alert"
+
+
+def test_real_self_deploy_failure_is_alertable() -> None:
+    """The positive half: a genuine failure must still reach the operator.
+
+    Without this, ``alertable`` could be hardcoded ``False`` -- silencing every real
+    self-deploy alarm -- and the negative tests above would all still pass.
+    """
+    genuine = SelfDeployResult(
+        ok=False,
+        pulled=False,
+        changed=False,
+        synced=False,
+        error="fatal: Not possible to fast-forward, aborting.",
+        previewed=False,
+    )
+
+    assert genuine.alertable is True
+
+
+def test_successful_preview_is_not_alertable() -> None:
+    """A preview that worked is not an alert either -- ``ok`` alone is not the test."""
+    assert (
+        SelfDeployResult(
+            ok=True, pulled=False, changed=False, synced=False, previewed=True
+        ).alertable
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
