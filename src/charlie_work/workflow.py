@@ -2705,6 +2705,20 @@ def _detect_and_handle_orphaned_workers(
         # packet. Only a real packet should flip this orphaned-but-dispatched
         # issue to "reviewing".
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # That is not a fresh packet -- the PR is dead, not transiently
+        # blocked -- so it must NOT flip this issue to "reviewing" (an
+        # ACTIVE_STATE_STATUS no reconcile rule clears while the GitHub
+        # issue itself stays open: issue_active_label_no_open_pr sees the
+        # closed PR still links to the issue, issue_active_label_with_open_pr
+        # sees no OPEN PR, and the unknown-status recompute sweep skips
+        # "reviewing" because it is a VALID_ISSUE_STATUSES member). The
+        # issue's disposition is left to the existing closed-unmerged
+        # issue-side handling (closed_unmerged_pr_active_labels). Neither
+        # the "reviewing" flip nor the transient-block drift fingerprint
+        # below applies to a permanently-dead PR.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(state_file):
             state = load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -2713,6 +2727,7 @@ def _detect_and_handle_orphaned_workers(
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
@@ -5971,7 +5986,15 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found.
+            was not found. Two ok=True returns carry NO packet and callers that
+            gate a status->"reviewing" flip on ``ok`` must additionally exclude
+            them via the data flags: ``routed_to_rework`` (the janitor-gate
+            conflict/no-op-rework route re-requests rework with no packet) and
+            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
+            converged to state status "closed" at the janitor gate -- the PR is
+            dead, not a fresh-packet candidate). See
+            ``_route_rework_candidate_to_review`` and the dead-worker orphan
+            sweep for the canonical gating pattern.
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
@@ -11863,6 +11886,17 @@ class OrchestratorApp:
         # ok=False janitor-block case already guards against (issue #339
         # finding 1, see this method's docstring).
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # The PR is dead, not a fresh-packet candidate, so flipping the issue
+        # to "reviewing" here would strand it in an ACTIVE_STATE_STATUS no
+        # reconcile rule clears while the GitHub issue stays open (the closed
+        # PR still links to the issue, so issue_active_label_no_open_pr does
+        # not fire; "reviewing" is a VALID_ISSUE_STATUSES member, so the
+        # unknown-status recompute sweep skips it). The issue stays
+        # rework_requested and the existing closed-unmerged issue-side
+        # handling (closed_unmerged_pr_active_labels) finalizes it.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -11871,6 +11905,7 @@ class OrchestratorApp:
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"
