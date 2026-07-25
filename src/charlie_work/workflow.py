@@ -87,6 +87,7 @@ from .worktree import (
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
+    _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
     clear_reviewer_quota,
@@ -1159,9 +1160,18 @@ def _is_review_dispatchable(
     if status == "review_dispatch_dispatched":
         if _reviewer_pid_alive(pr_state):
             return False
+        # Dead reviewer: the stalled-review sweep must disposition this claim
+        # first — it classifies throttle tails, counts probe failures, reaps
+        # the sidecar, and emits events; freeing here does none of that.
+        # Racing the sweep on the same 5-minute timeout measured later in the
+        # pass livelocked probes during closed quota windows (issue #571):
+        # each silent relaunch reset the clock just after the sweep looked,
+        # so backoff never engaged and a 429'd probe launched every pass.
+        # The longer backstop frees only true orphans the sweep cannot see
+        # (e.g. died before its sidecar was written).
         dispatched_at = pr_state.get("review_dispatched_at")
         return dispatched_at is None or is_claim_stale(
-            dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES
         )
 
     if status == "review_dispatch_failed":
