@@ -585,6 +585,281 @@ Operator discipline:
   `--version` checks — use them to confirm the CLI is reachable at all
   before burning a dispatch wave on a broken PATH.
 
+## API worker operations
+
+The `api` adapter is a third worker kind: the Claude Code CLI launched with
+provider environment injected so any **Anthropic-compatible** paid-API endpoint
+(Moonshot/Kimi K3, GLM, MiniMax, vLLM deployments, …) powers the session. The
+entire launch/supervision stack is reused — `api_worker.launch_api_worker`
+delegates to `claude_code.launch_claude_worker` with `adapter_kind="api"`, so
+sidecars land as `issue-<n>.api.json`, the watchdog/supervisor treats api
+workers like any other, and dead-worker reconciliation is unchanged. Routing is
+per-issue (not global per repo): reworks and `complexity:high` first-pass issues
+go to the api worker; everything else goes to the default adapter.
+
+Design reference: [docs/design/api-worker-adapter.md](design/api-worker-adapter.md).
+The config dataclasses are `ApiWorkerConfig`, `ApiProviderConfig`, and
+`ApiBudgetConfig` in `config.py`; the ledger is `api_budget.py`; routing is
+`routing.py`. This section is verified against those modules, not the design
+spec.
+
+### Enabling the api worker per repo
+
+The feature is **off by default** (`api_worker.enabled: false`). Enable it by
+adding an `api_worker:` section to your `orchestrator.config.yaml`. The full
+annotated schema, matching the shipped frozen dataclasses exactly:
+
+```yaml
+api_worker:
+  enabled: false                    # master switch; default false
+  provider: kimi-k3                 # active provider key (must exist in providers)
+  max_concurrent_sessions: 1        # live api workers allowed at once
+  providers:                        # registry; adding a provider is a config edit (see below)
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic   # Anthropic-compatible endpoint
+      api_key_env: MOONSHOT_API_KEY                  # NAME of the env var holding the key
+      model: kimi-k3                                 # pinned via ANTHROPIC_MODEL
+      input_usd_per_mtok: 3.0                        # > 0 required when enabled
+      output_usd_per_mtok: 15.0                      # > 0 required when enabled
+      cached_input_usd_per_mtok: 0.30                # >= 0; defaults to 0.0
+  budget:
+    max_usd_per_session: 0          # 0 = per-session cap UNSET (calibration window)
+    preflight_reserve_usd: 1.00     # headroom estimate while per-session cap is unset
+    max_usd_per_day: 5.00           # daily USD ceiling
+    lifetime_usd: 15.00             # lifetime USD ceiling (trial ceiling; raise post-trial)
+  fallback_adapter: devin-shell     # adapter used when an api preflight check fails
+  worker_template: worker_claude_code.md
+  rework_template: rework.md
+```
+
+**Where this section lives in the layered config.** Config is loaded by
+`global_config.load_layered_config`: a global layer at
+`<fleet_dir>/config.yaml` (Windows: `%LOCALAPPDATA%\charlie-work\config.yaml`;
+POSIX: `${XDG_STATE_HOME:-~/.local/state}/charlie-work/config.yaml`) supplies
+fleet-wide defaults, and the per-repo `orchestrator.config.yaml` overrides on
+any key present in both. The `api_worker` section is the **one section that is
+deep-merged** (so a per-repo override of, say, `budget.max_usd_per_session` or
+an added `providers` entry does not drop the global defaults). All other
+sections keep shallow-merge semantics (repo keys fully replace global keys).
+Put fleet-wide provider definitions and baseline caps in the global layer; put
+per-repo `enabled: true` and any cap overrides in the per-repo file.
+
+**The host environment variable.** The API key **value never lives in config** —
+only the *name* of the env var does (`api_key_env`). The host running charlie
+must export the env var named by the active provider's `api_key_env` (e.g.
+`$env:MOONSHOT_API_KEY = "<key>"` in PowerShell). `launch_api_worker` reads it
+via `os.environ.get(provider.api_key_env)`; a missing/empty var is an error
+*value* (a `ClaudeWorkerRecord` with `.error` set), never a raise. The token
+travels only in the child process env — it is never written to a sidecar, log,
+prompt, or command argv. `doctor`'s launched-sessions probe surfaces
+`provider-auth` and `budget-exceeded` failure kinds on dead sidecars.
+
+**Validation at config load** (`ApiWorkerConfig.__post_init__`): when
+`enabled: true`, `provider` must be a non-empty string naming a key in
+`providers`; the active provider's `api_key_env` must be non-empty; its
+`input_usd_per_mtok` and `output_usd_per_mtok` must be `> 0`; and
+`cached_input_usd_per_mtok` must be `>= 0`. Budget fields must be numbers `>= 0`.
+A misconfigured `api_worker` block fails fast at load — fix the config before
+re-running.
+
+### Adding a provider (config-only, no code changes)
+
+Any Anthropic-compatible endpoint is a new entry under `providers:` — set its
+`base_url`, `api_key_env`, `model`, and per-Mtok pricing, then point
+`provider:` at the new key. There are **no code changes**: the registry is read
+from config at load time and exposed as an immutable mapping on
+`ApiWorkerConfig.providers`. To switch the active provider, change `provider:`
+(and ensure the new key's `api_key_env` is exported on the host).
+
+**Explicit non-goal:** OpenAI-protocol-only endpoints are **not** supported.
+The harness is the Claude Code CLI, which speaks the Anthropic Messages API;
+providers must expose an Anthropic-compatible endpoint. Revisit only when a
+concretely wanted provider lacks one.
+
+Pricing fields drive the spend ledger (see Budget operations). Per-Mtok cost is
+`usd = tokens / 1_000_000 * usd_per_mtok` per token class: `input_tokens`
+(including `cache_creation_input_tokens`, billed at the input rate — there is no
+separate cache-write premium) at `input_usd_per_mtok`; `cache_read_input_tokens`
+at `cached_input_usd_per_mtok`; `output_tokens` at `output_usd_per_mtok`. Claude
+Code's self-reported dollar cost is **wrong** against non-Anthropic endpoints;
+token counts are correct, so the ledger derives USD from tokens × your pricing.
+
+### Calibration procedure (per-session cap ships UNSET)
+
+`budget.max_usd_per_session` ships at `0.0` **on purpose** — the in-flight
+enforcement code is live but dormant until you calibrate. Do not guess a cap;
+measure first:
+
+1. **Enable** the api worker (above) with `max_usd_per_session: 0`, conservative
+   `max_usd_per_day` and `lifetime_usd`, and `preflight_reserve_usd` set to a
+   headroom estimate (default `1.00`).
+2. **Route two issues through the api worker.** Reworks route to api
+   automatically (`policy:rework`); a first-pass issue routes to api when it
+   carries the `complexity:high` label (`policy:complexity`). Let both sessions
+   run to completion.
+3. **Read their ledger entries** in `.var/charlie-work/api-budget.json` under
+   `sessions`. Each entry records `issue`, `session_id`, `provider`, `model`,
+   `started_at`, `ended_at`, `input_tokens`, `output_tokens`, `cached_tokens`,
+   `usd`, `duration_s`, and `outcome`. Inspect with:
+   ```powershell
+   Get-Content .var\charlie-work\api-budget.json | ConvertFrom-Json | Select-Object -ExpandProperty sessions
+   ```
+4. **Keep reviewing subsequent sessions** — the first two are a sample, not a
+   distribution. Watch the `usd` and `duration_s` columns across several healthy
+   sessions.
+5. **Set `budget.max_usd_per_session`** from the observed cost distribution.
+   Starting guideline: **~1.5× the max `usd` of a healthy session**. Put the
+   override in the per-repo (or global) config and reload.
+
+**How daily/lifetime caps protect spend while the per-session cap is unset.**
+With `max_usd_per_session: 0`, the preflight still enforces `max_usd_per_day`
+and `lifetime_usd` every launch: a new api launch is refused when
+`spent_today + reserve > max_usd_per_day` or when lifetime spend has reached
+`lifetime_usd`, and routing falls back to `fallback_adapter` with
+`fallback:budget` (recorded in `adapter_history`). The `reserve` used for the
+daily headroom check is `max_usd_per_session` when set, otherwise
+`preflight_reserve_usd` — that is the conservative stand-in during the
+calibration window. So even with the per-session cap dormant, a runaway day or a
+blown lifetime ceiling still trips and diverts to the fallback adapter.
+
+### Budget operations
+
+**Ledger location and shape.** The ledger lives at
+`.var/charlie-work/api-budget.json` (`api_budget.LEDGER_FILENAME` joined to the
+state dir). Shape: `days` (UTC `YYYY-MM-DD` → `{input_tokens, output_tokens,
+cached_tokens, usd}` aggregate), `lifetime_usd` (running total), and `sessions`
+(per-session detail list). All writes are atomic (temp-file + `replace()`), and
+settlement is idempotent — re-settling the same session
+(`issue` + `started_at` + `session_id`) is a no-op, so a double reap never
+double-charges.
+
+**Reading the ledger:**
+```powershell
+Get-Content .var\charlie-work\api-budget.json | ConvertFrom-Json
+```
+Today's spend is `days[<UTC date>].usd`; lifetime is `lifetime_usd`;
+per-session detail is `sessions` (the calibration source).
+
+**What happens at daily/lifetime exhaustion.** Routing's api preflight
+(`routing._api_preflight`) runs before every api launch in order: `enabled` →
+`auth` → `budget` → `cooldown` → `concurrency`. When
+`spent_today + reserve > max_usd_per_day` **or** lifetime spend has reached
+`lifetime_usd`, the preflight returns `fallback:budget` and the issue is routed
+to `fallback_adapter` (default `devin-shell`) instead. The choice is appended to
+that issue's `adapter_history` in `state.json` as
+`{ts, kind, provider, reason}` with `reason: "fallback:budget"` (see Reading
+routing decisions). No api launch happens until headroom returns (a new UTC day
+for the daily cap; a raised `lifetime_usd` for the lifetime cap).
+
+**Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
+config (global or per-repo) and reload. There is no ledger reset — raising
+`lifetime_usd` above the current `lifetime_usd` immediately restores headroom.
+To start a fresh accounting period (e.g. a new billing month), the lifetime
+total is the cumulative sum of all settled sessions; you raise the ceiling, you
+do not zero the ledger.
+
+**Corrupt-ledger recovery.** `api_budget.load_ledger` never raises on a
+truncated or malformed `api-budget.json`. On a `JSONDecodeError`, `OSError`, or
+a wrong-typed field, the file is moved aside to a timestamped sibling
+`api-budget.json.corrupt-<UTC-timestamp>` (e.g.
+`api-budget.json.corrupt-20260725T020000Z`) and a fresh empty ledger is used
+for that run — the corrupt original is preserved on disk for forensics, and a
+loud `ERROR` log line names the quarantined path. After a quarantine, the
+ledger starts fresh (empty `days`/`sessions`, `lifetime_usd: 0`); GitHub labels
+and `state.json` are untouched. To recover: find the quarantined file
+(`Get-ChildItem .var\charlie-work\api-budget.json.corrupt-*`), extract any
+forensic value, and move it aside — do not delete it silently. Corruption is
+almost always a process kill mid-write; the atomic temp-file-then-`replace`
+write makes a torn final file rare, but does not protect a manually edited file.
+
+### Failure modes
+
+Two api-specific failure kinds, both surfaced as values on the sidecar
+(`failure_kind` field of `issue-<n>.api.json`) and never raised:
+
+**`budget_exceeded` (in-flight per-session cap).** When
+`budget.max_usd_per_session` is set (`> 0`), each supervision pass accumulates
+token usage from the live session's `events.jsonl` and computes USD via
+`api_budget.cost_usd` with the active provider's pricing
+(`worker._api_session_over_budget`). If cost exceeds the cap, the process tree
+is killed via the shared `kill_process_tree` helper (orphan processes swept
+too), the sidecar is marked `failure_kind: "budget_exceeded"` via an atomic
+write, and a `session_budget_exceeded` event is appended to `state.json`. The
+killed session then flows through the **existing** dead-worker reconciliation
+on the next pass: with-PR → review/rework; without-PR → re-dispatch via
+`routing.select_adapter`, whose preflight naturally decides api-again vs.
+fallback. When the cap is `0`/unset the check is entirely dormant (no cost
+computation beyond what settlement already does). Non-api workers are never
+budget-evaluated.
+
+**`provider_auth` (dead/invalid API key).** When an api session exits, its log
+tail is matched against 401/403/authentication/invalid-api-key patterns
+(`claude_code._PROVIDER_AUTH_PATTERN`, api-kind only, checked **before** generic
+throttle markers so a dead key is never mislabeled as a throttle). On a match,
+`failure_kind` is set to `provider_auth` and the provider enters a cooldown
+reusing the existing `throttled_until` state mechanism
+(`state.set_throttled_until`) with the quota-exhaustion constant — **24 hours**,
+not the 15-minute rate-limit window, because a dead key will not self-heal.
+While `throttled_until` is in the future, `routing._api_preflight` returns
+`fallback:cooldown` and the issue routes to `fallback_adapter`; the dispatch
+throttle gate also defers. Recovery:
+
+1. **Check the key env var** named by the active provider's `api_key_env` is
+   present and valid on the host (e.g. `$env:MOONSHOT_API_KEY` is set and the
+   key is not expired/revoked).
+2. Then either **let the 24h cooldown lapse** (`is_throttled` returns false once
+   `now >= throttled_until`) or **clear the throttle state** by setting
+   `throttled_until` to `null` in `.var/charlie-work/state.json` (atomic write —
+   never edit in place while a pass is running).
+
+`doctor` surfaces both failure kinds: its launched-sessions probe appends
+`provider-auth: <issues>` and `budget-exceeded: <issues>` fragments to the
+session-record summary when any dead sidecar carries those kinds.
+
+### Reading routing decisions
+
+Every routing decision is appended to that issue's `adapter_history` in
+`state.json` by `routing.record_adapter_choice`:
+
+```json
+{"ts": "2026-07-25T02:00:00Z", "kind": "api", "provider": "kimi-k3", "reason": "policy:rework"}
+```
+
+`kind` is the adapter name (`api`, `devin-shell`, `claude-code`, …). `provider`
+is the api provider key for `kind == "api"` and empty for non-api adapters.
+`reason` is either a `policy:*` string (a routing rule matched and preflight
+passed) or a `fallback:*` string (an api preflight check failed and the
+fallback adapter was chosen). The complete set, enumerated from
+`routing.select_adapter` / `routing._api_preflight`:
+
+**`policy:*` (api chosen, preflight passed):**
+
+| Reason | When |
+|---|---|
+| `policy:rework` | `rework=True` (rework dispatch). Evaluated first, so a rework issue carrying `complexity:high` still routes here. |
+| `policy:complexity` | First pass (`rework=False`) and the issue carries the `complexity:high` label (from `config.labels.complexity_high`, default `complexity:high` — a routing hint, **not** a workflow state label, so it never blocks dispatch selection). |
+| `policy:default` | No api candidate rule matched; the default adapter (`dispatch`-level) is used with no provider. |
+
+**`fallback:*` (api preflight failed → `fallback_adapter`):**
+
+| Reason | Failing check |
+|---|---|
+| `fallback:disabled` | `api_worker.enabled` is false. |
+| `fallback:auth` | The active provider's `api_key_env` env var is missing/empty on the host. |
+| `fallback:budget` | Daily headroom exhausted (`spent_today + reserve > max_usd_per_day`) **or** lifetime headroom exhausted (`lifetime_usd` reached). |
+| `fallback:cooldown` | Provider is in a throttle cooldown (`throttled_until` in the future — e.g. after a `provider_auth` or quota-exhaustion classification). |
+| `fallback:concurrency` | Live api session count (`adapter_kind == "api"`, alive) has reached `max_concurrent_sessions`. |
+
+Preflight checks run in the order above; the **first** failing check wins, so
+the recorded `fallback:*` reason identifies the single binding constraint. To
+inspect an issue's routing history:
+
+```powershell
+Get-Content .var\charlie-work\state.json | ConvertFrom-Json | Select-Object -ExpandProperty issues | ConvertTo-Json -Depth 4
+```
+
+and read `adapter_history` for the issue number.
+
 ## Needs-attention notification and detection latency
 
 charlie-work has no daemon — detection is strictly invocation-cadence-bound. A stalled session found on pass N is invisible until pass N+1 runs, and nothing runs it automatically unless you schedule it. The pluggable `notify` layer (configured under `notify:` in `orchestrator.config.yaml`) turns health transitions (STALLED / RUNAWAY / DEAD / escalated-to-human) into outbound signals an operator actually sees — webhook, desktop toast, shell command, or file.
