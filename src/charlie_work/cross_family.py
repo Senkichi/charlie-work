@@ -163,12 +163,19 @@ def run_cross_family_review(
     If ``dry_run`` is True, skip the subprocess and return a synthetic result.
     """
     if dry_run:
-        return _fail(
-            report_path,
-            model,
-            "DRY-RUN: cross-family review not executed",
-            partial="",
+        # Deliberately NOT routed through _fail(): that helper mkdirs and
+        # write_text()s an "(UNAVAILABLE)" stub to report_path, so previewing a PR
+        # that already has a real cross-family report would *destroy* it and leave a
+        # DRY-RUN placeholder in its place -- the report is keyed by PR, so the
+        # genuine review for that PR is gone. A dry-run branch that bails out by
+        # writing is not a dry run (issue #613). The result shape is unchanged
+        # (ok=False, same error text) so existing callers behave exactly as before.
+        return CrossFamilyResult(
+            ok=False,
+            report_path=str(report_path),
+            model=model,
             returncode=None,
+            error="DRY-RUN: cross-family review not executed",
         )
 
     # Check for staleness: if we're about to overwrite a report with a different head SHA,
@@ -176,7 +183,12 @@ def run_cross_family_review(
     if report_path.exists() and report_path.stat().st_size > 0:
         old_text = report_path.read_text(encoding="utf-8")
         old_head_sha = extract_head_ref_oid(old_text)
-        if old_head_sha and old_head_sha != head_ref_oid:
+        # head_ref_oid must be known to claim staleness: it is optional (spec reviews
+        # pass no PR head at all), and the warning below subscripts it, so without
+        # this term a caller that omits it hits TypeError on None[:12] -- in a
+        # function whose contract is "never raises". With no new head to compare
+        # against there is also nothing to call stale.
+        if old_head_sha and head_ref_oid and old_head_sha != head_ref_oid:
             # Check if the reports are byte-identical despite different head SHAs
             # This is a staleness signal (issue #156)
             old_body = extract_report_body(old_text)

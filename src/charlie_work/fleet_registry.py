@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
-from .fleet_paths import fleet_dir
+from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError
 from .paths import RuntimePaths
 from .state import save_state, state_lock
@@ -111,6 +111,11 @@ def touch_repo(
         return _load_registry(fleet_json_path)
 
     fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+
+    # Issue #624: a virtualized fleet dir forks a private copy on this write,
+    # so registering a repo would land where the fleet supervisor never reads.
+    # Warn before the write; never block it.
+    warn_fleet_dir_virtualization_on_write(fleet_json_path.parent, context="writing fleet.json")
 
     # Ensure fleet directory exists before locking
     fleet_json_path.parent.mkdir(parents=True, exist_ok=True)

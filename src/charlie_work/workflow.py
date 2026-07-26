@@ -1416,9 +1416,20 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     A valid verdict must contain:
 
     - ``decision`` in ``{"approved", "request_changes", "blocked"}``
-    - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
-      non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
+    - ``summary`` as a non-empty string, for EVERY decision including
+      ``approved`` (issue #597), and not an unfilled ``<...>`` template
+      placeholder
     - ``required_changes`` is optional; if present it must be a list of strings
+
+    ``approved`` used to be exempt from the non-empty-summary rule, on the
+    reasoning that ``record_review`` only rejects empty summaries where a
+    reason is actionable. That exemption is what let a contentless approval
+    through: an approval with no stated reason is indistinguishable from a
+    reviewer that never formed an opinion, and approvals are the one decision
+    that leads directly to a merge. Requiring a reason costs a reviewer one
+    sentence; not requiring it cost ten unreviewed merges. A rejected verdict
+    is fail-safe here -- the caller records no verdict and the review is
+    retried, rather than merging on a verdict nobody stands behind.
 
     Returns the normalized verdict dict, or ``None`` if invalid.
     """
@@ -1432,7 +1443,12 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     summary = data.get("summary")
     if not isinstance(summary, str):
         return None
-    if decision in {"request_changes", "blocked"} and not summary.strip():
+    stripped_summary = summary.strip()
+    if not stripped_summary:
+        return None
+    # An unfilled template placeholder ("<concise summary of the review>") is
+    # prompt boilerplate that leaked into the verdict, never a real summary.
+    if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
         return None
 
     required_changes = data.get("required_changes")
@@ -1552,11 +1568,26 @@ def _parse_review_verdict_from_files(
     Reviewers sometimes write their review summary (verdict block included) to
     a Markdown file and merely *reference* it in final output instead of
     re-emitting the fenced JSON. Before counting a completed review as a
-    failed attempt, scan:
+    failed attempt, scan ``.md`` paths mentioned in the reviewer's decoded
+    output text, newest-mention-first.
 
-    1. ``.md`` paths mentioned in the reviewer's decoded output text,
-       newest-mention-first, then
-    2. ``*.md`` files in the PR's packet directory.
+    **Nothing inside ``packet_dir`` is ever a candidate (issue #597).** Review
+    sessions launch with a hard-pinned ``--permission-mode plan`` (see
+    ``claude_code._force_review_permission_mode``), so a reviewer cannot write
+    any file, anywhere — every file in the packet directory is authored by the
+    orchestrator itself. ``review-prompt.md`` is one of them, and it embeds an
+    example verdict block. Globbing ``packet_dir`` for ``*.md`` therefore did
+    not recover reviewer verdicts; it parsed the orchestrator's own
+    instructions and recorded whatever the example said. Because the example
+    read ``"decision": "approved"``, a reviewer that emitted no verdict had an
+    approval manufactured for it, which then took the merge label. Ten PRs
+    across two repos merged unreviewed that way. ``_extract_verdict_from_stream_json``
+    already guarded against this exact echo; this path was added later and
+    bypassed that guard.
+
+    ``packet_dir`` is still taken as a parameter because it defines the
+    exclusion zone: a reviewer that *mentions* a packet path in its prose must
+    not pull the prompt back in through the mention branch either.
 
     Every candidate is mtime-gated to the reviewer session's ``started_at``
     (minus slack): a stale review file from a previous round must never
@@ -1598,19 +1629,29 @@ def _parse_review_verdict_from_files(
                 seen.add(raw)
                 candidates.append(Path(raw).expanduser())
 
-    if packet_dir.is_dir():
-        for md_path in sorted(packet_dir.glob("*.md")):
-            key = str(md_path)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(md_path)
+    # Issue #597: the packet directory is orchestrator-authored territory (see
+    # this function's docstring). Never read anything inside it -- not via a
+    # glob, and not via a path the reviewer happened to mention in its prose.
+    try:
+        excluded_root = packet_dir.resolve()
+    except OSError:
+        excluded_root = packet_dir
+
+    def _inside_packet_dir(candidate: Path) -> bool:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        return resolved == excluded_root or excluded_root in resolved.parents
 
     # Stat-filter BEFORE capping: the cap bounds expensive file reads, and
     # spurious path-looking mentions in the reviewer's text (nonexistent,
-    # stale, oversized) must not starve the trusted packet-dir candidates
-    # out of the read budget.
+    # stale, oversized) must not starve genuine candidates out of the read
+    # budget.
     readable: list[Path] = []
     for candidate in candidates:
+        if _inside_packet_dir(candidate):
+            continue
         try:
             stat = candidate.stat()
         except OSError:
@@ -1960,6 +2001,58 @@ def _detect_and_handle_stalled_reviews(
                 state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
                 throttle_backoff_applied = True
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+            # A session that exhausted its full turn budget did real
+            # PR-specific work -- its death is a PR-level outcome (the
+            # review didn't fit the budget) regardless of what killed the
+            # final API call. Only sessions that died WITHOUT such work
+            # qualify for the provider-throttle rollback. _reap_review_verdicts
+            # (which runs before this sweep) sets
+            # review_turn_limit_summary_posted on the pr-state when it
+            # extracted a turn-limit miss from this same dead session, and
+            # that flag is reset to False on every new claim -- so it is the
+            # single source of truth for "this dispatch lifecycle's session
+            # did substantial work then died". When it is set, still apply
+            # the global quota backoff (the throttle signal itself is real)
+            # but treat the death as a normal counted failure so the per-PR
+            # attempt cap can converge (issue #583: without this guard a PR
+            # whose reviews deterministically hit the turn cap got unlimited
+            # free retries whenever the account was near its limit, and the
+            # 3-attempt cap never fired).
+            if pr_state.get("review_turn_limit_summary_posted"):
+                state["prs"][pr_key] = {
+                    **pr_state,
+                    "number": w.issue_number,
+                    "review_dispatch_status": "review_dispatch_failed",
+                    "review_dispatch_failed_at": w.started_at,
+                    "review_dispatch_pending_at": None,
+                    "review_dispatched_at": None,
+                    "reviewer_pid": None,
+                    "reviewer_process_start_time": None,
+                }
+                state = append_event(
+                    state,
+                    "review_dispatch_stalled",
+                    {
+                        "pr_number": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                        "throttled_until": throttled_until,
+                    },
+                    state_path=state_file,
+                )
+                changed = True
+                stalled.append(
+                    {
+                        "pr": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                    }
+                )
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                w.reap_sidecar(reviews_dir)
+                continue
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
             # re-dispatchable once the quota gate clears -- mirroring the
@@ -2781,6 +2874,20 @@ def _detect_and_handle_orphaned_workers(
         # packet. Only a real packet should flip this orphaned-but-dispatched
         # issue to "reviewing".
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # That is not a fresh packet -- the PR is dead, not transiently
+        # blocked -- so it must NOT flip this issue to "reviewing" (an
+        # ACTIVE_STATE_STATUS no reconcile rule clears while the GitHub
+        # issue itself stays open: issue_active_label_no_open_pr sees the
+        # closed PR still links to the issue, issue_active_label_with_open_pr
+        # sees no OPEN PR, and the unknown-status recompute sweep skips
+        # "reviewing" because it is a VALID_ISSUE_STATUSES member). The
+        # issue's disposition is left to the existing closed-unmerged
+        # issue-side handling (closed_unmerged_pr_active_labels). Neither
+        # the "reviewing" flip nor the transient-block drift fingerprint
+        # below applies to a permanently-dead PR.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(state_file):
             state = load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -2789,6 +2896,7 @@ def _detect_and_handle_orphaned_workers(
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
@@ -4481,7 +4589,12 @@ class OrchestratorApp:
             from .runners import format_runner_pool_state, observe_runner_pool
 
             try:
-                pool_state = observe_runner_pool(self.gh, self.config.runner_scaling)
+                # No state_dir here, so nothing is written either way today --
+                # threaded anyway so the call site stays honest if one is ever
+                # added, and so the dry-run call-site guard stays a bright line.
+                pool_state = observe_runner_pool(
+                    self.gh, self.config.runner_scaling, dry_run=self.gh.dry_run
+                )
                 runners_data = format_runner_pool_state(pool_state)
             except Exception:
                 # Don't fail status() if runner observation fails
@@ -6118,7 +6231,15 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found.
+            was not found. Two ok=True returns carry NO packet and callers that
+            gate a status->"reviewing" flip on ``ok`` must additionally exclude
+            them via the data flags: ``routed_to_rework`` (the janitor-gate
+            conflict/no-op-rework route re-requests rework with no packet) and
+            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
+            converged to state status "closed" at the janitor gate -- the PR is
+            dead, not a fresh-packet candidate). See
+            ``_route_rework_candidate_to_review`` and the dead-worker orphan
+            sweep for the canonical gating pattern.
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
@@ -6183,6 +6304,44 @@ class OrchestratorApp:
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            # Issue #558: a PR that is CLOSED (unmerged) on GitHub is dead --
+            # every other janitor failure is moot. Converge the state PR
+            # entry to "closed" at this boundary (single-point-of-enforcement)
+            # so the janitor stops re-fetching and re-evaluating it every
+            # pass. The reconcile rule (closed_unmerged_pr_state_converged)
+            # is the idempotent backstop for entries the janitor gate never
+            # observes (e.g. a PR that closed between passes, or one never
+            # routed through review()). MERGED PRs are left to
+            # merged_outside_orchestrator's reconcile rule. The linked
+            # issue's disposition is left to the existing closed-unmerged
+            # issue-side handling.
+            if str(pr.get("state") or "").upper() == "CLOSED":
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    existing_pr_state = state["prs"].get(str(pr_number), {})
+                    if existing_pr_state.get("status") != "closed":
+                        state["prs"][str(pr_number)] = {
+                            **without_review_dispatch_claim(existing_pr_state),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "closed",
+                        }
+                        state = self._record_event(
+                            state,
+                            "closed_unmerged_pr_state_converged",
+                            {"pr_number": pr_number, "issue_number": issue_number},
+                        )
+                        save_state(self.paths.state_file, state)
+                return CommandResult(
+                    True,
+                    f"PR #{pr_number} is CLOSED (unmerged) on GitHub; "
+                    f"converged state status to 'closed'",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "closed_unmerged_converged": True,
+                    },
+                )
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
@@ -11180,7 +11339,37 @@ class OrchestratorApp:
         operator_claimed = operator_claimed_issues(state)
         operator_claimed_skipped: list[int] = []
 
-        # Find issues with rework_requested status
+        # Build the open-PR index BEFORE any per-issue gh.issue_view() fetch.
+        # pr_list() returns only OPEN PRs by contract (--state open), so an
+        # issue whose PR is closed-unmerged (or that never had one) is absent
+        # from pr_by_issue. Issue #558: without this ordering, the candidate
+        # scan below called gh.issue_view() for every rework_requested issue
+        # every pass -- including issues whose PR closed-unmerged between
+        # reconcile sweeps -- a permanent per-pass GitHub fetch with no
+        # terminal exit (the exact slow-cost-spiral shape #556/#558 exist to
+        # eliminate). Filtering by open PR first cuts the fetch to genuine
+        # candidates only. pr_list() is cached within a pass, so calling it
+        # here vs. later is the same GitHub call.
+        prs = self.gh.pr_list()
+        pr_by_issue: dict[int, dict[str, Any]] = {}
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None:
+                # If multiple PRs link to the same issue, keep the lowest PR number
+                if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                    pr_by_issue[issue_number]["number"]
+                ):
+                    pr_by_issue[issue_number] = pr
+
+        # Find issues with rework_requested status. Only fetch the full issue
+        # from GitHub for issues that actually have an open PR -- a
+        # rework_requested issue with no open PR is not a launch candidate
+        # (the PR was closed-unmerged or never existed), so the per-issue
+        # gh.issue_view fetch is skipped entirely.
         rework_issues = []
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
@@ -11190,6 +11379,11 @@ class OrchestratorApp:
                 # Issue #400: operator-claimed issues are not rework-dispatchable.
                 if issue_number in operator_claimed:
                     operator_claimed_skipped.append(issue_number)
+                    continue
+                # Issue #558: skip the gh.issue_view fetch for issues with no
+                # open PR -- not a rework candidate, and the fetch is the
+                # permanent per-pass cost this gate exists to eliminate.
+                if issue_number not in pr_by_issue:
                     continue
                 # Fetch the full issue from GitHub to get labels and other metadata
                 try:
@@ -11225,24 +11419,11 @@ class OrchestratorApp:
                     data,
                 )
 
-        # Filter to issues with open PRs
-        prs = self.gh.pr_list()
-        pr_by_issue = {}
-        for pr in prs:
-            issue_number = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=self.config.dispatch.branch_prefix,
-            )
-            if issue_number is not None:
-                # If multiple PRs link to the same issue, keep the lowest PR number
-                if issue_number not in pr_by_issue or int(pr["number"]) < int(
-                    pr_by_issue[issue_number]["number"]
-                ):
-                    pr_by_issue[issue_number] = pr
-
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
+        # rework_issues already contains only issues with an open PR (the
+        # fetch loop above skipped issues absent from pr_by_issue), so this
+        # filter is now a no-op kept for clarity/defense-in-depth.
         candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         # Issue #339: a rework worker relaunched onto a PR whose rework was
@@ -11972,6 +12153,17 @@ class OrchestratorApp:
         # ok=False janitor-block case already guards against (issue #339
         # finding 1, see this method's docstring).
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # The PR is dead, not a fresh-packet candidate, so flipping the issue
+        # to "reviewing" here would strand it in an ACTIVE_STATE_STATUS no
+        # reconcile rule clears while the GitHub issue stays open (the closed
+        # PR still links to the issue, so issue_active_label_no_open_pr does
+        # not fire; "reviewing" is a VALID_ISSUE_STATUSES member, so the
+        # unknown-status recompute sweep skips it). The issue stays
+        # rework_requested and the existing closed-unmerged issue-side
+        # handling (closed_unmerged_pr_active_labels) finalizes it.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -11980,6 +12172,7 @@ class OrchestratorApp:
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"

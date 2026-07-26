@@ -95,17 +95,21 @@ helps the rework pass trust the rest of the feedback.
 
 ## Decision output
 
-Write your review summary to a Markdown file, then emit your final verdict as a fenced JSON object. The orchestrator will extract this block from your final output and record the verdict.
+End your response with your final verdict as a fenced JSON block. The orchestrator extracts this block from your final output and records the verdict. This is the ONLY channel that records a decision.
+
+You are running in plan mode and cannot write files. That does not exempt you from emitting this block — the block is output, not a file write. Emit it directly in your final message. Do not stage it, do not describe it, and do not ask for permission to write it: a response without this block records no verdict at all, and the review is counted as a failure and retried.
+
+The block must have this exact shape, with `decision` replaced by exactly one of the three literal values:
 
 ```json
 {
-  "decision": "approved",
-  "summary": "<concise summary of the review>",
-  "required_changes": []
+  "decision": "approved" | "request_changes" | "blocked",
+  "summary": "one or two sentence explanation of the decision",
+  "required_changes": ["specific required change", "..."]
 }
 ```
 
-Use `"decision": "request_changes"` when rework is required. Use `"decision": "blocked"` when human input is needed. The `summary` must be non-empty for `request_changes` and `blocked`. `required_changes` is optional; when provided it must be a list of strings and will be persisted in the verdict file.
+The `summary` must be non-empty for every decision, including `approved` — an approval with no stated reason is indistinguishable from a reviewer that never ran. `required_changes` is optional; when provided it must be a list of strings and will be persisted in the verdict file. Use `request_changes` when rework is required, and `blocked` when human input is needed.
 
 Your summary must include:
 

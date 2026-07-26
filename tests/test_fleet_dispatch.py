@@ -1,21 +1,39 @@
 from __future__ import annotations
 
+import json as _json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig, RuntimeConfig, SupervisorConfig
+from charlie_work.config import (
+    OrchestratorConfig,
+    RunnerAllocationConfig,
+    RunnerScalingConfig,
+    RuntimeConfig,
+    SupervisorConfig,
+)
 from charlie_work.fleet_dispatch import (
+    ApiWorkerFleetReport,
     _build_fleet_attention_digest,
     _extract_attention_events,
     _is_fleet_pass_active,
+    _run_fleet_allocation_prologue,
     _select_repos,
+    compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
 )
 from charlie_work.fleet_registry import count_fleet_runners
+from charlie_work.runner_allocation import (
+    AllocationPlan,
+    SlotAction,
+    SlotChange,
+    SlotChangeResult,
+)
+from charlie_work.runner_allocation_pass import AllocationPassResult
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -1113,6 +1131,66 @@ def test_run_fleet_supervise_loops_until_max_passes(
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_logs_global_config_provenance(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The supervisor must record whether its global config layer was readable.
+
+    This is the half of the #590 diagnostic that has to survive at the default
+    log level: the loader's equivalent line is DEBUG, so on a real host this is
+    the only place the fact appears. A successfully-loaded config that reports
+    ``absent`` here is the silent-{} path in load_layered_config; one that
+    reports ``present`` means the section was lost downstream of the read. The
+    two demand opposite fixes, so neither reading may be missing.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    def provenance_lines() -> str:
+        return "\n".join(
+            r.getMessage()
+            for r in caplog.records
+            if "Fleet supervisor global config" in r.getMessage()
+        )
+
+    # No global config on this fleet dir: reported as absent, at INFO.
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(
+            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+        )
+    absent = provenance_lines()
+    assert absent, "the supervisor logged no global-config provenance at all"
+    assert str(tmp_path / "config.yaml") in absent, "the path must be named"
+    assert "absent" in absent, f"an absent global layer was not reported: {absent!r}"
+
+    # Same call with the layer in place: distinguishable, with its size.
+    caplog.clear()
+    (tmp_path / "config.yaml").write_text("dispatch: {}\n", encoding="utf-8")
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(
+            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+        )
+    present = provenance_lines()
+    assert "present" in present, f"a present global layer was not reported: {present!r}"
+    assert "absent" not in present, "a present layer must not read as absent"
+    assert "bytes=" in present, "the size distinguishes an empty layer from a populated one"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
 def test_run_fleet_supervise_respects_max_runtime(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
@@ -1788,3 +1866,833 @@ def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
     assert by_health["OK"].issue_number == 10
     assert by_health["ERROR"].last_log_line == "no parseable verdict"
     assert by_health["ERROR"].issue_number == 11
+
+
+# ---------------------------------------------------------------------------
+# api-worker fleet report (issue #483)
+# ---------------------------------------------------------------------------
+
+_API_WORKER_YAML = """\
+api_worker:
+  enabled: {enabled}
+  provider: kimi-k3
+  providers:
+    kimi-k3:
+      base_url: https://api.moonshot.ai/anthropic
+      api_key_env: MOONSHOT_API_KEY
+      model: kimi-k3
+      input_usd_per_mtok: 3.0
+      output_usd_per_mtok: 15.0
+      cached_input_usd_per_mtok: 0.30
+  budget:
+    max_usd_per_day: 5.0
+    lifetime_usd: 15.0
+"""
+
+_BASE_YAML = """\
+labels:
+  ready: automated-ready
+  queued: agent:queued
+  in_progress: agent:in-progress
+runtime:
+  state_dir: .var/charlie-work
+"""
+
+
+def _make_repo(tmp_path: Path, name: str, *, api_worker: str | None) -> Path:
+    """Create a repo dir with a config file. api_worker is the YAML snippet or None."""
+    repo = tmp_path / name
+    repo.mkdir(parents=True)
+    config = repo / "orchestrator.config.yaml"
+    content = _BASE_YAML
+    if api_worker is not None:
+        content += "\n" + api_worker
+    config.write_text(content, encoding="utf-8")
+    (repo / ".var" / "charlie-work").mkdir(parents=True)
+    return repo
+
+
+def _make_fleet_json(tmp_path: Path, fleet_dir: Path, repos: dict[str, dict[str, Any]]) -> None:
+    fleet_json = fleet_dir / "fleet.json"
+    fleet_json.parent.mkdir(parents=True, exist_ok=True)
+    registry = {"version": 1, "repos": repos}
+    fleet_json.write_text(_json.dumps(registry, indent=2), encoding="utf-8")
+
+
+def test_api_worker_fleet_report_no_repos_configured(tmp_path: Path) -> None:
+    """0 repos configured → report is None (line omitted entirely)."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        repo = _make_repo(tmp_path, f"repo{i}", api_worker=None)
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None
+
+
+def test_api_worker_fleet_report_partial_enablement(tmp_path: Path) -> None:
+    """1/4 enabled → report shows enabled 1/4 repos."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        enabled = i == 0  # Only repo0 enabled
+        repo = _make_repo(
+            tmp_path,
+            f"repo{i}",
+            api_worker=_API_WORKER_YAML.format(enabled="true" if enabled else "false"),
+        )
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 1
+    assert report.enabled_m == 4
+    assert report.provider == "kimi-k3"
+    assert report.live == 0
+    assert report.cap_usd == 15.0
+    line = report.format_line()
+    assert "enabled 1/4 repos" in line
+    assert "kimi-k3" in line
+    assert "$15.00" in line
+
+
+def test_api_worker_fleet_report_all_enabled(tmp_path: Path) -> None:
+    """4/4 enabled → report shows enabled 4/4 repos."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(4):
+        repo = _make_repo(tmp_path, f"repo{i}", api_worker=_API_WORKER_YAML.format(enabled="true"))
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 4
+    assert report.enabled_m == 4
+    line = report.format_line()
+    assert "enabled 4/4 repos" in line
+
+
+def test_api_worker_fleet_report_all_disabled_but_configured(tmp_path: Path) -> None:
+    """All configured but none enabled → line still renders (rollout insurance)."""
+    fleet_dir = tmp_path / "fleet"
+    repos_map = {}
+    for i in range(2):
+        repo = _make_repo(
+            tmp_path, f"repo{i}", api_worker=_API_WORKER_YAML.format(enabled="false")
+        )
+        repos_map[f"owner/repo{i}"] = {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.enabled_k == 0
+    assert report.enabled_m == 2
+    line = report.format_line()
+    assert "enabled 0/2 repos" in line
+
+
+def test_api_worker_fleet_report_line_format() -> None:
+    """The format_line method produces the exact required format."""
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=1.50,
+        lifetime_usd=7.25,
+        cap_usd=15.00,
+        live=2,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    line = report.format_line()
+    assert (
+        line == "api-worker: kimi-k3, $1.50 today / $7.25 lifetime of $15.00, "
+        "2 live, enabled 1/4 repos"
+    )
+
+
+def test_api_worker_fleet_report_to_dict() -> None:
+    """to_dict includes all fields plus the formatted line."""
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=0.0,
+        lifetime_usd=0.0,
+        cap_usd=15.0,
+        live=0,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    d = report.to_dict()
+    assert d["provider"] == "kimi-k3"
+    assert d["today_usd"] == 0.0
+    assert d["lifetime_usd"] == 0.0
+    assert d["cap_usd"] == 15.0
+    assert d["live"] == 0
+    assert d["enabled_k"] == 1
+    assert d["enabled_m"] == 4
+    assert "line" in d
+    assert "api-worker:" in d["line"]
+
+
+def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
+    """The report reads spend from the representative (enabled) repo's ledger."""
+    from datetime import UTC, datetime
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repo1 = _make_repo(tmp_path, "repo1", api_worker=_API_WORKER_YAML.format(enabled="false"))
+    state_dir0 = repo0 / ".var" / "charlie-work"
+
+    # Write a ledger with today's spend.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ledger_data = {
+        "days": {today: {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "usd": 2.25}},
+        "lifetime_usd": 8.75,
+        "sessions": [],
+    }
+    (state_dir0 / "api-budget.json").write_text(_json.dumps(ledger_data), encoding="utf-8")
+
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(state_dir0),
+        },
+        "owner/repo1": {
+            "repo_root": str(repo1),
+            "config_path": str(repo1 / "orchestrator.config.yaml"),
+            "state_dir": str(repo1 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.today_usd == 2.25
+    assert report.lifetime_usd == 8.75
+    line = report.format_line()
+    assert "$2.25 today" in line
+    assert "$8.75 lifetime" in line
+
+
+def test_api_worker_fleet_report_no_hardcoded_lists() -> None:
+    """The report line must not contain any hardcoded repo or provider names
+    beyond what is derived from the actual fleet config. This is a sanity
+    check that the format string uses only the report's own fields."""
+    report = ApiWorkerFleetReport(
+        provider="custom-provider",
+        today_usd=0.0,
+        lifetime_usd=0.0,
+        cap_usd=100.0,
+        live=0,
+        enabled_k=3,
+        enabled_m=7,
+    )
+    line = report.format_line()
+    # The provider name comes from the report field, not a hardcoded list.
+    assert "custom-provider" in line
+    assert "enabled 3/7 repos" in line
+    # No hardcoded provider names like "kimi-k3" or "moonshot" in the format.
+    assert "moonshot" not in line
+
+
+def test_compute_api_worker_fleet_report_uses_preloaded_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """preloaded_configs skips load_layered_config for those repos (no redundant reload).
+
+    Review finding: fleet_loop reloaded every repo's config each pass even
+    though it had already loaded the selected repos' configs for dispatch.
+    This test verifies the optimization: a repo present in preloaded_configs
+    reuses that config and load_layered_config is NOT called for it, while a
+    repo absent from the map still falls back to load_layered_config.
+    """
+    from charlie_work.global_config import load_layered_config as real_load
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repo1 = _make_repo(tmp_path, "repo1", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(repo0 / ".var" / "charlie-work"),
+        },
+        "owner/repo1": {
+            "repo_root": str(repo1),
+            "config_path": str(repo1 / "orchestrator.config.yaml"),
+            "state_dir": str(repo1 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Preload repo0's config exactly as fleet_loop would (raw layered config).
+    preloaded = {
+        "owner/repo0": real_load(repo0, repo0 / "orchestrator.config.yaml"),
+    }
+
+    calls: list[str] = []
+
+    def _spy(repo_root: Path, explicit: Path | None, *, fleet_dir_override: str | None = None):
+        calls.append(str(repo_root))
+        return real_load(repo_root, explicit, fleet_dir_override=fleet_dir_override)
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.load_layered_config", _spy)
+
+    report = compute_api_worker_fleet_report(
+        fleet_dir_override=str(fleet_dir), preloaded_configs=preloaded
+    )
+
+    assert report is not None
+    assert report.enabled_m == 2
+    assert report.enabled_k == 2
+    # load_layered_config called only for repo1 (repo0 was preloaded).
+    assert calls == [str(repo1)]
+
+
+def test_compute_api_worker_fleet_report_preloaded_overrides_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preloaded config wins over what disk would load for that repo_key.
+
+    This pins the contract: preloaded_configs is an override, not a hint. If
+    the caller passes a default (unconfigured) config for a repo whose disk
+    config has api_worker enabled, the report uses the preloaded view.
+    """
+    from charlie_work.config import ApiWorkerConfig, OrchestratorConfig as _OC
+    from charlie_work.global_config import load_layered_config as real_load
+
+    fleet_dir = tmp_path / "fleet"
+    repo0 = _make_repo(tmp_path, "repo0", api_worker=_API_WORKER_YAML.format(enabled="true"))
+    repos_map = {
+        "owner/repo0": {
+            "repo_root": str(repo0),
+            "config_path": str(repo0 / "orchestrator.config.yaml"),
+            "state_dir": str(repo0 / ".var" / "charlie-work"),
+        },
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Sanity: disk config has api_worker configured.
+    disk_config = real_load(repo0, repo0 / "orchestrator.config.yaml")
+    assert disk_config.api_worker != ApiWorkerConfig()
+
+    # Preload a default (unconfigured) config to prove override semantics.
+    preloaded = {"owner/repo0": _OC()}
+
+    report = compute_api_worker_fleet_report(
+        fleet_dir_override=str(fleet_dir), preloaded_configs=preloaded
+    )
+
+    # The preloaded default (unconfigured) wins → no repo configures the section.
+    assert report is None
+
+
+@patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_threads_api_worker_report_into_data(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_compute_report: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop places compute_api_worker_fleet_report's dict into CommandResult.data.
+
+    The standalone compute function is covered by the tests above; this
+    verifies the fleet_loop wiring (the api_worker_report key in the returned
+    CommandResult.data) so a silent breakage in the key-lookup path can't ship
+    undetected. An empty registry means no per-repo work runs.
+    """
+    mock_load_registry.return_value = {"repos": {}}
+    report = ApiWorkerFleetReport(
+        provider="kimi-k3",
+        today_usd=1.50,
+        lifetime_usd=7.25,
+        cap_usd=15.00,
+        live=2,
+        enabled_k=1,
+        enabled_m=4,
+    )
+    mock_compute_report.return_value = report
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+
+    assert result.ok is True
+    assert result.data["api_worker_report"] == report.to_dict()
+    assert result.data["api_worker_report"]["provider"] == "kimi-k3"
+    assert "line" in result.data["api_worker_report"]
+    # The compute function is called with the fleet_dir override and the
+    # configs fleet_loop already loaded this pass (no redundant reload).
+    mock_compute_report.assert_called_once_with(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        preloaded_configs={},
+    )
+
+
+@patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_api_worker_report_none_when_unconfigured(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_compute_report: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """fleet_loop sets api_worker_report to None when no repo configures the section."""
+    mock_load_registry.return_value = {"repos": {}}
+    mock_compute_report.return_value = None
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+
+    assert result.ok is True
+    assert result.data["api_worker_report"] is None
+
+
+# --------------------------------------------------------------------------
+# Runner-allocation prologue (the path the 5-minute fleet pass actually takes)
+# --------------------------------------------------------------------------
+
+
+def _allocation_config(**overrides: Any) -> OrchestratorConfig:
+    """A global config with the allocation section populated."""
+    return OrchestratorConfig(
+        runner_allocation=RunnerAllocationConfig(**overrides),
+        runner_scaling=RunnerScalingConfig(managed_root="C:/fallback-root"),
+    )
+
+
+def test_allocation_prologue_is_inert_when_disabled(tmp_path: Path) -> None:
+    """Default-off must mean off: no registry read, no gh client, no events."""
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass") as pass_mock:
+        events = _run_fleet_allocation_prologue(
+            str(tmp_path / "fleet"),
+            _allocation_config(enabled=False),
+            dry_run=False,
+        )
+
+    assert events == []
+    pass_mock.assert_not_called()
+
+
+def test_allocation_prologue_skips_when_no_repo_root_is_usable(tmp_path: Path) -> None:
+    """Without a real directory to anchor the gh client, skip rather than guess."""
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/gone": {"repo_root": str(tmp_path / "vanished"), "state_dir": ""}},
+    )
+
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass") as pass_mock:
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    # Visible, not silent: an unusable registry is nobody's deliberate choice,
+    # so it reaches the digest rather than only the log (issue #590).
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert "registry" in events[0]["reason"]
+    pass_mock.assert_not_called()
+
+
+def test_allocation_prologue_anchors_on_a_live_repo_and_passes_config_through(
+    tmp_path: Path,
+) -> None:
+    """The prologue's whole job: find an anchor, hand the pass its wiring."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        },
+    )
+
+    plan = AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=())
+    result = AllocationPassResult(ok=True, plan=plan, notes=("cw: pinned",))
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=result) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub") as gh_mock,
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir),
+            _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+            dry_run=True,
+        )
+
+    assert gh_mock.call_args.kwargs["repo_root"] == repo
+    kwargs = pass_mock.call_args.kwargs
+    assert kwargs["managed_root_fallback"] == "C:/fallback-root"
+    assert kwargs["fleet_dir_override"] == str(fleet_dir)
+    assert kwargs["state_path"] == repo / ".var" / "charlie-work" / "state.json"
+    assert kwargs["dry_run"] is True
+
+    # A note alone is enough to surface an event; a balanced host stays quiet.
+    assert [event["type"] for event in events] == ["runner_allocation"]
+    assert events[0]["budget"] == 8
+    assert events[0]["dry_run"] is True
+
+
+def test_allocation_prologue_stays_quiet_when_nothing_moves(tmp_path: Path) -> None:
+    """A balanced host must not add a line to every 5-minute digest."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+    balanced = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+    )
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=balanced),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert events == []
+
+
+def test_allocation_prologue_surfaces_errors_and_failed_slots(tmp_path: Path) -> None:
+    """Config typos and refused parks both have to reach the operator."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+
+    failed = AllocationPassResult(ok=False, error="managed_root does not exist: C:/nope")
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=failed),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+    assert [event["type"] for event in events] == ["runner_allocation_error"]
+    assert "does not exist" in events[0]["error"]
+
+    change = SlotChange(
+        repo="owner/anchor",
+        runner_name="cw-2",
+        path=tmp_path / "cw-2",
+        action=SlotAction.PARK,
+        reason="idle 3 passes",
+    )
+    with (
+        patch(
+            "charlie_work.fleet_dispatch.run_allocation_pass",
+            return_value=AllocationPassResult(
+                ok=True,
+                plan=AllocationPlan(
+                    budget=8, budget_reason="configured", targets=(), changes=(change,)
+                ),
+                results=(SlotChangeResult(change=change, ok=False, message="job in flight"),),
+            ),
+        ),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert [event["type"] for event in events] == ["runner_allocation_slot_error"]
+    assert events[0]["runner"] == "cw-2"
+    assert events[0]["action"] == "park"
+
+
+def test_allocation_prologue_warns_when_the_config_lacks_the_section(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """A config object without the section means code/config disagree.
+
+    That is a different failure from "the operator left it off" — it happens
+    when a load failure already fell back to defaults, or when the process is
+    holding a config built by other code — and it must not look like a
+    deliberate opt-out.
+    """
+    import logging
+
+    class _NoSection:
+        pass
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
+
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert "NoSection" in events[0]["reason"]
+    assert any("no runner_allocation" in record.message for record in caplog.records)
+
+
+def test_disabled_allocation_prologue_is_visible_at_info(tmp_path, caplog) -> None:
+    """The disabled branch must log at INFO, not DEBUG.
+
+    Regression guard for issue #590: the daemon runs at INFO, so a DEBUG line here
+    is never written at all, which made a host where allocation never ran
+    indistinguishable from a converged one. The message must also name the fleet
+    directory, since that identifies which config.yaml governs the decision.
+    """
+    import logging
+    from dataclasses import replace
+
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.fleet_dispatch import _run_fleet_allocation_prologue
+
+    base = OrchestratorConfig()
+    config = replace(base, runner_allocation=replace(base.runner_allocation, enabled=False))
+
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        events = _run_fleet_allocation_prologue(str(tmp_path), config, True)
+
+    assert events == []
+    assert "runner_allocation.enabled is false" in caplog.text
+    assert str(tmp_path) in caplog.text
+
+
+def test_allocation_prologue_logs_its_inputs_before_any_branch(tmp_path: Any, caplog: Any) -> None:
+    """The entry line must be unconditional.
+
+    Regression guard for the evidence gap that kept #590 unisolated: every skip
+    path used to log from *inside* a branch, so an absent log line was equally
+    consistent with "reached and declined" and "never reached". One line before
+    the first branch separates those two readings, which is the only thing that
+    distinguishes a misconfigured host from an unreached call site.
+    """
+    import logging
+
+    class _NoSection:
+        pass
+
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        _run_fleet_allocation_prologue(str(tmp_path / "fleet"), _NoSection(), False)
+
+    # Logged even in the most degenerate case, where there is no section to read.
+    assert "prologue: entered" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        _run_fleet_allocation_prologue(
+            str(tmp_path / "fleet"),
+            _allocation_config(enabled=False, managed_root="C:/actions-runners", **{}),
+            False,
+        )
+
+    assert "prologue: entered" in caplog.text
+    assert "enabled=False" in caplog.text
+    assert "C:/actions-runners" in caplog.text
+
+
+def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
+    """An unmapped event type must not vanish.
+
+    The mapper was an if/elif chain with no else, so the prologue's own
+    ``runner_allocation_error`` was emitted correctly and then dropped on the
+    floor — the digest could not show the one signal that mattered for #590.
+    """
+    events = [
+        {"repo_key": "fleet", "type": "runner_allocation_error", "error": "managed_root missing"},
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_skipped",
+            "reason": "no usable repo root",
+        },
+    ]
+
+    digest = _build_fleet_attention_digest(events)
+
+    assert len(digest.transitions) == 2
+    rendered = {entry.health: entry.last_log_line for entry in digest.transitions}
+    assert rendered["ERROR"] == "managed_root missing"
+    assert rendered["INFO"] == "no usable repo root"
+
+
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_actually_reaches_the_allocation_pass(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Pin the wiring, not just the pieces.
+
+    Every prologue test calls ``_run_fleet_allocation_prologue`` directly and
+    every ``run_fleet_supervise`` test patches ``fleet_loop`` out, so nothing
+    asserted that a real fleet pass reaches allocation at all. This drives
+    ``fleet_loop`` unmocked and patches only one level below the prologue.
+
+    Scope, so this does not misdirect the next triage: it covers ``fleet_loop``
+    only. ``run_fleet_supervise``'s own ``load_layered_config(Path.cwd(), ...)``
+    and the HEAD-drift and self-deploy steps that run *before* ``fleet_loop`` are
+    still unexercised, and #590 could live in any of them.
+    """
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=(),
+    )
+
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=_allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    from charlie_work.runner_slots import UNATTENDED_ALLOCATION_SOURCE
+
+    mock_run_allocation_pass.assert_called_once()
+    assert mock_run_allocation_pass.call_args.kwargs["dry_run"] is False
+    # The daemon must identify itself as the unattended writer: the doctor probe
+    # accepts only this value as evidence that allocation runs without an operator.
+    assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE
+
+
+def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
+    """A healthy rebalance must not put an entry in every 5-minute digest.
+
+    The prologue emits `runner_allocation` when anything moved OR any note was
+    produced, and the notes include standing advisory conditions that persist as long
+    as the condition does. Verified against this host's events.db: every recorded pass
+    carried such a note while moving zero slots. So routing this event through the
+    generic fallback would render a near-identical attention entry on every pass.
+
+    Precise about what this does and does not assert. It pins the *entry*: none is
+    rendered for a converged pass. It does not assert the digest sink stays untouched,
+    because the envelope is emitted every pass either way -- `fleet_loop`'s notify gate
+    tests the raw event list rather than the built digest, so `emit_digest` is called
+    with `transitions=()` on a converged pass. That gate/digest mismatch predates this
+    PR (unchanged since #591) and is tracked separately in issue #610; it is not
+    something this branch introduced or fixes.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    converged = [
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation",
+            "started": 0,
+            "parked": 0,
+            "budget": 8,
+            "notes": ["Senkichi/job-cannon: holding 4 surplus slot(s) - slack for 0/3 pass(es)"],
+            "dry_run": False,
+        }
+    ]
+    digest = _build_fleet_attention_digest(converged)
+    assert digest.transitions == ()
+
+
+def test_digest_still_surfaces_allocation_failures() -> None:
+    """Dropping the success event must not also drop the errors and skips."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest
+
+    failures = [
+        {"repo_key": "fleet", "type": "runner_allocation_error", "error": "managed_root missing"},
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_slot_error",
+            "runner": "cw-2",
+            "action": "park",
+            "message": "still busy",
+        },
+        {"repo_key": "fleet", "type": "runner_allocation_skipped", "reason": "no registry anchor"},
+    ]
+    digest = _build_fleet_attention_digest(failures)
+    assert len(digest.transitions) == 3
+    healths = {e.health for e in digest.transitions}
+    # Both error types must reach the desktop-eligible severity set, not just the log.
+    assert "ERROR" in healths
+    reasons = " ".join(str(e.last_log_line) for e in digest.transitions)
+    assert "managed_root missing" in reasons
+    assert "no registry anchor" in reasons

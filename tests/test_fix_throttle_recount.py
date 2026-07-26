@@ -139,3 +139,112 @@ def test_wave_of_throttled_reviewers_is_one_backoff_increment(tmp_path: Path) ->
     # ... but the wave is ONE observation of ONE closed provider window:
     # exactly one backoff increment.
     assert state.get("reviewer_quota", {}).get("consecutive_probe_failures") == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #583: throttle-classified reviewer deaths that ALSO exhausted the turn
+# budget must NOT roll back the attempt counter.
+# ---------------------------------------------------------------------------
+
+
+def _seed_with_attempt(tmp_path: Path, pr_number: int, attempt_count: int):
+    """Seed state with a dispatched reviewer claim and a non-zero attempt count."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+            "review_dispatch_attempt_count": attempt_count,
+            # Set by _reap_review_verdicts (which runs before this sweep) when
+            # it extracted a turn-limit miss from this same dead session.
+            "review_turn_limit_summary_posted": True,
+        }
+        save_state(state_file, state)
+    return repo_root, reviews_dir, config, state_file
+
+
+def test_throttled_death_with_turn_limit_miss_counts_attempt(tmp_path: Path) -> None:
+    """Issue #583: a dead reviewer whose log tail matches a throttle signature
+    AND that produced a turn-limit miss (``review_turn_limit_summary_posted``
+    set on the pr-state by the verdict-reaper that runs before this sweep) did
+    real PR-specific work. Its death is a PR-level outcome, so the global quota
+    backoff must still be applied (the throttle signal is real) but the per-PR
+    attempt counter must NOT be rolled back -- otherwise a PR whose reviews
+    deterministically hit the turn cap gets unlimited free retries whenever the
+    account is near its limit and the 3-attempt cap can never fire.
+    """
+    repo_root, reviews_dir, config, state_file = _seed_with_attempt(tmp_path, 100, 1)
+    sidecar_path = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = load_state(state_file)
+
+    # The global quota backoff IS applied -- the throttle signal is real.
+    quota = state.get("reviewer_quota", {})
+    assert quota.get("consecutive_probe_failures") == 1
+    assert quota.get("throttled_until") is not None
+
+    # The attempt counter is NOT rolled back: this is a counted failure.
+    assert state["prs"]["100"].get("review_dispatch_attempt_count") == 1
+
+    # The claim is moved to review_dispatch_failed (a counted, terminal
+    # failure) -- NOT rolled back to None (which would make it immediately
+    # re-dispatchable and never converge).
+    assert state["prs"]["100"].get("review_dispatch_status") == "review_dispatch_failed"
+
+    # The dead session's sidecar is reaped so it cannot resurrect as a phantom.
+    assert not sidecar_path.exists()
+
+    # A distinct stalled reason is emitted so the counted-but-throttled
+    # outcome is observable in events.db.
+    counted_events = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "review_dispatch_stalled"
+        and e.get("payload", {}).get("reason") == "provider_throttled_turn_limit_counted"
+    ]
+    assert len(counted_events) == 1
+    assert any(
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled_turn_limit_counted"
+        for entry in stalled
+    )
+
+
+def test_pure_throttle_death_without_turn_limit_still_rolls_back(tmp_path: Path) -> None:
+    """Issue #583 guard: a throttled death WITHOUT a turn-limit miss still
+    gets the provider-throttle rollback (claim cleared, attempt decremented).
+    Only sessions that did substantial work lose the rollback.
+    """
+    repo_root, reviews_dir, config, state_file = _seed_with_attempt(tmp_path, 100, 1)
+    # Clear the turn-limit flag: this session died purely from the provider
+    # limit without exhausting its turn budget.
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"]["review_turn_limit_summary_posted"] = False
+        save_state(state_file, state)
+    sidecar_path = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = load_state(state_file)
+    # Quota backoff applied.
+    assert state.get("reviewer_quota", {}).get("consecutive_probe_failures") == 1
+    # Attempt rolled back (pure provider outage -- not a PR-specific failure).
+    assert state["prs"]["100"].get("review_dispatch_attempt_count") == 0
+    # Claim cleared (rolled back, immediately re-dispatchable once quota opens).
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+    assert not sidecar_path.exists()

@@ -354,6 +354,18 @@ physical cores.
 - `charlie fleet bash-rats [--limit N] [--repos …] [--merge/--no-merge]` runs
   the full intake→work→review→merge loop per repo.
 
+> **Previewing a fleet pass.** `charlie --dry-run fleet bash-rats` and
+> `charlie --dry-run fleet supervise` gate the self-deploy step, so they do not
+> fast-forward-pull `origin/main` into the running checkout or `uv sync` its venv;
+> they report what the deploy *would* do instead.
+>
+> On builds predating that fix (issue #613) they did both, on every invocation —
+> and because moving the deployed checkout's HEAD terminates a running supervisor
+> by design (drift exit), a "preview" typed while diagnosing a fleet problem could
+> deepen it into an outage when the watchdog task was disabled. If you are on such
+> a build, preview with `charlie --dry-run runners allocate` or the read-only
+> `charlie fleet status` instead.
+
 `fleet work` / `fleet bash-rats` walk the registry oldest-`last_seen`-first (or
 the explicit `--repos` order), enforce both the per-repo
 `dispatch.max_concurrent_sessions` and the fleet-global cap at every dispatch

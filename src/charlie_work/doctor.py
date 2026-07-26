@@ -8,6 +8,7 @@ config, but its validity is never asserted by hand.
 
 from __future__ import annotations
 
+import datetime
 import json
 import shutil
 from dataclasses import dataclass
@@ -16,8 +17,8 @@ from typing import Any
 
 import yaml
 
-from .config import OrchestratorConfig
-from .fleet_paths import fleet_dir
+from .config import ApiWorkerConfig, OrchestratorConfig
+from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from .github import (
     GitHub,
@@ -33,6 +34,12 @@ from .github import (
 )
 from .paths import RuntimePaths
 from .prompts import resolve_template
+from .runner_slots import (
+    ALLOCATION_STATE_FILENAME,
+    CLI_ALLOCATION_SOURCE,
+    UNATTENDED_ALLOCATION_SOURCE,
+    load_allocation_stamp,
+)
 from .supervise import try_acquire_supervisor_lock
 
 
@@ -135,6 +142,129 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
 
 
+def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig) -> None:
+    """Observability probes for the paid ``api`` worker tier (issue #483).
+
+    When the ``api_worker`` section is configured (non-default):
+
+    * ``enabled: true``  — four checks: the active provider's ``api_key_env``
+      names a variable present in the environment (the NAME only is reported,
+      never any value), ``base_url`` parses as an https URL, the ledger file
+      ``<state_dir>/api-budget.json`` is absent-or-parsable, and remaining
+      daily/lifetime budget headroom is surfaced from ``api_budget.budget_status``.
+    * ``enabled: false`` — a single notice line so a built-but-dormant feature
+      stays visible in every doctor run (rollout insurance).
+
+    Near read-only: this probe never settles or writes the ledger itself, but
+    ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
+    a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
+    filesystem mutation. Errors surface as check details, never raised.
+    """
+    # ``configured`` = the section is not the package default. A bare
+    # ``api_worker: {enabled: false}`` with no providers/budget is the default
+    # and carries nothing to report; a section with providers set but
+    # ``enabled: false`` is the built-but-dormant case the notice targets.
+    if config.api_worker == ApiWorkerConfig():
+        return
+
+    if not config.api_worker.enabled:
+        add(
+            "api_worker configured but disabled",
+            True,
+            "api_worker section is configured but disabled (enabled is false) — "
+            "flip enabled to true to activate the paid api worker tier",
+            severity="warning",
+        )
+        return
+
+    import os
+    from datetime import UTC, datetime
+
+    from .api_budget import budget_status, ledger_path, load_ledger
+
+    provider_name = config.api_worker.provider
+    provider = config.api_worker.providers.get(provider_name)
+    if provider is None:
+        # Config load validates this, but a directly-constructed config must
+        # still get a value, not a raise.
+        add(
+            "api_worker provider",
+            False,
+            f"active provider {provider_name!r} is not in api_worker.providers",
+        )
+        return
+
+    # 1. api_key_env present in the environment (NAME only, never the value).
+    key_present = bool(os.environ.get(provider.api_key_env))
+    add(
+        "api_worker api key",
+        key_present,
+        f"env var {provider.api_key_env!r} is set"
+        if key_present
+        else f"env var {provider.api_key_env!r} is NOT set — api worker cannot launch",
+    )
+
+    # 2. base_url parses as an https URL.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(provider.base_url)
+    url_ok = parsed.scheme == "https" and bool(parsed.netloc)
+    add(
+        "api_worker base url",
+        url_ok,
+        f"{provider.base_url} (https)"
+        if url_ok
+        else f"base_url {provider.base_url!r} is not a valid https URL",
+    )
+
+    # 3. Ledger file absent-or-parsable. load_ledger quarantines a corrupt file
+    #    and returns an empty ledger — we detect corruption by checking for a
+    #    freshly-created .corrupt sibling. Read-only: no settlement or write.
+    ledger_file = ledger_path(paths.root)
+    corrupt_before = (
+        set(ledger_file.parent.glob(f"{ledger_file.name}.corrupt-*"))
+        if ledger_file.parent.exists()
+        else set()
+    )
+    ledger = load_ledger(ledger_file)
+    corrupt_after = (
+        set(ledger_file.parent.glob(f"{ledger_file.name}.corrupt-*"))
+        if ledger_file.parent.exists()
+        else set()
+    )
+    newly_quarantined = corrupt_after - corrupt_before
+    if newly_quarantined:
+        names = ", ".join(p.name for p in sorted(newly_quarantined))
+        add(
+            "api_worker budget ledger",
+            False,
+            f"ledger {ledger_file} was corrupt and quarantined: {names}",
+        )
+    else:
+        add(
+            "api_worker budget ledger",
+            True,
+            f"{ledger_file} ({'present, parsable' if ledger_file.exists() else 'not yet created'})",
+        )
+
+    # 4. Remaining daily/lifetime budget headroom.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    status = budget_status(ledger, config.api_worker.budget, today)
+    daily_remaining = max(0.0, config.api_worker.budget.max_usd_per_day - status.spent_today_usd)
+    lifetime_remaining = max(
+        0.0, config.api_worker.budget.lifetime_usd - status.lifetime_spent_usd
+    )
+    add(
+        "api_worker budget headroom",
+        status.daily_headroom and status.lifetime_headroom,
+        f"${status.spent_today_usd:.2f} spent today / ${config.api_worker.budget.max_usd_per_day:.2f} cap "
+        f"(${daily_remaining:.2f} remaining, {'ok' if status.daily_headroom else 'exhausted'}); "
+        f"${status.lifetime_spent_usd:.2f} spent lifetime / ${config.api_worker.budget.lifetime_usd:.2f} cap "
+        f"(${lifetime_remaining:.2f} remaining, {'ok' if status.lifetime_headroom else 'exhausted'})",
+        severity="warning",
+    )
+
+
 def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
     """Flag launched sessions that failed or whose process died without the
     orchestrator recording an outcome (orphans reconcile cannot see)."""
@@ -229,6 +359,154 @@ def _surface_post_mortems(
             "; ".join(lines),
             severity="warning",
         )
+
+
+def _allocation_writer_label(source: str | None) -> str:
+    """Describe which path wrote an allocation state file, for probe output.
+
+    An unrecognised value is echoed rather than collapsed into "unknown": if a
+    future writer forgets to extend ``AllocationSource``, the probe should name
+    what it actually found instead of hiding it.
+    """
+    if source is None:
+        return "writer unrecorded — file predates provenance tracking"
+    if source == UNATTENDED_ALLOCATION_SOURCE:
+        return "unattended fleet pass"
+    if source == CLI_ALLOCATION_SOURCE:
+        return "a manual `charlie runners allocate`"
+    return f"an unrecognised writer {source!r}"
+
+
+def _check_runner_allocation(
+    add: Any, config: OrchestratorConfig, fleet_dir_override: str | None = None
+) -> None:
+    """Report whether host-wide runner allocation is actually running (issue #590).
+
+    Every way the allocation prologue can decline to act is silent by nature: a
+    false ``enabled`` flag, a config object built by code that predates the
+    section, or a registry with no reachable repo root all make it return without
+    doing anything — and a converged host looks exactly like one where allocation
+    never ran at all. Logs cannot settle it either: the daemon's stderr has proven
+    lossy in practice, so the absence of a log line is not evidence.
+
+    ``run_allocation_pass`` rewrites ``runner-allocation.json`` on every non-dry
+    pass even when no slot moves, which makes that file's ``updated_at`` the only
+    positive evidence that a pass happened.
+
+    Age alone is not enough, though. ``charlie runners allocate`` writes the same
+    host-wide file, and CLAUDE.md *requires* post-reboot procedures to call exactly
+    that — so an operator's manual run would otherwise make this probe read healthy
+    for three intervals, during the very window someone is diagnosing #590. Each
+    pass records which path wrote it and only the unattended one is accepted as
+    evidence here; a manual write is reported as "cannot confirm" rather than
+    "fine", because the file keeps just the latest write.
+    """
+    allocation = getattr(config, "runner_allocation", None)
+    if allocation is None or not allocation.enabled:
+        return
+
+    state_dir = fleet_dir(override=fleet_dir_override)
+    interval = max(config.supervisor.full_pass_interval_seconds, 1)
+    # Three intervals: one missed pass is normal jitter (a pass can run long), a
+    # sustained gap is not.
+    stale_after = interval * 3
+    budget = allocation.max_running_runners
+
+    stamp = load_allocation_stamp(state_dir)
+    if stamp is None:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but has never run: "
+            f"{state_dir / ALLOCATION_STATE_FILENAME} absent, "
+            f"expected a pass every {interval}s",
+            severity="warning",
+        )
+        return
+
+    if stamp.updated_at is None:
+        add(
+            "runner allocation",
+            False,
+            f"enabled but {ALLOCATION_STATE_FILENAME} has no readable updated_at stamp",
+            severity="warning",
+        )
+        return
+
+    # Clock skew or a hand-edited stamp can date the write in the future. A
+    # negative age is not freshness evidence, so clamp it instead of reporting
+    # "last pass -42s ago" as healthy.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    age = max(0, int((now - stamp.updated_at).total_seconds()))
+    writer = _allocation_writer_label(stamp.source)
+
+    if age > stale_after:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but the last pass ({writer}) was {age}s ago, "
+            f"over the {stale_after}s staleness bound — allocation is configured but "
+            f"is not running unattended (issue #590)",
+            severity="warning",
+        )
+        return
+
+    if stamp.source != UNATTENDED_ALLOCATION_SOURCE:
+        add(
+            "runner allocation",
+            False,
+            f"enabled (budget {budget}) but the most recent pass {age}s ago was "
+            f"{writer}, which overwrites the same file the unattended pass uses — "
+            f"this cannot confirm the daemon is rebalancing (issue #590)",
+            severity="warning",
+        )
+        return
+
+    add(
+        "runner allocation",
+        True,
+        f"last unattended pass {age}s ago, budget {budget}",
+    )
+
+
+def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = None) -> None:
+    """Warn when the fleet directory is per-process virtualized (issue #624).
+
+    MSIX/container copy-on-write redirection makes the literal fleet-dir path
+    string identical in both the container and the host while naming different
+    files: reads pass through to the real file, but the first write forks a
+    private copy that daemons reading the same path string never see. This
+    cost a full day on #590 — ``runner_allocation`` was believed deployed and
+    enabled since 09:24, while the file the fleet supervisor actually read
+    never had the section at all.
+
+    The signal is that the literal path and its resolved form disagree — never
+    a hardcoded package moniker (which would rot on the next app update, only
+    cover one container, and violate the no-hardcoded-lists rule). A
+    virtualized fleet dir is not fatal for an interactive human running
+    ``charlie doctor`` from a packaged terminal — reads still pass through
+    until something writes — so this is a warning, not an error. It names both
+    paths and states plainly that any write forks a private copy daemons will
+    never see, referencing #590 for the failure it produced.
+
+    Repo-agnostic by construction: the fleet dir is a host-wide per-process
+    property, so the same probe fires regardless of which registered repo the
+    operator ran ``charlie doctor`` from.
+    """
+    diverged = fleet_dir_virtualization(override=fleet_dir_override)
+    if diverged is None:
+        return
+    literal, resolved = diverged
+    add(
+        "fleet dir virtualization",
+        False,
+        f"fleet dir {literal} resolves to {resolved} — host-wide state written "
+        f"here is invisible to scheduled tasks and daemons reading the same "
+        f"path string: the first write forks a private copy they will never "
+        f"see (this is the exact shape of the #590 failure). Daemon-visible "
+        f"state must be written via a non-redirected route (e.g. a UNC path).",
+        severity="warning",
+    )
 
 
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:
@@ -605,6 +883,11 @@ def run_doctor(
             "(set it to null to disable venv sharing)",
         )
 
+    # -- api worker observability (issue #483) ------------------------------
+    # Always runs (not gated on --adapter-probe): these are config/environment
+    # checks, not external CLI probes. Read-only — never mutates the ledger.
+    _probe_api_worker(add, paths, config)
+
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
         _surface_sessions(add, repo_root, config)
@@ -645,6 +928,17 @@ def run_doctor(
 
     # -- fleet supervisor ----------------------------------------------------
     _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
+
+    # -- fleet dir virtualization (issue #624) -------------------------------
+    # Read-only: compares the literal fleet-dir path against its resolved form.
+    # Never raises and never writes; a virtualized fleet dir is a warning, not
+    # an error, because reads still pass through until something writes.
+    _check_fleet_dir_virtualization(add, fleet_dir_override=fleet_dir_override)
+
+    # -- host-wide runner allocation (issue #590) ----------------------------
+    # Read-only: compares the allocation state file's age against the pass
+    # interval. Never starts, parks, or plans anything.
+    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

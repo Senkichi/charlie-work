@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import logging
 import os
@@ -21264,6 +21265,64 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
     assert result.data["sessions"][0]["issue_number"] == 123
 
 
+def test_dispatch_rework_skips_issue_view_for_rework_requested_issue_with_closed_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #558: dispatch_rework's candidate scan must NOT call
+    gh.issue_view() for a rework_requested issue whose PR is closed-unmerged.
+    pr_list() returns only OPEN PRs, so an issue with a closed-unmerged PR is
+    absent from the open-PR index; the per-issue gh.issue_view fetch is the
+    permanent per-pass cost this gate exists to eliminate. Verifying the fetch
+    is skipped (not just that selected_count is 0) pins the reorder directly.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class IssueViewRecordingGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # PR 456 linked to issue 123, but CLOSED-unmerged on GitHub.
+            self.prs[0]["state"] = "CLOSED"
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            return super().issue_view(number)
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = IssueViewRecordingGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    # The whole point: no per-issue gh.issue_view fetch for the
+    # closed-unmerged-PR issue.
+    assert 123 not in fake_gh.issue_view_calls
+    assert fake_gh.issue_view_calls == []
+
+
 def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
     """Issue #85 acceptance test: two rework_requested issues, loop(limit=1) dispatches different issues.
 
@@ -24509,6 +24568,106 @@ def test_global_config_global_only(tmp_path: Path) -> None:
     config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
 
     assert config.dispatch.max_concurrent_sessions == 5
+
+
+def test_layered_config_logs_whether_global_layer_was_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The provenance line must report *readership*, not resolved values.
+
+    A section that is missing from the global file and a global file that was
+    never read produce byte-identical resolved config -- pristine dataclass
+    defaults -- but demand opposite fixes. Issue #590 stalled on exactly that
+    ambiguity, so this asserts the one fact that separates them survives in the
+    log even when the resulting config looks entirely ordinary.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Absent global layer: resolved config is all defaults, and the log says why.
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    absent_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "absent" in absent_line, f"absent global layer not reported: {absent_line!r}"
+    assert str(fleet_dir_path / "config.yaml") in absent_line, "the path itself must be logged"
+
+    # Present global layer: same call, and the log distinguishes it.
+    caplog.clear()
+    (fleet_dir_path / "config.yaml").write_text(
+        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
+    )
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    present_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "present" in present_line, f"present global layer not reported: {present_line!r}"
+    assert "absent" not in present_line, "a present layer must not read as absent"
+    assert "dispatch" in present_line, "the sections actually read must be named"
+    assert "bytes=" in present_line, "same vocabulary as the supervisor's INFO line"
+
+    # An empty global file resolves to pristine defaults with zero sections --
+    # indistinguishable from an absent one on the resolved config alone, and the
+    # reason this line carries a byte count rather than a bare "present".
+    caplog.clear()
+    (fleet_dir_path / "config.yaml").write_text("", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    empty_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "bytes=0" in empty_line, f"a truncated global layer must be visible: {empty_line!r}"
+    assert "absent" not in empty_line, "an empty file is present-but-empty, not absent"
+    assert "(none)" in empty_line, "an empty file contributes no sections"
+
+
+def test_describe_config_file_separates_absent_from_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config that could not be reached must not read as one that is absent.
+
+    ``Path.exists()`` returns a bare False for every error in
+    ``pathlib._ignore_error`` -- ENOENT, ENOTDIR, EBADF, ELOOP and the Windows
+    unready-device / unresolvable-path winerrors. All of them take
+    load_layered_config's silent-``{}`` branch and yield pristine dataclass
+    defaults with no error raised, which is #590's symptom exactly. The cause
+    must survive into the log instead of collapsing into "absent".
+
+    ENOTDIR is used rather than EACCES deliberately: permission errors are *not*
+    in the ignored set, so they raise instead of silently defaulting, which is
+    why they cannot be #590's mechanism.
+    """
+    from charlie_work.global_config import describe_config_file
+
+    missing = tmp_path / "nope.yaml"
+    assert describe_config_file(missing) == "absent"
+
+    present = tmp_path / "config.yaml"
+    present.write_text("dispatch: {}\n", encoding="utf-8")
+    assert describe_config_file(present) == f"present bytes={present.stat().st_size}"
+
+    real_stat = Path.stat
+
+    def not_a_dir(self: Path, *args: object, **kwargs: object) -> object:
+        if self == present:
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", not_a_dir)
+
+    # The precondition that makes this helper necessary: exists() hides this.
+    assert present.exists() is False, "precondition: exists() collapses ENOTDIR to False"
+
+    described = describe_config_file(present)
+    assert described != "absent", "an unreachable config must not read as absent"
+    assert described.startswith("UNREADABLE"), f"cause was lost: {described!r}"
+    assert "NotADirectoryError" in described, "the failure cause must reach the log"
 
 
 def test_global_config_per_repo_wins(tmp_path: Path) -> None:
