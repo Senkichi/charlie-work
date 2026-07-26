@@ -11110,12 +11110,26 @@ class OrchestratorApp:
 
         # Issue #502: post-merge tripwire. Detect any merged worker PR that was
         # not approved by the orchestrator's adversarial review gate.
+        #
         # Reuse the merged PR list already fetched by dispatch() to avoid a
-        # second GraphQL call per loop pass. dispatch() returns an empty list
-        # (not the fetched merged PRs) when there are no ready issues, so coerce
-        # an empty reuse list back to None — the tripwire must then fetch its
-        # own list to stay armed even when the queue is idle (a worker self-merge
-        # can land regardless of whether issues are ready).
+        # redundant fetch per loop pass. dispatch() returns an empty list (not
+        # the fetched merged PRs) when there are no ready issues, so coerce an
+        # empty reuse list back to None — the tripwire must then fetch its own
+        # list to stay armed even when the queue is idle (a worker self-merge can
+        # land regardless of whether issues are ready).
+        #
+        # Deliberate trade-off: because empty-means-unknown is indistinguishable
+        # from empty-means-no-merged-PRs, an idle queue costs one extra
+        # merged_pr_list() call per pass. That is a paginated REST fetch, not a
+        # GraphQL check-run walk (merged_pr_list is REST-only by construction —
+        # issue #361), so the cost is bounded and does not risk the gateway 502s
+        # that motivated #361. Staying armed while idle is worth it: the whole
+        # point of the tripwire is to catch merges the orchestrator did not
+        # perform, which are exactly the ones that can happen on a quiet pass.
+        # Replacing this with an explicit "not fetched" sentinel threaded out of
+        # dispatch() would remove the extra call; that is tracked in #446 with
+        # the rest of the per-pass fetch consolidation, and is deliberately not
+        # done here to keep this security fix narrow.
         merged_prs_for_tripwire: list[dict[str, Any]] | None = dispatch.data.get("merged_prs")
         if not merged_prs_for_tripwire:
             merged_prs_for_tripwire = None

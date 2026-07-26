@@ -8472,6 +8472,95 @@ def test_detect_unauthorized_merges_reuses_dispatch_merged_prs(tmp_path: Path) -
     assert detected[0]["pr"] == 501
 
 
+def test_detect_unauthorized_merges_against_real_rest_merged_pr_list(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The tripwire must fire against the shape merged_pr_list() ACTUALLY returns.
+
+    Every other tripwire test above builds its merged-PR fixture by hand and
+    spells ``headRefOid`` explicitly. But ``merged_pr_list()`` is REST-only by
+    construction (issue #361) and the REST payload spells that field
+    ``head.sha``, so those fixtures asserted a key the production path did not
+    emit: ``live_head_sha`` was always ``None``, ``head_matches`` was always
+    False, and the SHA half of this control could never distinguish an
+    authorized merge from a bypass. Fixed in #631; this test is the regression
+    guard, and it exercises the real producer so the *contract* between
+    ``merged_pr_list()`` and the tripwire is what is under test rather than a
+    hand-written dict.
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    merged_head_sha = "27a20fbd9c1e4d3a8f5b6c7d8e9f0a1b2c3d4e5f"
+    rest_page = [
+        {
+            "number": 501,
+            "title": "fix: a worker branch that got merged",
+            "body": "Closes #494",
+            "merged_at": "2026-07-20T20:19:07Z",
+            "head": {
+                "ref": "agent/issue-494-fix",
+                "sha": merged_head_sha,
+                "repo": {"full_name": "o/r"},
+            },
+            "base": {"repo": {"full_name": "o/r"}},
+        }
+    ]
+    # merged_pr_list() paginates until it sees an empty page.
+    responses = [json.dumps(rest_page), "[]"]
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    # The real producer, driven off a real REST payload.
+    merged_prs = github_module.GitHub(tmp_path).merged_pr_list()
+    assert len(merged_prs) == 1
+    assert merged_prs[0]["headRefOid"] == merged_head_sha, (
+        "merged_pr_list() must map REST head.sha onto headRefOid (#631) — "
+        "without it the tripwire below cannot compare SHAs at all"
+    )
+
+    # The real consumer. loop() hands the fetched list in as a parameter on the
+    # hot path, so passing it explicitly is the production shape; FakeGitHub is
+    # here only to satisfy the app's constructor, not to supply the fixture.
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    pr_dir = paths.prs / "pr-501"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    decision_path = pr_dir / "review-decision.json"
+
+    # 1. Approved for exactly the merged head -> authorized, tripwire silent.
+    #    This is the assertion that fails when the REST normalizer omits
+    #    headRefOid: head_matches degrades to False and a properly reviewed
+    #    merge gets reported as a bypass.
+    decision_path.write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": merged_head_sha}),
+        encoding="utf-8",
+    )
+    assert app._detect_unauthorized_merges(merged_prs) == []
+
+    # 2. Approved for a DIFFERENT head -> flagged, and live_head_sha must carry
+    #    the real REST head.sha rather than None.
+    decision_path.write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "stale-review-sha"}),
+        encoding="utf-8",
+    )
+    detected = app._detect_unauthorized_merges(merged_prs)
+
+    assert len(detected) == 1
+    assert detected[0]["pr"] == 501
+    assert detected[0]["issue"] == 494
+    assert detected[0]["decision"] == "approved"
+    assert detected[0]["reviewed_head_sha"] == "stale-review-sha"
+    assert detected[0]["live_head_sha"] == merged_head_sha
+
+
 def test_loop_surfaces_unauthorized_merge_in_errors_bucket(tmp_path: Path) -> None:
     """loop() must wire the post-merge tripwire into the errors bucket even when dispatch() had no ready issues and returned an empty merged_prs list (issue #502)."""
     from charlie_work.config import OrchestratorConfig
