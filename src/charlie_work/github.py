@@ -40,14 +40,25 @@ ISSUE_VIEW_FIELDS = (
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
-# merged_pr_list() only feeds workflow._merged_pr_referenced_issue_numbers(),
-# which (via linked_issue_number()/issue_numbers_mentioned_by_pr()) reads
-# exactly these 6 fields. Deliberately narrower than PR_LIST_FIELDS: merged
-# PRs don't need current CI/review/label state, and `statusCheckRollup` in
-# particular forces gh's GraphQL query to walk each PR's check-run
-# connection — expensive across up to 500 merged PRs and the cause of
-# intermittent gateway 502s on this query (issue #361).
-MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state"
+# The field contract for every merged-PR listing. Two producers must satisfy
+# it identically: merged_prs_for_issue() queries these fields directly, and
+# merged_pr_list() goes through the REST endpoint and must reproduce this exact
+# key set via _normalize_rest_pr() (enforced by
+# test_normalize_rest_pr_satisfies_merged_pr_list_field_contract).
+#
+# Consumers: workflow._merged_pr_referenced_issue_numbers() (via
+# linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
+# branch fields; post-merge audit paths additionally need `headRefOid` to tell
+# *which commit* was merged, not merely that a merge happened.
+#
+# Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
+# CI/review/label state, and `statusCheckRollup` in particular forces gh's
+# GraphQL query to walk each PR's check-run connection — expensive across up to
+# 500 merged PRs and the cause of intermittent gateway 502s on this query
+# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
+# object, and on the REST path it is already present in the payload as
+# head.sha, so adding it costs neither an extra request nor a graph walk.
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -220,6 +231,10 @@ class GitHub:
             "headRefName": head.get("ref"),
             "isCrossRepository": is_cross_repository,
             "state": "MERGED",
+            # REST spells the head OID `head.sha`; consumers expect gh's
+            # GraphQL name. Without this mapping every consumer reading
+            # headRefOid off a merged PR silently sees None.
+            "headRefOid": head.get("sha"),
         }
 
     def run(
