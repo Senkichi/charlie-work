@@ -258,6 +258,82 @@ def detect_drift(
                         remove_labels=tuple(sorted(issue_active_labels)),
                     )
                 )
+            # Issue #558: converge the state PR entry's own status to
+            # "closed" when GitHub reports the PR closed-unmerged. Without
+            # this, entries stuck in active statuses (janitor_blocked,
+            # rework_requested, reviewing, escalated, ...) are invisible to
+            # every terminal-status sweep and get re-fetched / re-evaluated
+            # every pass forever. This is the PR-side counterpart to the
+            # issue-side closed_unmerged_pr_active_labels above; the two are
+            # independent and may both fire for the same PR. The linked
+            # issue's disposition (label strip / carry-forward redispatch)
+            # is left entirely to the existing issue-side handling. MERGED
+            # PRs are excluded -- that is merged_outside_orchestrator's job.
+            #
+            # A tracked PR (state_entry is not None) whose status key is
+            # missing is the same blind spot the sibling OPEN-PR repair
+            # branch (pr_status_normalized below) covers for OPEN PRs: it
+            # normalizes a None status to the passive placeholder. The
+            # symmetric convergence here covers a tracked CLOSED-unmerged
+            # PR with no status key, so the entry does not linger as a
+            # status-less record the closed sweep skips (Minor symmetry gap
+            # vs the OPEN branch). Untracked PRs (state_entry is None) are
+            # still never invented an entry for.
+            state_status = (state_entry or {}).get("status")
+            if state_entry is not None and state_status not in ("closed", "merged"):
+                drift.append(
+                    DriftItem(
+                        kind="closed_unmerged_pr_state_converged",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} is CLOSED (unmerged) on GitHub but "
+                            f"state status is {state_status!r}; converging to 'closed'"
+                        ),
+                        fix_actions=(f"set state prs[{pr_number}].status = 'closed'",),
+                        new_status="closed",
+                    )
+                )
+
+            # Issue #558 (issue-side counterpart): converge the linked
+            # issue's state status away from any ACTIVE_STATE_STATUS when
+            # its PR is closed-unmerged and the GitHub issue itself is
+            # still OPEN. Without this, an issue stuck in
+            # "rework_requested" (or "reviewing", "escalated", ...) is
+            # selected by dispatch_rework's state-driven candidate scan
+            # every loop pass, which calls gh.issue_view() on it before
+            # any open-PR filtering -- a permanent per-pass GitHub fetch
+            # with no terminal exit, the exact slow-cost-spiral shape
+            # #556/#558 exist to eliminate. The existing
+            # closed_unmerged_pr_active_labels rule only strips GitHub
+            # labels and never touches state["issues"][n]["status"], and
+            # state_active_status_issue_closed only fires when the GitHub
+            # issue itself is CLOSED -- so an OPEN issue with a
+            # closed-unmerged PR is invisible to both. Converge to the
+            # dormant baseline (drop the status key, the same target
+            # issue_status_normalized uses for a never-dispatched issue)
+            # so the issue drops out of every status-driven selector until
+            # a human re-arms it. The linked issue's label disposition
+            # remains owned by closed_unmerged_pr_active_labels; the two
+            # are independent and may both fire for the same PR.
+            if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
+                issue_entry = state.get("issues", {}).get(str(issue_number))
+                issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
+                if issue_status in ACTIVE_STATE_STATUSES:
+                    drift.append(
+                        DriftItem(
+                            kind="closed_unmerged_pr_issue_state_converged",
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            detail=(
+                                f"PR #{pr_number} is CLOSED (unmerged) on GitHub but "
+                                f"linked issue #{issue_number} state status is "
+                                f"{issue_status!r}; converging to dormant (no status)"
+                            ),
+                            fix_actions=(f"drop status key for issues[{issue_number}]",),
+                            new_status=None,
+                        )
+                    )
         elif gh_state == "OPEN":
             # A PR record that the orchestrator is already tracking (has an
             # entry in state["prs"]) but that never got a status written --
@@ -316,6 +392,12 @@ def detect_drift(
         )
 
         sessions_dir = repo_root / config.devin.sessions_dir
+        # state_dir root (sibling of state.json) for api-budget ledger settlement
+        # on reap (issue #480). Resolved through runtime_paths so an absolute
+        # state_dir config is honored identically to state.json itself.
+        from .paths import runtime_paths
+
+        state_dir_root = runtime_paths(repo_root, config.runtime.state_dir).root
         if sessions_dir.is_dir():
             for w in iter_workers(sessions_dir):
                 # Track live sessions to avoid false-positive drift detection (issue #214)
@@ -349,13 +431,25 @@ def detect_drift(
                                 fallback_kind="launch_stalled",
                                 config=config,
                             )
+                        elif w.adapter_kind == "api":
+                            update_worker_record_with_failure_classification(
+                                sessions_dir,
+                                w.issue_number,
+                                fallback_kind="launch_stalled",
+                                config=config,
+                                adapter_kind="api",
+                            )
 
                         # Kill the process tree to free the slot
                         if w.pid is not None:
                             kill_process_tree(w.pid, w.process_start_time)
 
                         # Reap the sidecar to prevent phantom sessions
-                        w.reap_sidecar(sessions_dir)
+                        w.reap_sidecar(
+                            sessions_dir,
+                            api_config=config.api_worker,
+                            state_dir=state_dir_root,
+                        )
 
                         # Reconcile labels for launch_stalled sessions with no open PR
                         if w.issue_number not in open_prs_by_issue:
@@ -438,6 +532,16 @@ def detect_drift(
                                     config=config,
                                 )
                             )
+                        elif w.adapter_kind == "api":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind="unpublished_work",
+                                    config=config,
+                                    adapter_kind="api",
+                                )
+                            )
                         else:
                             failure_kind, throttled_until = None, None
                         # Diagnostic post-mortem; its worker_blocked verdict is ignored
@@ -466,6 +570,16 @@ def detect_drift(
                                     config=config,
                                 )
                             )
+                        elif w.adapter_kind == "api":
+                            failure_kind, throttled_until = (
+                                update_worker_record_with_failure_classification(
+                                    sessions_dir,
+                                    w.issue_number,
+                                    fallback_kind=fallback_kind,
+                                    config=config,
+                                    adapter_kind="api",
+                                )
+                            )
                         else:
                             failure_kind, throttled_until = None, None
 
@@ -487,7 +601,11 @@ def detect_drift(
 
                     # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
                     # Delete the sidecar file after the session is detected as dead and classified
-                    w.reap_sidecar(sessions_dir)
+                    w.reap_sidecar(
+                        sessions_dir,
+                        api_config=config.api_worker,
+                        state_dir=state_dir_root,
+                    )
 
                     # Issue #118: reconcile labels for dead sessions with no open PR
                     # A dead worker with no open PR is recoverable and should be relabeled
@@ -1063,6 +1181,39 @@ def apply_fixes(
         elif item.kind == "state_pr_missing_on_github":
             if item.pr_number is not None:
                 new_prs.pop(str(item.pr_number), None)
+
+        elif item.kind == "closed_unmerged_pr_state_converged":
+            # Issue #558: converge the state PR entry's own status to
+            # "closed" when GitHub reports the PR closed-unmerged. Only the
+            # PR entry's status is touched; the linked issue's disposition
+            # is left to the existing closed-unmerged issue-side handling
+            # (closed_unmerged_pr_active_labels / state_active_status_issue_
+            # closed). Any stale review-dispatch claim is also cleared so a
+            # dead PR never retains a live-claim-shaped record.
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                new_prs[pr_key] = {
+                    **without_review_dispatch_claim(existing_pr),
+                    "number": item.pr_number,
+                    "status": "closed",
+                }
+                if item.issue_number is not None:
+                    new_prs[pr_key]["issue_number"] = item.issue_number
+
+        elif item.kind == "closed_unmerged_pr_issue_state_converged":
+            # Issue #558 (issue-side): drop the linked issue's active
+            # status key so dispatch_rework's state-driven candidate scan
+            # stops selecting it (and calling gh.issue_view every loop
+            # pass). The issue's label disposition is owned by
+            # closed_unmerged_pr_active_labels; this only touches the
+            # state status, converging to the dormant baseline (no status
+            # key) that issue_status_normalized also uses for a
+            # never-dispatched issue. Other fields are preserved.
+            if item.issue_number is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                new_issues[issue_key] = {k: v for k, v in existing_issue.items() if k != "status"}
 
         elif item.kind in (
             "issue_active_label_no_open_pr",

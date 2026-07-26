@@ -50,8 +50,14 @@ DELTA_SKIP_SUFFIX = " (delta skipped: last beat <10m ago)"
 
 FLEET_TASK_NAME = "charlie-fleet-pass"
 # schtasks "Last Result" codes that mean "not actually a failure":
-# 0 = success, 267009 = task currently running, 267011 = task has not yet run.
-SCHTASKS_OK_RESULT_CODES = {0, 267009, 267011}
+# 0 = success, 267009 = task currently running, 267011 = task has not yet run,
+# -2147020576 = 0x800710E0, "the operator or administrator has refused the
+# request" -- what Task Scheduler records when a repetition trigger fires while
+# a previous instance is still running and the task is configured
+# MultipleInstances: IgnoreNew. Fleet passes routinely exceed the 5-minute
+# repetition interval, so this is the documented, intended behaviour of that
+# setting rather than a failure (issue #587).
+SCHTASKS_OK_RESULT_CODES = {0, 267009, 267011, -2147020576}
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 

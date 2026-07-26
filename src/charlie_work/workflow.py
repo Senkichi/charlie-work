@@ -7,7 +7,7 @@ import re
 import signal
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -17,8 +17,20 @@ from .adapters import (
     SessionDispatchResult,
     SessionRequest,
     dispatch_sessions,
+    write_session_manifest,
+    write_session_results,
 )
-from .claude_code import _events_path, launch_claude_worker, parse_claude_events
+from .api_budget import budget_status as _api_budget_status
+from .api_budget import ledger_path as _api_ledger_path
+from .api_budget import load_ledger as _api_load_ledger
+from .claude_code import (
+    _events_path,
+    extract_event_text,
+    iter_stream_json_events,
+    launch_claude_worker,
+    parse_claude_events,
+    resolve_review_effort,
+)
 from .checks import CheckSummary, summarize_checks
 from .config import (
     AutoMergeConfig,
@@ -29,6 +41,7 @@ from .config import (
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
@@ -78,9 +91,11 @@ from .worktree import (
     worktree_path_for_branch,
     write_worktree_marker,
 )
+from . import state as _state
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
+    _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
     clear_reviewer_quota,
@@ -106,6 +121,7 @@ from .instrumentation import correlation_context, log_event, record_loop_pass
 from .throttle_signatures import match_throttle_tail
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
+from .routing import AdapterChoice, record_adapter_choice, select_adapter
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -429,6 +445,135 @@ def _janitor_section(warnings: tuple[str, ...]) -> str:
         f"{lines}\n\n"
         "These deterministic pre-checks passed the gate but deserve reviewer attention.\n"
     )
+
+
+def _ci_status_section(
+    checks: list[dict[str, Any]] | None,
+    required: tuple[str, ...],
+    checks_json_path: Path,
+) -> str:
+    """Render the $ci_status_section packet block from already-fetched CI data.
+
+    ``run_janitor`` deterministically verifies required checks BEFORE a review
+    packet is ever generated: a definitive required-check failure short-
+    circuits ``review()`` long before this function is reached (see the
+    ``janitor_blocked`` branch). So a reviewer re-reading ``checks.json`` to
+    re-confirm what the gate already verified is pure token waste. This
+    section states that verification result inline instead, while still
+    surfacing everything the gate does NOT resolve: unfetchable CI data, an
+    unconfigured required-check list (the gate is a no-op in that case),
+    still-pending required checks, and failing non-required/informational
+    checks (the gate never blocks on those).
+
+    Pure and I/O-free like ``_janitor_section`` — safe to call every pass.
+    """
+    if checks is None:
+        return (
+            "CI status could not be fetched by the orchestrator (`gh` failure). "
+            f"Do not assume checks are green — inspect `{checks_json_path}` "
+            "directly if CI status matters to this review.\n"
+        )
+
+    if not required:
+        return (
+            "No required checks are configured for this repo, so CI status was "
+            "not deterministically verified before dispatch. Inspect "
+            f"`{checks_json_path}` if CI status is relevant to your review.\n"
+        )
+
+    summary = summarize_checks(checks, required)
+    lines: list[str] = []
+    if summary.passed:
+        lines.append(
+            f"Required check(s) passing — verified deterministically by the "
+            f"orchestrator before dispatch: {', '.join(summary.passed)}. Do "
+            "not spend turns re-inspecting these."
+        )
+    if summary.pending:
+        lines.append(
+            f"Required check(s) still pending, not yet confirmed: {', '.join(summary.pending)}."
+        )
+    lines.append(f"`checks.json` is available at `{checks_json_path}` if a specific doubt arises.")
+
+    non_required_failing, non_required_cancelled = _non_required_check_findings(checks, required)
+    if non_required_failing:
+        lines.append(
+            "Non-required/informational check(s) currently failing (the "
+            "janitor gate does not block on these — weigh them yourself): "
+            + ", ".join(non_required_failing)
+        )
+    if non_required_cancelled:
+        lines.append(
+            "Non-required/informational check(s) cancelled (often infra-transient, "
+            "not necessarily a code failure — weigh them yourself): "
+            + ", ".join(non_required_cancelled)
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _non_required_check_findings(
+    checks: list[dict[str, Any]], required: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Classify non-required checks into (failing, cancelled) name lists.
+
+    Deliberately does NOT reuse ``summarize_checks`` here: its ``else:
+    name_failed = True`` catch-all (checks.py) is correct for REQUIRED checks
+    (any non-passing/non-pending/non-infra state should gate the janitor) but
+    wrong for informational awareness of non-required checks, where it
+    silently swept SKIPPED and NEUTRAL conclusions (a path-filtered or
+    matrix-conditional job that correctly did not run) into "failed", making
+    every such PR's packet falsely claim an unrelated check was "currently
+    failing". ``summarize_checks`` itself must not change — it is the
+    janitor's required-check semantics — so this classifies non-required
+    checks directly from their raw per-run state/bucket instead.
+
+    A genuine failure is FAILURE, INFRA_FAILURE, or any other unrecognized
+    terminal state (e.g. TIMED_OUT, ACTION_REQUIRED) — the same "anything
+    else is a real failure" posture ``summarize_checks`` takes, minus the
+    SKIPPED/NEUTRAL carve-out. CANCELLED is reported separately (worded as
+    "cancelled," never "failing") since it is frequently an infra hiccup
+    rather than a code problem. Multiple runs sharing a name use worst-of
+    semantics, mirroring ``summarize_checks``.
+    """
+    required_set = set(required)
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for check in checks:
+        name = str(check.get("name") or "")
+        if not name or name in required_set:
+            continue
+        by_name.setdefault(name, []).append(check)
+
+    failing: list[str] = []
+    cancelled: list[str] = []
+    for name, runs in by_name.items():
+        name_failed = False
+        name_cancelled = False
+        for check in runs:
+            state = str(check.get("state") or "").upper()
+            bucket = str(check.get("bucket") or "").lower()
+            if state == "SUCCESS" or bucket == "pass":
+                continue
+            if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
+                continue
+            if not state and not bucket:
+                continue
+            if state in {"SKIPPED", "NEUTRAL"}:
+                # Legitimate non-outcomes (path-filtered/matrix-conditional
+                # jobs) — never a failure.
+                continue
+            if state == "CANCELLED":
+                name_cancelled = True
+                continue
+            # FAILURE, INFRA_FAILURE, or any other unrecognized state
+            # (TIMED_OUT, ACTION_REQUIRED, ...): a genuine failure.
+            name_failed = True
+        if name_failed:
+            failing.append(name)
+        elif name_cancelled:
+            cancelled.append(name)
+
+    return tuple(sorted(failing)), tuple(sorted(cancelled))
 
 
 def render_test_adequacy_section(
@@ -765,6 +910,7 @@ def _detect_and_handle_stalled_sessions(
     from .post_mortem import classify_and_record
     from .worker import (
         _next_inconclusive_probe_deferred_count,
+        _api_session_over_budget,
         classify_worker_health,
         iter_workers,
         real_activity_probe_for,
@@ -825,6 +971,67 @@ def _detect_and_handle_stalled_sessions(
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
         update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+
+        # Issue #484: in-flight api per-session budget kill. Independent of the
+        # STALLED/DEAD classification below — an api worker over its
+        # ``max_usd_per_session`` cap is killed immediately and sidecar-marked
+        # ``budget_exceeded``. The killed session then flows through the
+        # EXISTING dead-worker reconciliation on the next pass (with-PR ->
+        # review/rework; without-PR -> re-dispatch via select_adapter, whose
+        # preflight naturally decides api-again vs fallback). When the cap is
+        # 0/unset the check is entirely dormant. Non-api workers are never
+        # budget-evaluated. The kill uses the shared ``kill_process_tree``
+        # helper (no-console-window discipline on Windows, full process tree
+        # reaped) — not reimplemented here.
+        if w.adapter_kind == "api" and _api_session_over_budget(w, config):
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            orphan_pids_budget: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
+                for orphan in orphan_processes:
+                    _kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids_budget = [o["pid"] for o in orphan_processes]
+
+            # Set failure_kind="budget_exceeded" on the sidecar via the shared
+            # atomic-write helper. Written directly (not through
+            # update_worker_record_with_failure_classification) so the
+            # budget-exceeded verdict is not overridden by a coincidental
+            # throttle/auth log-tail match. The dead-session lane's
+            # classification call then short-circuits on the already-set
+            # failure_kind.
+            from .claude_code import _sidecar_path as _api_sidecar_path
+            from .claude_code import _write_json_atomic as _api_write_json_atomic
+
+            api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
+            try:
+                with api_sidecar.open("r", encoding="utf-8") as handle:
+                    api_payload = json.load(handle)
+                if isinstance(api_payload, dict):
+                    api_payload["failure_kind"] = "budget_exceeded"
+                    _api_write_json_atomic(api_sidecar, api_payload)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "session_budget_exceeded",
+                    {
+                        "issue_number": w.issue_number,
+                        "pid": w.pid,
+                        "process_start_time": w.process_start_time,
+                        "killed_pids": killed_pids,
+                        "orphan_pids": orphan_pids_budget if orphan_pids_budget else None,
+                        "provider": w.provider,
+                    },
+                    state_path=state_file,
+                )
+                save_state(state_file, state)
+
+            stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
+            continue
 
         # If a stalled-looking worker is still within a previously stored rate-limit
         # defer window, skip it. The deadline is re-derived from the sidecar each pass.
@@ -909,6 +1116,20 @@ def _detect_and_handle_stalled_sessions(
                         w.issue_number,
                         fallback_kind="stalled",
                         config=config,
+                    )
+                )
+            elif w.adapter_kind == "api":
+                # api sidecars share the claude-code classification helper but
+                # land as issue-<n>.api.json and get provider-auth classification
+                # (issue #484). adapter_kind="api" selects both the sidecar
+                # suffix and the auth-pattern check inside _classify_session_failure.
+                resolved_failure_kind, throttled_until = (
+                    update_worker_record_with_failure_classification(
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="stalled",
+                        config=config,
+                        adapter_kind="api",
                     )
                 )
 
@@ -1153,9 +1374,18 @@ def _is_review_dispatchable(
     if status == "review_dispatch_dispatched":
         if _reviewer_pid_alive(pr_state):
             return False
+        # Dead reviewer: the stalled-review sweep must disposition this claim
+        # first — it classifies throttle tails, counts probe failures, reaps
+        # the sidecar, and emits events; freeing here does none of that.
+        # Racing the sweep on the same 5-minute timeout measured later in the
+        # pass livelocked probes during closed quota windows (issue #571):
+        # each silent relaunch reset the clock just after the sweep looked,
+        # so backoff never engaged and a 429'd probe launched every pass.
+        # The longer backstop frees only true orphans the sweep cannot see
+        # (e.g. died before its sidecar was written).
         dispatched_at = pr_state.get("review_dispatched_at")
         return dispatched_at is None or is_claim_stale(
-            dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES
         )
 
     if status == "review_dispatch_failed":
@@ -1168,32 +1398,81 @@ def _is_review_dispatchable(
     return True
 
 
-def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
-    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
-    Looks for triple-backtick code fences in ``log_path`` and tries to parse
-    each one as JSON, starting from the last fence (the final output). Accepts
-    fences with or without a ``json`` language tag. A valid verdict block must
-    contain:
+# Absolute path ending in .md, as reviewers reference their summary files in
+# final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
+# quotes, and whitespace terminate the match so "path:line" refs don't bleed.
+_REVIEW_MD_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|~[\\/]|/)[^\s`\"'<>|*?:]+\.md")
+
+_REVIEW_FALLBACK_FILE_MAX_BYTES = 1024 * 1024
+_REVIEW_FALLBACK_MTIME_SLACK_S = 120
+_REVIEW_FALLBACK_MAX_CANDIDATES = 8
+
+
+def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
+    """Validate one decoded JSON candidate as a review verdict.
+
+    A valid verdict must contain:
 
     - ``decision`` in ``{"approved", "request_changes", "blocked"}``
-    - ``summary`` as a string; for ``request_changes``/``blocked`` it must be
-      non-empty whitespace-trimmed (``record_review`` rejects empty summaries)
+    - ``summary`` as a non-empty string, for EVERY decision including
+      ``approved`` (issue #597), and not an unfilled ``<...>`` template
+      placeholder
     - ``required_changes`` is optional; if present it must be a list of strings
 
-    Returns the parsed dict on success, or ``None`` if no valid block is found.
-    Malformed/truncated logs and 0-byte logs both return ``None``.
+    ``approved`` used to be exempt from the non-empty-summary rule, on the
+    reasoning that ``record_review`` only rejects empty summaries where a
+    reason is actionable. That exemption is what let a contentless approval
+    through: an approval with no stated reason is indistinguishable from a
+    reviewer that never formed an opinion, and approvals are the one decision
+    that leads directly to a merge. Requiring a reason costs a reviewer one
+    sentence; not requiring it cost ten unreviewed merges. A rejected verdict
+    is fail-safe here -- the caller records no verdict and the review is
+    retried, rather than merging on a verdict nobody stands behind.
+
+    Returns the normalized verdict dict, or ``None`` if invalid.
     """
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    if not isinstance(data, dict):
         return None
 
-    matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", log_text, re.DOTALL))
-    if not matches:
+    decision = data.get("decision")
+    if decision not in {"approved", "request_changes", "blocked"}:
         return None
 
-    for match in reversed(matches):
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        return None
+    stripped_summary = summary.strip()
+    if not stripped_summary:
+        return None
+    # An unfilled template placeholder ("<concise summary of the review>") is
+    # prompt boilerplate that leaked into the verdict, never a real summary.
+    if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+        return None
+
+    required_changes = data.get("required_changes")
+    if required_changes is not None and not isinstance(required_changes, list):
+        return None
+    if required_changes is not None and not all(
+        isinstance(item, str) for item in required_changes
+    ):
+        return None
+
+    return {
+        "decision": decision,
+        "summary": summary,
+        "required_changes": required_changes if required_changes is not None else [],
+    }
+
+
+def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+    """Extract the last valid fenced JSON verdict block from plain text.
+
+    Accepts fences with or without a ``json`` language tag, scanning from the
+    last fence (the final output) backwards.
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
         candidate = match.group(1).strip()
         if not candidate:
             continue
@@ -1201,133 +1480,262 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
             data = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if not isinstance(data, dict):
-            continue
-
-        decision = data.get("decision")
-        if decision not in {"approved", "request_changes", "blocked"}:
-            continue
-
-        summary = data.get("summary")
-        if not isinstance(summary, str):
-            continue
-        if decision in {"request_changes", "blocked"} and not summary.strip():
-            continue
-
-        required_changes = data.get("required_changes")
-        if required_changes is not None and not isinstance(required_changes, list):
-            continue
-        if required_changes is not None and not all(
-            isinstance(item, str) for item in required_changes
-        ):
-            continue
-
-        return {
-            "decision": decision,
-            "summary": summary,
-            "required_changes": required_changes if required_changes is not None else [],
-        }
-
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
     return None
+
+
+def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
+    """Extract a verdict from tee'd stream-json JSONL text.
+
+    With ``tee_stream_json`` enabled the sidecar log is JSONL where every
+    fence lives *inside* a JSON string (``\\n`` as escape sequences), so a
+    regex over the raw text can never match. Decode the events and accept a
+    fence ONLY from the final output: the ``result`` event's text, or —
+    absent a usable one (session killed before the result line) — the single
+    last assistant text. Never scan further back: a mid-session draft or an
+    echo of the review prompt's own few-shot example (which contains a
+    literal ``"decision": "approved"`` fence) must not be recorded as the
+    session's verdict when the reviewer produced no final one. A fence-less
+    final output returns ``None`` so the caller's no-verdict path
+    (turn-limit summary + retry) handles it as designed.
+    """
+    result_text: str | None = None
+    last_assistant_text: str | None = None
+    for event in iter_stream_json_events(raw_text):
+        text = extract_event_text(event)
+        if not text:
+            continue
+        if event.get("type") == "result":
+            result_text = text
+        else:
+            last_assistant_text = text
+
+    for text in (result_text, last_assistant_text):
+        if text:
+            verdict = _extract_verdict_from_text(text)
+            if verdict is not None:
+                return verdict
+    return None
+
+
+def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
+    """Extract a fenced JSON verdict block from a reviewer's sidecar log.
+
+    Handles both log formats: plaintext logs (fences matched directly) and
+    stream-json JSONL logs produced by ``tee_stream_json`` (fences are
+    JSON-escaped inside event strings, so events are decoded first). Returns
+    the parsed dict on success, or ``None`` if no valid block is found.
+    Malformed/truncated logs and 0-byte logs both return ``None``.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    verdict = _extract_verdict_from_text(log_text)
+    if verdict is not None:
+        return verdict
+    return _extract_verdict_from_stream_json(log_text)
 
 
 def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
     """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
 
-    Fallback for when ``_parse_review_verdict_from_log`` fails: the plaintext
-    log may be truncated or the verdict block may be split across tee buffer
-    boundaries, but the structured stream-json events.jsonl contains the
-    assistant's message text in discrete JSONL lines. This scans
-    ``assistant_message`` events for the same fenced JSON verdict block.
+    Fallback for when ``_parse_review_verdict_from_log`` fails: the log may be
+    truncated or the verdict block split across tee buffer boundaries, but the
+    structured events.jsonl carries the assistant's text in discrete JSONL
+    lines. Decodes real stream-json events (``assistant``/``result``) as well
+    as the legacy ``assistant_message`` shape.
 
     Returns the parsed dict on success, or ``None`` if no valid block is found.
     """
-    if not events_path.exists():
-        return None
     try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
+        raw_text = events_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    return _extract_verdict_from_stream_json(raw_text)
 
-    # Scan in reverse: the verdict is in the final assistant message.
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
+
+def _parse_review_verdict_from_files(
+    log_path: Path,
+    packet_dir: Path,
+    started_at: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    """Last-resort verdict recovery from files the reviewer wrote (issue #566).
+
+    Reviewers sometimes write their review summary (verdict block included) to
+    a Markdown file and merely *reference* it in final output instead of
+    re-emitting the fenced JSON. Before counting a completed review as a
+    failed attempt, scan ``.md`` paths mentioned in the reviewer's decoded
+    output text, newest-mention-first.
+
+    **Nothing inside ``packet_dir`` is ever a candidate (issue #597).** Review
+    sessions launch with a hard-pinned ``--permission-mode plan`` (see
+    ``claude_code._force_review_permission_mode``), so a reviewer cannot write
+    any file, anywhere — every file in the packet directory is authored by the
+    orchestrator itself. ``review-prompt.md`` is one of them, and it embeds an
+    example verdict block. Globbing ``packet_dir`` for ``*.md`` therefore did
+    not recover reviewer verdicts; it parsed the orchestrator's own
+    instructions and recorded whatever the example said. Because the example
+    read ``"decision": "approved"``, a reviewer that emitted no verdict had an
+    approval manufactured for it, which then took the merge label. Ten PRs
+    across two repos merged unreviewed that way. ``_extract_verdict_from_stream_json``
+    already guarded against this exact echo; this path was added later and
+    bypassed that guard.
+
+    ``packet_dir`` is still taken as a parameter because it defines the
+    exclusion zone: a reviewer that *mentions* a packet path in its prose must
+    not pull the prompt back in through the mention branch either.
+
+    Every candidate is mtime-gated to the reviewer session's ``started_at``
+    (minus slack): a stale review file from a previous round must never
+    resurrect an old verdict for a new head. Without a parseable
+    ``started_at`` there is no safe gate, so no fallback is attempted.
+
+    Returns ``(verdict, source_path)`` or ``None``.
+    """
+    if not started_at:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
+            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
+        )
+    except ValueError:
+        return None
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    texts = [
+        text
+        for text in (extract_event_text(event) for event in iter_stream_json_events(log_text))
+        if text
+    ]
+    if not texts and log_text:
+        texts = [log_text]
+    for text in reversed(texts):
+        for match in _REVIEW_MD_PATH_RE.finditer(text):
+            raw = match.group(0)
+            if raw not in seen:
+                seen.add(raw)
+                candidates.append(Path(raw).expanduser())
+
+    # Issue #597: the packet directory is orchestrator-authored territory (see
+    # this function's docstring). Never read anything inside it -- not via a
+    # glob, and not via a path the reviewer happened to mention in its prose.
+    try:
+        excluded_root = packet_dir.resolve()
+    except OSError:
+        excluded_root = packet_dir
+
+    def _inside_packet_dir(candidate: Path) -> bool:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        return resolved == excluded_root or excluded_root in resolved.parents
+
+    # Stat-filter BEFORE capping: the cap bounds expensive file reads, and
+    # spurious path-looking mentions in the reviewer's text (nonexistent,
+    # stale, oversized) must not starve genuine candidates out of the read
+    # budget.
+    readable: list[Path] = []
+    for candidate in candidates:
+        if _inside_packet_dir(candidate):
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            stat = candidate.stat()
+        except OSError:
             continue
-        if not isinstance(event, dict):
+        if not candidate.is_file():
             continue
-        if event.get("type") != "assistant_message":
+        if stat.st_size > _REVIEW_FALLBACK_FILE_MAX_BYTES:
             continue
-
-        # The content may be a string or a list of content blocks.
-        content = event.get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text += str(block.get("text", ""))
-        elif isinstance(content, dict):
-            text = str(content.get("text", ""))
-
-        if not text:
+        if datetime.fromtimestamp(stat.st_mtime, tz=UTC) < cutoff:
             continue
+        readable.append(candidate)
+        if len(readable) >= _REVIEW_FALLBACK_MAX_CANDIDATES:
+            break
 
-        # Reuse the same fenced-JSON extraction logic.
-        matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL))
-        if not matches:
+    for candidate in readable:
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
-
-        for match in reversed(matches):
-            candidate = match.group(1).strip()
-            if not candidate:
-                continue
-            try:
-                data = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, dict):
-                continue
-
-            decision = data.get("decision")
-            if decision not in {"approved", "request_changes", "blocked"}:
-                continue
-
-            summary = data.get("summary")
-            if not isinstance(summary, str):
-                continue
-            if decision in {"request_changes", "blocked"} and not summary.strip():
-                continue
-
-            required_changes = data.get("required_changes")
-            if required_changes is not None and not isinstance(required_changes, list):
-                continue
-            if required_changes is not None and not all(
-                isinstance(item, str) for item in required_changes
-            ):
-                continue
-
-            return {
-                "decision": decision,
-                "summary": summary,
-                "required_changes": required_changes if required_changes is not None else [],
-            }
+        verdict = _extract_verdict_from_text(content)
+        if verdict is not None:
+            return verdict, str(candidate)
 
     return None
+
+
+def _reviewer_session_metrics(events_path: Path, verdict_source: str) -> dict[str, Any] | None:
+    """Parse reviewer session telemetry for a recorded verdict (perf/spend visibility).
+
+    Returns a dict of ``tokens``/``cost_usd``/``turn_count``/``tool_call_count``/
+    ``verdict_source`` for ``record_review`` to fold into the ``record_review``
+    event and the PR's state entry, or ``None`` when the events.jsonl sidecar
+    is missing or unparseable (devin workers, or a claude-code session launched
+    without tee_stream_json). Never raises: ``parse_claude_events`` already
+    tolerates a missing/malformed file, and a missing telemetry file must never
+    block recording the verdict itself.
+    """
+    progress = parse_claude_events(events_path)
+    if progress is None:
+        return None
+    return {
+        "tokens": progress.tokens,
+        "cost_usd": progress.cost_usd,
+        "turn_count": progress.turn_count,
+        "tool_call_count": progress.tool_call_count,
+        "verdict_source": verdict_source,
+    }
+
+
+# Why a reviewer session ended without a structured verdict. These are the
+# ``reason`` values on ``review_verdict_missed`` events; they have disjoint
+# remediations, so collapsing them into one label points every diagnostic at
+# the wrong fix (issue #588).
+REVIEW_MISS_TURN_LIMIT = "turn_limit_summary_posted"
+REVIEW_MISS_LAUNCH_FAILED = "launch_failed"
+REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
+
+
+@dataclass(frozen=True)
+class ReviewSessionOutcome:
+    """A reviewer session that ended without producing a structured verdict.
+
+    ``did_substantial_work`` is the distinction that matters downstream: a
+    session that completed turns and then died is a PR-level outcome (the
+    review didn't fit its budget), while one that never reached its first turn
+    is an environmental failure that says nothing about the PR.
+    """
+
+    text: str
+    reason: str
+    turn_count: int
+    tool_call_count: int
+
+    @property
+    def did_substantial_work(self) -> bool:
+        return self.reason != REVIEW_MISS_LAUNCH_FAILED
 
 
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
     max_turns: int,
-) -> str | None:
-    """Extract a markdown summary of a reviewer session that produced no verdict.
+) -> ReviewSessionOutcome | None:
+    """Summarize and classify a reviewer session that produced no verdict.
 
     When a reviewer hits the ``--max-turns`` limit (or dies for any other
     reason after doing substantial work), the structured verdict block is
@@ -1335,9 +1743,15 @@ def _extract_review_session_summary(
     tool-call metrics. This function reconstructs a human-readable summary
     from those events so the work is not silently lost.
 
-    Returns a markdown string suitable for a PR comment, or ``None`` if the
-    events file is missing or contains no assistant messages (nothing to
-    summarize).
+    It also classifies *why* the verdict is missing. A session that never
+    reached its first turn did not hit a turn limit -- it never ran -- and the
+    text recovered from its log is the process's own error output, not
+    analysis. Reporting the two identically hid a 25-hour outage in which 19
+    reviewers died on a rejected argv while every signal said "turn limit"
+    (issue #588).
+
+    Returns ``None`` if the events file is missing and the log contains no
+    recoverable text (nothing to summarize).
     """
     progress = parse_claude_events(events_path)
     # Also try the plaintext log as a fallback for assistant text.
@@ -1345,49 +1759,32 @@ def _extract_review_session_summary(
 
     if events_path.exists():
         try:
-            with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") != "assistant_message":
-                        continue
-                    content = event.get("content")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text += str(block.get("text", ""))
-                    elif isinstance(content, dict):
-                        text = str(content.get("text", ""))
-                    if text.strip():
-                        assistant_texts.append(text.strip())
+            raw_events = events_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            raw_events = ""
+        for event in iter_stream_json_events(raw_events):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
 
-    # Fallback: if no events.jsonl, try extracting non-verdict text from the
-    # plaintext log. This is less structured but still preserves the reviewer's
-    # analysis for the human.
+    # Fallback: if no events.jsonl, try the log. When it is a stream-json
+    # tee, decode the events; otherwise keep the remaining prose lines with
+    # fenced code blocks stripped (those are verdict attempts, not analysis).
     if not assistant_texts:
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        # Strip fenced code blocks (those are verdict attempts, not analysis)
-        # and keep the remaining prose lines.
-        stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
-        for line in stripped.splitlines():
-            stripped_line = line.strip()
-            if stripped_line and not stripped_line.startswith((">", "#", "-")):
-                assistant_texts.append(stripped_line)
+        for event in iter_stream_json_events(log_text):
+            text = extract_event_text(event)
+            if text.strip():
+                assistant_texts.append(text.strip())
+        if not assistant_texts:
+            stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+            for line in stripped.splitlines():
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith((">", "#", "-")):
+                    assistant_texts.append(stripped_line)
 
     if not assistant_texts:
         return None
@@ -1397,26 +1794,41 @@ def _extract_review_session_summary(
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
-    parts: list[str] = [
-        "## Reviewer session summary (no verdict produced)\n",
-    ]
-    if max_turns > 0 and turn_count >= max_turns:
-        parts.append(
-            f"The automated reviewer hit the {max_turns}-turn limit before "
-            f"producing a structured verdict.\n"
-        )
-    elif turn_count > 0:
-        parts.append(
-            f"The automated reviewer ran for {turn_count} turns "
-            f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
-        )
+    # A session with no turns and no tool calls never reached its first turn:
+    # the process died at launch and whatever text we recovered is its error
+    # output, not reviewer analysis.
+    if turn_count == 0 and tool_call_count == 0:
+        reason = REVIEW_MISS_LAUNCH_FAILED
+    elif max_turns > 0 and turn_count >= max_turns:
+        reason = REVIEW_MISS_TURN_LIMIT
     else:
-        parts.append("The automated reviewer did not produce a structured verdict.\n")
+        reason = REVIEW_MISS_DIED_MID_SESSION
 
-    # Include the last few assistant messages — earlier turns are usually
-    # tool-use planning; the final messages contain the analysis.
+    if reason == REVIEW_MISS_LAUNCH_FAILED:
+        parts = ["## Reviewer session failed to start\n"]
+        parts.append(
+            "The automated reviewer exited before running a single turn, so no "
+            "review was performed. This is an environmental or launch failure, "
+            "not a judgement about this PR.\n"
+        )
+        parts.append("\n### Error output from the reviewer process:\n")
+    else:
+        parts = ["## Reviewer session summary (no verdict produced)\n"]
+        if reason == REVIEW_MISS_TURN_LIMIT:
+            parts.append(
+                f"The automated reviewer hit the {max_turns}-turn limit before "
+                f"producing a structured verdict.\n"
+            )
+        else:
+            parts.append(
+                f"The automated reviewer ran for {turn_count} turns "
+                f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
+            )
+        # Include the last few assistant messages — earlier turns are usually
+        # tool-use planning; the final messages contain the analysis.
+        parts.append("\n### Recent analysis from the reviewer:\n")
+
     recent = assistant_texts[-3:]
-    parts.append("\n### Recent analysis from the reviewer:\n")
     for text in recent:
         if len(text) > 2000:
             text = text[:2000] + "\n... (truncated)"
@@ -1435,7 +1847,12 @@ def _extract_review_session_summary(
     if meta_parts:
         parts.append(f"\n*{' · '.join(meta_parts)}*")
 
-    return "\n".join(parts)
+    return ReviewSessionOutcome(
+        text="\n".join(parts),
+        reason=reason,
+        turn_count=turn_count,
+        tool_call_count=tool_call_count,
+    )
 
 
 def _remove_review_checkout_with_warning(
@@ -1544,8 +1961,9 @@ def _detect_and_handle_stalled_reviews(
     """Detect reviewer processes that died without a verdict and free their claims.
 
     A reviewer is considered stalled/orphaned when its sidecar process is no
-    longer alive and the claim timestamp is past the stale-claim timeout (30
-    minutes, see ``state.is_claim_stale``). When that happens, the per-PR
+    longer alive and the claim timestamp is past the stale-claim timeout
+    (``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES``, currently 5 minutes -- see
+    ``state.is_claim_stale``). When that happens, the per-PR
     ``review_dispatch_status`` is moved to ``review_dispatch_failed`` with the
     stale timestamp as ``review_dispatch_failed_at``. The next
     ``dispatch_reviews`` pass can then re-dispatch the PR after the same stale
@@ -1567,9 +1985,20 @@ def _detect_and_handle_stalled_reviews(
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
     """
     stalled: list[dict[str, Any]] = []
+    sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
     changed = False
     seen_pr_keys: set[str] = set()
+    # One provider-throttle condition per sweep, no matter how many dead
+    # reviewers show the same limit signature: the exponential probe backoff
+    # counts consecutive failed PROBES, and a wave of N simultaneously
+    # throttled reviewers is one observation of the closed provider window,
+    # not N. Without this, a 2-reviewer wave incremented the counter twice
+    # per sweep and (combined with the un-reaped sidecars below) drove the
+    # backoff from its 15-minute base to the 4-hour cap within 40 minutes
+    # (observed live 2026-07-24: consecutive_probe_failures=14 from a single
+    # quota outage).
+    throttle_backoff_applied = False
 
     for w in iter_workers(reviews_dir):
         pr_key = str(w.issue_number)
@@ -1622,9 +2051,63 @@ def _detect_and_handle_stalled_reviews(
             throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
 
         if throttled:
-            now_dt = datetime.now(UTC)
-            state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+            if not throttle_backoff_applied:
+                now_dt = datetime.now(UTC)
+                state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+                throttle_backoff_applied = True
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+            # A session that exhausted its full turn budget did real
+            # PR-specific work -- its death is a PR-level outcome (the
+            # review didn't fit the budget) regardless of what killed the
+            # final API call. Only sessions that died WITHOUT such work
+            # qualify for the provider-throttle rollback. _reap_review_verdicts
+            # (which runs before this sweep) sets
+            # review_turn_limit_summary_posted on the pr-state when it
+            # extracted a turn-limit miss from this same dead session, and
+            # that flag is reset to False on every new claim -- so it is the
+            # single source of truth for "this dispatch lifecycle's session
+            # did substantial work then died". When it is set, still apply
+            # the global quota backoff (the throttle signal itself is real)
+            # but treat the death as a normal counted failure so the per-PR
+            # attempt cap can converge (issue #583: without this guard a PR
+            # whose reviews deterministically hit the turn cap got unlimited
+            # free retries whenever the account was near its limit, and the
+            # 3-attempt cap never fired).
+            if pr_state.get("review_turn_limit_summary_posted"):
+                state["prs"][pr_key] = {
+                    **pr_state,
+                    "number": w.issue_number,
+                    "review_dispatch_status": "review_dispatch_failed",
+                    "review_dispatch_failed_at": w.started_at,
+                    "review_dispatch_pending_at": None,
+                    "review_dispatched_at": None,
+                    "reviewer_pid": None,
+                    "reviewer_process_start_time": None,
+                }
+                state = append_event(
+                    state,
+                    "review_dispatch_stalled",
+                    {
+                        "pr_number": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                        "throttled_until": throttled_until,
+                    },
+                    state_path=state_file,
+                )
+                changed = True
+                stalled.append(
+                    {
+                        "pr": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": "provider_throttled_turn_limit_counted",
+                    }
+                )
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                w.reap_sidecar(reviews_dir)
+                continue
             # Roll back (not fail) the claim: this is a global condition, not
             # a defect in this PR's review, so it should be immediately
             # re-dispatchable once the quota gate clears -- mirroring the
@@ -1659,6 +2142,17 @@ def _detect_and_handle_stalled_reviews(
                 }
             )
             remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            # Reap the sidecar like every other handled path in this sweep.
+            # The rolled-back claim is deliberately non-terminal (so the PR
+            # re-dispatches once the quota gate clears), which means neither
+            # terminal guard above will ever reap this sidecar -- without
+            # this line the same dead reviewer resurfaces every sweep, its
+            # log tail still matches the throttle signature, and each pass
+            # re-applies the exponential backoff for a session that died
+            # exactly once (observed live 2026-07-24: two dead reviewers
+            # re-counted across ~6 passes pushed probe_after 4 hours out
+            # while the provider window was already open again).
+            w.reap_sidecar(reviews_dir)
             continue
 
         state["prs"][pr_key] = {
@@ -1671,15 +2165,15 @@ def _detect_and_handle_stalled_reviews(
             "reviewer_pid": None,
             "reviewer_process_start_time": None,
         }
-        state = append_event(
-            state,
-            "review_dispatch_stalled",
-            {
-                "pr_number": w.issue_number,
-                "pid": w.pid,
-                "started_at": w.started_at,
-            },
-            state_path=state_file,
+        sweep_events.append(
+            (
+                "review_dispatch_stalled",
+                {
+                    "pr_number": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                },
+            )
         )
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
@@ -1711,15 +2205,15 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                 }
-                state = append_event(
-                    state,
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "pending",
-                        "pending_at": pending_at,
-                    },
-                    state_path=state_file,
+                sweep_events.append(
+                    (
+                        "review_dispatch_stalled",
+                        {
+                            "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                            "status": "pending",
+                            "pending_at": pending_at,
+                        },
+                    )
                 )
                 changed = True
                 stalled.append(
@@ -1750,15 +2244,15 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                 }
-                state = append_event(
-                    state,
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "dispatched",
-                        "dispatched_at": dispatched_at,
-                    },
-                    state_path=state_file,
+                sweep_events.append(
+                    (
+                        "review_dispatch_stalled",
+                        {
+                            "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                            "status": "dispatched",
+                            "dispatched_at": dispatched_at,
+                        },
+                    )
                 )
                 changed = True
                 stalled.append(
@@ -1818,15 +2312,15 @@ def _detect_and_handle_stalled_reviews(
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
             }
-            state = append_event(
-                state,
-                "review_dispatch_stalled",
-                {
-                    "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                    "status": "unclaimed",
-                    "prompt_mtime": packet_age,
-                },
-                state_path=state_file,
+            sweep_events.append(
+                (
+                    "review_dispatch_stalled",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "status": "unclaimed",
+                        "prompt_mtime": packet_age,
+                    },
+                )
             )
             changed = True
             stalled.append(
@@ -1841,6 +2335,9 @@ def _detect_and_handle_stalled_reviews(
                 )
 
     if changed:
+        state = _append_sweep_events(
+            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+        )
         save_state(state_file, state)
 
     return stalled
@@ -1955,6 +2452,7 @@ def _reap_orphaned_review_checkouts(
 
     alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
     reaped: list[int] = []
+    sweep_events: list[tuple[str, dict[str, Any]]] = []
     changed = False
     for pr_number in sorted(candidate_pr_numbers):
         try:
@@ -1996,15 +2494,18 @@ def _reap_orphaned_review_checkouts(
         # which re-triggers this reap — an infinite ping-pong per merged PR.
         _reap_review_sidecar(reviews_dir, pr_number)
         if removed:
-            state = append_event(
-                state,
-                "review_dispatch_lifecycle_reaped",
-                {"pr_number": pr_number, "github_state": gh_state.lower()},
-                state_path=state_file,
+            sweep_events.append(
+                (
+                    "review_dispatch_lifecycle_reaped",
+                    {"pr_number": pr_number, "github_state": gh_state.lower()},
+                )
             )
             reaped.append(pr_number)
 
     if changed:
+        state = _append_sweep_events(
+            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+        )
         save_state(state_file, state)
 
     return reaped
@@ -2013,6 +2514,7 @@ def _reap_orphaned_review_checkouts(
 def _append_sweep_events(
     state: dict[str, Any],
     sweep_events: list[tuple[str, dict[str, Any]]],
+    max_size: int | None = None,
     *,
     state_file: Path | None = None,
 ) -> dict[str, Any]:
@@ -2020,7 +2522,7 @@ def _append_sweep_events(
 
     A single occurrence of a kind is emitted with the original kind and payload.
     Multiple occurrences of the same kind are emitted as one ``{kind}_sweep`` event
-    with a count and issue-numbers list. This prevents a single bulk sweep from
+    with a count and a numbers list. This prevents a single bulk sweep from
     flooding the bounded event buffer and evicting unrelated diagnostic history.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -2029,20 +2531,30 @@ def _append_sweep_events(
 
     for kind, payloads in grouped.items():
         if len(payloads) == 1:
-            state = append_event(state, kind, payloads[0], state_path=state_file)
+            state = append_event(
+                state, kind, payloads[0], max_size=max_size, state_path=state_file
+            )
         else:
-            issue_numbers = [
-                payload["issue_number"]
-                for payload in payloads
-                if payload.get("issue_number") is not None
-            ]
+            numbers: list[int] = []
+            numbers_key = "numbers"
+            for payload in payloads:
+                if payload.get("issue_number") is not None:
+                    numbers.append(payload["issue_number"])
+                    numbers_key = "issue_numbers"
+                elif payload.get("pr_number") is not None:
+                    numbers.append(payload["pr_number"])
+                    if numbers_key == "numbers":
+                        numbers_key = "pr_numbers"
+                elif payload.get("number") is not None:
+                    numbers.append(payload["number"])
             state = append_event(
                 state,
                 f"{kind}_sweep",
                 {
                     "count": len(payloads),
-                    "issue_numbers": issue_numbers,
+                    numbers_key: numbers,
                 },
+                max_size=max_size,
                 state_path=state_file,
             )
     return state
@@ -2389,7 +2901,9 @@ def _detect_and_handle_orphaned_workers(
 
             state["issues"][str(issue_number)] = entry
 
-        state = _append_sweep_events(state, sweep_events, state_file=state_file)
+        state = _append_sweep_events(
+            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+        )
         save_state(state_file, state)
 
     # Route head-advanced request_changes findings to the review lane outside
@@ -2415,6 +2929,20 @@ def _detect_and_handle_orphaned_workers(
         # packet. Only a real packet should flip this orphaned-but-dispatched
         # issue to "reviewing".
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # That is not a fresh packet -- the PR is dead, not transiently
+        # blocked -- so it must NOT flip this issue to "reviewing" (an
+        # ACTIVE_STATE_STATUS no reconcile rule clears while the GitHub
+        # issue itself stays open: issue_active_label_no_open_pr sees the
+        # closed PR still links to the issue, issue_active_label_with_open_pr
+        # sees no OPEN PR, and the unknown-status recompute sweep skips
+        # "reviewing" because it is a VALID_ISSUE_STATUSES member). The
+        # issue's disposition is left to the existing closed-unmerged
+        # issue-side handling (closed_unmerged_pr_active_labels). Neither
+        # the "reviewing" flip nor the transient-block drift fingerprint
+        # below applies to a permanently-dead PR.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(state_file):
             state = load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -2423,6 +2951,7 @@ def _detect_and_handle_orphaned_workers(
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
@@ -3087,6 +3616,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     fallback_kind=failure_kind,
                     config=config,
                 )
+            elif w.adapter_kind == "api":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    adapter_kind="api",
+                )
             if failure_kind and throttled_until:
                 # A throttle-caused launch failure must persist its window just
                 # like the dead-session branch below — otherwise the governor
@@ -3134,7 +3671,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                     )
                     save_state(state_file, state)
 
-            w.reap_sidecar(sessions_dir)
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
             reaped.append(
                 {
                     "issue_number": w.issue_number,
@@ -3247,6 +3788,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                         )
                     )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            adapter_kind="api",
+                        )
+                    )
                 else:
                     failure_kind, throttled_until = None, None
                 # Diagnostic post-mortem; its worker_blocked verdict is ignored
@@ -3273,6 +3824,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                         )
                     )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            adapter_kind="api",
+                        )
+                    )
                 else:
                     failure_kind, throttled_until = None, None
 
@@ -3285,7 +3846,11 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
-            w.reap_sidecar(sessions_dir)
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
             reaped.append(
                 {
                     "issue_number": w.issue_number,
@@ -3726,6 +4291,8 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
+        # Make the event ring cap config-driven (issue #525).
+        _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir
         if prompts_dir:
             override = Path(prompts_dir)
@@ -3768,19 +4335,19 @@ class OrchestratorApp:
         # both repo-relative and absolute config paths.
         return self.repo_root / value
 
-    def _adapter_settings(self) -> AdapterSettings:
+    def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         claude = self.config.claude_code
         devin = self.config.devin
         api_worker = self.config.api_worker
-        adapter = devin.adapter
+        resolved_adapter = adapter if adapter is not None else devin.adapter
         # Use adapter-specific venv_source and worker_env
-        if adapter == "devin-shell":
+        if resolved_adapter == "devin-shell":
             venv_source = self._resolve(devin.venv_source) if devin.venv_source else None
             worker_env = devin.worker_env
-        elif adapter == "claude-code":
+        elif resolved_adapter == "claude-code":
             venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
             worker_env = claude.worker_env
-        elif adapter == "api":
+        elif resolved_adapter == "api":
             # api workers are Claude Code CLI processes with provider env
             # injected, so they reuse the claude-code venv/env resolution
             # (shared venv junction, worker_env overrides). The provider
@@ -3793,7 +4360,7 @@ class OrchestratorApp:
             venv_source = None
             worker_env = {}
         return AdapterSettings(
-            adapter=adapter,
+            adapter=resolved_adapter,
             dispatch_command=devin.dispatch_command,
             command_timeout_seconds=devin.command_timeout_seconds,
             sessions_dir=self._resolve(devin.sessions_dir),
@@ -3808,8 +4375,183 @@ class OrchestratorApp:
             base_ref=self.config.dispatch.base_ref,
             tee_stream_json=claude.tee_stream_json,
             launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
-            api_worker_config=api_worker if adapter == "api" else None,
+            api_worker_config=api_worker if resolved_adapter == "api" else None,
             config=self.config,
+        )
+
+    def _routing_inputs(self) -> tuple[Any, bool, bool, list[int]]:
+        """Compute pass-level routing inputs shared across all issues (issue #482).
+
+        Returns ``(budget, api_key_present, provider_in_cooldown,
+        live_api_sessions)`` — the inputs to ``routing.select_adapter`` for one
+        dispatch pass. Per-issue inputs (``rework``, ``issue_labels``) are
+        supplied by the caller.
+
+        * ``budget``: ``routing.BudgetStatus`` from ``api_budget.budget_status``
+          over the loaded ledger.
+        * ``api_key_present``: whether the active provider's ``api_key_env``
+          names a non-empty environment variable.
+        * ``provider_in_cooldown``: from the existing ``throttled_until`` state
+          mechanism (``state.is_throttled``). The dispatch-level throttle gate
+          already defers when this is True, so this is defense-in-depth for the
+          future api-specific cooldown (issue ⑦ in the design decomposition).
+        * ``live_api_sessions``: a **mutable** one-element list ``[count]``
+          holding the number of in-flight api workers (alive workers with
+          ``adapter_kind == "api"`` counted via ``worker.iter_workers``). The
+          list is mutated in place by ``_select_adapter_for_issue``: each issue
+          routed to the api adapter increments ``live_api_sessions[0]`` so that
+          subsequent issues in the same pass see the updated in-flight count and
+          fall back when ``max_concurrent_sessions`` is reached. Without this
+          running increment, every api-eligible issue in a batch would see the
+          same stale count and all bypass the concurrency cap simultaneously.
+        """
+        api_config = self.config.api_worker
+        # Budget status from the on-disk spend ledger (atomic load with
+        # corrupt-file recovery; missing file = empty ledger).
+        ledger = _api_load_ledger(_api_ledger_path(self.paths.state_file.parent))
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        budget = _api_budget_status(ledger, api_config.budget, today)
+        # API key present from the environment (name from the active provider).
+        provider = api_config.providers.get(api_config.provider)
+        api_key_present = bool(provider and os.environ.get(provider.api_key_env))
+        # Provider in cooldown from the existing throttle-cooldown state.
+        state = load_state_locked(self.paths.state_file)
+        provider_in_cooldown = is_throttled(state)
+        # Live api sessions counted via iter_workers filtered to adapter_kind == "api".
+        # Wrapped in a mutable list so _select_adapter_for_issue can increment it
+        # as issues are routed to api within the same pass (concurrency cap fix).
+        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        live_api_sessions = sum(
+            1 for w in iter_workers(sessions_dir) if w.adapter_kind == "api" and w.is_alive()
+        )
+        return budget, api_key_present, provider_in_cooldown, [live_api_sessions]
+
+    def _select_adapter_for_issue(
+        self,
+        *,
+        rework: bool,
+        issue_labels: set[str],
+        routing_inputs: tuple[Any, bool, bool, list[int]],
+    ) -> AdapterChoice:
+        """Call ``routing.select_adapter`` for one issue (issue #482).
+
+        The single point of adapter routing enforcement: no inline
+        adapter-choice conditionals live in workflow.py. Per-issue inputs
+        (``rework``, ``issue_labels``) are passed in; pass-level inputs come
+        from ``_routing_inputs``.
+
+        When the choice resolves to the api adapter, the mutable
+        ``live_api_sessions`` counter inside ``routing_inputs`` is incremented
+        in place so the next issue in the same pass sees the updated in-flight
+        count. This prevents a whole batch of api-eligible issues from all
+        passing the concurrency preflight against a stale count and exceeding
+        ``max_concurrent_sessions``.
+        """
+        budget, api_key_present, provider_in_cooldown, live_api_sessions = routing_inputs
+        choice = select_adapter(
+            rework=rework,
+            issue_labels=issue_labels,
+            complexity_high_label=self.config.labels.complexity_high,
+            api_config=self.config.api_worker,
+            budget=budget,
+            api_key_present=api_key_present,
+            provider_in_cooldown=provider_in_cooldown,
+            live_api_sessions=live_api_sessions[0],
+            default_adapter=self.config.devin.adapter,
+        )
+        if choice.kind == "api":
+            live_api_sessions[0] += 1
+        return choice
+
+    def _dispatch_partitioned(
+        self,
+        session_requests: list[SessionRequest],
+        adapter_choices: dict[int, AdapterChoice],
+    ) -> list[SessionDispatchResult]:
+        """Partition requests by ``AdapterChoice.kind`` and dispatch per group (issue #482).
+
+        When ``adapter_choices`` is empty (api disabled), dispatches all
+        requests as a single group with the default ``AdapterSettings`` —
+        byte-identical to the pre-#482 behavior. When non-empty, partitions
+        by kind and invokes ``dispatch_sessions`` once per non-empty group
+        with that group's ``AdapterSettings`` (built via ``_adapter_settings``
+        parameterized by kind). ``launch_stagger_seconds`` applies within each
+        group as today.
+
+        After all groups are dispatched, a combined session manifest and
+        results file are written to the standard paths so the on-disk
+        artifacts reflect every session in the pass (per-group calls each
+        overwrite these files; the combined write at the end is authoritative).
+        """
+        manifest_path = self.repo_root / self.config.devin.session_manifest
+        results_path = self.repo_root / self.config.devin.session_results
+
+        if not adapter_choices:
+            # No routing (api disabled) — single group, today's behavior.
+            return dispatch_sessions(
+                self.repo_root,
+                manifest_path,
+                results_path,
+                self._adapter_settings(),
+                session_requests,
+            )
+
+        # Partition by adapter kind, preserving the original request order
+        # within each group (stable partition).
+        groups: dict[str, list[SessionRequest]] = {}
+        for req in session_requests:
+            kind = adapter_choices[req.issue_number].kind
+            groups.setdefault(kind, []).append(req)
+
+        all_results: list[SessionDispatchResult] = []
+        for kind, group_requests in groups.items():
+            group_results = dispatch_sessions(
+                self.repo_root,
+                manifest_path,
+                results_path,
+                self._adapter_settings(adapter=kind),
+                group_requests,
+            )
+            all_results.extend(group_results)
+
+        # Write combined manifest and results reflecting all sessions in the
+        # pass. Per-group dispatch_sessions calls each overwrite these files;
+        # this final write is the authoritative on-disk artifact.
+        write_session_manifest(manifest_path, session_requests, adapter="mixed")
+        write_session_results(results_path, all_results)
+        return all_results
+
+    def _rescue_adapter_settings(self) -> AdapterSettings:
+        """AdapterSettings for a rescue-tier rework dispatch (issue #555).
+
+        Mirrors the "claude-code" branch of ``_adapter_settings()`` exactly
+        (same venv/worker_env/command resolution), but forces
+        ``adapter="claude-code"`` regardless of the primary configured
+        ``devin.adapter`` — the rescue tier always uses the claude-code
+        adapter — and overrides ``claude_code.model`` to
+        ``rescue.worker_model`` via a one-off config copy. This is the
+        "adapter/model overridden from RescueConfig" the rescue rework
+        reuses the existing rework-dispatch path with, never a parallel
+        launch path.
+        """
+        claude = self.config.claude_code
+        rescue_config = dataclasses_replace(
+            self.config,
+            claude_code=dataclasses_replace(claude, model=self.config.rescue.worker_model),
+        )
+        return AdapterSettings(
+            adapter="claude-code",
+            sessions_dir=self._resolve(self.config.devin.sessions_dir),
+            claude_command=claude.command,
+            worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
+            venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
+            worker_env=claude.worker_env,
+            materialize_dirs=self.config.dispatch.materialize_dirs,
+            dry_run=self.dry_run,
+            base_ref=self.config.dispatch.base_ref,
+            tee_stream_json=claude.tee_stream_json,
+            launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
+            config=rescue_config,
         )
 
     def _apply_concurrency_governor(
@@ -3902,7 +4644,12 @@ class OrchestratorApp:
             from .runners import format_runner_pool_state, observe_runner_pool
 
             try:
-                pool_state = observe_runner_pool(self.gh, self.config.runner_scaling)
+                # No state_dir here, so nothing is written either way today --
+                # threaded anyway so the call site stays honest if one is ever
+                # added, and so the dry-run call-site guard stays a bright line.
+                pool_state = observe_runner_pool(
+                    self.gh, self.config.runner_scaling, dry_run=self.gh.dry_run
+                )
                 runners_data = format_runner_pool_state(pool_state)
             except Exception:
                 # Don't fail status() if runner observation fails
@@ -4039,6 +4786,7 @@ class OrchestratorApp:
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
             self.config.labels.complexity_high: (
                 "Routing hint: route this first-pass issue to the api worker "
                 "(multi-module, cross-cutting invariant, or prior escalation)."
@@ -4632,11 +5380,28 @@ class OrchestratorApp:
             # Compute would-be SessionRequests without state mutation
             session_requests: list[SessionRequest] = []
             full_issues: dict[int, dict[str, Any]] = {}
+            # Issue #482: compute would-be adapter choices (read-only).
+            adapter_choices: dict[int, AdapterChoice] = {}
+            api_enabled = self.config.api_worker.enabled
+            routing_inputs = self._routing_inputs() if api_enabled else None
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
-                prompt_path = self._write_worker_prompt(full_issue)
                 branch_name = self._branch_name(full_issue)
+
+                template: str | None = None
+                if api_enabled and routing_inputs is not None:
+                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                    choice = self._select_adapter_for_issue(
+                        rework=False,
+                        issue_labels=issue_labels,
+                        routing_inputs=routing_inputs,
+                    )
+                    adapter_choices[issue_number] = choice
+                    if choice.kind == "api":
+                        template = self.config.api_worker.worker_template
+
+                prompt_path = self._write_worker_prompt(full_issue, template=template)
 
                 # Check if this is a dead-worker recovery (same logic as real dispatch)
                 recovery_record: dict[str, Any] | None = None
@@ -4669,6 +5434,10 @@ class OrchestratorApp:
                 ),
                 "label_errors": [],
                 "sessions": [asdict(request) for request in session_requests],
+                "adapter_choices": {
+                    str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
+                    for n, c in sorted(adapter_choices.items())
+                },
                 "dispatch_results": [],
                 "blocked": [
                     {"issue": issue_number, "blockers": blockers}
@@ -4765,7 +5534,46 @@ class OrchestratorApp:
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
         # redispatch it. Issue #432: capped to finalize_limit per pass.
-        for issue_number in finalizable_mention_issue_numbers:
+        #
+        # Issue #564: one-shot flagging. The flag must fire once per issue,
+        # not every pass — otherwise the operator's removal of
+        # agent:human-needed is overridden on the next pass and the event
+        # stream is spammed with one dispatch_merged_pr_mention_flagged event
+        # per pass while the mention persists. Skip issues whose state entry
+        # already records merged_pr_mention_flagged_at (set the first time
+        # this path flagged them). This follows the emit-on-change dedup
+        # pattern established in #556 for dispatch_skip_blocked/janitor_gate.
+        #
+        # Re-flag semantics: keyed on the timestamp's absence — once flagged,
+        # an issue is never re-flagged, even if a NEW merged PR mentions it.
+        # The simplest acceptable semantics per issue #564; pinned by
+        # test_dispatch_merged_pr_mention_flag_is_one_shot.
+        #
+        # Known limitation (issue #564 point 2, documented as out of scope):
+        # the mention-only *dispatch exclusion* still keys off the raw mention
+        # scan (merged_pr_issue_numbers below), not the label. So an operator
+        # who removes agent:human-needed to re-arm automation does NOT re-enter
+        # dispatch — the scan-based exclusion keeps blocking the issue until it
+        # closes or the mentioning PRs are no longer merged/referenced. Keying
+        # the exclusion off the label instead would let a deliberate operator
+        # requeue take effect, but it widens the blast radius (label-read
+        # dependency in the candidate filter) and is left for a follow-up.
+        # load_state_locked (not raw load_state) so the read holds the
+        # advisory state lock — required by the invariant enforced in
+        # test_no_unlocked_load_state_in_production_code. The authoritative
+        # timestamp write below is a separate locked critical section; this
+        # read is best-effort relative to it but must still hold the lock to
+        # avoid racing a concurrent tmp+replace writer (issue #310).
+        mention_state = load_state_locked(self.paths.state_file)
+        already_flagged_mention_issues = {
+            int(num)
+            for num, entry in mention_state.get("issues", {}).items()
+            if isinstance(entry, dict) and entry.get("merged_pr_mention_flagged_at")
+        }
+        newly_flagged_mention_issues = [
+            n for n in finalizable_mention_issue_numbers if n not in already_flagged_mention_issues
+        ]
+        for issue_number in newly_flagged_mention_issues:
             transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
 
         # Issue #429/#433: closed-unmerged stripping is handled by
@@ -4810,7 +5618,11 @@ class OrchestratorApp:
             # check) can surface mention-only coverage without re-deriving
             # the mention scan. "status" is deliberately untouched — the
             # issue stays open and its normal state machine intact.
-            for issue_number in finalizable_mention_issue_numbers:
+            # Issue #564: only record/emit for issues flagged *this* pass
+            # (newly_flagged_mention_issues); already-flagged issues are
+            # skipped so the event fires once and the operator's label
+            # removal is not overridden on the next pass.
+            for issue_number in newly_flagged_mention_issues:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -4818,11 +5630,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if finalizable_mention_issue_numbers:
+            if newly_flagged_mention_issues:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": finalizable_mention_issue_numbers},
+                    {"issue_numbers": newly_flagged_mention_issues},
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
@@ -5010,11 +5822,35 @@ class OrchestratorApp:
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
+        # Issue #482: per-issue adapter routing. When api_worker is enabled,
+        # select_adapter is called once per issue to route it to the api or
+        # fallback adapter. When disabled, adapter_choices stays empty and
+        # _dispatch_partitioned falls back to a single-group dispatch
+        # byte-identical to the pre-#482 behavior.
+        adapter_choices: dict[int, AdapterChoice] = {}
+        api_enabled = self.config.api_worker.enabled
+        routing_inputs = self._routing_inputs() if api_enabled else None
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
-            prompt_path = self._write_worker_prompt(full_issue)
             branch_name = self._branch_name(full_issue)
+
+            # Determine the adapter for this issue (single point of enforcement:
+            # routing.select_adapter). The prompt template follows the choice
+            # so the api worker gets the claude-code-flavored prompt.
+            template: str | None = None
+            if api_enabled and routing_inputs is not None:
+                issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                choice = self._select_adapter_for_issue(
+                    rework=False,
+                    issue_labels=issue_labels,
+                    routing_inputs=routing_inputs,
+                )
+                adapter_choices[issue_number] = choice
+                if choice.kind == "api":
+                    template = self.config.api_worker.worker_template
+
+            prompt_path = self._write_worker_prompt(full_issue, template=template)
 
             # Check if this is a dead-worker recovery: the issue has a previous
             # dispatch record with the same branch name (i.e., our own crashed attempt)
@@ -5035,27 +5871,41 @@ class OrchestratorApp:
                     recovery=recovery_record,
                 )
             )
+        dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
-        dispatch_results = dispatch_sessions(
-            self.repo_root,
-            manifest_path,
-            results_path,
-            self._adapter_settings(),
-            session_requests,
-        )
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
-        live_worker_issue_numbers = {
-            result.issue_number
-            for result in dispatch_results
-            if not result.ok and result.failure_kind == "live_worker_redispatch_averted"
-        }
+        # Issue #523: a live_worker_redispatch_averted result claims the prior
+        # worker is still alive, but the adapter's probe (_probe_recovery_liveness)
+        # can fail closed on an inconclusive real-activity signal (probe_error) or
+        # report fresh sessions.db activity even when the recorded wrapper PID is
+        # dead/recycled. Verify the PID against the OS (with start-time identity)
+        # at the single point where live worker slots are counted — the same
+        # is_pid_alive + process_start_time check the review lane uses via
+        # _reviewer_pid_alive. A session whose recorded PID is dead is a phantom
+        # slot and is routed through the dead-session path below (sidecar reap,
+        # label repair) instead of starving fresh dispatch.
+        live_worker_issue_numbers: set[int] = set()
+        phantom_live_worker_issue_numbers: set[int] = set()
+        for result in dispatch_results:
+            if result.ok or result.failure_kind != "live_worker_redispatch_averted":
+                continue
+            if (
+                result.pid is not None
+                and result.pid > 0
+                and is_pid_alive(result.pid, result.process_start_time)
+            ):
+                live_worker_issue_numbers.add(result.issue_number)
+            else:
+                phantom_live_worker_issue_numbers.add(result.issue_number)
         failed_issue_numbers = {
             result.issue_number
             for result in dispatch_results
-            if not result.ok and result.issue_number not in live_worker_issue_numbers
+            if not result.ok
+            and result.issue_number not in live_worker_issue_numbers
+            and result.issue_number not in phantom_live_worker_issue_numbers
         }
         foreign_writer_issue_numbers = {
             result.issue_number
@@ -5072,6 +5922,7 @@ class OrchestratorApp:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
                 is_live_worker = request.issue_number in live_worker_issue_numbers
+                is_phantom_live_worker = request.issue_number in phantom_live_worker_issue_numbers
                 prev_entry = state["issues"].get(str(request.issue_number), {})
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
@@ -5079,6 +5930,23 @@ class OrchestratorApp:
                 elif is_live_worker:
                     status = "dispatched"
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
+                elif is_phantom_live_worker:
+                    # Issue #523: the adapter reported a live worker, but the
+                    # recorded PID failed the OS-level liveness + identity
+                    # check. Route through the dead-session path (sidecar reap,
+                    # label repair) instead of keeping the phantom slot
+                    # occupied. The slot is freed and the issue becomes
+                    # dispatchable again without burning a redispatch attempt.
+                    # A dispatched request's issue can never have an open
+                    # tracked PR -- candidate selection excludes every issue in
+                    # pr_by_issue -- so the rework-routing case is handled by
+                    # the dead-session reaper lane, not here.
+                    status, dispatched_at, state = self._route_phantom_live_worker(
+                        state,
+                        request,
+                        full_issue,
+                        sessions_dir,
+                    )
                 else:
                     # Issue #461: bound dispatch_failed retries with the same
                     # redispatch-window cap used for rework.
@@ -5131,6 +5999,18 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     entry.pop("escalation_reason", None)
+                elif is_phantom_live_worker:
+                    # Issue #523: a phantom live worker is being routed as dead;
+                    # do not preserve a stale worker_pid that would keep the slot
+                    # occupied, and do not burn a redispatch attempt (the launch
+                    # was averted, not failed).
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    entry.pop("escalation_reason", None)
+                    entry.pop("worker_pid", None)
+                    entry.pop("worker_process_start_time", None)
                 elif status == "escalated":
                     entry["dispatch_failed_at"] = all_attempts
                     entry["escalation_reason"] = (
@@ -5152,6 +6032,13 @@ class OrchestratorApp:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
                 state["issues"][str(request.issue_number)] = entry
+                # Issue #482: record the adapter choice (including fallback
+                # choices) into adapter_history so every routing decision is
+                # auditable. record_adapter_choice returns a new state dict
+                # (immutable helper); chain it before the atomic save.
+                choice = adapter_choices.get(request.issue_number)
+                if choice is not None:
+                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 # Persist the launched worker BEFORE touching GitHub labels: a
                 # transient label-write failure (or crash) must never leave a live
                 # worker unrecorded and therefore re-dispatchable next wave. The
@@ -5302,6 +6189,7 @@ class OrchestratorApp:
                 {
                     "issue_numbers": sorted(successful_issue_numbers),
                     "live_worker_issue_numbers": sorted(live_worker_issue_numbers),
+                    "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
                     "label_errors": sorted(label_errors),
@@ -5309,7 +6197,7 @@ class OrchestratorApp:
                     "deferred_by_concurrency": deferred_by_concurrency,
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-                    "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+                    "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                     "failures": dispatch_failure_map,
                 },
                 state_path=self.paths.state_file,
@@ -5329,19 +6217,25 @@ class OrchestratorApp:
             message += f" (skipped non-dispatchable: {skipped_issue_numbers})"
         if label_errors:
             message += f" (launched but label write failed: {sorted(label_errors)})"
+        if phantom_live_worker_issue_numbers:
+            message += (
+                f" (reaped phantom live worker slots: {sorted(phantom_live_worker_issue_numbers)})"
+            )
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
             "failed_count": len(failed_issue_numbers),
             "failures": dispatch_failure_map,
             "live_worker_count": len(live_worker_issue_numbers),
+            "phantom_live_worker_count": len(phantom_live_worker_issue_numbers),
+            "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "merged_prs": merged_prs,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
-            "merged_pr_flagged_issue_numbers": sorted(finalizable_mention_issue_numbers),
+            "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -5414,7 +6308,15 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found.
+            was not found. Two ok=True returns carry NO packet and callers that
+            gate a status->"reviewing" flip on ``ok`` must additionally exclude
+            them via the data flags: ``routed_to_rework`` (the janitor-gate
+            conflict/no-op-rework route re-requests rework with no packet) and
+            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
+            converged to state status "closed" at the janitor gate -- the PR is
+            dead, not a fresh-packet candidate). See
+            ``_route_rework_candidate_to_review`` and the dead-worker orphan
+            sweep for the canonical gating pattern.
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
@@ -5479,6 +6381,44 @@ class OrchestratorApp:
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
         if not verdict.ok:
+            # Issue #558: a PR that is CLOSED (unmerged) on GitHub is dead --
+            # every other janitor failure is moot. Converge the state PR
+            # entry to "closed" at this boundary (single-point-of-enforcement)
+            # so the janitor stops re-fetching and re-evaluating it every
+            # pass. The reconcile rule (closed_unmerged_pr_state_converged)
+            # is the idempotent backstop for entries the janitor gate never
+            # observes (e.g. a PR that closed between passes, or one never
+            # routed through review()). MERGED PRs are left to
+            # merged_outside_orchestrator's reconcile rule. The linked
+            # issue's disposition is left to the existing closed-unmerged
+            # issue-side handling.
+            if str(pr.get("state") or "").upper() == "CLOSED":
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    existing_pr_state = state["prs"].get(str(pr_number), {})
+                    if existing_pr_state.get("status") != "closed":
+                        state["prs"][str(pr_number)] = {
+                            **without_review_dispatch_claim(existing_pr_state),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "closed",
+                        }
+                        state = self._record_event(
+                            state,
+                            "closed_unmerged_pr_state_converged",
+                            {"pr_number": pr_number, "issue_number": issue_number},
+                        )
+                        save_state(self.paths.state_file, state)
+                return CommandResult(
+                    True,
+                    f"PR #{pr_number} is CLOSED (unmerged) on GitHub; "
+                    f"converged state status to 'closed'",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "closed_unmerged_converged": True,
+                    },
+                )
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
@@ -5704,9 +6644,33 @@ class OrchestratorApp:
             enabled=cross_family,
         )
         prompt_path = pr_dir / "review-prompt.md"
+        decision_path = pr_dir / "review-decision.json"
         diff_size_section = _diff_size_section(
             diff, self.config.review_dispatch.diff_line_threshold, diff_path
         )
+        ci_status_section = _ci_status_section(
+            checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
+        )
+
+        # Single read of review-decision.json, BEFORE rendering: reused both to
+        # build the round-2 $prior_review_section below and, after rendering,
+        # by the stale-verdict reset a few lines down. Previously that reset
+        # was the only reader, and it ran after the prompt was already
+        # rendered — so a prior round's verdict/summary/required_changes were
+        # on disk at render time but never surfaced to the reviewer.
+        existing_decision = self._review_decision(pr_number)
+        prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
+        is_round2_review = (
+            existing_decision.get("decision") not in ("pending", None, "missing", "invalid")
+            and prior_reviewed_head_sha
+            and prior_reviewed_head_sha != pr.get("headRefOid")
+        )
+        prior_review_section = (
+            self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
+            if is_round2_review
+            else ""
+        )
+
         prompt = self._render(
             "review.md",
             {
@@ -5717,12 +6681,13 @@ class OrchestratorApp:
                 "issue_title": issue.get("title", "UNKNOWN"),
                 "issue_url": issue.get("url", ""),
                 "pr_json_path": pr_dir / "pr.json",
-                "checks_json_path": pr_dir / "checks.json",
                 "diff_path": pr_dir / "diff.patch",
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
                 "diff_size_section": diff_size_section,
+                "ci_status_section": ci_status_section,
+                "prior_review_section": prior_review_section,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -5734,7 +6699,6 @@ class OrchestratorApp:
             "required_changes": [],
             "reviewed_at": None,
         }
-        decision_path = pr_dir / "review-decision.json"
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
         else:
@@ -5745,10 +6709,8 @@ class OrchestratorApp:
             # equally stale when the head has advanced, and carrying forward its
             # summary/required_changes misleads the reviewer into re-issuing the
             # same verdict without examining the new diff.
-            existing_decision = self._review_decision(pr_number)
-            reviewed_head_sha = existing_decision.get("reviewed_head_sha")
             if existing_decision.get("decision") not in ("pending", None) and (
-                reviewed_head_sha is None or reviewed_head_sha != pr.get("headRefOid")
+                prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
         with state_lock(self.paths.state_file):
@@ -6063,6 +7025,7 @@ class OrchestratorApp:
                     continue
                 issue_number = pr_state.get("issue_number")
 
+            verdict_source = "log"
             verdict = _parse_review_verdict_from_log(Path(w.log_path))
             if verdict is None:
                 # Fallback: parse the structured events.jsonl. The plaintext log
@@ -6070,48 +7033,106 @@ class OrchestratorApp:
                 # boundaries, but the stream-json events contain the assistant's
                 # message text in discrete JSONL lines.
                 events_path = _events_path(reviews_dir, pr_number, review=True)
+                verdict_source = "events"
                 verdict = _parse_review_verdict_from_events(events_path)
+            if verdict is None:
+                # Last resort (issue #566): the reviewer may have written its
+                # verdict to a Markdown file it referenced in final output
+                # instead of re-emitting the fenced block. mtime-gated to this
+                # session's started_at so stale files never resurrect old
+                # verdicts.
+                file_hit = _parse_review_verdict_from_files(
+                    Path(w.log_path),
+                    self.paths.prs / f"pr-{pr_number}",
+                    w.started_at,
+                )
+                if file_hit is not None:
+                    verdict, file_source = file_hit
+                    verdict_source = f"file:{file_source}"
             if verdict is None:
                 # No structured verdict found. Before discarding this reviewer's
                 # work, check if it did substantial analysis (e.g. hit the
                 # --max-turns limit) and post a summary PR comment so the work
                 # is not silently lost. Only post once per dispatch lifecycle.
                 pr_state_dict = pr_state
-                if not pr_state_dict.get("review_turn_limit_summary_posted"):
+                # One-shot guard. ``review_miss_summary_posted`` covers every
+                # miss reason; the legacy turn-limit key is still honoured so
+                # PRs mid-lifecycle when this shipped don't get a second
+                # comment.
+                already_posted = pr_state_dict.get(
+                    "review_miss_summary_posted"
+                ) or pr_state_dict.get("review_turn_limit_summary_posted")
+                if not already_posted:
                     events_path = _events_path(reviews_dir, pr_number, review=True)
                     max_turns = self.config.review_dispatch.review_max_turns
-                    summary_text = _extract_review_session_summary(
+                    outcome = _extract_review_session_summary(
                         events_path, Path(w.log_path), max_turns
                     )
-                    if summary_text is not None:
+                    if outcome is not None:
                         try:
-                            self._comment_pr(pr_number, summary_text)
+                            self._comment_pr(pr_number, outcome.text)
                         except Exception:
                             pass
                         with state_lock(self.paths.state_file):
                             state = load_state(self.paths.state_file)
                             ps = state["prs"].get(str(pr_number), {})
+                            # The turn-limit key means "this dispatch
+                            # lifecycle's session did substantial work then
+                            # died". The provider-throttle sweep reads it to
+                            # deny a rollback (#583) and #584 counts it as a
+                            # turn-limit death, so a session that never
+                            # reached turn 1 must not set it -- that death is
+                            # environmental and says nothing about this PR.
                             state["prs"][str(pr_number)] = {
                                 **ps,
-                                "review_turn_limit_summary_posted": True,
+                                "review_miss_summary_posted": True,
+                                "review_turn_limit_summary_posted": (outcome.did_substantial_work),
                             }
+                            state = append_event(
+                                state,
+                                "review_verdict_missed",
+                                {
+                                    "pr_number": pr_number,
+                                    "issue_number": issue_number,
+                                    "reason": outcome.reason,
+                                    "turn_count": outcome.turn_count,
+                                    "tool_call_count": outcome.tool_call_count,
+                                },
+                                state_path=self.paths.state_file,
+                            )
                             save_state(self.paths.state_file, state)
                         missed.append(
                             {
                                 "pr": pr_number,
                                 "issue": issue_number,
-                                "reason": "turn_limit_summary_posted",
+                                "reason": outcome.reason,
                             }
                         )
                 continue
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
+            session_metrics = _reviewer_session_metrics(
+                _events_path(reviews_dir, pr_number, review=True), verdict_source
+            )
+            # Fold the review_effort experiment's arm/effort assignment (set
+            # at claim time in dispatch_reviews) into session_metrics so the
+            # record_review event alone is enough to split spend/quality by
+            # arm, without a join back to the dispatch event.
+            review_effort_arm = pr_state.get("review_effort_arm")
+            review_effort_used = pr_state.get("review_effort_used")
+            if review_effort_arm is not None or review_effort_used is not None:
+                session_metrics = {
+                    **(session_metrics or {}),
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
+                }
             result = self.record_review(
                 pr_number,
                 verdict["decision"],
                 summary=verdict["summary"],
                 reviewed_head=packet_head_sha,
                 required_changes=verdict["required_changes"],
+                session_metrics=session_metrics,
             )
             if result.ok:
                 recorded.append(
@@ -6119,14 +7140,29 @@ class OrchestratorApp:
                         "pr": pr_number,
                         "issue": issue_number,
                         "decision": verdict["decision"],
+                        "verdict_source": verdict_source,
                     }
                 )
             else:
+                reason = result.message or "record_review failed"
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "review_verdict_missed",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "reason": reason,
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
                 missed.append(
                     {
                         "pr": pr_number,
                         "issue": issue_number,
-                        "reason": result.message or "record_review failed",
+                        "reason": reason,
                     }
                 )
 
@@ -6259,6 +7295,18 @@ class OrchestratorApp:
                         ),
                     ),
                 )
+            # Rescue tier (issue #555): the quota gate above governs Claude-
+            # family reviewer launches only. Rescue reviews run on the
+            # cross-family (Devin) adapter via _process_rescue_review and do
+            # not consume Claude quota, so a Claude quota deferral must not
+            # freeze them. Still compute the queue and process the rescue
+            # partition here; the deferred result below covers normal
+            # candidates only, unchanged from before this fix.
+            deferred_queue_result = self.review_queue()
+            deferred_candidates = deferred_queue_result.data.get("queue", [])
+            _deferred_normal, deferred_rescue_results = self._partition_rescue_candidates(
+                deferred_candidates
+            )
             return CommandResult(
                 True,
                 "review dispatch deferred: reviewer quota exhausted, probe not ready",
@@ -6270,6 +7318,7 @@ class OrchestratorApp:
                     "deferred_reason": "reviewer_quota_probe_backoff",
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "rescue_review_results": deferred_rescue_results,
                 },
             )
 
@@ -6289,10 +7338,36 @@ class OrchestratorApp:
                 },
             )
 
+        # Rescue tier (issue #555): a rescue-marked PR's review must run
+        # through the cross-family rescue reviewer (_process_rescue_review),
+        # never a normal same-family Claude reviewer -- the exit-to-human-on-
+        # request_changes rule only holds if this replaces, rather than
+        # precedes, the normal dispatch below. Partitioned out here, before
+        # any of the normal claim/quota machinery runs on these PRs. Routing
+        # keys on the durable rescue_attempted marker alone (never on
+        # self.config.rescue.enabled -- see _partition_rescue_candidates).
+        candidates, rescue_review_results = self._partition_rescue_candidates(candidates)
+        if not candidates:
+            return CommandResult(
+                True,
+                f"review dispatch: {len(rescue_review_results)} rescue review(s) "
+                "processed, no normal candidates",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                    "rescue_review_results": rescue_review_results,
+                },
+            )
+
         # Filter out PRs that are already claimed or still have a live reviewer.
         # Also escalate PRs that have exhausted their dispatch attempt budget.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
         escalated_for_labels: list[tuple[int, int | None]] = []
+        escalated_skipped: list[int] = []
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Escalate PRs whose dispatch attempt count has reached the cap.
@@ -6303,7 +7378,49 @@ class OrchestratorApp:
             for c in candidates:
                 pr_key = str(c["pr"])
                 pr_state = state["prs"].get(pr_key, {})
+                # Escalation gate (issue #575): a PR whose pr-state status is
+                # "escalated", or whose linked issue's state status is
+                # "escalated", is awaiting a human and must never be
+                # re-dispatched or re-escalated -- record_review's escalation
+                # guard (~line 6823) refuses the verdict anyway, so dispatching
+                # here only burns provider quota on a session whose result is
+                # thrown away and then silently lost (the live incident behind
+                # this fix: issue #480/PR #540). This must run BEFORE the
+                # attempt-cap escalation below too: an issue that gets
+                # escalated by an independent path (not this attempt-cap
+                # branch) while its PR is already sitting at the cap must not
+                # trigger a second, bogus "max_review_dispatch_attempts_exceeded"
+                # escalation on top of it. No per-pass event is emitted for the
+                # skip itself (see review_dispatch_escalated below for the
+                # human-facing signal) because this condition holds every pass
+                # while a human has not yet resolved the escalation; emitting a
+                # duplicate event each pass would spam the event log.
+                issue_num_gate = pr_state.get("issue_number") or c.get("issue")
+                issue_state_gate = (
+                    state["issues"].get(str(issue_num_gate), {})
+                    if issue_num_gate is not None
+                    else {}
+                )
+                if (
+                    pr_state.get("status") == "escalated"
+                    or issue_state_gate.get("status") == "escalated"
+                ):
+                    escalated_skipped.append(c["pr"])
+                    continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                if pr_state.get(
+                    "review_dispatch_status"
+                ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
+                    # Never escalate over a LIVE in-flight reviewer (issue
+                    # #573): the cap can be reached by attempts that predate
+                    # the current launch (e.g. quota deaths whose rollback
+                    # decrement was bypassed), and killing the claim
+                    # mid-review orphans the imminent verdict — the reaper
+                    # only records verdicts for dispatched claims. Let the
+                    # review finish: a recorded verdict resets the counter;
+                    # a death is dispositioned by the stalled sweep, after
+                    # which the cap escalates honestly on a dead claim.
+                    continue
                 if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state["prs"][pr_key] = {
@@ -6338,10 +7455,17 @@ class OrchestratorApp:
                     escalated_for_labels.append((int(c["pr"]), issue_num))
             if changed:
                 save_state(self.paths.state_file, state)
+            # The escalation gate above already filtered out escalated
+            # candidates (and recorded them in escalated_skipped) before any
+            # attempt-count or claim mutation ran for them; here we only need
+            # to exclude those same PR numbers so this second pass over
+            # candidates doesn't re-select them via _is_review_dispatchable.
+            escalated_skipped_set = set(escalated_skipped)
             dispatchable = [
                 c
                 for c in candidates
-                if _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
+                if c["pr"] not in escalated_skipped_set
+                and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
             ]
 
         # Apply the human-needed label edge for each fresh escalation, outside
@@ -6405,6 +7529,7 @@ class OrchestratorApp:
                     "failed_count": 0,
                     "launched_count": 0,
                     "deferred_count": len(candidates) - len(selected),
+                    "escalated_skipped": escalated_skipped,
                     **local_cap.report_fields(),
                 },
             )
@@ -6416,10 +7541,21 @@ class OrchestratorApp:
         now = utc_now()
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            review_effort_assignments: list[dict[str, Any]] = []
+            # Single source of truth for the review_effort experiment arm:
+            # resolved ONCE here at claim time and threaded through to the
+            # launch call below via resolved_review_effort, so the launch
+            # uses exactly this value instead of re-deriving it (agreement
+            # by construction, not by convention).
+            resolved_review_efforts: dict[int, str] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+                review_effort_used, review_effort_arm = resolve_review_effort(
+                    pr_number, self.config.review_dispatch, self.config.claude_code
+                )
+                resolved_review_efforts[pr_number] = review_effort_used
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -6432,7 +7568,17 @@ class OrchestratorApp:
                     "reviewer_process_start_time": None,
                     "review_dispatch_attempt_count": attempt_count + 1,
                     "review_turn_limit_summary_posted": False,
+                    "review_miss_summary_posted": False,
+                    "review_effort_arm": review_effort_arm,
+                    "review_effort_used": review_effort_used,
                 }
+                review_effort_assignments.append(
+                    {
+                        "pr_number": pr_number,
+                        "review_effort_arm": review_effort_arm,
+                        "review_effort_used": review_effort_used,
+                    }
+                )
             if selected:
                 state = append_event(
                     state,
@@ -6440,6 +7586,7 @@ class OrchestratorApp:
                     {
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
+                        "review_effort_assignments": review_effort_assignments,
                     },
                     state_path=self.paths.state_file,
                 )
@@ -6499,9 +7646,21 @@ class OrchestratorApp:
                 # the read-only command template regardless of what is passed
                 # for command_template, so passing it through would be
                 # misleading dead code (PR #397 round-2 review).
+                #
+                # `config` IS forwarded (unlike the above): launch_claude_worker
+                # falls back to a bare default OrchestratorConfig() whenever
+                # config is omitted, which was silently discarding every
+                # review-only pin (review_effort, review_max_turns, and the
+                # review_effort experiment) at the one real dispatch_reviews()
+                # launch site — the effort/max-turns pins only ever worked in
+                # direct launch_claude_worker(config=...) unit tests, never in
+                # an actual dispatch pass. adapters.py's worker-dispatch path
+                # (_run_claude_code_adapter) already forwards config the same
+                # way.
                 launch_kwargs: dict[str, Any] = {
                     "repo_root": self.repo_root,
                     "sessions_dir": reviews_dir,
+                    "config": self.config,
                     "env": claude_cfg.worker_env,
                     "materialize_dirs": self.config.dispatch.materialize_dirs,
                     "review": True,
@@ -6512,6 +7671,11 @@ class OrchestratorApp:
                     # benefit from the structured output because their verdict
                     # extraction depends on it.
                     "tee_stream_json": True,
+                    # The review_effort experiment arm was already resolved
+                    # once, above, at claim time (and persisted to state/
+                    # telemetry) -- pass it through so launch_claude_worker
+                    # uses this value directly instead of re-resolving it.
+                    "resolved_review_effort": resolved_review_efforts.get(pr_number),
                 }
 
                 record = launch_claude_worker(
@@ -6649,11 +7813,198 @@ class OrchestratorApp:
             "probe_mode": probe_mode,
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
+            "escalated_skipped": escalated_skipped,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
+            "rescue_review_results": rescue_review_results,
         }
         data.update(local_cap.report_fields())
         return CommandResult(ok, message, data)
+
+    def _partition_rescue_candidates(
+        self, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split ``review_queue()`` candidates into normal vs rescue-marked
+        (issue #555), and process the rescue ones via ``_process_rescue_review``.
+
+        Routing keys on the durable ``rescue_attempted`` marker ALONE, never
+        on ``self.config.rescue.enabled``: an operator flipping ``enabled``
+        off while a rescue is in flight must not cause an already-marked PR
+        to fall through to a normal same-family reviewer, or (on a later
+        request_changes) to the legacy escalation path without the two
+        rescue artifacts. ``enabled`` only gates NEW rescue entry at the
+        three cap sites (record_review / _route_janitor_gate_failure_to_
+        rework) — routing of PRs that already carry the marker is
+        unconditional.
+
+        A rescue-marked PR whose ``pr_state["status"] == "escalated"`` is
+        dropped entirely — not processed again, not returned as a normal
+        candidate either. ``_process_rescue_review``'s escalation write does
+        not advance the review packet's recorded decision, so
+        ``review_queue()`` would otherwise keep requeuing it every pass,
+        re-running the (blocking, up to ``reviewer_timeout_seconds``)
+        cross-family review, reposting the escalation PR comment, and
+        re-firing ``rescue_review_escalated`` forever.
+        """
+        rescue_snapshot = load_state_locked(self.paths.state_file)
+        normal_candidates: list[dict[str, Any]] = []
+        rescue_review_results: list[dict[str, Any]] = []
+        for c in candidates:
+            pr_state = rescue_snapshot.get("prs", {}).get(str(c["pr"]), {})
+            if not pr_state.get("rescue_attempted"):
+                normal_candidates.append(c)
+                continue
+            if pr_state.get("status") == "escalated":
+                continue
+            result = self._process_rescue_review(c)
+            rescue_review_results.append({"pr": c["pr"], **result.data})
+        return normal_candidates, rescue_review_results
+
+    def _process_rescue_review(self, candidate: dict[str, Any]) -> CommandResult:
+        """Run the cross-family rescue review for one rescue-marked PR
+        (issue #555) and apply the rescue tier's exit semantics.
+
+        Called from ``dispatch_reviews()`` INSTEAD of the normal Claude
+        reviewer dispatch for any candidate whose PR record already carries
+        ``rescue_attempted`` — i.e. its rescue rework was already dispatched
+        (via the normal rework-dispatch path, just adapter/model-overridden;
+        see ``_rescue_adapter_settings``) and has since pushed a new head.
+
+        Synchronous and one-shot (mirrors ``run_cross_family_review``'s own
+        contract): no new polling/reaping machinery is introduced. Exit
+        semantics per the issue spec:
+
+        - ``approved`` -> recorded through the SAME entry point normal
+          reviews use (``record_review``), so the existing ship-it/merge
+          path takes over exactly as it would for a normal approval.
+        - ``request_changes``/``blocked``/unparseable report -> escalates to
+          a human immediately (never loops back into another rework cycle):
+          both artifacts (the rescue PR/diff — this PR's current branch and
+          head SHA, since the rescue worker pushed directly to it — and the
+          cross-family report path) are attached to the escalation event
+          payload and posted as a PR comment.
+        """
+        pr_number = int(candidate["pr"])
+        issue_number = candidate.get("issue")
+        pr = self.gh.pr_view(pr_number)
+        head_sha = str(pr.get("headRefOid") or "")
+        branch = str(pr.get("headRefName") or "")
+        pr_state = load_state_locked(self.paths.state_file).get("prs", {}).get(str(pr_number), {})
+        cause = str(pr_state.get("rescue_cause") or "unknown")
+
+        pr_dir = self.paths.prs / f"pr-{pr_number}"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        diff_text = self.gh.pr_diff(pr_number) or ""
+        prompt_text = rescue_helpers.build_rescue_review_prompt(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            branch=branch,
+            diff_text=diff_text,
+            cause=cause,
+        )
+        prompt_path = pr_dir / "rescue-review-prompt.md"
+        report_path = pr_dir / "rescue-review-report.md"
+        cfg = self.config.rescue
+        cf_result = run_cross_family_review(
+            model=cfg.reviewer_model,
+            command=cfg.reviewer_command or self.config.cross_family.command,
+            repo_root=self.repo_root,
+            prompt_text=prompt_text,
+            prompt_path=prompt_path,
+            report_path=report_path,
+            timeout_seconds=cfg.reviewer_timeout_seconds,
+            head_ref_oid=head_sha,
+        )
+
+        verdict: dict[str, Any] | None = None
+        if cf_result.ok and report_path.exists():
+            report_text = extract_report_body(report_path.read_text(encoding="utf-8"))
+            verdict = _extract_verdict_from_text(report_text)
+
+        if verdict is not None and verdict["decision"] == "approved":
+            result = self.record_review(
+                pr_number,
+                "approved",
+                summary=verdict["summary"],
+                reviewed_head=head_sha,
+                required_changes=verdict["required_changes"],
+            )
+            return CommandResult(
+                True,
+                f"PR #{pr_number} rescue review approved — {result.message}",
+                {
+                    "rescue_review_decision": "approved",
+                    "cross_family_report": str(report_path),
+                    "record_review": result.data,
+                },
+            )
+
+        # request_changes / blocked / unparseable report -> escalate to a
+        # human immediately. Never re-enter the rework loop: this PR already
+        # spent its one rescue attempt (rescue_attempted stays durably set).
+        verdict_summary = verdict["summary"] if verdict else (cf_result.error or "")
+        comment_body = rescue_helpers.build_rescue_escalation_comment(
+            cause=cause,
+            rescue_branch=branch,
+            rescue_head_sha=head_sha,
+            cross_family_report_path=str(report_path),
+            verdict_summary=verdict_summary,
+        )
+        label_error: dict[str, Any] | None = None
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "escalated",
+            }
+            if issue_number is not None:
+                state["issues"][str(issue_number)] = {
+                    **state["issues"].get(str(issue_number), {}),
+                    "number": issue_number,
+                    "status": "escalated",
+                    "merge_alert": "OK",
+                }
+            state = self._record_event(
+                state,
+                "rescue_review_escalated",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "cause": cause,
+                    "rescue_branch": branch,
+                    "rescue_head_sha": head_sha,
+                    "cross_family_report": str(report_path),
+                    "cross_family_ok": cf_result.ok,
+                    "verdict_decision": verdict["decision"] if verdict else None,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        if issue_number is not None:
+            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            if result.outcome != TransitionOutcome.APPLIED:
+                label_error = {
+                    "edge": "escalated",
+                    "outcome": result.outcome.value,
+                    "add_failures": result.add_failures,
+                    "remove_failures": result.remove_failures,
+                }
+        try:
+            self._comment_pr(pr_number, comment_body)
+        except GitHubError as exc:
+            label_error = {**(label_error or {}), "comment_error": str(exc)}
+        return CommandResult(
+            True,
+            f"PR #{pr_number} rescue review did not approve — escalated to human",
+            {
+                "rescue_review_decision": verdict["decision"] if verdict else "unparseable",
+                "cross_family_report": str(report_path),
+                "cross_family_ok": cf_result.ok,
+                "escalated": True,
+                "label_error": label_error,
+            },
+        )
 
     def record_review(
         self,
@@ -6664,6 +8015,7 @@ class OrchestratorApp:
         comment: bool = False,
         reviewed_head: str | None = None,
         required_changes: Sequence[str] | None = None,
+        session_metrics: dict[str, Any] | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -6816,6 +8168,7 @@ class OrchestratorApp:
             pr_state = state["prs"].get(str(pr_number), {})
             rework_path: str | None = None
             escalated = False
+            rescue_dispatched = False
             # Durable per-PR rework counter — NOT derived from the global events
             # log, which append_event truncates to the last 200 entries: on a busy
             # repo that eviction silently reset the count and defeated the cap
@@ -6826,6 +8179,20 @@ class OrchestratorApp:
                 # thrashes (wrong brief or unimplementable criteria) — escalate to
                 # a human instead of dispatching another cycle.
                 escalated = request_changes_count >= self.config.review.max_rework_cycles
+                # Rescue tier (issue #555): a cap exceedance here is one of the
+                # three verdict-driven ("cheap model wasn't good enough")
+                # causes the rescue tier is gated on. If enabled and this PR
+                # has not already spent its one rescue attempt, route to a
+                # bounded Opus rework instead of escalating — never a second
+                # rescue for the same PR (rescue_attempted is durable, cleared
+                # only by `charlie unescalate`).
+                if (
+                    escalated
+                    and self.config.rescue.enabled
+                    and not pr_state.get("rescue_attempted")
+                ):
+                    escalated = False
+                    rescue_dispatched = True
                 # Only count a rework cycle when the PR head has actually advanced.
                 # If the head is unchanged, the prior cycle's attempt was never
                 # delivered (e.g., worker died orphaned), so re-issuing request_changes
@@ -6834,9 +8201,23 @@ class OrchestratorApp:
                 if not escalated and head_advanced:
                     request_changes_count += 1
                 if not escalated:
-                    rework_path = str(self._write_rework_prompt(pr, issue_number, summary_text))
+                    rework_summary = (
+                        rescue_helpers.build_rescue_rework_summary(
+                            "rework_cycle_cap", summary_text
+                        )
+                        if rescue_dispatched
+                        else summary_text
+                    )
+                    rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             decision_payload["escalated"] = escalated
             self._write_json(decision_path, decision_payload)
+            rescue_fields = (
+                rescue_helpers.build_rescue_dataclass_kwargs("rework_cycle_cap")
+                if rescue_dispatched
+                else {}
+            )
+            if rescue_dispatched:
+                rescue_fields["rescue_dispatched_at"] = utc_now()
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,
@@ -6849,6 +8230,7 @@ class OrchestratorApp:
                 "request_changes_count": request_changes_count,
                 "status": "escalated" if escalated else decision,
                 "consecutive_failed_merge_attempts": 0,
+                **rescue_fields,
                 # The reviewer agent has recorded its verdict. The hub no longer
                 # needs to treat this PR as having an in-flight reviewer; the next
                 # stale-head review-queue entry will re-dispatch cleanly.
@@ -6859,6 +8241,14 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reviewer session token/cost telemetry (best-effort): merge-update
+                # so a call without metrics (e.g. a manual `charlie verdict`)
+                # never clobbers metrics recorded by an earlier automated reap.
+                "review_session_metrics": (
+                    session_metrics
+                    if session_metrics is not None
+                    else pr_state.get("review_session_metrics")
+                ),
             }
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
@@ -6901,11 +8291,24 @@ class OrchestratorApp:
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
                     state["issues"][str(issue_number)].pop("worker_process_start_time", None)
-            state = self._record_event(
-                state,
-                "record_review",
-                {"pr_number": pr_number, "decision": decision, "escalated": escalated},
-            )
+            event_payload: dict[str, Any] = {
+                "pr_number": pr_number,
+                "decision": decision,
+                "escalated": escalated,
+            }
+            if session_metrics is not None:
+                event_payload["session_metrics"] = session_metrics
+            state = self._record_event(state, "record_review", event_payload)
+            if rescue_dispatched:
+                state = self._record_event(
+                    state,
+                    "rescue_dispatched",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "cause": "rework_cycle_cap",
+                    },
+                )
             save_state(self.paths.state_file, state)
         # GitHub label side effects are best-effort and isolated: the durable
         # decision above is the authority; a label failure is reported, not fatal.
@@ -6954,12 +8357,18 @@ class OrchestratorApp:
                 else:
                     label_error["comment_error"] = str(exc)
         source_note = f"head from {reviewed_head_source}"
-        message = (
-            f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
-            f"escalated to human ({source_note})"
-            if escalated
-            else f"review recorded ({source_note})"
-        )
+        if rescue_dispatched:
+            message = (
+                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) "
+                f"reached, rescue tier dispatched instead of escalating ({source_note})"
+            )
+        elif escalated:
+            message = (
+                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
+                f"escalated to human ({source_note})"
+            )
+        else:
+            message = f"review recorded ({source_note})"
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(
@@ -6975,6 +8384,7 @@ class OrchestratorApp:
                 "packet_head_sha": packet_head_sha,
                 "rework_path": rework_path,
                 "escalated": escalated,
+                "rescue_dispatched": rescue_dispatched,
                 "request_changes_count": request_changes_count,
                 "label_error": label_error,
             },
@@ -7000,11 +8410,18 @@ class OrchestratorApp:
         "reviewer_pid",
         "reviewer_process_start_time",
         "review_turn_limit_summary_posted",
+        "review_miss_summary_posted",
         "janitor_ok",
         "janitor_failures",
         "janitor_warnings",
         "escalation_reason",
         "label_error",
+        # Rescue tier (issue #555): rescue_attempted is the durable "used my
+        # one shot" marker. Only charlie unescalate clears it (this tuple) —
+        # every other code path treats a present marker as permanent.
+        "rescue_attempted",
+        "rescue_cause",
+        "rescue_dispatched_at",
     )
     # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
     _UNESCALATE_ISSUE_RESET_FIELDS = (
@@ -7709,6 +9126,8 @@ class OrchestratorApp:
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
+        merge_hold: bool = False
+        merge_hold_check_unavailable: bool = False
         if can_merge and should_merge:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
@@ -7727,7 +9146,31 @@ class OrchestratorApp:
                 # reconcile.py's merged_outside_orchestrator drift path
                 # reconciles status to "merged" and runs the "merged" label
                 # transition — no new post-merge bookkeeping is added here.
-                mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
+                #
+                # Issue #496: an operator can park an approved PR by adding the
+                # configured merge-hold label to the PR or its linked issue.
+                # When the hold is present, skip the mergequeue re-add entirely.
+                # Scope note: this hold check runs only in mergequeue mode
+                # (when ``mergequeue_label`` is set). In direct-merge mode the
+                # hold label has no effect — the issue title scopes this to
+                # "the mergequeue re-add," so the self-merge branch is unchanged.
+                merge_hold = self.config.labels.merge_hold in label_names(pr)
+                if not merge_hold and issue_number is not None:
+                    try:
+                        issue = self.gh.issue_view(issue_number)
+                    except (GitHubError, ValueError):
+                        merge_hold_check_unavailable = True
+                        issue = None
+                    if not merge_hold_check_unavailable and (
+                        not isinstance(issue, dict) or "labels" not in issue
+                    ):
+                        merge_hold_check_unavailable = True
+                        issue = None
+                    if not merge_hold_check_unavailable:
+                        issue_labels = label_names(issue) if issue else set()
+                        merge_hold = self.config.labels.merge_hold in issue_labels
+                if not merge_hold and not merge_hold_check_unavailable:
+                    mergequeue_label_applied = self.gh.add_pr_label(pr_number, mergequeue_label)
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
@@ -7941,13 +9384,20 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            if approved and can_merge and merge_output is None and not mergequeue_handoff_failed:
+            if (
+                approved
+                and can_merge
+                and merge_output is None
+                and not mergequeue_handoff_failed
+                and not merge_hold_check_unavailable
+            ):
                 # merge=False / auto_merge.enabled=False: can_merge recovered but no
                 # merge was attempted. Clear the merge alert so a subsequent
                 # degradation can re-fire the digest (last_health == current_health
                 # dedup would otherwise drop it). Excluded when the mergequeue
-                # handoff itself failed — that is a genuine problem, not a
-                # benign evaluation-only pass, and must not be masked as OK.
+                # handoff itself failed or the merge-hold issue check was
+                # unavailable — both are genuine problems, not benign
+                # evaluation-only passes, and must not be masked as OK.
                 if issue_number is not None:
                     _issue_key = str(issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
@@ -7971,6 +9421,8 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "can_merge": can_merge,
                     "merged": bool(merge_output),
+                    "merge_hold": merge_hold,
+                    "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
@@ -7999,12 +9451,20 @@ class OrchestratorApp:
             "cross_pr_revert_reason": cross_pr_revert_reason,
             "cross_pr_revert_routed": cross_pr_revert_routed,
             "mergequeue_label_applied": mergequeue_label_applied,
+            "merge_hold": merge_hold,
+            "merge_hold_check_unavailable": merge_hold_check_unavailable,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif merge_hold_check_unavailable:
+            message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
+        elif merge_hold:
+            message += (
+                f" (merge-hold label {self.config.labels.merge_hold!r} present — left alone)"
+            )
         elif mergequeue_label_applied is False:
             message += (
                 f" (mergequeue label {self.config.auto_merge.mergequeue_label!r} FAILED to "
@@ -8018,7 +9478,9 @@ class OrchestratorApp:
             message += f" (merged; post-merge label/branch cleanup failed: {label_error})"
         elif label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
-        return CommandResult(not checks_unavailable, message, data)
+        return CommandResult(
+            not (checks_unavailable or merge_hold_check_unavailable), message, data
+        )
 
     @_guard_state_lock
     def spec_review(self, artifact_path: Path) -> CommandResult:
@@ -8130,6 +9592,76 @@ class OrchestratorApp:
             head_ref_oid=pr.get("headRefOid"),
         )
         return self._cross_family_section(result.report_path), result
+
+    def _build_prior_review_section(
+        self,
+        pr_dir: Path,
+        prior_decision: dict[str, Any],
+        new_head_sha: str | None,
+    ) -> str:
+        """Render ``$prior_review_section`` for a round-2+ review packet.
+
+        Only called when the prior decision is a terminal, non-pending
+        verdict recorded against a head that differs from the live PR head
+        (a genuine rework round, not a first-round review). Surfaces round-1
+        findings (decision/summary/required changes) plus an interdiff
+        (prior reviewed head -> new head) so the reviewer has somewhere to
+        start, without losing sight of the full diff: the interdiff is
+        "start here," never "only look here" -- the full diff stays
+        attached and remains authoritative for findings outside it.
+
+        Fail-safe posture mirrors janitor.py's patch-id carry-forward
+        (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
+        here (``compare_diff``) already returns errors as values (``None``),
+        never raises, so a failed/unavailable comparison (404, GC'd SHA,
+        rebase/divergence, gh failure) just omits the interdiff and says so
+        -- it never blocks packet generation.
+        """
+        prior_head_sha = prior_decision.get("reviewed_head_sha")
+        decision = prior_decision.get("decision") or "unknown"
+        summary = str(prior_decision.get("summary") or "").strip()
+        required_changes = prior_decision.get("required_changes")
+        if not isinstance(required_changes, list):
+            required_changes = []
+
+        lines = [
+            "",
+            "## Prior review (round 1, earlier head)",
+            "",
+            f"A previous review round on an earlier head (`{prior_head_sha}`) "
+            f"recorded decision **{decision}**. These are round-1 findings on "
+            "a DIFFERENT diff than the one you are reviewing now -- verify "
+            "each one against the current code, don't assume it still applies.",
+            "",
+        ]
+        if summary:
+            lines.append(f"Round-1 summary: {summary}")
+            lines.append("")
+        if required_changes:
+            lines.append("Round-1 required changes:")
+            lines.extend(f"- {change}" for change in required_changes)
+            lines.append("")
+
+        interdiff_text = None
+        if prior_head_sha and new_head_sha:
+            interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
+        if interdiff_text and interdiff_text.strip():
+            interdiff_path = pr_dir / "interdiff.patch"
+            interdiff_path.write_text(interdiff_text, encoding="utf-8")
+            lines.append(
+                f"Interdiff (round-1 head to this head): `{interdiff_path}`. Verify "
+                "each required change above is addressed there first -- but the "
+                "full diff remains authoritative; findings outside the interdiff "
+                "are still in scope."
+            )
+        else:
+            lines.append(
+                "Prior-head comparison was unavailable (rebase, divergence, or an "
+                "API error) -- no interdiff could be generated. Review the full "
+                "diff as usual, with the round-1 findings above in mind."
+            )
+        lines.append("")
+        return "\n".join(lines)
 
     def reconcile(self, *, fix: bool = False) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the
@@ -8840,6 +10372,90 @@ class OrchestratorApp:
                 return None
         attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
 
+        if (
+            max_attempts > 0
+            and attempts > max_attempts
+            and self.config.rescue.enabled
+            and not existing_pr_state.get("rescue_attempted")
+        ):
+            # Rescue tier (issue #555): conflict-rework and no-op-rework caps
+            # are both eligible ("cheap model wasn't good enough") causes.
+            # Route to a bounded Opus rework via the SAME router this
+            # function already uses for the non-cap-exceeded routing path
+            # below, instead of escalating — never a second rescue for the
+            # same PR (rescue_attempted is durable, cleared only by
+            # `charlie unescalate`).
+            #
+            # Ordering note (reviewed, deliberate): the marker is committed
+            # under this lock BEFORE `router(...)` runs its own separate
+            # state_lock write below. A crash in that narrow window leaves
+            # `rescue_attempted=True` with no rework actually dispatched —
+            # the PR's one rescue slot is spent for nothing and the NEXT cap
+            # exceedance escalates straight to a human instead of retrying
+            # the rescue. This is intentional, not an oversight: the
+            # alternative (write the marker AFTER `router()` succeeds) fails
+            # the other way — a crash between a successful `router()` write
+            # and the marker write leaves the PR eligible for a SECOND
+            # rescue attempt on the next cap exceedance, violating the "one
+            # rescue per PR" invariant the whole feature is built around
+            # (issue #555: "no upward-migrating cost spiral"). Under-rescue
+            # (safe, wasteful) is a strictly better failure mode than
+            # over-rescue (invariant violation) here, so marker-first is
+            # kept. This mirrors this same function's pre-existing,
+            # explicitly-accepted two-lock deviation for `attempts_key`
+            # itself (see the docstring above and the comment at the
+            # `snapshot = load_state_locked(...)` read a few lines up) —
+            # not a new risk introduced by the rescue tier, the same
+            # "self-corrects, at worst delays by one cycle" tradeoff this
+            # function already makes elsewhere. Making this fully atomic
+            # would require plumbing an extra_payload-style rescue-marker
+            # parameter through `_request_merge_conflict_rework`/
+            # `_request_no_op_rework_repair` (both also called from
+            # merge_ready's approved+alarm-threshold path with no rescue
+            # concept), which is a larger blast-radius change than this
+            # fix-forward warrants; revisit only if the wasted-slot case is
+            # ever observed live.
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    attempts_key: attempts,
+                    **rescue_helpers.build_rescue_dataclass_kwargs(reason),
+                    "rescue_dispatched_at": utc_now(),
+                }
+                state = self._record_event(
+                    state,
+                    "rescue_dispatched",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "cause": reason,
+                        "attempts": attempts,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+            decision = self._review_decision(pr_number)
+            route_extra_state: dict[str, Any] = {attempts_key: attempts}
+            if head_sha:
+                route_extra_state[last_head_key] = head_sha
+            label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
+            return CommandResult(
+                True,
+                f"PR #{pr_number} janitor {reason} rework cap exceeded "
+                f"({attempts}/{max_attempts}); rescue tier dispatched instead of escalating",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "janitor_ok": False,
+                    "routed_to_rework": True,
+                    "rescue_dispatched": True,
+                    "rework_reason": reason,
+                    "label_error": label_error,
+                },
+            )
+
         if max_attempts > 0 and attempts > max_attempts:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -9304,8 +10920,10 @@ class OrchestratorApp:
         errors: list[dict[str, Any]],
         merges: list[dict[str, Any]],
     ) -> None:
-        """Append a merge_ready result to merges or errors if checks are unavailable."""
-        if merge_result.data.get("checks_unavailable"):
+        """Append a merge_ready result to merges or errors if a gh check failed."""
+        if merge_result.data.get("checks_unavailable") or merge_result.data.get(
+            "merge_hold_check_unavailable"
+        ):
             errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
         else:
             merges.append(merge_result.data)
@@ -9854,7 +11472,37 @@ class OrchestratorApp:
         operator_claimed = operator_claimed_issues(state)
         operator_claimed_skipped: list[int] = []
 
-        # Find issues with rework_requested status
+        # Build the open-PR index BEFORE any per-issue gh.issue_view() fetch.
+        # pr_list() returns only OPEN PRs by contract (--state open), so an
+        # issue whose PR is closed-unmerged (or that never had one) is absent
+        # from pr_by_issue. Issue #558: without this ordering, the candidate
+        # scan below called gh.issue_view() for every rework_requested issue
+        # every pass -- including issues whose PR closed-unmerged between
+        # reconcile sweeps -- a permanent per-pass GitHub fetch with no
+        # terminal exit (the exact slow-cost-spiral shape #556/#558 exist to
+        # eliminate). Filtering by open PR first cuts the fetch to genuine
+        # candidates only. pr_list() is cached within a pass, so calling it
+        # here vs. later is the same GitHub call.
+        prs = self.gh.pr_list()
+        pr_by_issue: dict[int, dict[str, Any]] = {}
+        for pr in prs:
+            issue_number = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if issue_number is not None:
+                # If multiple PRs link to the same issue, keep the lowest PR number
+                if issue_number not in pr_by_issue or int(pr["number"]) < int(
+                    pr_by_issue[issue_number]["number"]
+                ):
+                    pr_by_issue[issue_number] = pr
+
+        # Find issues with rework_requested status. Only fetch the full issue
+        # from GitHub for issues that actually have an open PR -- a
+        # rework_requested issue with no open PR is not a launch candidate
+        # (the PR was closed-unmerged or never existed), so the per-issue
+        # gh.issue_view fetch is skipped entirely.
         rework_issues = []
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
@@ -9864,6 +11512,11 @@ class OrchestratorApp:
                 # Issue #400: operator-claimed issues are not rework-dispatchable.
                 if issue_number in operator_claimed:
                     operator_claimed_skipped.append(issue_number)
+                    continue
+                # Issue #558: skip the gh.issue_view fetch for issues with no
+                # open PR -- not a rework candidate, and the fetch is the
+                # permanent per-pass cost this gate exists to eliminate.
+                if issue_number not in pr_by_issue:
                     continue
                 # Fetch the full issue from GitHub to get labels and other metadata
                 try:
@@ -9899,24 +11552,11 @@ class OrchestratorApp:
                     data,
                 )
 
-        # Filter to issues with open PRs
-        prs = self.gh.pr_list()
-        pr_by_issue = {}
-        for pr in prs:
-            issue_number = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=self.config.dispatch.branch_prefix,
-            )
-            if issue_number is not None:
-                # If multiple PRs link to the same issue, keep the lowest PR number
-                if issue_number not in pr_by_issue or int(pr["number"]) < int(
-                    pr_by_issue[issue_number]["number"]
-                ):
-                    pr_by_issue[issue_number] = pr
-
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
+        # rework_issues already contains only issues with an open PR (the
+        # fetch loop above skipped issues absent from pr_by_issue), so this
+        # filter is now a no-op kept for clarity/defense-in-depth.
         candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         # Issue #339: a rework worker relaunched onto a PR whose rework was
@@ -10167,6 +11807,33 @@ class OrchestratorApp:
         full_issues: dict[int, dict[str, Any]] = {}
         skipped_issue_numbers: list[int] = []
         missing_prompt_failures: dict[int, str] = {}
+        # Issue #482: per-issue adapter routing for rework. Rework issues
+        # route to the api adapter when preflight passes (policy:rework),
+        # falling back to the default adapter on any preflight failure.
+        # The rework prompt is already on disk (written during the review
+        # flow with config.dispatch.rework_template); api_worker.rework_template
+        # defaults to the same "rework.md", so no re-render is needed here.
+        adapter_choices: dict[int, AdapterChoice] = {}
+        api_enabled = self.config.api_worker.enabled
+        routing_inputs = self._routing_inputs() if api_enabled else None
+        # Rescue tier (issue #555): an issue is rescue-marked when the rescue
+        # interception sites (record_review / _route_janitor_gate_failure_to_
+        # rework) already stamped `rescue_attempted` on its PR record instead
+        # of escalating. Those issues must launch via the claude-code adapter
+        # pinned to `rescue.worker_model`, regardless of the primary
+        # configured `devin.adapter` — tracked separately here so the SAME
+        # candidate-selection/session-request/state-bookkeeping code below
+        # handles them, only the final dispatch_sessions() call differs.
+        #
+        # Always loaded (never gated on self.config.rescue.enabled): routing
+        # of a PR that already carries the durable marker must not depend on
+        # the current config value. If an operator flips rescue.enabled off
+        # while a rescue rework is queued (rework_requested + marker set,
+        # worker not yet launched), it must still launch via the rescue
+        # adapter/model -- enabled only gates NEW rescue entry at the three
+        # cap sites, never routing of an already-marked PR.
+        rescue_issue_numbers: set[int] = set()
+        rescue_state_snapshot = load_state_locked(self.paths.state_file)
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -10184,6 +11851,24 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
+            # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
+            # adapter routing — they always launch via the claude-code adapter
+            # pinned to rescue.worker_model, regardless of the primary
+            # configured devin.adapter or api_worker routing preflight.
+            pr_state_for_rescue = rescue_state_snapshot.get("prs", {}).get(str(pr_number), {})
+            if pr_state_for_rescue.get("rescue_attempted"):
+                rescue_issue_numbers.add(issue_number)
+            else:
+                # Route this non-rescue rework issue through the single
+                # enforcement point (issue #482).
+                if api_enabled and routing_inputs is not None:
+                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                    choice = self._select_adapter_for_issue(
+                        rework=True,
+                        issue_labels=issue_labels,
+                        routing_inputs=routing_inputs,
+                    )
+                    adapter_choices[issue_number] = choice
             session_requests.append(
                 SessionRequest(
                     issue_number=issue_number,
@@ -10255,13 +11940,41 @@ class OrchestratorApp:
 
         manifest_path = self.repo_root / self.config.devin.session_manifest
         results_path = self.repo_root / self.config.devin.session_results
-        dispatch_results = dispatch_sessions(
-            self.repo_root,
-            manifest_path,
-            results_path,
-            self._adapter_settings(),
-            session_requests,
-        )
+        # Rescue tier (issue #555) + per-issue routing (issue #482): split
+        # the batch so rescue-marked issues launch via the claude-code adapter
+        # pinned to rescue.worker_model (see _rescue_adapter_settings),
+        # while every other candidate is dispatched via the per-issue routing
+        # partition (_dispatch_partitioned). Rescue issues bypass routing
+        # entirely — they always use the rescue adapter/model. Reuses the
+        # same dispatch_sessions()/launch_claude_worker() path for both; the
+        # only difference is which AdapterSettings/config is passed in.
+        normal_requests = [
+            r for r in session_requests if r.issue_number not in rescue_issue_numbers
+        ]
+        rescue_requests = [r for r in session_requests if r.issue_number in rescue_issue_numbers]
+        dispatch_results: list[SessionDispatchResult] = []
+        if normal_requests:
+            # adapter_choices only contains non-rescue issues (rescue issues
+            # were never routed in the loop above), so the partition is
+            # correct.
+            dispatch_results.extend(self._dispatch_partitioned(normal_requests, adapter_choices))
+        if rescue_requests:
+            dispatch_results.extend(
+                dispatch_sessions(
+                    self.repo_root,
+                    manifest_path,
+                    results_path,
+                    self._rescue_adapter_settings(),
+                    rescue_requests,
+                )
+            )
+        # _dispatch_partitioned and dispatch_sessions each overwrite
+        # manifest/results on each call; rewrite once more with the combined
+        # batch so the on-disk observability files
+        # (session-manifest.json/session-results.json) reflect the full pass,
+        # not just the last sub-call.
+        write_session_manifest(manifest_path, session_requests, adapter=self.config.devin.adapter)
+        write_session_results(results_path, dispatch_results)
 
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
@@ -10295,6 +12008,12 @@ class OrchestratorApp:
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
+                # Issue #482: record the adapter choice into adapter_history
+                # before constructing the entry, so the {**entry} spread below
+                # preserves the adapter_history field.
+                choice = adapter_choices.get(request.issue_number)
+                if choice is not None:
+                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 entry = {
                     **state["issues"].get(str(request.issue_number), {}),
                     "number": request.issue_number,
@@ -10567,6 +12286,17 @@ class OrchestratorApp:
         # ok=False janitor-block case already guards against (issue #339
         # finding 1, see this method's docstring).
         routed_to_rework = bool(review_result.data.get("routed_to_rework"))
+        # Issue #558: review() also returns ok=True when it converges a
+        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
+        # The PR is dead, not a fresh-packet candidate, so flipping the issue
+        # to "reviewing" here would strand it in an ACTIVE_STATE_STATUS no
+        # reconcile rule clears while the GitHub issue stays open (the closed
+        # PR still links to the issue, so issue_active_label_no_open_pr does
+        # not fire; "reviewing" is a VALID_ISSUE_STATUSES member, so the
+        # unknown-status recompute sweep skips it). The issue stays
+        # rework_requested and the existing closed-unmerged issue-side
+        # handling (closed_unmerged_pr_active_labels) finalizes it.
+        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -10575,6 +12305,7 @@ class OrchestratorApp:
             if (
                 review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"
@@ -10673,6 +12404,90 @@ class OrchestratorApp:
             state = load_state_locked(self.paths.state_file)
             operator_claimed = operator_claimed_issues(state)
         return int(issue["number"]) not in operator_claimed
+
+    def _route_phantom_live_worker(
+        self,
+        state: dict[str, Any],
+        request: SessionRequest,
+        full_issue: dict[str, Any],
+        sessions_dir: Path,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        """Route a phantom ``live_worker_redispatch_averted`` result as dead.
+
+        The adapter reported a live worker, but the recorded PID failed the
+        OS-level liveness + identity check (issue #523). Remove the stale
+        sidecar/marker so the session no longer occupies a concurrency slot,
+        then strip active labels and restore ``automated-ready`` so the issue
+        is dispatchable again, recording a single
+        ``session_failed_relabeled`` attention event.
+
+        This mirrors ``_classify_dead_sessions_and_update_throttle_state``'s
+        no-open-PR relabel path. The open-PR/rework-routing case is
+        intentionally NOT handled here: a dispatched request's issue can never
+        have an open tracked PR, because ``_dispatch_impl`` builds
+        ``pr_by_issue`` once and candidate selection excludes every issue in
+        it (so ``request.issue_number`` is never in ``pr_by_issue``). A phantom
+        worker whose issue later opens a PR is routed to rework by the
+        dead-session reaper lane, not by dispatch.
+
+        Returns ``(status, dispatched_at, state)``. The status is
+        ``"dispatch_failed"`` so the caller's entry-building frees the slot;
+        ``dispatched_at`` is ``None`` because no worker was actually launched.
+        """
+        issue_number = request.issue_number
+
+        # Reap the stale sidecar and matching worktree writer marker. Reuse
+        # WorkerView.reap_sidecar so the adapter-specific path derivation and
+        # session-id-gated marker removal stay in one place.
+        for w in iter_workers(sessions_dir):
+            if w.issue_number == issue_number:
+                w.reap_sidecar(sessions_dir)
+
+        # Strip active labels and ensure the ready label is present so the
+        # issue becomes dispatchable. This mirrors
+        # _classify_dead_sessions_and_update_throttle_state's no-open-PR
+        # relabel path, gated on an active label actually being present so a
+        # terminal-only issue is never given ``ready`` back spuriously.
+        issue_labels = label_names(full_issue)
+        active_labels = issue_labels & self.config.labels.active
+        if not active_labels:
+            state = append_event(
+                state,
+                "session_failed_relabeled",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": "live_worker_redispatch_averted",
+                    "reason": "phantom_live_worker_pid_dead",
+                    "removed_labels": [],
+                    "added_ready": False,
+                    "label_write_ok": True,
+                },
+                state_path=self.paths.state_file,
+            )
+            return "dispatch_failed", None, state
+
+        needs_ready = self.config.labels.ready not in issue_labels
+        label_write_ok = True
+        for label in sorted(active_labels):
+            if not self.gh.remove_issue_label(issue_number, label):
+                label_write_ok = False
+        if needs_ready:
+            if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
+                label_write_ok = False
+        state = append_event(
+            state,
+            "session_failed_relabeled",
+            {
+                "issue_number": issue_number,
+                "failure_kind": "live_worker_redispatch_averted",
+                "reason": "phantom_live_worker_pid_dead",
+                "removed_labels": sorted(active_labels),
+                "added_ready": needs_ready,
+                "label_write_ok": label_write_ok,
+            },
+            state_path=self.paths.state_file,
+        )
+        return "dispatch_failed", None, state
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
@@ -10873,13 +12688,13 @@ class OrchestratorApp:
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
-    def _write_worker_prompt(self, issue: dict[str, Any]) -> Path:
+    def _write_worker_prompt(self, issue: dict[str, Any], *, template: str | None = None) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         issue_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = issue_dir / "worker-prompt.md"
         prompt = self._render(
-            self.config.dispatch.worker_template,
+            template or self.config.dispatch.worker_template,
             {
                 "issue_number": issue_number,
                 "issue_title": issue.get("title", ""),

@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from charlie_work.config import (
+    ApiBudgetConfig,
     AutoMergeConfig,
     ClaudeCodeConfig,
     CrossFamilyConfig,
@@ -15,6 +16,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     RuntimeConfig,
 )
+from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
 from charlie_work.doctor import _check_name_matches, run_doctor, workflow_job_names
 from charlie_work.paths import runtime_paths
 from charlie_work.subprocess_runner import RunResult
@@ -928,3 +930,617 @@ def test_doctor_fleet_supervisor_per_repo_aware(
     assert "owner/repo1" in fleet_check.detail
     assert "owner/repo2" in fleet_check.detail
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# api_worker doctor probes (issue #483)
+# ---------------------------------------------------------------------------
+
+
+def _api_provider(
+    *,
+    api_key_env: str = "MOONSHOT_API_KEY",
+    base_url: str = "https://api.moonshot.ai/anthropic",
+) -> ApiProviderConfig:
+    return ApiProviderConfig(
+        base_url=base_url,
+        api_key_env=api_key_env,
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+
+
+def _api_worker_config(
+    *,
+    enabled: bool = True,
+    provider: ApiProviderConfig | None = None,
+    budget: ApiBudgetConfig | None = None,
+    provider_name: str = "kimi-k3",
+) -> ApiWorkerConfig:
+    return ApiWorkerConfig(
+        enabled=enabled,
+        provider=provider_name,
+        providers={provider_name: provider or _api_provider()},
+        budget=budget or ApiBudgetConfig(),
+    )
+
+
+def test_doctor_api_worker_not_configured_emits_nothing(tmp_path: Path) -> None:
+    """Default (absent) api_worker section → no api_worker checks at all."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    names = {check.name for check in checks}
+    assert not any(name.startswith("api_worker") for name in names)
+    assert ok is True
+
+
+def test_doctor_api_worker_disabled_emits_notice(tmp_path: Path) -> None:
+    """Configured but disabled → single notice line, warning severity, ok=True."""
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    notice = by_name["api_worker configured but disabled"]
+    assert notice.ok is True
+    assert notice.severity == "warning"
+    assert "disabled" in notice.detail
+    # No enabled-mode checks should appear.
+    assert "api_worker api key" not in by_name
+    assert "api_worker base url" not in by_name
+    assert ok is True
+
+
+def test_doctor_api_worker_enabled_all_checks_ok(tmp_path: Path, monkeypatch) -> None:
+    """Enabled with key present, valid URL, no ledger → all four checks pass."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["api_worker api key"].ok is True
+    assert "MOONSHOT_API_KEY" in by_name["api_worker api key"].detail
+    # No secret value leaks into the detail.
+    assert "sk-test-value" not in by_name["api_worker api key"].detail
+
+    assert by_name["api_worker base url"].ok is True
+    assert "https" in by_name["api_worker base url"].detail
+
+    assert by_name["api_worker budget ledger"].ok is True
+    assert "not yet created" in by_name["api_worker budget ledger"].detail
+
+    headroom = by_name["api_worker budget headroom"]
+    assert headroom.ok is True
+    assert headroom.severity == "warning"
+    assert "$0.00 spent today" in headroom.detail
+    assert "$15.00" in headroom.detail  # lifetime cap default
+    assert ok is True
+
+
+def test_doctor_api_worker_missing_env_var(tmp_path: Path, monkeypatch) -> None:
+    """Enabled but env var absent → api key check fails (error severity)."""
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["api_worker api key"].ok is False
+    assert "NOT set" in by_name["api_worker api key"].detail
+    assert "MOONSHOT_API_KEY" in by_name["api_worker api key"].detail
+    assert ok is False  # error-severity failure blocks
+
+
+def test_doctor_api_worker_bad_url(tmp_path: Path, monkeypatch) -> None:
+    """Enabled but base_url is not https → base url check fails."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(
+            enabled=True,
+            provider=_api_provider(base_url="http://insecure.example.com"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["api_worker base url"].ok is False
+    assert "not a valid https URL" in by_name["api_worker base url"].detail
+    assert ok is False
+
+
+def test_doctor_api_worker_corrupt_ledger(tmp_path: Path, monkeypatch) -> None:
+    """Enabled with a corrupt ledger file → ledger check fails (corrupt detected)."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    # Write a corrupt ledger file.
+    ledger_file = paths.root / "api-budget.json"
+    ledger_file.write_text("{ this is not valid json", encoding="utf-8")
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    ledger_check = by_name["api_worker budget ledger"]
+    assert ledger_check.ok is False
+    assert "corrupt" in ledger_check.detail.lower()
+    assert "quarantined" in ledger_check.detail.lower()
+
+
+def test_doctor_api_worker_headroom_math(tmp_path: Path, monkeypatch) -> None:
+    """Enabled with a ledger showing spend → headroom check reports correct math."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
+    budget = ApiBudgetConfig(
+        max_usd_per_session=0.0,
+        preflight_reserve_usd=1.0,
+        max_usd_per_day=5.0,
+        lifetime_usd=15.0,
+    )
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True, budget=budget),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    # Write a ledger with today's spend and lifetime spend.
+    from datetime import UTC, datetime
+
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ledger_data = {
+        "days": {
+            today: {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "usd": 3.50,
+            }
+        },
+        "lifetime_usd": 10.00,
+        "sessions": [],
+    }
+    ledger_file = paths.root / "api-budget.json"
+    ledger_file.write_text(json.dumps(ledger_data), encoding="utf-8")
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    headroom = by_name["api_worker budget headroom"]
+    # 3.50 spent today + 1.0 reserve = 4.50 <= 5.0 cap → daily ok
+    # 10.00 < 15.0 → lifetime ok
+    assert headroom.ok is True
+    assert "$3.50 spent today" in headroom.detail
+    assert "$5.00 cap" in headroom.detail
+    assert "$1.50 remaining" in headroom.detail  # 5.0 - 3.50
+    assert "$10.00 spent lifetime" in headroom.detail
+    assert "$5.00 remaining" in headroom.detail  # 15.0 - 10.00
+    assert ok is True
+
+
+def test_doctor_api_worker_headroom_exhausted(tmp_path: Path, monkeypatch) -> None:
+    """Enabled with spend at caps → headroom check fails (exhausted)."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
+    budget = ApiBudgetConfig(
+        max_usd_per_session=0.0,
+        preflight_reserve_usd=1.0,
+        max_usd_per_day=5.0,
+        lifetime_usd=15.0,
+    )
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True, budget=budget),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    from datetime import UTC, datetime
+
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    # Daily: 4.50 spent + 1.0 reserve = 5.50 > 5.0 → daily exhausted
+    # Lifetime: 15.00 >= 15.0 → lifetime exhausted
+    ledger_data = {
+        "days": {
+            today: {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "usd": 4.50,
+            }
+        },
+        "lifetime_usd": 15.00,
+        "sessions": [],
+    }
+    ledger_file = paths.root / "api-budget.json"
+    ledger_file.write_text(json.dumps(ledger_data), encoding="utf-8")
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    headroom = by_name["api_worker budget headroom"]
+    assert headroom.ok is False
+    # Both daily and lifetime are exhausted in this fixture; the detail must
+    # report each leg's exhaustion, not just one occurrence of the word.
+    assert headroom.detail.count("exhausted") >= 2
+    assert "$4.50 spent today" in headroom.detail
+    assert "$0.50 remaining" in headroom.detail  # max(0, 5.0 - 4.50)
+    assert "$15.00 spent lifetime" in headroom.detail
+    assert "$0.00 remaining" in headroom.detail  # max(0, 15.0 - 15.00)
+    # Headroom is warning severity, so it does not block the overall ok —
+    # the api key / base url / ledger checks all pass, so ok stays True.
+    assert headroom.severity == "warning"
+    assert ok is True
+
+
+def test_doctor_api_worker_no_secret_in_output(tmp_path: Path, monkeypatch) -> None:
+    """The API key VALUE must never appear in any doctor check detail."""
+    secret = "sk-super-secret-key-value-9999"
+    monkeypatch.setenv("MOONSHOT_API_KEY", secret)
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        api_worker=_api_worker_config(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    _ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    for check in checks:
+        if check.name.startswith("api_worker"):
+            assert secret not in check.detail, (
+                f"Secret leaked in check {check.name!r}: {check.detail}"
+            )
+
+
+# --- host-wide runner allocation staleness probe (issue #590) ---------------
+#
+# The probe exists because every way the allocation prologue can decline to act is
+# silent, so "configured but inert" has to be *detected* rather than inferred from
+# logs that have proven lossy.
+
+
+def _doctor_allocation_config(*, enabled: bool = True, budget: int = 8) -> Any:
+    from dataclasses import replace
+
+    from charlie_work.config import OrchestratorConfig
+
+    base = OrchestratorConfig()
+    return replace(
+        base,
+        runner_allocation=replace(
+            base.runner_allocation, enabled=enabled, max_running_runners=budget
+        ),
+    )
+
+
+def _collect_allocation_checks(config: Any, fleet_dir: Path) -> list[tuple[str, bool, str]]:
+    from charlie_work.doctor import _check_runner_allocation
+
+    collected: list[tuple[str, bool, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        collected.append((name, ok, detail))
+
+    _check_runner_allocation(add, config, fleet_dir_override=str(fleet_dir))
+    return collected
+
+
+def test_allocation_probe_is_silent_when_the_feature_is_disabled(tmp_path: Path) -> None:
+    checks = _collect_allocation_checks(_doctor_allocation_config(enabled=False), tmp_path)
+    assert checks == []
+
+
+def test_allocation_probe_reports_enabled_but_never_run(tmp_path: Path) -> None:
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    name, ok, detail = checks[0]
+    assert name == "runner allocation"
+    assert ok is False
+    assert "never run" in detail
+
+
+def test_allocation_probe_passes_on_a_fresh_pass(tmp_path: Path) -> None:
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
+        json.dumps({"version": 1, "updated_at": now, "source": "prologue", "repos": {}}),
+        encoding="utf-8",
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is True
+    assert "budget 8" in detail
+    # Only an unattended write is evidence, so the ok line has to say which it saw.
+    assert "unattended" in detail
+
+
+def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
+    """A configured-but-inert allocator is the exact shape of issue #590."""
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    config = _doctor_allocation_config()
+    stale_by = config.supervisor.full_pass_interval_seconds * 3 + 60
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=stale_by)
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
+        json.dumps(
+            {"version": 1, "updated_at": old.isoformat(), "source": "prologue", "repos": {}}
+        ),
+        encoding="utf-8",
+    )
+    checks = _collect_allocation_checks(config, tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "not running unattended" in detail
+
+
+def test_allocation_probe_survives_a_corrupt_state_file(tmp_path: Path) -> None:
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    (tmp_path / ALLOCATION_STATE_FILENAME).write_text("{not json", encoding="utf-8")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "updated_at" in detail
+
+
+def _write_allocation_stamp(fleet_dir: Path, *, age_seconds: float, source: Any) -> None:
+    """Write a state file aged ``age_seconds`` (negative = future-dated)."""
+    import datetime
+
+    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+
+    when = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age_seconds)
+    payload: dict[str, Any] = {"version": 1, "updated_at": when.isoformat(), "repos": {}}
+    if source is not None:
+        payload["source"] = source
+    (fleet_dir / ALLOCATION_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_allocation_probe_does_not_accept_a_manual_pass_as_evidence(tmp_path: Path) -> None:
+    """A fresh manual allocate must not make the probe read healthy.
+
+    CLAUDE.md requires post-reboot procedures to delegate to `charlie runners
+    allocate`, so this is the routine case -- and it writes the same host-wide file
+    the unattended pass does. Treating its timestamp as proof would blind the probe
+    for three intervals during exactly the window an operator is diagnosing #590.
+    """
+    _write_allocation_stamp(tmp_path, age_seconds=5, source="cli")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "manual" in detail
+    assert "cannot confirm" in detail
+
+
+def test_allocation_probe_reports_unrecorded_provenance_rather_than_assuming(
+    tmp_path: Path,
+) -> None:
+    """A file written before provenance tracking is unknown, not unattended."""
+    _write_allocation_stamp(tmp_path, age_seconds=5, source=None)
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    assert len(checks) == 1
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "unrecorded" in detail
+
+
+def test_allocation_probe_names_an_unrecognised_writer(tmp_path: Path) -> None:
+    """A future writer that forgets to extend AllocationSource is named, not hidden."""
+    _write_allocation_stamp(tmp_path, age_seconds=5, source="some-new-path")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "some-new-path" in detail
+
+
+def test_allocation_probe_clamps_a_future_dated_stamp(tmp_path: Path) -> None:
+    """Clock skew must not print a negative age, and must not read as stale."""
+    _write_allocation_stamp(tmp_path, age_seconds=-600, source="prologue")
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is True
+    assert "-" not in detail
+    assert "0s ago" in detail
+
+
+def test_run_doctor_wires_the_allocation_probe(tmp_path: Path) -> None:
+    """Pin the wiring, not just the probe body.
+
+    Every other allocation test calls ``_check_runner_allocation`` directly, so
+    deleting its call in ``run_doctor`` would leave them all green while the probe
+    silently stopped running for operators.
+    """
+    config = _doctor_allocation_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    _, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(tmp_path)
+    )
+
+    allocation_checks = [c for c in checks if c.name == "runner allocation"]
+    assert len(allocation_checks) == 1
+    # No state file was written, so the probe should report the never-run case.
+    assert allocation_checks[0].ok is False
+    assert "never run" in allocation_checks[0].detail
+    # Warning-only: the probe must never change doctor's exit code.
+    assert allocation_checks[0].severity == "warning"
+
+
+# ---------------------------------------------------------------------------
+# fleet dir virtualization probe (issue #624)
+#
+# MSIX/container redirection makes the literal fleet-dir path string identical
+# in both the container and the host while naming different files. The probe
+# keys on the literal path disagreeing with its resolved form -- never on a
+# hardcoded package moniker. The tests inject the divergence by patching the
+# resolution step (per the issue's test guidance), not by building a real
+# MSIX redirect.
+
+
+def _patch_resolve_to_diverge(monkeypatch: Any, literal: Path, redirected: Path) -> None:
+    """Make ``Path.resolve()`` return ``redirected`` for ``literal`` only.
+
+    Every other path resolves normally, so the rest of ``run_doctor`` is
+    unaffected. This is the "patch the resolution step" injection the issue
+    prescribes: the real ``fleet_dir_virtualization`` logic runs end-to-end,
+    only the filesystem's answer is forged.
+    """
+    import os as _os
+    import pathlib
+
+    real_resolve = pathlib.Path.resolve
+
+    def fake_resolve(self, *args, **kwargs):
+        result = real_resolve(self, *args, **kwargs)
+        if _os.path.normcase(_os.fspath(result)) == _os.path.normcase(_os.fspath(literal)):
+            return redirected
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "resolve", fake_resolve)
+
+
+def test_doctor_warns_when_fleet_dir_is_virtualized(tmp_path: Path, monkeypatch: Any) -> None:
+    """A literal/resolved divergence fires a warning naming both paths."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet_dir_path, redirected)
+
+    ok, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    by_name = {check.name: check for check in checks}
+    virt = by_name["fleet dir virtualization"]
+    assert virt.ok is False
+    assert virt.severity == "warning"
+    # Both paths must be named so the operator can see where it landed.
+    assert str(fleet_dir_path) in virt.detail
+    assert str(redirected) in virt.detail
+    # Reference the #590 failure and state the write-forks-a-copy consequence.
+    assert "#590" in virt.detail
+    assert "private copy" in virt.detail
+    # Warning-only: a virtualized fleet dir is not fatal for an interactive human.
+    assert ok is True
+
+
+def test_doctor_is_silent_when_fleet_dir_is_not_virtualized(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Equal literal and resolved paths produce no virtualization check."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    # No divergence injection: resolve() returns the literal path unchanged.
+    ok, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    names = {check.name for check in checks}
+    assert "fleet dir virtualization" not in names
+    assert ok is True
+
+
+def test_fleet_dir_virtualization_probe_is_repo_agnostic(tmp_path: Path, monkeypatch: Any) -> None:
+    """The probe fires for any fleet_dir override, not just charlie-work's layout.
+
+    The redirection is a per-process property of the host, so a repo whose
+    fleet dir is unrelated to charlie-work's own layout must still be flagged.
+    """
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    # An arbitrary override path with no charlie-work-specific component.
+    literal = tmp_path / "some-other-repo" / "fleet-state"
+    redirected = tmp_path / "Packages" / "other-app" / "LocalCache" / "some-other-repo"
+    _patch_resolve_to_diverge(monkeypatch, literal, redirected)
+
+    diverged = fleet_dir_virtualization(override=str(literal))
+    assert diverged is not None
+    assert diverged[0] == literal
+    assert diverged[1] == redirected
+
+
+def test_fleet_dir_virtualization_returns_none_when_equal(tmp_path: Path) -> None:
+    """No divergence -> None (the probe must stay silent)."""
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    literal = tmp_path / "fleet"
+    literal.mkdir(parents=True, exist_ok=True)
+    assert fleet_dir_virtualization(override=str(literal)) is None
+
+
+def test_run_doctor_wires_the_virtualization_probe(tmp_path: Path, monkeypatch: Any) -> None:
+    """Pin the wiring, not just the probe body.
+
+    Deleting the ``_check_fleet_dir_virtualization`` call in ``run_doctor``
+    would leave the probe-body tests green while the probe silently stopped
+    running for operators.
+    """
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet_dir_path, redirected)
+
+    _, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    virt_checks = [c for c in checks if c.name == "fleet dir virtualization"]
+    assert len(virt_checks) == 1
+    assert virt_checks[0].severity == "warning"

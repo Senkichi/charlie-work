@@ -501,6 +501,37 @@ def test_observe_runner_pool_with_mocked_github(tmp_path: Path) -> None:
     assert state.timestamp is not None
 
 
+def test_observe_runner_pool_dry_run_writes_no_pool_sample(tmp_path: Path) -> None:
+    """Previewing must not inject observations into the real idle-detection history.
+
+    Pool samples are the input to is_pool_idle_for_minutes, so a preview that wrote one
+    could tip a later *real* scale decision. This function took no ``dry_run`` parameter
+    at all before, which meant no caller could gate it (issue #609).
+    """
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(side_effect=lambda args, **kwargs: _mock_github_response(args))
+
+    observe_runner_pool(
+        gh, RunnerScalingConfig(), default_branch="main", state_dir=tmp_path, dry_run=True
+    )
+
+    assert not (tmp_path / "runner-pool-samples.jsonl").exists()
+
+
+def test_observe_runner_pool_records_a_sample_when_not_previewing(tmp_path: Path) -> None:
+    """The other direction: a real observation still records its sample.
+
+    Without this, gating the preview could silently disable idle detection outright and
+    the suite would stay green.
+    """
+    gh = MagicMock(spec=GitHub)
+    gh.run = MagicMock(side_effect=lambda args, **kwargs: _mock_github_response(args))
+
+    observe_runner_pool(gh, RunnerScalingConfig(), default_branch="main", state_dir=tmp_path)
+
+    assert (tmp_path / "runner-pool-samples.jsonl").exists()
+
+
 def test_observe_runner_pool_resolves_default_branch(tmp_path: Path) -> None:
     """When no default_branch is supplied, observe resolves it via the repo endpoint.
 
@@ -1038,6 +1069,96 @@ def test_scale_down_idle_runners_at_min(tmp_path: Path) -> None:
 
     assert removed == 0
     assert "At min_runners floor" in errors
+
+
+def _seed_scale_down_ready_pool(tmp_path: Path) -> RunnerScalingConfig:
+    """Set up two managed runners above the floor with a long idle history.
+
+    Shared by the two dry-run gate tests below so they differ only in the flag.
+    Returns the config; the state dir and managed root are both ``tmp_path``.
+    """
+    config = RunnerScalingConfig(
+        enabled=True,
+        managed_root=str(tmp_path),
+        runner_dir_prefix="jc-",
+        min_runners=1,
+        idle_scale_down_minutes=15,
+        cooldown_minutes=5,
+    )
+    for name in ("jc-1", "jc-2"):
+        runner_dir = tmp_path / name
+        runner_dir.mkdir()
+        (runner_dir / ".charlie-managed").touch()
+
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    for minutes_ago in range(20, 0, -1):
+        save_pool_sample(
+            tmp_path,
+            PoolSample(
+                timestamp=(now - timedelta(minutes=minutes_ago)).isoformat(),
+                busy=False,
+                queued_jobs=0,
+            ),
+        )
+    return config
+
+
+def test_scale_down_dry_run_records_no_scale_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A previewed scale-down must not write the cooldown timestamp (issue #609).
+
+    ``gracefully_remove_runner`` reports success under ``dry_run`` without removing
+    anything, so ``removed_count`` counts removals that did not happen — and the
+    cooldown this would write is read by ``decide_autoscale`` *before* it branches
+    up-vs-down, so one preview would suppress real scaling in BOTH directions for
+    ``cooldown_minutes``.
+
+    The removal itself is stubbed so this targets the state-write gate rather than the
+    removal machinery.
+    """
+    monkeypatch.setattr(
+        "charlie_work.runners.gracefully_remove_runner",
+        lambda runner_dir, gh, dry_run=False: (True, None),
+    )
+    config = _seed_scale_down_ready_pool(tmp_path)
+
+    removed, errors = scale_down_idle_runners(
+        Path(config.managed_root),
+        config.runner_dir_prefix,
+        MagicMock(spec=GitHub),
+        config,
+        tmp_path,
+        dry_run=True,
+    )
+
+    assert removed == 1, errors
+    assert get_last_scale_event_time(tmp_path) is None
+
+
+def test_scale_down_without_dry_run_records_the_scale_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction: a real scale-down still records the cooldown."""
+    monkeypatch.setattr(
+        "charlie_work.runners.gracefully_remove_runner",
+        lambda runner_dir, gh, dry_run=False: (True, None),
+    )
+    config = _seed_scale_down_ready_pool(tmp_path)
+
+    removed, errors = scale_down_idle_runners(
+        Path(config.managed_root),
+        config.runner_dir_prefix,
+        MagicMock(spec=GitHub),
+        config,
+        tmp_path,
+        dry_run=False,
+    )
+
+    assert removed == 1, errors
+    assert get_last_scale_event_time(tmp_path) is not None
 
 
 def test_ensure_runner_running_not_managed(tmp_path: Path) -> None:

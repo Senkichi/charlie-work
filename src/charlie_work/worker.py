@@ -6,12 +6,14 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 """
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from json import JSONDecodeError
 from os import stat_result
 from pathlib import Path
+from typing import Any
 
 from .claude_code import (
     ClaudeWorkerRecord,
@@ -31,6 +33,8 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Shim marker that indicates successful infra materialization (issue #221)
@@ -152,6 +156,7 @@ class WorkerHealth(Enum):
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    6.5. in-flight api per-session budget (api only) → RUNAWAY (issue #484)
     7. (none of the above) → HEALTHY
 
     SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
@@ -263,6 +268,7 @@ class WorkerView:
     )
     inconclusive_probe_deferred_count: int = 0  # Signal-1 deferral counter (issue #338)
     session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
+    provider: str = ""  # api provider name (issue #484); empty for non-api adapters
 
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
@@ -373,7 +379,13 @@ class WorkerView:
         except (OSError, json.JSONDecodeError):
             pass
 
-    def reap_sidecar(self, sessions_dir: Path) -> None:
+    def reap_sidecar(
+        self,
+        sessions_dir: Path,
+        *,
+        api_config: Any = None,
+        state_dir: Path | str | None = None,
+    ) -> None:
         """Delete the sidecar file for this worker to prevent phantom sessions.
 
         Dispatches to the adapter-specific sidecar path function based on adapter_kind.
@@ -384,6 +396,14 @@ class WorkerView:
 
         This is called after a session is detected as dead and classified to prevent
         phantom sessions from PID recycling (issue #113).
+
+        For ``adapter_kind == "api"`` (issue #480), when ``api_config`` and
+        ``state_dir`` are supplied, the session's spend is settled into the
+        api-budget ledger BEFORE the sidecar is unlinked (so the sidecar's
+        provider field can still be read). Settlement is best-effort accounting:
+        any failure is logged and swallowed so it can never break the reap.
+        Callers without api context (legacy callers, tests, review-lane reaps)
+        omit the kwargs and skip settlement — the unlink still happens.
         """
         if self.adapter_kind == "devin":
             sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
@@ -394,6 +414,9 @@ class WorkerView:
             # routed through the adapter_kind-aware _sidecar_path helper so the
             # .api.json suffix is selected.
             sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, "api")
+            # Best-effort spend settlement before the sidecar is unlinked (issue #480).
+            if api_config is not None and state_dir is not None:
+                self._settle_api_budget(sidecar_path, api_config, state_dir)
         else:
             # Unknown adapter kind - nothing to reap
             return
@@ -405,6 +428,92 @@ class WorkerView:
             pass
 
         self._remove_writer_marker()
+
+    def _settle_api_budget(
+        self,
+        sidecar_path: Path,
+        api_config: Any,
+        state_dir: Path | str,
+    ) -> None:
+        """Best-effort spend settlement for an api worker session (issue #480).
+
+        Reads the sidecar for the provider name, parses the session's
+        events.jsonl for token usage (via the shared ``iter_claude_events``
+        primitive), computes USD from the provider's configured pricing, and
+        atomically settles the entry into the api-budget ledger. Never raises
+        — settlement is accounting, not enforcement, and must not break the
+        sidecar reap that prevents phantom sessions.
+        """
+        from .api_budget import (
+            SessionEntry,
+            cost_usd,
+            ledger_path,
+            settle_session_to_disk,
+            usage_from_events,
+        )
+        from .claude_code import iter_claude_events
+
+        try:
+            provider_name = ""
+            try:
+                with sidecar_path.open("r", encoding="utf-8") as handle:
+                    sidecar = json.load(handle)
+                if isinstance(sidecar, dict):
+                    provider_name = str(sidecar.get("provider") or "")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            provider_cfg = api_config.providers.get(provider_name) if provider_name else None
+            if provider_cfg is None:
+                # No pricing for the resolved provider → cannot compute cost.
+                # Skip settlement rather than recording a zero-cost entry that
+                # would understate spend. Logged so the drop is visible (a
+                # silent accounting gap is inconsistent with the ledger's
+                # "accounting data is never silently destroyed" guarantee).
+                logger.warning(
+                    "api budget settlement skipped for issue %s: no pricing "
+                    "configured for provider %r (session cost not recorded)",
+                    self.issue_number,
+                    provider_name or "",
+                )
+                return
+
+            events_path = _events_path_from_log(Path(self.log_path))
+            usage = usage_from_events(iter_claude_events(events_path))
+            usd = cost_usd(usage, provider_cfg)
+            ended_at = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            entry = SessionEntry(
+                issue=self.issue_number,
+                session_id=self.session_id or "",
+                provider=provider_name,
+                model=provider_cfg.model,
+                started_at=self.started_at,
+                ended_at=ended_at,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cached_tokens=usage.cached_tokens,
+                usd=usd,
+                duration_s=self.runtime_seconds(),
+                outcome=self.failure_kind or "reaped",
+            )
+            # Locked read-modify-write: load→settle→save happens inside
+            # advisory_file_lock so concurrent reaps of different api sessions
+            # cannot lose a settlement (issue #480 review — same lost-update
+            # hazard state_lock closes for state.json). Lock-contention skips
+            # as a value (logged inside settle_session_to_disk); the reap still
+            # completes below.
+            settle_session_to_disk(ledger_path(state_dir), entry)
+        except Exception:
+            logger.warning(
+                "api budget settlement failed for issue %s; reap continues",
+                self.issue_number,
+                exc_info=True,
+            )
 
     def runtime_seconds(self) -> float:
         """Calculate runtime in seconds from started_at to now.
@@ -552,6 +661,7 @@ def classify_worker_health(
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
     6. cost/token budget (Claude Code only) → SLOW (or RUNAWAY if cost_budget_action="kill")
+    6.5. in-flight api per-session budget (api only) → RUNAWAY (issue #484)
     7. (none of the above) → HEALTHY
 
     Signals 1 and 3 are corroborated against ``real_activity_probe`` (issues #280,
@@ -710,8 +820,60 @@ def classify_worker_health(
                     else:
                         return WorkerHealth.SLOW
 
+    # Signal 6.5: in-flight api per-session budget kill (issue #484)
+    # Only applies to api workers. Claude Code's self-reported cost_usd (Signal
+    # 6) is WRONG against non-Anthropic endpoints, so api cost is derived from
+    # token usage times the configured provider pricing via api_budget. When
+    # ``max_usd_per_session`` is 0/unset the check is entirely dormant
+    # (calibration window): no cost computation side effects beyond what the
+    # ledger already does at settlement. Non-api workers are never
+    # budget-evaluated here.
+    if _api_session_over_budget(view, config):
+        return WorkerHealth.RUNAWAY
+
     # Signal 7: (none of the above)
     return WorkerHealth.HEALTHY
+
+
+def _api_session_over_budget(view: WorkerView, config: OrchestratorConfig) -> bool:
+    """Return True when an api worker's accumulated cost exceeds the per-session cap.
+
+    Pure check (no side effects beyond reading the session's events.jsonl):
+    accumulates token usage via ``api_budget.usage_from_events`` over the
+    session's events.jsonl and computes USD via ``api_budget.cost_usd`` with
+    the active provider's configured pricing. Returns False (dormant) when:
+
+    * the worker is not ``adapter_kind == "api"`` (non-api workers are never
+      budget-evaluated — issue #484 acceptance criterion),
+    * ``max_usd_per_session`` is 0/unset (calibration window — the check is
+      entirely dormant with no cost computation side effects beyond what the
+      ledger already does at settlement),
+    * the worker has no resolved provider name, or the provider is not in the
+      registry (no pricing → cannot compute cost),
+    * the events.jsonl file does not exist yet (a young session that has not
+      emitted any usage).
+
+    Shared by ``classify_worker_health`` (Signal 6.5) and the supervision
+    path's budget-kill block so the cost computation is implemented once.
+    """
+    if view.adapter_kind != "api":
+        return False
+    cap = config.api_worker.budget.max_usd_per_session
+    if cap <= 0 or not view.provider:
+        return False
+    provider_cfg = config.api_worker.providers.get(view.provider)
+    if provider_cfg is None:
+        return False
+    events_path = _events_path_from_log(Path(view.log_path))
+    if not events_path.exists():
+        return False
+    from .api_budget import cost_usd as _api_cost_usd
+    from .api_budget import usage_from_events as _api_usage_from_events
+    from .claude_code import iter_claude_events
+
+    api_usage = _api_usage_from_events(iter_claude_events(events_path))
+    session_cost = _api_cost_usd(api_usage, provider_cfg)
+    return session_cost > cap
 
 
 def _from_session_record(record: SessionRecord, repo_key: str) -> WorkerView:
@@ -764,6 +926,7 @@ def _from_claude_record(record: ClaudeWorkerRecord, repo_key: str) -> WorkerView
         rate_limit_defer_until=record.rate_limit_defer_until,
         inconclusive_probe_deferred_count=record.inconclusive_probe_deferred_count,
         session_id=record.session_id,
+        provider=record.provider,
     )
 
 

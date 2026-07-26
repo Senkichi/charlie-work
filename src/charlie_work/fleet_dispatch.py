@@ -7,11 +7,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ConfigError, OrchestratorConfig
+from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
-from .global_config import load_layered_config
+from .global_config import describe_config_file, load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
@@ -22,6 +22,8 @@ from .supervise import (
     take_snapshot,
     try_acquire_supervisor_lock,
 )
+from .runner_allocation_pass import run_allocation_pass
+from .runner_slots import UNATTENDED_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -77,6 +79,367 @@ def _select_repos(
 
         all_repos.sort(key=last_seen_key)
         return all_repos
+
+
+@dataclass(frozen=True)
+class ApiWorkerFleetReport:
+    """Fleet-wide api-worker observability line (issue #483).
+
+    Read-only snapshot rendered in the fleet status / pass summary. The
+    ``provider``, ``today_usd``, ``lifetime_usd``, and ``cap_usd`` fields come
+    from a representative repo (the first enabled repo, or the first configured
+    repo when none are enabled). ``live`` is the fleet-wide count of alive
+    ``adapter_kind == "api"`` workers. ``enabled_k``/``enabled_m`` is the
+    fleet-wide enablement ratio across all repos that configure the section.
+    """
+
+    provider: str
+    today_usd: float
+    lifetime_usd: float
+    cap_usd: float
+    live: int
+    enabled_k: int
+    enabled_m: int
+
+    def format_line(self) -> str:
+        return (
+            f"api-worker: {self.provider}, "
+            f"${self.today_usd:.2f} today / ${self.lifetime_usd:.2f} lifetime "
+            f"of ${self.cap_usd:.2f}, {self.live} live, "
+            f"enabled {self.enabled_k}/{self.enabled_m} repos"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "today_usd": self.today_usd,
+            "lifetime_usd": self.lifetime_usd,
+            "cap_usd": self.cap_usd,
+            "live": self.live,
+            "enabled_k": self.enabled_k,
+            "enabled_m": self.enabled_m,
+            "line": self.format_line(),
+        }
+
+
+def _api_worker_configured(config: OrchestratorConfig) -> bool:
+    """Return True when the api_worker section is non-default (configured).
+
+    A bare ``api_worker: {enabled: false}`` with no providers/budget is the
+    package default and carries nothing to report. A section with providers
+    set but ``enabled: false`` is the built-but-dormant case.
+    """
+    return config.api_worker != ApiWorkerConfig()
+
+
+def compute_api_worker_fleet_report(
+    *,
+    fleet_dir_override: str | None = None,
+    preloaded_configs: dict[str, OrchestratorConfig] | None = None,
+) -> ApiWorkerFleetReport | None:
+    """Compute the fleet-wide api-worker report line (issue #483).
+
+    Returns ``None`` when no registered repo configures the ``api_worker``
+    section (the line is omitted entirely in that case). Otherwise returns an
+    ``ApiWorkerFleetReport`` with spend from a representative repo's ledger and
+    a fleet-wide live-worker count.
+
+    ``preloaded_configs`` is an optional ``repo_key -> config`` mapping for
+    repos whose layered config the caller already loaded (e.g. ``fleet_loop``
+    loads each selected repo's config for dispatch). When a repo_key is present
+    in this map, its config is reused instead of re-loading from disk — this
+    avoids a redundant per-repo config reload on every fleet pass. Repos absent
+    from the map (unselected, or callers that don't preload) fall back to
+    ``load_layered_config``. The preloaded config must be the raw layered
+    config (the report only reads ``api_worker`` fields, so a caller-side
+    ``replace(...)`` on unrelated fields is harmless).
+
+    Near read-only: never settles or writes the ledger itself, but
+    ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
+    a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
+    filesystem mutation. All errors surface as report values (zeroed spend,
+    zero live), never raised.
+    """
+    from datetime import UTC, datetime
+
+    from .api_budget import budget_status, ledger_path, load_ledger
+    from .worker import iter_workers
+
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    repos = registry.get("repos", {})
+    if not repos:
+        return None
+
+    enabled_k = 0
+    configured_m = 0
+    representative: tuple[str, OrchestratorConfig, dict[str, Any]] | None = None
+
+    for repo_key, entry in repos.items():
+        repo_root = Path(entry.get("repo_root", ""))
+        if not repo_root.is_dir():
+            continue
+        config = preloaded_configs.get(repo_key) if preloaded_configs else None
+        if config is None:
+            try:
+                explicit_cfg = entry.get("config_path")
+                config = load_layered_config(
+                    repo_root,
+                    Path(explicit_cfg) if explicit_cfg else None,
+                    fleet_dir_override=fleet_dir_override,
+                )
+            except (ConfigError, GitHubError, OSError):
+                continue
+        if not _api_worker_configured(config):
+            continue
+        configured_m += 1
+        if config.api_worker.enabled:
+            enabled_k += 1
+            if representative is None:
+                representative = (repo_key, config, entry)
+        elif representative is None:
+            representative = (repo_key, config, entry)
+
+    if configured_m == 0:
+        return None
+
+    assert representative is not None  # configured_m > 0 guarantees this
+    _, rep_config, rep_entry = representative
+    provider_name = rep_config.api_worker.provider
+
+    # Spend from the representative repo's ledger (read-only).
+    state_dir_str = rep_entry.get("state_dir")
+    today_usd = 0.0
+    lifetime_usd = 0.0
+    cap_usd = rep_config.api_worker.budget.lifetime_usd
+    if state_dir_str:
+        try:
+            ledger_file = ledger_path(Path(state_dir_str))
+            ledger = load_ledger(ledger_file)
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            status = budget_status(ledger, rep_config.api_worker.budget, today)
+            today_usd = status.spent_today_usd
+            lifetime_usd = status.lifetime_spent_usd
+        except Exception:
+            pass
+
+    # Fleet-wide live api worker count.
+    live = 0
+    for _repo_key, entry in repos.items():
+        state_dir_str = entry.get("state_dir")
+        if not state_dir_str:
+            continue
+        sessions_dir = Path(state_dir_str) / "dispatches" / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        try:
+            for w in iter_workers(sessions_dir):
+                if w.adapter_kind == "api" and w.is_alive():
+                    live += 1
+        except Exception:
+            pass
+
+    return ApiWorkerFleetReport(
+        provider=provider_name,
+        today_usd=today_usd,
+        lifetime_usd=lifetime_usd,
+        cap_usd=cap_usd,
+        live=live,
+        enabled_k=enabled_k,
+        enabled_m=configured_m,
+    )
+
+
+def _run_fleet_allocation_prologue(
+    fleet_dir_override: str | None,
+    global_config: Any,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    """Rebalance the host's running runner listeners across repos by demand.
+
+    Runs before the autoscale prologue on purpose: reallocating existing
+    capacity is free and instant, so it should be tried before deciding that
+    the host needs *more* runners registered. A repo that looks starved often
+    only needs a slot another repo is sitting on idle.
+
+    This is host-wide rather than per-repo — the repo set comes from the
+    ``.runner`` files under the managed root, not from the fleet registry, so a
+    repo with runners on this host is covered whether or not it is registered
+    for dispatch. Gated on ``runner_allocation.enabled``.
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+        global_config: Global fleet configuration.
+        dry_run: If True, plan without starting or parking anything.
+
+    Returns:
+        A list of attention event dicts for aggregation into the fleet digest.
+    """
+    events: list[dict[str, Any]] = []
+
+    allocation = getattr(global_config, "runner_allocation", None)
+
+    # Unconditional, before any branch. This line is the whole difference
+    # between "the prologue ran and declined" and "the prologue was never
+    # reached" — and #590 stayed unisolated for hours precisely because every
+    # skip path lived inside a branch, so an absent log line was consistent
+    # with both readings and could not be used as evidence either way. Logging
+    # the resolved decision inputs here, where nothing can short-circuit past
+    # them, means the next occurrence names its own cause.
+    logger.info(
+        "Fleet allocation prologue: entered (enabled=%s, budget=%s, managed_root=%s, "
+        "fleet_dir=%s, dry_run=%s)",
+        getattr(allocation, "enabled", None),
+        getattr(allocation, "max_running_runners", None),
+        getattr(allocation, "managed_root", None) or "(unset)",
+        fleet_dir(override=fleet_dir_override),
+        dry_run,
+    )
+
+    def skipped(reason: str) -> list[dict[str, Any]]:
+        """Record an anomalous skip in the digest, not only in the log.
+
+        The log is a host-local file that rotates and has been demonstrably
+        lossy here; the digest is the structured surface operators actually
+        read. A prologue that cannot act for a reason nobody chose belongs in
+        the same place its errors go.
+        """
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation_skipped",
+                "reason": reason,
+            }
+        )
+        return events
+
+    if global_config is None:
+        # No global fleet config supplied at all — this is the documented default
+        # of fleet_loop's parameter, not a disagreement between code and config,
+        # so it must not be reported as an anomaly. Host-wide allocation has
+        # nothing to read here; the entry line above already records that the
+        # prologue was reached, which is the distinction #590 needed.
+        logger.info("Fleet allocation prologue: not run — no global fleet config was supplied")
+        return events
+    if allocation is None:
+        # The config object has no such section at all. That is not "the
+        # operator left it off" — it means this process is holding a config
+        # built by different code, or a load failure already fell back to
+        # defaults. Either way the feature is silently absent, so say so.
+        logger.warning(
+            "Fleet allocation prologue: config object has no runner_allocation "
+            "section (%s); allocation cannot run in this process",
+            type(global_config).__name__,
+        )
+        return skipped(
+            f"config object has no runner_allocation section ({type(global_config).__name__})"
+        )
+    if not allocation.enabled:
+        # INFO, not DEBUG. This is the branch that makes the entire feature inert,
+        # and the daemon runs at INFO, so a DEBUG line here is never written at
+        # all: during issue #590 a host where allocation never ran was
+        # indistinguishable from a converged one, and the absence of a log line
+        # could not be used as evidence either way.
+        # Name the fleet directory too — it identifies *which* config.yaml
+        # governs, which is the thing an operator gets wrong when they set a
+        # host-wide knob in a per-repo layer.
+        # Deliberately log-only, unlike the other early returns: this is a state
+        # the operator chose, so a digest entry every pass would be recurring
+        # noise on any host that simply runs without allocation. The entry line
+        # above already distinguishes it from "never reached", which was the
+        # evidence gap that mattered.
+        logger.info(
+            "Fleet allocation prologue: not run — runner_allocation.enabled is false "
+            "in the resolved config (fleet dir: %s)",
+            fleet_dir(override=fleet_dir_override),
+        )
+        return events
+
+    # Any existing repo root works as the gh working directory: the allocation
+    # pass addresses every repo by explicit owner/name slug, so the cwd's git
+    # identity is irrelevant. Only auth and a valid directory are needed.
+    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    registry = _load_registry(fleet_json_path)
+    anchor_root: Path | None = None
+    anchor_state: Path | None = None
+    for entry in registry.get("repos", {}).values():
+        candidate = Path(entry.get("repo_root", ""))
+        if candidate.is_dir():
+            anchor_root = candidate
+            state_dir = entry.get("state_dir")
+            anchor_state = Path(state_dir) / "state.json" if state_dir else None
+            break
+
+    if anchor_root is None:
+        logger.info("Fleet allocation prologue: no usable repo root in registry, skipping")
+        return skipped("no usable repo root in the fleet registry")
+
+    runtime = getattr(global_config, "runtime", None)
+    runner_scaling = getattr(global_config, "runner_scaling", None)
+    gh = GitHub(repo_root=anchor_root, runtime=runtime, dry_run=False)
+
+    result = run_allocation_pass(
+        gh,
+        allocation,
+        managed_root_fallback=getattr(runner_scaling, "managed_root", "") or "",
+        fleet_dir_override=fleet_dir_override,
+        state_path=anchor_state,
+        dry_run=dry_run,
+        source=UNATTENDED_ALLOCATION_SOURCE,
+    )
+
+    if result.error:
+        logger.warning("Fleet allocation prologue: %s", result.error)
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation_error",
+                "error": result.error,
+            }
+        )
+        return events
+
+    # Report the inputs alongside the outcome: "started=0 parked=0" is the correct
+    # result for a converged host *and* for one pointed at the wrong managed_root
+    # or running under a budget the operator did not intend. Without the budget and
+    # root, a healthy no-op and a misconfigured no-op read identically.
+    logger.info(
+        "Fleet allocation prologue: started=%d parked=%d notes=%d (budget=%d, managed_root=%s)",
+        result.started,
+        result.parked,
+        len(result.notes),
+        allocation.max_running_runners,
+        allocation.managed_root or getattr(runner_scaling, "managed_root", "") or "(unset)",
+    )
+
+    # Only surface an event when something actually moved or a bound was hit;
+    # a balanced host should not add noise to every digest.
+    if result.started or result.parked or result.notes:
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": "runner_allocation",
+                "started": result.started,
+                "parked": result.parked,
+                "budget": result.plan.budget if result.plan else 0,
+                "notes": list(result.notes),
+                "dry_run": dry_run,
+            }
+        )
+
+    for slot in result.results:
+        if not slot.ok:
+            events.append(
+                {
+                    "repo_key": "fleet",
+                    "type": "runner_allocation_slot_error",
+                    "runner": slot.change.runner_name,
+                    "action": slot.change.action.value,
+                    "message": slot.message,
+                }
+            )
+
+    return events
 
 
 def _run_fleet_autoscale_prologue(
@@ -159,7 +522,7 @@ def _run_fleet_autoscale_prologue(
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
-    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root, dry_run=dry_run)
 
     # Check cooldown and idle duration
     in_cooldown = is_in_cooldown(paths.root, config.runner_scaling.cooldown_minutes)
@@ -618,6 +981,38 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+        elif event_type == "runner_allocation":
+            # Deliberately not in the digest — unlike the accidental drops the
+            # fallback below exists to prevent. This is the allocator's *success*
+            # event, and the attention digest is for things needing attention.
+            #
+            # It also cannot be left to the fallback: the prologue emits it when
+            # anything moved *or any note was produced*, and the notes include
+            # standing advisory conditions that persist for as long as the condition
+            # does ("holding 4 surplus slot(s) — slack for 0/3 pass(es)", "demand 7
+            # exceeds its 2 registered runner(s)"). Verified against this host's
+            # events.db: every recorded pass carried a note while moving no slots, so
+            # rendering it would put a near-identical entry in every 5-minute digest.
+            # The event stays in events.db and the prologue logs its inputs at INFO,
+            # which is where standing conditions belong.
+            continue
+        else:
+            # Visible by default. This chain used to end here, so any event type
+            # without an explicit branch was dropped silently — which is how the
+            # prologue's own ``runner_allocation_error`` never reached the digest
+            # despite being emitted correctly (issue #590). Making the fallback
+            # generic means adding an event type can no longer make it invisible;
+            # forgetting a branch costs a less specific entry, not a lost signal.
+            entries.append(
+                AttentionEntry(
+                    issue_number=event.get("issue_number") or event.get("pr") or -1,
+                    adapter_kind=event.get("repo_key", "fleet"),
+                    health="ERROR" if "error" in event_type else "INFO",
+                    previous_health=None,
+                    last_log_line=event.get("error") or event.get("reason") or event_type,
+                    pid=event.get("pid"),
+                )
+            )
 
     return AttentionDigest(
         generated_at=utc_now(),
@@ -666,16 +1061,30 @@ def fleet_loop(
     per_repo_results: dict[str, CommandResult] = {}
     attention_events: list[dict[str, Any]] = []
     orphan_sweep_calls = 0
+    # Collect each selected repo's raw layered config so the api-worker fleet
+    # report below can reuse it instead of re-loading every config each pass
+    # (issue #483 review: redundant per-repo config reload each fleet pass).
+    # The raw config is captured before the notify-silencing replace() below;
+    # the report only reads api_worker fields, which that replace never touches.
+    loaded_configs: dict[str, OrchestratorConfig] = {}
 
-    # Run autoscale prologue if enabled (only for full loop, not work-only)
+    # Run runner prologues if enabled (only for full loop, not work-only).
+    # Allocation first: moving an idle slot to a starved repo is free, so it
+    # runs before autoscale decides the host needs more runners registered.
     if not work_only:
+        attention_events.extend(
+            _run_fleet_allocation_prologue(fleet_dir_override, global_config, dry_run)
+        )
         autoscale_events = _run_fleet_autoscale_prologue(
             fleet_dir_override, global_config, dry_run
         )
         attention_events.extend(autoscale_events)
 
     for repo_key, entry in selected:
-        repo_root = Path(entry.get("repo_root"))
+        # Default to "" rather than None: a registry entry missing repo_root
+        # entirely would make Path(None) raise, where the is_dir() check below
+        # already has the right answer for a bad path.
+        repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
             # Tolerate vanished/moved repo (#169 precedent)
             per_repo_results[repo_key] = CommandResult(
@@ -694,6 +1103,9 @@ def fleet_loop(
                 Path(explicit_cfg) if explicit_cfg else None,
                 fleet_dir_override=fleet_dir_override,
             )
+            # Cache the raw layered config for the api-worker fleet report
+            # (captured before the notify-silencing replace below).
+            loaded_configs[repo_key] = config
             # Fleet mode is the single notification authority: the aggregate
             # digest below emits once for the whole pass. Silence per-repo
             # dispatch()/loop() emission so one health transition doesn't fire
@@ -803,12 +1215,23 @@ def fleet_loop(
         repo_data["message"] = r.message  # Surface per-repo failure message
         repos_data[k] = repo_data
 
+    # api-worker fleet report line (issue #483): near read-only, never raises.
+    # Reuse the configs already loaded this pass instead of re-loading every
+    # repo config (review: redundant per-repo config reload each fleet pass).
+    api_worker_report = compute_api_worker_fleet_report(
+        fleet_dir_override=fleet_dir_override,
+        preloaded_configs=loaded_configs,
+    )
+
     return CommandResult(
         ok,
         message,
         {
             "repos": repos_data,
             "digest": digest,
+            "api_worker_report": api_worker_report.to_dict()
+            if api_worker_report is not None
+            else None,
         },
     )
 
@@ -927,8 +1350,35 @@ def run_fleet_supervise(
         global_config = load_layered_config(
             Path.cwd(), None, fleet_dir_override=fleet_dir_override
         )
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        # Falling back to defaults silently is how a whole feature disappears
+        # without a trace: every config-gated behavior (notify, labels, the
+        # runner prologues) reverts to off while passes keep reporting success.
+        # A typo in the global layer must be loud.
+        logger.warning(
+            "Fleet supervisor could not load config; running on DEFAULTS "
+            "(notify, labels and runner prologues are all off): %s",
+            exc,
+        )
+        print(f"config load failed, running on defaults: {exc}", flush=True)
         global_config = OrchestratorConfig()
+
+    # Provenance of the layer every fleet-wide knob comes from, logged once per
+    # supervisor start (not per pass -- this is startup, so it costs one stat).
+    # The prologue already logs what runner_allocation *resolved to*; the fact
+    # missing from #590 is whether the file that declares it was read at all.
+    #
+    # Deliberately one stat() rather than an exists() flag: exists() collapses a
+    # missing file, an unready device and an unresolvable path into the same bare
+    # False, and all of them take load_layered_config's silent-{} branch. A bare
+    # exists=False here would reproduce the exact ambiguity this line exists to
+    # remove. See describe_config_file for which errors are and are not hidden.
+    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    logger.info(
+        "Fleet supervisor global config: path=%s %s",
+        global_config_path,
+        describe_config_file(global_config_path),
+    )
 
     overrides: dict[str, int] = {}
     if poll_interval_override is not None:
@@ -991,14 +1441,20 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(orchestrator_root(), fleet_dir_override=fleet_dir_override)
+            deploy = self_deploy(
+                orchestrator_root(), fleet_dir_override=fleet_dir_override, dry_run=dry_run
+            )
             if not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",
                     flush=True,
                 )
                 notify_config = getattr(global_config, "notify", None)
-                if notify_config is not None and getattr(notify_config, "enabled", False):
+                if (
+                    deploy.alertable
+                    and notify_config is not None
+                    and getattr(notify_config, "enabled", False)
+                ):
                     attention_digest = AttentionDigest(
                         generated_at=utc_now(),
                         repo="fleet",
@@ -1014,6 +1470,8 @@ def run_fleet_supervise(
                         ),
                     )
                     emit_digest(notify_config, attention_digest)
+            elif deploy.previewed:
+                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.synced:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.venv_repaired:
@@ -1052,17 +1510,14 @@ def run_fleet_supervise(
             # call: no dispatch/state mutation has happened yet this
             # iteration, and state.json is disk-persisted, not in-memory, so
             # the next process resumes from exactly where this one left off.
-            head_changed = bool(
-                deploy.ok
-                and deploy.pulled
-                and deploy.from_sha
-                and deploy.to_sha
-                and deploy.from_sha != deploy.to_sha
-            )
-            if head_changed:
+            # Bind the shas to locals so the non-None guard survives into the
+            # message below; folding the check into a bool() loses it.
+            from_sha = deploy.from_sha
+            to_sha = deploy.to_sha
+            if deploy.ok and deploy.pulled and from_sha and to_sha and from_sha != to_sha:
                 print(
-                    f"[{now_str}] self-deploy: HEAD moved {deploy.from_sha[:12]} -> "
-                    f"{deploy.to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                    f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
+                    f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
                     flush=True,
                 )
                 break
@@ -1115,6 +1570,13 @@ def run_fleet_supervise(
                 f"{attention_count} attention event(s)",
                 flush=True,
             )
+
+            # api-worker fleet report line (issue #483): one line per pass
+            # when any repo configures the section, keeping partial rollout
+            # visible until fleet-wide enablement completes.
+            api_worker_report = data.get("api_worker_report") if isinstance(data, dict) else None
+            if isinstance(api_worker_report, dict) and api_worker_report.get("line"):
+                print(f"[{now_str}] {api_worker_report['line']}", flush=True)
 
             # Snapshot after the pass becomes the baseline for the next delta
             # check; this avoids a spurious extra pass when this pass's own

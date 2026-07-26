@@ -17,6 +17,7 @@ sidecar so ``doctor``/reconcile code can treat both worker kinds uniformly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -24,14 +25,19 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
-from .config import CLAUDE_CODE_PROMPT_FILENAME, OrchestratorConfig
+from .config import (
+    CLAUDE_CODE_PROMPT_FILENAME,
+    ClaudeCodeConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+)
 from .env_sanitize import sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
@@ -67,6 +73,27 @@ _QUOTA_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern for provider authentication failures (issue #484). Matched against the
+# log tail of api-kind sessions only — a dead/invalid API key against a custom
+# Anthropic-compatible endpoint surfaces as 401/403 or an explicit
+# authentication/invalid-api-key error. Auth failures must NOT masquerade as
+# generic throttles: they are classified as ``provider_auth`` and enter the
+# existing ``throttled_until`` cooldown so routing preflight falls back until
+# the key is fixed (a dead key will not self-heal in minutes).
+#
+# The bare HTTP status codes 401/403 are anchored with word boundaries (\b) so
+# a coincidental numeric substring in an unrelated log tail (e.g. "error code
+# 14013", "4034 files processed", "issue #4019") cannot trip a false-positive
+# 24h cooldown. Every other pattern in this file (throttle markers, quota
+# phrases) matches natural-language substrings; the bare codes are the only
+# numeric tokens and would otherwise be the sole false-positive vector.
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
@@ -93,7 +120,9 @@ class ClaudeWorkerRecord:
     started_at: str
     log_path: str
     error: str | None = None
-    failure_kind: str | None = None  # "rate_limited" | "quota_exhausted" | ...
+    failure_kind: str | None = (
+        None  # "rate_limited" | "quota_exhausted" | "provider_auth" | "budget_exceeded" | ...
+    )
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
     last_activity_at: str | None = None  # ISO timestamp from log_path.stat().st_mtime
@@ -248,6 +277,75 @@ def _events_path(
     return sessions_dir / f"issue-{issue_number}{suffix}"
 
 
+def iter_stream_json_events(text: str) -> Iterator[dict[str, Any]]:
+    """Yield parsed stream-json events from tee'd JSONL text.
+
+    Claude Code's ``--output-format stream-json`` emits one JSON object per
+    line. Both the plaintext ``.log`` and the ``.events.jsonl`` sidecar carry
+    this format when ``tee_stream_json`` is enabled. Non-JSON lines (plain
+    stderr noise, truncated tails) are skipped, not raised.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def extract_event_text(event: dict[str, Any]) -> str:
+    """Assistant-visible text carried by one stream-json event.
+
+    Real stream-json shapes (``--output-format stream-json``):
+
+    - ``{"type": "assistant", "message": {"content": [{"type": "text", ...}]}}``
+      — concatenates ``text`` blocks. ``thinking`` blocks are deliberately
+      excluded: they can contain draft verdicts the model later revised.
+    - ``{"type": "result", "result": "<final output text>"}``
+
+    Legacy/simplified shape (``{"type": "assistant_message", "content": ...}``
+    with string, block-list, or dict content) is still honored so any adapter
+    emitting it keeps working. Returns ``""`` for events carrying no text.
+    """
+    event_type = event.get("type")
+
+    if event_type == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return ""
+
+    if event_type == "result":
+        result = event.get("result")
+        return result if isinstance(result, str) else ""
+
+    if event_type == "assistant_message":
+        content = event.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        if isinstance(content, dict):
+            return str(content.get("text", ""))
+
+    return ""
+
+
 @dataclass(frozen=True)
 class ClaudeProgress:
     """Progress metrics parsed from Claude Code's stream-json events.
@@ -262,11 +360,61 @@ class ClaudeProgress:
     cost_usd: float | None = None
 
 
+def iter_claude_events(events_path: Path) -> Iterator[dict[str, Any]]:
+    """Yield parsed JSON event dicts from a Claude Code stream-json events file.
+
+    This is the single parsing primitive for ``events.jsonl``: it owns the
+    tolerant line-by-line read (partial/trailing lines and malformed JSON are
+    skipped, never raised; a missing file yields nothing). Higher-level
+    consumers — ``parse_claude_events`` (progress metrics) and
+    ``api_budget.usage_from_events`` (token usage for spend accounting) —
+    iterate this generator so the JSONL parsing logic is implemented once and
+    reused, never duplicated.
+
+    Args:
+        events_path: Path to the events.jsonl file.
+
+    Yields:
+        Each parsed JSON object that is a dict. Non-dict JSON values are
+        skipped.
+    """
+    if not events_path.exists():
+        return
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Skip malformed lines (including partial trailing lines
+                    # written while the file is being appended to live).
+                    continue
+                if isinstance(event, dict):
+                    yield event
+    except OSError:
+        # File read error — treat as no events (absence is not an error).
+        return
+
+
 def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     """Parse Claude Code's stream-json events file and extract progress metrics.
 
-    Reads the events.jsonl file line-by-line, accumulating tool_call_count and
-    turn_count, and taking the last-seen cumulative usage fields (tokens, cost_usd).
+    Reads the events.jsonl file via ``iter_claude_events`` (the shared parsing
+    primitive), accumulating tool_call_count and turn_count, and taking the
+    last-seen cumulative usage fields (tokens, cost_usd).
+
+    Two schemas are handled:
+
+    * The real ``--output-format stream-json`` schema: ``assistant`` events
+      carry ``message.content`` blocks (tool calls appear as ``tool_use``
+      blocks); the terminal ``result`` event reports authoritative
+      ``num_turns`` / ``total_cost_usd`` / ``usage``.
+    * A legacy/simplified schema (``tool_call`` / ``user_message`` /
+      ``assistant_message`` event types and top-level ``tokens`` / ``cost_usd``
+      fields), kept for adapters that emit it.
 
     Tolerates partial/incomplete final lines (file is being appended to live).
     Malformed/unparseable lines are skipped, not raised.
@@ -280,47 +428,69 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     Returns:
         ClaudeProgress with accumulated metrics, or None if file doesn't exist
     """
-    if not events_path.exists():
-        return None
-
     tool_call_count = 0
     turn_count = 0
     tokens = None
     cost_usd = None
 
-    try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
+    for event in iter_claude_events(events_path):
+        event_type = event.get("type")
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # Skip malformed lines
-                    continue
+        # Real stream-json schema (--output-format stream-json):
+        # assistant events carry message.content blocks; tool calls
+        # appear as tool_use blocks; the final result event reports
+        # authoritative num_turns / total_cost_usd / usage.
+        if event_type == "assistant":
+            turn_count += 1
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                tool_call_count += sum(
+                    1
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                )
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                per_request = sum(
+                    v
+                    for v in (
+                        usage.get("input_tokens"),
+                        usage.get("output_tokens"),
+                    )
+                    if isinstance(v, int)
+                )
+                if per_request:
+                    tokens = (tokens or 0) + per_request
+        elif event_type == "result":
+            num_turns = event.get("num_turns")
+            if isinstance(num_turns, int) and num_turns > 0:
+                turn_count = max(turn_count, num_turns)
+            total_cost = event.get("total_cost_usd")
+            if isinstance(total_cost, (int, float)):
+                cost_usd = float(total_cost)
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                final_tokens = sum(
+                    v
+                    for v in (
+                        usage.get("input_tokens"),
+                        usage.get("output_tokens"),
+                    )
+                    if isinstance(v, int)
+                )
+                if final_tokens:
+                    tokens = final_tokens
 
-                if not isinstance(event, dict):
-                    continue
-
-                # Count tool calls
-                if event.get("type") == "tool_call":
-                    tool_call_count += 1
-
-                # Count turns (user/assistant exchanges)
-                if event.get("type") in ("user_message", "assistant_message"):
-                    turn_count += 1
-
-                # Extract cumulative usage fields (take last-seen value)
-                if "tokens" in event and isinstance(event["tokens"], int):
-                    tokens = event["tokens"]
-                if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
-                    cost_usd = float(event["cost_usd"])
-
-    except OSError:
-        # File read error - treat as no progress data
-        return None
+        # Legacy/simplified schema kept for adapters that emit it.
+        if event_type == "tool_call":
+            tool_call_count += 1
+        if event_type in ("user_message", "assistant_message"):
+            turn_count += 1
+        if "tokens" in event and isinstance(event["tokens"], int):
+            tokens = event["tokens"]
+        if "cost_usd" in event and isinstance(event["cost_usd"], (int, float)):
+            cost_usd = float(event["cost_usd"])
 
     # If we parsed no valid events, return None
     if tool_call_count == 0 and turn_count == 0 and tokens is None and cost_usd is None:
@@ -339,11 +509,12 @@ def _classify_session_failure(
     throttle_error_markers: Sequence[str] | None = None,
     *,
     resume_margin_seconds: int = 0,
+    adapter_kind: str = "claude-code",
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | None
+    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" | None
     - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
@@ -352,6 +523,13 @@ def _classify_session_failure(
     reported reset (or fixed quota cooldown) time. Provider reset estimates are
     floors, not guarantees, and dispatching at T+0 races the actual reset
     (issue #499).
+
+    ``adapter_kind`` selects provider-auth classification (issue #484): when
+    ``"api"``, the log tail is also matched against 401/403/authentication
+    patterns. Auth failures are checked BEFORE throttle markers so a dead API
+    key does not masquerade as a generic throttle. On a ``provider_auth`` match,
+    the cooldown reuses the existing quota-exhaustion constant (24h) — a dead
+    key needs human intervention, not a 15-minute retry window.
     """
     if not log_path.exists():
         return None, None
@@ -363,6 +541,17 @@ def _classify_session_failure(
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Provider-auth classification (api only, issue #484). Checked before
+    # quota/throttle so an auth failure is never relabeled as a generic
+    # throttle. A dead API key reuses the quota-exhaustion cooldown (24h)
+    # rather than the short rate-limit cooldown — the key will not self-heal.
+    if adapter_kind == "api" and _PROVIDER_AUTH_PATTERN.search(tail):
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
+        throttled_until = datetime.now(UTC) + cooldown
+        return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
 
     # Check for quota exhaustion first (more severe)
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
@@ -553,6 +742,53 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
     return tuple(filtered) + ("--effort", effort)
 
 
+def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:
+    """Deterministically assign a PR to the review_effort experiment's
+    treatment arm.
+
+    Pure function of ``(pr_number, fraction, salt)`` — no ``random``/``time``
+    involved — so the same PR always lands in the same arm across rework
+    rounds and re-dispatches (arm-hopping across rounds would contaminate
+    the per-PR quality signal the experiment measures). Hashes
+    ``f"{salt}:{pr_number}"`` with sha256 and maps the first 8 bytes to a
+    uniform float in [0, 1); the PR is "treatment" iff that value is below
+    ``fraction``.
+
+    Returns True for "treatment", False for "control".
+    """
+    digest = hashlib.sha256(f"{salt}:{pr_number}".encode()).digest()
+    point = int.from_bytes(digest[:8], "big") / 2**64
+    return point < fraction
+
+
+def resolve_review_effort(
+    pr_number: int,
+    review_dispatch: ReviewDispatchConfig,
+    claude_code: ClaudeCodeConfig,
+) -> tuple[str, str | None]:
+    """Resolve the ``--effort`` string for a reviewer session, plus which
+    review_effort_experiment arm (if any) the PR was assigned to.
+
+    Returns ``(effort, arm)``:
+      - When ``review_dispatch.review_effort_experiment_fraction <= 0.0``
+        (the default), the experiment is disabled: ``arm`` is ``None`` and
+        ``effort`` is ``review_dispatch.review_effort`` when set, else
+        ``claude_code.effort`` — exactly the pre-experiment behavior.
+      - Otherwise, ``arm`` is ``"treatment"`` or ``"control"`` per
+        ``_review_effort_arm``, and ``effort`` is ``review_dispatch.review_effort``
+        for treatment or ``claude_code.effort`` for control.
+
+    Only meaningful for reviewer (``review=True``) launches; callers must
+    gate on that themselves (worker launches always use ``claude_code.effort``).
+    """
+    fraction = review_dispatch.review_effort_experiment_fraction
+    if fraction <= 0.0:
+        return (review_dispatch.review_effort or claude_code.effort, None)
+    if _review_effort_arm(pr_number, fraction, review_dispatch.review_effort_experiment_salt):
+        return (review_dispatch.review_effort, "treatment")
+    return (claude_code.effort, "control")
+
+
 def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> tuple[str, ...]:
     """Hard-pin ``--max-turns {max_turns}`` onto ``command_template``.
 
@@ -616,6 +852,7 @@ def launch_claude_worker(
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
     provider: str = "",
+    resolved_review_effort: str | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -658,6 +895,16 @@ def launch_claude_worker(
     ``issue-<n>.claude.json``, ``api`` -> ``issue-<n>.api.json``). ``provider``
     is recorded on the sidecar but does not change the launch command in this
     issue; it is reserved for future adapter-specific command rendering.
+
+    ``resolved_review_effort``, when provided on a ``review=True`` launch, is
+    used verbatim as the ``--effort`` pin instead of re-deriving it via
+    ``resolve_review_effort``. Callers that already computed the
+    review_effort_experiment arm at claim time (e.g. ``dispatch_reviews``,
+    which persists the arm to state/telemetry before launching) should pass
+    it through here so there is exactly ONE computation of the arm on the
+    production path, rather than two calls to the same pure function that
+    merely agree by convention. When omitted (direct callers, unit tests),
+    the effort is resolved internally as a fallback.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -690,7 +937,25 @@ def launch_claude_worker(
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
     command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
-    command_template = _apply_effort_pin(command_template, resolved_config.claude_code.effort)
+    # Reviewer sessions may pin their own effort independently of worker
+    # effort (empty string means fall back to claude_code.effort), optionally
+    # split into a per-PR randomized treatment/control experiment — see
+    # resolve_review_effort. Worker (non-review) launches always use
+    # claude_code.effort unconditionally. When the caller already resolved
+    # the arm at claim time (resolved_review_effort passed), use it directly
+    # so the arm is computed exactly once on the production path; only
+    # direct callers/tests that don't pass it fall back to resolving here.
+    if review:
+        effort = (
+            resolved_review_effort
+            if resolved_review_effort is not None
+            else resolve_review_effort(
+                issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+            )[0]
+        )
+    else:
+        effort = resolved_config.claude_code.effort
+    command_template = _apply_effort_pin(command_template, effort)
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
@@ -1166,6 +1431,7 @@ def update_worker_record_with_failure_classification(
     *,
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
+    adapter_kind: str = "claude-code",
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1174,24 +1440,30 @@ def update_worker_record_with_failure_classification(
 
     Log-tail classification (``_classify_session_failure``) always runs first.
     If it detects a provider throttle signature (``rate_limited`` /
-    ``quota_exhausted``), that classification wins — including its computed
+    ``quota_exhausted``) or a provider-auth failure (``provider_auth``, api
+    only — issue #484), that classification wins — including its computed
     ``throttled_until`` cooldown — regardless of ``fallback_kind``. Only when
-    the log shows no throttle signature does ``fallback_kind`` apply (e.g. the
-    stall watchdog's "stalled" default, or the launch-stall watchdog's
-    "launch_stalled" default). This ordering matters: a worker that dies
-    because it hit a provider rate limit must be classified as such even when
-    the caller only knows "this looked stalled" — otherwise ``throttled_until``
-    never gets set and dispatch keeps relaunching workers into the same limit.
+    the log shows no throttle/auth signature does ``fallback_kind`` apply
+    (e.g. the stall watchdog's "stalled" default, or the launch-stall
+    watchdog's "launch_stalled" default). This ordering matters: a worker
+    that dies because it hit a provider rate limit or a dead API key must be
+    classified as such even when the caller only knows "this looked stalled"
+    — otherwise ``throttled_until`` never gets set and dispatch keeps
+    relaunching workers into the same limit.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
     are used instead of the defaults.
 
+    ``adapter_kind`` selects the sidecar filename suffix (``issue-<n>.api.json``
+    for ``"api"``) and enables provider-auth classification (issue #484).
+    Defaults to ``"claude-code"`` for backward compatibility.
+
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
-    when log-tail classification actually matched a throttle signature.
+    when log-tail classification actually matched a throttle/auth signature.
     """
-    sidecar_path = _sidecar_path(sessions_dir, issue_number)
+    sidecar_path = _sidecar_path(sessions_dir, issue_number, adapter_kind)
     if not sidecar_path.exists():
         return None, None
 
@@ -1222,6 +1494,7 @@ def update_worker_record_with_failure_classification(
             Path(log_path_str),
             throttle_markers,
             resume_margin_seconds=resume_margin_seconds,
+            adapter_kind=adapter_kind,
         )
 
     resolved_kind = classified_kind or fallback_kind
@@ -1244,5 +1517,6 @@ __all__ = [
     "_sidecar_path",
     "ClaudeProgress",
     "parse_claude_events",
+    "iter_claude_events",
     "_events_path",
 ]

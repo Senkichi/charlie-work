@@ -168,9 +168,33 @@ uv run charlie bash-rats --limit 3
 Every command accepts `--json` (either before or after the subcommand — the
 CLI strips `--json` from `argv` before `argparse` sees it) for
 machine-readable output, and `--dry-run` to suppress **mutating** `gh` calls
-(the `_is_mutating` guard in `github.py`; note this does not suppress local
-state writes or adapter/model subprocess calls — see
-[WORKFLOWS.md](WORKFLOWS.md) for the exact scope).
+(the `_is_mutating` guard in `github.py`).
+
+`--dry-run` additionally suppresses these local mutations, each of which used to
+run during a "preview":
+
+- the `fleet bash-rats` / `fleet supervise` **self-deploy**, which otherwise
+  fast-forward-pulls `origin/main` into the running checkout and may `uv sync`
+  its venv (issue #613). Because moving that checkout's HEAD terminates a running
+  supervisor by design, an ungated preview could take the fleet down.
+- the runner **scale-event cooldown** write, which gates *both* scale directions
+  (issue #609), and the runner **pool-sample** write that feeds idle detection.
+- the **cross-family review report** write. This one was actively destructive: the
+  dry-run branch bailed out through the shared failure helper, which writes an
+  `(UNAVAILABLE)` stub over `report_path` — so previewing a PR that already had a
+  real cross-family review *destroyed* it, and the reports are keyed by PR, so
+  there was no second copy. A preview now writes neither the report nor the
+  prompt and never spawns the reviewer — but **only on the PR-review path**
+  (`why-charlie-hate --pr`), which is the one call site that passes the flag
+  down. The rescue-review and `why-charlie-hate-spec` paths still do not thread
+  `--dry-run`, so they continue to spawn the real reviewer and write a real
+  report. Those two are tracked separately and are *not* fixed by the above.
+
+It does **not** suppress local state writes in general. **Worker** adapter
+launches (`devin-shell` / `claude-code`) are a separate mechanism —
+`AdapterSettings.dry_run`, threaded from the same flag — and are not covered by
+the audit above. Treat any other state write as unsuppressed unless you have
+checked it — see [WORKFLOWS.md](WORKFLOWS.md) for the exact scope.
 
 ## 6. Choose a worker adapter profile
 
