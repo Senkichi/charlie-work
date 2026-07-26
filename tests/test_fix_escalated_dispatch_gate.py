@@ -42,6 +42,7 @@ from test_charlie_work import (
     _dispatch_reviews_app,
     _make_dead_review_sidecar,
     _set_review_dispatched_state,
+    _write_review_events,
     _write_review_packet,
 )
 
@@ -256,11 +257,19 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
-def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path: Path) -> None:
-    """Regression guard for the other missed-append site: a dead reviewer with
-    no parseable verdict (turn-limit path) must also emit
-    review_verdict_missed, matching test_charlie_work.py's
-    test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper."""
+def test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer that died before its first turn must not be labelled a
+    turn-limit death (issue #588).
+
+    The fixture is the real shape of the 2026-07-22 outage: no events sidecar
+    at all, and a log holding only the process's own error text. Zero turns and
+    zero tool calls means the session never ran, so its death is environmental
+    and says nothing about this PR. Reporting it as ``turn_limit_summary_posted``
+    pointed every diagnostic at ``review_max_turns`` for 25 hours while the
+    actual cause was a rejected argv.
+    """
     from datetime import UTC, datetime, timedelta
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
@@ -268,7 +277,59 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
     reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(
+        reviews_dir,
+        100,
+        "Error: When using --print, --output-format=stream-json requires --verbose",
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    # The miss is still reported -- only its classification changes.
+    assert len(result["missed"]) == 1
+    assert result["missed"][0]["reason"] == "launch_failed"
+
+    state = load_state(app.paths.state_file)
+    missed_events = _events(state, "review_verdict_missed")
+    assert len(missed_events) == 1
+    assert missed_events[0]["payload"] == {
+        "pr_number": 100,
+        "issue_number": 10,
+        "reason": "launch_failed",
+        "turn_count": 0,
+        "tool_call_count": 0,
+    }
+
+    # The turn-limit marker gates two downstream behaviours: #584 counts it as
+    # a turn-limit death, and the provider-throttle sweep reads it to deny a
+    # rollback (#583). A session that never ran must set neither.
+    pr_state = state["prs"]["100"]
+    assert pr_state.get("review_turn_limit_summary_posted") is False
+    assert pr_state.get("review_miss_summary_posted") is True
+
+
+def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path: Path) -> None:
+    """Regression guard for the other missed-append site: a dead reviewer with
+    no parseable verdict (turn-limit path) must also emit
+    review_verdict_missed, matching test_charlie_work.py's
+    test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper.
+
+    Unlike the launch-failure case above, this session genuinely exhausted its
+    turn budget, so it keeps the ``turn_limit_summary_posted`` reason and sets
+    the marker that denies the provider-throttle rollback."""
+    from datetime import UTC, datetime, timedelta
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    max_turns = app.config.review_dispatch.review_max_turns
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    _write_review_events(reviews_dir, 100, turns=max_turns, tool_calls=3)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
     monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
@@ -285,4 +346,33 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
         "pr_number": 100,
         "issue_number": 10,
         "reason": "turn_limit_summary_posted",
+        "turn_count": max_turns,
+        "tool_call_count": 3,
     }
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
+
+
+def test_reap_review_verdicts_death_after_partial_work_is_its_own_bucket(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer that did real work but died short of the turn cap is neither
+    a launch failure nor a turn-limit death (issue #588)."""
+    from datetime import UTC, datetime, timedelta
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    _write_review_events(reviews_dir, 100, turns=3, tool_calls=2)
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["missed"][0]["reason"] == "died_mid_session"
+    state = load_state(app.paths.state_file)
+    # It did substantial work, so the throttle-rollback denial still applies.
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True

@@ -1701,12 +1701,41 @@ def _reviewer_session_metrics(events_path: Path, verdict_source: str) -> dict[st
     }
 
 
+# Why a reviewer session ended without a structured verdict. These are the
+# ``reason`` values on ``review_verdict_missed`` events; they have disjoint
+# remediations, so collapsing them into one label points every diagnostic at
+# the wrong fix (issue #588).
+REVIEW_MISS_TURN_LIMIT = "turn_limit_summary_posted"
+REVIEW_MISS_LAUNCH_FAILED = "launch_failed"
+REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
+
+
+@dataclass(frozen=True)
+class ReviewSessionOutcome:
+    """A reviewer session that ended without producing a structured verdict.
+
+    ``did_substantial_work`` is the distinction that matters downstream: a
+    session that completed turns and then died is a PR-level outcome (the
+    review didn't fit its budget), while one that never reached its first turn
+    is an environmental failure that says nothing about the PR.
+    """
+
+    text: str
+    reason: str
+    turn_count: int
+    tool_call_count: int
+
+    @property
+    def did_substantial_work(self) -> bool:
+        return self.reason != REVIEW_MISS_LAUNCH_FAILED
+
+
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
     max_turns: int,
-) -> str | None:
-    """Extract a markdown summary of a reviewer session that produced no verdict.
+) -> ReviewSessionOutcome | None:
+    """Summarize and classify a reviewer session that produced no verdict.
 
     When a reviewer hits the ``--max-turns`` limit (or dies for any other
     reason after doing substantial work), the structured verdict block is
@@ -1714,9 +1743,15 @@ def _extract_review_session_summary(
     tool-call metrics. This function reconstructs a human-readable summary
     from those events so the work is not silently lost.
 
-    Returns a markdown string suitable for a PR comment, or ``None`` if the
-    events file is missing or contains no assistant messages (nothing to
-    summarize).
+    It also classifies *why* the verdict is missing. A session that never
+    reached its first turn did not hit a turn limit -- it never ran -- and the
+    text recovered from its log is the process's own error output, not
+    analysis. Reporting the two identically hid a 25-hour outage in which 19
+    reviewers died on a rejected argv while every signal said "turn limit"
+    (issue #588).
+
+    Returns ``None`` if the events file is missing and the log contains no
+    recoverable text (nothing to summarize).
     """
     progress = parse_claude_events(events_path)
     # Also try the plaintext log as a fallback for assistant text.
@@ -1759,26 +1794,41 @@ def _extract_review_session_summary(
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
-    parts: list[str] = [
-        "## Reviewer session summary (no verdict produced)\n",
-    ]
-    if max_turns > 0 and turn_count >= max_turns:
-        parts.append(
-            f"The automated reviewer hit the {max_turns}-turn limit before "
-            f"producing a structured verdict.\n"
-        )
-    elif turn_count > 0:
-        parts.append(
-            f"The automated reviewer ran for {turn_count} turns "
-            f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
-        )
+    # A session with no turns and no tool calls never reached its first turn:
+    # the process died at launch and whatever text we recovered is its error
+    # output, not reviewer analysis.
+    if turn_count == 0 and tool_call_count == 0:
+        reason = REVIEW_MISS_LAUNCH_FAILED
+    elif max_turns > 0 and turn_count >= max_turns:
+        reason = REVIEW_MISS_TURN_LIMIT
     else:
-        parts.append("The automated reviewer did not produce a structured verdict.\n")
+        reason = REVIEW_MISS_DIED_MID_SESSION
 
-    # Include the last few assistant messages — earlier turns are usually
-    # tool-use planning; the final messages contain the analysis.
+    if reason == REVIEW_MISS_LAUNCH_FAILED:
+        parts = ["## Reviewer session failed to start\n"]
+        parts.append(
+            "The automated reviewer exited before running a single turn, so no "
+            "review was performed. This is an environmental or launch failure, "
+            "not a judgement about this PR.\n"
+        )
+        parts.append("\n### Error output from the reviewer process:\n")
+    else:
+        parts = ["## Reviewer session summary (no verdict produced)\n"]
+        if reason == REVIEW_MISS_TURN_LIMIT:
+            parts.append(
+                f"The automated reviewer hit the {max_turns}-turn limit before "
+                f"producing a structured verdict.\n"
+            )
+        else:
+            parts.append(
+                f"The automated reviewer ran for {turn_count} turns "
+                f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
+            )
+        # Include the last few assistant messages — earlier turns are usually
+        # tool-use planning; the final messages contain the analysis.
+        parts.append("\n### Recent analysis from the reviewer:\n")
+
     recent = assistant_texts[-3:]
-    parts.append("\n### Recent analysis from the reviewer:\n")
     for text in recent:
         if len(text) > 2000:
             text = text[:2000] + "\n... (truncated)"
@@ -1797,7 +1847,12 @@ def _extract_review_session_summary(
     if meta_parts:
         parts.append(f"\n*{' · '.join(meta_parts)}*")
 
-    return "\n".join(parts)
+    return ReviewSessionOutcome(
+        text="\n".join(parts),
+        reason=reason,
+        turn_count=turn_count,
+        tool_call_count=tool_call_count,
+    )
 
 
 def _remove_review_checkout_with_warning(
@@ -6978,23 +7033,38 @@ class OrchestratorApp:
                 # --max-turns limit) and post a summary PR comment so the work
                 # is not silently lost. Only post once per dispatch lifecycle.
                 pr_state_dict = pr_state
-                if not pr_state_dict.get("review_turn_limit_summary_posted"):
+                # One-shot guard. ``review_miss_summary_posted`` covers every
+                # miss reason; the legacy turn-limit key is still honoured so
+                # PRs mid-lifecycle when this shipped don't get a second
+                # comment.
+                already_posted = pr_state_dict.get(
+                    "review_miss_summary_posted"
+                ) or pr_state_dict.get("review_turn_limit_summary_posted")
+                if not already_posted:
                     events_path = _events_path(reviews_dir, pr_number, review=True)
                     max_turns = self.config.review_dispatch.review_max_turns
-                    summary_text = _extract_review_session_summary(
+                    outcome = _extract_review_session_summary(
                         events_path, Path(w.log_path), max_turns
                     )
-                    if summary_text is not None:
+                    if outcome is not None:
                         try:
-                            self._comment_pr(pr_number, summary_text)
+                            self._comment_pr(pr_number, outcome.text)
                         except Exception:
                             pass
                         with state_lock(self.paths.state_file):
                             state = load_state(self.paths.state_file)
                             ps = state["prs"].get(str(pr_number), {})
+                            # The turn-limit key means "this dispatch
+                            # lifecycle's session did substantial work then
+                            # died". The provider-throttle sweep reads it to
+                            # deny a rollback (#583) and #584 counts it as a
+                            # turn-limit death, so a session that never
+                            # reached turn 1 must not set it -- that death is
+                            # environmental and says nothing about this PR.
                             state["prs"][str(pr_number)] = {
                                 **ps,
-                                "review_turn_limit_summary_posted": True,
+                                "review_miss_summary_posted": True,
+                                "review_turn_limit_summary_posted": (outcome.did_substantial_work),
                             }
                             state = append_event(
                                 state,
@@ -7002,7 +7072,9 @@ class OrchestratorApp:
                                 {
                                     "pr_number": pr_number,
                                     "issue_number": issue_number,
-                                    "reason": "turn_limit_summary_posted",
+                                    "reason": outcome.reason,
+                                    "turn_count": outcome.turn_count,
+                                    "tool_call_count": outcome.tool_call_count,
                                 },
                                 state_path=self.paths.state_file,
                             )
@@ -7011,7 +7083,7 @@ class OrchestratorApp:
                             {
                                 "pr": pr_number,
                                 "issue": issue_number,
-                                "reason": "turn_limit_summary_posted",
+                                "reason": outcome.reason,
                             }
                         )
                 continue
@@ -7474,6 +7546,7 @@ class OrchestratorApp:
                     "reviewer_process_start_time": None,
                     "review_dispatch_attempt_count": attempt_count + 1,
                     "review_turn_limit_summary_posted": False,
+                    "review_miss_summary_posted": False,
                     "review_effort_arm": review_effort_arm,
                     "review_effort_used": review_effort_used,
                 }
@@ -8315,6 +8388,7 @@ class OrchestratorApp:
         "reviewer_pid",
         "reviewer_process_start_time",
         "review_turn_limit_summary_posted",
+        "review_miss_summary_posted",
         "janitor_ok",
         "janitor_failures",
         "janitor_warnings",
