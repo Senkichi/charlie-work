@@ -208,6 +208,7 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
         "pr_url": "https://example.test/pull/456",
         "issue_number": 123,
         "review_summary": "Fix the typo in the search function.",
+        "branch_name": "agent/issue-123-fix-search",
     }
     # The rework.md template is in the package prompts dir, not repo-local
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
