@@ -441,6 +441,21 @@ def test_worker_prompts_require_body_checklist_revalidation() -> None:
         assert "including the checklist" in prompt
 
 
+def test_worker_prompts_contain_no_merge_contract() -> None:
+    """Verify that worker prompts carry the no-merge contract (issue #502)."""
+    sections = section_variables()
+    assert "section_no_merge_contract" in sections
+    contract = sections["section_no_merge_contract"]
+    assert "Your deliverable ENDS at pushing the branch and opening the PR" in contract
+    assert "gh pr merge" in contract
+    assert "never" in contract.lower()
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "## No-merge contract" in prompt
+        assert "Your deliverable ENDS at pushing the branch and opening the PR" in prompt
+
+
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:
     """Verify that review.md contains the $test_adequacy_section placeholder (issue #180)."""
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
