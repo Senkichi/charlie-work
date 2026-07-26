@@ -24581,8 +24581,6 @@ def test_layered_config_logs_whether_global_layer_was_read(
     ambiguity, so this asserts the one fact that separates them survives in the
     log even when the resulting config looks entirely ordinary.
     """
-    import logging as _logging
-
     from charlie_work.global_config import load_layered_config
 
     repo_root = tmp_path / "repo"
@@ -24591,7 +24589,7 @@ def test_layered_config_logs_whether_global_layer_was_read(
     fleet_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Absent global layer: resolved config is all defaults, and the log says why.
-    with caplog.at_level(_logging.DEBUG, logger="charlie_work.global_config"):
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
         load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
     absent_line = "\n".join(
         r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
@@ -24604,7 +24602,7 @@ def test_layered_config_logs_whether_global_layer_was_read(
     (fleet_dir_path / "config.yaml").write_text(
         "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
     )
-    with caplog.at_level(_logging.DEBUG, logger="charlie_work.global_config"):
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
         load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
     present_line = "\n".join(
         r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
