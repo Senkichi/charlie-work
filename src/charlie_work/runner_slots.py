@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Mapping
 
+from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError
 from .runner_allocation import (
     AllocationPlan,
@@ -382,6 +383,11 @@ def save_idle_streaks(
     path it is, because a caller that silently inherited the unattended default
     would make the state file assert that the daemon ran when it did not.
     """
+    # Issue #624: a virtualized fleet dir forks a private copy on this write,
+    # so "I deployed runner_allocation" would be reported while the file the
+    # fleet supervisor reads never updates. Warn before the write lands; never
+    # block it (the operator already asked for it).
+    warn_fleet_dir_virtualization_on_write(fleet_dir, context="writing runner-allocation.json")
     fleet_dir.mkdir(parents=True, exist_ok=True)
     path = fleet_dir / ALLOCATION_STATE_FILENAME
     payload = {
