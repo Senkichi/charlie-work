@@ -8312,6 +8312,28 @@ def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -
     assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
+def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
+    """Declare the #502 tripwire already armed, so a test sees its steady state.
+
+    The tripwire's first pass over a fresh state records a baseline of the merges
+    that predate it and reports nothing (see
+    ``OrchestratorApp._apply_unauthorized_merge_baseline``). Any test asserting on
+    findings must therefore say whether it is exercising the arming pass or the
+    steady state. Calling this with no arguments means "armed, and there was no
+    pre-existing backlog", which is the condition every pre-baseline tripwire test
+    was implicitly written against.
+    """
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
+
+    state = load_state(paths.state_file)
+    state[UNAUTHORIZED_MERGE_BASELINE_KEY] = {
+        "armed_at": "2026-07-26T00:00:00Z",
+        "pre_existing_prs": list(pre_existing),
+    }
+    save_state(paths.state_file, state)
+
+
 def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> None:
     """A merged worker branch without an approved review decision is flagged as a possible self-merge (issue #502)."""
     from charlie_work.config import OrchestratorConfig
@@ -8319,6 +8341,8 @@ def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> N
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
 
     class FakeGitHubWithMergedWorkerPR(FakeGitHub):
         def __init__(self) -> None:
@@ -8381,6 +8405,8 @@ def test_detect_unauthorized_merges_flags_approved_sha_mismatch(tmp_path: Path) 
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
 
     class FakeGitHubWithMergedWorkerPR(FakeGitHub):
         def __init__(self) -> None:
@@ -8442,6 +8468,8 @@ def test_detect_unauthorized_merges_reuses_dispatch_merged_prs(tmp_path: Path) -
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
     fake_gh = CountingFakeGitHub()
     fake_gh.prs = [
         {
@@ -8529,6 +8557,10 @@ def test_detect_unauthorized_merges_against_real_rest_merged_pr_list(
     # here only to satisfy the app's constructor, not to supply the fixture.
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    # Steady state, not the arming pass: this test is about the producer/consumer
+    # SHA contract, so the baseline must not be what silences it.
+    _arm_unauthorized_merge_tripwire(paths)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
     pr_dir = paths.prs / "pr-501"
@@ -8568,6 +8600,8 @@ def test_loop_surfaces_unauthorized_merge_in_errors_bucket(tmp_path: Path) -> No
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
 
     class CountingFakeGitHub(FakeGitHub):
         def __init__(self) -> None:
@@ -8621,6 +8655,11 @@ def test_loop_tripwire_silent_for_approved_matching_head(tmp_path: Path) -> None
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    # Arm with an empty baseline so the silence asserted below is evidence that
+    # the approval matched the merged head — an unarmed pass is silent about
+    # everything, which would make this test pass for the wrong reason.
+    _arm_unauthorized_merge_tripwire(paths)
 
     fake_gh = FakeGitHub()
     fake_gh.issues = []
@@ -8654,6 +8693,172 @@ def test_loop_tripwire_silent_for_approved_matching_head(tmp_path: Path) -> None
     ]
     assert tripwire_errors == [], (
         f"approved matching-head merge must not be flagged, got {tripwire_errors}"
+    )
+
+
+def _merged_worker_pr(number: int, issue: int, sha: str) -> dict[str, Any]:
+    """A merged worker-branch PR shaped like merged_pr_list() output."""
+    return {
+        "number": number,
+        "title": f"fix: work for #{issue}",
+        "url": f"https://example.test/pull/{number}",
+        "headRefName": f"agent/issue-{issue}-fix",
+        "baseRefName": "main",
+        "headRefOid": sha,
+        "state": "MERGED",
+        "isCrossRepository": False,
+        "body": f"Closes #{issue}",
+        "labels": [],
+    }
+
+
+def test_unauthorized_merge_tripwire_arms_instead_of_flagging_history(tmp_path: Path) -> None:
+    """The first pass records pre-existing uncovered merges as a baseline and reports nothing.
+
+    Without this bound the tripwire asserts its policy retroactively over the
+    whole 500-PR ``merged_pr_list()`` window. Measured against the live repo
+    before this landed, that was 48 findings appended to ``loop()``'s ``errors``
+    bucket on EVERY pass — there is no dedupe — which pins ok=False forever and
+    buries a real self-merge in constant noise. A control that can never go quiet
+    is not a control.
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    history = [
+        _merged_worker_pr(101, 91, "sha-101"),
+        _merged_worker_pr(102, 92, "sha-102"),
+    ]
+
+    # No decision files at all: both would be flagged by an unbounded tripwire.
+    assert app._detect_unauthorized_merges(history) == [], (
+        "the arming pass must report nothing, not the whole backlog"
+    )
+
+    state = load_state(paths.state_file)
+    baseline = state.get(UNAUTHORIZED_MERGE_BASELINE_KEY)
+    assert isinstance(baseline, dict), "arming must persist a baseline to state.json"
+    assert baseline["pre_existing_prs"] == [101, 102]
+    assert baseline["armed_at"]
+
+    # The backlog must remain auditable rather than being silently dropped: the
+    # event carries the full PR list, not just a count.
+    armed = [e for e in state["events"] if e["kind"] == "unauthorized_merge_baseline_armed"]
+    assert len(armed) == 1
+    assert armed[0]["payload"]["pre_existing_count"] == 2
+    assert armed[0]["payload"]["pre_existing_prs"] == [101, 102]
+
+
+def test_unauthorized_merge_tripwire_flags_merges_after_arming(tmp_path: Path) -> None:
+    """A merge that lands after arming is still flagged — the baseline suppresses history only."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    history = [_merged_worker_pr(101, 91, "sha-101")]
+    assert app._detect_unauthorized_merges(history) == []
+
+    # A NEW uncovered merge appears. Note its number (99) is BELOW the baselined
+    # PR's (101): a high-water-mark watermark would wrongly exempt it, which is
+    # why the baseline is an explicit set. Three worker PRs were open and
+    # below the highest merged PR when this armed on the live repo, so this is
+    # the real case, not a contrived one.
+    later = [*history, _merged_worker_pr(99, 89, "sha-99")]
+    detected = app._detect_unauthorized_merges(later)
+
+    assert [d["pr"] for d in detected] == [99], (
+        f"only the post-arming merge may be flagged, got {detected}"
+    )
+    assert detected[0]["issue"] == 89
+    assert detected[0]["live_head_sha"] == "sha-99"
+
+
+def test_unauthorized_merge_baseline_arms_once_and_does_not_widen(tmp_path: Path) -> None:
+    """Re-running the tripwire must not re-arm and swallow merges that landed after the first pass."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    assert app._detect_unauthorized_merges([_merged_worker_pr(101, 91, "sha-101")]) == []
+    first = load_state(paths.state_file)[UNAUTHORIZED_MERGE_BASELINE_KEY]
+
+    grown = [_merged_worker_pr(101, 91, "sha-101"), _merged_worker_pr(102, 92, "sha-102")]
+    for _ in range(3):
+        assert [d["pr"] for d in app._detect_unauthorized_merges(grown)] == [102]
+
+    after = load_state(paths.state_file)[UNAUTHORIZED_MERGE_BASELINE_KEY]
+    assert after == first, "the baseline must be written once and never widened"
+
+
+def test_unauthorized_merge_tripwire_does_not_arm_when_pr_fetch_fails(tmp_path: Path) -> None:
+    """A gh failure must not bake an empty baseline that permanently exempts real history.
+
+    This is the sharpest failure mode of the whole mechanism: if the very first
+    pass after deployment cannot fetch the merged PR list and arms anyway, the
+    baseline records "nothing pre-existed" and the tripwire is then permanently
+    blind to every merge it never saw.
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def merged_pr_list(self):
+            raise github_module.GitHubError("gh unavailable")
+
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHubFailingMergedList())
+
+    assert app._detect_unauthorized_merges() == []
+    assert UNAUTHORIZED_MERGE_BASELINE_KEY not in load_state(paths.state_file), (
+        "a failed fetch must leave the tripwire unarmed so it can arm from real data later"
+    )
+
+    # Proof the unarmed state is recoverable: once gh works, arming sees the real
+    # history and the tripwire still reports post-arming merges.
+    app.gh = FakeGitHub()  # type: ignore[assignment]
+    assert app._detect_unauthorized_merges([_merged_worker_pr(101, 91, "sha-101")]) == []
+    assert load_state(paths.state_file)[UNAUTHORIZED_MERGE_BASELINE_KEY]["pre_existing_prs"] == [
+        101
+    ]
+
+
+def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: Path) -> None:
+    """--dry-run must not persist the baseline (issues #609/#613/#621).
+
+    A preview that arms the tripwire would silently consume the one-time arming
+    opportunity, permanently baselining whatever happened to be merged at preview
+    time. The preview still reports nothing, which is what an armed pass reports.
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    assert app._detect_unauthorized_merges([_merged_worker_pr(101, 91, "sha-101")]) == []
+    assert UNAUTHORIZED_MERGE_BASELINE_KEY not in load_state(paths.state_file), (
+        "dry-run must leave no baseline behind"
     )
 
 
