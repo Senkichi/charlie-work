@@ -105,14 +105,23 @@ def load_layered_config(
     # config records what a section *became*, never whether the file that
     # declares it was read. Callers that do expect a global layer log this at
     # INFO themselves (see run_fleet_supervise).
-    # Only pay for the extra stat on the branch where the answer is ambiguous.
-    # A layer that was read is self-evidently present; one that was not could be
-    # either absent (legitimate) or unreadable (a silent host misconfiguration),
-    # and those need telling apart.
+    # One vocabulary for both provenance lines, so this and the supervisor's INFO
+    # line are directly comparable. A bare "present" would collapse a truncated
+    # 0-byte file into the same token as a populated one, and "present
+    # sections=(none)" is *exactly* the #590 signature -- the byte count is what
+    # separates "the file is empty" from "the file has content that did not
+    # parse into any section".
+    #
+    # ``exists()`` stays the read gate on purpose: it swallows a specific set of
+    # errors (see describe_config_file) and changing which failures reach the
+    # caller is a behaviour change, not a logging one. The description is a
+    # second, independent observation used only for the message -- if the two
+    # ever disagree, sections= and the description are both printed, so the
+    # contradiction is visible in the log rather than resolved silently.
     logger.debug(
         "Layered config: global path=%s %s sections=%s; repo path=%s",
         global_config_path,
-        "present" if global_exists else describe_config_file(global_config_path),
+        describe_config_file(global_config_path),
         sorted(global_data) if global_data else "(none)",
         repo_config_path,
     )

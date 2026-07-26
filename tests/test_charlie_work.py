@@ -24610,6 +24610,21 @@ def test_layered_config_logs_whether_global_layer_was_read(
     assert "present" in present_line, f"present global layer not reported: {present_line!r}"
     assert "absent" not in present_line, "a present layer must not read as absent"
     assert "dispatch" in present_line, "the sections actually read must be named"
+    assert "bytes=" in present_line, "same vocabulary as the supervisor's INFO line"
+
+    # An empty global file resolves to pristine defaults with zero sections --
+    # indistinguishable from an absent one on the resolved config alone, and the
+    # reason this line carries a byte count rather than a bare "present".
+    caplog.clear()
+    (fleet_dir_path / "config.yaml").write_text("", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    empty_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "bytes=0" in empty_line, f"a truncated global layer must be visible: {empty_line!r}"
+    assert "absent" not in empty_line, "an empty file is present-but-empty, not absent"
+    assert "(none)" in empty_line, "an empty file contributes no sections"
 
 
 def test_describe_config_file_separates_absent_from_unreachable(
