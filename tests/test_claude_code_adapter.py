@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
 from charlie_work.config import (
@@ -190,12 +191,7 @@ def test_launch_claude_worker_process_receives_prompt_via_stdin(
 
     # Wait for the fake claude subprocess (very fast: reads stdin, writes, exits).
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
-    assert marker_path.read_text(encoding="utf-8") == "prompt payload for stdin"
+    read_worker_marker(marker_path, expected="prompt payload for stdin")
 
 
 def test_launch_claude_worker_injects_worker_env(
@@ -239,13 +235,8 @@ def test_launch_claude_worker_injects_worker_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
     # Injected var present AND orchestrator env inherited (merge, not replace).
-    assert probe_path.read_text(encoding="utf-8") == "2|inherited-value"
+    read_worker_marker(probe_path, expected="2|inherited-value")
 
 
 def test_launch_claude_worker_worker_env_overrides_sanitize_env(
@@ -298,13 +289,8 @@ def test_launch_claude_worker_worker_env_overrides_sanitize_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
     # worker_env VIRTUAL_ENV override wins over sanitize_env's stripping
-    assert probe_path.read_text(encoding="utf-8") == "/custom/override/venv"
+    read_worker_marker(probe_path, expected="/custom/override/venv")
 
 
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
@@ -344,12 +330,7 @@ def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
 
     worktree_path = Path(record.worktree_path)
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
-    assert marker_path.read_text(encoding="utf-8") == "prompt payload for argv"
+    read_worker_marker(marker_path, expected="prompt payload for argv")
 
 
 def test_launch_claude_worker_missing_binary_returns_error_record(
@@ -2024,9 +2005,7 @@ def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
+    read_worker_marker(probe_path)
 
 
 def test_launch_sanitizes_with_worktree_venv(
@@ -2082,15 +2061,10 @@ def test_launch_sanitizes_with_worktree_venv(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent
-    assert received == f"{str(worktree_venv)}|<unset>", (
-        f"VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected=f"{str(worktree_venv)}|<unset>",
+        reason="VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent",
     )
 
 
@@ -2140,15 +2114,10 @@ def test_launch_preserves_worker_env_override(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # User-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped
-    assert received == "/custom/.venv|<unset>|custom-value", (
-        f"User VIRTUAL_ENV override must win, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="/custom/.venv|<unset>|custom-value",
+        reason="user-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped",
     )
 
 
@@ -2210,15 +2179,13 @@ def test_launch_override_precedence_with_worktree_venv(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # User-provided VIRTUAL_ENV must win over worktree .venv (merge order: sanitizer first, then user overrides)
-    assert received == "/custom/.venv|<unset>|custom-value", (
-        f"User VIRTUAL_ENV override must win over worktree .venv, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="/custom/.venv|<unset>|custom-value",
+        reason=(
+            "user-provided VIRTUAL_ENV must win over worktree .venv "
+            "(merge order: sanitizer first, then user overrides)"
+        ),
     )
 
 
@@ -2275,15 +2242,10 @@ def test_launch_sanitizes_environment_with_prompt_path(
 
     worktree_path = Path(record.worktree_path)
     probe_path = worktree_path / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped (no worktree .venv)
-    assert received == "<unset>|<unset>", (
-        f"VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="<unset>|<unset>",
+        reason="VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped (no worktree .venv)",
     )
 
 
@@ -2554,13 +2516,9 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     assert record.ok
     worktree_path = Path(record.worktree_path)
 
-    # Wait for the worker to complete
+    # Wait for the worker to complete (content, not just the path appearing).
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
+    read_worker_marker(marker_path)
 
     # Give the tee thread a moment to finish writing
     time.sleep(0.2)
