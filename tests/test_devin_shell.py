@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _worker_marker_wait import read_worker_marker
 
 from charlie_work import devin_shell
 from charlie_work.config import DevinConfig, OrchestratorConfig, RuntimeConfig
@@ -2355,14 +2356,9 @@ def test_launch_devin_session_injects_worker_env(
     assert record.error is None
     assert record.pid is not None
 
-    # Wait for the subprocess to complete
-    deadline = time.time() + 10
+    # Wait for the subprocess to finish WRITING, not merely to create the file.
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    assert probe_path.read_text(encoding="utf-8") == "test-value"
+    read_worker_marker(probe_path, expected="test-value")
 
 
 def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(

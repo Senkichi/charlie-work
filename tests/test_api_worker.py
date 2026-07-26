@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import sys
 import textwrap
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _worker_marker_wait import read_worker_marker
 
 from charlie_work import api_worker, claude_code
 from charlie_work.api_worker import launch_api_worker
@@ -273,14 +273,21 @@ def test_launch_api_worker_injects_provider_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    base_url, auth_token, model, haiku, small_fast = probe_path.read_text(encoding="utf-8").split(
-        "|"
-    )
+    # Wait for the whole probe, not just for the path to appear: a partially
+    # written probe splits into the wrong number of fields (see
+    # _worker_marker_wait).
+    base_url, auth_token, model, haiku, small_fast = read_worker_marker(
+        probe_path,
+        expected="|".join(
+            [
+                "https://api.moonshot.ai/anthropic",
+                "sk-test-key-value-1234",
+                "kimi-k3",
+                "kimi-k3",
+                "kimi-k3",
+            ]
+        ),
+    ).split("|")
     assert base_url == "https://api.moonshot.ai/anthropic"
     assert auth_token == "sk-test-key-value-1234"
     assert model == "kimi-k3"
@@ -340,12 +347,7 @@ def test_launch_api_worker_worker_env_merged_under_provider_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe2.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    xdist, model = probe_path.read_text(encoding="utf-8").split("|")
+    xdist, model = read_worker_marker(probe_path, expected="2|kimi-k3").split("|")
     assert xdist == "2"
     # Provider routing var wins over worker_env.
     assert model == "kimi-k3"
