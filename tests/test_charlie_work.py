@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import logging
 import os
@@ -24595,7 +24596,7 @@ def test_layered_config_logs_whether_global_layer_was_read(
     absent_line = "\n".join(
         r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
     )
-    assert "exists=False" in absent_line, f"absent global layer not reported: {absent_line!r}"
+    assert "absent" in absent_line, f"absent global layer not reported: {absent_line!r}"
     assert str(fleet_dir_path / "config.yaml") in absent_line, "the path itself must be logged"
 
     # Present global layer: same call, and the log distinguishes it.
@@ -24608,8 +24609,52 @@ def test_layered_config_logs_whether_global_layer_was_read(
     present_line = "\n".join(
         r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
     )
-    assert "exists=True" in present_line, f"present global layer not reported: {present_line!r}"
+    assert "present" in present_line, f"present global layer not reported: {present_line!r}"
+    assert "absent" not in present_line, "a present layer must not read as absent"
     assert "dispatch" in present_line, "the sections actually read must be named"
+
+
+def test_describe_config_file_separates_absent_from_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config that could not be reached must not read as one that is absent.
+
+    ``Path.exists()`` returns a bare False for every error in
+    ``pathlib._ignore_error`` -- ENOENT, ENOTDIR, EBADF, ELOOP and the Windows
+    unready-device / unresolvable-path winerrors. All of them take
+    load_layered_config's silent-``{}`` branch and yield pristine dataclass
+    defaults with no error raised, which is #590's symptom exactly. The cause
+    must survive into the log instead of collapsing into "absent".
+
+    ENOTDIR is used rather than EACCES deliberately: permission errors are *not*
+    in the ignored set, so they raise instead of silently defaulting, which is
+    why they cannot be #590's mechanism.
+    """
+    from charlie_work.global_config import describe_config_file
+
+    missing = tmp_path / "nope.yaml"
+    assert describe_config_file(missing) == "absent"
+
+    present = tmp_path / "config.yaml"
+    present.write_text("dispatch: {}\n", encoding="utf-8")
+    assert describe_config_file(present) == f"present bytes={present.stat().st_size}"
+
+    real_stat = Path.stat
+
+    def not_a_dir(self: Path, *args: object, **kwargs: object) -> object:
+        if self == present:
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", not_a_dir)
+
+    # The precondition that makes this helper necessary: exists() hides this.
+    assert present.exists() is False, "precondition: exists() collapses ENOTDIR to False"
+
+    described = describe_config_file(present)
+    assert described != "absent", "an unreachable config must not read as absent"
+    assert described.startswith("UNREADABLE"), f"cause was lost: {described!r}"
+    assert "NotADirectoryError" in described, "the failure cause must reach the log"
 
 
 def test_global_config_per_repo_wins(tmp_path: Path) -> None:

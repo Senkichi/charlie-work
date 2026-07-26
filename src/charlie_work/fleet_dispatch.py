@@ -11,7 +11,7 @@ from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
-from .global_config import load_layered_config
+from .global_config import describe_config_file, load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
@@ -1366,21 +1366,17 @@ def run_fleet_supervise(
     # supervisor start (not per pass -- this is startup, so it costs one stat).
     # The prologue already logs what runner_allocation *resolved to*; the fact
     # missing from #590 is whether the file that declares it was read at all.
-    # A successful load that reports exists=False is the silent-{} path in
-    # load_layered_config and means the global layer never reached the merge;
-    # exists=True with a live section means the loss happened downstream. The
-    # two readings demand completely different fixes, and no other line in the
-    # log distinguishes them.
-    _global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
-    try:
-        _global_config_size: object = _global_config_path.stat().st_size
-    except OSError as exc:
-        _global_config_size = f"unreadable ({type(exc).__name__}: {exc})"
+    #
+    # Deliberately one stat() rather than an exists() flag: exists() collapses a
+    # missing file, an unready device and an unresolvable path into the same bare
+    # False, and all of them take load_layered_config's silent-{} branch. A bare
+    # exists=False here would reproduce the exact ambiguity this line exists to
+    # remove. See describe_config_file for which errors are and are not hidden.
+    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
     logger.info(
-        "Fleet supervisor global config: path=%s exists=%s bytes=%s",
-        _global_config_path,
-        _global_config_path.exists(),
-        _global_config_size,
+        "Fleet supervisor global config: path=%s %s",
+        global_config_path,
+        describe_config_file(global_config_path),
     )
 
     overrides: dict[str, int] = {}

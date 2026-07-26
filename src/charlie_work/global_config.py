@@ -16,6 +16,36 @@ from .fleet_paths import fleet_dir
 logger = logging.getLogger(__name__)
 
 
+def describe_config_file(path: Path) -> str:
+    """Describe a config file's readability for provenance logging.
+
+    ``Path.exists()`` does not report *why* it says no. It swallows every error
+    in ``pathlib._ignore_error`` -- ``ENOENT``, ``ENOTDIR``, ``EBADF``, ``ELOOP``
+    and, on Windows, the device-not-ready / invalid-name / cannot-resolve-filename
+    winerrors -- and returns a bare ``False`` for all of them. So "the file was
+    never created" is indistinguishable from "the volume wasn't ready" or "the
+    path could not be resolved", and *every one* of those takes the silent-``{}``
+    branch in :func:`load_layered_config`, yielding a config of pristine
+    dataclass defaults with no error raised anywhere.
+
+    That is the whole of issue #590's remaining unknown, so callers log this
+    string rather than an ``exists=`` flag. One ``stat()``, distinguishable
+    outcomes, and no second filesystem call that could disagree with the first.
+
+    Note that ``EACCES`` is *not* in that ignored set: a config that exists but
+    is permission-denied makes ``exists()`` raise rather than return False, so
+    it would crash the caller instead of silently defaulting. Permissions are
+    therefore ruled out as a cause of a silently-defaulted config -- worth
+    knowing, because it is the first thing one reaches for.
+    """
+    try:
+        return f"present bytes={path.stat().st_size}"
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        return f"UNREADABLE ({type(exc).__name__}: {exc})"
+
+
 def _deep_merge(base: Any, override: Any) -> Any:
     """Recursively merge two dicts; non-dict overrides win.
 
@@ -75,10 +105,14 @@ def load_layered_config(
     # config records what a section *became*, never whether the file that
     # declares it was read. Callers that do expect a global layer log this at
     # INFO themselves (see run_fleet_supervise).
+    # Only pay for the extra stat on the branch where the answer is ambiguous.
+    # A layer that was read is self-evidently present; one that was not could be
+    # either absent (legitimate) or unreadable (a silent host misconfiguration),
+    # and those need telling apart.
     logger.debug(
-        "Layered config: global path=%s exists=%s sections=%s; repo path=%s",
+        "Layered config: global path=%s %s sections=%s; repo path=%s",
         global_config_path,
-        global_exists,
+        "present" if global_exists else describe_config_file(global_config_path),
         sorted(global_data) if global_data else "(none)",
         repo_config_path,
     )
