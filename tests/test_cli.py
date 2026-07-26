@@ -510,6 +510,67 @@ def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
     assert digest["transitions"][0]["health"] == "REPAIRED"
 
 
+def test_run_fleet_bash_rats_loud_on_absent_global_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An absent global layer must be loud in `charlie fleet bash-rats`, not silent.
+
+    Mirrors test_run_fleet_supervise_loud_on_absent_global_layer: drives the
+    REAL ``load_layered_config`` (not a mock) against an empty fleet dir so the
+    ``require_global=True`` wiring in ``run_fleet_bash_rats`` is exercised
+    end-to-end. Every other ``run_fleet_bash_rats`` test mocks
+    ``load_layered_config`` away (``lambda *a, **k: None``), so without this
+    test a future silent drop of ``require_global=True`` would pass CI
+    undetected -- fleet-wide knobs (notify, runner prologues) would revert to
+    dataclass defaults with no error raised, the #623 failure shape.
+
+    ``self_deploy`` and ``fleet_loop`` are mocked so the pass does not touch the
+    network or the real fleet; only the config-load path is left real.
+    """
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            message="up to date",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    # Deliberately NOT mocking cli.load_layered_config.
+
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(tmp_path), "fleet", "bash-rats", "--limit", "1"]
+    )
+    result = cli.run_fleet_bash_rats(args)
+
+    # The require_global=True ConfigError is caught and printed loudly. If
+    # require_global=True were silently dropped, load_layered_config would
+    # return an OrchestratorConfig (not raise), "config load failed" would
+    # never be printed, and global_config would not be None.
+    out = capsys.readouterr().out
+    assert "config load failed" in out, (
+        "an absent global layer must be printed, not silently defaulted"
+    )
+    assert str(tmp_path / "config.yaml") in out, (
+        "the expected global config path must appear in the failure message"
+    )
+    assert "absent" in out, "an absent layer must read as absent in the message"
+
+    # The pass continued (the command must not crash) but on the None sentinel
+    # that the global load failed -- the same loud-but-alive shape the
+    # supervisor takes.
+    assert result.ok is True
+    assert fleet_loop_mock.call_count == 1
+    assert fleet_loop_mock.call_args.kwargs.get("global_config") is None, (
+        "fleet_loop must receive global_config=None when the global layer is absent"
+    )
+
+
 # ---------------------------------------------------------------------------
 # api-worker fleet report CLI wiring (issue #483)
 #
@@ -701,6 +762,57 @@ def test_cli_fleet_work_main_omits_line_when_unconfigured(
     assert rc == 0
     out = capsys.readouterr().out
     assert "api-worker:" not in out
+
+
+def test_run_fleet_work_loud_on_absent_global_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An absent global layer must be loud in `charlie fleet work`, not silent.
+
+    Mirrors test_run_fleet_supervise_loud_on_absent_global_layer: drives the
+    REAL ``load_layered_config`` (not a mock) against an empty fleet dir so the
+    ``require_global=True`` wiring in ``run_fleet_work`` is exercised
+    end-to-end. Every other ``run_fleet_work`` / ``charlie fleet work`` test
+    mocks ``load_layered_config`` away (``lambda *a, **k: None``), so without
+    this test a future silent drop of ``require_global=True`` would pass CI
+    undetected -- fleet-wide knobs (notify, runner prologues) would revert to
+    dataclass defaults with no error raised, the #623 failure shape.
+
+    ``fleet_loop`` is mocked so the pass does not touch the real fleet; only the
+    config-load path is left real.
+    """
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    # Deliberately NOT mocking cli.load_layered_config.
+
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(tmp_path), "fleet", "work", "--limit", "1"]
+    )
+    result = cli.run_fleet_work(args)
+
+    # The require_global=True ConfigError is caught and printed loudly. If
+    # require_global=True were silently dropped, load_layered_config would
+    # return an OrchestratorConfig (not raise), "config load failed" would
+    # never be printed, and global_config would not be None.
+    out = capsys.readouterr().out
+    assert "config load failed" in out, (
+        "an absent global layer must be printed, not silently defaulted"
+    )
+    assert str(tmp_path / "config.yaml") in out, (
+        "the expected global config path must appear in the failure message"
+    )
+    assert "absent" in out, "an absent layer must read as absent in the message"
+
+    # The pass continued (the command must not crash) but on the None sentinel
+    # that the global load failed -- the same loud-but-alive shape the
+    # supervisor takes.
+    assert result.ok is True
+    assert fleet_loop_mock.call_count == 1
+    assert fleet_loop_mock.call_args.kwargs.get("global_config") is None, (
+        "fleet_loop must receive global_config=None when the global layer is absent"
+    )
 
 
 # --------------------------------------------------------------------------
