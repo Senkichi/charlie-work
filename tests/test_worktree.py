@@ -15,7 +15,10 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfi
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.subprocess_runner import RunResult
+from charlie_work import worktree as worktree_module
 from charlie_work.worktree import (
+    OPERATOR_MARKER_KIND,
+    OPERATOR_MARKER_SESSION_ID,
     WorktreeCleanResult,
     WorktreeInfo,
     WorktreeProbeFailedError,
@@ -37,6 +40,7 @@ from charlie_work.worktree import (
     remove_review_checkout,
     remove_worktree,
     verify_shared_venv,
+    write_worktree_marker,
     _is_git_tracked,
     _materialize_directory,
     _slugify,
@@ -4321,7 +4325,102 @@ def test_clean_worktrees_skips_stray_post_merge_commit(tmp_path: Path) -> None:
     assert result.ok is True
     assert len(result.data["skipped"]) == 1
     reason = result.data["skipped"][0]["reason"].lower()
-    assert "stray" in reason or "does not match" in reason
+    assert "stray" in reason
+    assert info.path.exists()
+
+
+def test_clean_worktrees_removes_worktree_behind_merged_head(tmp_path: Path) -> None:
+    """The mirror of the stray-commit case, and the other half of the bug that
+    made ``worktree-clean`` inert.
+
+    The eligibility question is containment, not equality: does the worktree
+    hold commits that did NOT get merged? A worktree sitting *behind* the
+    merged head holds none — everything in it is reachable from what landed.
+    That is the ordinary shape here, because the merge path advances the PR
+    branch after the worker's last local commit (Aviator merge-queue rebases,
+    merge-train updates, base-into-branch merges).
+
+    The old ``local_head_sha != merged_head_sha`` test could not tell the two
+    directions apart and reported 46 of 47 mismatching worktrees on the live
+    host as "stray post-merge commit(s)" — a false reason attached to a
+    permanent skip.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-3-behind", base_ref="HEAD")
+    _git(info.path, "config", "user.email", "test@example.test")
+    _git(info.path, "config", "user.name", "Test User")
+    # The worktree's HEAD is where the worker stopped.
+    local_head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    # The branch then advanced (merge queue rebase / base-into-branch update)
+    # and GitHub recorded THAT tip as the merged headRefOid. Build it as a real
+    # descendant commit, then put the worktree back where the worker left it.
+    (info.path / "queued.txt").write_text("advanced by the merge queue", encoding="utf-8")
+    _git(info.path, "add", "queued.txt")
+    _git(info.path, "commit", "-m", "merge queue advanced the branch")
+    merged_head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    _git(info.path, "reset", "--hard", local_head_sha)
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == local_head_sha
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=3, pr_number=103)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=merged_head_sha),
+    )
+
+    assert result.ok is True, result.message
+    assert result.data["skipped"] == []
+    assert [entry["issue_number"] for entry in result.data["removed"]] == [3]
+    assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_when_merged_head_object_is_absent(tmp_path: Path) -> None:
+    """An unknown merged head must fail closed with a legible reason.
+
+    ``git merge-base --is-ancestor`` exits non-zero both for "not an ancestor"
+    and for "no such object", so the containment check gates on object
+    presence first. Without that gate the skip would still happen, but under
+    the wrong reason — and a wrong reason string is what makes a defect like
+    this survive a reading of the output.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-3-absent", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=3, pr_number=103)
+    # A well-formed SHA that names no object in this repo.
+    absent_sha = "0" * 39 + "1"
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=absent_sha),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "not present in the local object store" in result.data["skipped"][0]["reason"]
     assert info.path.exists()
 
 
@@ -4428,6 +4527,174 @@ def test_clean_worktrees_skips_live_worker(tmp_path: Path) -> None:
     assert len(result.data["skipped"]) == 1
     assert "live" in result.data["skipped"][0]["reason"].lower()
     assert info.path.exists()
+
+
+def test_clean_worktrees_removes_merged_worktree_with_no_recorded_worker_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression that made ``worktree-clean`` a no-op on the live host.
+
+    ``clean_worktrees`` used to gate removal on ``_probe_recovery_liveness``,
+    the *redispatch* lane's guard. That probe is fail-closed on an inconclusive
+    Devin activity probe, and on this repo's hosts it is inconclusive forever:
+    finished workers have no recorded pid (so the per-PID log source reports
+    ``no pid``), the Devin ``sessions.db`` holds no rows for claude-code/api
+    workers, and the probe's only escape hatch — the
+    ``inconclusive_probe_deferred_count`` cap — is never persisted by this
+    lane, so the counter is pinned at 0. Result: 70 of 81 merged worktrees
+    skipped with ``live worker detected: probe_error``, on every pass.
+
+    The old tests missed it because ``real_activity_for_worker`` *raised* under
+    tmp_path (no sessions.db at all), and the probe swallows exceptions as
+    "not live" — the opposite of what a real host with a real db does. So this
+    test forces the production shape directly: the redispatch probe declares a
+    live worker, and the merged worktree must still be removed, because the
+    cleanup lane must not consult that probe at all.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    def _always_probe_error(*args: Any, **kwargs: Any) -> None:
+        raise LiveWorkerRedispatchError(
+            issue_number=4,
+            pid=None,
+            process_start_time=None,
+            probe_result="probe_error",
+            inconclusive_probe_deferred_count=1,
+        )
+
+    monkeypatch.setattr(worktree_module, "_probe_recovery_liveness", _always_probe_error)
+
+    info = create_worktree(repo_root, "agent/issue-4-no-pid", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    # No worker_pid / last_known_worker_pid: the shape of a worker that
+    # finished long ago and whose pid was pruned from state.
+    state = _make_state(issue_number=4, pr_number=104)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.ok is True, result.message
+    assert result.data["skipped"] == []
+    assert [entry["issue_number"] for entry in result.data["removed"]] == [4]
+    assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_worktree_with_live_writer_marker(tmp_path: Path) -> None:
+    """No recorded pid, but a writer marker whose pid is alive: still in use.
+
+    This is the signal that replaces the redispatch probe — positive evidence
+    of a running process rather than an absence of records.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-4-marker", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    write_worktree_marker(info.path, os.getpid(), "session-live")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=4, pr_number=104)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "live writer marker" in result.data["skipped"][0]["reason"]
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_operator_claimed_worktree(tmp_path: Path) -> None:
+    """Operator markers carry a sentinel pid; state.json is the authority.
+
+    A pid-only liveness check would read the sentinel as dead and delete a
+    worktree an operator is actively editing.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-4-operator", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    write_worktree_marker(info.path, 0, OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND)
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=4, pr_number=104)
+    state["issues"]["4"]["operator_claimed_at"] = datetime.now(UTC).isoformat()
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "operator-claimed" in result.data["skipped"][0]["reason"]
+    assert info.path.exists()
+
+
+def test_clean_worktrees_released_operator_marker_does_not_block_removal(
+    tmp_path: Path,
+) -> None:
+    """A leftover operator marker with no live claim in state must not pin the
+    worktree forever — the marker alone is not evidence of a live operator."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-4-released", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    write_worktree_marker(info.path, 0, OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND)
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    # No operator_claimed_at: the claim was released.
+    state = _make_state(issue_number=4, pr_number=104)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.data["skipped"] == []
+    assert [entry["issue_number"] for entry in result.data["removed"]] == [4]
+    assert not info.path.exists()
 
 
 def test_clean_worktrees_dry_run_reports_plan_and_does_not_remove(tmp_path: Path) -> None:
