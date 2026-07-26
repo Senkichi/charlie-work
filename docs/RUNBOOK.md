@@ -299,6 +299,58 @@ fabricated verification results. If you explicitly set `devin.venv_source`, you
 are opting back into the junction and the cleanup hazard described above; keep
 per-worktree isolation unless you have a specific reason to share a venv.
 
+## GitHub credential isolation for workers (issue #502)
+
+Workers must not be able to merge their own PRs. The orchestrator's adversarial
+review gate is the only sanctioned path to `main`, so a worker that inherits the
+orchestrator's admin-scoped credentials can bypass review entirely by running
+`gh pr merge` itself.
+
+`sanitize_env()` (`env_sanitize.py`, shared by the `devin-shell`, `claude-code`,
+and `cross-family` adapters) closes both channels `gh` uses to resolve an
+identity:
+
+- **Environment tokens.** `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and
+  `GITHUB_ENTERPRISE_TOKEN` are stripped from the worker's base environment.
+- **Stored credentials.** `GH_CONFIG_DIR` is forced to a worktree-local empty
+  directory (`<worktree>/.var/gh-config`), created on demand, so `gh` cannot fall
+  back to the orchestrator's `gh auth login` state via the platform-default
+  config path.
+
+**Operational consequence: workers have no `gh` authentication by default.** This
+is intentional, but it means any worker task that needs `gh` — reading issue
+comments, pushing via the `gh` credential helper, opening its own PR — will fail
+with an auth error unless you supply a credential explicitly.
+
+To give workers a scoped credential, set a **narrowly scoped** PAT in the
+adapter's `worker_env`:
+
+```yaml
+devin:
+  worker_env:
+    GH_TOKEN: "<scoped-PAT>"
+claude_code:
+  worker_env:
+    GH_TOKEN: "<scoped-PAT>"
+```
+
+`worker_env` is merged **after** `sanitize_env()`, so an explicit value wins over
+sanitization while the orchestrator's own token still never reaches the worker.
+That merge order is load-bearing and covered by
+`test_launch_passes_operator_scoped_gh_token_through`.
+
+Scope the PAT to the minimum the worker actually needs, and specifically **do not
+grant it merge rights on protected branches** — a token with merge permission
+reopens exactly the bypass this control exists to prevent. The tripwire below
+will catch such a merge after the fact, but it cannot prevent it.
+
+**Post-merge tripwire.** Prevention is not assumed to be airtight, so every
+`loop()` pass also scans recently-merged PRs on the worker branch prefix and
+flags any whose merged head SHA is not covered by an `approved`
+`review-decision.json` (`_detect_unauthorized_merges()`). Findings surface in the
+pass's `errors` bucket. Treat one as a security event: identify which credential
+performed the merge before re-arming anything.
+
 ## Fleet: cross-repo dispatch
 
 The fleet layer extends the single-repo orchestrator to operate across multiple
