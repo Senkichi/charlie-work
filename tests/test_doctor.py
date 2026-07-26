@@ -1409,3 +1409,138 @@ def test_run_doctor_wires_the_allocation_probe(tmp_path: Path) -> None:
     assert "never run" in allocation_checks[0].detail
     # Warning-only: the probe must never change doctor's exit code.
     assert allocation_checks[0].severity == "warning"
+
+
+# ---------------------------------------------------------------------------
+# fleet dir virtualization probe (issue #624)
+#
+# MSIX/container redirection makes the literal fleet-dir path string identical
+# in both the container and the host while naming different files. The probe
+# keys on the literal path disagreeing with its resolved form -- never on a
+# hardcoded package moniker. The tests inject the divergence by patching the
+# resolution step (per the issue's test guidance), not by building a real
+# MSIX redirect.
+
+
+def _patch_resolve_to_diverge(monkeypatch: Any, literal: Path, redirected: Path) -> None:
+    """Make ``Path.resolve()`` return ``redirected`` for ``literal`` only.
+
+    Every other path resolves normally, so the rest of ``run_doctor`` is
+    unaffected. This is the "patch the resolution step" injection the issue
+    prescribes: the real ``fleet_dir_virtualization`` logic runs end-to-end,
+    only the filesystem's answer is forged.
+    """
+    import os as _os
+    import pathlib
+
+    real_resolve = pathlib.Path.resolve
+
+    def fake_resolve(self, *args, **kwargs):
+        result = real_resolve(self, *args, **kwargs)
+        if _os.path.normcase(_os.fspath(result)) == _os.path.normcase(_os.fspath(literal)):
+            return redirected
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "resolve", fake_resolve)
+
+
+def test_doctor_warns_when_fleet_dir_is_virtualized(tmp_path: Path, monkeypatch: Any) -> None:
+    """A literal/resolved divergence fires a warning naming both paths."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet_dir_path, redirected)
+
+    ok, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    by_name = {check.name: check for check in checks}
+    virt = by_name["fleet dir virtualization"]
+    assert virt.ok is False
+    assert virt.severity == "warning"
+    # Both paths must be named so the operator can see where it landed.
+    assert str(fleet_dir_path) in virt.detail
+    assert str(redirected) in virt.detail
+    # Reference the #590 failure and state the write-forks-a-copy consequence.
+    assert "#590" in virt.detail
+    assert "private copy" in virt.detail
+    # Warning-only: a virtualized fleet dir is not fatal for an interactive human.
+    assert ok is True
+
+
+def test_doctor_is_silent_when_fleet_dir_is_not_virtualized(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Equal literal and resolved paths produce no virtualization check."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    # No divergence injection: resolve() returns the literal path unchanged.
+    ok, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    names = {check.name for check in checks}
+    assert "fleet dir virtualization" not in names
+    assert ok is True
+
+
+def test_fleet_dir_virtualization_probe_is_repo_agnostic(tmp_path: Path, monkeypatch: Any) -> None:
+    """The probe fires for any fleet_dir override, not just charlie-work's layout.
+
+    The redirection is a per-process property of the host, so a repo whose
+    fleet dir is unrelated to charlie-work's own layout must still be flagged.
+    """
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    # An arbitrary override path with no charlie-work-specific component.
+    literal = tmp_path / "some-other-repo" / "fleet-state"
+    redirected = tmp_path / "Packages" / "other-app" / "LocalCache" / "some-other-repo"
+    _patch_resolve_to_diverge(monkeypatch, literal, redirected)
+
+    diverged = fleet_dir_virtualization(override=str(literal))
+    assert diverged is not None
+    assert diverged[0] == literal
+    assert diverged[1] == redirected
+
+
+def test_fleet_dir_virtualization_returns_none_when_equal(tmp_path: Path) -> None:
+    """No divergence -> None (the probe must stay silent)."""
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    literal = tmp_path / "fleet"
+    literal.mkdir(parents=True, exist_ok=True)
+    assert fleet_dir_virtualization(override=str(literal)) is None
+
+
+def test_run_doctor_wires_the_virtualization_probe(tmp_path: Path, monkeypatch: Any) -> None:
+    """Pin the wiring, not just the probe body.
+
+    Deleting the ``_check_fleet_dir_virtualization`` call in ``run_doctor``
+    would leave the probe-body tests green while the probe silently stopped
+    running for operators.
+    """
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet_dir_path, redirected)
+
+    _, checks = run_doctor(
+        tmp_path, paths, config, tmp_path / "c.yaml", gh, fleet_dir_override=str(fleet_dir_path)
+    )
+
+    virt_checks = [c for c in checks if c.name == "fleet dir virtualization"]
+    assert len(virt_checks) == 1
+    assert virt_checks[0].severity == "warning"
