@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1125,6 +1126,66 @@ def test_run_fleet_supervise_loops_until_max_passes(
     assert result.data["passes"] == 3
     assert mock_fleet_loop.call_count == 3
     assert fc.sleep_calls == [5.0, 5.0, 5.0]
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_logs_global_config_provenance(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The supervisor must record whether its global config layer was readable.
+
+    This is the half of the #590 diagnostic that has to survive at the default
+    log level: the loader's equivalent line is DEBUG, so on a real host this is
+    the only place the fact appears. A successfully-loaded config that reports
+    ``absent`` here is the silent-{} path in load_layered_config; one that
+    reports ``present`` means the section was lost downstream of the read. The
+    two demand opposite fixes, so neither reading may be missing.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    def provenance_lines() -> str:
+        return "\n".join(
+            r.getMessage()
+            for r in caplog.records
+            if "Fleet supervisor global config" in r.getMessage()
+        )
+
+    # No global config on this fleet dir: reported as absent, at INFO.
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(
+            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+        )
+    absent = provenance_lines()
+    assert absent, "the supervisor logged no global-config provenance at all"
+    assert str(tmp_path / "config.yaml") in absent, "the path must be named"
+    assert "absent" in absent, f"an absent global layer was not reported: {absent!r}"
+
+    # Same call with the layer in place: distinguishable, with its size.
+    caplog.clear()
+    (tmp_path / "config.yaml").write_text("dispatch: {}\n", encoding="utf-8")
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.INFO, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(
+            max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+        )
+    present = provenance_lines()
+    assert "present" in present, f"a present global layer was not reported: {present!r}"
+    assert "absent" not in present, "a present layer must not read as absent"
+    assert "bytes=" in present, "the size distinguishes an empty layer from a populated one"
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
