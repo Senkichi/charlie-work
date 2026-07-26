@@ -3186,11 +3186,79 @@ def _rework_prompt_search_dirs(
     return (path,)
 
 
+def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
+    """Render the ``$required_changes_section`` for a rework brief.
+
+    The findings are read from ``review-decision.json``'s ``required_changes``
+    list — the most actionable output the review pipeline produces. Giving
+    them their own rendered section (instead of multiplexing one prose slot)
+    means an operational dispatch note can no longer displace them.
+
+    Returns an empty string when there is no decision, no list, or an empty
+    list — the section is omitted entirely rather than rendering a hollow
+    header, so a brief with no findings looks the same as before.
+    """
+    if not isinstance(decision, dict):
+        return ""
+    required_changes = decision.get("required_changes")
+    if not isinstance(required_changes, list) or not required_changes:
+        return ""
+    lines = [
+        "## Required changes",
+        "",
+        "Address every item below. These are the reviewer's structured "
+        "findings — the authoritative list of what must change before this "
+        "PR can be approved.",
+        "",
+    ]
+    for change in required_changes:
+        text = str(change).strip()
+        if not text:
+            continue
+        lines.append(f"- {text}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _read_review_decision(decision_path: Path) -> dict[str, Any] | None:
+    """Read a PR's ``review-decision.json`` as a dict, or ``None`` if absent.
+
+    Mirrors ``OrchestratorApp._review_decision``'s read shape but returns
+    ``None`` (rather than a sentinel) for missing/invalid files so the caller
+    can distinguish "no verdict on disk" from "a verdict with an empty
+    findings list" — only the latter should render an (empty) section.
+    """
+    if not decision_path.exists():
+        return None
+    try:
+        with decision_path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
+    """Return True when the verdict file is strictly newer than the brief.
+
+    Used by ``dispatch_rework`` to detect a stale brief that has drifted from
+    a corrected ``review-decision.json`` (issue #632: the brief on disk is
+    authoritative and ``dispatch_rework`` reads it verbatim, so without this
+    check a hand-corrected verdict — the #510 case — never reaches the
+    worker). Comparison uses nanosecond mtimes; an equal timestamp (the
+    normal verdict path writes the decision immediately before the brief) is
+    treated as not-stale so the fresh brief is not pointlessly rewritten.
+    """
+    if not decision_path.exists() or not brief_path.exists():
+        return False
+    return decision_path.stat().st_mtime_ns > brief_path.stat().st_mtime_ns
+
+
 def _write_rework_prompt(
     state_file: Path,
     pr: dict[str, Any],
     issue_number: int | None,
-    summary: str,
+    dispatch_note: str,
     config: OrchestratorConfig,
     *,
     repo_root: Path | None = None,
@@ -3199,11 +3267,23 @@ def _write_rework_prompt(
 
     This module-level helper lets both the OrchestratorApp review path and the
     dead-session recovery path produce the same ``rework-prompt.md`` artifact.
+
+    Single point of enforcement for issue #632: the reviewer's structured
+    ``required_changes`` are read from ``review-decision.json`` here — not
+    threaded through by callers — so the three call sites cannot omit them.
+    The ``dispatch_note`` (formerly the ``$review_summary`` slot) carries the
+    operational/review-prose note and is kept separate from the findings, so
+    a churn/rescue message accompanies the findings instead of replacing
+    them. The raw note is also written to a sidecar
+    (``rework-dispatch-note.txt``) so a stale brief can be regenerated at
+    dispatch time without losing its note.
     """
     pr_number = int(pr["number"])
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = pr_dir / "rework-prompt.md"
+    decision = _read_review_decision(pr_dir / "review-decision.json")
+    required_changes_section = _render_required_changes_section(decision)
     prompt = render_prompt(
         config.dispatch.rework_template,
         {
@@ -3211,12 +3291,17 @@ def _write_rework_prompt(
             "pr_title": pr.get("title", ""),
             "pr_url": pr.get("url", ""),
             "issue_number": issue_number or "UNKNOWN",
-            "review_summary": summary,
+            "dispatch_note": dispatch_note,
+            "required_changes_section": required_changes_section,
             "branch_name": pr.get("headRefName", ""),
         },
         search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
     )
     prompt_path.write_text(prompt, encoding="utf-8")
+    # Sidecar: the raw dispatch note, so a dispatch-time regeneration (when
+    # review-decision.json is newer than the brief) can reproduce the note
+    # without parsing the rendered markdown.
+    (pr_dir / "rework-dispatch-note.txt").write_text(dispatch_note, encoding="utf-8")
     return prompt_path
 
 
@@ -8113,9 +8198,15 @@ class OrchestratorApp:
                         if rescue_dispatched
                         else summary_text
                     )
-                    rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             decision_payload["escalated"] = escalated
+            # Persist the verdict BEFORE rendering the rework brief: the brief
+            # reads review-decision.json itself (issue #632, single point of
+            # enforcement) to surface required_changes, so the decision file
+            # must be on disk first. A label-write failure or crash after this
+            # point leaves a durable verdict and a brief consistent with it.
             self._write_json(decision_path, decision_payload)
+            if decision == "request_changes" and not escalated:
+                rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             rescue_fields = (
                 rescue_helpers.build_rescue_dataclass_kwargs("rework_cycle_cap")
                 if rescue_dispatched
@@ -11718,6 +11809,20 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
+            # Issue #632: the brief on disk is authoritative and can drift
+            # arbitrarily far from a corrected verdict (an operator
+            # hand-editing review-decision.json is the #510 case). Regenerate
+            # it from the verdict + the preserved dispatch-note sidecar when
+            # the verdict is newer than the brief, so a stale brief cannot
+            # outlive a corrected verdict. The note sidecar is written by
+            # _write_rework_prompt; if it is absent (a brief predating the
+            # fix) the brief is regenerated with an empty note — the findings
+            # are the critical part and must not stay hidden.
+            decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
+            if _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
+                note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
+                dispatch_note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+                self._write_rework_prompt(pr, issue_number, dispatch_note)
             # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
             # adapter routing — they always launch via the claude-code adapter
             # pinned to rescue.worker_model, regardless of the primary
@@ -12575,13 +12680,13 @@ class OrchestratorApp:
         return prompt_path
 
     def _write_rework_prompt(
-        self, pr: dict[str, Any], issue_number: int | None, summary: str
+        self, pr: dict[str, Any], issue_number: int | None, dispatch_note: str
     ) -> Path:
         return _write_rework_prompt(
             self.paths.state_file,
             pr,
             issue_number,
-            summary,
+            dispatch_note,
             self.config,
             repo_root=self.repo_root,
         )

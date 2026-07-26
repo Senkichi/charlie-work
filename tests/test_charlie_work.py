@@ -555,7 +555,14 @@ def test_missing_repo_local_template_falls_back_to_package(tmp_path: Path) -> No
 
     prompt = render_prompt(
         "rework.md",
-        {"pr_number": 9, "pr_title": "t", "pr_url": "u", "issue_number": 1, "review_summary": "s"},
+        {
+            "pr_number": 9,
+            "pr_title": "t",
+            "pr_url": "u",
+            "issue_number": 1,
+            "dispatch_note": "s",
+            "required_changes_section": "",
+        },
         search_dirs=(override_dir,),
     )
 
@@ -29844,6 +29851,150 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:
+    """Issue #632 defect 1: a request_changes verdict's required_changes must
+    reach the rework brief. The brief reads review-decision.json itself (single
+    point of enforcement), so asserting on the rendered content — not on the
+    call having happened — is the right check."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    findings = ["add null check in parse()", "update tests for edge case"]
+    app.record_review(
+        456,
+        "request_changes",
+        summary="fix A",
+        required_changes=findings,
+    )
+
+    brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
+    for finding in findings:
+        assert finding in brief, f"finding missing from brief: {finding!r}"
+    # The prose summary rides in the dispatch-note slot and must still appear.
+    assert "fix A" in brief
+    # The section header is present so the worker can locate the list.
+    assert "## Required changes" in brief
+
+
+def test_rework_brief_keeps_both_dispatch_note_and_findings(tmp_path: Path) -> None:
+    """Issue #632 defect 2: the no-op-churn / merge-conflict routing path
+    passes an operational note into the brief. That note must accompany the
+    findings instead of displacing them — the #510 regression shipped a brief
+    with the churn message and zero findings."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    # A pre-existing verdict with structured findings on disk.
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "round-1 summary",
+                "required_changes": ["fix the off-by-one", "add a regression test"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    operational_note = (
+        "The previous rework cycle produced no actual content change. Push the real fix."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The operational note is preserved...
+    assert "no actual content change" in brief
+    # ...and the findings are still present alongside it.
+    assert "fix the off-by-one" in brief
+    assert "add a regression test" in brief
+    # The sidecar note is written for dispatch-time regeneration.
+    assert (pr_dir / "rework-dispatch-note.txt").read_text(encoding="utf-8") == operational_note
+
+
+def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
+    tmp_path: Path,
+) -> None:
+    """Issue #632 defect 4 / #510 case: dispatch_rework reads the brief
+    verbatim, so a hand-corrected review-decision.json never reached the
+    worker. The brief must be regenerated when the verdict is newer than the
+    brief, reflecting the edit."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, ReworkGitHub())
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    # A stale brief predating the fix: churn note, zero findings — exactly
+    # the #510 artifact.
+    brief_path = pr_dir / "rework-prompt.md"
+    brief_path.write_text("# Rework\n\nThe previous cycle was a no-op.\n", encoding="utf-8")
+    # The operator then corrects the verdict by hand, adding the findings.
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "corrected verdict",
+                "required_changes": ["handle the empty-list case", "guard the index access"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Make the corrected verdict strictly newer than the stale brief.
+    now = time.time()
+    os.utime(brief_path, (now, now))
+    os.utime(decision_path, (now + 10, now + 10))
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    assert result.data["selected_count"] == 1
+    regenerated = brief_path.read_text(encoding="utf-8")
+    # The regenerated brief reflects the edited verdict.
+    assert "handle the empty-list case" in regenerated
+    assert "guard the index access" in regenerated
+    # The stale churn-only content is gone.
+    assert "The previous cycle was a no-op." not in regenerated
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
