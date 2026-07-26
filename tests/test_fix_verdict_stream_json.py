@@ -268,12 +268,21 @@ def test_file_fallback_ignores_stale_md(tmp_path: Path) -> None:
     assert _parse_review_verdict_from_files(log, tmp_path / "no-packet-dir", started_at) is None
 
 
-def test_file_fallback_scans_packet_dir(tmp_path: Path) -> None:
-    """A review.md dropped in the PR packet dir is found even when the log
-    never mentions a path."""
+def test_file_fallback_never_reads_the_packet_dir(tmp_path: Path) -> None:
+    """Issue #597: the packet dir is orchestrator territory, never a source.
+
+    This test previously asserted the opposite -- that "a review.md dropped in
+    the PR packet dir is found even when the log never mentions a path". That
+    premise cannot hold: review sessions are launched with a hard-pinned
+    ``--permission-mode plan``, so a reviewer cannot drop a file there or
+    anywhere else. The only files in that directory are the orchestrator's
+    own, one of which is ``review-prompt.md`` -- and the prompt embedded an
+    example verdict block. The glob this test protected is what recorded that
+    example as a real verdict and merged ten unreviewed PRs.
+    """
     packet_dir = tmp_path / "pr-100"
     packet_dir.mkdir()
-    (packet_dir / "review.md").write_text(VERDICT_TEXT, encoding="utf-8")
+    (packet_dir / "review-prompt.md").write_text(VERDICT_TEXT, encoding="utf-8")
 
     log = tmp_path / "review.claude.log"
     log.write_text(
@@ -282,26 +291,27 @@ def test_file_fallback_scans_packet_dir(tmp_path: Path) -> None:
     )
 
     started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=10))
-    hit = _parse_review_verdict_from_files(log, packet_dir, started_at)
-
-    assert hit is not None
-    verdict, source = hit
-    assert verdict["decision"] == "approved"
-    assert source == str(packet_dir / "review.md")
+    assert _parse_review_verdict_from_files(log, packet_dir, started_at) is None
 
 
-def test_file_fallback_bogus_mentions_do_not_starve_packet_dir(tmp_path: Path) -> None:
+def test_file_fallback_bogus_mentions_do_not_starve_a_real_file(tmp_path: Path) -> None:
     """Adversarial finding (PR #568 review): nonexistent path-looking mentions
     in the reviewer's text must not consume the read-candidate budget and
-    starve out a valid packet-dir verdict file."""
+    starve out a genuine verdict file.
+
+    The concern is real and preserved; only its fixture moved. The genuine
+    file now lives outside the packet directory, which is where a
+    reviewer-authored file would actually be (issue #597).
+    """
     packet_dir = tmp_path / "pr-100"
     packet_dir.mkdir()
-    (packet_dir / "review.md").write_text(VERDICT_TEXT, encoding="utf-8")
+    real = tmp_path / "reviewer-notes.md"
+    real.write_text(VERDICT_TEXT, encoding="utf-8")
 
     bogus = " ".join(f"`C:\\reviewed\\file-{i}.md`" for i in range(10))
     log = tmp_path / "review.claude.log"
     log.write_text(
-        _stream_json_log(_result_event(f"Files I examined: {bogus}. Review complete.")),
+        _stream_json_log(_result_event(f"Files I examined: {bogus}. Review at `{real}`.")),
         encoding="utf-8",
     )
 
@@ -311,7 +321,7 @@ def test_file_fallback_bogus_mentions_do_not_starve_packet_dir(tmp_path: Path) -
     assert hit is not None
     verdict, source = hit
     assert verdict["decision"] == "approved"
-    assert source == str(packet_dir / "review.md")
+    assert source == str(real)
 
 
 def test_file_fallback_requires_started_at(tmp_path: Path) -> None:

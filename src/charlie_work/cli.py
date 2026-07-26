@@ -21,6 +21,9 @@ from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .state import StateLockBusy, load_state_locked, utc_now
 from .supervise import orchestrator_root, self_deploy
+from .runner_allocation import plan_summary
+from .runner_allocation_pass import run_allocation_pass
+from .runner_slots import CLI_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     ensure_runners_started,
@@ -34,6 +37,26 @@ from .runners import (
 )
 from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
+
+
+def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+    """Add a subcommand-level ``--dry-run`` that does not clobber the global one.
+
+    ``--dry-run`` also exists on the top-level parser, so an operator may write it
+    either before or after the subcommand. Both must work, and the plain idiom does
+    not: without ``SUPPRESS`` the subparser applies its own ``False`` default *after*
+    the top-level flag was parsed, silently overwriting it. ``charlie --dry-run
+    runners allocate`` therefore ran for real — and for ``allocate`` "for real"
+    means starting and terminating live CI listeners during what the operator
+    believes is a simulation. Observed on the live host: a global-flag dry run
+    launched a listener and reported its PID.
+
+    ``SUPPRESS`` makes the subparser set the attribute only when the flag is
+    actually present, so the global value stands when it is not. The top-level flag
+    keeps its ``False`` default, so ``args.dry_run`` always exists. Route every new
+    subcommand-level flag through here rather than repeating the idiom.
+    """
+    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     unescalate = subparsers.add_parser("unescalate")
     unescalate.add_argument("--pr", type=int, default=None)
     unescalate.add_argument("--issue", type=int, default=None)
-    unescalate.add_argument("--dry-run", action="store_true")
+    _add_dry_run(unescalate)
 
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
@@ -236,14 +259,22 @@ def build_parser() -> argparse.ArgumentParser:
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
     ensure_started_parser = runners_sub.add_parser("ensure-started")
-    ensure_started_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(ensure_started_parser)
     scale_down_parser = runners_sub.add_parser("scale-down")
-    scale_down_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(scale_down_parser)
     autoscale_parser = runners_sub.add_parser("autoscale")
-    autoscale_parser.add_argument("--dry-run", action="store_true")
+    _add_dry_run(autoscale_parser)
     autoscale_parser.add_argument(
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
+    allocate_parser = runners_sub.add_parser(
+        "allocate",
+        help=(
+            "Rebalance this host's running runner listeners across every repo "
+            "with runners registered under managed_root, by live queue demand"
+        ),
+    )
+    _add_dry_run(allocate_parser)
 
     subparsers.add_parser("worktree-clean")
 
@@ -317,10 +348,13 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     return fleet_loop(
@@ -345,20 +379,29 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Parse --repos into tuple if provided
     repos = tuple(args.repos.split(",")) if args.repos else None
 
-    # Load global config for notifier integration (optional, may be None)
+    # Load global config for notifier integration (optional, may be None).
+    # A failure here turns off every config-gated fleet behavior (notify and the
+    # runner prologues), so it is reported rather than swallowed.
     try:
         global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
-    except (ConfigError, RepoNotFoundError):
+    except (ConfigError, RepoNotFoundError) as exc:
+        print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
-    deploy = self_deploy(orchestrator_root(), fleet_dir_override=args.fleet_dir)
+    deploy = self_deploy(
+        orchestrator_root(), fleet_dir_override=args.fleet_dir, dry_run=args.dry_run
+    )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
         notify_config = getattr(global_config, "notify", None) if global_config else None
-        if notify_config is not None and getattr(notify_config, "enabled", False):
+        if (
+            deploy.alertable
+            and notify_config is not None
+            and getattr(notify_config, "enabled", False)
+        ):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
                 repo="fleet",
@@ -374,6 +417,8 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
                 ),
             )
             emit_digest(notify_config, attention_digest)
+    elif deploy.previewed:
+        print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.synced:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
@@ -538,7 +583,9 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
 
     try:
-        pool_state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+        pool_state = observe_runner_pool(
+            gh, config.runner_scaling, state_dir=paths.root, dry_run=args.dry_run
+        )
         formatted = format_runner_pool_state(pool_state)
         return CommandResult(
             ok=True,
@@ -702,10 +749,11 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
     # Observe current pool state
-    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root)
+    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root, dry_run=dry_run)
 
     # Load fleet-wide totals if requested
     fleet_totals: FleetTotals | None = None
+    skipped_repos: list[str] = []
     if fleet_wide:
         total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
             args.fleet_dir, runtime=config.runtime
@@ -745,6 +793,10 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
                 "fleet_totals": {
                     "total_runners": fleet_totals.total_runners if fleet_totals else 0,
                     "total_busy_runners": fleet_totals.total_busy_runners if fleet_totals else 0,
+                    # Repos whose runner count could not be read are an
+                    # undercount in the guardrail above, so name them rather
+                    # than letting the totals look authoritative.
+                    "skipped_repos": skipped_repos,
                 }
                 if fleet_totals
                 else None,
@@ -837,6 +889,79 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
                 },
             },
         )
+
+
+def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
+    """Rebalance running runner listeners across repos by live queue demand.
+
+    Unlike ``runners autoscale``, which grows or shrinks *this* repo's pool,
+    this command is host-wide: it discovers every repo with runners registered
+    under ``managed_root`` and redistributes one shared budget of running
+    listeners between them. Registration is never touched — slots move by
+    starting and stopping already-configured listeners.
+
+    Returns an error if the runner_allocation feature is not enabled.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    if not config.runner_allocation.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_allocation feature is not enabled in config",
+            data={},
+        )
+
+    dry_run = getattr(args, "dry_run", False)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
+
+    result = run_allocation_pass(
+        gh,
+        config.runner_allocation,
+        managed_root_fallback=config.runner_scaling.managed_root,
+        fleet_dir_override=args.fleet_dir,
+        state_path=paths.state_file,
+        dry_run=dry_run,
+        source=CLI_ALLOCATION_SOURCE,
+    )
+
+    if result.error:
+        return CommandResult(ok=False, message=f"allocate: {result.error}", data={})
+
+    data: dict[str, Any] = {
+        "dry_run": dry_run,
+        "notes": list(result.notes),
+        "applied": [
+            {
+                "repo": r.change.repo,
+                "runner": r.change.runner_name,
+                "action": r.change.action.value,
+                "ok": r.ok,
+                "message": r.message,
+            }
+            for r in result.results
+        ],
+    }
+    if result.plan is not None:
+        data["plan"] = plan_summary(result.plan)
+
+    if result.skipped:
+        return CommandResult(
+            ok=True,
+            message=f"allocate: no action - {'; '.join(result.notes) or 'nothing to do'}",
+            data=data,
+        )
+
+    prefix = "would " if dry_run else ""
+    return CommandResult(
+        ok=result.ok,
+        message=(
+            f"allocate: {prefix}start {result.started}, {prefix}park {result.parked} "
+            f"(budget {result.plan.budget if result.plan else 0})"
+        ),
+        data=data,
+    )
 
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
@@ -967,6 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_runners_scale_down(args)
             elif args.runners_command == "autoscale":
                 result = run_runners_autoscale(args)
+            elif args.runners_command == "allocate":
+                result = run_runners_allocate(args)
             else:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
