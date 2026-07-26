@@ -12765,6 +12765,15 @@ class OrchestratorApp:
                 # empty without arming, so a transient gh failure on the very
                 # first pass cannot bake an empty baseline and permanently
                 # exempt the real history it never saw.
+                #
+                # This covers the raising failures (gh missing, unparseable
+                # JSON, non-zero exit). It does NOT cover gh exiting 0 with
+                # empty stdout, which merged_pr_list() coerces to an empty page
+                # and treats as "no more results" — that would arm an empty
+                # baseline silently. Distinguishing the two belongs in
+                # github.py rather than here and is tracked in #633; recovery
+                # is to delete the baseline key from state.json and let the
+                # next pass re-arm from real data.
                 return []
 
         for pr in merged_prs:
