@@ -1227,11 +1227,9 @@ def test_run_fleet_supervise_loud_on_absent_global_layer(
 
     # The supervisor continues (the daemon must not crash on a missing global
     # layer) but it does so loudly: a WARNING was emitted naming the failure.
-    warning_lines = [
-        r.getMessage() for r in caplog.records if "could not load config" in r.getMessage()
-    ]
+    warning_lines = [r.getMessage() for r in caplog.records if "could not load" in r.getMessage()]
     assert warning_lines, "an absent global layer must trigger the loud handler, not silence"
-    assert "running on DEFAULTS" in warning_lines[0], (
+    assert "per-repo config only" in warning_lines[0], (
         f"the warning must name the fallback: {warning_lines[0]!r}"
     )
     # The ConfigError raised by require_global carries the path and the
@@ -1252,10 +1250,17 @@ def test_run_fleet_supervise_loud_on_absent_global_layer(
         "the absent-global failure must be printed, not only logged"
     )
 
-    # The supervisor fell back to defaults and still ran the pass -- the daemon
-    # stays alive, but the operator has been told exactly why.
+    # The supervisor fell back to the per-repo config (NOT discarded to None or
+    # pristine defaults) and still ran the pass -- the daemon stays alive, but
+    # the operator has been told exactly why. Discarding the per-repo config
+    # with the global layer would regress the #623 silent-disable failure.
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1
+    assert mock_fleet_loop.call_args.kwargs.get("global_config") is not None, (
+        "fleet_loop must NOT receive global_config=None when the global layer "
+        "is absent -- the per-repo config must survive the fallback, not be "
+        "discarded with the global layer (#623 silent-disable regression)"
+    )
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")

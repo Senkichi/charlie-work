@@ -360,7 +360,18 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
         )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        global_config = None
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to None if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=args.fleet_dir
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = None
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -396,7 +407,18 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        global_config = None
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to None if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=args.fleet_dir
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = None
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
@@ -913,7 +935,25 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     Returns an error if the runner_allocation feature is not enabled.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    # runner_allocation is a fleet-wide knob declared in the global fleet config
+    # layer. An unreachable global layer silently flips it to its dataclass
+    # default (enabled=False), and this command would then report "not enabled"
+    # -- the exact #623 silent-disable failure. Require the global layer and
+    # fail loudly instead, so an unready volume is distinguishable from a
+    # fleet that genuinely opted out of runner allocation.
+    try:
+        config = load_layered_config(
+            repo_root,
+            args.config,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
+    except (ConfigError, RepoNotFoundError) as exc:
+        return CommandResult(
+            ok=False,
+            message=f"config load failed, cannot decide runner_allocation: {exc}",
+            data={},
+        )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
 
     if not config.runner_allocation.enabled:
