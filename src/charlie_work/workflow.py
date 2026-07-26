@@ -5190,6 +5190,38 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
+        except GitHubError as exc:
+            # A GitHubError from _dispatch_impl means a GitHub API call
+            # needed for reliable dispatch failed. The two known sources are
+            # merged_pr_list() (raised on unusable responses — empty stdout,
+            # non-zero exit, unparseable JSON — per #633) and pr_list(); both
+            # are fetched before any issue is claimed or worker launched, so
+            # deferring here cannot leave a partial claim. Earlier
+            # _finalize_externally_merged_issues already recorded its own
+            # merged_pr_list failure in merged_pr_outcome, and
+            # _resolve_merged_prs re-raises that stored error (branch 2) so
+            # this handler covers BOTH the direct-fallback fetch (branch 1,
+            # the common case when there are open ready issues but no
+            # closed-ready issues this pass) and the finalize-errored re-raise
+            # (branch 2). Deferring is the correct response: proceeding with
+            # an empty merged-PR set would re-dispatch issues a merged PR
+            # already covered (the silent-empty path #633 closed), and letting
+            # the error propagate crashes the supervised loop daemon on a
+            # transient gh failure. Any claim written before a later
+            # GitHubError (e.g. issue_view mid-launch) is recovered by the
+            # existing stale-claim sweep on the next pass.
+            return CommandResult(
+                True,
+                f"dispatch deferred: GitHub API error ({exc})",
+                {
+                    "selected_count": 0,
+                    "deferred_reason": "github_error",
+                    "github_error": str(exc),
+                    "merged_prs": merged_prs_for_result,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
+                },
+            )
         finally:
             if fleet_lock is not None:
                 fleet_lock.release()
@@ -5276,6 +5308,16 @@ class OrchestratorApp:
         def _resolve_merged_prs(
             outcome: _MergedPRListOutcome | None,
         ) -> list[dict[str, Any]]:
+            # Both raising branches (the direct fallback below and the
+            # outcome.error re-raise) propagate GitHubError to dispatch()'s
+            # ``except GitHubError`` handler, which defers the pass. This is
+            # deliberate: proceeding with [] would re-dispatch issues a merged
+            # PR already covered (the silent-empty path #633 closed). The
+            # direct fallback is the COMMON case — it runs whenever there are
+            # open ready issues but no closed-ready issues this pass, because
+            # _finalize_externally_merged_issues skips the merged_pr_list()
+            # fetch entirely when closed_ready is empty (returning an outcome
+            # with called=False).
             if outcome is None or not outcome.called:
                 return self.gh.merged_pr_list() if issues else []
             if outcome.error is not None and issues:
@@ -12766,14 +12808,14 @@ class OrchestratorApp:
                 # first pass cannot bake an empty baseline and permanently
                 # exempt the real history it never saw.
                 #
-                # This covers the raising failures (gh missing, unparseable
-                # JSON, non-zero exit). It does NOT cover gh exiting 0 with
-                # empty stdout, which merged_pr_list() coerces to an empty page
-                # and treats as "no more results" — that would arm an empty
-                # baseline silently. Distinguishing the two belongs in
-                # github.py rather than here and is tracked in #633; recovery
-                # is to delete the baseline key from state.json and let the
-                # next pass re-arm from real data.
+                # This covers every raising failure in merged_pr_list(): gh
+                # missing, unparseable JSON, non-zero exit, AND gh exiting 0
+                # with empty stdout (the silent-empty case #633 closed —
+                # merged_pr_list() now raises GitHubError on a non-list result
+                # instead of coercing None to []). The empty-stdout path no
+                # longer arms an empty baseline silently; it is reported here
+                # as a raising failure and the next pass re-arms from real
+                # data.
                 return []
 
         for pr in merged_prs:

@@ -4535,6 +4535,98 @@ def test_dispatch_still_queries_merged_pr_list_when_ready_issues_exist(tmp_path:
     assert fake_gh.merged_pr_list_calls == 1
 
 
+def test_dispatch_defers_when_merged_pr_list_raises_on_direct_fallback(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer — not crash — when merged_pr_list() raises on the
+    _resolve_merged_prs direct-fallback path (#633 review finding).
+
+    This is the COMMON-case path: open ready issues exist but no closed-ready
+    issues this pass, so _finalize_externally_merged_issues skips the
+    merged_pr_list() fetch entirely (returns an outcome with called=False).
+    _resolve_merged_prs then calls merged_pr_list() directly (branch 1), and
+    after #633 that call raises GitHubError on an unusable response instead of
+    silently returning []. Without a handler the error propagates out of
+    dispatch() and crashes the supervised loop daemon on a transient gh
+    failure. dispatch()'s ``except GitHubError`` handler must catch it and
+    return a deferred result so the next pass retries.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
+
+
+def test_dispatch_defers_when_merged_pr_list_raises_on_finalize_reraise(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer when _resolve_merged_prs re-raises a finalize error.
+
+    When closed-ready issues exist, _finalize_externally_merged_issues calls
+    merged_pr_list() itself and records a failure in _MergedPRListOutcome
+    (called=True, error=GitHubError). _resolve_merged_prs branch 2 re-raises
+    that stored error. dispatch()'s ``except GitHubError`` handler must catch
+    the re-raise and defer — the same handler that covers the direct fallback
+    (branch 1) — so a transient gh failure during finalization does not crash
+    the supervised loop daemon.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # A closed ready-labeled issue forces _finalize_externally_merged_issues
+            # to actually call merged_pr_list() (rather than skip with called=False),
+            # so the error is recorded in the outcome. The OPEN ready issue stays
+            # in the queue after finalization strips the closed one, so ``issues``
+            # is non-empty in _dispatch_impl and _resolve_merged_prs branch 2
+            # (``if outcome.error is not None and issues: raise``) fires.
+            self.issues = [
+                {
+                    "number": 200,
+                    "title": "Closed ready issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Already done",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "CLOSED",
+                },
+                {
+                    "number": 201,
+                    "title": "Open ready issue",
+                    "url": "https://example.test/issues/201",
+                    "body": "Needs work",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "OPEN",
+                },
+            ]
+
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
+
+
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
