@@ -569,7 +569,21 @@ class GitHub:
                 ],
                 json_output=True,
             )
-            page_prs = result if isinstance(result, list) else []
+            # run() returns None when gh exits 0 with empty stdout. A genuine
+            # empty page comes back as the JSON array ``[]`` (a list), so a
+            # non-list result means the call produced nothing parseable — an
+            # unusable response, not "no more results". Silently coercing that
+            # to [] makes an empty fetch indistinguishable from a failed one,
+            # which would arm consumers like the #502 post-merge tripwire with
+            # an empty baseline and leave them permanently blind to the merges
+            # they never saw. Surface it as an error so callers can tell
+            # "fetch failed" from "fetch succeeded and found nothing" (#633).
+            if not isinstance(result, list):
+                raise GitHubError(
+                    "merged_pr_list: gh api returned no parseable list for "
+                    f"page {page}; cannot distinguish empty result from unusable response"
+                )
+            page_prs = result
             if not page_prs:
                 break
             for pr in page_prs:

@@ -411,6 +411,59 @@ def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: P
     assert call_count == 2
 
 
+def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """gh exiting 0 with empty stdout is an unusable response, not an empty page.
+
+    run() returns None for that case (github.py:284-285). A genuine empty page
+    comes back as the JSON array ``[]`` (a list). The previous idiom
+    ``result if isinstance(result, list) else []`` coerced None to [] and
+    silently broke the pagination loop, returning [] as though the repository
+    had no merged PRs — indistinguishable from a successful empty fetch. This
+    is the silent-empty path that would arm the #502 post-merge tripwire with
+    an empty baseline and leave it permanently blind (issue #633).
+    """
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # gh exits 0 with empty stdout — run() returns None.
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError):
+        gh.merged_pr_list()
+
+    # The first page is where the unusable response is detected.
+    assert call_count == 1
+
+
+def test_merged_pr_list_empty_page_terminates_cleanly(monkeypatch, tmp_path: Path) -> None:
+    """A genuine empty page (``[]``) terminates pagination without raising.
+
+    This is the positive counterpart to test_merged_pr_list_raises_on_empty_stdout:
+    a real empty page is a list (``[]``) and must keep being treated as "no more
+    results", not as an unusable response.
+    """
+    responses = ["[]"]
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.merged_pr_list()
+
+    assert result == []
+
+
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
     monkeypatch, tmp_path: Path
 ) -> None:
