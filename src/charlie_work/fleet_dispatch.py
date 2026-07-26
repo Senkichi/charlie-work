@@ -1347,7 +1347,10 @@ def run_fleet_supervise(
     """
     try:
         global_config = load_layered_config(
-            Path.cwd(), None, fleet_dir_override=fleet_dir_override
+            Path.cwd(),
+            None,
+            fleet_dir_override=fleet_dir_override,
+            require_global=True,
         )
     except (ConfigError, RepoNotFoundError) as exc:
         # Falling back to defaults silently is how a whole feature disappears

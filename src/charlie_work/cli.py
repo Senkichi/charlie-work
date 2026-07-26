@@ -352,7 +352,12 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
     try:
-        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+        global_config = load_layered_config(
+            Path.cwd(),
+            None,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
@@ -383,7 +388,12 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
     try:
-        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+        global_config = load_layered_config(
+            Path.cwd(),
+            None,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
         global_config = None
