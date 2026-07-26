@@ -3193,6 +3193,16 @@ def clean_worktrees(
             # This is the same class of error the note above records for
             # `_worktree_refuse_to_reset_reason`: a check whose shape counts
             # the expected post-merge topology as danger.
+            #
+            # Known limitation, deliberately left fail-closed: the containment
+            # test needs `merged_head_sha` to still be in the local object
+            # store. For a squash-merged PR whose remote branch was deleted,
+            # nothing references that SHA once the local branch sits behind it,
+            # so a `git gc` can prune it and the object-presence gate below
+            # starts refusing. That is the safe direction (refuse, don't
+            # remove), and it reports its own distinct reason string — if
+            # worktree-clean ever "stops removing things" again, read the
+            # reasons before re-deriving anything.
             if not _object_exists(repo_root, merged_head_sha):
                 skipped.append(
                     {
