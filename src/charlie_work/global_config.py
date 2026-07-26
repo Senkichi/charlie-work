@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ from .config import (
     load_config,
 )
 from .fleet_paths import fleet_dir
+
+logger = logging.getLogger(__name__)
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -58,12 +61,27 @@ def load_layered_config(
 
     # Load global config if present
     global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_exists = global_config_path.exists()
     global_raw = (
-        yaml.safe_load(global_config_path.read_text(encoding="utf-8"))
-        if global_config_path.exists()
-        else {}
+        yaml.safe_load(global_config_path.read_text(encoding="utf-8")) if global_exists else {}
     )
     global_data = global_raw if isinstance(global_raw, dict) else {}
+
+    # Provenance, not values. An absent global layer is legitimate (a plain
+    # single-repo checkout has none), so this cannot be a warning here -- but
+    # its effect is that every fleet-wide knob silently reverts to its dataclass
+    # default while passes keep reporting success. #590 was indistinguishable
+    # from "the feature was never wired up" for hours because the resolved
+    # config records what a section *became*, never whether the file that
+    # declares it was read. Callers that do expect a global layer log this at
+    # INFO themselves (see run_fleet_supervise).
+    logger.debug(
+        "Layered config: global path=%s exists=%s sections=%s; repo path=%s",
+        global_config_path,
+        global_exists,
+        sorted(global_data) if global_data else "(none)",
+        repo_config_path,
+    )
 
     # Load per-repo config if present
     repo_raw = (

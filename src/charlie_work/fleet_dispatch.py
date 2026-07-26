@@ -1362,6 +1362,27 @@ def run_fleet_supervise(
         print(f"config load failed, running on defaults: {exc}", flush=True)
         global_config = OrchestratorConfig()
 
+    # Provenance of the layer every fleet-wide knob comes from, logged once per
+    # supervisor start (not per pass -- this is startup, so it costs one stat).
+    # The prologue already logs what runner_allocation *resolved to*; the fact
+    # missing from #590 is whether the file that declares it was read at all.
+    # A successful load that reports exists=False is the silent-{} path in
+    # load_layered_config and means the global layer never reached the merge;
+    # exists=True with a live section means the loss happened downstream. The
+    # two readings demand completely different fixes, and no other line in the
+    # log distinguishes them.
+    _global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    try:
+        _global_config_size: object = _global_config_path.stat().st_size
+    except OSError as exc:
+        _global_config_size = f"unreadable ({type(exc).__name__}: {exc})"
+    logger.info(
+        "Fleet supervisor global config: path=%s exists=%s bytes=%s",
+        _global_config_path,
+        _global_config_path.exists(),
+        _global_config_size,
+    )
+
     overrides: dict[str, int] = {}
     if poll_interval_override is not None:
         overrides["poll_interval_seconds"] = poll_interval_override
