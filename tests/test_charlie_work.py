@@ -183,6 +183,27 @@ def test_default_config_throttle_error_markers() -> None:
     assert "A tool was rejected by the user" not in config.runtime.throttle_error_markers
 
 
+def test_default_config_session_limit_markers() -> None:
+    """RuntimeConfig.session_limit_markers defaults to the narrow CLI
+    session-limit death-message phrasing only (issue #651/#652).
+
+    Unlike throttle_error_markers (which includes generic substrings like
+    "rate limit" / "usage limit" appropriate for worker log tails), this list
+    contains only specific CLI death-message phrasing safe to match against
+    reviewer analysis prose. Generic markers must NOT appear here: reviewer
+    launches force tee_stream_json=True, making log_path and events_path
+    byte-identical, so a marker matched against the log tail is also matched
+    against the parsed assistant text -- generic markers would false-positive
+    on legitimate rate-limit/quota review commentary.
+    """
+    config = load_config()
+    assert "hit your session limit" in config.runtime.session_limit_markers
+    # Generic markers that appear in review commentary must NOT be here.
+    assert "rate limit" not in config.runtime.session_limit_markers
+    assert "usage limit" not in config.runtime.session_limit_markers
+    assert "too many requests" not in config.runtime.session_limit_markers
+
+
 def test_runner_scaling_config_parses_with_enabled_flag(tmp_path: Path) -> None:
     """RunnerScalingConfig parses with enabled=true and custom values."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -475,6 +496,24 @@ runtime:
         "Reached overall message rate limit",
         "A tool was rejected by the user",
         "custom provider failure",
+    )
+
+
+def test_load_config_runtime_session_limit_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.session_limit_markers is configurable from YAML (issue #651/#652)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runtime:
+  session_limit_markers:
+    - "hit your session limit"
+    - "custom session-limit phrasing"
+"""
+    )
+    config = load_config(config_file)
+    assert config.runtime.session_limit_markers == (
+        "hit your session limit",
+        "custom session-limit phrasing",
     )
 
 
