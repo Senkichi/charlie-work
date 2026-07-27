@@ -3440,6 +3440,57 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
+def test_dispatch_survives_worker_census_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #646 regression guard: ``_log_worker_census`` is invoked
+    unconditionally as the first statement of ``dispatch()`` so every dispatch
+    path logs it. That diagnostic must never be the reason a whole dispatch
+    pass aborts -- a torn sidecar read (or any other unexpected failure in the
+    census sweep) is *more* likely, not less, during the exact
+    high-concurrency moment this census exists to diagnose.
+
+    This behavior already regressed once earlier in this branch's own commit
+    history (the call was unguarded before commit f891866), so pin it with a
+    test: force the census to raise, then assert dispatch still runs to
+    completion and selects a worker, and that the failure is surfaced as a
+    warning rather than propagating or being silently swallowed.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Make the issue dispatchable (default fixture ships an open tracked PR).
+    app.gh.prs[0]["state"] = "CLOSED"
+
+    def _boom(_sessions_dir: Path) -> None:
+        raise OSError("simulated torn sidecar read")
+
+    monkeypatch.setattr("charlie_work.workflow._log_worker_census", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.workflow"):
+        result = app.dispatch(limit=1)
+
+    # dispatch() must not have raised: it returns a normal ok result and, more
+    # importantly, actually did its work (selected a worker, wrote the prompt)
+    # -- proving it continued past the failing census call rather than aborting
+    # at the first statement.
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert prompt_path.exists()
+    assert (123, "agent:queued") in fake_gh.labels_added
+
+    # The census failure must be surfaced as a warning (not silently swallowed
+    # and not propagated), so an operator scanning logs can still see it.
+    assert any("worker census failed" in record.getMessage() for record in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+
+
 def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     """Issue #257: a labeled issue with an open tracked PR must never be a
     dispatch candidate, even with no state.json entry (label drift after
