@@ -148,6 +148,116 @@ def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
     return result if isinstance(result, list) else []
 
 
+# Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
+# are not orchestrator LabelConfig values. Verified live against real Aviator
+# check-run output (job-cannon PR #1400, 2026-07-27): conclusion == "failure",
+# output.summary starts with "This PR is not ready to merge (currently in
+# state blocked): PR has a blocked label, remove to re-queue."
+AVIATOR_CHECK_NAME = "aviator/checks"
+AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
+
+
+def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list[DriftItem]:
+    """Detect PRs stuck behind a stale Aviator ``blocked`` label.
+
+    Aviator sometimes blocks a PR (setting ``blocked`` and stripping
+    ``mergequeue``) on a real CI failure, then never re-evaluates once the
+    underlying cause clears (a stale branch update, a flaky test passing on
+    rerun, ...) -- confirmed live on job-cannon #1387/#1400/#1398/#1392
+    (2026-07-27), each stuck for hours with every real CI check green.
+
+    Deliberately NOT folded into ``detect_drift``: that function's contract
+    (enforced by ``test_detect_drift_makes_zero_mutating_calls``) is exactly
+    two ``gh.run`` list calls and nothing else, specifically to avoid
+    repeating issue #361 (an unconditional per-PR GraphQL check-run walk via
+    ``statusCheckRollup`` caused 502s). This function instead issues one
+    ``commit_check_runs`` REST call per PR ALREADY LABELED ``blocked`` --
+    gated on the cheap, already-fetched ``labels`` field first, so the cost
+    scales with how many PRs are actually stuck, not with the full open-PR
+    count. ``blocked`` is not a common label in steady state.
+
+    Aviator's message lives in a Check Run's ``output.summary`` -- ``gh pr
+    checks --json``'s ``description`` field is always empty for App-created
+    Check Runs (only legacy Commit Statuses populate it), so
+    ``GitHub.pr_checks``/``PR_CHECKS_FIELDS`` cannot see it at all; this is
+    the only path that can.
+    """
+    drift: list[DriftItem] = []
+    for pr in _fetch_prs(gh):
+        if str(pr.get("state") or "").upper() != "OPEN":
+            continue
+        if "blocked" not in label_names(pr):
+            continue
+        pr_number = pr.get("number")
+        head_sha = pr.get("headRefOid")
+        if pr_number is None or not head_sha:
+            continue
+        pr_number = int(pr_number)
+
+        check_runs = gh.commit_check_runs(str(head_sha))
+        if not check_runs:
+            continue
+
+        # Multiple check-run entries can exist per name after a rerun; the
+        # highest numeric "id" is the most recent (GitHub assigns check-run
+        # ids monotonically per repo) -- never trust list order.
+        latest_by_name: dict[str, dict[str, Any]] = {}
+        for run in check_runs:
+            name = run.get("name")
+            if not name:
+                continue
+            current = latest_by_name.get(name)
+            if current is None or int(run.get("id") or 0) > int(current.get("id") or 0):
+                latest_by_name[name] = run
+
+        aviator_run = latest_by_name.get(AVIATOR_CHECK_NAME)
+        if aviator_run is None or aviator_run.get("conclusion") != "failure":
+            continue
+        summary = str((aviator_run.get("output") or {}).get("summary") or "")
+        if AVIATOR_BLOCKED_MESSAGE not in summary:
+            continue
+
+        other_checks_green = all(
+            run.get("conclusion") == "success"
+            for name, run in latest_by_name.items()
+            if name != AVIATOR_CHECK_NAME
+        )
+        if not other_checks_green:
+            continue
+
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        mergequeue_label = config.auto_merge.mergequeue_label
+        add_labels: tuple[str, ...] = ()
+        if mergequeue_label and mergequeue_label not in label_names(pr):
+            add_labels = (mergequeue_label,)
+
+        fix_actions = [f"remove label 'blocked' from PR #{pr_number}"]
+        if add_labels:
+            fix_actions.append(
+                f"add label {mergequeue_label!r} to PR #{pr_number} (Aviator re-queue)"
+            )
+        drift.append(
+            DriftItem(
+                kind="aviator_stale_blocked",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                detail=(
+                    f"PR #{pr_number} has a stale Aviator 'blocked' label -- all real CI "
+                    "checks are green but aviator/checks still reports the blocked-label "
+                    "failure"
+                ),
+                fix_actions=tuple(fix_actions),
+                remove_labels=("blocked",),
+                add_labels=add_labels,
+            )
+        )
+    return drift
+
+
 def detect_drift(
     gh: GitHub, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
@@ -1279,6 +1389,28 @@ def apply_fixes(
                 new_issue.pop("worker_process_start_time", None)
                 new_issues[issue_key] = new_issue
 
+                fix_actions = list(item.fix_actions)
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                    item = DriftItem(
+                        kind=item.kind,
+                        issue_number=item.issue_number,
+                        pr_number=item.pr_number,
+                        detail=item.detail,
+                        fix_actions=tuple(fix_actions),
+                        remove_labels=item.remove_labels,
+                        add_labels=item.add_labels,
+                    )
+
+        elif item.kind == "aviator_stale_blocked":
+            if item.pr_number is not None:
+                label_ok = True
+                for label in item.remove_labels:
+                    if not gh.remove_pr_label(item.pr_number, label):
+                        label_ok = False
+                for label in item.add_labels:
+                    if not gh.add_pr_label(item.pr_number, label):
+                        label_ok = False
                 fix_actions = list(item.fix_actions)
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")

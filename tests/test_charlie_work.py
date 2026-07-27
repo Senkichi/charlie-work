@@ -22756,6 +22756,74 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     assert state["prs"]["456"]["status"] == "escalated"
 
 
+def test_review_refreshes_janitor_diagnostics_while_issue_escalated(tmp_path: Path) -> None:
+    """job-cannon #1397/#1443 (2026-07-27): janitor_failures must not go stale
+    while the linked issue is escalated for an UNRELATED reason (e.g. a dead
+    rework-worker session), even though status/labels/routing stay frozen.
+
+    Before this fix, review()'s escalation short-circuit returned before ever
+    calling run_janitor again, so a PR whose merge conflict cleared (or whose
+    CI went green) kept reporting the stale pre-escalation failure for as long
+    as the issue stayed escalated -- sometimes many hours, until an operator
+    ran unescalate(). This asserts janitor_ok/janitor_failures track reality
+    on every review() call, while status/labels/attempt counters stay inert.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.pr_head_shas[456] = "sha-1"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
+    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+
+    # Seed a PR record with a stale-but-then-true merge-conflict failure, as
+    # the janitor gate itself would have written it before escalation.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": ["PR has merge conflicts (mergeable=CONFLICTING)"],
+        }
+        # Escalate the linked ISSUE only (mirrors a dead rework-worker
+        # escalation) -- the PR's own status is deliberately left at
+        # "janitor_blocked", matching the real #1397/#1443 state shape.
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(paths.state_file, state)
+
+    # The conflict clears (e.g. a branch update landed) while still escalated.
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data.get("skipped") is True
+    assert not fake_gh.labels_added
+    assert not fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    # Frozen: escalation stays terminal for status -- only unescalate() may
+    # move this.
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["issues"]["123"]["status"] == "escalated"
+    # Refreshed: the stale conflict failure must be gone.
+    assert state["prs"]["456"]["janitor_ok"] is True
+    assert state["prs"]["456"]["janitor_failures"] == []
+
+    # A second call with nothing changed must not re-log a duplicate event
+    # (cost-spirals.md Finding 2 dedup applies here too).
+    events_before = len(state.get("events", []))
+    app.review(456)
+    state = load_state(paths.state_file)
+    janitor_gate_events = [e for e in state.get("events", []) if e.get("kind") == "janitor_gate"]
+    assert len(janitor_gate_events) == 1
+    assert len(state.get("events", [])) == events_before
+
+
 def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     """Review_started transition should fire when there's no prior verdict."""
     config = OrchestratorConfig()
