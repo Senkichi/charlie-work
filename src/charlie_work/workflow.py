@@ -79,7 +79,12 @@ from .janitor import (
 from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
-from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
+from .reconcile import (
+    DriftItem,
+    apply_fixes as apply_drift_fixes,
+    detect_aviator_stale_blocked,
+    detect_drift,
+)
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -6572,6 +6577,55 @@ class OrchestratorApp:
                 if issue_number is not None and issue_escalated
                 else f"PR #{pr_number} is escalated; review skipped"
             )
+            # Refresh (but never act on) janitor diagnostics while escalated.
+            # PRs #1397/#1443 (job-cannon, 2026-07-27) sat with janitor_ok/
+            # janitor_failures frozen at hours-stale values because this early
+            # return prevented run_janitor from ever re-running once the
+            # LINKED ISSUE escalated -- caused there by an unrelated dead
+            # rework-worker session, not by the janitor's own verdict. A
+            # since-cleared merge conflict or a since-green CI run stayed
+            # reported as failing until an operator ran unescalate(), because
+            # nothing else re-observes reality for an escalated PR.
+            # Escalation must stay terminal for every side effect --status,
+            # labels, routing, attempt counters-- only unescalate() may re-arm
+            # those (see its docstring) -- so this recomputes janitor_ok/
+            # janitor_failures for visibility ONLY, reusing the same
+            # dedup'd write/event pattern the janitor gate itself uses
+            # (cost-spirals.md Finding 2) so an unrepaired PR doesn't
+            # re-log identical failures every pass while escalated either.
+            escalated_checks = self.gh.pr_checks(pr_number)
+            escalated_diff = self.gh.pr_diff(pr_number)
+            with state_lock(self.paths.state_file):
+                fresh_state = load_state(self.paths.state_file)
+                existing_pr_state = fresh_state["prs"].get(str(pr_number))
+                if existing_pr_state is not None:
+                    escalated_verdict = run_janitor(
+                        pr,
+                        escalated_checks,
+                        self.config,
+                        pr_state=existing_pr_state,
+                        repo_root=self.repo_root,
+                        pr_diff=escalated_diff,
+                    )
+                    failures_changed = existing_pr_state.get("janitor_failures") != list(
+                        escalated_verdict.failures
+                    )
+                    fresh_state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "janitor_ok": escalated_verdict.ok,
+                        "janitor_failures": list(escalated_verdict.failures),
+                    }
+                    if failures_changed:
+                        fresh_state = self._record_event(
+                            fresh_state,
+                            "janitor_gate",
+                            {
+                                "pr_number": pr_number,
+                                "failures": list(escalated_verdict.failures),
+                                "escalated": True,
+                            },
+                        )
+                    save_state(self.paths.state_file, fresh_state)
             return CommandResult(
                 True,
                 reason,
@@ -6579,7 +6633,7 @@ class OrchestratorApp:
                     "pr": pr_number,
                     "issue": issue_number,
                     "skipped": True,
-                    "checks_unavailable": False,
+                    "checks_unavailable": escalated_checks is None,
                 },
             )
 
@@ -9941,7 +9995,9 @@ class OrchestratorApp:
                             "graphql_threshold": threshold,
                         },
                     )
-                drift = detect_drift(self.gh, state, self.config, repo_root=self.repo_root)
+                drift = detect_drift(
+                    self.gh, state, self.config, repo_root=self.repo_root
+                ) + detect_aviator_stale_blocked(self.gh, self.config)
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
                 if fix and drift:
@@ -9955,7 +10011,7 @@ class OrchestratorApp:
                     # actually landed before reporting success.
                     post_fix_drift = detect_drift(
                         self.gh, new_state, self.config, repo_root=self.repo_root
-                    )
+                    ) + detect_aviator_stale_blocked(self.gh, self.config)
                     fixed = len(post_fix_drift) == 0
             message = f"found {len(drift)} drift item(s)"
             if fixed:

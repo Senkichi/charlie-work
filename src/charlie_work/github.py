@@ -74,8 +74,12 @@ MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,h
 PR_CHECKS_FIELDS = "name,state,bucket,link"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
+# headRefOid is a plain scalar (like state/title) -- NOT a per-item graph walk
+# like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
+# safe to include unconditionally. Needed by detect_aviator_stale_blocked's
+# commit_check_runs(sha) lookup.
 RECONCILE_PR_FIELDS = (
-    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
+    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid"
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
@@ -749,6 +753,30 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        """Fetch the GitHub Check Runs attached to a commit SHA.
+
+        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}/check-runs`` and
+        returns its ``check_runs`` array, or ``None`` on failure. Distinct
+        from ``pr_checks()``/``PR_CHECKS_FIELDS``: ``gh pr checks --json``
+        exposes only Commit-Status-shaped fields (its ``description`` field
+        is always empty for App-created Check Runs like Aviator's
+        ``aviator/checks`` -- Check Runs carry their message in
+        ``output.summary``/``output.title`` instead, which ``gh pr checks``
+        does not surface at all). This is the only way to read that message.
+        Errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+        if not isinstance(value, dict):
+            return None
+        check_runs = value.get("check_runs")
+        return check_runs if isinstance(check_runs, list) else None
+
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         """Compare two commits and return the comparison metadata.
 
@@ -891,6 +919,15 @@ class GitHub:
         label is already present) and never raises — see ``_run_bool``.
         """
         return self._run_bool(["pr", "edit", str(number), "--add-label", label])
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        """Remove a label from a PR (PR-scoped, not the linked issue).
+
+        Mirrors ``add_pr_label``. Used to clear Aviator's ``blocked`` label
+        once it has gone stale (reconcile.py's ``aviator_stale_blocked`` drift
+        kind). Idempotent and never raises — see ``_run_bool``.
+        """
+        return self._run_bool(["pr", "edit", str(number), "--remove-label", label])
 
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
