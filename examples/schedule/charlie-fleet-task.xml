@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-16"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
   charlie-work fleet scheduler — Windows Task Scheduler XML template.
   Import this task with: schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"
@@ -72,8 +72,8 @@
            %LOCALAPPDATA%\charlie-work\logs\charlie-work-YYYYMMDD.log
            (or $XDG_STATE_HOME/charlie-work/logs on POSIX) regardless of how
            this task is launched or whether stdout/stderr is captured.
-           Uncommenting the line below is still fine as belt-and-braces --
-           e.g. to also capture this command's own stdout/stderr framing --
+           Uncommenting the line below is still fine as belt-and-braces,
+           e.g. to also capture this command's own stdout/stderr framing,
            but it is not required to answer "what was running and when". -->
       <!-- <Arguments>/c "cd /d C:\path\to\your\repo &amp;&amp; charlie fleet bash-rats &gt;&gt; C:\path\to\charlie-work.log 2&gt;&amp;1"</Arguments> -->
     </Exec>
