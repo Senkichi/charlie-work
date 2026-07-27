@@ -1709,6 +1709,13 @@ REVIEW_MISS_TURN_LIMIT = "turn_limit_summary_posted"
 REVIEW_MISS_LAUNCH_FAILED = "launch_failed"
 REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
 
+# Default throttle markers for _extract_review_session_summary's session-limit
+# reclassification (issue #651). Mirrors the _DEFAULT_THROTTLE_ERROR_MARKERS
+# pattern in devin_shell.py / claude_code.py: the single source of truth for the
+# marker strings is RuntimeConfig.throttle_error_markers, and callers pass their
+# config's list explicitly so a new provider phrasing only needs a config change.
+_DEFAULT_REVIEW_THROTTLE_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
+
 # state.json key holding the one-time record of worker-PR merges that predate the
 # #502 post-merge tripwire. Named here rather than inlined so the arming logic and
 # the tests that pre-arm it cannot drift apart on a string literal.
@@ -1739,6 +1746,8 @@ def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
     max_turns: int,
+    *,
+    throttle_markers: Sequence[str] | None = None,
 ) -> ReviewSessionOutcome | None:
     """Summarize and classify a reviewer session that produced no verdict.
 
@@ -1754,6 +1763,25 @@ def _extract_review_session_summary(
     analysis. Reporting the two identically hid a 25-hour outage in which 19
     reviewers died on a rejected argv while every signal said "turn limit"
     (issue #588).
+
+    A session whose only output is a provider session-limit / throttle notice
+    (e.g. Claude Code's "hit your session limit") is also environmental, not a
+    PR-level outcome: ``parse_claude_events`` counts that notice as one turn,
+    so it fails the ``turn_count == 0`` check and would otherwise fall through
+    to ``REVIEW_MISS_DIED_MID_SESSION`` -- the same bucket as a session that
+    genuinely did substantial review work. That misclassification silently
+    defeats the #583 throttle-rollback guard (``did_substantial_work`` reads
+    ``reason != REVIEW_MISS_LAUNCH_FAILED`` and is persisted as
+    ``review_turn_limit_summary_posted``), letting a global session-limit
+    outage burn a PR's ``review_dispatch_attempt_count`` budget with zero
+    actual review work performed (issue #651). When the recovered text matches
+    a throttle marker, classify as ``REVIEW_MISS_LAUNCH_FAILED`` regardless of
+    ``turn_count`` so the rollback guard fires.
+
+    ``throttle_markers`` defaults to ``RuntimeConfig.throttle_error_markers``
+    so the marker list stays config-driven (single point of enforcement in
+    ``throttle_signatures.match_throttle_tail``); callers pass their config's
+    list explicitly.
 
     Returns ``None`` if the events file is missing and the log contains no
     recoverable text (nothing to summarize).
@@ -1799,6 +1827,10 @@ def _extract_review_session_summary(
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
+    markers = (
+        throttle_markers if throttle_markers is not None else _DEFAULT_REVIEW_THROTTLE_MARKERS
+    )
+
     # A session with no turns and no tool calls never reached its first turn:
     # the process died at launch and whatever text we recovered is its error
     # output, not reviewer analysis.
@@ -1806,6 +1838,22 @@ def _extract_review_session_summary(
         reason = REVIEW_MISS_LAUNCH_FAILED
     elif max_turns > 0 and turn_count >= max_turns:
         reason = REVIEW_MISS_TURN_LIMIT
+    elif match_throttle_tail("\n".join(assistant_texts), markers)[0]:
+        # A session whose only output is a provider session-limit / throttle
+        # notice (e.g. "hit your session limit") gets that notice counted as a
+        # turn by parse_claude_events, so it fails the turn_count == 0 check
+        # above and would fall through to REVIEW_MISS_DIED_MID_SESSION -- the
+        # same bucket as a session that genuinely did substantial review work.
+        # That misclassification silently defeats the #583 throttle-rollback
+        # guard (did_substantial_work reads reason != REVIEW_MISS_LAUNCH_FAILED
+        # and is persisted as review_turn_limit_summary_posted), letting a
+        # global session-limit outage burn a PR's attempt budget with zero
+        # review work performed (issue #651). The notice is environmental, not
+        # a PR-level outcome, so classify it as a launch failure regardless of
+        # turn_count. The turn-limit branch above already owns sessions that
+        # genuinely exhausted their turn budget, so this only intercepts deaths
+        # that occurred before the cap.
+        reason = REVIEW_MISS_LAUNCH_FAILED
     else:
         reason = REVIEW_MISS_DIED_MID_SESSION
 
@@ -7159,7 +7207,10 @@ class OrchestratorApp:
                     events_path = _events_path(reviews_dir, pr_number, review=True)
                     max_turns = self.config.review_dispatch.review_max_turns
                     outcome = _extract_review_session_summary(
-                        events_path, Path(w.log_path), max_turns
+                        events_path,
+                        Path(w.log_path),
+                        max_turns,
+                        throttle_markers=self.config.runtime.throttle_error_markers,
                     )
                     if outcome is not None:
                         try:
