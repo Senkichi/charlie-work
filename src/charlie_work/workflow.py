@@ -5186,8 +5186,20 @@ class OrchestratorApp:
         # or from inside a supervised pass (`loop()` -> `_loop_body()` ->
         # `dispatch()`), so it answers "how many suites were running at <time>,
         # from which worktrees, at what cap" regardless of which command
-        # launched them. Purely read-only.
-        _log_worker_census(self._resolve(self.config.devin.sessions_dir))
+        # launched them. Purely read-only, but explicitly guarded: per-file
+        # read errors are already swallowed inside read_worker_records/
+        # read_session_records, but this diagnostic must never be the reason a
+        # whole dispatch pass aborts, so any other unexpected failure here
+        # (formatting, directory-listing races, etc.) is logged and swallowed
+        # rather than propagated -- a torn sidecar read is *more* likely, not
+        # less, during the exact high-concurrency moment this census exists to
+        # diagnose.
+        try:
+            _log_worker_census(self._resolve(self.config.devin.sessions_dir))
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning("worker census failed", exc_info=True)
         # Finalize closed ready-labeled issues whose linked PR merged externally.
         # This runs before fleet lock / GraphQL budget / provider throttle guards
         # so a pass that defers new dispatch still drains the Aviator-merge backlog.
