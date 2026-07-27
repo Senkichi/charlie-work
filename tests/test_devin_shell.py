@@ -305,6 +305,66 @@ def test_launch_devin_session_worker_env_overrides_sanitize_env(
     assert log_text == "/custom/override/venv"
 
 
+def test_launch_devin_session_records_default_xdist_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: with no ambient/config cap, the sidecar records the safe default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        141,
+        "agent/issue-141-default-cap",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "2"
+    assert record.uv_no_sync is None  # no .venv in this fake worktree
+
+    payload = json.loads((sessions_dir / "issue-141.json").read_text(encoding="utf-8"))
+    assert payload["xdist_cap"] == "2"
+    assert payload["uv_no_sync"] is None
+
+
+def test_launch_devin_session_worker_env_pytest_cap_override_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: an explicit worker_env cap must win over the ambient env and default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "6")
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        142,
+        "agent/issue-142-cap-override",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "UV_NO_SYNC": "0"},
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "1"
+    assert record.uv_no_sync == "0"
+
+
 # ---------------------------------------------------------------------------
 # Core launch behaviour
 # ---------------------------------------------------------------------------

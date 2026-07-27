@@ -293,6 +293,60 @@ def test_launch_claude_worker_worker_env_overrides_sanitize_env(
     read_worker_marker(probe_path, expected="/custom/override/venv")
 
 
+def test_launch_claude_worker_records_default_xdist_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #646: with no ambient/config cap, the sidecar records the safe default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+
+    record = launch_claude_worker(
+        141,
+        "agent/issue-141-default-cap",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert record.ok
+    assert record.xdist_cap == "2"
+    assert record.uv_no_sync is None  # no .venv in this fake worktree
+
+    payload = json.loads((sessions_dir / "issue-141.claude.json").read_text(encoding="utf-8"))
+    assert payload["xdist_cap"] == "2"
+    assert payload["uv_no_sync"] is None
+
+
+def test_launch_claude_worker_worker_env_pytest_cap_override_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #646: an explicit worker_env cap must win over the ambient env and default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "6")
+
+    record = launch_claude_worker(
+        142,
+        "agent/issue-142-cap-override",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "UV_NO_SYNC": "0"},
+    )
+
+    assert record.ok
+    assert record.xdist_cap == "1"
+    assert record.uv_no_sync == "0"
+
+
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

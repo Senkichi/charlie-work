@@ -3069,6 +3069,70 @@ def _sweep_orphan_processes_for_dead_sessions(
                 save_state(state_file, state)
 
 
+def _log_worker_census(sessions_dir: Path) -> None:
+    """Log one INFO line per loop pass listing every currently-alive worker.
+
+    Issue #646: the launch-time log in claude_code.py/devin_shell.py answers
+    "what cap did this worker launch with", but says nothing about how many
+    are running *right now* -- the question a box-saturation incident needs
+    answered ("how many suites were running at 11:33, from which worktrees,
+    at what cap"). This sweep answers it directly from log content alone,
+    with no process forensics required.
+
+    Deliberately read-only (no state mutation): it carries none of the
+    fragile sole-writer invariants _detect_and_handle_stalled_sessions/
+    _sweep_orphan_processes_for_dead_sessions must protect. It also only
+    ever iterates *alive* records, so — unlike a dead/exit-transition sweep —
+    it has no "months of accumulated stale sidecar" flooding problem even if
+    old sidecars are never pruned from sessions_dir.
+
+    Runs unconditionally every pass (see _loop_body) regardless of how long
+    the orchestrator process itself lives: a one-shot ``charlie fleet work``
+    CLI invocation logs exactly one census line before exiting; a long-lived
+    ``charlie fleet supervise`` logs one per pass. Both answer the diagnostic
+    question above from log content alone -- no need to correlate against a
+    live process list.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    from .claude_code import is_worker_alive, read_worker_records
+    from .devin_shell import is_session_alive, read_session_records
+
+    now = datetime.now(UTC)
+
+    def _age_seconds(started_at: str) -> int | None:
+        try:
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return int((now - started).total_seconds())
+
+    entries: list[str] = []
+    # adapter_kind=None also covers the "api" adapter, which delegates to
+    # claude_code.launch_claude_worker under the hood and shares its sidecar
+    # schema (and therefore xdist_cap/is_worker_alive) unchanged.
+    for record in read_worker_records(sessions_dir, adapter_kind=None):
+        if record.pid is None or record.error is not None or not is_worker_alive(record):
+            continue
+        entries.append(
+            f"(adapter={record.adapter_kind} issue={record.issue_number} "
+            f"worktree={record.worktree_path} pid={record.pid} "
+            f"cap={record.xdist_cap} age_s={_age_seconds(record.started_at)})"
+        )
+    for record in read_session_records(sessions_dir):
+        if record.pid is None or record.error is not None or not is_session_alive(record):
+            continue
+        entries.append(
+            f"(adapter=devin-shell issue={record.issue_number} "
+            f"worktree={record.worktree_path} pid={record.pid} "
+            f"cap={record.xdist_cap} age_s={_age_seconds(record.started_at)})"
+        )
+
+    logger.info("worker census: n_alive=%d %s", len(entries), " ".join(entries) or "[]")
+
+
 def _rework_pr_for_worker(
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
@@ -11020,6 +11084,10 @@ class OrchestratorApp:
         # daemon's entire lifetime).
         self.gh.invalidate_list_cache()
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Issue #646: unconditional per-pass census of every alive worker, so
+        # a box-saturation incident can be diagnosed from logs alone. Purely
+        # read-only — safe to run before the stateful sweeps below.
+        _log_worker_census(sessions_dir)
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
         # The result is handed down to dispatch_rework()/dispatch() below so the
