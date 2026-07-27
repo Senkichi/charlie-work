@@ -486,3 +486,116 @@ def test_extract_review_session_summary_session_limit_notice_no_substantial_work
     assert outcome.tool_call_count == 0
     assert outcome.reason == "launch_failed"
     assert outcome.did_substantial_work is False
+
+
+def test_extract_review_session_summary_substantial_work_with_throttle_marker_in_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Regression for #652 review finding: a session that did real review work
+    (tool calls) must NEVER be reclassified as a launch failure, even when its
+    raw log tail genuinely contains a throttle marker.
+
+    The ``tool_call_count == 0`` guard is the boundary that protects
+    substantial-work sessions: a throttle on the final API call after real
+    review work is a PR-level outcome (``died_mid_session``), not an
+    environmental launch failure. Without the guard, a session that reviewed
+    several files then died on a "rate limit" retry would be silently
+    reclassified as ``launch_failed``, defeating the #583 rollback guard this
+    reclassification exists to protect.
+    """
+    from charlie_work.workflow import _extract_review_session_summary
+
+    # A session that did real work: 3 turns, 2 tool calls (read files). Its
+    # assistant analysis discusses a rate-limit PR (legit domain commentary),
+    # and its log tail ends with a genuine "rate limit" throttle notice -- the
+    # CLI hit a rate limit on its final API call after doing the review work.
+    events_path = tmp_path / "issue-100-review.events.jsonl"
+    lines: list[str] = []
+    for index in range(3):
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": f"Analysis step {index + 1}: this PR changes the rate limit config.",
+            }
+        ]
+        if index < 2:
+            content.append({"type": "tool_use", "id": f"t{index}", "name": "Read", "input": {}})
+        lines.append(json.dumps({"type": "assistant", "message": {"content": content}}))
+    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log_path = tmp_path / "issue-100-review.claude.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "Analysis step 1: this PR changes the rate limit config.",
+                "Analysis step 2: this PR changes the rate limit config.",
+                "Analysis step 3: this PR changes the rate limit config.",
+                "Error: rate limit exceeded",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    outcome = _extract_review_session_summary(events_path, log_path, max_turns=20)
+
+    assert outcome is not None
+    assert outcome.turn_count == 3
+    assert outcome.tool_call_count == 2
+    # Substantial work (tool calls) => died_mid_session, NOT launch_failed,
+    # even though the log tail contains the "rate limit" throttle marker.
+    assert outcome.reason == "died_mid_session"
+    assert outcome.did_substantial_work is True
+
+
+def test_extract_review_session_summary_matches_raw_log_tail_not_analysis_text(
+    tmp_path: Path,
+) -> None:
+    """Regression for #652 review finding: the throttle match reads the RAW
+    PROCESS LOG TAIL, not the parsed assistant analysis text.
+
+    A session with ``tool_call_count == 0`` whose assistant analysis text
+    contains a generic marker ("rate limit" -- legitimate review commentary in
+    this codebase's rate-limit/quota domain) but whose raw log contains NO
+    throttle marker must be ``died_mid_session``, not ``launch_failed``. The
+    pre-fix code matched against ``"\\n".join(assistant_texts)`` and would have
+    misclassified this session as a launch failure -- the exact silent
+    misclassification the review flagged. The raw-log-tail boundary mirrors the
+    proven stalled-session sweep pattern at workflow.py's
+    ``Path(w.log_path).read_text(...)`` call.
+    """
+    from charlie_work.workflow import _extract_review_session_summary
+
+    # tool_call_count == 0 (no tool use blocks), but the assistant text
+    # mentions "rate limit" as review commentary. The raw log contains only
+    # benign prose -- no throttle notice.
+    events_path = tmp_path / "issue-100-review.events.jsonl"
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "This PR adjusts the rate limit config in config.py.",
+                    }
+                ]
+            },
+        }
+    )
+    events_path.write_text(line + "\n", encoding="utf-8")
+    log_path = tmp_path / "issue-100-review.claude.log"
+    # Raw log has NO throttle marker -- only the parsed assistant event text
+    # does. The match must read the log, not the events. The log text is
+    # deliberately distinct from the assistant event text so a match against
+    # either source is unambiguous.
+    log_path.write_text("Reviewer process exited with no verdict produced.\n", encoding="utf-8")
+
+    outcome = _extract_review_session_summary(events_path, log_path, max_turns=20)
+
+    assert outcome is not None
+    assert outcome.turn_count == 1
+    assert outcome.tool_call_count == 0
+    # The raw log tail has no throttle marker, so this is NOT a launch failure
+    # even though the assistant analysis text contains "rate limit".
+    assert outcome.reason == "died_mid_session"
+    assert outcome.did_substantial_work is True

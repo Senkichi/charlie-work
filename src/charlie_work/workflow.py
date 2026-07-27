@@ -1716,6 +1716,40 @@ REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
 # config's list explicitly so a new provider phrasing only needs a config change.
 _DEFAULT_REVIEW_THROTTLE_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
 
+# Tail length for the raw-log throttle match in _extract_review_session_summary.
+# Mirrors the 2048-char tail used by the stalled-session sweep (the
+# ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call in
+# _handle_stalled_review_sessions): the CLI prints its session-limit / throttle
+# notice at the very end of the log, so the tail isolates the death message from
+# the multi-turn analysis prose earlier in the log.
+_REVIEW_THROTTLE_TAIL_CHARS = 2048
+
+
+def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
+    """Return True when the raw process log's tail contains a throttle marker.
+
+    Reads the last ``_REVIEW_THROTTLE_TAIL_CHARS`` chars of ``log_path`` and
+    matches against ``markers`` via ``match_throttle_tail``. This is the same
+    boundary the stalled-session sweep uses (raw log tail, not parsed assistant
+    event text): the throttle notice is the CLI process's own death message
+    printed to its log, while ``assistant_texts`` is the reviewer's analysis
+    prose -- which in this codebase's rate-limit/quota domain legitimately
+    contains generic markers like "rate limit" / "usage limit" (issue #652
+    review). Missing or unreadable logs do not match.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not log_text:
+        return False
+    if len(log_text) > _REVIEW_THROTTLE_TAIL_CHARS:
+        tail = log_text[-_REVIEW_THROTTLE_TAIL_CHARS:]
+    else:
+        tail = log_text
+    return match_throttle_tail(tail, markers)[0]
+
+
 # state.json key holding the one-time record of worker-PR merges that predate the
 # #502 post-merge tripwire. Named here rather than inlined so the arming logic and
 # the tests that pre-arm it cannot drift apart on a string literal.
@@ -1774,9 +1808,22 @@ def _extract_review_session_summary(
     ``reason != REVIEW_MISS_LAUNCH_FAILED`` and is persisted as
     ``review_turn_limit_summary_posted``), letting a global session-limit
     outage burn a PR's ``review_dispatch_attempt_count`` budget with zero
-    actual review work performed (issue #651). When the recovered text matches
-    a throttle marker, classify as ``REVIEW_MISS_LAUNCH_FAILED`` regardless of
-    ``turn_count`` so the rollback guard fires.
+    actual review work performed (issue #651). When the raw process log's tail
+    matches a throttle marker AND the session made no tool calls, classify as
+    ``REVIEW_MISS_LAUNCH_FAILED`` so the rollback guard fires.
+
+    The match is against the raw process log tail (last 2048 chars), mirroring
+    the proven stalled-session sweep pattern at the ``log_text =
+    Path(w.log_path).read_text(...)`` call below -- NOT against the parsed
+    assistant analysis text. ``assistant_texts`` is the reviewer's own prose,
+    and this codebase's rate-limit/quota domain means generic markers like
+    "rate limit" / "usage limit" legitimately appear in real review commentary;
+    matching against the analysis text would silently reclassify sessions that
+    did substantial real work, undermining the very #583 budget guard this
+    reclassification protects. The tail boundary isolates the CLI's own death
+    message, and the ``tool_call_count == 0`` guard ensures a session that made
+    any tool calls (real review actions) is never reclassified regardless of
+    what the tail contains.
 
     ``throttle_markers`` defaults to ``RuntimeConfig.throttle_error_markers``
     so the marker list stays config-driven (single point of enforcement in
@@ -1838,21 +1885,37 @@ def _extract_review_session_summary(
         reason = REVIEW_MISS_LAUNCH_FAILED
     elif max_turns > 0 and turn_count >= max_turns:
         reason = REVIEW_MISS_TURN_LIMIT
-    elif match_throttle_tail("\n".join(assistant_texts), markers)[0]:
-        # A session whose only output is a provider session-limit / throttle
-        # notice (e.g. "hit your session limit") gets that notice counted as a
-        # turn by parse_claude_events, so it fails the turn_count == 0 check
-        # above and would fall through to REVIEW_MISS_DIED_MID_SESSION -- the
-        # same bucket as a session that genuinely did substantial review work.
-        # That misclassification silently defeats the #583 throttle-rollback
-        # guard (did_substantial_work reads reason != REVIEW_MISS_LAUNCH_FAILED
-        # and is persisted as review_turn_limit_summary_posted), letting a
-        # global session-limit outage burn a PR's attempt budget with zero
-        # review work performed (issue #651). The notice is environmental, not
-        # a PR-level outcome, so classify it as a launch failure regardless of
-        # turn_count. The turn-limit branch above already owns sessions that
-        # genuinely exhausted their turn budget, so this only intercepts deaths
-        # that occurred before the cap.
+    elif tool_call_count == 0 and _log_tail_throttled(log_path, markers):
+        # A session that made no tool calls but whose raw process log tail
+        # contains a provider session-limit / throttle notice (e.g. "hit your
+        # session limit") died on the notice, not after review work. The notice
+        # gets counted as one turn by parse_claude_events, so it fails the
+        # turn_count == 0 check above and would fall through to
+        # REVIEW_MISS_DIED_MID_SESSION -- the same bucket as a session that
+        # genuinely did substantial review work. That misclassification silently
+        # defeats the #583 throttle-rollback guard (did_substantial_work reads
+        # reason != REVIEW_MISS_LAUNCH_FAILED and is persisted as
+        # review_turn_limit_summary_posted), letting a global session-limit
+        # outage burn a PR's attempt budget with zero review work performed
+        # (issue #651).
+        #
+        # Two boundaries make this safe, both flagged by the #652 review:
+        # (1) Match the RAW PROCESS LOG TAIL (last 2048 chars), not the parsed
+        #     assistant analysis text -- mirroring the proven stalled-session
+        #     sweep pattern at the ``Path(w.log_path).read_text(...)`` call
+        #     below. ``assistant_texts`` is the reviewer's own prose, and this
+        #     codebase's rate-limit/quota domain means generic markers like
+        #     "rate limit" / "usage limit" legitimately appear in real review
+        #     commentary; matching against analysis text would silently
+        #     reclassify sessions that did substantial real work. The tail
+        #     boundary isolates the CLI's own death message.
+        # (2) Guard on ``tool_call_count == 0``: a session that made any tool
+        #     calls did real review actions and is a PR-level outcome
+        #     (died_mid_session) regardless of what its log tail says -- a
+        #     throttle on the final API call after real work is not a launch
+        #     failure. The turn-limit branch above already owns sessions that
+        #     exhausted their turn budget, so this only intercepts deaths that
+        #     occurred before any tool use.
         reason = REVIEW_MISS_LAUNCH_FAILED
     else:
         reason = REVIEW_MISS_DIED_MID_SESSION
