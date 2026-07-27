@@ -211,6 +211,28 @@ def test_resolve_uv_no_sync_config_wins_over_ambient_env(
     assert (value, source) == ("1", "config")
 
 
+def test_resolve_uv_no_sync_ambient_env_survives_without_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an ambient UV_NO_SYNC must be reported even with no .venv.
+
+    sanitize_env() never *pops* an ambient UV_NO_SYNC -- it only skips the
+    setdefault when there's no .venv -- so the value still reaches the child
+    process regardless of .venv presence. A prior version of this function
+    checked the no-venv case before the ambient-env case and incorrectly
+    reported (None, "no-venv") here, understating what the subprocess
+    actually inherited.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.setenv(UV_NO_SYNC_VAR, "1")
+
+    sanitized = sanitize_env(worktree_path)
+    value, source = resolve_uv_no_sync(worktree_path, sanitized, None)
+
+    assert (value, source) == ("1", "env")
+
+
 def test_resolve_uv_no_sync_config_can_force_it_without_a_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

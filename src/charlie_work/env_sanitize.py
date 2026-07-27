@@ -166,11 +166,17 @@ def resolve_uv_no_sync(
     """Return ``(value, source)`` for ``UV_NO_SYNC`` after the same 3-way
     merge described in ``resolve_pytest_cap``.
 
-    ``value`` is ``None`` when ``target_path`` has no ``.venv`` and no
-    override forced one — this reflects the pairing invariant: ``UV_NO_SYNC``
-    is only ever set alongside a real ``.venv`` (see ``sanitize_env``'s
-    docstring for why an unconditional default would be wrong for a worktree
-    that legitimately manages its own venv).
+    ``value`` is ``None`` only when ``target_path`` has no ``.venv``, no
+    override forced one, AND no ambient ``UV_NO_SYNC`` was already exported —
+    the safety-net default is only ever injected alongside a real ``.venv``
+    (see ``sanitize_env``'s docstring for why an unconditional default would
+    be wrong for a worktree that legitimately manages its own venv). But
+    ``sanitize_env`` never *pops* an ambient ``UV_NO_SYNC`` — it only skips
+    the ``setdefault`` when there's no ``.venv`` — so an operator-exported
+    value still reaches the child process regardless of ``.venv``
+    presence. The ambient-env check must therefore run BEFORE the no-venv
+    short-circuit, or this function reports ``None`` while the subprocess
+    actually inherits a real value.
 
     ``source`` adds ``"no-venv"`` to the three values ``resolve_pytest_cap``
     uses, for the case where no value applies at all.
@@ -178,10 +184,10 @@ def resolve_uv_no_sync(
     override = (worker_env_override or {}).get(UV_NO_SYNC_VAR)
     if override is not None:
         return str(override), "config"
-    if not (target_path / ".venv").is_dir():
-        return None, "no-venv"
     if UV_NO_SYNC_VAR in os.environ:
         return sanitized_env[UV_NO_SYNC_VAR], "env"
+    if not (target_path / ".venv").is_dir():
+        return None, "no-venv"
     return sanitized_env.get(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT), "default"
 
 

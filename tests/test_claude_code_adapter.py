@@ -347,6 +347,63 @@ def test_launch_claude_worker_worker_env_pytest_cap_override_wins(
     assert record.uv_no_sync == "0"
 
 
+def test_log_worker_census_emits_alive_worker_with_cap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #646: the per-pass census must actually surface a real alive worker.
+
+    Regression guard against a census that only ever exercises the empty-
+    sessions-dir path (n_alive=0): writes a real sidecar for a genuinely
+    live process (matching pid + process_start_time, like production
+    sidecars) and asserts the emitted INFO line names its worktree, pid,
+    and resolved xdist_cap -- proving `cap` is populated end-to-end rather
+    than silently `None`.
+    """
+    from charlie_work.claude_code import _get_process_start_time
+    from charlie_work.workflow import _log_worker_census
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        start_time = _get_process_start_time(process.pid)
+        assert start_time is not None
+
+        record = ClaudeWorkerRecord(
+            issue_number=646,
+            branch="agent/issue-646-census",
+            worktree_path=str(tmp_path / "worktrees" / "issue-646-census"),
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+            process_start_time=start_time,
+            xdist_cap="2",
+        )
+        (sessions_dir / "issue-646.claude.json").write_text(
+            json.dumps(record.to_dict()), encoding="utf-8"
+        )
+
+        with caplog.at_level("INFO", logger="charlie_work.workflow"):
+            _log_worker_census(sessions_dir)
+
+        [census_record] = [r for r in caplog.records if "worker census" in r.message]
+        assert "n_alive=1" in census_record.message
+        assert f"pid={process.pid}" in census_record.message
+        assert "worktree=" in census_record.message and "issue-646-census" in census_record.message
+        assert "cap=2" in census_record.message
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

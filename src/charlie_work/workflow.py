@@ -3086,12 +3086,15 @@ def _log_worker_census(sessions_dir: Path) -> None:
     it has no "months of accumulated stale sidecar" flooding problem even if
     old sidecars are never pruned from sessions_dir.
 
-    Runs unconditionally every pass (see _loop_body) regardless of how long
-    the orchestrator process itself lives: a one-shot ``charlie fleet work``
-    CLI invocation logs exactly one census line before exiting; a long-lived
-    ``charlie fleet supervise`` logs one per pass. Both answer the diagnostic
-    question above from log content alone -- no need to correlate against a
-    live process list.
+    Called from the top of ``dispatch()`` (see its docstring) -- the one
+    chokepoint every dispatch path funnels through, standalone (`work`/`fleet
+    work`) or supervised (`loop()` -> `_loop_body()` -> `dispatch()`) -- so it
+    runs unconditionally regardless of how long the orchestrator process
+    itself lives: a one-shot ``charlie fleet work`` CLI invocation logs
+    exactly one census line before exiting; a long-lived ``charlie fleet
+    supervise`` logs one per pass. Both answer the diagnostic question above
+    from log content alone -- no need to correlate against a live process
+    list.
     """
     import logging
 
@@ -5176,6 +5179,15 @@ class OrchestratorApp:
         Finding 2). Standalone callers leave this as None and the sweep runs
         inside this call as before.
         """
+        # Issue #646: unconditional census of every alive worker, logged before
+        # any guard below can short-circuit (state lock busy, fleet lock held,
+        # GraphQL budget deferred) -- this is the one chokepoint every dispatch
+        # path funnels through, whether invoked standalone (`work`/`fleet work`)
+        # or from inside a supervised pass (`loop()` -> `_loop_body()` ->
+        # `dispatch()`), so it answers "how many suites were running at <time>,
+        # from which worktrees, at what cap" regardless of which command
+        # launched them. Purely read-only.
+        _log_worker_census(self._resolve(self.config.devin.sessions_dir))
         # Finalize closed ready-labeled issues whose linked PR merged externally.
         # This runs before fleet lock / GraphQL budget / provider throttle guards
         # so a pass that defers new dispatch still drains the Aviator-merge backlog.
@@ -11084,10 +11096,11 @@ class OrchestratorApp:
         # daemon's entire lifetime).
         self.gh.invalidate_list_cache()
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
-        # Issue #646: unconditional per-pass census of every alive worker, so
-        # a box-saturation incident can be diagnosed from logs alone. Purely
-        # read-only — safe to run before the stateful sweeps below.
-        _log_worker_census(sessions_dir)
+        # Issue #646: the worker census now logs from inside dispatch() itself
+        # (the one chokepoint every dispatch path funnels through, including
+        # standalone `work`/`fleet work` which never reach this method) --
+        # see dispatch()'s docstring. Not re-logged here to avoid a duplicate
+        # census line within the same pass.
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
         # The result is handed down to dispatch_rework()/dispatch() below so the
