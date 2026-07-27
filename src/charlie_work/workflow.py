@@ -1709,33 +1709,47 @@ REVIEW_MISS_TURN_LIMIT = "turn_limit_summary_posted"
 REVIEW_MISS_LAUNCH_FAILED = "launch_failed"
 REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
 
-# Default throttle markers for _extract_review_session_summary's session-limit
-# reclassification (issue #651). Mirrors the _DEFAULT_THROTTLE_ERROR_MARKERS
-# pattern in devin_shell.py / claude_code.py: the single source of truth for the
-# marker strings is RuntimeConfig.throttle_error_markers, and callers pass their
-# config's list explicitly so a new provider phrasing only needs a config change.
-_DEFAULT_REVIEW_THROTTLE_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
+# Default markers for _extract_review_session_summary's session-limit
+# reclassification (issue #651/#652). These are the NARROW
+# RuntimeConfig.session_limit_markers, NOT the broad throttle_error_markers:
+# reviewer launches force tee_stream_json=True (claude_code.py), making
+# log_path and events_path byte-identical, so any marker matched against the
+# log tail is also present in the parsed assistant text. The generic markers
+# in throttle_error_markers ("rate limit", "usage limit") legitimately appear
+# in this codebase's rate-limit/quota domain review commentary and would
+# false-positive on real review work. session_limit_markers contains only the
+# CLI's own specific session-limit death message phrasing, which is safe to
+# match against reviewer text. Callers pass their config's list explicitly so
+# a new session-limit phrasing only needs a config change.
+_DEFAULT_REVIEW_SESSION_LIMIT_MARKERS = OrchestratorConfig().runtime.session_limit_markers
 
-# Tail length for the raw-log throttle match in _extract_review_session_summary.
+# Tail length for the raw-log session-limit match in _extract_review_session_summary.
 # Mirrors the 2048-char tail used by the stalled-session sweep (the
 # ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call in
-# _handle_stalled_review_sessions): the CLI prints its session-limit / throttle
-# notice at the very end of the log, so the tail isolates the death message from
-# the multi-turn analysis prose earlier in the log.
+# _handle_stalled_review_sessions): the CLI prints its session-limit notice at
+# the very end of the log, so the tail isolates the death message from the
+# multi-turn analysis prose earlier in the log.
 _REVIEW_THROTTLE_TAIL_CHARS = 2048
 
 
 def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
-    """Return True when the raw process log's tail contains a throttle marker.
+    """Return True when the raw process log's tail contains a session-limit marker.
 
     Reads the last ``_REVIEW_THROTTLE_TAIL_CHARS`` chars of ``log_path`` and
     matches against ``markers`` via ``match_throttle_tail``. This is the same
-    boundary the stalled-session sweep uses (raw log tail, not parsed assistant
-    event text): the throttle notice is the CLI process's own death message
-    printed to its log, while ``assistant_texts`` is the reviewer's analysis
-    prose -- which in this codebase's rate-limit/quota domain legitimately
-    contains generic markers like "rate limit" / "usage limit" (issue #652
-    review). Missing or unreadable logs do not match.
+    raw-log-tail boundary the stalled-session sweep uses (the
+    ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call
+    in ``_handle_stalled_review_sessions``). Missing or unreadable logs do not
+    match.
+
+    Note (issue #652 review): because reviewer launches force
+    ``tee_stream_json=True``, ``log_path`` and ``events_path`` are
+    byte-identical — the raw log tail IS the events content, so matching
+    against the raw tail does NOT avoid matching the reviewer's own parsed
+    assistant text. The false-positive protection comes from the NARROW
+    ``session_limit_markers`` list (specific CLI death-message phrasing, not
+    generic domain terms), not from the raw-vs-parsed distinction. The
+    ``tool_call_count == 0`` guard in the caller is defense-in-depth.
     """
     try:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -1781,7 +1795,7 @@ def _extract_review_session_summary(
     log_path: Path,
     max_turns: int,
     *,
-    throttle_markers: Sequence[str] | None = None,
+    session_limit_markers: Sequence[str] | None = None,
 ) -> ReviewSessionOutcome | None:
     """Summarize and classify a reviewer session that produced no verdict.
 
@@ -1798,8 +1812,8 @@ def _extract_review_session_summary(
     reviewers died on a rejected argv while every signal said "turn limit"
     (issue #588).
 
-    A session whose only output is a provider session-limit / throttle notice
-    (e.g. Claude Code's "hit your session limit") is also environmental, not a
+    A session whose only output is a provider session-limit notice (e.g.
+    Claude Code's "hit your session limit") is also environmental, not a
     PR-level outcome: ``parse_claude_events`` counts that notice as one turn,
     so it fails the ``turn_count == 0`` check and would otherwise fall through
     to ``REVIEW_MISS_DIED_MID_SESSION`` -- the same bucket as a session that
@@ -1809,24 +1823,27 @@ def _extract_review_session_summary(
     ``review_turn_limit_summary_posted``), letting a global session-limit
     outage burn a PR's ``review_dispatch_attempt_count`` budget with zero
     actual review work performed (issue #651). When the raw process log's tail
-    matches a throttle marker AND the session made no tool calls, classify as
-    ``REVIEW_MISS_LAUNCH_FAILED`` so the rollback guard fires.
+    matches a session-limit marker AND the session made no tool calls, classify
+    as ``REVIEW_MISS_LAUNCH_FAILED`` so the rollback guard fires.
 
     The match is against the raw process log tail (last 2048 chars), mirroring
-    the proven stalled-session sweep pattern at the ``log_text =
-    Path(w.log_path).read_text(...)`` call below -- NOT against the parsed
-    assistant analysis text. ``assistant_texts`` is the reviewer's own prose,
-    and this codebase's rate-limit/quota domain means generic markers like
-    "rate limit" / "usage limit" legitimately appear in real review commentary;
-    matching against the analysis text would silently reclassify sessions that
-    did substantial real work, undermining the very #583 budget guard this
-    reclassification protects. The tail boundary isolates the CLI's own death
-    message, and the ``tool_call_count == 0`` guard ensures a session that made
-    any tool calls (real review actions) is never reclassified regardless of
-    what the tail contains.
+    the stalled-session sweep pattern at the ``log_text =
+    Path(w.log_path).read_text(...)`` call below. Because reviewer launches
+    force ``tee_stream_json=True`` (claude_code.py), ``log_path`` and
+    ``events_path`` are byte-identical -- the raw log tail IS the events
+    content, so matching against the raw tail does NOT avoid matching the
+    reviewer's own parsed assistant text (issue #652 review). The
+    false-positive protection comes from the NARROW
+    ``session_limit_markers`` list (specific CLI death-message phrasing like
+    "hit your session limit", NOT generic domain terms like "rate limit" /
+    "usage limit" that legitimately appear in this codebase's rate-limit/quota
+    review commentary), and the ``tool_call_count == 0`` guard ensures a
+    session that made any tool calls (real review actions) is never
+    reclassified regardless of what the tail contains.
 
-    ``throttle_markers`` defaults to ``RuntimeConfig.throttle_error_markers``
-    so the marker list stays config-driven (single point of enforcement in
+    ``session_limit_markers`` defaults to
+    ``RuntimeConfig.session_limit_markers`` so the marker list stays
+    config-driven (single point of enforcement in
     ``throttle_signatures.match_throttle_tail``); callers pass their config's
     list explicitly.
 
@@ -1875,7 +1892,9 @@ def _extract_review_session_summary(
     cost_usd = progress.cost_usd if progress else None
 
     markers = (
-        throttle_markers if throttle_markers is not None else _DEFAULT_REVIEW_THROTTLE_MARKERS
+        session_limit_markers
+        if session_limit_markers is not None
+        else _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS
     )
 
     # A session with no turns and no tool calls never reached its first turn:
@@ -1887,8 +1906,8 @@ def _extract_review_session_summary(
         reason = REVIEW_MISS_TURN_LIMIT
     elif tool_call_count == 0 and _log_tail_throttled(log_path, markers):
         # A session that made no tool calls but whose raw process log tail
-        # contains a provider session-limit / throttle notice (e.g. "hit your
-        # session limit") died on the notice, not after review work. The notice
+        # contains a provider session-limit notice (e.g. "hit your session
+        # limit") died on the notice, not after review work. The notice
         # gets counted as one turn by parse_claude_events, so it fails the
         # turn_count == 0 check above and would fall through to
         # REVIEW_MISS_DIED_MID_SESSION -- the same bucket as a session that
@@ -1899,16 +1918,18 @@ def _extract_review_session_summary(
         # outage burn a PR's attempt budget with zero review work performed
         # (issue #651).
         #
-        # Two boundaries make this safe, both flagged by the #652 review:
-        # (1) Match the RAW PROCESS LOG TAIL (last 2048 chars), not the parsed
-        #     assistant analysis text -- mirroring the proven stalled-session
-        #     sweep pattern at the ``Path(w.log_path).read_text(...)`` call
-        #     below. ``assistant_texts`` is the reviewer's own prose, and this
-        #     codebase's rate-limit/quota domain means generic markers like
-        #     "rate limit" / "usage limit" legitimately appear in real review
-        #     commentary; matching against analysis text would silently
-        #     reclassify sessions that did substantial real work. The tail
-        #     boundary isolates the CLI's own death message.
+        # Two boundaries make this safe (issue #652 review):
+        # (1) Match only the NARROW session_limit_markers (specific CLI
+        #     death-message phrasing like "hit your session limit"), NOT the
+        #     broad throttle_error_markers. Reviewer launches force
+        #     tee_stream_json=True, so log_path and events_path are
+        #     byte-identical -- the raw log tail IS the events content, so
+        #     matching the raw tail does not avoid the reviewer's own parsed
+        #     assistant text. Generic markers ("rate limit", "usage limit")
+        #     legitimately appear in this codebase's rate-limit/quota review
+        #     commentary and would false-positive on real review work. The
+        #     specific session-limit phrasing is the CLI's own death message,
+        #     not a domain term, so it is safe to match against reviewer text.
         # (2) Guard on ``tool_call_count == 0``: a session that made any tool
         #     calls did real review actions and is a PR-level outcome
         #     (died_mid_session) regardless of what its log tail says -- a
@@ -7273,7 +7294,7 @@ class OrchestratorApp:
                         events_path,
                         Path(w.log_path),
                         max_turns,
-                        throttle_markers=self.config.runtime.throttle_error_markers,
+                        session_limit_markers=self.config.runtime.session_limit_markers,
                     )
                     if outcome is not None:
                         try:
