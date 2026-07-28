@@ -16,6 +16,7 @@ from charlie_work import claude_code
 from charlie_work.config import (
     ClaudeCodeConfig,
     OrchestratorConfig,
+    QuotaProbeConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
 )
@@ -28,6 +29,7 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     resolve_review_effort,
+    run_quota_probe,
     update_worker_record_with_failure_classification,
     _apply_model_pin,
     _apply_effort_pin,
@@ -808,6 +810,107 @@ def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert result.ok
     assert calls[0][0] == ["claude", "--version"]
     assert calls[0][1] == tmp_path
+
+
+def _quota_probe_config(**overrides: Any) -> OrchestratorConfig:
+    return OrchestratorConfig(quota_probe=QuotaProbeConfig(**overrides))
+
+
+def test_run_quota_probe_green_returns_true_and_pins_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple] = []
+
+    def fake_run_captured(command, *, cwd, timeout_seconds, shell=False, stdin=None):
+        calls.append((command, cwd, timeout_seconds, stdin))
+        return RunResult(returncode=0, stdout="OK", stderr="")
+
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(claude_code, "run_captured", fake_run_captured)
+
+    config = _quota_probe_config(model="claude-haiku-4-5", timeout_seconds=42, prompt="say OK")
+
+    result = run_quota_probe(repo_root=tmp_path, config=config)
+
+    assert result is True
+    command, cwd, timeout_seconds, stdin = calls[0]
+    assert "--model" in command
+    assert command[command.index("--model") + 1] == "claude-haiku-4-5"
+    assert "--max-turns" in command
+    assert command[command.index("--max-turns") + 1] == "1"
+    assert cwd == tmp_path
+    assert timeout_seconds == 42
+    assert stdin == "say OK"
+
+
+def test_run_quota_probe_nonzero_exit_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=1, stdout="", stderr="boom"),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_quota_exhausted_output_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Issue: exit code 0 with an in-band throttle message must not be
+    # misread as a green probe (mirrors _classify_session_failure's log-tail
+    # handling for a real worker).
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(
+            returncode=0, stdout="daily usage quota has been exhausted", stderr=""
+        ),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_provider_auth_output_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=0, stdout="", stderr="401 unauthorized"),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_custom_throttle_marker_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=0, stdout="custom-throttle-marker seen", stderr=""),
+    )
+
+    config = OrchestratorConfig(
+        quota_probe=QuotaProbeConfig(),
+        runtime=RuntimeConfig(throttle_error_markers=("custom-throttle-marker",)),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=config)
+
+    assert result is False
 
 
 def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
