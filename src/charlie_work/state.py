@@ -592,12 +592,34 @@ def is_throttled(data: dict[str, Any]) -> bool:
         return False
 
 
-def set_throttled_until(data: dict[str, Any], throttled_until: str) -> dict[str, Any]:
+def set_throttled_until(
+    data: dict[str, Any],
+    throttled_until: str,
+    *,
+    reason: str | None = None,
+    adapter_kind: str | None = None,
+) -> dict[str, Any]:
     """Set the provider throttle cooldown window.
+
+    ``reason`` (a ``_classify_session_failure`` failure_kind -- e.g.
+    "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
+    (the adapter whose session hit the throttle) are recorded alongside the
+    cooldown so a later quota-probe decision (``clear_quota_throttles``) can
+    tell a self-healing rate limit from a dead credential that must not be
+    cleared early, and can tell whether an ambient-CLI probe actually
+    exercises the provider that was throttled. Both default to None so
+    call sites that have not been updated to pass them keep working; a
+    throttle with an unset reason/adapter_kind is treated as
+    claude-code-shaped (the common case) by ``clear_quota_throttles``.
 
     Returns a new state dict with throttled_until set; does not mutate ``data``.
     """
-    return {**data, "throttled_until": throttled_until}
+    return {
+        **data,
+        "throttled_until": throttled_until,
+        "throttle_reason": reason,
+        "throttle_adapter_kind": adapter_kind,
+    }
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
@@ -681,3 +703,150 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     quota.pop("probe_after", None)
     quota.pop("alerted_at", None)
     return {**data, "reviewer_quota": quota}
+
+
+def _quota_probe(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the quota-probe scheduling sub-dict from ``data``.
+
+    Distinct from ``reviewer_quota``: this tracks the flat-interval probe
+    mechanism itself (claude_code.run_quota_probe's schedule), not either
+    throttle it checks up on. Ensures a mutable copy so callers can build new
+    state without mutating the original ``data``.
+    """
+    probe = data.get("quota_probe")
+    if not isinstance(probe, dict):
+        return {}
+    return dict(probe)
+
+
+def is_quota_probe_armed(data: dict[str, Any]) -> bool:
+    """True once a next-probe timestamp has been scheduled.
+
+    Callers arm the probe (``arm_quota_probe``) the first pass a throttle
+    indicator is observed, without probing that same pass, so the first
+    real probe attempt happens roughly ``interval_minutes`` after onset
+    rather than instantly.
+    """
+    return bool(_quota_probe(data).get("next_probe_at"))
+
+
+def is_quota_probe_due(data: dict[str, Any]) -> bool:
+    """True when an armed probe's wait interval has elapsed.
+
+    False (not True) when unarmed -- an absent schedule means "not armed
+    yet", which callers handle by arming rather than probing immediately;
+    see ``is_quota_probe_armed``. Malformed timestamps are treated as due,
+    so a corrupt value cannot wedge probing off forever.
+    """
+    next_at = _quota_probe(data).get("next_probe_at")
+    if not next_at:
+        return False
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_quota_probe(data: dict[str, Any], next_probe_at: str) -> dict[str, Any]:
+    """Schedule the next quota-probe attempt.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    probe = _quota_probe(data)
+    probe["next_probe_at"] = next_probe_at
+    return {**data, "quota_probe": probe}
+
+
+def disarm_quota_probe(data: dict[str, Any]) -> dict[str, Any]:
+    """Clear the scheduled next-probe timestamp.
+
+    Called both when a probe succeeds (so the next exhaustion episode arms
+    fresh instead of reusing a stale timestamp) and when no throttle
+    indicator is active any more (the cooldown expired naturally before a
+    probe fired). Returns a new state dict; does not mutate ``data``.
+    """
+    probe = _quota_probe(data)
+    if not probe:
+        return data
+    probe.pop("next_probe_at", None)
+    return {**data, "quota_probe": probe}
+
+
+def any_quota_exhausted_indicator(data: dict[str, Any]) -> bool:
+    """True when either throttle mechanism is currently active.
+
+    The general/root throttle (``is_throttled``) and the reviewer-specific
+    quota throttle (``is_reviewer_quota_exhausted``) are the two places a
+    provider quota/rate-limit/auth exhaustion is recorded. General-purpose
+    "is anything throttled" check; see ``is_quota_probe_actionable`` for the
+    narrower gate the flat-interval probe itself uses.
+    """
+    return is_throttled(data) or is_reviewer_quota_exhausted(data)
+
+
+def _root_throttle_is_claude_code_shaped(data: dict[str, Any]) -> bool:
+    """True when the root throttle, if any, is one an ambient CLI probe speaks to.
+
+    Excludes a ``provider_auth`` cooldown (a dead credential does not
+    self-heal in minutes -- see claude_code._classify_session_failure) and
+    excludes any adapter other than claude-code (devin uses a different tool
+    entirely; the api adapter routes through a separately configured
+    provider base_url/key, not the account an operator manually switches).
+    ``None`` adapter_kind is included for backward compatibility with
+    throttles set before ``throttle_adapter_kind`` existed.
+    """
+    return data.get("throttle_reason") != "provider_auth" and data.get(
+        "throttle_adapter_kind"
+    ) in (None, "claude-code")
+
+
+def is_quota_probe_actionable(data: dict[str, Any]) -> bool:
+    """True when a green ambient-CLI probe could actually clear something.
+
+    Narrower than ``any_quota_exhausted_indicator``: mirrors exactly the
+    condition ``clear_quota_throttles`` acts on, so arming/running the flat
+    probe is impossible unless a green result would change state. Reviewer
+    quota exhaustion always qualifies (always set from a Claude-family
+    reviewer launch, never from the provider-auth pattern -- see
+    dispatch_reviews); the root throttle qualifies only when it is
+    claude-code-shaped. A devin/api-adapter or provider_auth-reasoned root
+    throttle would survive a green probe untouched (see
+    ``clear_quota_throttles``), so probing for one would just burn Haiku
+    sessions every ``interval_minutes`` for the whole cooldown window
+    without ever being able to help -- this is the gate that prevents that.
+    """
+    if is_reviewer_quota_exhausted(data):
+        return True
+    return is_throttled(data) and _root_throttle_is_claude_code_shaped(data)
+
+
+def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
+    """Clear throttle state after a green quota probe.
+
+    A green probe (a cheap ambient-CLI Haiku session that completed without
+    hitting a throttle/auth signature) proves the Claude Code CLI's own
+    ambient auth/quota has recovered -- e.g. the operator switched to a
+    different subscription account. That is exactly the condition
+    ``is_quota_probe_actionable`` gates on, which callers are expected to
+    check before running a probe at all -- see that function's docstring
+    for what is and is not cleared here and why.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    cleared = data
+    if _root_throttle_is_claude_code_shaped(data):
+        cleared = {
+            **cleared,
+            "throttled_until": None,
+            "throttle_reason": None,
+            "throttle_adapter_kind": None,
+        }
+    cleared = clear_reviewer_quota(cleared)
+    reviewer_quota = cleared.get("reviewer_quota")
+    if reviewer_quota:
+        cleared = {
+            **cleared,
+            "reviewer_quota": {**reviewer_quota, "consecutive_probe_failures": 0},
+        }
+    return cleared
