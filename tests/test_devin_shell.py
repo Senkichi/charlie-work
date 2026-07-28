@@ -1826,6 +1826,52 @@ def test_update_session_record_with_failure_classification_includes_resume_margi
     assert abs((parsed - expected).total_seconds()) < 1
 
 
+def test_update_session_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Sibling of the claude_code.py regression test -- same fix, devin adapter.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
+
+
 def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
     """Test that already-classified records are not re-classified."""
     sessions_dir = tmp_path / "sessions"

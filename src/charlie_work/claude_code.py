@@ -821,6 +821,53 @@ def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> t
     return tuple(filtered) + ("--max-turns", str(max_turns))
 
 
+def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
+    """Run a single, cheap, read-only Haiku-model CLI call to check whether an
+    active quota/rate-limit throttle has actually recovered (e.g. an operator
+    switched the ambient Claude Code CLI to a different subscription
+    account).
+
+    Deliberately NOT ``launch_claude_worker``: no worktree, no branch, no
+    sidecar, no Popen -- this is a single bounded, synchronous subprocess via
+    ``subprocess_runner.run_captured``, mirroring how other short-lived,
+    timeout-bounded external calls in this codebase are made (CLAUDE.md's
+    non-blocking-adapter invariant applies to worker/reviewer dispatch, not
+    to a deliberate, bounded health-check call like this one). Runs in
+    ``repo_root`` itself -- never mutates it: reuses ``_REVIEW_COMMAND_TEMPLATE``
+    (``--permission-mode plan``) capped to a single turn, so it is read-only
+    and cheap regardless of what the probe prompt asks.
+
+    Returns True ("green") only when the process exits 0 AND its combined
+    stdout+stderr shows no quota/auth/rate-limit throttle signature --
+    reusing the exact patterns ``_classify_session_failure`` applies to a
+    real worker's log tail (single point of enforcement, PR #262 findings
+    F1/F5) so a session that exits 0 with an embedded, in-band throttle
+    message is never misread as recovery. Never raises: ``run_captured``
+    already converts timeouts, missing binaries, and non-zero exits into a
+    ``RunResult`` value.
+    """
+    probe = config.quota_probe
+    command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
+    command = _apply_max_turns_pin(command, 1)
+    command = (resolve_cli_binary(command[0]), *command[1:])
+    result = run_captured(
+        list(command),
+        cwd=repo_root,
+        timeout_seconds=probe.timeout_seconds,
+        stdin=probe.prompt,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    tail = combined[-2048:] if len(combined) > 2048 else combined
+    if _PROVIDER_AUTH_PATTERN.search(tail):
+        return False
+    if _QUOTA_EXHAUSTED_PATTERN.search(tail):
+        return False
+    matched, _reset_minutes = match_throttle_tail(tail, config.runtime.throttle_error_markers)
+    if matched:
+        return False
+    return result.ok
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,
@@ -1465,6 +1512,7 @@ def update_worker_record_with_failure_classification(
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
+    session_completed: bool = False,
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1483,6 +1531,24 @@ def update_worker_record_with_failure_classification(
     classified as such even when the caller only knows "this looked stalled"
     — otherwise ``throttled_until`` never gets set and dispatch keeps
     relaunching workers into the same limit.
+
+    ``session_completed`` (issue #656): when the caller has already confirmed
+    via worktree inspection that this session produced complete, committable
+    work, log-tail classification is skipped entirely and ``fallback_kind`` is
+    used directly. A session that finished real work cannot also have been
+    killed by a provider quota/rate-limit/auth failure — that's ground truth,
+    not a heuristic — so there is no need to search its log tail at all.
+    Without this, the marker search treats the worker's own final-turn
+    completion summary (ordinary Claude Code CLI behavior — nearly every
+    session ends with a natural-language write-up) as fair game, and generic
+    markers like "usage limit" / "rate limit" false-positive on legitimate
+    prose about this codebase's own rate-limit/quota domain. Observed live
+    2026-07-27: a rework session for issue #651 (the bug about this exact
+    false-positive class in the *reviewer* path, fixed by #652) quoted its own
+    fix's marker examples in its completion summary and was reclassified
+    quota_exhausted, setting a fleet-wide 24h dispatch throttle despite having
+    finished cleanly — the same failure mode #652 fixed for reviewers, just in
+    the sibling worker-classification path #652 didn't touch.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
@@ -1515,7 +1581,7 @@ def update_worker_record_with_failure_classification(
 
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path")
+    log_path_str = payload.get("log_path") if not session_completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers

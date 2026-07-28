@@ -75,6 +75,12 @@ class DriftItem:
     # pr_status_normalized) -- None means "clear the status key" for those
     # kinds, and is simply unused (not "clear") for every other kind.
     new_status: str | None = None
+    # set_throttled_until's reason/adapter_kind for a provider_throttle_detected
+    # item -- carried as fields rather than parsed back out of fix_actions so
+    # apply_fixes can thread them through exactly as detect_drift computed them.
+    # Unused by every other kind.
+    throttle_reason: str | None = None
+    throttle_adapter_kind: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -624,6 +630,13 @@ def detect_drift(
                     # for diagnostics. For non-completed sessions, preserve the original
                     # ordering so worker_blocked still escalates.
                     if is_completed:
+                        # session_completed=True (issue #656): the worktree
+                        # inspection just above is ground truth this session
+                        # produced real, committable work -- skip log-tail
+                        # marker matching entirely rather than let it treat
+                        # the session's own completion-summary prose as a
+                        # provider-throttle signature. See claude_code.
+                        # update_worker_record_with_failure_classification.
                         if w.adapter_kind == "devin":
                             failure_kind, throttled_until = (
                                 update_session_record_with_failure_classification(
@@ -631,6 +644,7 @@ def detect_drift(
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
+                                    session_completed=True,
                                 )
                             )
                         elif w.adapter_kind == "claude-code":
@@ -640,6 +654,7 @@ def detect_drift(
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
+                                    session_completed=True,
                                 )
                             )
                         elif w.adapter_kind == "api":
@@ -650,6 +665,7 @@ def detect_drift(
                                     fallback_kind="unpublished_work",
                                     config=config,
                                     adapter_kind="api",
+                                    session_completed=True,
                                 )
                             )
                         else:
@@ -706,6 +722,8 @@ def detect_drift(
                                     f"{failure_kind}, throttling until {throttled_until}"
                                 ),
                                 fix_actions=(f"set throttled_until={throttled_until}",),
+                                throttle_reason=failure_kind,
+                                throttle_adapter_kind=w.adapter_kind,
                             )
                         )
 
@@ -1484,7 +1502,12 @@ def apply_fixes(
             for action in item.fix_actions:
                 if action.startswith("set throttled_until="):
                     throttled_until = action.split("=", 1)[1]
-                    new_state = set_throttled_until(new_state, throttled_until)
+                    new_state = set_throttled_until(
+                        new_state,
+                        throttled_until,
+                        reason=item.throttle_reason,
+                        adapter_kind=item.throttle_adapter_kind,
+                    )
                     break
 
         elif item.kind == "session_failed_escalated":

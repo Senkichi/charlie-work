@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Callable
 
 from . import fleet_registry, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
+from .safe_path import contains
 from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
 
@@ -314,9 +315,7 @@ def _find_venv_path(repo_root: Path) -> Path | None:
     virtual_env = os.environ.get("VIRTUAL_ENV")
     if virtual_env:
         candidate = Path(virtual_env).resolve()
-        if _is_venv(candidate) and (
-            candidate == repo_venv or candidate.is_relative_to(repo_root.resolve())
-        ):
+        if _is_venv(candidate) and contains(repo_root, candidate):
             return candidate
     if _is_venv(repo_venv):
         return repo_venv

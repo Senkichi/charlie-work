@@ -867,6 +867,11 @@ def test_detect_drift_provider_throttle_detected_with_repo_root(tmp_path: Path) 
     assert throttle_drift[0].issue_number == 42
     assert "rate_limited" in throttle_drift[0].detail
     assert "throttled_until" in throttle_drift[0].fix_actions[0]
+    # Regression: reason/adapter_kind must survive on the DriftItem itself
+    # (not just embedded in the detail string) so apply_fixes can thread them
+    # into set_throttled_until -- see test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind.
+    assert throttle_drift[0].throttle_reason == "rate_limited"
+    assert throttle_drift[0].throttle_adapter_kind == "devin"
 
 
 def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
@@ -897,6 +902,38 @@ def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
     assert new_state.get("throttled_until") == throttled_until
     # Original state should be unchanged
     assert state.get("throttled_until") is None
+
+
+def test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind() -> None:
+    """A ``provider_throttle_detected`` drift item's reason/adapter_kind must
+    reach ``set_throttled_until`` -- otherwise ``clear_quota_throttles``
+    treats a devin/provider_auth throttle applied via ``reconcile --fix`` as
+    claude-code-shaped (the field-unset default) and a later green ambient-CLI
+    probe wrongly clears a throttle it never actually tested."""
+    from datetime import UTC, datetime, timedelta
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    throttled_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    drift = [
+        DriftItem(
+            kind="provider_throttle_detected",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died with provider_auth",
+            fix_actions=(f"set throttled_until={throttled_until}",),
+            throttle_reason="provider_auth",
+            throttle_adapter_kind="devin",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state.get("throttled_until") == throttled_until
+    assert new_state.get("throttle_reason") == "provider_auth"
+    assert new_state.get("throttle_adapter_kind") == "devin"
 
 
 def test_detect_drift_without_repo_root_skips_session_check() -> None:
@@ -2134,6 +2171,132 @@ def _write_dead_session_sidecar(
     sidecar_path = sessions_dir / f"issue-{issue_number}.json"
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
     (sessions_dir / f"issue-{issue_number}.claude.json").unlink(missing_ok=True)
+
+
+# Adapter-kind -> sidecar filename suffix. Mirrors claude_code._ADAPTER_SIDECAR_SUFFIXES
+# without importing it (keeps the test's failure surface independent of the adapter).
+_ADAPTER_SIDECAR_SUFFIX = {"devin": "", "claude-code": ".claude", "api": ".api"}
+
+
+def _write_dead_session_sidecar_for_adapter(
+    sessions_dir: Path,
+    issue_number: int,
+    branch: str,
+    worktree_path: Path,
+    adapter_kind: str,
+    log_text: str,
+) -> Path:
+    """Write a dead-session sidecar for any adapter kind, plus its log file.
+
+    Unlike ``_write_dead_session_sidecar`` (devin-only, no log content), this
+    also writes the log file with ``log_text`` so log-tail classification has
+    real bytes to match against -- required for issue #656 regression coverage
+    where the log must carry a throttle marker that *would* reclassify a
+    non-completed session.
+    """
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    suffix = _ADAPTER_SIDECAR_SUFFIX[adapter_kind]
+    sidecar_path = sessions_dir / f"issue-{issue_number}{suffix}.json"
+    if adapter_kind == "devin":
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path="/tmp/prompt.md",
+            command=("devin", "--prompt-file", "/tmp/prompt.md"),
+            pid=None,
+            started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            log_path=str(log_path),
+            error=None,
+        )
+        sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    else:
+        # claude-code / api share the ClaudeWorkerRecord on-disk shape; the
+        # ``adapter_kind`` field disambiguates them (worker._from_claude_record
+        # honors it so api sidecars surface as adapter_kind=="api").
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "worktree_path": str(worktree_path),
+                    "prompt_path": "/tmp/prompt.md",
+                    "command": ["claude", "-p"],
+                    "pid": None,
+                    "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "adapter_kind": adapter_kind,
+                }
+            ),
+            encoding="utf-8",
+        )
+    return sidecar_path
+
+
+@pytest.mark.parametrize("adapter_kind", ["devin", "claude-code", "api"])
+def test_detect_drift_completed_worktree_skips_log_tail_throttle_classification(
+    tmp_path: Path, adapter_kind: str
+) -> None:
+    """Issue #656 regression: a completed worktree's log-tail throttle markers
+    must NOT emit ``provider_throttle_detected`` drift.
+
+    This guards the three ``session_completed=True`` call sites in
+    ``reconcile.detect_drift`` (one per adapter kind). The log file is seeded
+    with ``"usage limit"`` -- a ``_QUOTA_EXHAUSTED_PATTERN`` substring that, if
+    log-tail classification ran, would return ``quota_exhausted`` plus a 24h
+    ``throttled_until`` and emit a ``provider_throttle_detected`` drift item.
+    The worktree inspection is ground truth the session completed, so
+    ``session_completed=True`` must skip log-tail matching entirely.
+
+    If ``session_completed=True`` is silently dropped from any of the three
+    call sites, this test fails: a ``provider_throttle_detected`` drift item
+    appears and the salvage drift (which proves the is_completed lane was
+    taken) is shadowed by the throttle.
+    """
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 656
+    worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    # Log tail that quotes a throttle marker in legitimate completion prose --
+    # the exact false-positive shape observed live 2026-07-27.
+    _write_dead_session_sidecar_for_adapter(
+        sessions_dir,
+        issue_number,
+        branch,
+        worktree_path,
+        adapter_kind,
+        log_text=(
+            '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") '
+            "that legitimately appear in this codebase's rate-limit/quota domain.\n"
+        ),
+    )
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config, repo_root=repo_root)
+
+    # The is_completed lane was taken: salvage drift is emitted.
+    salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == issue_number
+
+    # The throttle must NOT fire despite the "usage limit" marker in the log --
+    # session_completed=True skipped log-tail classification entirely.
+    throttle = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert not throttle, (
+        f"completed {adapter_kind} session was reclassified from log tail despite "
+        f"session_completed=True (issue #656 regression): {throttle}"
+    )
 
 
 def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> None:

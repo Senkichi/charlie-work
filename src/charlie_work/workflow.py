@@ -30,6 +30,7 @@ from .claude_code import (
     launch_claude_worker,
     parse_claude_events,
     resolve_review_effort,
+    run_quota_probe,
 )
 from .checks import CheckSummary, summarize_checks
 from .config import (
@@ -103,8 +104,14 @@ from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
+    arm_quota_probe,
+    clear_quota_throttles,
     clear_reviewer_quota,
+    disarm_quota_probe,
     is_claim_stale,
+    is_quota_probe_actionable,
+    is_quota_probe_armed,
+    is_quota_probe_due,
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
@@ -1061,7 +1068,12 @@ def _detect_and_handle_stalled_sessions(
                         update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
                         with state_lock(state_file):
                             state = load_state(state_file)
-                            state = set_throttled_until(state, defer_until)
+                            state = set_throttled_until(
+                                state,
+                                defer_until,
+                                reason="rate_limited",
+                                adapter_kind=w.adapter_kind,
+                            )
                             state = append_event(
                                 state,
                                 "session_rate_limit_deferred",
@@ -1145,7 +1157,12 @@ def _detect_and_handle_stalled_sessions(
                 # relaunching into the same provider rate limit/quota window.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=resolved_failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Log the event
@@ -3839,7 +3856,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # relaunches straight into the same throttled provider.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             if (
@@ -3979,6 +4001,12 @@ def _classify_dead_sessions_and_update_throttle_state(
             # is already set). For non-completed sessions, preserve the original
             # ordering so worker_blocked still escalates.
             if is_completed:
+                # session_completed=True (issue #656): the worktree inspection
+                # just above is ground truth that this session produced real,
+                # committable work -- it cannot also have died to a provider
+                # quota/rate-limit/auth failure, so log-tail marker matching
+                # (which would otherwise treat the session's own completion
+                # summary prose as fair game) is skipped entirely.
                 if w.adapter_kind == "devin":
                     failure_kind, throttled_until = (
                         update_session_record_with_failure_classification(
@@ -3986,6 +4014,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -3995,6 +4024,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4005,6 +4035,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             adapter_kind="api",
+                            session_completed=True,
                         )
                     )
                 else:
@@ -4050,7 +4081,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # Update state with throttle window
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
@@ -11289,6 +11325,91 @@ class OrchestratorApp:
             )
             return result
 
+    def _maybe_probe_quota_recovery(self) -> None:
+        """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
+
+        Runs every loop pass but is a near-no-op unless a throttle that a
+        green ambient-CLI probe could actually clear is currently active
+        (``is_quota_probe_actionable``) -- an operator switching to a
+        different subscription account can make a provider's quota recover
+        well before a blanket cooldown (e.g. the 24h
+        ``_DEFAULT_QUOTA_COOLDOWN_HOURS`` window) elapses, and there was
+        previously no way to detect that early. Deliberately a *flat*
+        ``quota_probe.interval_minutes`` schedule (not exponential backoff
+        like ``reviewer_quota.probe_after``): the user asked for a fixed
+        15-minute recheck, not a growing wait.
+
+        The gate is narrower than "any throttle indicator" -- a devin/api
+        adapter throttle or a provider_auth cooldown would survive
+        ``clear_quota_throttles`` untouched even on a green probe (see that
+        function), so arming/probing for one would just burn Haiku sessions
+        every interval for no possible benefit. Because of this, a green
+        probe reaching the success branch below is guaranteed to have
+        something to clear -- no post-hoc check needed there.
+
+        Two-phase lock pattern so the (possibly tens-of-seconds) subprocess
+        call in ``run_quota_probe`` never holds ``state_lock`` and blocks
+        every other state read/writer in the process:
+          1. Under the lock: decide whether to probe at all, and if not,
+             arm/disarm/return without calling out to the CLI.
+          2. Outside the lock: run the actual probe subprocess.
+          3. Under the lock again: re-read state (it may have changed while
+             unlocked) and apply the outcome.
+        """
+        if not self.config.quota_probe.enabled:
+            return
+
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                if is_quota_probe_armed(state):
+                    state = disarm_quota_probe(state)
+                    save_state(state_file, state)
+                return
+            if not is_quota_probe_armed(state):
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                save_state(state_file, state)
+                return
+            if not is_quota_probe_due(state):
+                return
+
+        probe_ok = run_quota_probe(repo_root=self.repo_root, config=self.config)
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                # Cleared or became non-actionable while the probe ran unlocked.
+                state = disarm_quota_probe(state)
+                save_state(state_file, state)
+                return
+            if probe_ok:
+                state = clear_quota_throttles(state)
+                state = disarm_quota_probe(state)
+                state = self._record_event(state, "quota_probe_succeeded", {})
+            else:
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                state = self._record_event(state, "quota_probe_failed", {})
+            save_state(state_file, state)
+
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
@@ -11340,6 +11461,10 @@ class OrchestratorApp:
             self.config,
             persist_inconclusive_probe_counter=False,
         )
+
+        # Flat-interval Haiku probe for early quota/rate-limit recovery (see
+        # docstring): only does real work when a throttle indicator is active.
+        self._maybe_probe_quota_recovery()
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills

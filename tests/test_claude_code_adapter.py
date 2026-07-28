@@ -16,6 +16,7 @@ from charlie_work import claude_code
 from charlie_work.config import (
     ClaudeCodeConfig,
     OrchestratorConfig,
+    QuotaProbeConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
 )
@@ -28,6 +29,7 @@ from charlie_work.claude_code import (
     probe_claude,
     read_worker_records,
     resolve_review_effort,
+    run_quota_probe,
     update_worker_record_with_failure_classification,
     _apply_model_pin,
     _apply_effort_pin,
@@ -810,6 +812,107 @@ def test_probe_claude_uses_run_captured(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert calls[0][1] == tmp_path
 
 
+def _quota_probe_config(**overrides: Any) -> OrchestratorConfig:
+    return OrchestratorConfig(quota_probe=QuotaProbeConfig(**overrides))
+
+
+def test_run_quota_probe_green_returns_true_and_pins_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple] = []
+
+    def fake_run_captured(command, *, cwd, timeout_seconds, shell=False, stdin=None):
+        calls.append((command, cwd, timeout_seconds, stdin))
+        return RunResult(returncode=0, stdout="OK", stderr="")
+
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(claude_code, "run_captured", fake_run_captured)
+
+    config = _quota_probe_config(model="claude-haiku-4-5", timeout_seconds=42, prompt="say OK")
+
+    result = run_quota_probe(repo_root=tmp_path, config=config)
+
+    assert result is True
+    command, cwd, timeout_seconds, stdin = calls[0]
+    assert "--model" in command
+    assert command[command.index("--model") + 1] == "claude-haiku-4-5"
+    assert "--max-turns" in command
+    assert command[command.index("--max-turns") + 1] == "1"
+    assert cwd == tmp_path
+    assert timeout_seconds == 42
+    assert stdin == "say OK"
+
+
+def test_run_quota_probe_nonzero_exit_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=1, stdout="", stderr="boom"),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_quota_exhausted_output_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Issue: exit code 0 with an in-band throttle message must not be
+    # misread as a green probe (mirrors _classify_session_failure's log-tail
+    # handling for a real worker).
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(
+            returncode=0, stdout="daily usage quota has been exhausted", stderr=""
+        ),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_provider_auth_output_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=0, stdout="", stderr="401 unauthorized"),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=_quota_probe_config())
+
+    assert result is False
+
+
+def test_run_quota_probe_custom_throttle_marker_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
+    monkeypatch.setattr(
+        claude_code,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=0, stdout="custom-throttle-marker seen", stderr=""),
+    )
+
+    config = OrchestratorConfig(
+        quota_probe=QuotaProbeConfig(),
+        runtime=RuntimeConfig(throttle_error_markers=("custom-throttle-marker",)),
+    )
+
+    result = run_quota_probe(repo_root=tmp_path, config=config)
+
+    assert result is False
+
+
 def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
     """Mirror of test_is_session_alive_reflects_real_process from test_devin_shell.py."""
     # Spawn a short-lived process
@@ -1254,6 +1357,59 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
     expected = now + timedelta(minutes=5, seconds=90)
     assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_update_worker_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Reproduces the live incident: a worker's completion summary quoted the
+    throttle-marker text ("usage limit") while describing an unrelated fix,
+    and log-tail classification stomped the caller's ``fallback_kind`` with
+    ``quota_exhausted`` despite the worktree proving the work completed.
+    ``session_completed=True`` must skip log-tail classification entirely.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Completion summary prose that happens to quote a throttle marker while
+    # describing an unrelated fix -- not an actual provider death message.
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n"
+        "- `ruff check` + `ruff format`: clean\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
 
 
 def _make_worker_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:

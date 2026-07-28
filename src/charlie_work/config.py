@@ -235,6 +235,41 @@ class ReviewConfig:
 
 
 @dataclass(frozen=True)
+class QuotaProbeConfig:
+    # Issue TBD: a blanket provider-throttle cooldown (claude_code.py's
+    # _DEFAULT_QUOTA_COOLDOWN_HOURS, 24h) can badly outlive the real-world
+    # constraint that caused it -- an operator can switch the ambient Claude
+    # Code CLI to a different subscription account well before the cooldown
+    # expires. When enabled, the supervisor periodically fires a single,
+    # cheap, read-only Haiku-model CLI call (claude_code.run_quota_probe) and
+    # clears the throttle early on a green result, instead of always riding
+    # out the full cooldown window. False disables probing entirely -- the
+    # cooldown then behaves exactly as before this feature existed.
+    enabled: bool = True
+    # Flat retry interval, NOT exponential backoff (deliberately distinct
+    # from review_dispatch's quota_probe_interval_minutes below, which
+    # doubles on each consecutive failure). The probe is cheap enough that a
+    # fixed 15-minute cadence for the lifetime of the throttle is acceptable,
+    # and a flat interval is simpler to reason about for "did my account
+    # switch get picked up yet".
+    interval_minutes: int = 15
+    # Short alias form (matches ClaudeCodeConfig.model's convention), pinned
+    # explicitly via --model so the probe never inherits ambient /model
+    # state -- see ClaudeCodeConfig.model's comment for the outage this
+    # guards against. A dedicated Haiku pin (distinct from claude_code.model)
+    # keeps the probe cheap regardless of what model workers/reviewers use.
+    model: str = "claude-haiku-4-5"
+    # Bounded synchronous subprocess timeout. A single "reply OK" prompt
+    # should return in well under a minute; this is a ceiling against a hung
+    # CLI process, not an expected duration.
+    timeout_seconds: int = 60
+    # Deliberately trivial: the probe only needs to prove the CLI can
+    # complete a session without hitting a throttle/auth signature, not
+    # produce any real work.
+    prompt: str = "Reply with the single word OK and nothing else."
+
+
+@dataclass(frozen=True)
 class ReviewDispatchConfig:
     # Issue #370: concurrent reviewer launcher for queued PRs. This is a
     # deterministic loop stage, not a provider governor; reviewers use
@@ -1144,6 +1179,7 @@ class OrchestratorConfig:
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
+    quota_probe: QuotaProbeConfig = field(default_factory=QuotaProbeConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -1385,6 +1421,52 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             "treatment effort string (e.g. 'high') before enabling the experiment"
         )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
+    quota_probe_data = _section(data, "quota_probe")
+    qp_enabled = quota_probe_data.get("enabled")
+    if qp_enabled is not None and not isinstance(qp_enabled, bool):
+        raise ConfigError(
+            f"config section 'quota_probe' key 'enabled' must be a bool, "
+            f"got {type(qp_enabled).__name__}"
+        )
+    qp_interval = quota_probe_data.get("interval_minutes")
+    if qp_interval is not None and (
+        isinstance(qp_interval, bool) or not isinstance(qp_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'quota_probe' key 'interval_minutes' must be an int, "
+            f"got {type(qp_interval).__name__}"
+        )
+    if qp_interval is not None and qp_interval < 1:
+        raise ConfigError(
+            f"config section 'quota_probe' key 'interval_minutes' must be >= 1, got {qp_interval}"
+        )
+    qp_model = quota_probe_data.get("model")
+    if qp_model is not None and not isinstance(qp_model, str):
+        raise ConfigError(
+            f"config section 'quota_probe' key 'model' must be a string, got {type(qp_model).__name__}"
+        )
+    if qp_model is not None and not qp_model.strip():
+        raise ConfigError("config section 'quota_probe' key 'model' must not be empty")
+    qp_timeout = quota_probe_data.get("timeout_seconds")
+    if qp_timeout is not None and (
+        isinstance(qp_timeout, bool) or not isinstance(qp_timeout, int)
+    ):
+        raise ConfigError(
+            "config section 'quota_probe' key 'timeout_seconds' must be an int, "
+            f"got {type(qp_timeout).__name__}"
+        )
+    if qp_timeout is not None and qp_timeout < 1:
+        raise ConfigError(
+            f"config section 'quota_probe' key 'timeout_seconds' must be >= 1, got {qp_timeout}"
+        )
+    qp_prompt = quota_probe_data.get("prompt")
+    if qp_prompt is not None and not isinstance(qp_prompt, str):
+        raise ConfigError(
+            f"config section 'quota_probe' key 'prompt' must be a string, got {type(qp_prompt).__name__}"
+        )
+    if qp_prompt is not None and not qp_prompt.strip():
+        raise ConfigError("config section 'quota_probe' key 'prompt' must not be empty")
+    quota_probe = _build_section(QuotaProbeConfig, "quota_probe", quota_probe_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -2127,6 +2209,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         dispatch=dispatch,
         review=review,
         review_dispatch=review_dispatch,
+        quota_probe=quota_probe,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
