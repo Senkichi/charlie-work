@@ -199,6 +199,81 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.max_local_review_processes == 4
 
 
+def test_load_config_quota_probe_defaults() -> None:
+    """QuotaProbeConfig defaults: enabled, flat 15-minute interval, Haiku."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.quota_probe.enabled is True
+    assert config.quota_probe.interval_minutes == 15
+    assert config.quota_probe.model == "claude-haiku-4-5"
+    assert config.quota_probe.timeout_seconds == 60
+    assert config.quota_probe.prompt
+
+
+def test_load_config_quota_probe_override(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """quota_probe:
+  enabled: false
+  interval_minutes: 30
+  model: claude-haiku-custom
+  timeout_seconds: 20
+  prompt: "ping"
+""",
+    )
+    config = load_config(config_file)
+    assert config.quota_probe.enabled is False
+    assert config.quota_probe.interval_minutes == 30
+    assert config.quota_probe.model == "claude-haiku-custom"
+    assert config.quota_probe.timeout_seconds == 20
+    assert config.quota_probe.prompt == "ping"
+
+
+def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "quota_probe:\n  enabled: not-a-bool\n")
+    with pytest.raises(ConfigError, match="quota_probe.*enabled.*must be a bool"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_load_config_quota_probe_interval_minutes_rejects_non_positive(
+    tmp_path: Path, value: int
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, f"quota_probe:\n  interval_minutes: {value}\n")
+    with pytest.raises(ConfigError, match="quota_probe.*interval_minutes.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_quota_probe_interval_minutes_rejects_non_int(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "quota_probe:\n  interval_minutes: '15'\n")
+    with pytest.raises(ConfigError, match="quota_probe.*interval_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_quota_probe_model_rejects_empty(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "quota_probe:\n  model: '   '\n")
+    with pytest.raises(ConfigError, match="quota_probe.*model.*must not be empty"):
+        load_config(config_file)
+
+
+def test_load_config_quota_probe_timeout_seconds_rejects_non_positive(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "quota_probe:\n  timeout_seconds: 0\n")
+    with pytest.raises(ConfigError, match="quota_probe.*timeout_seconds.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_quota_probe_prompt_rejects_empty(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "quota_probe:\n  prompt: ''\n")
+    with pytest.raises(ConfigError, match="quota_probe.*prompt.*must not be empty"):
+        load_config(config_file)
+
+
 def test_load_config_review_effort_experiment_defaults() -> None:
     """review_effort_experiment_fraction/salt default to disabled (0.0/'')."""
     config = load_config(Path("nonexistent.yaml"))

@@ -30,6 +30,7 @@ from .claude_code import (
     launch_claude_worker,
     parse_claude_events,
     resolve_review_effort,
+    run_quota_probe,
 )
 from .checks import CheckSummary, summarize_checks
 from .config import (
@@ -103,8 +104,14 @@ from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
+    arm_quota_probe,
+    clear_quota_throttles,
     clear_reviewer_quota,
+    disarm_quota_probe,
     is_claim_stale,
+    is_quota_probe_actionable,
+    is_quota_probe_armed,
+    is_quota_probe_due,
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
@@ -1061,7 +1068,12 @@ def _detect_and_handle_stalled_sessions(
                         update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
                         with state_lock(state_file):
                             state = load_state(state_file)
-                            state = set_throttled_until(state, defer_until)
+                            state = set_throttled_until(
+                                state,
+                                defer_until,
+                                reason="rate_limited",
+                                adapter_kind=w.adapter_kind,
+                            )
                             state = append_event(
                                 state,
                                 "session_rate_limit_deferred",
@@ -1145,7 +1157,12 @@ def _detect_and_handle_stalled_sessions(
                 # relaunching into the same provider rate limit/quota window.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=resolved_failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Log the event
@@ -3450,11 +3467,91 @@ def _rework_prompt_search_dirs(
     return (path,)
 
 
+def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
+    """Render the ``$required_changes_section`` for a rework brief.
+
+    The findings are read from ``review-decision.json``'s ``required_changes``
+    list — the most actionable output the review pipeline produces. Giving
+    them their own rendered section (instead of multiplexing one prose slot)
+    means an operational dispatch note can no longer displace them.
+
+    Only rendered for a ``request_changes`` verdict. An ``approved`` or
+    ``blocked`` verdict may carry a non-empty ``required_changes`` list
+    (the field is optional for every decision), but rendering "what must
+    change before this PR can be approved" into an already-approved PR's
+    operational rework brief (merge-conflict / no-CI / cross-pr-revert
+    routes, which explicitly say "do not re-litigate the review") would be
+    contradictory. The findings for non-request_changes verdicts reach the
+    reviewer via ``$prior_review_section`` instead.
+
+    Returns an empty string when there is no decision, no list, an empty
+    list, or a non-request_changes decision — the section is omitted
+    entirely rather than rendering a hollow or contradictory header, so a
+    brief with no findings looks the same as before.
+    """
+    if not isinstance(decision, dict):
+        return ""
+    if decision.get("decision") != "request_changes":
+        return ""
+    required_changes = decision.get("required_changes")
+    if not isinstance(required_changes, list) or not required_changes:
+        return ""
+    lines = [
+        "## Required changes",
+        "",
+        "Address every item below. These are the reviewer's structured "
+        "findings — the authoritative list of what must change before this "
+        "PR can be approved.",
+        "",
+    ]
+    for change in required_changes:
+        text = str(change).strip()
+        if not text:
+            continue
+        lines.append(f"- {text}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _read_review_decision(decision_path: Path) -> dict[str, Any] | None:
+    """Read a PR's ``review-decision.json`` as a dict, or ``None`` if absent.
+
+    Mirrors ``OrchestratorApp._review_decision``'s read shape but returns
+    ``None`` (rather than a sentinel) for missing/invalid files so the caller
+    can distinguish "no verdict on disk" from "a verdict with an empty
+    findings list" — only the latter should render an (empty) section.
+    """
+    if not decision_path.exists():
+        return None
+    try:
+        with decision_path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
+    """Return True when the verdict file is strictly newer than the brief.
+
+    Used by ``dispatch_rework`` to detect a stale brief that has drifted from
+    a corrected ``review-decision.json`` (issue #632: the brief on disk is
+    authoritative and ``dispatch_rework`` reads it verbatim, so without this
+    check a hand-corrected verdict — the #510 case — never reaches the
+    worker). Comparison uses nanosecond mtimes; an equal timestamp (the
+    normal verdict path writes the decision immediately before the brief) is
+    treated as not-stale so the fresh brief is not pointlessly rewritten.
+    """
+    if not decision_path.exists() or not brief_path.exists():
+        return False
+    return decision_path.stat().st_mtime_ns > brief_path.stat().st_mtime_ns
+
+
 def _write_rework_prompt(
     state_file: Path,
     pr: dict[str, Any],
     issue_number: int | None,
-    summary: str,
+    dispatch_note: str,
     config: OrchestratorConfig,
     *,
     repo_root: Path | None = None,
@@ -3463,11 +3560,23 @@ def _write_rework_prompt(
 
     This module-level helper lets both the OrchestratorApp review path and the
     dead-session recovery path produce the same ``rework-prompt.md`` artifact.
+
+    Single point of enforcement for issue #632: the reviewer's structured
+    ``required_changes`` are read from ``review-decision.json`` here — not
+    threaded through by callers — so the three call sites cannot omit them.
+    The ``dispatch_note`` (formerly the ``$review_summary`` slot) carries the
+    operational/review-prose note and is kept separate from the findings, so
+    a churn/rescue message accompanies the findings instead of replacing
+    them. The raw note is also written to a sidecar
+    (``rework-dispatch-note.txt``) so a stale brief can be regenerated at
+    dispatch time without losing its note.
     """
     pr_number = int(pr["number"])
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = pr_dir / "rework-prompt.md"
+    decision = _read_review_decision(pr_dir / "review-decision.json")
+    required_changes_section = _render_required_changes_section(decision)
     prompt = render_prompt(
         config.dispatch.rework_template,
         {
@@ -3475,12 +3584,17 @@ def _write_rework_prompt(
             "pr_title": pr.get("title", ""),
             "pr_url": pr.get("url", ""),
             "issue_number": issue_number or "UNKNOWN",
-            "review_summary": summary,
+            "dispatch_note": dispatch_note,
+            "required_changes_section": required_changes_section,
             "branch_name": pr.get("headRefName", ""),
         },
         search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
     )
     prompt_path.write_text(prompt, encoding="utf-8")
+    # Sidecar: the raw dispatch note, so a dispatch-time regeneration (when
+    # review-decision.json is newer than the brief) can reproduce the note
+    # without parsing the rendered markdown.
+    (pr_dir / "rework-dispatch-note.txt").write_text(dispatch_note, encoding="utf-8")
     return prompt_path
 
 
@@ -3839,7 +3953,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # relaunches straight into the same throttled provider.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             if (
@@ -4059,7 +4178,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # Update state with throttle window
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
@@ -5006,8 +5130,8 @@ class OrchestratorApp:
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
             self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
             self.config.labels.complexity_high: (
-                "Routing hint: route this first-pass issue to the api worker "
-                "(multi-module, cross-cutting invariant, or prior escalation)."
+                "Routing hint: route to the api worker (multi-module, "
+                "cross-cutting invariant, or prior escalation)."
             ),
         }
         for label in self.config.labels.all:
@@ -5424,6 +5548,38 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
+        except GitHubError as exc:
+            # A GitHubError from _dispatch_impl means a GitHub API call
+            # needed for reliable dispatch failed. The two known sources are
+            # merged_pr_list() (raised on unusable responses — empty stdout,
+            # non-zero exit, unparseable JSON — per #633) and pr_list(); both
+            # are fetched before any issue is claimed or worker launched, so
+            # deferring here cannot leave a partial claim. Earlier
+            # _finalize_externally_merged_issues already recorded its own
+            # merged_pr_list failure in merged_pr_outcome, and
+            # _resolve_merged_prs re-raises that stored error (branch 2) so
+            # this handler covers BOTH the direct-fallback fetch (branch 1,
+            # the common case when there are open ready issues but no
+            # closed-ready issues this pass) and the finalize-errored re-raise
+            # (branch 2). Deferring is the correct response: proceeding with
+            # an empty merged-PR set would re-dispatch issues a merged PR
+            # already covered (the silent-empty path #633 closed), and letting
+            # the error propagate crashes the supervised loop daemon on a
+            # transient gh failure. Any claim written before a later
+            # GitHubError (e.g. issue_view mid-launch) is recovered by the
+            # existing stale-claim sweep on the next pass.
+            return CommandResult(
+                True,
+                f"dispatch deferred: GitHub API error ({exc})",
+                {
+                    "selected_count": 0,
+                    "deferred_reason": "github_error",
+                    "github_error": str(exc),
+                    "merged_prs": merged_prs_for_result,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
+                },
+            )
         finally:
             if fleet_lock is not None:
                 fleet_lock.release()
@@ -5510,6 +5666,16 @@ class OrchestratorApp:
         def _resolve_merged_prs(
             outcome: _MergedPRListOutcome | None,
         ) -> list[dict[str, Any]]:
+            # Both raising branches (the direct fallback below and the
+            # outcome.error re-raise) propagate GitHubError to dispatch()'s
+            # ``except GitHubError`` handler, which defers the pass. This is
+            # deliberate: proceeding with [] would re-dispatch issues a merged
+            # PR already covered (the silent-empty path #633 closed). The
+            # direct fallback is the COMMON case — it runs whenever there are
+            # open ready issues but no closed-ready issues this pass, because
+            # _finalize_externally_merged_issues skips the merged_pr_list()
+            # fetch entirely when closed_ready is empty (returning an outcome
+            # with called=False).
             if outcome is None or not outcome.called:
                 return self.gh.merged_pr_list() if issues else []
             if outcome.error is not None and issues:
@@ -6948,11 +7114,19 @@ class OrchestratorApp:
         # on disk at render time but never surfaced to the reviewer.
         existing_decision = self._review_decision(pr_number)
         prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
-        is_round2_review = (
-            existing_decision.get("decision") not in ("pending", None, "missing", "invalid")
-            and prior_reviewed_head_sha
-            and prior_reviewed_head_sha != pr.get("headRefOid")
-        )
+        # Issue #632 defect 3: a terminal verdict on disk must reach the
+        # reviewer even when the head has NOT moved (a PR parked on
+        # agent:human-needed, or an operator-corrected verdict). The old gate
+        # required prior_reviewed_head_sha != headRefOid, so a same-head
+        # re-review rendered an empty $prior_review_section and the corrected
+        # findings were invisible. _build_prior_review_section adapts its
+        # wording to the same-head vs moved-head case.
+        is_round2_review = existing_decision.get("decision") not in (
+            "pending",
+            None,
+            "missing",
+            "invalid",
+        ) and bool(prior_reviewed_head_sha)
         prior_review_section = (
             self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
             if is_round2_review
@@ -8499,9 +8673,15 @@ class OrchestratorApp:
                         if rescue_dispatched
                         else summary_text
                     )
-                    rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             decision_payload["escalated"] = escalated
+            # Persist the verdict BEFORE rendering the rework brief: the brief
+            # reads review-decision.json itself (issue #632, single point of
+            # enforcement) to surface required_changes, so the decision file
+            # must be on disk first. A label-write failure or crash after this
+            # point leaves a durable verdict and a brief consistent with it.
             self._write_json(decision_path, decision_payload)
+            if decision == "request_changes" and not escalated:
+                rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             rescue_fields = (
                 rescue_helpers.build_rescue_dataclass_kwargs("rework_cycle_cap")
                 if rescue_dispatched
@@ -9892,14 +10072,22 @@ class OrchestratorApp:
     ) -> str:
         """Render ``$prior_review_section`` for a round-2+ review packet.
 
-        Only called when the prior decision is a terminal, non-pending
-        verdict recorded against a head that differs from the live PR head
-        (a genuine rework round, not a first-round review). Surfaces round-1
-        findings (decision/summary/required changes) plus an interdiff
-        (prior reviewed head -> new head) so the reviewer has somewhere to
-        start, without losing sight of the full diff: the interdiff is
-        "start here," never "only look here" -- the full diff stays
-        attached and remains authoritative for findings outside it.
+        Called when the prior decision is a terminal, non-pending verdict
+        with a recorded ``reviewed_head_sha``. Two cases:
+
+        - **Moved head** (prior head != live head): a genuine rework round.
+          Surfaces round-1 findings plus an interdiff (prior reviewed head
+          -> new head) so the reviewer has somewhere to start, without
+          losing sight of the full diff: the interdiff is "start here,"
+          never "only look here" -- the full diff stays attached and
+          remains authoritative for findings outside it.
+        - **Same head** (prior head == live head, issue #632 defect 3): a
+          PR parked on ``agent:human-needed`` whose head has not advanced,
+          or an operator-corrected verdict. The diff is identical, so no
+          interdiff is generated; the findings are surfaced so a re-review
+          can verify whether they still apply or whether the verdict was
+          corrected. Without this branch the corrected verdict was
+          invisible to the reviewer (the #510 case).
 
         Fail-safe posture mirrors janitor.py's patch-id carry-forward
         (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
@@ -9914,6 +10102,34 @@ class OrchestratorApp:
         required_changes = prior_decision.get("required_changes")
         if not isinstance(required_changes, list):
             required_changes = []
+
+        same_head = bool(prior_head_sha) and prior_head_sha == new_head_sha
+
+        if same_head:
+            lines = [
+                "",
+                "## Prior review (same head)",
+                "",
+                f"A prior review of this head (`{prior_head_sha}`) recorded "
+                f"decision **{decision}**. The diff has not changed since that "
+                "review -- the findings below are from the same code you are "
+                "reviewing now. Verify whether they still apply or whether the "
+                "verdict was corrected (e.g. by an operator hand-edit).",
+                "",
+            ]
+            if summary:
+                lines.append(f"Prior summary: {summary}")
+                lines.append("")
+            if required_changes:
+                lines.append("Prior required changes:")
+                lines.extend(f"- {change}" for change in required_changes)
+                lines.append("")
+            lines.append(
+                "No interdiff is needed -- the head is unchanged. Re-examine "
+                "the full diff and confirm or overturn the prior verdict."
+            )
+            lines.append("")
+            return "\n".join(lines)
 
         lines = [
             "",
@@ -11298,6 +11514,91 @@ class OrchestratorApp:
             )
             return result
 
+    def _maybe_probe_quota_recovery(self) -> None:
+        """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
+
+        Runs every loop pass but is a near-no-op unless a throttle that a
+        green ambient-CLI probe could actually clear is currently active
+        (``is_quota_probe_actionable``) -- an operator switching to a
+        different subscription account can make a provider's quota recover
+        well before a blanket cooldown (e.g. the 24h
+        ``_DEFAULT_QUOTA_COOLDOWN_HOURS`` window) elapses, and there was
+        previously no way to detect that early. Deliberately a *flat*
+        ``quota_probe.interval_minutes`` schedule (not exponential backoff
+        like ``reviewer_quota.probe_after``): the user asked for a fixed
+        15-minute recheck, not a growing wait.
+
+        The gate is narrower than "any throttle indicator" -- a devin/api
+        adapter throttle or a provider_auth cooldown would survive
+        ``clear_quota_throttles`` untouched even on a green probe (see that
+        function), so arming/probing for one would just burn Haiku sessions
+        every interval for no possible benefit. Because of this, a green
+        probe reaching the success branch below is guaranteed to have
+        something to clear -- no post-hoc check needed there.
+
+        Two-phase lock pattern so the (possibly tens-of-seconds) subprocess
+        call in ``run_quota_probe`` never holds ``state_lock`` and blocks
+        every other state read/writer in the process:
+          1. Under the lock: decide whether to probe at all, and if not,
+             arm/disarm/return without calling out to the CLI.
+          2. Outside the lock: run the actual probe subprocess.
+          3. Under the lock again: re-read state (it may have changed while
+             unlocked) and apply the outcome.
+        """
+        if not self.config.quota_probe.enabled:
+            return
+
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                if is_quota_probe_armed(state):
+                    state = disarm_quota_probe(state)
+                    save_state(state_file, state)
+                return
+            if not is_quota_probe_armed(state):
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                save_state(state_file, state)
+                return
+            if not is_quota_probe_due(state):
+                return
+
+        probe_ok = run_quota_probe(repo_root=self.repo_root, config=self.config)
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                # Cleared or became non-actionable while the probe ran unlocked.
+                state = disarm_quota_probe(state)
+                save_state(state_file, state)
+                return
+            if probe_ok:
+                state = clear_quota_throttles(state)
+                state = disarm_quota_probe(state)
+                state = self._record_event(state, "quota_probe_succeeded", {})
+            else:
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                state = self._record_event(state, "quota_probe_failed", {})
+            save_state(state_file, state)
+
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
@@ -11349,6 +11650,10 @@ class OrchestratorApp:
             self.config,
             persist_inconclusive_probe_counter=False,
         )
+
+        # Flat-interval Haiku probe for early quota/rate-limit recovery (see
+        # docstring): only does real work when a throttle indicator is active.
+        self._maybe_probe_quota_recovery()
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
@@ -12163,6 +12468,20 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
+            # Issue #632: the brief on disk is authoritative and can drift
+            # arbitrarily far from a corrected verdict (an operator
+            # hand-editing review-decision.json is the #510 case). Regenerate
+            # it from the verdict + the preserved dispatch-note sidecar when
+            # the verdict is newer than the brief, so a stale brief cannot
+            # outlive a corrected verdict. The note sidecar is written by
+            # _write_rework_prompt; if it is absent (a brief predating the
+            # fix) the brief is regenerated with an empty note — the findings
+            # are the critical part and must not stay hidden.
+            decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
+            if _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
+                note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
+                dispatch_note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+                self._write_rework_prompt(pr, issue_number, dispatch_note)
             # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
             # adapter routing — they always launch via the claude-code adapter
             # pinned to rescue.worker_model, regardless of the primary
@@ -13020,13 +13339,13 @@ class OrchestratorApp:
         return prompt_path
 
     def _write_rework_prompt(
-        self, pr: dict[str, Any], issue_number: int | None, summary: str
+        self, pr: dict[str, Any], issue_number: int | None, dispatch_note: str
     ) -> Path:
         return _write_rework_prompt(
             self.paths.state_file,
             pr,
             issue_number,
-            summary,
+            dispatch_note,
             self.config,
             repo_root=self.repo_root,
         )
@@ -13059,14 +13378,14 @@ class OrchestratorApp:
                 # first pass cannot bake an empty baseline and permanently
                 # exempt the real history it never saw.
                 #
-                # This covers the raising failures (gh missing, unparseable
-                # JSON, non-zero exit). It does NOT cover gh exiting 0 with
-                # empty stdout, which merged_pr_list() coerces to an empty page
-                # and treats as "no more results" — that would arm an empty
-                # baseline silently. Distinguishing the two belongs in
-                # github.py rather than here and is tracked in #633; recovery
-                # is to delete the baseline key from state.json and let the
-                # next pass re-arm from real data.
+                # This covers every raising failure in merged_pr_list(): gh
+                # missing, unparseable JSON, non-zero exit, AND gh exiting 0
+                # with empty stdout (the silent-empty case #633 closed —
+                # merged_pr_list() now raises GitHubError on a non-list result
+                # instead of coercing None to []). The empty-stdout path no
+                # longer arms an empty baseline silently; it is reported here
+                # as a raising failure and the next pass re-arms from real
+                # data.
                 return []
 
         for pr in merged_prs:

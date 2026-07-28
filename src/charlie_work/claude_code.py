@@ -821,6 +821,53 @@ def _apply_max_turns_pin(command_template: tuple[str, ...], max_turns: int) -> t
     return tuple(filtered) + ("--max-turns", str(max_turns))
 
 
+def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
+    """Run a single, cheap, read-only Haiku-model CLI call to check whether an
+    active quota/rate-limit throttle has actually recovered (e.g. an operator
+    switched the ambient Claude Code CLI to a different subscription
+    account).
+
+    Deliberately NOT ``launch_claude_worker``: no worktree, no branch, no
+    sidecar, no Popen -- this is a single bounded, synchronous subprocess via
+    ``subprocess_runner.run_captured``, mirroring how other short-lived,
+    timeout-bounded external calls in this codebase are made (CLAUDE.md's
+    non-blocking-adapter invariant applies to worker/reviewer dispatch, not
+    to a deliberate, bounded health-check call like this one). Runs in
+    ``repo_root`` itself -- never mutates it: reuses ``_REVIEW_COMMAND_TEMPLATE``
+    (``--permission-mode plan``) capped to a single turn, so it is read-only
+    and cheap regardless of what the probe prompt asks.
+
+    Returns True ("green") only when the process exits 0 AND its combined
+    stdout+stderr shows no quota/auth/rate-limit throttle signature --
+    reusing the exact patterns ``_classify_session_failure`` applies to a
+    real worker's log tail (single point of enforcement, PR #262 findings
+    F1/F5) so a session that exits 0 with an embedded, in-band throttle
+    message is never misread as recovery. Never raises: ``run_captured``
+    already converts timeouts, missing binaries, and non-zero exits into a
+    ``RunResult`` value.
+    """
+    probe = config.quota_probe
+    command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
+    command = _apply_max_turns_pin(command, 1)
+    command = (resolve_cli_binary(command[0]), *command[1:])
+    result = run_captured(
+        list(command),
+        cwd=repo_root,
+        timeout_seconds=probe.timeout_seconds,
+        stdin=probe.prompt,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    tail = combined[-2048:] if len(combined) > 2048 else combined
+    if _PROVIDER_AUTH_PATTERN.search(tail):
+        return False
+    if _QUOTA_EXHAUSTED_PATTERN.search(tail):
+        return False
+    matched, _reset_minutes = match_throttle_tail(tail, config.runtime.throttle_error_markers)
+    if matched:
+        return False
+    return result.ok
+
+
 def _render_command(
     command_template: tuple[str, ...],
     prompt_path: Path,

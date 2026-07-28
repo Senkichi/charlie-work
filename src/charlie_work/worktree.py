@@ -30,6 +30,7 @@ from .janitor import _calculate_patch_id
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
+from .safe_path import contains
 from .subprocess_runner import RunResult, run_captured
 from . import state as _state
 
@@ -1407,7 +1408,7 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     source = repo_root / dir_path_posix
     if not source.exists():
         return ()
-    if not source.is_relative_to(repo_root):
+    if not contains(repo_root, source):
         return ()
 
     target_root = worktree_path / dir_path_posix
@@ -2837,7 +2838,7 @@ def _verify_shared_venv_by_import(repo_root: Path, venv_path: Path) -> tuple[boo
             f"shared venv charlie_work __file__ is not a valid path: {result.stdout!r} "
             "(hint: uv sync --all-extras --reinstall-package charlie-work)"
         )
-    if not imported.is_relative_to(main_src):
+    if not contains(main_src, imported):
         return False, (
             f"shared venv imports charlie_work from {imported}, not main checkout {main_src} "
             "(hint: uv sync --all-extras --reinstall-package charlie-work)"
@@ -3046,7 +3047,7 @@ def clean_worktrees(
     worktree_list_failed = list_error is not None
     for wt in registered_worktrees:
         wt_path = wt.get("worktree")
-        if not isinstance(wt_path, Path) or not wt_path.is_relative_to(worktrees_dir):
+        if not isinstance(wt_path, Path) or not contains(worktrees_dir, wt_path):
             continue
         raw_branch = str(wt.get("branch", ""))
         branch = raw_branch.removeprefix("refs/heads/")

@@ -599,7 +599,8 @@ def test_missing_repo_local_template_falls_back_to_package(tmp_path: Path) -> No
             "pr_title": "t",
             "pr_url": "u",
             "issue_number": 1,
-            "review_summary": "s",
+            "dispatch_note": "s",
+            "required_changes_section": "",
             "branch_name": "agent/issue-1-t",
         },
         search_dirs=(override_dir,),
@@ -4623,6 +4624,98 @@ def test_dispatch_still_queries_merged_pr_list_when_ready_issues_exist(tmp_path:
 
     assert result.ok is True
     assert fake_gh.merged_pr_list_calls == 1
+
+
+def test_dispatch_defers_when_merged_pr_list_raises_on_direct_fallback(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer — not crash — when merged_pr_list() raises on the
+    _resolve_merged_prs direct-fallback path (#633 review finding).
+
+    This is the COMMON-case path: open ready issues exist but no closed-ready
+    issues this pass, so _finalize_externally_merged_issues skips the
+    merged_pr_list() fetch entirely (returns an outcome with called=False).
+    _resolve_merged_prs then calls merged_pr_list() directly (branch 1), and
+    after #633 that call raises GitHubError on an unusable response instead of
+    silently returning []. Without a handler the error propagates out of
+    dispatch() and crashes the supervised loop daemon on a transient gh
+    failure. dispatch()'s ``except GitHubError`` handler must catch it and
+    return a deferred result so the next pass retries.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
+
+
+def test_dispatch_defers_when_merged_pr_list_raises_on_finalize_reraise(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer when _resolve_merged_prs re-raises a finalize error.
+
+    When closed-ready issues exist, _finalize_externally_merged_issues calls
+    merged_pr_list() itself and records a failure in _MergedPRListOutcome
+    (called=True, error=GitHubError). _resolve_merged_prs branch 2 re-raises
+    that stored error. dispatch()'s ``except GitHubError`` handler must catch
+    the re-raise and defer — the same handler that covers the direct fallback
+    (branch 1) — so a transient gh failure during finalization does not crash
+    the supervised loop daemon.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # A closed ready-labeled issue forces _finalize_externally_merged_issues
+            # to actually call merged_pr_list() (rather than skip with called=False),
+            # so the error is recorded in the outcome. The OPEN ready issue stays
+            # in the queue after finalization strips the closed one, so ``issues``
+            # is non-empty in _dispatch_impl and _resolve_merged_prs branch 2
+            # (``if outcome.error is not None and issues: raise``) fires.
+            self.issues = [
+                {
+                    "number": 200,
+                    "title": "Closed ready issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Already done",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "CLOSED",
+                },
+                {
+                    "number": 201,
+                    "title": "Open ready issue",
+                    "url": "https://example.test/issues/201",
+                    "body": "Needs work",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "OPEN",
+                },
+            ]
+
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
 
 
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
@@ -10082,6 +10175,172 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
     assert "throttled_until" not in cleared["reviewer_quota"]
 
 
+def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
+    from charlie_work.state import empty_state, set_throttled_until
+
+    state = set_throttled_until(
+        empty_state(),
+        "2026-08-01T00:00:00Z",
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+    )
+
+    assert state["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert state["throttle_reason"] == "quota_exhausted"
+    assert state["throttle_adapter_kind"] == "claude-code"
+
+
+def test_set_throttled_until_defaults_reason_and_adapter_kind_to_none() -> None:
+    from charlie_work.state import empty_state, set_throttled_until
+
+    state = set_throttled_until(empty_state(), "2026-08-01T00:00:00Z")
+
+    assert state["throttle_reason"] is None
+    assert state["throttle_adapter_kind"] is None
+
+
+def test_quota_probe_arm_disarm_and_due_lifecycle() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.state import (
+        arm_quota_probe,
+        disarm_quota_probe,
+        empty_state,
+        is_quota_probe_armed,
+        is_quota_probe_due,
+    )
+
+    state = empty_state()
+    assert is_quota_probe_armed(state) is False
+    assert is_quota_probe_due(state) is False  # unarmed is never "due"
+
+    future = (datetime.now(UTC) + timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+    state = arm_quota_probe(state, future)
+    assert is_quota_probe_armed(state) is True
+    assert is_quota_probe_due(state) is False
+
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    state = arm_quota_probe(state, past)
+    assert is_quota_probe_due(state) is True
+
+    state = disarm_quota_probe(state)
+    assert is_quota_probe_armed(state) is False
+
+
+def test_is_quota_probe_due_treats_malformed_timestamp_as_due() -> None:
+    from charlie_work.state import arm_quota_probe, empty_state, is_quota_probe_due
+
+    state = arm_quota_probe(empty_state(), "not-a-timestamp")
+
+    assert is_quota_probe_due(state) is True
+
+
+def test_any_quota_exhausted_indicator_gate() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.state import (
+        any_quota_exhausted_indicator,
+        empty_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    assert any_quota_exhausted_indicator(empty_state()) is False
+
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    root_throttled = set_throttled_until(empty_state(), future, reason="rate_limited")
+    assert any_quota_exhausted_indicator(root_throttled) is True
+
+    reviewer_throttled = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until=future, probe_after=future
+    )
+    assert any_quota_exhausted_indicator(reviewer_throttled) is True
+
+
+def test_clear_quota_throttles_clears_root_throttle_for_claude_code_or_unset_adapter() -> None:
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    for adapter_kind in (None, "claude-code"):
+        state = set_throttled_until(
+            empty_state(),
+            "2026-08-01T00:00:00Z",
+            reason="rate_limited",
+            adapter_kind=adapter_kind,
+        )
+
+        cleared = clear_quota_throttles(state)
+
+        assert cleared["throttled_until"] is None
+        assert cleared["throttle_reason"] is None
+        assert cleared["throttle_adapter_kind"] is None
+
+
+def test_clear_quota_throttles_preserves_provider_auth_throttle() -> None:
+    """A dead key does not self-heal within minutes -- see
+    claude_code._classify_session_failure; a green probe must not mask it."""
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    state = set_throttled_until(
+        empty_state(),
+        "2026-08-01T00:00:00Z",
+        reason="provider_auth",
+        adapter_kind="claude-code",
+    )
+
+    cleared = clear_quota_throttles(state)
+
+    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert cleared["throttle_reason"] == "provider_auth"
+
+
+def test_clear_quota_throttles_preserves_non_claude_code_adapter_throttle() -> None:
+    """A devin/api-adapter throttle is on a different credential the ambient
+    Claude Code CLI probe provides no evidence about."""
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    for adapter_kind in ("devin", "api"):
+        state = set_throttled_until(
+            empty_state(),
+            "2026-08-01T00:00:00Z",
+            reason="rate_limited",
+            adapter_kind=adapter_kind,
+        )
+
+        cleared = clear_quota_throttles(state)
+
+        assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+        assert cleared["throttle_adapter_kind"] == adapter_kind
+
+
+def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_failures() -> None:
+    from charlie_work.state import (
+        clear_quota_throttles,
+        empty_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    state = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    state = {
+        **state,
+        "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
+    }
+    # Also carry a devin-adapter root throttle, to confirm reviewer_quota
+    # clears independently of what the root-throttle branch decides.
+    state = set_throttled_until(
+        state, "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="devin"
+    )
+
+    cleared = clear_quota_throttles(state)
+
+    assert "throttled_until" not in cleared["reviewer_quota"]
+    assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
+    # The devin adapter's root throttle must still be untouched.
+    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+
+
 def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -11617,6 +11876,47 @@ def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Pa
     assert result.ok is True
     packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
     assert "## Prior review" not in packet
+
+
+def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> None:
+    """Issue #632 defect 3: a terminal verdict on disk for the SAME head (a
+    PR parked on agent:human-needed whose head has not advanced, or an
+    operator-corrected verdict) must still surface its findings to a
+    re-review. The old is_round2_review gate required
+    prior_reviewed_head_sha != headRefOid, so the corrected verdict was
+    invisible and re-reviewing the unchanged diff started from scratch."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    # A corrected verdict pinned to the SAME head as the live PR.
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "the null check is still missing",
+                "required_changes": ["add null check in validate()", "cover empty input"],
+                "reviewed_head_sha": "sha-abc123",  # == live head
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    # The prior findings reach the reviewer even though the head hasn't moved.
+    assert "## Prior review" in packet
+    assert "same head" in packet.lower()
+    assert "the null check is still missing" in packet
+    assert "add null check in validate()" in packet
+    assert "cover empty input" in packet
+    # No interdiff is generated for a same-head review.
+    assert not (decision_dir / "interdiff.patch").exists()
+    assert "No interdiff is needed" in packet
 
 
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
@@ -14581,6 +14881,26 @@ def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None
     # All labels verified present — must report honest success.
     assert result.ok is True
     assert result.data["missing"] == []
+
+
+def test_bootstrap_labels_descriptions_fit_github_limit(tmp_path: Path) -> None:
+    """GitHub rejects label descriptions over 100 chars with HTTP 422.
+
+    FakeGitHub doesn't enforce this, so a too-long description passes the
+    other bootstrap tests while silently 422ing against the real API (the
+    failure is swallowed by label_create's allow_failure=True) — 'complexity:high'
+    shipped with a 121-char description and was missing from every repo as a
+    result. Assert on the real descriptions directly so this can't recur.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.bootstrap_labels()
+
+    too_long = {name: desc for name, _color, desc in fake_gh.labels_created if len(desc) > 100}
+    assert too_long == {}
 
 
 def test_bootstrap_labels_fails_when_creation_silently_missed(tmp_path: Path) -> None:
@@ -22995,6 +23315,340 @@ def test_is_throttled_checks_against_current_time(tmp_path: Path) -> None:
     assert is_throttled(state) is False
 
 
+def _quota_probe_app(
+    tmp_path: Path, *, interval_minutes: int = 15, enabled: bool = True
+) -> OrchestratorApp:
+    from charlie_work.config import QuotaProbeConfig
+
+    config = OrchestratorConfig(
+        quota_probe=QuotaProbeConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+
+def test_maybe_probe_quota_recovery_noop_when_nothing_throttled(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _quota_probe_app(tmp_path)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("run_quota_probe must not be called when nothing is throttled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_disarms_stale_schedule_when_throttle_cleared(
+    tmp_path: Path,
+) -> None:
+    """A cooldown can expire naturally (root throttled_until passes) between
+    passes, before the flat-interval probe schedule fires. The next pass
+    must disarm the now-stale schedule rather than probing needlessly."""
+    from charlie_work.state import arm_quota_probe, save_state
+
+    app = _quota_probe_app(tmp_path)
+    state = load_state(app.paths.state_file)
+    state = arm_quota_probe(state, "2026-08-01T00:00:00Z")
+    save_state(app.paths.state_file, state)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_arms_on_first_pass_without_probing(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("first pass after onset must arm, not probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=15)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_maybe_probe_quota_recovery_waits_until_due(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=10))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("must not probe before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["quota_probe"]["next_probe_at"] == not_due
+
+
+def test_maybe_probe_quota_recovery_green_clears_all_throttles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=future)
+    state = {
+        **state,
+        "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
+    }
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    calls: list[dict] = []
+
+    def _fake_probe(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fake_probe)
+
+    app._maybe_probe_quota_recovery()
+
+    assert len(calls) == 1
+    assert calls[0]["repo_root"] == tmp_path
+    state = load_state(app.paths.state_file)
+    assert state["throttled_until"] is None
+    assert "throttled_until" not in state.get("reviewer_quota", {})
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert any(e["kind"] == "quota_probe_succeeded" for e in state["events"])
+    assert state["reviewer_quota"]["consecutive_probe_failures"] == 0
+
+
+def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_throttle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # Flat interval: rescheduled ~15 minutes out again, not a growing backoff.
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=15)
+    assert abs((parsed - expected).total_seconds()) < 5
+    assert state["throttled_until"] == future
+    assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
+
+
+def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, enabled=False)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("disabled quota_probe must never call run_quota_probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_never_arms_for_provider_auth_throttle(
+    tmp_path: Path,
+) -> None:
+    """A dead key does not self-heal within minutes, and ``clear_quota_throttles``
+    deliberately leaves a provider_auth-reasoned root throttle untouched even
+    on a green probe. The probe must therefore never arm for one in the first
+    place -- arming/probing a throttle that can never be cleared would just
+    burn a Haiku session every ``interval_minutes`` for the whole cooldown
+    window with no possible benefit."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file),
+        future,
+        reason="provider_auth",
+        adapter_kind="claude-code",
+    )
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("provider_auth throttle must never arm the probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert state["throttled_until"] == future
+    assert state["throttle_reason"] == "provider_auth"
+
+
+def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throttle(
+    tmp_path: Path,
+) -> None:
+    """A devin/api-adapter throttle is not cleared by a claude-code ambient
+    probe (different tool/credential entirely -- see
+    ``clear_quota_throttles``), so the probe must never arm for one."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file),
+        future,
+        reason="rate_limited",
+        adapter_kind="devin",
+    )
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("devin-adapter throttle must never arm the probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert state["throttled_until"] == future
+    assert state["throttle_adapter_kind"] == "devin"
+
+
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.workflow import _count_live_sessions
@@ -25569,6 +26223,147 @@ def test_load_layered_config_require_global_present_loads(tmp_path: Path) -> Non
         require_global=True,
     )
     assert config.dispatch.max_concurrent_sessions == 5
+
+
+def test_load_layered_config_require_global_present_but_invalid_keeps_per_repo(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A present-but-invalid global layer under require_global must not discard
+    the per-repo config.
+
+    Regression for the second orchestrator review of PR #630: the caller-level
+    ``require_global=True`` fallback (catch ``ConfigError``, reload with
+    ``require_global=False``) must not be the thing that rescues a valid
+    per-repo config from a broken global layer -- that rescue happens *inside*
+    ``load_layered_config`` itself (the in-function fallback added by #667), so
+    the caller's catch block never fires for this case. This test proves the
+    per-repo config survives a present-but-invalid global layer *without* the
+    caller-level retry, i.e. ``require_global=True`` returns successfully and
+    the per-repo value is intact.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is present but invalid (unknown top-level section).
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    # Per-repo config is valid and carries a distinctive value.
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 7\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.global_config"):
+        config = load_layered_config(
+            repo_root,
+            None,
+            fleet_dir_override=str(fleet_dir_path),
+            require_global=True,
+        )
+
+    # The per-repo value survives -- the broken global layer did not discard it.
+    assert config.dispatch.max_concurrent_sessions == 7
+
+    # The discard is loud, not silent: a warning names the discarded global path.
+    warning = "\n".join(
+        r.getMessage() for r in caplog.records if "global layer was discarded" in r.getMessage()
+    )
+    assert warning, "discarding an invalid global layer must be logged as a warning"
+    assert str(global_config_path) in warning, "the warning must name the global path"
+
+
+def test_global_config_invalid_global_keeps_per_repo_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A present-but-invalid global layer must not discard a valid per-repo config.
+
+    Regression for issue #665: when the global config file exists but fails
+    validation (e.g. an unknown key), the merged load raises ConfigError.
+    Callers (fleet_dispatch) catch ConfigError and skip the repo, silently
+    discarding a *valid* per-repo config -- the #623 failure shape (host-wide
+    knobs silently disabled) via a different trigger. The per-repo config
+    must survive, and the discard must be loud (a warning), not silent.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is present but invalid (unknown top-level section).
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    # Per-repo config is valid and carries a distinctive value.
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 7\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.global_config"):
+        config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    # The per-repo value survives -- the broken global layer did not discard it.
+    assert config.dispatch.max_concurrent_sessions == 7
+
+    # The discard is loud, not silent: a warning names the discarded global path.
+    warning = "\n".join(
+        r.getMessage() for r in caplog.records if "global layer was discarded" in r.getMessage()
+    )
+    assert warning, "discarding an invalid global layer must be logged as a warning"
+    assert str(global_config_path) in warning, "the warning must name the global path"
+
+
+def test_global_config_invalid_global_no_per_repo_still_raises(tmp_path: Path) -> None:
+    """With no per-repo config to rescue, an invalid global layer must still raise.
+
+    Silently defaulting here would itself reproduce the #623 shape (host-wide
+    knobs silently disabled): the operator's only config is broken, and a
+    pristine-defaults return hides that. The error must propagate.
+    """
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is present but invalid; no per-repo config exists.
+    (fleet_dir_path / "config.yaml").write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+
+def test_global_config_invalid_per_repo_still_raises(tmp_path: Path) -> None:
+    """An invalid *per-repo* config must still raise even with a valid global layer.
+
+    The fallback rescues a valid per-repo config from a broken global layer, not
+    the reverse: when the per-repo config is itself broken, the error propagates
+    so the operator learns their per-repo file is invalid.
+    """
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is valid.
+    (fleet_dir_path / "config.yaml").write_text(
+        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
+    )
+    # Per-repo config is invalid (unknown section).
+    (repo_root / "orchestrator.config.yaml").write_text(
+        "unknown_section:\n  foo: bar\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
 
 
 def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30733,6 +31528,201 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:
+    """Issue #632 defect 1: a request_changes verdict's required_changes must
+    reach the rework brief. The brief reads review-decision.json itself (single
+    point of enforcement), so asserting on the rendered content — not on the
+    call having happened — is the right check."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    findings = ["add null check in parse()", "update tests for edge case"]
+    app.record_review(
+        456,
+        "request_changes",
+        summary="fix A",
+        required_changes=findings,
+    )
+
+    brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
+    for finding in findings:
+        assert finding in brief, f"finding missing from brief: {finding!r}"
+    # The prose summary rides in the dispatch-note slot and must still appear.
+    assert "fix A" in brief
+    # The section header is present so the worker can locate the list.
+    assert "## Required changes" in brief
+
+
+def test_rework_brief_keeps_both_dispatch_note_and_findings(tmp_path: Path) -> None:
+    """Issue #632 defect 2: the no-op-churn / merge-conflict routing path
+    passes an operational note into the brief. That note must accompany the
+    findings instead of displacing them — the #510 regression shipped a brief
+    with the churn message and zero findings."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    # A pre-existing verdict with structured findings on disk.
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "round-1 summary",
+                "required_changes": ["fix the off-by-one", "add a regression test"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    operational_note = (
+        "The previous rework cycle produced no actual content change. Push the real fix."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The operational note is preserved...
+    assert "no actual content change" in brief
+    # ...and the findings are still present alongside it.
+    assert "fix the off-by-one" in brief
+    assert "add a regression test" in brief
+    # The sidecar note is written for dispatch-time regeneration.
+    assert (pr_dir / "rework-dispatch-note.txt").read_text(encoding="utf-8") == operational_note
+
+
+def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
+    tmp_path: Path,
+) -> None:
+    """Issue #632 defect 4 / #510 case: dispatch_rework reads the brief
+    verbatim, so a hand-corrected review-decision.json never reached the
+    worker. The brief must be regenerated when the verdict is newer than the
+    brief, reflecting the edit."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, ReworkGitHub())
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    # A stale brief predating the fix: churn note, zero findings — exactly
+    # the #510 artifact.
+    brief_path = pr_dir / "rework-prompt.md"
+    brief_path.write_text("# Rework\n\nThe previous cycle was a no-op.\n", encoding="utf-8")
+    # The operator then corrects the verdict by hand, adding the findings.
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "corrected verdict",
+                "required_changes": ["handle the empty-list case", "guard the index access"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Make the corrected verdict strictly newer than the stale brief.
+    now = time.time()
+    os.utime(brief_path, (now, now))
+    os.utime(decision_path, (now + 10, now + 10))
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    assert result.data["selected_count"] == 1
+    regenerated = brief_path.read_text(encoding="utf-8")
+    # The regenerated brief reflects the edited verdict.
+    assert "handle the empty-list case" in regenerated
+    assert "guard the index access" in regenerated
+    # The stale churn-only content is gone.
+    assert "The previous cycle was a no-op." not in regenerated
+
+
+def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path) -> None:
+    """Issue #632 edge case: an approved verdict may carry a non-empty
+    required_changes list (the field is optional for every decision). The
+    merge-conflict / no-CI / cross-pr-revert routes render a rework brief
+    for an already-approved PR whose dispatch note explicitly says "do not
+    re-litigate the review". Rendering a "Required changes ... before this
+    PR can be approved" section into that brief would be contradictory.
+    The section must only appear for a request_changes verdict."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    # An approved verdict that nonetheless carries required_changes (a
+    # reviewer mistake, or stale carry-forward from a prior round).
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "summary": "lgtm",
+                "required_changes": ["add a docstring", "rename foo to bar"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    # The merge-conflict operational note says "do not re-litigate".
+    operational_note = (
+        "The PR branch has a merge conflict. Merge the base branch and resolve. "
+        "The code changes are already approved; do not re-litigate the review."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The operational note is present.
+    assert "do not re-litigate" in brief
+    assert "merge conflict" in brief
+    # The contradictory required-changes section is NOT rendered.
+    assert "## Required changes" not in brief
+    assert "before this PR can be approved" not in brief
+    assert "add a docstring" not in brief
+    assert "rename foo to bar" not in brief
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
