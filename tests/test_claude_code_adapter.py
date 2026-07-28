@@ -1256,6 +1256,59 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
     assert abs((parsed - expected).total_seconds()) < 1
 
 
+def test_update_worker_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Reproduces the live incident: a worker's completion summary quoted the
+    throttle-marker text ("usage limit") while describing an unrelated fix,
+    and log-tail classification stomped the caller's ``fallback_kind`` with
+    ``quota_exhausted`` despite the worktree proving the work completed.
+    ``session_completed=True`` must skip log-tail classification entirely.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Completion summary prose that happens to quote a throttle marker while
+    # describing an unrelated fix -- not an actual provider death message.
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n"
+        "- `ruff check` + `ruff format`: clean\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
+
+
 def _make_worker_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:
     """Write a minimal worker sidecar for failure-classification tests."""
     sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"

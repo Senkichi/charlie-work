@@ -624,6 +624,13 @@ def detect_drift(
                     # for diagnostics. For non-completed sessions, preserve the original
                     # ordering so worker_blocked still escalates.
                     if is_completed:
+                        # session_completed=True (issue #656): the worktree
+                        # inspection just above is ground truth this session
+                        # produced real, committable work -- skip log-tail
+                        # marker matching entirely rather than let it treat
+                        # the session's own completion-summary prose as a
+                        # provider-throttle signature. See claude_code.
+                        # update_worker_record_with_failure_classification.
                         if w.adapter_kind == "devin":
                             failure_kind, throttled_until = (
                                 update_session_record_with_failure_classification(
@@ -631,6 +638,7 @@ def detect_drift(
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
+                                    session_completed=True,
                                 )
                             )
                         elif w.adapter_kind == "claude-code":
@@ -640,6 +648,7 @@ def detect_drift(
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
+                                    session_completed=True,
                                 )
                             )
                         elif w.adapter_kind == "api":
@@ -650,6 +659,7 @@ def detect_drift(
                                     fallback_kind="unpublished_work",
                                     config=config,
                                     adapter_kind="api",
+                                    session_completed=True,
                                 )
                             )
                         else:
