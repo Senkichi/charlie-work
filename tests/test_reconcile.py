@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,12 @@ from charlie_work.file_lock import try_acquire_byte_range_lock
 from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import (
+    AVIATOR_BLOCKED_MESSAGE,
+    AVIATOR_CHECK_NAME,
     DriftItem,
     _LIST_LIMIT as reconcile_list_limit,
     apply_fixes,
+    detect_aviator_stale_blocked,
     detect_drift,
 )
 from charlie_work.state import empty_state, is_claim_stale, load_state
@@ -59,6 +63,14 @@ class FakeGitHub:
         self._rate_limit_sufficient = rate_limit_sufficient
         self._rate_limit_remaining = rate_limit_remaining
         self._rate_limit_reset = rate_limit_reset
+        # PR-scoped label tracking, distinct from the issue-scoped lists above.
+        self.pr_labels_added: list[tuple[int, str]] = []
+        self.pr_labels_removed: list[tuple[int, str]] = []
+        self._fail_add_pr_labels: set[tuple[int, str]] = set()
+        self._fail_remove_pr_labels: set[tuple[int, str]] = set()
+        # sha -> list of check-run dicts, for detect_aviator_stale_blocked.
+        self.check_runs_by_sha: dict[str, list[dict[str, Any]]] = {}
+        self.commit_check_runs_calls: list[str] = []
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         self.run_calls.append(args)
@@ -75,6 +87,18 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
         return (number, label) not in self._fail_remove_labels
+
+    def add_pr_label(self, number: int, label: str) -> bool:
+        self.pr_labels_added.append((number, label))
+        return (number, label) not in self._fail_add_pr_labels
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        self.pr_labels_removed.append((number, label))
+        return (number, label) not in self._fail_remove_pr_labels
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        self.commit_check_runs_calls.append(sha)
+        return self.check_runs_by_sha.get(sha)
 
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
@@ -2112,6 +2136,132 @@ def _write_dead_session_sidecar(
     (sessions_dir / f"issue-{issue_number}.claude.json").unlink(missing_ok=True)
 
 
+# Adapter-kind -> sidecar filename suffix. Mirrors claude_code._ADAPTER_SIDECAR_SUFFIXES
+# without importing it (keeps the test's failure surface independent of the adapter).
+_ADAPTER_SIDECAR_SUFFIX = {"devin": "", "claude-code": ".claude", "api": ".api"}
+
+
+def _write_dead_session_sidecar_for_adapter(
+    sessions_dir: Path,
+    issue_number: int,
+    branch: str,
+    worktree_path: Path,
+    adapter_kind: str,
+    log_text: str,
+) -> Path:
+    """Write a dead-session sidecar for any adapter kind, plus its log file.
+
+    Unlike ``_write_dead_session_sidecar`` (devin-only, no log content), this
+    also writes the log file with ``log_text`` so log-tail classification has
+    real bytes to match against -- required for issue #656 regression coverage
+    where the log must carry a throttle marker that *would* reclassify a
+    non-completed session.
+    """
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    suffix = _ADAPTER_SIDECAR_SUFFIX[adapter_kind]
+    sidecar_path = sessions_dir / f"issue-{issue_number}{suffix}.json"
+    if adapter_kind == "devin":
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path="/tmp/prompt.md",
+            command=("devin", "--prompt-file", "/tmp/prompt.md"),
+            pid=None,
+            started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            log_path=str(log_path),
+            error=None,
+        )
+        sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    else:
+        # claude-code / api share the ClaudeWorkerRecord on-disk shape; the
+        # ``adapter_kind`` field disambiguates them (worker._from_claude_record
+        # honors it so api sidecars surface as adapter_kind=="api").
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "worktree_path": str(worktree_path),
+                    "prompt_path": "/tmp/prompt.md",
+                    "command": ["claude", "-p"],
+                    "pid": None,
+                    "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "adapter_kind": adapter_kind,
+                }
+            ),
+            encoding="utf-8",
+        )
+    return sidecar_path
+
+
+@pytest.mark.parametrize("adapter_kind", ["devin", "claude-code", "api"])
+def test_detect_drift_completed_worktree_skips_log_tail_throttle_classification(
+    tmp_path: Path, adapter_kind: str
+) -> None:
+    """Issue #656 regression: a completed worktree's log-tail throttle markers
+    must NOT emit ``provider_throttle_detected`` drift.
+
+    This guards the three ``session_completed=True`` call sites in
+    ``reconcile.detect_drift`` (one per adapter kind). The log file is seeded
+    with ``"usage limit"`` -- a ``_QUOTA_EXHAUSTED_PATTERN`` substring that, if
+    log-tail classification ran, would return ``quota_exhausted`` plus a 24h
+    ``throttled_until`` and emit a ``provider_throttle_detected`` drift item.
+    The worktree inspection is ground truth the session completed, so
+    ``session_completed=True`` must skip log-tail matching entirely.
+
+    If ``session_completed=True`` is silently dropped from any of the three
+    call sites, this test fails: a ``provider_throttle_detected`` drift item
+    appears and the salvage drift (which proves the is_completed lane was
+    taken) is shadowed by the throttle.
+    """
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 656
+    worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    # Log tail that quotes a throttle marker in legitimate completion prose --
+    # the exact false-positive shape observed live 2026-07-27.
+    _write_dead_session_sidecar_for_adapter(
+        sessions_dir,
+        issue_number,
+        branch,
+        worktree_path,
+        adapter_kind,
+        log_text=(
+            '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") '
+            "that legitimately appear in this codebase's rate-limit/quota domain.\n"
+        ),
+    )
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config, repo_root=repo_root)
+
+    # The is_completed lane was taken: salvage drift is emitted.
+    salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == issue_number
+
+    # The throttle must NOT fire despite the "usage limit" marker in the log --
+    # session_completed=True skipped log-tail classification entirely.
+    throttle = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert not throttle, (
+        f"completed {adapter_kind} session was reclassified from log tail despite "
+        f"session_completed=True (issue #656 regression): {throttle}"
+    )
+
+
 def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> None:
     """Issue #252: dead session with clean, ahead worktree emits salvage drift."""
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -2719,3 +2869,214 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
     assert entry.issue == 55
     assert entry.provider == "example"
     assert entry.usd == pytest.approx(6.15)
+
+
+# ---------------------------------------------------------------------------
+# detect_aviator_stale_blocked (job-cannon #1387/#1400/#1398/#1392, 2026-07-27)
+# ---------------------------------------------------------------------------
+
+_AVIATOR_FAILURE_OUTPUT = {
+    "title": "Aviator checks - blocked",
+    "summary": (
+        "This PR is not ready to merge (currently in state blocked): "
+        f"{AVIATOR_BLOCKED_MESSAGE}.\n\n### Pending Status Checks\n\n* ✅ 5 tests passing!"
+    ),
+}
+
+
+def _aviator_check_run(
+    conclusion: str | None, output: dict[str, Any] | None = None, *, run_id: int = 1
+) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": AVIATOR_CHECK_NAME,
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        "output": output or {},
+    }
+
+
+def _passing_check_run(name: str, *, run_id: int) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": "completed",
+        "conclusion": "success",
+        "output": {},
+    }
+
+
+def test_detect_aviator_stale_blocked_finds_stale_blocked_pr() -> None:
+    config = OrchestratorConfig()
+    pr = {**_pr(1400, "OPEN"), "headRefOid": "sha-1400", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1400"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+        _passing_check_run("Pre-commit", run_id=3),
+    ]
+
+    drift = detect_aviator_stale_blocked(gh, config)
+
+    assert len(drift) == 1
+    item = drift[0]
+    assert item.kind == "aviator_stale_blocked"
+    assert item.pr_number == 1400
+    assert item.remove_labels == ("blocked",)
+    if config.auto_merge.mergequeue_label:
+        assert item.add_labels == (config.auto_merge.mergequeue_label,)
+    assert gh.commit_check_runs_calls == ["sha-1400"]
+
+
+def test_detect_aviator_stale_blocked_ignores_pending_aviator_check() -> None:
+    """Aviator still queued (not failed) is the normal, non-stale state."""
+    config = OrchestratorConfig()
+    pr = {**_pr(1, "OPEN"), "headRefOid": "sha-1", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1"] = [
+        _aviator_check_run(None, run_id=1),  # in_progress, no conclusion yet
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_aviator_stale_blocked(gh, config) == []
+
+
+def test_detect_aviator_stale_blocked_ignores_real_check_failure() -> None:
+    """A real CI failure alongside `blocked` must NOT be cleared -- #1329's shape."""
+    config = OrchestratorConfig()
+    pr = {**_pr(2, "OPEN"), "headRefOid": "sha-2", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-2"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        {
+            "id": 2,
+            "name": "Tests passed",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {},
+        },
+    ]
+
+    assert detect_aviator_stale_blocked(gh, config) == []
+
+
+def test_detect_aviator_stale_blocked_ignores_unrelated_aviator_failure_message() -> None:
+    """aviator/checks can fail for other reasons -- only the specific stale
+    'remove the blocked label' message is safe to auto-clear."""
+    config = OrchestratorConfig()
+    pr = {**_pr(3, "OPEN"), "headRefOid": "sha-3", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-3"] = [
+        _aviator_check_run("failure", {"summary": "merge conflict with base branch"}, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_aviator_stale_blocked(gh, config) == []
+
+
+def test_detect_aviator_stale_blocked_skips_gh_calls_when_not_blocked() -> None:
+    """Cost gate: commit_check_runs must only be called for blocked-labeled PRs."""
+    config = OrchestratorConfig()
+    prs = [{**_pr(n, "OPEN"), "headRefOid": f"sha-{n}"} for n in range(1, 6)]
+    gh = FakeGitHub(prs=prs, issues=[])
+
+    assert detect_aviator_stale_blocked(gh, config) == []
+    assert gh.commit_check_runs_calls == []
+
+
+def test_detect_aviator_stale_blocked_uses_latest_check_run_by_id() -> None:
+    """A rerun leaves stale AND fresh entries for the same name -- the higher
+    id (most recent) must win, not list order."""
+    config = OrchestratorConfig()
+    pr = {**_pr(4, "OPEN"), "headRefOid": "sha-4", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-4"] = [
+        # Stale failing run for "Tests passed" listed AFTER its fresh success --
+        # order must not matter, only id.
+        _passing_check_run("Tests passed", run_id=10),
+        {
+            "id": 5,
+            "name": "Tests passed",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {},
+        },
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+    ]
+
+    drift = detect_aviator_stale_blocked(gh, config)
+    assert len(drift) == 1
+    assert drift[0].pr_number == 4
+
+
+def test_detect_aviator_stale_blocked_no_readd_when_mergequeue_already_present() -> None:
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    pr = {
+        **_pr(5, "OPEN"),
+        "headRefOid": "sha-5",
+        "labels": [{"name": "blocked"}, {"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-5"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_aviator_stale_blocked(gh, config)
+    assert len(drift) == 1
+    assert drift[0].add_labels == ()
+
+
+def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -> None:
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="aviator_stale_blocked",
+            issue_number=None,
+            pr_number=1400,
+            detail="PR #1400 has a stale Aviator 'blocked' label",
+            fix_actions=("remove label 'blocked' from PR #1400",),
+            remove_labels=("blocked",),
+            add_labels=(mergequeue_label,),
+        )
+    ]
+
+    apply_fixes(gh, state, drift, config)
+
+    assert gh.pr_labels_removed == [(1400, "blocked")]
+    assert gh.pr_labels_added == [(1400, mergequeue_label)]
+
+
+def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None:
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    gh._fail_remove_pr_labels = {(1400, "blocked")}
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="aviator_stale_blocked",
+            issue_number=None,
+            pr_number=1400,
+            detail="PR #1400 has a stale Aviator 'blocked' label",
+            fix_actions=("remove label 'blocked' from PR #1400",),
+            remove_labels=("blocked",),
+            add_labels=(),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
+    )

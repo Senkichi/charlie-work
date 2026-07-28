@@ -34,6 +34,8 @@ $required_changes_section
 - Re-run verification and update the PR body or comment with results.
 - If you disagree with a finding, explain with evidence in the PR instead of ignoring it.
 
+$section_no_merge_contract
+
 ## Done condition
 
 You are done only when the existing PR has new commits addressing the review and the PR includes updated verification evidence.

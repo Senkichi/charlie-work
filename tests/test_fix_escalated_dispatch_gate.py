@@ -33,6 +33,7 @@ test_charlie_work.py (PR #566/#507 review-reaper fixtures).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from test_charlie_work import (
     _dispatch_reviews_app,
     _make_dead_review_sidecar,
     _set_review_dispatched_state,
+    _write_review_events,
     _write_review_packet,
 )
 
@@ -256,11 +258,19 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
-def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path: Path) -> None:
-    """Regression guard for the other missed-append site: a dead reviewer with
-    no parseable verdict (turn-limit path) must also emit
-    review_verdict_missed, matching test_charlie_work.py's
-    test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper."""
+def test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer that died before its first turn must not be labelled a
+    turn-limit death (issue #588).
+
+    The fixture is the real shape of the 2026-07-22 outage: no events sidecar
+    at all, and a log holding only the process's own error text. Zero turns and
+    zero tool calls means the session never ran, so its death is environmental
+    and says nothing about this PR. Reporting it as ``turn_limit_summary_posted``
+    pointed every diagnostic at ``review_max_turns`` for 25 hours while the
+    actual cause was a rejected argv.
+    """
     from datetime import UTC, datetime, timedelta
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
@@ -268,7 +278,59 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
     reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(
+        reviews_dir,
+        100,
+        "Error: When using --print, --output-format=stream-json requires --verbose",
+    )
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    # The miss is still reported -- only its classification changes.
+    assert len(result["missed"]) == 1
+    assert result["missed"][0]["reason"] == "launch_failed"
+
+    state = load_state(app.paths.state_file)
+    missed_events = _events(state, "review_verdict_missed")
+    assert len(missed_events) == 1
+    assert missed_events[0]["payload"] == {
+        "pr_number": 100,
+        "issue_number": 10,
+        "reason": "launch_failed",
+        "turn_count": 0,
+        "tool_call_count": 0,
+    }
+
+    # The turn-limit marker gates two downstream behaviours: #584 counts it as
+    # a turn-limit death, and the provider-throttle sweep reads it to deny a
+    # rollback (#583). A session that never ran must set neither.
+    pr_state = state["prs"]["100"]
+    assert pr_state.get("review_turn_limit_summary_posted") is False
+    assert pr_state.get("review_miss_summary_posted") is True
+
+
+def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path: Path) -> None:
+    """Regression guard for the other missed-append site: a dead reviewer with
+    no parseable verdict (turn-limit path) must also emit
+    review_verdict_missed, matching test_charlie_work.py's
+    test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper.
+
+    Unlike the launch-failure case above, this session genuinely exhausted its
+    turn budget, so it keeps the ``turn_limit_summary_posted`` reason and sets
+    the marker that denies the provider-throttle rollback."""
+    from datetime import UTC, datetime, timedelta
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    max_turns = app.config.review_dispatch.review_max_turns
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    _write_review_events(reviews_dir, 100, turns=max_turns, tool_calls=3)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
     monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
@@ -285,4 +347,275 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
         "pr_number": 100,
         "issue_number": 10,
         "reason": "turn_limit_summary_posted",
+        "turn_count": max_turns,
+        "tool_call_count": 3,
     }
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
+
+
+def test_reap_review_verdicts_death_after_partial_work_is_its_own_bucket(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer that did real work but died short of the turn cap is neither
+    a launch failure nor a turn-limit death (issue #588)."""
+    from datetime import UTC, datetime, timedelta
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
+    _write_review_events(reviews_dir, 100, turns=3, tool_calls=2)
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["missed"][0]["reason"] == "died_mid_session"
+    state = load_state(app.paths.state_file)
+    # It did substantial work, so the throttle-rollback denial still applies.
+    assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
+
+
+# Claude Code's account-level session-limit notice, verbatim as observed
+# 2026-07-21 (see RuntimeConfig.session_limit_markers). Distinct from the
+# "rate limit"/"usage limit" phrasings and the --verbose argv crash covered by
+# test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit above.
+_SESSION_LIMIT_NOTICE = "You've hit your session limit \u00b7 resets 4:40pm (America/Los_Angeles)"
+
+
+def _session_limit_jsonl() -> str:
+    """The stream-json JSONL line for a session-limit-notice death.
+
+    ``parse_claude_events`` counts this assistant event as one turn but zero
+    tool calls -- the exact shape that defeated the #583 rollback guard before
+    issue #651 (the notice is counted as a turn, so it failed the
+    ``turn_count == 0 and tool_call_count == 0`` launch-failure check and fell
+    through to ``died_mid_session``).
+    """
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": _SESSION_LIMIT_NOTICE}]},
+            }
+        )
+        + "\n"
+    )
+
+
+def _write_session_limit_events(reviews_dir: Path, pr_number: int) -> Path:
+    """Write an events sidecar for a reviewer that died on the session-limit notice.
+
+    ``parse_claude_events`` counts the notice's assistant event as one turn but
+    zero tool calls -- the exact shape that defeated the #583 rollback guard
+    before issue #651 (the notice is counted as a turn, so it failed the
+    ``turn_count == 0 and tool_call_count == 0`` launch-failure check and fell
+    through to ``died_mid_session``).
+    """
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    events_path = reviews_dir / f"issue-{pr_number}-review.events.jsonl"
+    events_path.write_text(_session_limit_jsonl(), encoding="utf-8")
+    return events_path
+
+
+def test_reap_review_verdicts_session_limit_notice_is_launch_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer whose only output is the session-limit notice must be classified
+    as a launch failure, not ``died_mid_session`` (issue #651).
+
+    The notice gets counted as one turn by ``parse_claude_events`` (turn_count=1,
+    tool_call_count=0), so before this fix it failed the
+    ``turn_count == 0 and tool_call_count == 0`` check and fell through to
+    ``REVIEW_MISS_DIED_MID_SESSION``. That made ``did_substantial_work`` True,
+    persisting ``review_turn_limit_summary_posted=True`` and silently defeating
+    the #583 throttle-rollback guard: a global session-limit outage burned a PR's
+    ``review_dispatch_attempt_count`` budget with zero actual review work, eventually
+    tripping ``max_review_dispatch_attempts_exceeded`` on a PR that was never really
+    reviewed.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+
+    old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    # Reviewer launches force tee_stream_json=True, so log_path and events_path
+    # are byte-identical in production (issue #652 review). Write the same JSONL
+    # to both: _make_dead_review_sidecar creates the .claude.json sidecar and
+    # writes log_text to the log, then _write_session_limit_events writes the
+    # events sidecar. Passing the JSONL as log_text makes the log byte-identical
+    # to the events file.
+    _make_dead_review_sidecar(reviews_dir, 100, _session_limit_jsonl())
+    _write_session_limit_events(reviews_dir, 100)
+    _set_review_dispatched_state(app, 100, 10, old_dispatched)
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert len(result["missed"]) == 1
+    assert result["missed"][0]["reason"] == "launch_failed"
+
+    state = load_state(app.paths.state_file)
+    missed_events = _events(state, "review_verdict_missed")
+    assert len(missed_events) == 1
+    assert missed_events[0]["payload"] == {
+        "pr_number": 100,
+        "issue_number": 10,
+        "reason": "launch_failed",
+        "turn_count": 1,
+        "tool_call_count": 0,
+    }
+
+    # did_substantial_work is False, so the #583 rollback guard actually fires:
+    # the turn-limit marker must NOT be set, otherwise the throttle sweep takes
+    # the counted-failure path and consumes the attempt budget for zero work.
+    pr_state = state["prs"]["100"]
+    assert pr_state.get("review_turn_limit_summary_posted") is False
+    assert pr_state.get("review_miss_summary_posted") is True
+
+
+def test_extract_review_session_summary_session_limit_notice_no_substantial_work(
+    tmp_path: Path,
+) -> None:
+    """Direct unit test for issue #651: a session-limit-notice session with
+    turn_count=1, tool_call_count=0 must report ``did_substantial_work=False``
+    so the #583 rollback guard fires, regardless of turn_count.
+
+    Reviewer launches force ``tee_stream_json=True``, so log_path and
+    events_path are byte-identical in production (issue #652 review). This test
+    writes the same JSONL to both files, exercising the real code path.
+    """
+    from charlie_work.workflow import _extract_review_session_summary
+
+    line = _session_limit_jsonl()
+    events_path = tmp_path / "issue-100-review.events.jsonl"
+    log_path = tmp_path / "issue-100-review.claude.log"
+    events_path.write_text(line, encoding="utf-8")
+    log_path.write_text(line, encoding="utf-8")
+
+    outcome = _extract_review_session_summary(events_path, log_path, max_turns=20)
+
+    assert outcome is not None
+    assert outcome.turn_count == 1
+    assert outcome.tool_call_count == 0
+    assert outcome.reason == "launch_failed"
+    assert outcome.did_substantial_work is False
+
+
+def test_extract_review_session_summary_substantial_work_with_session_limit_marker_in_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Regression for #652 review finding: a session that did real review work
+    (tool calls) must NEVER be reclassified as a launch failure, even when its
+    raw log tail genuinely contains the specific session-limit marker.
+
+    The ``tool_call_count == 0`` guard is the boundary that protects
+    substantial-work sessions: a session-limit notice on the final API call
+    after real review work is a PR-level outcome (``died_mid_session``), not an
+    environmental launch failure. Without the guard, a session that reviewed
+    several files then died on a "hit your session limit" notice would be
+    silently reclassified as ``launch_failed``, defeating the #583 rollback
+    guard this reclassification exists to protect.
+
+    Uses the SPECIFIC session-limit marker ("hit your session limit") in the
+    log tail so the ``tool_call_count == 0`` guard is what's actually tested --
+    not the marker narrowness. log_path and events_path are byte-identical
+    (tee_stream_json=True in production, issue #652 review).
+    """
+    from charlie_work.workflow import _extract_review_session_summary
+
+    # A session that did real work: 3 turns, 2 tool calls (read files). Its
+    # final assistant event carries the session-limit notice -- the CLI hit
+    # the session limit on its final API call after doing the review work.
+    lines: list[str] = []
+    for index in range(3):
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": f"Analysis step {index + 1}: reviewing the changes.",
+            }
+        ]
+        if index < 2:
+            content.append({"type": "tool_use", "id": f"t{index}", "name": "Read", "input": {}})
+        if index == 2:
+            content[0]["text"] = _SESSION_LIMIT_NOTICE
+        lines.append(json.dumps({"type": "assistant", "message": {"content": content}}))
+    jsonl = "\n".join(lines) + "\n"
+    events_path = tmp_path / "issue-100-review.events.jsonl"
+    log_path = tmp_path / "issue-100-review.claude.log"
+    events_path.write_text(jsonl, encoding="utf-8")
+    log_path.write_text(jsonl, encoding="utf-8")
+
+    outcome = _extract_review_session_summary(events_path, log_path, max_turns=20)
+
+    assert outcome is not None
+    assert outcome.turn_count == 3
+    assert outcome.tool_call_count == 2
+    # Substantial work (tool calls) => died_mid_session, NOT launch_failed,
+    # even though the log tail contains the "hit your session limit" marker.
+    assert outcome.reason == "died_mid_session"
+    assert outcome.did_substantial_work is True
+
+
+def test_extract_review_session_summary_generic_marker_in_review_commentary_not_reclassified(
+    tmp_path: Path,
+) -> None:
+    """Regression for #652 review finding: a session with ``tool_call_count == 0``
+    whose assistant text contains a GENERIC throttle marker ("rate limit" --
+    legitimate review commentary in this codebase's rate-limit/quota domain)
+    must NOT be reclassified as a launch failure.
+
+    The reclassification matches only the NARROW ``session_limit_markers``
+    (specific CLI death-message phrasing like "hit your session limit"), NOT
+    the broad ``throttle_error_markers``. Reviewer launches force
+    ``tee_stream_json=True``, so log_path and events_path are byte-identical --
+    the raw log tail IS the events content, so matching the raw tail does not
+    avoid matching the reviewer's own parsed assistant text (issue #652 review).
+    The false-positive protection comes from the narrow marker list, not from
+    the raw-vs-parsed distinction. This test uses byte-identical content so the
+    generic marker is present in BOTH the log tail and the parsed assistant
+    text, exercising the real production code path.
+    """
+    from charlie_work.workflow import _extract_review_session_summary
+
+    # tool_call_count == 0 (no tool use blocks), and the assistant text
+    # mentions "rate limit" as legitimate review commentary. The text does NOT
+    # contain the specific "hit your session limit" marker. log_path and
+    # events_path are byte-identical (tee_stream_json=True in production).
+    line = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "This PR adjusts the rate limit config in config.py.",
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    events_path = tmp_path / "issue-100-review.events.jsonl"
+    log_path = tmp_path / "issue-100-review.claude.log"
+    events_path.write_text(line, encoding="utf-8")
+    log_path.write_text(line, encoding="utf-8")
+
+    outcome = _extract_review_session_summary(events_path, log_path, max_turns=20)
+
+    assert outcome is not None
+    assert outcome.turn_count == 1
+    assert outcome.tool_call_count == 0
+    # "rate limit" is a generic throttle_error_marker, NOT a session_limit_marker,
+    # so this is NOT a launch failure even though the marker is present in both
+    # the log tail and the parsed assistant text.
+    assert outcome.reason == "died_mid_session"
+    assert outcome.did_substantial_work is True

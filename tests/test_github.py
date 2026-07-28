@@ -324,7 +324,11 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "number": 1,
             "title": "x",
             "body": "",
-            "head": {"ref": "agent/issue-1-x", "repo": {"full_name": "owner/repo"}},
+            "head": {
+                "ref": "agent/issue-1-x",
+                "sha": "aaaa1111",
+                "repo": {"full_name": "owner/repo"},
+            },
             "base": {"repo": {"full_name": "owner/repo"}},
             "merged_at": "2026-07-21T20:00:00Z",
             "state": "closed",
@@ -366,6 +370,7 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "headRefName": "agent/issue-1-x",
             "isCrossRepository": False,
             "state": "MERGED",
+            "headRefOid": "aaaa1111",
         }
     ]
     assert pull_call_count >= 1
@@ -629,3 +634,156 @@ def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> No
     result = gh.compare_diff("sha-old", "sha-new")
 
     assert result is None
+
+
+# --- merged-PR field contract: the REST normalizer must reproduce exactly the
+# key set that merged_prs_for_issue() gets from `gh pr list --json`. These are
+# two independent producers of the same value shape; when they drift, consumers
+# reading a field the normalizer forgot silently see None on the REST path
+# (which is the only path merged_pr_list() uses) while every FakeGitHub-based
+# test keeps passing, because those fixtures hand-write the richer shape.
+
+
+def test_normalize_rest_pr_satisfies_merged_pr_list_field_contract() -> None:
+    """_normalize_rest_pr() must emit exactly MERGED_PR_LIST_FIELDS.
+
+    The constant is the single source of truth for the merged-PR shape; this
+    asserts the REST path honors it rather than restating the field list, so
+    adding a field to the contract forces the normalizer to supply it.
+    """
+    expected: set[str] = set(github_module.MERGED_PR_LIST_FIELDS.split(","))
+
+    gh = github_module.GitHub(Path("."))
+    normalized = gh._normalize_rest_pr(
+        {
+            "number": 501,
+            "title": "fix: something",
+            "body": "Closes #494",
+            "merged_at": "2026-07-20T20:19:07Z",
+            "head": {
+                "ref": "agent/issue-494-fix-something",
+                "sha": "27a20fbdc0ffee0123456789abcdef0123456789",
+                "repo": {"full_name": "Senkichi/charlie-work"},
+            },
+            "base": {"repo": {"full_name": "Senkichi/charlie-work"}},
+        }
+    )
+
+    assert set(normalized) == expected, (
+        "REST normalizer drifted from MERGED_PR_LIST_FIELDS: "
+        f"missing={sorted(expected - set(normalized))} "
+        f"extra={sorted(set(normalized) - expected)}"
+    )
+
+
+def test_normalize_rest_pr_maps_head_sha_to_head_ref_oid() -> None:
+    """REST spells the merged head OID `head.sha`; consumers read gh's GraphQL
+    name `headRefOid`. Post-merge audits use it to prove *which* commit was
+    merged, so a None here silently defeats any approved-SHA comparison."""
+    gh = github_module.GitHub(Path("."))
+
+    normalized = gh._normalize_rest_pr(
+        {
+            "number": 1,
+            "head": {"ref": "topic", "sha": "deadbeef", "repo": {"full_name": "o/r"}},
+            "base": {"repo": {"full_name": "o/r"}},
+        }
+    )
+
+    assert normalized["headRefOid"] == "deadbeef"
+
+
+def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: Path) -> None:
+    """The full REST path — not just the normalizer — must surface headRefOid,
+    since merged_pr_list() is REST-only by construction (issue #361)."""
+    page = [
+        {
+            "number": 501,
+            "title": "fix: something",
+            "body": "",
+            "merged_at": "2026-07-20T20:19:07Z",
+            "head": {"ref": "agent/issue-494", "sha": "27a20fbd", "repo": {"full_name": "o/r"}},
+            "base": {"repo": {"full_name": "o/r"}},
+        }
+    ]
+    responses = [json.dumps(page), "[]"]
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    merged = gh.merged_pr_list()
+
+    assert len(merged) == 1
+    assert merged[0]["headRefOid"] == "27a20fbd"
+
+
+def test_commit_check_runs_wraps_rest_endpoint(monkeypatch, tmp_path: Path) -> None:
+    """reconcile.py's aviator_stale_blocked detection needs output.summary,
+    which gh pr checks --json cannot surface (its description field is always
+    empty for App-created Check Runs) -- this is the only path that can."""
+    payload = {
+        "check_runs": [
+            {
+                "id": 90085390042,
+                "name": "aviator/checks",
+                "status": "completed",
+                "conclusion": "failure",
+                "output": {
+                    "title": "Aviator checks - blocked",
+                    "summary": (
+                        "This PR is not ready to merge (currently in state blocked): "
+                        "PR has a blocked label, remove to re-queue."
+                    ),
+                },
+            }
+        ]
+    }
+
+    def fake_run(cmd, *args, **kwargs):
+        assert cmd[:2] == ["gh", "api"]
+        assert cmd[2] == "repos/{owner}/{repo}/commits/abc123/check-runs"
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    check_runs = gh.commit_check_runs("abc123")
+
+    assert check_runs is not None
+    assert check_runs[0]["name"] == "aviator/checks"
+    assert check_runs[0]["conclusion"] == "failure"
+    assert "blocked label" in check_runs[0]["output"]["summary"]
+
+
+def test_commit_check_runs_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    assert gh.commit_check_runs("missing-sha") is None
+
+
+def test_remove_pr_label_invokes_gh_pr_edit(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    ok = gh.remove_pr_label(1400, "blocked")
+
+    assert ok is True
+    assert calls[-1][:5] == ["gh", "pr", "edit", "1400", "--remove-label"]
+    assert calls[-1][5] == "blocked"

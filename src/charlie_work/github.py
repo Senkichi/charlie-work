@@ -40,14 +40,25 @@ ISSUE_VIEW_FIELDS = (
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
-# merged_pr_list() only feeds workflow._merged_pr_referenced_issue_numbers(),
-# which (via linked_issue_number()/issue_numbers_mentioned_by_pr()) reads
-# exactly these 6 fields. Deliberately narrower than PR_LIST_FIELDS: merged
-# PRs don't need current CI/review/label state, and `statusCheckRollup` in
-# particular forces gh's GraphQL query to walk each PR's check-run
-# connection — expensive across up to 500 merged PRs and the cause of
-# intermittent gateway 502s on this query (issue #361).
-MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state"
+# The field contract for every merged-PR listing. Two producers must satisfy
+# it identically: merged_prs_for_issue() queries these fields directly, and
+# merged_pr_list() goes through the REST endpoint and must reproduce this exact
+# key set via _normalize_rest_pr() (enforced by
+# test_normalize_rest_pr_satisfies_merged_pr_list_field_contract).
+#
+# Consumers: workflow._merged_pr_referenced_issue_numbers() (via
+# linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
+# branch fields; post-merge audit paths additionally need `headRefOid` to tell
+# *which commit* was merged, not merely that a merge happened.
+#
+# Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
+# CI/review/label state, and `statusCheckRollup` in particular forces gh's
+# GraphQL query to walk each PR's check-run connection — expensive across up to
+# 500 merged PRs and the cause of intermittent gateway 502s on this query
+# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
+# object, and on the REST path it is already present in the payload as
+# head.sha, so adding it costs neither an extra request nor a graph walk.
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -63,8 +74,12 @@ MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state"
 PR_CHECKS_FIELDS = "name,state,bucket,link"
 LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
+# headRefOid is a plain scalar (like state/title) -- NOT a per-item graph walk
+# like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
+# safe to include unconditionally. Needed by detect_aviator_stale_blocked's
+# commit_check_runs(sha) lookup.
 RECONCILE_PR_FIELDS = (
-    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository"
+    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid"
 )
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
@@ -220,6 +235,10 @@ class GitHub:
             "headRefName": head.get("ref"),
             "isCrossRepository": is_cross_repository,
             "state": "MERGED",
+            # REST spells the head OID `head.sha`; consumers expect gh's
+            # GraphQL name. Without this mapping every consumer reading
+            # headRefOid off a merged PR silently sees None.
+            "headRefOid": head.get("sha"),
         }
 
     def run(
@@ -734,6 +753,30 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        """Fetch the GitHub Check Runs attached to a commit SHA.
+
+        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}/check-runs`` and
+        returns its ``check_runs`` array, or ``None`` on failure. Distinct
+        from ``pr_checks()``/``PR_CHECKS_FIELDS``: ``gh pr checks --json``
+        exposes only Commit-Status-shaped fields (its ``description`` field
+        is always empty for App-created Check Runs like Aviator's
+        ``aviator/checks`` -- Check Runs carry their message in
+        ``output.summary``/``output.title`` instead, which ``gh pr checks``
+        does not surface at all). This is the only way to read that message.
+        Errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+        if not isinstance(value, dict):
+            return None
+        check_runs = value.get("check_runs")
+        return check_runs if isinstance(check_runs, list) else None
+
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         """Compare two commits and return the comparison metadata.
 
@@ -876,6 +919,15 @@ class GitHub:
         label is already present) and never raises — see ``_run_bool``.
         """
         return self._run_bool(["pr", "edit", str(number), "--add-label", label])
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        """Remove a label from a PR (PR-scoped, not the linked issue).
+
+        Mirrors ``add_pr_label``. Used to clear Aviator's ``blocked`` label
+        once it has gone stale (reconcile.py's ``aviator_stale_blocked`` drift
+        kind). Idempotent and never raises — see ``_run_bool``.
+        """
+        return self._run_bool(["pr", "edit", str(number), "--remove-label", label])
 
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.

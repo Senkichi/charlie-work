@@ -209,6 +209,7 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
         "issue_number": 123,
         "dispatch_note": "Fix the typo in the search function.",
         "required_changes_section": "",
+        "branch_name": "agent/issue-123-fix-search",
     }
     # The rework.md template is in the package prompts dir, not repo-local
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
@@ -439,6 +440,21 @@ def test_worker_prompts_require_body_checklist_revalidation() -> None:
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         prompt = _render_worker_with_sections(template_name)
         assert "including the checklist" in prompt
+
+
+def test_worker_prompts_contain_no_merge_contract() -> None:
+    """Verify that worker prompts carry the no-merge contract (issue #502)."""
+    sections = section_variables()
+    assert "section_no_merge_contract" in sections
+    contract = sections["section_no_merge_contract"]
+    assert "Your deliverable ENDS at pushing the branch and opening the PR" in contract
+    assert "gh pr merge" in contract
+    assert "never" in contract.lower()
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "## No-merge contract" in prompt
+        assert "Your deliverable ENDS at pushing the branch and opening the PR" in prompt
 
 
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:

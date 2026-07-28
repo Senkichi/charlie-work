@@ -79,7 +79,12 @@ from .janitor import (
 from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths
 from .prompts import render_prompt
-from .reconcile import DriftItem, apply_fixes as apply_drift_fixes, detect_drift
+from .reconcile import (
+    DriftItem,
+    apply_fixes as apply_drift_fixes,
+    detect_aviator_stale_blocked,
+    detect_drift,
+)
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -1701,12 +1706,103 @@ def _reviewer_session_metrics(events_path: Path, verdict_source: str) -> dict[st
     }
 
 
+# Why a reviewer session ended without a structured verdict. These are the
+# ``reason`` values on ``review_verdict_missed`` events; they have disjoint
+# remediations, so collapsing them into one label points every diagnostic at
+# the wrong fix (issue #588).
+REVIEW_MISS_TURN_LIMIT = "turn_limit_summary_posted"
+REVIEW_MISS_LAUNCH_FAILED = "launch_failed"
+REVIEW_MISS_DIED_MID_SESSION = "died_mid_session"
+
+# Default markers for _extract_review_session_summary's session-limit
+# reclassification (issue #651/#652). These are the NARROW
+# RuntimeConfig.session_limit_markers, NOT the broad throttle_error_markers:
+# reviewer launches force tee_stream_json=True (claude_code.py), making
+# log_path and events_path byte-identical, so any marker matched against the
+# log tail is also present in the parsed assistant text. The generic markers
+# in throttle_error_markers ("rate limit", "usage limit") legitimately appear
+# in this codebase's rate-limit/quota domain review commentary and would
+# false-positive on real review work. session_limit_markers contains only the
+# CLI's own specific session-limit death message phrasing, which is safe to
+# match against reviewer text. Callers pass their config's list explicitly so
+# a new session-limit phrasing only needs a config change.
+_DEFAULT_REVIEW_SESSION_LIMIT_MARKERS = OrchestratorConfig().runtime.session_limit_markers
+
+# Tail length for the raw-log session-limit match in _extract_review_session_summary.
+# Mirrors the 2048-char tail used by the stalled-session sweep (the
+# ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call in
+# _handle_stalled_review_sessions): the CLI prints its session-limit notice at
+# the very end of the log, so the tail isolates the death message from the
+# multi-turn analysis prose earlier in the log.
+_REVIEW_THROTTLE_TAIL_CHARS = 2048
+
+
+def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
+    """Return True when the raw process log's tail contains a session-limit marker.
+
+    Reads the last ``_REVIEW_THROTTLE_TAIL_CHARS`` chars of ``log_path`` and
+    matches against ``markers`` via ``match_throttle_tail``. This is the same
+    raw-log-tail boundary the stalled-session sweep uses (the
+    ``log_text[-2048:]`` slice at the ``Path(w.log_path).read_text(...)`` call
+    in ``_handle_stalled_review_sessions``). Missing or unreadable logs do not
+    match.
+
+    Note (issue #652 review): because reviewer launches force
+    ``tee_stream_json=True``, ``log_path`` and ``events_path`` are
+    byte-identical — the raw log tail IS the events content, so matching
+    against the raw tail does NOT avoid matching the reviewer's own parsed
+    assistant text. The false-positive protection comes from the NARROW
+    ``session_limit_markers`` list (specific CLI death-message phrasing, not
+    generic domain terms), not from the raw-vs-parsed distinction. The
+    ``tool_call_count == 0`` guard in the caller is defense-in-depth.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not log_text:
+        return False
+    if len(log_text) > _REVIEW_THROTTLE_TAIL_CHARS:
+        tail = log_text[-_REVIEW_THROTTLE_TAIL_CHARS:]
+    else:
+        tail = log_text
+    return match_throttle_tail(tail, markers)[0]
+
+
+# state.json key holding the one-time record of worker-PR merges that predate the
+# #502 post-merge tripwire. Named here rather than inlined so the arming logic and
+# the tests that pre-arm it cannot drift apart on a string literal.
+UNAUTHORIZED_MERGE_BASELINE_KEY = "unauthorized_merge_baseline"
+
+
+@dataclass(frozen=True)
+class ReviewSessionOutcome:
+    """A reviewer session that ended without producing a structured verdict.
+
+    ``did_substantial_work`` is the distinction that matters downstream: a
+    session that completed turns and then died is a PR-level outcome (the
+    review didn't fit its budget), while one that never reached its first turn
+    is an environmental failure that says nothing about the PR.
+    """
+
+    text: str
+    reason: str
+    turn_count: int
+    tool_call_count: int
+
+    @property
+    def did_substantial_work(self) -> bool:
+        return self.reason != REVIEW_MISS_LAUNCH_FAILED
+
+
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
     max_turns: int,
-) -> str | None:
-    """Extract a markdown summary of a reviewer session that produced no verdict.
+    *,
+    session_limit_markers: Sequence[str] | None = None,
+) -> ReviewSessionOutcome | None:
+    """Summarize and classify a reviewer session that produced no verdict.
 
     When a reviewer hits the ``--max-turns`` limit (or dies for any other
     reason after doing substantial work), the structured verdict block is
@@ -1714,9 +1810,50 @@ def _extract_review_session_summary(
     tool-call metrics. This function reconstructs a human-readable summary
     from those events so the work is not silently lost.
 
-    Returns a markdown string suitable for a PR comment, or ``None`` if the
-    events file is missing or contains no assistant messages (nothing to
-    summarize).
+    It also classifies *why* the verdict is missing. A session that never
+    reached its first turn did not hit a turn limit -- it never ran -- and the
+    text recovered from its log is the process's own error output, not
+    analysis. Reporting the two identically hid a 25-hour outage in which 19
+    reviewers died on a rejected argv while every signal said "turn limit"
+    (issue #588).
+
+    A session whose only output is a provider session-limit notice (e.g.
+    Claude Code's "hit your session limit") is also environmental, not a
+    PR-level outcome: ``parse_claude_events`` counts that notice as one turn,
+    so it fails the ``turn_count == 0`` check and would otherwise fall through
+    to ``REVIEW_MISS_DIED_MID_SESSION`` -- the same bucket as a session that
+    genuinely did substantial review work. That misclassification silently
+    defeats the #583 throttle-rollback guard (``did_substantial_work`` reads
+    ``reason != REVIEW_MISS_LAUNCH_FAILED`` and is persisted as
+    ``review_turn_limit_summary_posted``), letting a global session-limit
+    outage burn a PR's ``review_dispatch_attempt_count`` budget with zero
+    actual review work performed (issue #651). When the raw process log's tail
+    matches a session-limit marker AND the session made no tool calls, classify
+    as ``REVIEW_MISS_LAUNCH_FAILED`` so the rollback guard fires.
+
+    The match is against the raw process log tail (last 2048 chars), mirroring
+    the stalled-session sweep pattern at the ``log_text =
+    Path(w.log_path).read_text(...)`` call below. Because reviewer launches
+    force ``tee_stream_json=True`` (claude_code.py), ``log_path`` and
+    ``events_path`` are byte-identical -- the raw log tail IS the events
+    content, so matching against the raw tail does NOT avoid matching the
+    reviewer's own parsed assistant text (issue #652 review). The
+    false-positive protection comes from the NARROW
+    ``session_limit_markers`` list (specific CLI death-message phrasing like
+    "hit your session limit", NOT generic domain terms like "rate limit" /
+    "usage limit" that legitimately appear in this codebase's rate-limit/quota
+    review commentary), and the ``tool_call_count == 0`` guard ensures a
+    session that made any tool calls (real review actions) is never
+    reclassified regardless of what the tail contains.
+
+    ``session_limit_markers`` defaults to
+    ``RuntimeConfig.session_limit_markers`` so the marker list stays
+    config-driven (single point of enforcement in
+    ``throttle_signatures.match_throttle_tail``); callers pass their config's
+    list explicitly.
+
+    Returns ``None`` if the events file is missing and the log contains no
+    recoverable text (nothing to summarize).
     """
     progress = parse_claude_events(events_path)
     # Also try the plaintext log as a fallback for assistant text.
@@ -1759,26 +1896,81 @@ def _extract_review_session_summary(
     tokens = progress.tokens if progress else None
     cost_usd = progress.cost_usd if progress else None
 
-    parts: list[str] = [
-        "## Reviewer session summary (no verdict produced)\n",
-    ]
-    if max_turns > 0 and turn_count >= max_turns:
-        parts.append(
-            f"The automated reviewer hit the {max_turns}-turn limit before "
-            f"producing a structured verdict.\n"
-        )
-    elif turn_count > 0:
-        parts.append(
-            f"The automated reviewer ran for {turn_count} turns "
-            f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
-        )
-    else:
-        parts.append("The automated reviewer did not produce a structured verdict.\n")
+    markers = (
+        session_limit_markers
+        if session_limit_markers is not None
+        else _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS
+    )
 
-    # Include the last few assistant messages — earlier turns are usually
-    # tool-use planning; the final messages contain the analysis.
+    # A session with no turns and no tool calls never reached its first turn:
+    # the process died at launch and whatever text we recovered is its error
+    # output, not reviewer analysis.
+    if turn_count == 0 and tool_call_count == 0:
+        reason = REVIEW_MISS_LAUNCH_FAILED
+    elif max_turns > 0 and turn_count >= max_turns:
+        reason = REVIEW_MISS_TURN_LIMIT
+    elif tool_call_count == 0 and _log_tail_throttled(log_path, markers):
+        # A session that made no tool calls but whose raw process log tail
+        # contains a provider session-limit notice (e.g. "hit your session
+        # limit") died on the notice, not after review work. The notice
+        # gets counted as one turn by parse_claude_events, so it fails the
+        # turn_count == 0 check above and would fall through to
+        # REVIEW_MISS_DIED_MID_SESSION -- the same bucket as a session that
+        # genuinely did substantial review work. That misclassification silently
+        # defeats the #583 throttle-rollback guard (did_substantial_work reads
+        # reason != REVIEW_MISS_LAUNCH_FAILED and is persisted as
+        # review_turn_limit_summary_posted), letting a global session-limit
+        # outage burn a PR's attempt budget with zero review work performed
+        # (issue #651).
+        #
+        # Two boundaries make this safe (issue #652 review):
+        # (1) Match only the NARROW session_limit_markers (specific CLI
+        #     death-message phrasing like "hit your session limit"), NOT the
+        #     broad throttle_error_markers. Reviewer launches force
+        #     tee_stream_json=True, so log_path and events_path are
+        #     byte-identical -- the raw log tail IS the events content, so
+        #     matching the raw tail does not avoid the reviewer's own parsed
+        #     assistant text. Generic markers ("rate limit", "usage limit")
+        #     legitimately appear in this codebase's rate-limit/quota review
+        #     commentary and would false-positive on real review work. The
+        #     specific session-limit phrasing is the CLI's own death message,
+        #     not a domain term, so it is safe to match against reviewer text.
+        # (2) Guard on ``tool_call_count == 0``: a session that made any tool
+        #     calls did real review actions and is a PR-level outcome
+        #     (died_mid_session) regardless of what its log tail says -- a
+        #     throttle on the final API call after real work is not a launch
+        #     failure. The turn-limit branch above already owns sessions that
+        #     exhausted their turn budget, so this only intercepts deaths that
+        #     occurred before any tool use.
+        reason = REVIEW_MISS_LAUNCH_FAILED
+    else:
+        reason = REVIEW_MISS_DIED_MID_SESSION
+
+    if reason == REVIEW_MISS_LAUNCH_FAILED:
+        parts = ["## Reviewer session failed to start\n"]
+        parts.append(
+            "The automated reviewer exited before running a single turn, so no "
+            "review was performed. This is an environmental or launch failure, "
+            "not a judgement about this PR.\n"
+        )
+        parts.append("\n### Error output from the reviewer process:\n")
+    else:
+        parts = ["## Reviewer session summary (no verdict produced)\n"]
+        if reason == REVIEW_MISS_TURN_LIMIT:
+            parts.append(
+                f"The automated reviewer hit the {max_turns}-turn limit before "
+                f"producing a structured verdict.\n"
+            )
+        else:
+            parts.append(
+                f"The automated reviewer ran for {turn_count} turns "
+                f"({tool_call_count} tool calls) but did not produce a structured verdict.\n"
+            )
+        # Include the last few assistant messages — earlier turns are usually
+        # tool-use planning; the final messages contain the analysis.
+        parts.append("\n### Recent analysis from the reviewer:\n")
+
     recent = assistant_texts[-3:]
-    parts.append("\n### Recent analysis from the reviewer:\n")
     for text in recent:
         if len(text) > 2000:
             text = text[:2000] + "\n... (truncated)"
@@ -1797,7 +1989,12 @@ def _extract_review_session_summary(
     if meta_parts:
         parts.append(f"\n*{' · '.join(meta_parts)}*")
 
-    return "\n".join(parts)
+    return ReviewSessionOutcome(
+        text="\n".join(parts),
+        reason=reason,
+        turn_count=turn_count,
+        tool_call_count=tool_call_count,
+    )
 
 
 def _remove_review_checkout_with_warning(
@@ -3009,6 +3206,73 @@ def _sweep_orphan_processes_for_dead_sessions(
                 save_state(state_file, state)
 
 
+def _log_worker_census(sessions_dir: Path) -> None:
+    """Log one INFO line per loop pass listing every currently-alive worker.
+
+    Issue #646: the launch-time log in claude_code.py/devin_shell.py answers
+    "what cap did this worker launch with", but says nothing about how many
+    are running *right now* -- the question a box-saturation incident needs
+    answered ("how many suites were running at 11:33, from which worktrees,
+    at what cap"). This sweep answers it directly from log content alone,
+    with no process forensics required.
+
+    Deliberately read-only (no state mutation): it carries none of the
+    fragile sole-writer invariants _detect_and_handle_stalled_sessions/
+    _sweep_orphan_processes_for_dead_sessions must protect. It also only
+    ever iterates *alive* records, so — unlike a dead/exit-transition sweep —
+    it has no "months of accumulated stale sidecar" flooding problem even if
+    old sidecars are never pruned from sessions_dir.
+
+    Called from the top of ``dispatch()`` (see its docstring) -- the one
+    chokepoint every dispatch path funnels through, standalone (`work`/`fleet
+    work`) or supervised (`loop()` -> `_loop_body()` -> `dispatch()`) -- so it
+    runs unconditionally regardless of how long the orchestrator process
+    itself lives: a one-shot ``charlie fleet work`` CLI invocation logs
+    exactly one census line before exiting; a long-lived ``charlie fleet
+    supervise`` logs one per pass. Both answer the diagnostic question above
+    from log content alone -- no need to correlate against a live process
+    list.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    from .claude_code import is_worker_alive, read_worker_records
+    from .devin_shell import is_session_alive, read_session_records
+
+    now = datetime.now(UTC)
+
+    def _age_seconds(started_at: str) -> int | None:
+        try:
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return int((now - started).total_seconds())
+
+    entries: list[str] = []
+    # adapter_kind=None also covers the "api" adapter, which delegates to
+    # claude_code.launch_claude_worker under the hood and shares its sidecar
+    # schema (and therefore xdist_cap/is_worker_alive) unchanged.
+    for record in read_worker_records(sessions_dir, adapter_kind=None):
+        if record.pid is None or record.error is not None or not is_worker_alive(record):
+            continue
+        entries.append(
+            f"(adapter={record.adapter_kind} issue={record.issue_number} "
+            f"worktree={record.worktree_path} pid={record.pid} "
+            f"cap={record.xdist_cap} age_s={_age_seconds(record.started_at)})"
+        )
+    for record in read_session_records(sessions_dir):
+        if record.pid is None or record.error is not None or not is_session_alive(record):
+            continue
+        entries.append(
+            f"(adapter=devin-shell issue={record.issue_number} "
+            f"worktree={record.worktree_path} pid={record.pid} "
+            f"cap={record.xdist_cap} age_s={_age_seconds(record.started_at)})"
+        )
+
+    logger.info("worker census: n_alive=%d %s", len(entries), " ".join(entries) or "[]")
+
+
 def _rework_pr_for_worker(
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
@@ -3800,6 +4064,12 @@ def _classify_dead_sessions_and_update_throttle_state(
             # is already set). For non-completed sessions, preserve the original
             # ordering so worker_blocked still escalates.
             if is_completed:
+                # session_completed=True (issue #656): the worktree inspection
+                # just above is ground truth that this session produced real,
+                # committable work -- it cannot also have died to a provider
+                # quota/rate-limit/auth failure, so log-tail marker matching
+                # (which would otherwise treat the session's own completion
+                # summary prose as fair game) is skipped entirely.
                 if w.adapter_kind == "devin":
                     failure_kind, throttled_until = (
                         update_session_record_with_failure_classification(
@@ -3807,6 +4077,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -3816,6 +4087,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -3826,6 +4098,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             adapter_kind="api",
+                            session_completed=True,
                         )
                     )
                 else:
@@ -5137,6 +5410,27 @@ class OrchestratorApp:
         Finding 2). Standalone callers leave this as None and the sweep runs
         inside this call as before.
         """
+        # Issue #646: unconditional census of every alive worker, logged before
+        # any guard below can short-circuit (state lock busy, fleet lock held,
+        # GraphQL budget deferred) -- this is the one chokepoint every dispatch
+        # path funnels through, whether invoked standalone (`work`/`fleet work`)
+        # or from inside a supervised pass (`loop()` -> `_loop_body()` ->
+        # `dispatch()`), so it answers "how many suites were running at <time>,
+        # from which worktrees, at what cap" regardless of which command
+        # launched them. Purely read-only, but explicitly guarded: per-file
+        # read errors are already swallowed inside read_worker_records/
+        # read_session_records, but this diagnostic must never be the reason a
+        # whole dispatch pass aborts, so any other unexpected failure here
+        # (formatting, directory-listing races, etc.) is logged and swallowed
+        # rather than propagated -- a torn sidecar read is *more* likely, not
+        # less, during the exact high-concurrency moment this census exists to
+        # diagnose.
+        try:
+            _log_worker_census(self._resolve(self.config.devin.sessions_dir))
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning("worker census failed", exc_info=True)
         # Finalize closed ready-labeled issues whose linked PR merged externally.
         # This runs before fleet lock / GraphQL budget / provider throttle guards
         # so a pass that defers new dispatch still drains the Aviator-merge backlog.
@@ -5151,6 +5445,14 @@ class OrchestratorApp:
                 deferred_reason="state_lock_busy",
             )
 
+        # Reuse the merged PR list already fetched by _finalize_externally_merged_issues
+        # so the post-merge tripwire in loop() can avoid a second GraphQL call.
+        merged_prs_for_result: list[dict[str, Any]] | None = (
+            merged_pr_outcome.items
+            if merged_pr_outcome.called and merged_pr_outcome.error is None
+            else None
+        )
+
         fleet_lock = None
         if self.config.fleet.global_max_concurrent_sessions > 0:
             fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
@@ -5161,6 +5463,7 @@ class OrchestratorApp:
                     {
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
+                        "merged_prs": merged_prs_for_result,
                         "merged_pr_closed_issue_numbers": sorted(finalized),
                         "merged_pr_referenced_issue_numbers": sorted(finalized),
                     },
@@ -5187,6 +5490,7 @@ class OrchestratorApp:
                 "dispatch deferred: state lock held",
                 selected_count=0,
                 deferred_reason="state_lock_busy",
+                merged_prs=merged_prs_for_result,
                 merged_pr_closed_issue_numbers=sorted(finalized),
                 merged_pr_referenced_issue_numbers=sorted(finalized),
             )
@@ -5200,6 +5504,7 @@ class OrchestratorApp:
                     "graphql_remaining": exc.remaining,
                     "graphql_reset": exc.reset_at,
                     "graphql_threshold": exc.threshold,
+                    "merged_prs": merged_prs_for_result,
                     "merged_pr_closed_issue_numbers": sorted(finalized),
                     "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
@@ -5253,6 +5558,14 @@ class OrchestratorApp:
         gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
         dispatch_limit = gov.dispatch_limit
 
+        # Compute the merged PR list (if already fetched) for the tripwire so
+        # loop() can reuse it and avoid a second GraphQL call per pass.
+        merged_prs_for_tripwire: list[dict[str, Any]] | None = (
+            merged_prs.items
+            if merged_prs is not None and merged_prs.called and merged_prs.error is None
+            else None
+        )
+
         # Apply provider throttle cooldown check
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -5267,6 +5580,7 @@ class OrchestratorApp:
                     "label_errors": [],
                     "sessions": [],
                     "dispatch_results": [],
+                    "merged_prs": merged_prs_for_tripwire,
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
@@ -5437,6 +5751,7 @@ class OrchestratorApp:
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "merged_prs": merged_prs,
                 "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                 "merged_pr_mention_only_issue_numbers": sorted(
                     merged_pr_mention_only_issue_numbers
@@ -6241,6 +6556,7 @@ class OrchestratorApp:
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
+            "merged_prs": merged_prs,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
             "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
@@ -6355,6 +6671,55 @@ class OrchestratorApp:
                 if issue_number is not None and issue_escalated
                 else f"PR #{pr_number} is escalated; review skipped"
             )
+            # Refresh (but never act on) janitor diagnostics while escalated.
+            # PRs #1397/#1443 (job-cannon, 2026-07-27) sat with janitor_ok/
+            # janitor_failures frozen at hours-stale values because this early
+            # return prevented run_janitor from ever re-running once the
+            # LINKED ISSUE escalated -- caused there by an unrelated dead
+            # rework-worker session, not by the janitor's own verdict. A
+            # since-cleared merge conflict or a since-green CI run stayed
+            # reported as failing until an operator ran unescalate(), because
+            # nothing else re-observes reality for an escalated PR.
+            # Escalation must stay terminal for every side effect --status,
+            # labels, routing, attempt counters-- only unescalate() may re-arm
+            # those (see its docstring) -- so this recomputes janitor_ok/
+            # janitor_failures for visibility ONLY, reusing the same
+            # dedup'd write/event pattern the janitor gate itself uses
+            # (cost-spirals.md Finding 2) so an unrepaired PR doesn't
+            # re-log identical failures every pass while escalated either.
+            escalated_checks = self.gh.pr_checks(pr_number)
+            escalated_diff = self.gh.pr_diff(pr_number)
+            with state_lock(self.paths.state_file):
+                fresh_state = load_state(self.paths.state_file)
+                existing_pr_state = fresh_state["prs"].get(str(pr_number))
+                if existing_pr_state is not None:
+                    escalated_verdict = run_janitor(
+                        pr,
+                        escalated_checks,
+                        self.config,
+                        pr_state=existing_pr_state,
+                        repo_root=self.repo_root,
+                        pr_diff=escalated_diff,
+                    )
+                    failures_changed = existing_pr_state.get("janitor_failures") != list(
+                        escalated_verdict.failures
+                    )
+                    fresh_state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "janitor_ok": escalated_verdict.ok,
+                        "janitor_failures": list(escalated_verdict.failures),
+                    }
+                    if failures_changed:
+                        fresh_state = self._record_event(
+                            fresh_state,
+                            "janitor_gate",
+                            {
+                                "pr_number": pr_number,
+                                "failures": list(escalated_verdict.failures),
+                                "escalated": True,
+                            },
+                        )
+                    save_state(self.paths.state_file, fresh_state)
             return CommandResult(
                 True,
                 reason,
@@ -6362,7 +6727,7 @@ class OrchestratorApp:
                     "pr": pr_number,
                     "issue": issue_number,
                     "skipped": True,
-                    "checks_unavailable": False,
+                    "checks_unavailable": escalated_checks is None,
                 },
             )
 
@@ -7063,23 +7428,41 @@ class OrchestratorApp:
                 # --max-turns limit) and post a summary PR comment so the work
                 # is not silently lost. Only post once per dispatch lifecycle.
                 pr_state_dict = pr_state
-                if not pr_state_dict.get("review_turn_limit_summary_posted"):
+                # One-shot guard. ``review_miss_summary_posted`` covers every
+                # miss reason; the legacy turn-limit key is still honoured so
+                # PRs mid-lifecycle when this shipped don't get a second
+                # comment.
+                already_posted = pr_state_dict.get(
+                    "review_miss_summary_posted"
+                ) or pr_state_dict.get("review_turn_limit_summary_posted")
+                if not already_posted:
                     events_path = _events_path(reviews_dir, pr_number, review=True)
                     max_turns = self.config.review_dispatch.review_max_turns
-                    summary_text = _extract_review_session_summary(
-                        events_path, Path(w.log_path), max_turns
+                    outcome = _extract_review_session_summary(
+                        events_path,
+                        Path(w.log_path),
+                        max_turns,
+                        session_limit_markers=self.config.runtime.session_limit_markers,
                     )
-                    if summary_text is not None:
+                    if outcome is not None:
                         try:
-                            self._comment_pr(pr_number, summary_text)
+                            self._comment_pr(pr_number, outcome.text)
                         except Exception:
                             pass
                         with state_lock(self.paths.state_file):
                             state = load_state(self.paths.state_file)
                             ps = state["prs"].get(str(pr_number), {})
+                            # The turn-limit key means "this dispatch
+                            # lifecycle's session did substantial work then
+                            # died". The provider-throttle sweep reads it to
+                            # deny a rollback (#583) and #584 counts it as a
+                            # turn-limit death, so a session that never
+                            # reached turn 1 must not set it -- that death is
+                            # environmental and says nothing about this PR.
                             state["prs"][str(pr_number)] = {
                                 **ps,
-                                "review_turn_limit_summary_posted": True,
+                                "review_miss_summary_posted": True,
+                                "review_turn_limit_summary_posted": (outcome.did_substantial_work),
                             }
                             state = append_event(
                                 state,
@@ -7087,7 +7470,9 @@ class OrchestratorApp:
                                 {
                                     "pr_number": pr_number,
                                     "issue_number": issue_number,
-                                    "reason": "turn_limit_summary_posted",
+                                    "reason": outcome.reason,
+                                    "turn_count": outcome.turn_count,
+                                    "tool_call_count": outcome.tool_call_count,
                                 },
                                 state_path=self.paths.state_file,
                             )
@@ -7096,7 +7481,7 @@ class OrchestratorApp:
                             {
                                 "pr": pr_number,
                                 "issue": issue_number,
-                                "reason": "turn_limit_summary_posted",
+                                "reason": outcome.reason,
                             }
                         )
                 continue
@@ -7559,6 +7944,7 @@ class OrchestratorApp:
                     "reviewer_process_start_time": None,
                     "review_dispatch_attempt_count": attempt_count + 1,
                     "review_turn_limit_summary_posted": False,
+                    "review_miss_summary_posted": False,
                     "review_effort_arm": review_effort_arm,
                     "review_effort_used": review_effort_used,
                 }
@@ -8406,6 +8792,7 @@ class OrchestratorApp:
         "reviewer_pid",
         "reviewer_process_start_time",
         "review_turn_limit_summary_posted",
+        "review_miss_summary_posted",
         "janitor_ok",
         "janitor_failures",
         "janitor_warnings",
@@ -9708,7 +10095,9 @@ class OrchestratorApp:
                             "graphql_threshold": threshold,
                         },
                     )
-                drift = detect_drift(self.gh, state, self.config, repo_root=self.repo_root)
+                drift = detect_drift(
+                    self.gh, state, self.config, repo_root=self.repo_root
+                ) + detect_aviator_stale_blocked(self.gh, self.config)
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
                 if fix and drift:
@@ -9722,7 +10111,7 @@ class OrchestratorApp:
                     # actually landed before reporting success.
                     post_fix_drift = detect_drift(
                         self.gh, new_state, self.config, repo_root=self.repo_root
-                    )
+                    ) + detect_aviator_stale_blocked(self.gh, self.config)
                     fixed = len(post_fix_drift) == 0
             message = f"found {len(drift)} drift item(s)"
             if fixed:
@@ -11010,6 +11399,11 @@ class OrchestratorApp:
         # daemon's entire lifetime).
         self.gh.invalidate_list_cache()
         sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        # Issue #646: the worker census now logs from inside dispatch() itself
+        # (the one chokepoint every dispatch path funnels through, including
+        # standalone `work`/`fleet work` which never reach this method) --
+        # see dispatch()'s docstring. Not re-logged here to avoid a duplicate
+        # census line within the same pass.
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
         # The result is handed down to dispatch_rework()/dispatch() below so the
@@ -11102,6 +11496,57 @@ class OrchestratorApp:
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+
+        # Issue #502: post-merge tripwire. Detect any merged worker PR that was
+        # not approved by the orchestrator's adversarial review gate.
+        #
+        # Reuse the merged PR list already fetched by dispatch() to avoid a
+        # redundant fetch per loop pass. dispatch() returns an empty list (not
+        # the fetched merged PRs) when there are no ready issues, so coerce an
+        # empty reuse list back to None — the tripwire must then fetch its own
+        # list to stay armed even when the queue is idle (a worker self-merge can
+        # land regardless of whether issues are ready).
+        #
+        # Deliberate trade-off: because empty-means-unknown is indistinguishable
+        # from empty-means-no-merged-PRs, an idle queue costs one extra
+        # merged_pr_list() call per pass. That is a paginated REST fetch, not a
+        # GraphQL check-run walk (merged_pr_list is REST-only by construction —
+        # issue #361), so the cost is bounded and does not risk the gateway 502s
+        # that motivated #361. Staying armed while idle is worth it: the whole
+        # point of the tripwire is to catch merges the orchestrator did not
+        # perform, which are exactly the ones that can happen on a quiet pass.
+        # Replacing this with an explicit "not fetched" sentinel threaded out of
+        # dispatch() would remove the extra call; that is tracked in #446 with
+        # the rest of the per-pass fetch consolidation, and is deliberately not
+        # done here to keep this security fix narrow.
+        merged_prs_for_tripwire: list[dict[str, Any]] | None = dispatch.data.get("merged_prs")
+        if not merged_prs_for_tripwire:
+            merged_prs_for_tripwire = None
+        for unauthorized in self._detect_unauthorized_merges(merged_prs_for_tripwire):
+            reviewed_sha = unauthorized.get("reviewed_head_sha")
+            live_sha = unauthorized.get("live_head_sha")
+            if (
+                unauthorized["decision"] == "approved"
+                and reviewed_sha is not None
+                and live_sha is not None
+                and reviewed_sha != live_sha
+            ):
+                reason = f"approved for head {reviewed_sha!r} but merged head is {live_sha!r}"
+            else:
+                reason = (
+                    f"without an approved review decision (decision={unauthorized['decision']!r})"
+                )
+            errors.append(
+                {
+                    "pr": unauthorized["pr"],
+                    "issue": unauthorized["issue"],
+                    "error": (
+                        f"PR #{unauthorized['pr']} ({unauthorized['head']}) is MERGED "
+                        f"{reason}; possible worker self-merge"
+                    ),
+                }
+            )
+
         foreign_transitions: dict[int, dict[str, Any]] = {}
         open_tracked_prs = 0
         skipped_reviews = 0
@@ -12690,6 +13135,186 @@ class OrchestratorApp:
             self.config,
             repo_root=self.repo_root,
         )
+
+    def _detect_unauthorized_merges(
+        self, merged_prs: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Scan recently-merged PRs for worker branches whose merged head does not match an approved review decision.
+
+        Workers are forbidden from merging their own PRs (issue #502). This
+        post-merge tripwire catches a bypass after it happens: any merged PR
+        whose head branch matches the configured worker branch prefix and whose
+        head SHA is not covered by an approved ``.var/charlie-work/prs/pr-N/review-decision.json``
+        was merged without the orchestrator's adversarial review gate. GitHub
+        errors are swallowed so a transient ``gh`` failure cannot crash the
+        fleet pass.
+
+        Findings are bounded to merges this control could actually have governed
+        — see ``_apply_unauthorized_merge_baseline``, which every return path
+        goes through so the bound cannot be bypassed by a future caller.
+        """
+        candidates: list[dict[str, Any]] = []
+        prefix = self.config.dispatch.branch_prefix
+        if merged_prs is None:
+            try:
+                merged_prs = self.gh.merged_pr_list()
+            except GitHubError:
+                # No list means nothing observed, not "nothing wrong" — return
+                # empty without arming, so a transient gh failure on the very
+                # first pass cannot bake an empty baseline and permanently
+                # exempt the real history it never saw.
+                #
+                # This covers the raising failures (gh missing, unparseable
+                # JSON, non-zero exit). It does NOT cover gh exiting 0 with
+                # empty stdout, which merged_pr_list() coerces to an empty page
+                # and treats as "no more results" — that would arm an empty
+                # baseline silently. Distinguishing the two belongs in
+                # github.py rather than here and is tracked in #633; recovery
+                # is to delete the baseline key from state.json and let the
+                # next pass re-arm from real data.
+                return []
+
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            if pr.get("isCrossRepository") is True:
+                continue
+            head = str(pr.get("headRefName") or "")
+            if not head.startswith(prefix):
+                continue
+            raw_number = pr.get("number")
+            try:
+                pr_number = int(raw_number) if raw_number is not None else None
+            except (TypeError, ValueError):
+                continue
+            if pr_number is None:
+                continue
+            decision = self._review_decision(pr_number)
+            decision_value = decision.get("decision")
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+            live_head_sha = pr.get("headRefOid")
+            approved = decision_value == "approved"
+            head_matches = (
+                reviewed_head_sha is not None
+                and live_head_sha is not None
+                and reviewed_head_sha == live_head_sha
+            )
+            if not approved or not head_matches:
+                issue_number = linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=prefix,
+                )
+                candidates.append(
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "head": head,
+                        "decision": decision_value,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "live_head_sha": live_head_sha,
+                    }
+                )
+        return self._apply_unauthorized_merge_baseline(candidates)
+
+    def _apply_unauthorized_merge_baseline(
+        self, candidates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Bound the tripwire to merges it could actually have governed.
+
+        The tripwire asserts a policy — every merged worker PR is covered by an
+        ``approved`` decision recorded at its merged head — that this
+        repository's history predates. ``merged_pr_list()`` returns the last 500
+        closed PRs, and many of those merged before the review gate existed,
+        under the #597 hollow-verdict bug, or with no decision file at all.
+        Measured against the live repo before this landed, an unbounded first
+        pass yields 48 findings.
+
+        Those 48 would append to ``loop()``'s ``errors`` bucket on *every* pass
+        — there is no dedupe and the 500-PR window keeps them in scope for a
+        very long time — pinning ``ok=False`` permanently and burying any real
+        self-merge in constant background noise. That is the same "noise, not
+        signal" failure this tripwire exists to prevent, arriving from the other
+        direction: a control that can never go quiet is not a control.
+
+        So the first pass *arms* rather than alarms. It records exactly which PRs
+        were already merged-and-uncovered, emits them once as an
+        ``unauthorized_merge_baseline_armed`` event so the backlog stays
+        auditable, and reports nothing. Every later pass reports only merges
+        absent from that baseline.
+
+        Why an explicit set of PR numbers and not a high-water PR number: a
+        number watermark also exempts any PR that was already open when the
+        control armed but merges afterwards. That is not hypothetical here — at
+        arming there were three open worker PRs (#510, #585, #630), every one
+        numbered below the highest merged PR (#631), so a number watermark would
+        have permanently exempted all three, including the PR that adds this
+        tripwire. The set is derived at runtime from live data, never hard-coded,
+        and suppresses precisely the merges that already happened.
+
+        Cost, stated plainly: a genuine bypass that lands in the same window as
+        the arming pass is baselined rather than reported. It still appears in
+        the armed event's PR list, which is why that event carries the full set
+        rather than just a count.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        key = UNAUTHORIZED_MERGE_BASELINE_KEY
+
+        def _suppressed(baseline: Any) -> set[int]:
+            if not isinstance(baseline, dict):
+                return set()
+            raw = baseline.get("pre_existing_prs") or []
+            return {int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)}
+
+        state = load_state_locked(self.paths.state_file)
+        if isinstance(state.get(key), dict):
+            pre_existing = _suppressed(state.get(key))
+            return [c for c in candidates if c["pr"] not in pre_existing]
+
+        # ---- arming pass ----
+        pre_existing_now = sorted({int(c["pr"]) for c in candidates})
+
+        if self.dry_run:
+            # A preview must not write state (issues #609/#613/#621). Report what
+            # an armed pass would report — nothing — without persisting, so the
+            # preview is both write-free and truthful about post-arm behaviour.
+            logger.info(
+                "DRY-RUN: unauthorized-merge tripwire would arm with %d pre-existing "
+                "uncovered merge(s); not persisting",
+                len(pre_existing_now),
+            )
+            return []
+
+        with state_lock(self.paths.state_file):
+            locked = load_state(self.paths.state_file)
+            if isinstance(locked.get(key), dict):
+                # Another pass armed between the read above and this lock. Its
+                # baseline wins, so arming is idempotent and never re-widens.
+                pre_existing = _suppressed(locked.get(key))
+                return [c for c in candidates if c["pr"] not in pre_existing]
+            locked[key] = {
+                "armed_at": utc_now(),
+                "pre_existing_prs": pre_existing_now,
+            }
+            locked = self._record_event(
+                locked,
+                "unauthorized_merge_baseline_armed",
+                {
+                    "pre_existing_count": len(pre_existing_now),
+                    "pre_existing_prs": pre_existing_now,
+                },
+            )
+            save_state(self.paths.state_file, locked)
+
+        logger.warning(
+            "unauthorized-merge tripwire armed: %d pre-existing uncovered merge(s) "
+            "recorded as baseline and will not be reported again (%s)",
+            len(pre_existing_now),
+            ", ".join(f"#{n}" for n in pre_existing_now) or "none",
+        )
+        return []
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
