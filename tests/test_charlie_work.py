@@ -11878,6 +11878,47 @@ def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Pa
     assert "## Prior review" not in packet
 
 
+def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> None:
+    """Issue #632 defect 3: a terminal verdict on disk for the SAME head (a
+    PR parked on agent:human-needed whose head has not advanced, or an
+    operator-corrected verdict) must still surface its findings to a
+    re-review. The old is_round2_review gate required
+    prior_reviewed_head_sha != headRefOid, so the corrected verdict was
+    invisible and re-reviewing the unchanged diff started from scratch."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    # A corrected verdict pinned to the SAME head as the live PR.
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "the null check is still missing",
+                "required_changes": ["add null check in validate()", "cover empty input"],
+                "reviewed_head_sha": "sha-abc123",  # == live head
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    # The prior findings reach the reviewer even though the head hasn't moved.
+    assert "## Prior review" in packet
+    assert "same head" in packet.lower()
+    assert "the null check is still missing" in packet
+    assert "add null check in validate()" in packet
+    assert "cover empty input" in packet
+    # No interdiff is generated for a same-head review.
+    assert not (decision_dir / "interdiff.patch").exists()
+    assert "No interdiff is needed" in packet
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
@@ -31340,6 +31381,57 @@ def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
     assert "guard the index access" in regenerated
     # The stale churn-only content is gone.
     assert "The previous cycle was a no-op." not in regenerated
+
+
+def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path) -> None:
+    """Issue #632 edge case: an approved verdict may carry a non-empty
+    required_changes list (the field is optional for every decision). The
+    merge-conflict / no-CI / cross-pr-revert routes render a rework brief
+    for an already-approved PR whose dispatch note explicitly says "do not
+    re-litigate the review". Rendering a "Required changes ... before this
+    PR can be approved" section into that brief would be contradictory.
+    The section must only appear for a request_changes verdict."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    # An approved verdict that nonetheless carries required_changes (a
+    # reviewer mistake, or stale carry-forward from a prior round).
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "approved",
+                "summary": "lgtm",
+                "required_changes": ["add a docstring", "rename foo to bar"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    # The merge-conflict operational note says "do not re-litigate".
+    operational_note = (
+        "The PR branch has a merge conflict. Merge the base branch and resolve. "
+        "The code changes are already approved; do not re-litigate the review."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The operational note is present.
+    assert "do not re-litigate" in brief
+    assert "merge conflict" in brief
+    # The contradictory required-changes section is NOT rendered.
+    assert "## Required changes" not in brief
+    assert "before this PR can be approved" not in brief
+    assert "add a docstring" not in brief
+    assert "rename foo to bar" not in brief
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(

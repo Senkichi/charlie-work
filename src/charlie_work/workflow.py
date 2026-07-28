@@ -3475,11 +3475,23 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     them their own rendered section (instead of multiplexing one prose slot)
     means an operational dispatch note can no longer displace them.
 
-    Returns an empty string when there is no decision, no list, or an empty
-    list — the section is omitted entirely rather than rendering a hollow
-    header, so a brief with no findings looks the same as before.
+    Only rendered for a ``request_changes`` verdict. An ``approved`` or
+    ``blocked`` verdict may carry a non-empty ``required_changes`` list
+    (the field is optional for every decision), but rendering "what must
+    change before this PR can be approved" into an already-approved PR's
+    operational rework brief (merge-conflict / no-CI / cross-pr-revert
+    routes, which explicitly say "do not re-litigate the review") would be
+    contradictory. The findings for non-request_changes verdicts reach the
+    reviewer via ``$prior_review_section`` instead.
+
+    Returns an empty string when there is no decision, no list, an empty
+    list, or a non-request_changes decision — the section is omitted
+    entirely rather than rendering a hollow or contradictory header, so a
+    brief with no findings looks the same as before.
     """
     if not isinstance(decision, dict):
+        return ""
+    if decision.get("decision") != "request_changes":
         return ""
     required_changes = decision.get("required_changes")
     if not isinstance(required_changes, list) or not required_changes:
@@ -7102,11 +7114,19 @@ class OrchestratorApp:
         # on disk at render time but never surfaced to the reviewer.
         existing_decision = self._review_decision(pr_number)
         prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
-        is_round2_review = (
-            existing_decision.get("decision") not in ("pending", None, "missing", "invalid")
-            and prior_reviewed_head_sha
-            and prior_reviewed_head_sha != pr.get("headRefOid")
-        )
+        # Issue #632 defect 3: a terminal verdict on disk must reach the
+        # reviewer even when the head has NOT moved (a PR parked on
+        # agent:human-needed, or an operator-corrected verdict). The old gate
+        # required prior_reviewed_head_sha != headRefOid, so a same-head
+        # re-review rendered an empty $prior_review_section and the corrected
+        # findings were invisible. _build_prior_review_section adapts its
+        # wording to the same-head vs moved-head case.
+        is_round2_review = existing_decision.get("decision") not in (
+            "pending",
+            None,
+            "missing",
+            "invalid",
+        ) and bool(prior_reviewed_head_sha)
         prior_review_section = (
             self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
             if is_round2_review
@@ -10052,14 +10072,22 @@ class OrchestratorApp:
     ) -> str:
         """Render ``$prior_review_section`` for a round-2+ review packet.
 
-        Only called when the prior decision is a terminal, non-pending
-        verdict recorded against a head that differs from the live PR head
-        (a genuine rework round, not a first-round review). Surfaces round-1
-        findings (decision/summary/required changes) plus an interdiff
-        (prior reviewed head -> new head) so the reviewer has somewhere to
-        start, without losing sight of the full diff: the interdiff is
-        "start here," never "only look here" -- the full diff stays
-        attached and remains authoritative for findings outside it.
+        Called when the prior decision is a terminal, non-pending verdict
+        with a recorded ``reviewed_head_sha``. Two cases:
+
+        - **Moved head** (prior head != live head): a genuine rework round.
+          Surfaces round-1 findings plus an interdiff (prior reviewed head
+          -> new head) so the reviewer has somewhere to start, without
+          losing sight of the full diff: the interdiff is "start here,"
+          never "only look here" -- the full diff stays attached and
+          remains authoritative for findings outside it.
+        - **Same head** (prior head == live head, issue #632 defect 3): a
+          PR parked on ``agent:human-needed`` whose head has not advanced,
+          or an operator-corrected verdict. The diff is identical, so no
+          interdiff is generated; the findings are surfaced so a re-review
+          can verify whether they still apply or whether the verdict was
+          corrected. Without this branch the corrected verdict was
+          invisible to the reviewer (the #510 case).
 
         Fail-safe posture mirrors janitor.py's patch-id carry-forward
         (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
@@ -10074,6 +10102,34 @@ class OrchestratorApp:
         required_changes = prior_decision.get("required_changes")
         if not isinstance(required_changes, list):
             required_changes = []
+
+        same_head = bool(prior_head_sha) and prior_head_sha == new_head_sha
+
+        if same_head:
+            lines = [
+                "",
+                "## Prior review (same head)",
+                "",
+                f"A prior review of this head (`{prior_head_sha}`) recorded "
+                f"decision **{decision}**. The diff has not changed since that "
+                "review -- the findings below are from the same code you are "
+                "reviewing now. Verify whether they still apply or whether the "
+                "verdict was corrected (e.g. by an operator hand-edit).",
+                "",
+            ]
+            if summary:
+                lines.append(f"Prior summary: {summary}")
+                lines.append("")
+            if required_changes:
+                lines.append("Prior required changes:")
+                lines.extend(f"- {change}" for change in required_changes)
+                lines.append("")
+            lines.append(
+                "No interdiff is needed -- the head is unchanged. Re-examine "
+                "the full diff and confirm or overturn the prior verdict."
+            )
+            lines.append("")
+            return "\n".join(lines)
 
         lines = [
             "",
