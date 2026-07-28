@@ -1128,3 +1128,126 @@ def test_label_config_is_frozen() -> None:
     labels = LabelConfig()
     with pytest.raises(FrozenInstanceError):
         labels.complexity_high = "x"  # type: ignore[misc]
+
+
+# --- Issue #600: runner_allocation is host-wide only; cross-validate floors ---
+
+
+def test_load_layered_config_rejects_per_repo_runner_allocation(tmp_path: Path) -> None:
+    """Issue #600: a per-repo ``runner_allocation`` section must be rejected.
+
+    The merge in ``load_layered_config`` is section-by-section with the per-repo
+    file winning per key, so without an explicit rejection a per-repo
+    ``orchestrator.config.yaml`` could silently override a host-wide knob. The
+    section is documented host-wide-only (see ``RunnerAllocationConfig``); make
+    the invalid state unrepresentable rather than merely unused.
+    """
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("runner_allocation:\n  enabled: true\n", encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_config(
+        repo_root / "orchestrator.config.yaml",
+        "runner_allocation:\n  enabled: true\n  min_running_per_repo: 2\n",
+    )
+
+    with pytest.raises(ConfigError, match="host-wide only"):
+        load_layered_config(repo_root, fleet_dir_override=str(fleet))
+
+
+def test_load_layered_config_accepts_global_runner_allocation(tmp_path: Path) -> None:
+    """The rejection is scoped to the per-repo layer; the global layer keeps it."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(
+        "runner_allocation:\n  enabled: true\n  min_running_per_repo: 2\n",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # No per-repo config at all -- the global layer stands alone.
+    config = load_layered_config(repo_root, fleet_dir_override=str(fleet))
+    assert config.runner_allocation.enabled is True
+    assert config.runner_allocation.min_running_per_repo == 2
+
+
+def test_load_config_rejects_allocation_floor_above_scaling_floor(tmp_path: Path) -> None:
+    """Issue #600: when both features are enabled, the allocation floor must not
+    exceed the scaling floor -- allocation caps each repo's target at its
+    registered runner count, so a higher ``min_running_per_repo`` silently
+    degrades with nothing reconciling the two."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runner_scaling:
+  enabled: true
+  min_runners: 1
+runner_allocation:
+  enabled: true
+  min_running_per_repo: 3
+""",
+    )
+    with pytest.raises(ConfigError, match="floors disagree"):
+        load_config(config_file)
+
+
+def test_load_config_accepts_equal_floors_both_enabled(tmp_path: Path) -> None:
+    """Equal floors are the unambiguous single-source-of-truth case."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runner_scaling:
+  enabled: true
+  min_runners: 2
+runner_allocation:
+  enabled: true
+  min_running_per_repo: 2
+""",
+    )
+    config = load_config(config_file)
+    assert config.runner_scaling.enabled is True
+    assert config.runner_allocation.enabled is True
+    assert config.runner_scaling.min_runners == config.runner_allocation.min_running_per_repo
+
+
+def test_load_config_accepts_scaling_floor_above_allocation_floor(tmp_path: Path) -> None:
+    """``min_runners > min_running_per_repo`` is a legitimate buffer: registered
+    but parked runners that allocation promotes on demand. Only the unsatisfiable
+    direction (allocation > scaling) is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runner_scaling:
+  enabled: true
+  min_runners: 5
+runner_allocation:
+  enabled: true
+  min_running_per_repo: 1
+""",
+    )
+    config = load_config(config_file)
+    assert config.runner_scaling.min_runners == 5
+    assert config.runner_allocation.min_running_per_repo == 1
+
+
+def test_load_config_skips_floor_check_when_only_one_enabled(tmp_path: Path) -> None:
+    """The cross-section check fires only when both features are enabled; a
+    mismatched floor with one disabled is not a conflict (the disabled feature
+    imposes no floor)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runner_scaling:
+  enabled: false
+  min_runners: 1
+runner_allocation:
+  enabled: true
+  min_running_per_repo: 9
+""",
+    )
+    config = load_config(config_file)
+    assert config.runner_scaling.enabled is False
+    assert config.runner_allocation.enabled is True
+    assert config.runner_allocation.min_running_per_repo == 9
