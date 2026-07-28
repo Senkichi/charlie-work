@@ -1369,7 +1369,15 @@ def fleet_loop(
         "orphan_sweep_calls": orphan_sweep_calls,
         "emitted": False,
     }
-    if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
+    # Build the digest whenever notify is on, then gate the *emission* on the
+    # built digest's transitions — not on the raw event list. A converged pass
+    # (every event routed to an explicit ``continue``, e.g. a healthy
+    # ``runner_allocation``) has a non-empty ``attention_events`` list but an
+    # empty ``transitions`` tuple; testing the raw list would call
+    # ``emit_digest`` with ``transitions=()`` and append an empty envelope to
+    # ``digest.jsonl`` every 5-minute pass (issue #610). The ``notify_config``
+    # check stays outermost so no digest is built when notify is off.
+    if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
         attention_digest = _build_fleet_attention_digest(
             attention_events, state_file=health_state_file

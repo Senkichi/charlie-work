@@ -2745,12 +2745,12 @@ def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
     generic fallback would render a near-identical attention entry on every pass.
 
     Precise about what this does and does not assert. It pins the *entry*: none is
-    rendered for a converged pass. It does not assert the digest sink stays untouched,
-    because the envelope is emitted every pass either way -- `fleet_loop`'s notify gate
-    tests the raw event list rather than the built digest, so `emit_digest` is called
-    with `transitions=()` on a converged pass. That gate/digest mismatch predates this
-    PR (unchanged since #591) and is tracked separately in issue #610; it is not
-    something this branch introduced or fixes.
+    rendered for a converged pass. The emission-level guarantee -- that `emit_digest`
+    is not called at all on such a pass -- is covered by
+    ``test_fleet_loop_converged_pass_does_not_emit_digest`` (issue #610), which drives
+    the full ``fleet_loop`` notify gate. This test stays at the builder level so a
+    regression in the routing (re-introducing a fallback for ``runner_allocation``)
+    is caught here even if the gate test's mocks mask it.
     """
     from charlie_work.fleet_dispatch import _build_fleet_attention_digest
 
@@ -2767,6 +2767,98 @@ def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
     ]
     digest = _build_fleet_attention_digest(converged)
     assert digest.transitions == ()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_converged_pass_does_not_emit_digest(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #610: a converged pass must not call emit_digest at all.
+
+    A converged allocation pass emits a ``runner_allocation`` event (the
+    prologue fires it whenever anything moved *or any note was produced*, and
+    standing advisory notes persist for as long as the condition does). That
+    event is routed to an explicit ``continue`` in
+    ``_build_fleet_attention_digest``, so ``attention_events`` is non-empty
+    while ``transitions`` is empty. The notify gate must test the built digest,
+    not the raw event list, or ``emit_digest`` is called with
+    ``transitions=()`` and an empty envelope is appended to ``digest.jsonl``
+    on every 5-minute pass.
+
+    This drives ``fleet_loop`` unmocked (only the prologue's
+    ``run_allocation_pass`` and the per-repo ``OrchestratorApp`` are patched)
+    so the gate at the emission site is the thing under test. The per-repo
+    loop returns an empty ``CommandResult.data`` so no per-repo attention
+    events are produced -- the only event is the converged
+    ``runner_allocation``.
+    """
+    from dataclasses import replace
+
+    from charlie_work.config import NotifyConfig
+
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    # Converged: nothing moved, but a standing advisory note is present -- the
+    # exact shape every recorded pass on this host had (verified against
+    # events.db). The prologue emits runner_allocation because notes is non-empty.
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=("Senkichi/job-cannon: holding 4 surplus slot(s) - slack for 0/3 pass(es)",),
+    )
+
+    cfg = replace(
+        _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=cfg,
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # The raw event list is non-empty (runner_allocation), but every event hit
+    # an explicit continue, so transitions is empty and emit_digest must not
+    # fire. This is the gate/digest mismatch issue #610 describes: testing the
+    # raw list would pass the outer gate and call emit_digest with ().
+    mock_emit_digest.assert_not_called()
 
 
 def test_digest_still_surfaces_allocation_failures() -> None:
