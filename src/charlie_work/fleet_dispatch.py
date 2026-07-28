@@ -1348,7 +1348,10 @@ def run_fleet_supervise(
     """
     try:
         global_config = load_layered_config(
-            Path.cwd(), None, fleet_dir_override=fleet_dir_override
+            Path.cwd(),
+            None,
+            fleet_dir_override=fleet_dir_override,
+            require_global=True,
         )
     except (ConfigError, RepoNotFoundError) as exc:
         # Falling back to defaults silently is how a whole feature disappears
@@ -1356,12 +1359,24 @@ def run_fleet_supervise(
         # runner prologues) reverts to off while passes keep reporting success.
         # A typo in the global layer must be loud.
         logger.warning(
-            "Fleet supervisor could not load config; running on DEFAULTS "
-            "(notify, labels and runner prologues are all off): %s",
+            "Fleet supervisor could not load the global config layer; "
+            "continuing with per-repo config only (fleet-wide knobs fall back "
+            "to per-repo values or defaults): %s",
             exc,
         )
-        print(f"config load failed, running on defaults: {exc}", flush=True)
-        global_config = OrchestratorConfig()
+        print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to pristine defaults if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=fleet_dir_override
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = OrchestratorConfig()
 
     # Provenance of the layer every fleet-wide knob comes from, logged once per
     # supervisor start (not per pass -- this is startup, so it costs one stat).
