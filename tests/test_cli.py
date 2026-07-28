@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from charlie_work import cli
-from charlie_work.config import NotifyConfig
+from charlie_work.config import (
+    NotifyConfig,
+    OrchestratorConfig,
+    RunnerAllocationConfig,
+    RunnerScalingConfig,
+)
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.supervise import SelfDeployResult
@@ -931,6 +936,152 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     assert "not enabled" not in result.message, (
         "the silent-disable 'not enabled' message must NOT appear when the real "
         "cause is an unreachable global layer"
+    )
+
+
+# --------------------------------------------------------------------------
+# runners ensure-started: single-controller guard (issue #598)
+# --------------------------------------------------------------------------
+
+
+def _ensure_started_config(
+    *,
+    scaling_enabled: bool = True,
+    allocation_enabled: bool = False,
+    managed_root: str = "",
+) -> OrchestratorConfig:
+    """Build an OrchestratorConfig with the runner_scaling/allocation knobs set.
+
+    ``managed_root`` defaults to empty so the guard fires before any
+    path-existence check; tests that need to reach ``ensure_runners_started``
+    pass a real tmp_path.
+    """
+    return OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(
+            enabled=scaling_enabled,
+            managed_root=managed_root,
+        ),
+        runner_allocation=RunnerAllocationConfig(enabled=allocation_enabled),
+    )
+
+
+def test_run_runners_ensure_started_refuses_when_allocation_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ensure-started must refuse when runner_allocation is enabled (#598).
+
+    ``ensure_runner_running`` relaunches any runner where
+    ``not is_runner_launched(...)`` -- exactly the state a deliberately parked
+    slot is in. Running ensure-started while allocation is enabled therefore
+    restarts every parked listener and silently undoes ``runners allocate``,
+    burning a full ``demand_idle_samples`` hysteresis window reconverging.
+    The guard refuses and points at the single controller.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *a, **k: _ensure_started_config(allocation_enabled=True),
+    )
+    ensure_mock = MagicMock(return_value=(0, []))
+    monkeypatch.setattr(cli, "ensure_runners_started", ensure_mock)
+
+    args = cli.build_parser().parse_args(["runners", "ensure-started"])
+    result = cli.run_runners_ensure_started(args)
+
+    assert result.ok is False, (
+        "ensure-started must refuse when runner_allocation is enabled, not "
+        "silently relaunch parked slots"
+    )
+    assert "runner_allocation is enabled" in result.message, (
+        f"refusal must name runner_allocation: {result.message!r}"
+    )
+    assert "runners allocate" in result.message, (
+        f"refusal must point at the single controller: {result.message!r}"
+    )
+    assert "--force" in result.message, (
+        f"refusal must mention the --force escape hatch: {result.message!r}"
+    )
+    (
+        ensure_mock.assert_not_called(),
+        (
+            "ensure_runners_started must NOT be called when the guard refuses -- "
+            "calling it would relaunch parked slots, which is the exact bug"
+        ),
+    )
+
+
+def test_run_runners_ensure_started_force_bypasses_allocation_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """--force is the explicit escape hatch past the allocation guard (#598).
+
+    A deliberate manual recovery that ``runners allocate`` cannot do may need
+    to relaunch every listener; --force records that intent explicitly so the
+    operator owns the reconvergence cost rather than the command silently
+    incurring it.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir()
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *a, **k: _ensure_started_config(
+            allocation_enabled=True,
+            managed_root=str(managed_root),
+        ),
+    )
+    ensure_mock = MagicMock(return_value=(2, ["jc-1: launched", "jc-2: launched"]))
+    monkeypatch.setattr(cli, "ensure_runners_started", ensure_mock)
+
+    args = cli.build_parser().parse_args(["runners", "ensure-started", "--force"])
+    result = cli.run_runners_ensure_started(args)
+
+    assert result.ok is True, f"--force must bypass the guard and proceed: {result.message!r}"
+    (
+        ensure_mock.assert_called_once(),
+        ("ensure_runners_started must be called when --force is passed"),
+    )
+
+
+def test_run_runners_ensure_started_proceeds_when_allocation_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No guard regression: allocation disabled means ensure-started runs.
+
+    The single-controller guard only applies when allocation is enabled. A
+    fleet that has not opted into runner_allocation must keep using
+    ensure-started as the recovery path for managed runners that die on
+    reboot/logoff -- the guard must not turn into a blanket refusal.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir()
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *a, **k: _ensure_started_config(
+            allocation_enabled=False,
+            managed_root=str(managed_root),
+        ),
+    )
+    ensure_mock = MagicMock(return_value=(1, ["jc-1: launched"]))
+    monkeypatch.setattr(cli, "ensure_runners_started", ensure_mock)
+
+    args = cli.build_parser().parse_args(["runners", "ensure-started"])
+    result = cli.run_runners_ensure_started(args)
+
+    assert result.ok is True, (
+        "ensure-started must proceed when runner_allocation is disabled -- "
+        "the guard is not a blanket refusal"
+    )
+    (
+        ensure_mock.assert_called_once(),
+        ("ensure_runners_started must be called when allocation is disabled"),
     )
 
 
