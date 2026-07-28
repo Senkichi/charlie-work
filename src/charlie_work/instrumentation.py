@@ -202,18 +202,68 @@ def _classify_level(kind: str) -> str:
     return "info"
 
 
+# Plural payload keys that carry lists of PR or issue numbers, consulted when
+# the singular keys (``pr_number``/``pr``, ``issue_number``/``issue``) are
+# absent. Ordered by preference: the first non-empty numeric list wins. Only
+# the first numeric element is used to backfill the single-valued indexed
+# column — the events table has one ``pr_number``/``issue_number`` slot per
+# row, so a multi-ref event is indexed by its most representative ref (the
+# first launched PR, the first dispatched issue). Non-numeric elements
+# (dicts, strings) are skipped so list-of-summary shapes (e.g. ``issues`` as
+# a list of dicts in CommandResult data) never produce a false ref.
+_PR_PLURAL_KEYS: tuple[str, ...] = ("pr_numbers", "prs", "launched", "failed")
+_ISSUE_PLURAL_KEYS: tuple[str, ...] = ("issue_numbers", "issues")
+
+
+def _first_number_from_list(value: Any) -> int | None:
+    """Return the first int/float element of a list, or None.
+
+    Bools are excluded because ``isinstance(True, int)`` is True in Python but
+    a boolean is never a valid PR/issue reference. Non-list values return None.
+    """
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, (int, float)) and item == item:
+            return int(item)
+    return None
+
+
 def _extract_payload_refs(payload: dict[str, Any]) -> tuple[int | None, int | None]:
     """Extract pr_number and issue_number from a payload dict for indexed columns.
 
     These are the most common query dimensions for root-cause analysis.
     Returns ``(pr_number, issue_number)`` with None for absent values.
+
+    Singular keys are tried first (``pr_number``/``pr``,
+    ``issue_number``/``issue``). When absent, common plural keys
+    (``issue_numbers``, ``pr_numbers``, ``launched``, ``failed``, …) are
+    unwrapped and the first numeric element backfills the indexed column.
+    This makes list-valued events (``dispatch``, ``review_dispatch``,
+    ``dispatch_rework``, ``review_dispatch_claim``) visible to
+    ``query_events``/``events_by_correlation_id`` PR/issue filtering instead
+    of landing with NULL refs (issue #553).
     """
     pr_number = payload.get("pr_number")
     if pr_number is None:
         pr_number = payload.get("pr")
+    if pr_number is None:
+        for key in _PR_PLURAL_KEYS:
+            candidate = _first_number_from_list(payload.get(key))
+            if candidate is not None:
+                pr_number = candidate
+                break
     issue_number = payload.get("issue_number")
     if issue_number is None:
         issue_number = payload.get("issue")
+    if issue_number is None:
+        for key in _ISSUE_PLURAL_KEYS:
+            candidate = _first_number_from_list(payload.get(key))
+            if candidate is not None:
+                issue_number = candidate
+                break
     return (
         int(pr_number) if isinstance(pr_number, (int, float)) and pr_number == pr_number else None,
         int(issue_number)

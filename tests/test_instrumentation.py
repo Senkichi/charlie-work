@@ -183,6 +183,94 @@ def test_pr_number_extraction(tmp_path: Path) -> None:
     assert events[2]["issue_number"] == 5
 
 
+def test_plural_payload_key_extraction(tmp_path: Path) -> None:
+    """Issue #553: list-valued payload keys must populate pr_number/issue_number.
+
+    dispatch/dispatch_rework carry ``issue_numbers`` (list), review_dispatch_claim
+    carries ``pr_numbers`` (list), and review_dispatch carries ``launched``/``failed``
+    (lists of PR ints). Without unwrapping, ~13% of events land with NULL indexed
+    columns and are invisible to query_events/events_by_correlation_id filtering.
+    The single-valued column is backfilled from the first numeric element.
+    """
+    state_path = tmp_path / "state.json"
+    # dispatch: issue_numbers list
+    log_event(state_path, "dispatch", {"issue_numbers": [101, 102, 103]})
+    # dispatch_rework: issue_numbers list
+    log_event(state_path, "dispatch_rework", {"issue_numbers": [200], "failed_issue_numbers": []})
+    # review_dispatch_claim: pr_numbers list
+    log_event(state_path, "review_dispatch_claim", {"pr_numbers": [55, 56], "count": 2})
+    # review_dispatch: launched list (preferred over failed)
+    log_event(
+        state_path,
+        "review_dispatch",
+        {"launched": [77, 78], "failed": [79], "quota_hit": False},
+    )
+    # review_dispatch with only failures
+    log_event(
+        state_path,
+        "review_dispatch",
+        {"launched": [], "failed": [88], "quota_hit": False},
+    )
+
+    events = read_event_log(state_path)
+    assert events[0]["issue_number"] == 101
+    assert events[0]["pr_number"] is None
+    assert events[1]["issue_number"] == 200
+    assert events[1]["pr_number"] is None
+    assert events[2]["pr_number"] == 55
+    assert events[2]["issue_number"] is None
+    assert events[3]["pr_number"] == 77
+    assert events[3]["issue_number"] is None
+    assert events[4]["pr_number"] == 88
+    assert events[4]["issue_number"] is None
+
+
+def test_plural_extraction_skips_non_numeric_lists(tmp_path: Path) -> None:
+    """Plural keys whose elements are dicts/objects must not produce false refs.
+
+    Some payloads use ``issues``/``prs``/``failed`` as lists of summary dicts
+    (e.g. CommandResult data). Only numeric elements are indexed; dict-shaped
+    lists leave the column NULL rather than guessing.
+    """
+    state_path = tmp_path / "state.json"
+    log_event(
+        state_path,
+        "intake",
+        {"issues": [{"number": 1, "title": "x"}], "prs": [{"number": 2}]},
+    )
+    log_event(state_path, "review_dispatch", {"failed": [{"pr": 9, "error": "boom"}]})
+
+    events = read_event_log(state_path)
+    assert events[0]["pr_number"] is None
+    assert events[0]["issue_number"] is None
+    assert events[1]["pr_number"] is None
+    assert events[1]["issue_number"] is None
+
+
+def test_singular_key_preferred_over_plural(tmp_path: Path) -> None:
+    """An explicit singular ref must win over a plural list."""
+    state_path = tmp_path / "state.json"
+    log_event(
+        state_path,
+        "dispatch",
+        {"pr_number": 42, "issue_numbers": [101, 102]},
+    )
+
+    events = read_event_log(state_path)
+    assert events[0]["pr_number"] == 42
+    assert events[0]["issue_number"] == 101
+
+
+def test_plural_extraction_query_events_filter(tmp_path: Path) -> None:
+    """Issue #553 core symptom: events with plural refs must be findable by PR/issue."""
+    state_path = tmp_path / "state.json"
+    log_event(state_path, "dispatch", {"issue_numbers": [101, 102]})
+
+    results = query_events(state_path, issue_number=101)
+    assert len(results) == 1
+    assert results[0]["kind"] == "dispatch"
+
+
 def test_level_classification(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     log_event(state_path, "dispatch", {})
