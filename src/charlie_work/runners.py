@@ -416,8 +416,23 @@ def get_runner_launcher_process(runner_dir: Path) -> subprocess.Popen[bytes] | N
         return None
     needle = str(script).lower()
 
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    # Restrict the scan to processes that could plausibly be the launch wrapper
+    # before doing the substring test. Without this, any unrelated process whose
+    # argv happens to contain the absolute run.cmd/run.sh path (an editor, grep,
+    # a diff tool with that file open) is mistaken for the wrapper and the slot
+    # reports "still starting up" forever — silently starving it. Mirrors the
+    # name+cwd restriction used by get_runner_listener_process.
+    if sys.platform == "win32":
+        # ``cmd /c run.cmd`` is the wrapper; conhost may host it.
+        allowed_names = {"cmd.exe", "conhost.exe"}
+    else:
+        # run.sh is executed via its shebang, i.e. a POSIX shell interpreter.
+        allowed_names = {"sh", "bash", "dash", "zsh", "ksh", "ash"}
+
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
+            if (proc.info["name"] or "").lower() not in allowed_names:
+                continue
             cmdline = proc.info["cmdline"] or []
             if any(needle in str(part).lower() for part in cmdline):
                 return proc  # type: ignore[return-value]
