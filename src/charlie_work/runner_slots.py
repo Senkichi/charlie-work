@@ -323,6 +323,23 @@ def load_idle_streaks(fleet_dir: Path) -> dict[str, int]:
     return streaks
 
 
+def load_tie_break_offset(fleet_dir: Path) -> int:
+    """Read the persisted floor-shortfall tie-break rotation offset.
+
+    Degrades to 0 (no rotation) on any problem — a missing or corrupt file
+    simply means the first pass uses the base name order.
+    """
+    path = fleet_dir / ALLOCATION_STATE_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    offset = data.get("tie_break_offset")
+    return offset if isinstance(offset, int) else 0
+
+
 @dataclass(frozen=True)
 class AllocationStamp:
     """Provenance of the last persisted allocation pass.
@@ -374,13 +391,22 @@ def load_allocation_stamp(fleet_dir: Path) -> AllocationStamp | None:
 
 
 def save_idle_streaks(
-    fleet_dir: Path, streaks: Mapping[str, int], *, source: AllocationSource
+    fleet_dir: Path,
+    streaks: Mapping[str, int],
+    *,
+    source: AllocationSource,
+    tie_break_offset: int = 0,
 ) -> None:
     """Persist slack streaks using the project's atomic temp-file + replace.
 
     ``source`` is required rather than defaulted: every writer has to say which
     path it is, because a caller that silently inherited the unattended default
     would make the state file assert that the daemon ran when it did not.
+
+    ``tie_break_offset`` persists the floor-shortfall tie-break rotation so the
+    same repo is not permanently starved when the budget cannot cover every
+    repo's floor (issue #601). Defaults to 0 for callers that predate the
+    rotation feature.
     """
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so "I deployed runner_allocation" would be reported while the file the
@@ -393,6 +419,7 @@ def save_idle_streaks(
         "version": 1,
         "updated_at": datetime.now(UTC).isoformat(),
         "source": source,
+        "tie_break_offset": tie_break_offset,
         "repos": {repo: {"idle_streak": streak} for repo, streak in sorted(streaks.items())},
     }
     tmp = path.with_suffix(path.suffix + ".tmp")

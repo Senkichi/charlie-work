@@ -191,6 +191,8 @@ def allocate_slots(
     budget: int,
     min_per_repo: int,
     pinned: Mapping[str, int] | None = None,
+    *,
+    tie_break_offset: int = 0,
 ) -> dict[str, int]:
     """Distribute ``budget`` running slots across repos by demand.
 
@@ -205,8 +207,9 @@ def allocate_slots(
        by how many runners it actually has registered) so no repo's queue can
        go unclaimed.
     3. Leftover budget is water-filled one slot at a time to whichever repo has
-       the largest unmet demand — max-min fair, so a burst in one repo cannot
-       starve another that also has work.
+       the largest unmet demand, breaking ties toward the repo with the fewest
+       slots held. This is max-min fair *per pass*: a burst in one repo cannot
+       starve another that also has work within a single call.
     4. No repo is ever given more slots than it has registered runners, and
        spare budget beyond total demand is left unused rather than spent on
        listeners nobody needs.
@@ -214,7 +217,13 @@ def allocate_slots(
     When floors alone exceed the budget, slots go to the hungriest repos first
     and some repos get nothing; the caller surfaces that as a note.
 
-    Ties break on repo name so the same inputs always give the same plan.
+    Ties (equal hunger in step 2, equal shortfall in step 3) break on a
+    *rotated* name order driven by ``tie_break_offset``. Without rotation, the
+    same repo loses every name tie on every pass — e.g. demand A=5 B=1 C=1,
+    budget 2, ``min_per_repo`` 1 always starves C. The caller increments the
+    offset each pass so the loser rotates, spreading floor shortfall fairly
+    across passes rather than permanently punishing whichever repo sorts last.
+    A single call with a fixed offset is still deterministic.
     """
     pinned = pinned or {}
     targets: dict[str, int] = {}
@@ -235,12 +244,20 @@ def allocate_slots(
     def want(repo: str) -> int:
         return min(demands.get(repo, 0), capacities.get(repo, 0))
 
+    # Rotated name priority: ``(index + offset) % len(elastic)`` shifts which
+    # repo wins a name tie so the same repo is not permanently punished. With
+    # elastic [B, C] and offset 0, B outranks C; with offset 1, C outranks B.
+    # The modular addition (not a cyclic list rotation) is what actually flips
+    # the relative order of tied repos — a plain rotation preserves adjacency.
+    n = len(elastic)
+    name_priority = {repo: (i + tie_break_offset) % n for i, repo in enumerate(elastic)}
+
     floors = {repo: min(min_per_repo, capacities.get(repo, 0)) for repo in elastic}
 
     # Step 2: floors. If they don't all fit, the hungriest repos are served
     # first — but every repo still gets a shot before anyone gets a second slot.
     if sum(floors.values()) > remaining:
-        by_hunger = sorted(elastic, key=lambda r: (-want(r), r))
+        by_hunger = sorted(elastic, key=lambda r: (-want(r), name_priority[r]))
         progressed = True
         while remaining > 0 and progressed:
             progressed = False
@@ -262,8 +279,11 @@ def allocate_slots(
         candidates = [repo for repo in elastic if targets[repo] < want(repo)]
         if not candidates:
             break
-        # Largest shortfall wins; then fewest slots held; then name.
-        chosen = min(candidates, key=lambda r: (-(want(r) - targets[r]), targets[r], r))
+        # Largest shortfall wins; then fewest slots held; then rotated name.
+        chosen = min(
+            candidates,
+            key=lambda r: (-(want(r) - targets[r]), targets[r], name_priority[r]),
+        )
         targets[chosen] += 1
         remaining -= 1
 
@@ -279,6 +299,7 @@ def plan_allocation(
     min_per_repo: int,
     idle_streaks: Mapping[str, int],
     demand_idle_samples: int,
+    tie_break_offset: int = 0,
 ) -> AllocationPlan:
     """Turn observations into a concrete set of start/park actions.
 
@@ -312,6 +333,7 @@ def plan_allocation(
         budget,
         min_per_repo,
         pinned=pinned,
+        tie_break_offset=tie_break_offset,
     )
 
     notes: list[str] = []
@@ -337,18 +359,6 @@ def plan_allocation(
         notes.append(
             f"budget {budget} cannot cover a {min_per_repo}-slot floor for "
             f"{len(capacities) - len(pinned)} repo(s); hungriest served first"
-        )
-
-    # Pins are the one way the host can sit above its budget: a repo whose
-    # demand we cannot read keeps its running slots, because parking them
-    # could strand work we simply failed to see. The allocator refuses to
-    # compound that (elastic repos get nothing), but silence would let the
-    # operator read an over-budget host as a healthy one.
-    allocated = sum(targets.values())
-    if allocated > budget:
-        notes.append(
-            f"{allocated} slot(s) running above the {budget}-slot budget, held by "
-            f"{len(pinned)} unmeasurable repo(s); no slot moves until demand reads again"
         )
 
     # Someone is starved: their fair target is below what they could use.
@@ -377,6 +387,10 @@ def plan_allocation(
 
         if target > len(running):
             needed = target - len(running)
+            # ``target <= capacity == running + parked`` always holds, so
+            # ``needed <= len(parked)`` — there is always a parked runner to
+            # start. (Issue #601: the ``needed > len(parked)`` guard that used
+            # to live here was unreachable and has been removed.)
             for inst in sorted(parked, key=lambda i: i.name)[:needed]:
                 changes.append(
                     SlotChange(
@@ -389,11 +403,6 @@ def plan_allocation(
                             f"{len(running)} running"
                         ),
                     )
-                )
-            if needed > len(parked):
-                notes.append(
-                    f"{repo}: wanted {needed} more slot(s) but only {len(parked)} "
-                    f"registered runner(s) are parked"
                 )
             continue
 
@@ -429,6 +438,28 @@ def plan_allocation(
                     f"{repo}: {surplus - len(reclaimable)} surplus slot(s) left running "
                     f"because they are executing jobs"
                 )
+
+    # The host can sit above its budget for two reasons the allocator refuses
+    # to "fix" by parking: a repo whose demand we cannot read is pinned to its
+    # running count, and a repo whose surplus listeners are executing jobs.
+    # In both cases parking would strand or abort work, so the overage is
+    # reported rather than silently absorbed. The sum of *targets* can equal
+    # the budget while the post-plan running total exceeds it — busy listeners
+    # that cannot be parked keep running on top of the starts the plan issues
+    # (issue #601). Self-corrects on the next pass once demand reads again or
+    # the busy jobs finish.
+    post_running = sum(running_counts.values())
+    for change in changes:
+        if change.action is SlotAction.START:
+            post_running += 1
+        else:
+            post_running -= 1
+    if post_running > budget:
+        notes.append(
+            f"{post_running} slot(s) running above the {budget}-slot budget; "
+            f"busy listeners and/or unmeasurable repos cannot be parked — "
+            f"no slot moves until demand reads again"
+        )
 
     return AllocationPlan(
         budget=budget,

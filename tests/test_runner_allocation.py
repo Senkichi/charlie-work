@@ -283,6 +283,80 @@ def test_over_budget_pins_are_reported_to_the_operator() -> None:
     assert any("above the 4-slot budget" in note for note in plan.notes)
 
 
+def test_over_budget_from_busy_listeners_is_reported() -> None:
+    """A plan whose targets fit the budget can still push running over it.
+
+    Reproduced from issue #601: A(cap 3, 2 running both busy, demand 0),
+    B(cap 5, 1 running, demand 10), budget 3. Targets A=1 B=2 sum to 3, so
+    the old sum-of-targets check never fired. But A's two busy listeners
+    cannot be parked, while B starts one more — running goes 3 -> 4. The
+    post-plan running total must be the warn condition, not the target sum.
+    """
+    plan = plan_allocation(
+        _instances(
+            {
+                CW: [("cw-1", True, True), ("cw-2", True, True), ("cw-3", False, False)],
+                JC: [("jc-1", True, False), ("jc-2", False, False), ("jc-3", False, False)],
+            }
+        ),
+        {CW: RepoDemand(CW), JC: RepoDemand(JC, queued_jobs=10)},
+        budget=3,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 99},
+        demand_idle_samples=3,
+    )
+    # B starts one listener; A's busy listeners stay running.
+    starts = [c for c in plan.changes if c.action is SlotAction.START]
+    assert len(starts) == 1 and starts[0].repo == JC
+    parks = [c for c in plan.changes if c.action is SlotAction.PARK]
+    assert parks == []  # A's surplus listeners are busy — cannot park
+    # Post-plan running = 2 (A, busy) + 2 (B, 1 existing + 1 start) = 4 > 3.
+    assert any("above the 3-slot budget" in note for note in plan.notes)
+
+
+def test_floor_shortfall_tie_break_rotates_with_offset() -> None:
+    """The same repo must not lose every name tie on every pass (issue #601).
+
+    demand A=5 B=1 C=1, caps 5, budget 2, min_per_repo 1: only two repos get
+    a floor slot. With offset 0, C is starved (B wins the tie). With offset 1,
+    B is starved (C wins the tie). The rotation spreads the shortfall.
+    """
+    args = dict(
+        demands={"A": 5, "B": 1, "C": 1},
+        capacities={"A": 5, "B": 1, "C": 1},
+        budget=2,
+        min_per_repo=1,
+    )
+    targets0 = allocate_slots(**args, tie_break_offset=0)  # type: ignore[arg-type]
+    assert targets0 == {"A": 1, "B": 1, "C": 0}
+
+    targets1 = allocate_slots(**args, tie_break_offset=1)  # type: ignore[arg-type]
+    assert targets1 == {"A": 1, "B": 0, "C": 1}
+
+    targets2 = allocate_slots(**args, tie_break_offset=2)  # type: ignore[arg-type]
+    assert targets2 == {"A": 1, "B": 1, "C": 0}
+
+
+def test_water_fill_tie_break_rotates_with_offset() -> None:
+    """The water-fill step's name tie-break also rotates (issue #601).
+
+    Two repos with equal demand and an odd budget: the extra slot goes to
+    CW with offset 0, to JC with offset 1.
+    """
+    args = dict(
+        demands={CW: 3, JC: 3},
+        capacities={CW: 3, JC: 3},
+        budget=3,
+        min_per_repo=1,
+    )
+    targets0 = allocate_slots(**args, tie_break_offset=0)  # type: ignore[arg-type]
+    assert targets0 == {CW: 2, JC: 1}
+
+    targets1 = allocate_slots(**args, tie_break_offset=1)  # type: ignore[arg-type]
+    assert targets1 == {CW: 1, JC: 2}
+
+
 def test_allocation_is_deterministic() -> None:
     """Same inputs, same plan — ties break on repo name."""
     args = dict(
@@ -463,7 +537,14 @@ def test_plan_reports_targets_for_every_repo() -> None:
     assert {t["repo"] for t in summary["targets"]} == {CW, JC}
 
 
-def test_plan_notes_when_a_repo_has_no_parked_runner_to_start() -> None:
+def test_plan_target_capped_by_capacity_when_demand_exceeds_registered_runners() -> None:
+    """A repo whose demand exceeds its registered runner count is capped at capacity.
+
+    The target equals the running count (both 1 — the single registered runner),
+    so no start or park is issued. The ``needed > len(parked)`` branch that used
+    to guard this path was unreachable (target <= capacity == running + parked)
+    and has been removed (issue #601).
+    """
     instances = _instances({JC: [("jc-1", True, True)]})
     plan = plan_allocation(
         instances,
@@ -667,6 +748,27 @@ def test_discovery_uses_the_platform_launch_script(tmp_path: Path) -> None:
 def test_idle_streaks_round_trip(tmp_path: Path) -> None:
     save_idle_streaks(tmp_path, {CW: 2, JC: 0}, source="prologue")
     assert load_idle_streaks(tmp_path) == {CW: 2, JC: 0}
+
+
+def test_tie_break_offset_round_trip(tmp_path: Path) -> None:
+    """The floor-shortfall rotation offset persists across passes (issue #601)."""
+    from charlie_work.runner_slots import load_tie_break_offset
+
+    save_idle_streaks(tmp_path, {CW: 1}, source="prologue", tie_break_offset=3)
+    assert load_tie_break_offset(tmp_path) == 3
+
+
+def test_tie_break_offset_defaults_to_zero_on_missing_file(tmp_path: Path) -> None:
+    from charlie_work.runner_slots import load_tie_break_offset
+
+    assert load_tie_break_offset(tmp_path) == 0
+
+
+def test_tie_break_offset_defaults_to_zero_on_corrupt_state(tmp_path: Path) -> None:
+    from charlie_work.runner_slots import load_tie_break_offset
+
+    (tmp_path / "runner-allocation.json").write_text("{ not json", encoding="utf-8")
+    assert load_tie_break_offset(tmp_path) == 0
 
 
 def test_idle_streak_write_is_atomic(tmp_path: Path) -> None:
