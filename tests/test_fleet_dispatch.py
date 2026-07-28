@@ -2913,3 +2913,132 @@ def test_run_fleet_supervise_self_deploy_error_dedups_across_passes(
     assert len(digest.transitions) == 1
     assert digest.transitions[0].health == "ERROR"
     assert digest.transitions[0].previous_health is None
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: occurrence-style events must not be deduped by the
+    stateful filter. ``review_verdict_recorded`` carries a constant ``OK``
+    health string by construction; if the cross-pass dedup applied to it, the
+    recorded-verdict heartbeat would collapse after the first occurrence per
+    issue/repo and a silent 0%-recording-rate regression would go invisible.
+    The fleet path in production goes through ``_build_fleet_attention_digest``
+    with ``state_file`` set, so this locks in the filtered path (not just the
+    unfiltered one covered by ``test_build_fleet_attention_digest_maps_review_verdict_events``).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_recorded",
+            "issue_number": 10,
+            "pr": 100,
+            "decision": "approved",
+        }
+    ]
+
+    # Two passes, identical recorded-verdict event — both must emit. The
+    # heartbeat stays visible; the baseline sidecar is not consulted for
+    # occurrence-style entries.
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "OK"
+    assert digest1.transitions[0].last_log_line == "approved recorded for PR 100"
+
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "OK"
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_missed_every_pass(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: ``review_verdict_missed`` has health ``ERROR`` (the same
+    string as a persistent worker error) but is an occurrence-style event. The
+    dedup must be scoped by entry type, not by health string, or repeat
+    missed-verdict signals would be silently dropped after the first one per
+    issue/repo. Locks in the exception for the ERROR-health occurrence case.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_missed",
+            "issue_number": 11,
+            "pr": 101,
+            "reason": "no parseable verdict",
+        }
+    ]
+
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "ERROR"
+    assert digest1.transitions[0].last_log_line == "no parseable verdict"
+
+    # Same missed verdict next pass — still emits despite health == "ERROR",
+    # because the event type is occurrence-style and bypasses the baseline.
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "ERROR"
+
+
+def test_build_fleet_attention_digest_stateful_mixed_persistent_and_occurrence(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: a persistent ``error`` and an occurrence
+    ``review_verdict_recorded`` for the same issue/repo share the dedup key
+    ``adapter_kind:issue_number``. The persistent entry must still be deduped
+    across passes while the occurrence entry keeps emitting, and the occurrence
+    entry must not poison the persistent baseline (so a later persistent
+    transition is not masked).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    persistent_event = {
+        "repo_key": "owner/repo",
+        "type": "error",
+        "issue_number": 42,
+        "error": "launch failed: OSError",
+    }
+    occurrence_event = {
+        "repo_key": "owner/repo",
+        "type": "review_verdict_recorded",
+        "issue_number": 42,
+        "pr": 420,
+        "decision": "approved",
+    }
+
+    # Pass 1: persistent null->ERROR emits; occurrence OK emits alongside.
+    digest1 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    healths = [t.health for t in digest1.transitions]
+    assert healths == ["ERROR", "OK"]
+
+    # Pass 2: persistent ERROR->ERROR is deduped away; occurrence OK still emits.
+    digest2 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    assert [t.health for t in digest2.transitions] == ["OK"]
+
+    # Pass 3: persistent ERROR->STALLED is a real transition and must emit even
+    # though the occurrence event sat between them every pass — the occurrence
+    # entry never wrote the shared baseline key.
+    stalled_event = {
+        "repo_key": "owner/repo",
+        "type": "stalled",
+        "issue_number": 42,
+        "reason": "no progress for 30m",
+    }
+    digest3 = _build_fleet_attention_digest(
+        [stalled_event, occurrence_event], state_file=state_file
+    )
+    healths3 = [t.health for t in digest3.transitions]
+    assert healths3 == ["STALLED", "OK"]
+    assert digest3.transitions[0].previous_health == "ERROR"

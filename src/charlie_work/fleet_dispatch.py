@@ -888,6 +888,17 @@ def _add_launch_failures(
 
 _FLEET_HEALTH_STATE_FILENAME = "notify_health_state.json"
 
+# Event types whose AttentionEntry represents a persistent health state of an
+# issue/worker (STALLED/ERROR/REPAIRED-style). Only these are subject to
+# cross-pass transition dedup: a persistent ERROR must not re-fire with
+# ``previous_health: null`` every pass (issue #554). Occurrence-style events
+# (review_verdict_recorded, review_verdict_missed, skipped,
+# live_worker_redispatch_averted, and the operational fallback entries) are
+# one-shot confirmations whose health string is constant by construction, so
+# deduping them would collapse the recorded-verdict heartbeat and silently drop
+# repeat missed-verdict signals (PR #669 review).
+_PERSISTENT_HEALTH_EVENT_TYPES = frozenset({"stalled", "error", "health_transition"})
+
 
 def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
     """Return the fleet-level notify health baseline sidecar path.
@@ -941,18 +952,30 @@ def _save_fleet_health_state(path: Path, issues: dict[str, str]) -> None:
 def _filter_fleet_health_transitions(
     entries: list[AttentionEntry],
     state_file: Path,
+    *,
+    persistent_mask: list[bool] | None = None,
 ) -> list[AttentionEntry]:
-    """Stateful filter: keep only entries whose health changed since last pass.
+    """Stateful filter: keep only persistent-health entries whose health changed.
 
     Reads the fleet health baseline sidecar (``notify_health_state.json``)
     mapping ``"adapter_kind:issue_number"`` to the last-emitted health. For
-    each entry, only keeps it when the health differs from the persisted
-    baseline, setting ``previous_health`` to that prior value. Updates and
-    atomically persists the new baselines.
+    each *persistent* entry, only keeps it when the health differs from the
+    persisted baseline, setting ``previous_health`` to that prior value.
+    Updates and atomically persists the new baselines.
 
     This is the fleet-level analogue of ``workflow._build_attention_digest``'s
     per-issue transition dedup. Without it, every fleet pass re-emits the same
     ERROR/STALLED entries with ``previous_health: null`` (issue #554).
+
+    ``persistent_mask`` (parallel to ``entries``) marks which entries represent
+    a persistent health state subject to cross-pass dedup. Entries marked
+    ``False`` are occurrence-style events (review_verdict_recorded/missed,
+    skipped, live_worker_redispatch_averted, operational fallback) and pass
+    through unchanged every call — they never consult nor update the baseline,
+    so a constant-health confirmation keeps firing as a heartbeat (PR #669
+    review). When ``persistent_mask`` is ``None`` every entry is treated as
+    persistent (the self-deploy ERROR/REPAIRED path, which is always
+    persistent).
 
     Entries are processed in order so a within-pass health change (e.g.
     ERROR then OK for the same issue) emits both transitions; the persisted
@@ -964,7 +987,14 @@ def _filter_fleet_health_transitions(
     state_file.parent.mkdir(parents=True, exist_ok=True)
     with state_lock(state_file):
         baselines = _load_fleet_health_state(state_file)
-        for entry in entries:
+        for idx, entry in enumerate(entries):
+            is_persistent = persistent_mask[idx] if persistent_mask is not None else True
+            if not is_persistent:
+                # Occurrence-style event: emit every time and leave the
+                # persisted baseline untouched (it tracks persistent health
+                # only, so a one-shot confirmation must not poison it).
+                emitted.append(entry)
+                continue
             key = f"{entry.adapter_kind}:{entry.issue_number}"
             last = baselines.get(key)
             if last == entry.health:
@@ -1017,16 +1047,25 @@ def _build_fleet_attention_digest(
     still surface in the digest instead of being silently dropped.
 
     When ``state_file`` is provided, the entries are filtered through
-    ``_filter_fleet_health_transitions`` so only real health transitions
-    (vs the last-persisted baseline) are emitted. Without it every pass
-    re-fires the same entries with ``previous_health: null`` (issue #554).
-    The returned digest always carries the post-filter entries; callers
-    that pass ``state_file`` should still check ``digest.transitions`` for
-    emptiness before emitting.
+    ``_filter_fleet_health_transitions`` so persistent-health entries
+    (``stalled``/``error``/``health_transition``) emit only on real transitions
+    vs the last-persisted baseline, while occurrence-style entries
+    (``review_verdict_recorded``/``review_verdict_missed``, ``skipped``,
+    ``live_worker_redispatch_averted``, operational fallback) pass through
+    every pass — collapsing those would defeat the recorded-verdict heartbeat
+    (PR #669 review). Without ``state_file`` every pass re-fires the same
+    entries with ``previous_health: null`` (issue #554). The returned digest
+    always carries the post-filter entries; callers that pass ``state_file``
+    should still check ``digest.transitions`` for emptiness before emitting.
     """
     entries: list[AttentionEntry] = []
+    # Parallel to ``entries``: True for persistent-health event types subject
+    # to cross-pass dedup, False for occurrence-style events that emit every
+    # pass. See ``_PERSISTENT_HEALTH_EVENT_TYPES``.
+    persistent_mask: list[bool] = []
     for event in attention_events:
         event_type = event["type"]
+        is_persistent = event_type in _PERSISTENT_HEALTH_EVENT_TYPES
         if event_type == "stalled":
             entries.append(
                 AttentionEntry(
@@ -1038,6 +1077,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "error":
             entries.append(
                 AttentionEntry(
@@ -1049,6 +1089,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "health_transition":
             entries.append(
                 AttentionEntry(
@@ -1060,6 +1101,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "skipped":
             entries.append(
                 AttentionEntry(
@@ -1071,6 +1113,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "live_worker_redispatch_averted":
             entries.append(
                 AttentionEntry(
@@ -1082,6 +1125,7 @@ def _build_fleet_attention_digest(
                     pid=event.get("pid"),
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "review_verdict_recorded":
             entries.append(
                 AttentionEntry(
@@ -1093,6 +1137,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "review_verdict_missed":
             entries.append(
                 AttentionEntry(
@@ -1104,6 +1149,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "runner_allocation":
             # Deliberately not in the digest — unlike the accidental drops the
             # fallback below exists to prevent. This is the allocator's *success*
@@ -1136,9 +1182,12 @@ def _build_fleet_attention_digest(
                     pid=event.get("pid"),
                 )
             )
+            persistent_mask.append(is_persistent)
 
     if state_file is not None:
-        entries = _filter_fleet_health_transitions(entries, state_file)
+        entries = _filter_fleet_health_transitions(
+            entries, state_file, persistent_mask=persistent_mask
+        )
 
     return AttentionDigest(
         generated_at=utc_now(),
