@@ -14583,6 +14583,26 @@ def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None
     assert result.data["missing"] == []
 
 
+def test_bootstrap_labels_descriptions_fit_github_limit(tmp_path: Path) -> None:
+    """GitHub rejects label descriptions over 100 chars with HTTP 422.
+
+    FakeGitHub doesn't enforce this, so a too-long description passes the
+    other bootstrap tests while silently 422ing against the real API (the
+    failure is swallowed by label_create's allow_failure=True) — 'complexity:high'
+    shipped with a 121-char description and was missing from every repo as a
+    result. Assert on the real descriptions directly so this can't recur.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.bootstrap_labels()
+
+    too_long = {name: desc for name, _color, desc in fake_gh.labels_created if len(desc) > 100}
+    assert too_long == {}
+
+
 def test_bootstrap_labels_fails_when_creation_silently_missed(tmp_path: Path) -> None:
     """If label_create silently fails (e.g. no auth), bootstrap must report failure."""
     config = OrchestratorConfig()
