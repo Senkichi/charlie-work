@@ -1210,6 +1210,81 @@ def test_run_fleet_supervise_logs_global_config_provenance(
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_loud_on_absent_global_layer(
+    mock_lock: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An absent global layer must be loud, not silent, in the supervisor.
+
+    Before #623, ``load_layered_config`` treated an unreachable global fleet
+    config as an empty mapping with no diagnostic, so a fleet supervisor whose
+    global layer was missing silently ran on pristine dataclass defaults --
+    ``runner_allocation`` off, ``notify`` off, ``labels`` back to built-ins --
+    while passes kept reporting success. ``run_fleet_supervise`` now loads with
+    ``require_global=True``, so the absent case raises ``ConfigError`` and the
+    supervisor's existing handler catches it, warns, and prints -- the same
+    loud path a malformed config already took.
+
+    This test drives the *real* ``load_layered_config`` (not a mock) against an
+    empty fleet dir so the ``require_global=True`` wiring is actually exercised
+    end-to-end. The provenance line below the handler still fires because it
+    uses ``describe_config_file`` directly, so the operator sees both the
+    warning and the cause.
+    """
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        result = run_fleet_supervise(
+            max_passes=1,
+            clock=fc.now,
+            sleep=fc.sleep,
+            fleet_dir_override=str(tmp_path),
+        )
+
+    # The supervisor continues (the daemon must not crash on a missing global
+    # layer) but it does so loudly: a WARNING was emitted naming the failure.
+    warning_lines = [r.getMessage() for r in caplog.records if "could not load" in r.getMessage()]
+    assert warning_lines, "an absent global layer must trigger the loud handler, not silence"
+    assert "per-repo config only" in warning_lines[0], (
+        f"the warning must name the fallback: {warning_lines[0]!r}"
+    )
+    # The ConfigError raised by require_global carries the path and the
+    # describe_config_file cause, and the handler interpolates it into the
+    # warning -- so the operator sees *why* the layer was unreadable, not just
+    # that it was.
+    assert str(tmp_path / "config.yaml") in warning_lines[0], (
+        "the expected global config path must appear in the warning"
+    )
+    assert "absent" in warning_lines[0], (
+        f"an absent layer must read as absent in the warning: {warning_lines[0]!r}"
+    )
+
+    # The handler also prints, so the failure is visible on stdout, not only in
+    # the log.
+    captured = capsys.readouterr()
+    assert "config load failed" in captured.out, (
+        "the absent-global failure must be printed, not only logged"
+    )
+
+    # The supervisor fell back to the per-repo config (NOT discarded to None or
+    # pristine defaults) and still ran the pass -- the daemon stays alive, but
+    # the operator has been told exactly why. Discarding the per-repo config
+    # with the global layer would regress the #623 silent-disable failure.
+    assert result.ok is True
+    assert mock_fleet_loop.call_count == 1
+    assert mock_fleet_loop.call_args.kwargs.get("global_config") is not None, (
+        "fleet_loop must NOT receive global_config=None when the global layer "
+        "is absent -- the per-repo config must survive the fallback, not be "
+        "discarded with the global layer (#623 silent-disable regression)"
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
 def test_run_fleet_supervise_respects_max_runtime(
