@@ -10222,12 +10222,19 @@ class OrchestratorApp:
                     )
                 drift = detect_drift(
                     self.gh, state, self.config, repo_root=self.repo_root
-                ) + detect_aviator_stale_blocked(self.gh, self.config)
+                ) + detect_aviator_stale_blocked(
+                    self.gh, self.config, repo_root=self.repo_root
+                )
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
                 if fix and drift:
                     new_state = apply_drift_fixes(
-                        self.gh, state, drift, self.config, repo_root=self.repo_root
+                        self.gh,
+                        state,
+                        drift,
+                        self.config,
+                        repo_root=self.repo_root,
+                        state_path=self.paths.state_file,
                     )
                     save_state(self.paths.state_file, new_state)
                     # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
@@ -10236,7 +10243,9 @@ class OrchestratorApp:
                     # actually landed before reporting success.
                     post_fix_drift = detect_drift(
                         self.gh, new_state, self.config, repo_root=self.repo_root
-                    ) + detect_aviator_stale_blocked(self.gh, self.config)
+                    ) + detect_aviator_stale_blocked(
+                        self.gh, self.config, repo_root=self.repo_root
+                    )
                     fixed = len(post_fix_drift) == 0
             message = f"found {len(drift)} drift item(s)"
             if fixed:
