@@ -748,6 +748,7 @@ def update_session_record_with_failure_classification(
     *,
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
+    session_completed: bool = False,
 ) -> tuple[str | None, str | None]:
     """Update a session record with failure classification after the session exits.
 
@@ -764,6 +765,16 @@ def update_session_record_with_failure_classification(
     because it hit a provider rate limit must be classified as such even when
     the caller only knows "this looked stalled" — otherwise ``throttled_until``
     never gets set and dispatch keeps relaunching workers into the same limit.
+
+    ``session_completed`` (issue #656): when the caller has already confirmed
+    via worktree inspection that this session produced complete, committable
+    work, log-tail classification is skipped entirely and ``fallback_kind`` is
+    used directly. A session that finished real work cannot also have been
+    killed by a provider rate-limit failure — that's ground truth, not a
+    heuristic. See ``claude_code.update_worker_record_with_failure_
+    classification`` for the sibling fix and the live false-positive this
+    protects against (a worker's own completion-summary prose quoting
+    throttle-marker text).
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
@@ -792,7 +803,7 @@ def update_session_record_with_failure_classification(
 
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path")
+    log_path_str = payload.get("log_path") if not session_completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers

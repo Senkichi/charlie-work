@@ -1465,6 +1465,7 @@ def update_worker_record_with_failure_classification(
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
+    session_completed: bool = False,
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1483,6 +1484,24 @@ def update_worker_record_with_failure_classification(
     classified as such even when the caller only knows "this looked stalled"
     — otherwise ``throttled_until`` never gets set and dispatch keeps
     relaunching workers into the same limit.
+
+    ``session_completed`` (issue #656): when the caller has already confirmed
+    via worktree inspection that this session produced complete, committable
+    work, log-tail classification is skipped entirely and ``fallback_kind`` is
+    used directly. A session that finished real work cannot also have been
+    killed by a provider quota/rate-limit/auth failure — that's ground truth,
+    not a heuristic — so there is no need to search its log tail at all.
+    Without this, the marker search treats the worker's own final-turn
+    completion summary (ordinary Claude Code CLI behavior — nearly every
+    session ends with a natural-language write-up) as fair game, and generic
+    markers like "usage limit" / "rate limit" false-positive on legitimate
+    prose about this codebase's own rate-limit/quota domain. Observed live
+    2026-07-27: a rework session for issue #651 (the bug about this exact
+    false-positive class in the *reviewer* path, fixed by #652) quoted its own
+    fix's marker examples in its completion summary and was reclassified
+    quota_exhausted, setting a fleet-wide 24h dispatch throttle despite having
+    finished cleanly — the same failure mode #652 fixed for reviewers, just in
+    the sibling worker-classification path #652 didn't touch.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
@@ -1515,7 +1534,7 @@ def update_worker_record_with_failure_classification(
 
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path")
+    log_path_str = payload.get("log_path") if not session_completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers

@@ -3979,6 +3979,12 @@ def _classify_dead_sessions_and_update_throttle_state(
             # is already set). For non-completed sessions, preserve the original
             # ordering so worker_blocked still escalates.
             if is_completed:
+                # session_completed=True (issue #656): the worktree inspection
+                # just above is ground truth that this session produced real,
+                # committable work -- it cannot also have died to a provider
+                # quota/rate-limit/auth failure, so log-tail marker matching
+                # (which would otherwise treat the session's own completion
+                # summary prose as fair game) is skipped entirely.
                 if w.adapter_kind == "devin":
                     failure_kind, throttled_until = (
                         update_session_record_with_failure_classification(
@@ -3986,6 +3992,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -3995,6 +4002,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind="unpublished_work",
                             config=config,
+                            session_completed=True,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4005,6 +4013,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             adapter_kind="api",
+                            session_completed=True,
                         )
                     )
                 else:

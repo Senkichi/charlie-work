@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import os
+import subprocess
 import time
 
 from charlie_work.claude_code import ClaudeWorkerRecord
@@ -1030,6 +1031,227 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
     assert not sidecar_path.exists()
     assert (123, config.labels.in_progress) in fake_gh.labels_removed
     assert (123, config.labels.ready) in fake_gh.labels_added
+
+
+# --- helpers for issue #656 workflow call-site regression coverage ----------
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
+
+
+def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A bare remote + a non-bare clone with one commit on main, pushed."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir(parents=True, exist_ok=True)
+    _git(remote, "init", "--bare", "--initial-branch=main")
+    clone = tmp_path / "clone"
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "--initial-branch=main")
+    _git(clone, "config", "user.email", "test@example.test")
+    _git(clone, "config", "user.name", "Test User")
+    _git(clone, "config", "commit.gpgSign", "false")
+    _git(clone, "remote", "add", "origin", str(remote))
+    (clone / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(clone, "add", "README.md")
+    _git(clone, "commit", "-m", "initial commit")
+    _git(clone, "push", "-u", "origin", "main")
+    return remote, clone
+
+
+def _setup_completed_worktree(repo_root: Path, issue_number: int) -> tuple[Path, str]:
+    """Create a worktree with one commit beyond origin/main (WorktreeState.COMPLETED)."""
+    from charlie_work.worktree import create_worktree
+
+    branch = f"agent/issue-{issue_number}"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+    return info.path, branch
+
+
+# Adapter-kind -> sidecar filename suffix (mirrors claude_code sidecar naming).
+_WF_ADAPTER_SIDECAR_SUFFIX = {"devin": "", "claude-code": ".claude", "api": ".api"}
+
+
+def _wf_write_dead_session_sidecar(
+    sessions_dir: Path,
+    issue_number: int,
+    branch: str,
+    worktree_path: Path,
+    adapter_kind: str,
+    log_text: str,
+) -> Path:
+    """Write a dead-session sidecar (pid=None) for any adapter kind + its log."""
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    suffix = _WF_ADAPTER_SIDECAR_SUFFIX[adapter_kind]
+    sidecar_path = sessions_dir / f"issue-{issue_number}{suffix}.json"
+    if adapter_kind == "devin":
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path="/tmp/prompt.md",
+            command=("devin", "--prompt-file", "/tmp/prompt.md"),
+            pid=None,
+            started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            log_path=str(log_path),
+            error=None,
+        )
+        sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    else:
+        # claude-code / api share the ClaudeWorkerRecord on-disk shape; the
+        # ``adapter_kind`` field disambiguates api from claude-code.
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "worktree_path": str(worktree_path),
+                    "prompt_path": "/tmp/prompt.md",
+                    "command": ["claude", "-p"],
+                    "pid": None,
+                    "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "adapter_kind": adapter_kind,
+                }
+            ),
+            encoding="utf-8",
+        )
+    return sidecar_path
+
+
+class _NoOpGitHub:
+    """Minimal GitHub stub for the dead-session lane.
+
+    Returns no open PRs and an issue carrying only a non-active label, so the
+    post-classification relabel/salvage block hits ``if not active_labels:
+    continue`` and the test's concern -- the throttle-state write -- is
+    exercised in isolation. ``repo_root`` is deliberately NOT set so the
+    salvage path (which needs push/PR creation) is skipped.
+    """
+
+    def __init__(self, issue_number: int, label: str) -> None:
+        self._issue = {
+            "number": issue_number,
+            "title": f"issue {issue_number}",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "",
+            "labels": [{"name": label}],
+            "state": "OPEN",
+        }
+        self.labels_added: list[tuple[int, str]] = []
+        self.labels_removed: list[tuple[int, str]] = []
+
+    def pr_list(self) -> list[dict]:
+        return []
+
+    def issue_view(self, number: int):
+        if number != self._issue["number"]:
+            raise ValueError(f"issue {number} not found")
+        return self._issue
+
+    def add_issue_label(self, number: int, label: str) -> bool:
+        self.labels_added.append((number, label))
+        return True
+
+    def remove_issue_label(self, number: int, label: str) -> bool:
+        self.labels_removed.append((number, label))
+        return True
+
+
+@pytest.mark.parametrize("adapter_kind", ["devin", "claude-code", "api"])
+def test_workflow_classify_dead_sessions_completed_skips_log_tail_throttle(
+    tmp_path: Path, adapter_kind: str
+) -> None:
+    """Issue #656 regression: a completed worktree's log-tail throttle markers
+    must NOT set ``throttled_until`` in state.json.
+
+    Guards the three ``session_completed=True`` call sites in
+    ``workflow._classify_dead_sessions_and_update_throttle_state`` (one per
+    adapter kind, including the claude-code branch that caused the live #651
+    incident). The log file is seeded with ``"usage limit"`` -- a
+    ``_QUOTA_EXHAUSTED_PATTERN`` substring that, if log-tail classification
+    ran, would return ``quota_exhausted`` plus a 24h ``throttled_until`` and
+    write it into state.json. The worktree inspection is ground truth the
+    session completed, so ``session_completed=True`` must skip log-tail
+    matching entirely and leave ``failure_kind="unpublished_work"``.
+
+    If ``session_completed=True`` is silently dropped from any of the three
+    call sites, this test fails on both assertions: ``failure_kind`` becomes
+    ``quota_exhausted`` and ``state["throttled_until"]`` is set to a 24h
+    future timestamp.
+    """
+    import sys
+
+    from charlie_work.state import load_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit")
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+        # pid=None skips the corroboration/deferral lane entirely, so the
+        # deferral cap is irrelevant here; pin it for determinism anyway.
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0),
+    )
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 656
+    worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    sessions_dir = repo_root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sidecar_path = _wf_write_dead_session_sidecar(
+        sessions_dir,
+        issue_number,
+        branch,
+        worktree_path,
+        adapter_kind,
+        log_text=(
+            '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") '
+            "that legitimately appear in this codebase's rate-limit/quota domain.\n"
+        ),
+    )
+
+    # Issue carries only a non-active label so the relabel/salvage block
+    # short-circuits and the throttle-state write is the only side effect.
+    gh = _NoOpGitHub(issue_number, config.labels.ready)
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
+
+    reaped = _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config
+    )
+
+    # The dead lane ran and reaped the sidecar.
+    assert len(reaped) == 1
+    assert reaped[0]["adapter_kind"] == adapter_kind
+    # The is_completed lane was taken: failure_kind is the caller's
+    # "unpublished_work" fallback, NOT log-tail-derived "quota_exhausted".
+    assert reaped[0]["failure_kind"] == "unpublished_work", (
+        f"completed {adapter_kind} session was reclassified from log tail "
+        f"(issue #656 regression): {reaped[0]['failure_kind']}"
+    )
+    assert not sidecar_path.exists()
+
+    # The throttle must NOT fire despite the "usage limit" marker in the log --
+    # session_completed=True skipped log-tail classification entirely, so no
+    # throttled_until window was written into state.json.
+    final_state = load_state(state_file)
+    assert final_state.get("throttled_until") is None, (
+        f"completed {adapter_kind} session set a fleet-wide throttle despite "
+        f"session_completed=True (issue #656 regression): "
+        f"{final_state.get('throttled_until')}"
+    )
 
 
 def test_iter_workers_backward_compatibility(tmp_path: Path) -> None:
