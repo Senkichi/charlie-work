@@ -15,6 +15,7 @@ from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfi
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
 from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
+from charlie_work.instrumentation import read_event_log
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import (
     AVIATOR_BLOCKED_MESSAGE,
@@ -3068,6 +3069,114 @@ def test_detect_aviator_stale_blocked_no_readd_when_mergequeue_already_present()
     assert drift[0].add_labels == ()
 
 
+def _write_review_decision(
+    tmp_path: Path, config: OrchestratorConfig, pr_number: int, decision: dict[str, Any]
+) -> None:
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+
+
+def _aviator_blocked_pr_and_gh(pr_number: int, head_sha: str) -> tuple[dict[str, Any], Any]:
+    pr = {**_pr(pr_number, "OPEN"), "headRefOid": head_sha, "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha[head_sha] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+    return pr, gh
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_without_repo_root() -> None:
+    """Fail closed: without repo_root there is no way to check the review
+    decision, so re-queueing must not happen even though CI is green."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+
+    drift = detect_aviator_stale_blocked(gh, config)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == ("blocked",)
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_when_not_approved(
+    tmp_path: Path,
+) -> None:
+    """job-cannon #1408/#1404: a PR carrying request_changes must never be
+    re-queued just because Aviator's own 'blocked' label went stale."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "request_changes", "reviewed_head_sha": "sha-1408"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_when_approved_at_stale_head(
+    tmp_path: Path,
+) -> None:
+    """An approval recorded for an old commit must not authorize a newer,
+    unreviewed head -- mirrors the head_moved check in ship_it's can_merge."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-new")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-old"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_readds_mergequeue_when_approved_at_live_head(
+    tmp_path: Path,
+) -> None:
+    """Once a PR is genuinely approved at its current head, unsticking the
+    stale 'blocked' label may still re-queue it for Aviator."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == (mergequeue_label,)
+
+
 def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -> None:
     config = OrchestratorConfig()
     mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
@@ -3092,6 +3201,37 @@ def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -
 
     assert gh.pr_labels_removed == [(1400, "blocked")]
     assert gh.pr_labels_added == [(1400, mergequeue_label)]
+
+
+def test_apply_fixes_dual_writes_reconcile_event_to_events_db(tmp_path: Path) -> None:
+    """``apply_fixes`` must pass ``state_path`` through to ``append_event`` --
+    without it, every reconcile fix (including aviator_stale_blocked re-queues)
+    is invisible to events.db and only survives in the capped 200-entry ring
+    in state.json (found via job-cannon audit: 39 merged_outside_orchestrator
+    fixes recorded in state.json, zero in events.db)."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="aviator_stale_blocked",
+            issue_number=None,
+            pr_number=1400,
+            detail="PR #1400 has a stale Aviator 'blocked' label",
+            fix_actions=("remove label 'blocked' from PR #1400",),
+            remove_labels=("blocked",),
+            add_labels=(),
+        )
+    ]
+    state_path = tmp_path / "state.json"
+
+    apply_fixes(gh, state, drift, config, state_path=state_path)
+
+    events = read_event_log(state_path)
+    reconcile_events = [e for e in events if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "aviator_stale_blocked"
+    assert reconcile_events[0]["payload"]["pr_number"] == 1400
 
 
 def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None:

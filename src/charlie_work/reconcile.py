@@ -38,6 +38,7 @@ from .github import (
     linked_issue_number,
 )
 from .labels import TransitionOutcome, transition
+from .paths import runtime_paths
 from .process_utils import kill_process_tree
 from .state import (
     PASSIVE_OPEN_STATUS,
@@ -163,7 +164,41 @@ AVIATOR_CHECK_NAME = "aviator/checks"
 AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
 
 
-def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list[DriftItem]:
+def _pr_review_approved_at_head(
+    config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
+) -> bool:
+    """Mirror ``OrchestratorApp._review_decision``'s approval gate.
+
+    Re-adding the Aviator ``mergequeue`` label must never be safer than the
+    normal ship_it path, which only queues a PR when its review-decision.json
+    records ``decision == "approved"`` at the PR's *current* head. Without
+    this check, ``detect_aviator_stale_blocked`` re-queued job-cannon PR
+    #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
+    their recorded decisions were ``request_changes``/never-reviewed --
+    Aviator then merged both unreviewed once CI was green, since Aviator's
+    own admission check knows nothing about ``review-decision.json``.
+    Returns ``False`` (fail closed) when *repo_root* is unavailable or no
+    matching approved-at-head decision can be read.
+    """
+    if repo_root is None:
+        return False
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+    if not decision_path.exists():
+        return False
+    try:
+        with decision_path.open("r", encoding="utf-8") as handle:
+            decision = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(decision, dict) or decision.get("decision") != "approved":
+        return False
+    return decision.get("reviewed_head_sha") == head_sha
+
+
+def detect_aviator_stale_blocked(
+    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+) -> list[DriftItem]:
     """Detect PRs stuck behind a stale Aviator ``blocked`` label.
 
     Aviator sometimes blocks a PR (setting ``blocked`` and stripping
@@ -187,6 +222,13 @@ def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list
     Check Runs (only legacy Commit Statuses populate it), so
     ``GitHub.pr_checks``/``PR_CHECKS_FIELDS`` cannot see it at all; this is
     the only path that can.
+
+    The stale ``blocked`` label is always cleared once CI is confirmed green
+    (Aviator will re-evaluate honestly on its own). The ``mergequeue`` label
+    is re-added only when ``_pr_review_approved_at_head`` confirms the PR is
+    currently approved at its live head -- otherwise this function would
+    reintroduce the exact worker-self-merge-without-review gap issue #502's
+    unauthorized-merge tripwire exists to catch.
     """
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
@@ -238,7 +280,11 @@ def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list
         )
         mergequeue_label = config.auto_merge.mergequeue_label
         add_labels: tuple[str, ...] = ()
-        if mergequeue_label and mergequeue_label not in label_names(pr):
+        if (
+            mergequeue_label
+            and mergequeue_label not in label_names(pr)
+            and _pr_review_approved_at_head(config, repo_root, pr_number, str(head_sha))
+        ):
             add_labels = (mergequeue_label,)
 
         fix_actions = [f"remove label 'blocked' from PR #{pr_number}"]
@@ -1164,6 +1210,7 @@ def apply_fixes(
     config: OrchestratorConfig,
     *,
     repo_root: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, Any]:
     """Apply the structured fixes for each drift item and return a NEW state dict.
 
@@ -1175,6 +1222,12 @@ def apply_fixes(
     state so the closed lifecycle cannot be mistaken for a live claim. A PR
     whose reviewer process is still alive is deferred to a later pass (issue
     #504) so the live session is not interrupted.
+
+    ``state_path`` is threaded through to ``append_event`` so each
+    ``"reconcile"`` event is also dual-written to the unlimited ``events.db``
+    log, not just the capped 200-entry ring in ``state.json`` — without it,
+    fixes like ``merged_outside_orchestrator`` and ``aviator_stale_blocked``
+    are invisible to ``query_events``/``event_counts_by_kind`` entirely.
     """
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
@@ -1647,6 +1700,7 @@ def apply_fixes(
                 "fix_actions": list(item.fix_actions),
                 "detail": item.detail,
             },
+            state_path=state_path,
         )
 
     return new_state
