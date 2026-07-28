@@ -773,3 +773,70 @@ def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: P
 
     assert len(merged) == 1
     assert merged[0]["headRefOid"] == "27a20fbd"
+
+
+def test_commit_check_runs_wraps_rest_endpoint(monkeypatch, tmp_path: Path) -> None:
+    """reconcile.py's aviator_stale_blocked detection needs output.summary,
+    which gh pr checks --json cannot surface (its description field is always
+    empty for App-created Check Runs) -- this is the only path that can."""
+    payload = {
+        "check_runs": [
+            {
+                "id": 90085390042,
+                "name": "aviator/checks",
+                "status": "completed",
+                "conclusion": "failure",
+                "output": {
+                    "title": "Aviator checks - blocked",
+                    "summary": (
+                        "This PR is not ready to merge (currently in state blocked): "
+                        "PR has a blocked label, remove to re-queue."
+                    ),
+                },
+            }
+        ]
+    }
+
+    def fake_run(cmd, *args, **kwargs):
+        assert cmd[:2] == ["gh", "api"]
+        assert cmd[2] == "repos/{owner}/{repo}/commits/abc123/check-runs"
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    check_runs = gh.commit_check_runs("abc123")
+
+    assert check_runs is not None
+    assert check_runs[0]["name"] == "aviator/checks"
+    assert check_runs[0]["conclusion"] == "failure"
+    assert "blocked label" in check_runs[0]["output"]["summary"]
+
+
+def test_commit_check_runs_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    assert gh.commit_check_runs("missing-sha") is None
+
+
+def test_remove_pr_label_invokes_gh_pr_edit(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    ok = gh.remove_pr_label(1400, "blocked")
+
+    assert ok is True
+    assert calls[-1][:5] == ["gh", "pr", "edit", "1400", "--remove-label"]
+    assert calls[-1][5] == "blocked"

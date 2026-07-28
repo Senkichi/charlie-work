@@ -183,6 +183,27 @@ def test_default_config_throttle_error_markers() -> None:
     assert "A tool was rejected by the user" not in config.runtime.throttle_error_markers
 
 
+def test_default_config_session_limit_markers() -> None:
+    """RuntimeConfig.session_limit_markers defaults to the narrow CLI
+    session-limit death-message phrasing only (issue #651/#652).
+
+    Unlike throttle_error_markers (which includes generic substrings like
+    "rate limit" / "usage limit" appropriate for worker log tails), this list
+    contains only specific CLI death-message phrasing safe to match against
+    reviewer analysis prose. Generic markers must NOT appear here: reviewer
+    launches force tee_stream_json=True, making log_path and events_path
+    byte-identical, so a marker matched against the log tail is also matched
+    against the parsed assistant text -- generic markers would false-positive
+    on legitimate rate-limit/quota review commentary.
+    """
+    config = load_config()
+    assert "hit your session limit" in config.runtime.session_limit_markers
+    # Generic markers that appear in review commentary must NOT be here.
+    assert "rate limit" not in config.runtime.session_limit_markers
+    assert "usage limit" not in config.runtime.session_limit_markers
+    assert "too many requests" not in config.runtime.session_limit_markers
+
+
 def test_runner_scaling_config_parses_with_enabled_flag(tmp_path: Path) -> None:
     """RunnerScalingConfig parses with enabled=true and custom values."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -475,6 +496,24 @@ runtime:
         "Reached overall message rate limit",
         "A tool was rejected by the user",
         "custom provider failure",
+    )
+
+
+def test_load_config_runtime_session_limit_markers(tmp_path: Path) -> None:
+    """RuntimeConfig.session_limit_markers is configurable from YAML (issue #651/#652)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+runtime:
+  session_limit_markers:
+    - "hit your session limit"
+    - "custom session-limit phrasing"
+"""
+    )
+    config = load_config(config_file)
+    assert config.runtime.session_limit_markers == (
+        "hit your session limit",
+        "custom session-limit phrasing",
     )
 
 
@@ -3438,6 +3477,57 @@ def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> N
     # been independently confirmed, so in-progress must not be applied.
     assert (123, "agent:queued") in fake_gh.labels_added
     assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def test_dispatch_survives_worker_census_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #646 regression guard: ``_log_worker_census`` is invoked
+    unconditionally as the first statement of ``dispatch()`` so every dispatch
+    path logs it. That diagnostic must never be the reason a whole dispatch
+    pass aborts -- a torn sidecar read (or any other unexpected failure in the
+    census sweep) is *more* likely, not less, during the exact
+    high-concurrency moment this census exists to diagnose.
+
+    This behavior already regressed once earlier in this branch's own commit
+    history (the call was unguarded before commit f891866), so pin it with a
+    test: force the census to raise, then assert dispatch still runs to
+    completion and selects a worker, and that the failure is surfaced as a
+    warning rather than propagating or being silently swallowed.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Make the issue dispatchable (default fixture ships an open tracked PR).
+    app.gh.prs[0]["state"] = "CLOSED"
+
+    def _boom(_sessions_dir: Path) -> None:
+        raise OSError("simulated torn sidecar read")
+
+    monkeypatch.setattr("charlie_work.workflow._log_worker_census", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.workflow"):
+        result = app.dispatch(limit=1)
+
+    # dispatch() must not have raised: it returns a normal ok result and, more
+    # importantly, actually did its work (selected a worker, wrote the prompt)
+    # -- proving it continued past the failing census call rather than aborting
+    # at the first statement.
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert prompt_path.exists()
+    assert (123, "agent:queued") in fake_gh.labels_added
+
+    # The census failure must be surfaced as a warning (not silently swallowed
+    # and not propagated), so an operator scanning logs can still see it.
+    assert any("worker census failed" in record.getMessage() for record in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
 
 
 def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
@@ -22756,6 +22846,74 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     # The PR state must remain escalated, not be clobbered to janitor_blocked.
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "escalated"
+
+
+def test_review_refreshes_janitor_diagnostics_while_issue_escalated(tmp_path: Path) -> None:
+    """job-cannon #1397/#1443 (2026-07-27): janitor_failures must not go stale
+    while the linked issue is escalated for an UNRELATED reason (e.g. a dead
+    rework-worker session), even though status/labels/routing stay frozen.
+
+    Before this fix, review()'s escalation short-circuit returned before ever
+    calling run_janitor again, so a PR whose merge conflict cleared (or whose
+    CI went green) kept reporting the stale pre-escalation failure for as long
+    as the issue stayed escalated -- sometimes many hours, until an operator
+    ran unescalate(). This asserts janitor_ok/janitor_failures track reality
+    on every review() call, while status/labels/attempt counters stay inert.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.pr_head_shas[456] = "sha-1"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
+    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+
+    # Seed a PR record with a stale-but-then-true merge-conflict failure, as
+    # the janitor gate itself would have written it before escalation.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": ["PR has merge conflicts (mergeable=CONFLICTING)"],
+        }
+        # Escalate the linked ISSUE only (mirrors a dead rework-worker
+        # escalation) -- the PR's own status is deliberately left at
+        # "janitor_blocked", matching the real #1397/#1443 state shape.
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(paths.state_file, state)
+
+    # The conflict clears (e.g. a branch update landed) while still escalated.
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data.get("skipped") is True
+    assert not fake_gh.labels_added
+    assert not fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    # Frozen: escalation stays terminal for status -- only unescalate() may
+    # move this.
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["issues"]["123"]["status"] == "escalated"
+    # Refreshed: the stale conflict failure must be gone.
+    assert state["prs"]["456"]["janitor_ok"] is True
+    assert state["prs"]["456"]["janitor_failures"] == []
+
+    # A second call with nothing changed must not re-log a duplicate event
+    # (cost-spirals.md Finding 2 dedup applies here too).
+    events_before = len(state.get("events", []))
+    app.review(456)
+    state = load_state(paths.state_file)
+    janitor_gate_events = [e for e in state.get("events", []) if e.get("kind") == "janitor_gate"]
+    assert len(janitor_gate_events) == 1
+    assert len(state.get("events", [])) == events_before
 
 
 def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:

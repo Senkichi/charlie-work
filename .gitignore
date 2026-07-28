@@ -12,3 +12,17 @@ htmlcov/
 
 # Local orchestrator profile (self-hosting); machine-specific, keep untracked like job-cannon
 orchestrator.config.yaml
+
+# Agent/tool scratch output (nit-pick-supreme, devin CLI, ad-hoc session work).
+# NB: scripts/ is deliberately NOT ignored — the fleet launcher lives there and
+# is load-bearing (see scripts/fleet-pass-hidden.vbs).
+scratchpad/
+.nit-supreme/
+.devin/
+
+# Host-local operational logs and one-off artifacts
+proc-monitor.log
+rollcall_charlie.json
+*.tmp_log*.txt
+test_marker*.txt
+*.bak

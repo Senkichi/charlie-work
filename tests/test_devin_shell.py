@@ -305,6 +305,66 @@ def test_launch_devin_session_worker_env_overrides_sanitize_env(
     assert log_text == "/custom/override/venv"
 
 
+def test_launch_devin_session_records_default_xdist_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: with no ambient/config cap, the sidecar records the safe default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        141,
+        "agent/issue-141-default-cap",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "2"
+    assert record.uv_no_sync is None  # no .venv in this fake worktree
+
+    payload = json.loads((sessions_dir / "issue-141.json").read_text(encoding="utf-8"))
+    assert payload["xdist_cap"] == "2"
+    assert payload["uv_no_sync"] is None
+
+
+def test_launch_devin_session_worker_env_pytest_cap_override_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: an explicit worker_env cap must win over the ambient env and default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "6")
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        142,
+        "agent/issue-142-cap-override",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "UV_NO_SYNC": "0"},
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "1"
+    assert record.uv_no_sync == "0"
+
+
 # ---------------------------------------------------------------------------
 # Core launch behaviour
 # ---------------------------------------------------------------------------
@@ -1764,6 +1824,52 @@ def test_update_session_record_with_failure_classification_includes_resume_margi
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
     expected = now + timedelta(minutes=5, seconds=90)
     assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_update_session_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Sibling of the claude_code.py regression test -- same fix, devin adapter.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
 
 
 def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
