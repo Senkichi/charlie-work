@@ -2124,6 +2124,31 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     runner_allocation = _build_section(
         RunnerAllocationConfig, "runner_allocation", runner_allocation_data
     )
+    # Cross-section floor check (issue #600): runner_scaling and runner_allocation
+    # both declare a "minimum runners per repo" floor on different axes -- scaling
+    # keeps runners *registered* (provisioning/deregistering), allocation keeps
+    # listeners *running* (starting/stopping already-configured listeners). When
+    # both are enabled, an allocation floor higher than the scaling floor is
+    # unsatisfiable: allocation caps each repo's target at its registered runner
+    # count (runner_allocation.plan_allocation), so min_running_per_repo >
+    # min_runners silently degrades to min_runners with nothing reconciling the
+    # two. Reject it at load time rather than documenting the caveat. The reverse
+    # (min_runners > min_running_per_repo) is a legitimate buffer -- registered
+    # but parked runners that allocation promotes on demand -- and is allowed.
+    if (
+        runner_scaling.enabled
+        and runner_allocation.enabled
+        and runner_allocation.min_running_per_repo > runner_scaling.min_runners
+    ):
+        raise ConfigError(
+            "config sections 'runner_scaling' and 'runner_allocation' are both "
+            "enabled but their floors disagree: runner_allocation."
+            f"min_running_per_repo={runner_allocation.min_running_per_repo} "
+            f"exceeds runner_scaling.min_runners={runner_scaling.min_runners}. "
+            "Allocation cannot keep more listeners running than scaling "
+            "provisions; raise runner_scaling.min_runners to at least the "
+            "allocation floor."
+        )
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
