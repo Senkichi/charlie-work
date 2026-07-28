@@ -32,6 +32,7 @@ from typing import Literal, Mapping
 
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError
+from .safe_path import contains
 from .runner_allocation import (
     AllocationPlan,
     RepoDemand,
@@ -114,8 +115,6 @@ def discover_runner_instances(
     instances: list[RunnerInstance] = []
     notes: list[str] = []
 
-    resolved_root = managed_root.resolve()
-
     for entry in sorted(managed_root.iterdir(), key=lambda p: p.name):
         if not entry.is_dir():
             continue
@@ -125,7 +124,7 @@ def discover_runner_instances(
         # hand back a tree somewhere else entirely — including the unrelated
         # runner service at C:\actions-runner — and make it start/park-eligible.
         # Enforce containment on the resolved path rather than trusting shape.
-        if not entry.resolve().is_relative_to(resolved_root):
+        if not contains(managed_root, entry):
             notes.append(f"{entry.name}: resolves outside managed_root, skipped")
             continue
         if not (entry / script_name).exists():
