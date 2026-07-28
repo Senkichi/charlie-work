@@ -5130,8 +5130,8 @@ class OrchestratorApp:
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
             self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
             self.config.labels.complexity_high: (
-                "Routing hint: route this first-pass issue to the api worker "
-                "(multi-module, cross-cutting invariant, or prior escalation)."
+                "Routing hint: route to the api worker (multi-module, "
+                "cross-cutting invariant, or prior escalation)."
             ),
         }
         for label in self.config.labels.all:

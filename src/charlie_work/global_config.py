@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from .config import (
+    ConfigError,
     OrchestratorConfig,
     find_config_path,
     load_config,
@@ -173,7 +174,28 @@ def load_layered_config(
         tmp_path = Path(tmp.name)
 
     try:
-        return load_config(tmp_path)
+        try:
+            return load_config(tmp_path)
+        except ConfigError:
+            # A present-but-invalid global layer (e.g. an unknown key) makes
+            # the merged load raise, and callers (fleet_dispatch) catch
+            # ConfigError and skip the repo -- silently discarding a *valid*
+            # per-repo config. That is the #623 failure shape (host-wide knobs
+            # silently disabled) via a different trigger (issue #665). When a
+            # per-repo config exists, retry with it alone so the global layer's
+            # breakage does not take the per-repo config down with it. With no
+            # per-repo config to rescue, propagate the original error --
+            # silently defaulting would itself reproduce the #623 shape.
+            if not global_exists or not repo_data:
+                raise
+            repo_only = load_config(repo_config_path)
+            logger.warning(
+                "Layered config: merged load failed validation; the global "
+                "layer was discarded and the per-repo config used alone. "
+                "global path=%s",
+                global_config_path,
+            )
+            return repo_only
     finally:
         # Clean up the temp file
         try:

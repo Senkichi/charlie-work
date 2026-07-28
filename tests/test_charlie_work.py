@@ -14883,6 +14883,26 @@ def test_bootstrap_labels_creates_every_configured_label(tmp_path: Path) -> None
     assert result.data["missing"] == []
 
 
+def test_bootstrap_labels_descriptions_fit_github_limit(tmp_path: Path) -> None:
+    """GitHub rejects label descriptions over 100 chars with HTTP 422.
+
+    FakeGitHub doesn't enforce this, so a too-long description passes the
+    other bootstrap tests while silently 422ing against the real API (the
+    failure is swallowed by label_create's allow_failure=True) — 'complexity:high'
+    shipped with a 121-char description and was missing from every repo as a
+    result. Assert on the real descriptions directly so this can't recur.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.bootstrap_labels()
+
+    too_long = {name: desc for name, _color, desc in fake_gh.labels_created if len(desc) > 100}
+    assert too_long == {}
+
+
 def test_bootstrap_labels_fails_when_creation_silently_missed(tmp_path: Path) -> None:
     """If label_create silently fails (e.g. no auth), bootstrap must report failure."""
     config = OrchestratorConfig()
@@ -26070,6 +26090,97 @@ def test_global_config_unknown_key_raises(tmp_path: Path) -> None:
     # Create global config with unknown top-level section
     global_config_path = fleet_dir_path / "config.yaml"
     global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+
+def test_global_config_invalid_global_keeps_per_repo_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A present-but-invalid global layer must not discard a valid per-repo config.
+
+    Regression for issue #665: when the global config file exists but fails
+    validation (e.g. an unknown key), the merged load raises ConfigError.
+    Callers (fleet_dispatch) catch ConfigError and skip the repo, silently
+    discarding a *valid* per-repo config -- the #623 failure shape (host-wide
+    knobs silently disabled) via a different trigger. The per-repo config
+    must survive, and the discard must be loud (a warning), not silent.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is present but invalid (unknown top-level section).
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    # Per-repo config is valid and carries a distinctive value.
+    repo_config_path = repo_root / "orchestrator.config.yaml"
+    repo_config_path.write_text("dispatch:\n  max_concurrent_sessions: 7\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.global_config"):
+        config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    # The per-repo value survives -- the broken global layer did not discard it.
+    assert config.dispatch.max_concurrent_sessions == 7
+
+    # The discard is loud, not silent: a warning names the discarded global path.
+    warning = "\n".join(
+        r.getMessage() for r in caplog.records if "global layer was discarded" in r.getMessage()
+    )
+    assert warning, "discarding an invalid global layer must be logged as a warning"
+    assert str(global_config_path) in warning, "the warning must name the global path"
+
+
+def test_global_config_invalid_global_no_per_repo_still_raises(tmp_path: Path) -> None:
+    """With no per-repo config to rescue, an invalid global layer must still raise.
+
+    Silently defaulting here would itself reproduce the #623 shape (host-wide
+    knobs silently disabled): the operator's only config is broken, and a
+    pristine-defaults return hides that. The error must propagate.
+    """
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is present but invalid; no per-repo config exists.
+    (fleet_dir_path / "config.yaml").write_text("unknown_section:\n  foo: bar\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+
+def test_global_config_invalid_per_repo_still_raises(tmp_path: Path) -> None:
+    """An invalid *per-repo* config must still raise even with a valid global layer.
+
+    The fallback rescues a valid per-repo config from a broken global layer, not
+    the reverse: when the per-repo config is itself broken, the error propagates
+    so the operator learns their per-repo file is invalid.
+    """
+    from charlie_work.config import ConfigError
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Global layer is valid.
+    (fleet_dir_path / "config.yaml").write_text(
+        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
+    )
+    # Per-repo config is invalid (unknown section).
+    (repo_root / "orchestrator.config.yaml").write_text(
+        "unknown_section:\n  foo: bar\n", encoding="utf-8"
+    )
 
     with pytest.raises(ConfigError, match="unknown config section"):
         load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
