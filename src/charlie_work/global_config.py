@@ -164,6 +164,21 @@ def load_layered_config(
     )
     repo_data = repo_raw if isinstance(repo_raw, dict) else {}
 
+    # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
+    # docstring): three repos must not hold three opinions about how many jobs
+    # one machine can run. The merge below is section-by-section with the
+    # per-repo file winning per key, so without this rejection a per-repo
+    # ``orchestrator.config.yaml`` could silently override a host-wide knob --
+    # the exact confusion that made #590 expensive to diagnose. Reject the key
+    # outright so the invalid state is unrepresentable rather than merely
+    # unused (issue #600).
+    if "runner_allocation" in repo_data:
+        raise ConfigError(
+            "config section 'runner_allocation' is host-wide only and must not "
+            f"appear in a per-repo config ({repo_config_path}); declare it in "
+            "the global fleet layer (<fleet_dir>/config.yaml) instead"
+        )
+
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
     all_sections = set(global_data.keys()) | set(repo_data.keys())
