@@ -10222,9 +10222,7 @@ class OrchestratorApp:
                     )
                 drift = detect_drift(
                     self.gh, state, self.config, repo_root=self.repo_root
-                ) + detect_aviator_stale_blocked(
-                    self.gh, self.config, repo_root=self.repo_root
-                )
+                ) + detect_aviator_stale_blocked(self.gh, self.config, repo_root=self.repo_root)
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
                 if fix and drift:
