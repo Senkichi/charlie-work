@@ -1776,7 +1776,7 @@ def test_run_fleet_supervise_emits_attention_digest_on_venv_repaired(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    result = run_fleet_supervise(max_passes=1)
+    result = run_fleet_supervise(max_passes=1, fleet_dir_override=str(tmp_path / "fleet"))
 
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1
@@ -1834,7 +1834,7 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    result = run_fleet_supervise(max_passes=1)
+    result = run_fleet_supervise(max_passes=1, fleet_dir_override=str(tmp_path / "fleet"))
 
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1
@@ -2792,3 +2792,253 @@ def test_digest_still_surfaces_allocation_failures() -> None:
     reasons = " ".join(str(e.last_log_line) for e in digest.transitions)
     assert "managed_root missing" in reasons
     assert "no registry anchor" in reasons
+
+
+def test_filter_fleet_health_transitions_dedups_repeated_error(tmp_path: Path) -> None:
+    """Issue #554: a persistent ERROR must not re-fire with previous_health:null every pass."""
+    from dataclasses import replace
+
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=42,
+        adapter_kind="owner/repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="failed to launch claude: OSError",
+        pid=None,
+    )
+
+    # Pass 1: null -> ERROR is a real transition; emits with previous_health=None.
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+    assert first[0].health == "ERROR"
+    assert first[0].previous_health is None
+
+    # Pass 2: ERROR -> ERROR is not a transition; nothing emits.
+    second = _filter_fleet_health_transitions([entry], state_file)
+    assert second == []
+
+    # Pass 3: ERROR -> STALLED is a real transition; emits with previous_health=ERROR.
+    stalled = replace(entry, health="STALLED")
+    third = _filter_fleet_health_transitions([stalled], state_file)
+    assert len(third) == 1
+    assert third[0].health == "STALLED"
+    assert third[0].previous_health == "ERROR"
+
+
+def test_build_fleet_attention_digest_stateful_skips_repeats(tmp_path: Path) -> None:
+    """Issue #554: _build_fleet_attention_digest with state_file emits only on real transitions."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo",
+            "type": "error",
+            "issue_number": 100,
+            "error": "PR #100 review failed: timeout",
+        }
+    ]
+
+    # First pass: null -> ERROR transition emits.
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "ERROR"
+    assert digest1.transitions[0].previous_health is None
+
+    # Second pass: same ERROR, no transition — digest is empty.
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert digest2.transitions == ()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_error_dedups_across_passes(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #554: a persistent self-deploy ERROR emits once, not every supervisor pass."""
+    from charlie_work.config import NotifyConfig
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="venv pth repair failed: Access is denied",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=2,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    # Two passes, same persistent ERROR — emit_digest fires once (first pass).
+    assert mock_emit_digest.call_count == 1
+    digest = mock_emit_digest.call_args[0][1]
+    assert len(digest.transitions) == 1
+    assert digest.transitions[0].health == "ERROR"
+    assert digest.transitions[0].previous_health is None
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: occurrence-style events must not be deduped by the
+    stateful filter. ``review_verdict_recorded`` carries a constant ``OK``
+    health string by construction; if the cross-pass dedup applied to it, the
+    recorded-verdict heartbeat would collapse after the first occurrence per
+    issue/repo and a silent 0%-recording-rate regression would go invisible.
+    The fleet path in production goes through ``_build_fleet_attention_digest``
+    with ``state_file`` set, so this locks in the filtered path (not just the
+    unfiltered one covered by ``test_build_fleet_attention_digest_maps_review_verdict_events``).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_recorded",
+            "issue_number": 10,
+            "pr": 100,
+            "decision": "approved",
+        }
+    ]
+
+    # Two passes, identical recorded-verdict event — both must emit. The
+    # heartbeat stays visible; the baseline sidecar is not consulted for
+    # occurrence-style entries.
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "OK"
+    assert digest1.transitions[0].last_log_line == "approved recorded for PR 100"
+
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "OK"
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_missed_every_pass(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: ``review_verdict_missed`` has health ``ERROR`` (the same
+    string as a persistent worker error) but is an occurrence-style event. The
+    dedup must be scoped by entry type, not by health string, or repeat
+    missed-verdict signals would be silently dropped after the first one per
+    issue/repo. Locks in the exception for the ERROR-health occurrence case.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_missed",
+            "issue_number": 11,
+            "pr": 101,
+            "reason": "no parseable verdict",
+        }
+    ]
+
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "ERROR"
+    assert digest1.transitions[0].last_log_line == "no parseable verdict"
+
+    # Same missed verdict next pass — still emits despite health == "ERROR",
+    # because the event type is occurrence-style and bypasses the baseline.
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "ERROR"
+
+
+def test_build_fleet_attention_digest_stateful_mixed_persistent_and_occurrence(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: a persistent ``error`` and an occurrence
+    ``review_verdict_recorded`` for the same issue/repo share the dedup key
+    ``adapter_kind:issue_number``. The persistent entry must still be deduped
+    across passes while the occurrence entry keeps emitting, and the occurrence
+    entry must not poison the persistent baseline (so a later persistent
+    transition is not masked).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    persistent_event = {
+        "repo_key": "owner/repo",
+        "type": "error",
+        "issue_number": 42,
+        "error": "launch failed: OSError",
+    }
+    occurrence_event = {
+        "repo_key": "owner/repo",
+        "type": "review_verdict_recorded",
+        "issue_number": 42,
+        "pr": 420,
+        "decision": "approved",
+    }
+
+    # Pass 1: persistent null->ERROR emits; occurrence OK emits alongside.
+    digest1 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    healths = [t.health for t in digest1.transitions]
+    assert healths == ["ERROR", "OK"]
+
+    # Pass 2: persistent ERROR->ERROR is deduped away; occurrence OK still emits.
+    digest2 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    assert [t.health for t in digest2.transitions] == ["OK"]
+
+    # Pass 3: persistent ERROR->STALLED is a real transition and must emit even
+    # though the occurrence event sat between them every pass — the occurrence
+    # entry never wrote the shared baseline key.
+    stalled_event = {
+        "repo_key": "owner/repo",
+        "type": "stalled",
+        "issue_number": 42,
+        "reason": "no progress for 30m",
+    }
+    digest3 = _build_fleet_attention_digest(
+        [stalled_event, occurrence_event], state_file=state_file
+    )
+    healths3 = [t.health for t in digest3.transitions]
+    assert healths3 == ["STALLED", "OK"]
+    assert digest3.transitions[0].previous_health == "ERROR"
