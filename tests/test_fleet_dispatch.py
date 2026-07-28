@@ -2793,10 +2793,15 @@ def test_fleet_loop_converged_pass_does_not_emit_digest(
     standing advisory notes persist for as long as the condition does). That
     event is routed to an explicit ``continue`` in
     ``_build_fleet_attention_digest``, so ``attention_events`` is non-empty
-    while ``transitions`` is empty. The notify gate must test the built digest,
-    not the raw event list, or ``emit_digest`` is called with
-    ``transitions=()`` and an empty envelope is appended to ``digest.jsonl``
-    on every 5-minute pass.
+    while ``transitions`` is empty.
+
+    Note: #669's inner ``if attention_digest.transitions:`` gate already
+    prevents ``emit_digest`` being called with ``transitions=()`` on this
+    scenario — so this test would pass identically without this PR's outer
+    gate change. It pins the inner gate's behavior on the
+    converged-allocation-note shape. This PR's actual behavior change (the
+    outer ``and attention_events`` removal) is exercised by
+    ``test_fleet_loop_empty_events_still_builds_digest_when_notify_on``.
 
     This drives ``fleet_loop`` unmocked (only the prologue's
     ``run_allocation_pass`` and the per-repo ``OrchestratorApp`` are patched)
@@ -2854,11 +2859,117 @@ def test_fleet_loop_converged_pass_does_not_emit_digest(
         work_only=False,
     )
 
-    # The raw event list is non-empty (runner_allocation), but every event hit
-    # an explicit continue, so transitions is empty and emit_digest must not
-    # fire. This is the gate/digest mismatch issue #610 describes: testing the
-    # raw list would pass the outer gate and call emit_digest with ().
+    # The raw event list is non-empty (runner_allocation), but every event
+    # hit an explicit continue, so transitions is empty and the inner
+    # ``if attention_digest.transitions:`` gate (#669) blocks emit_digest.
+    # This pins that inner gate on the converged-allocation-note shape; the
+    # outer-gate removal this PR makes is covered by the empty-events test.
     mock_emit_digest.assert_not_called()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_empty_events_still_builds_digest_when_notify_on(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #610: the genuinely new path this PR opens -- empty attention_events.
+
+    Pre-PR the outer gate was ``notify_config.enabled and attention_events``,
+    so a pass with *zero* attention events (no prologue event, no per-repo
+    events) skipped the whole digest-build block: ``_build_fleet_attention_digest``
+    never ran and the fleet health-state sidecar was never written. This PR
+    drops ``and attention_events`` so the digest is built whenever notify is on.
+
+    #669's inner ``if attention_digest.transitions:`` gate already prevents
+    ``emit_digest`` being called with ``transitions=()`` on a converged pass
+    (the non-empty-events case) -- so this PR's value is *not* fixing a
+    currently-reproducing empty-envelope emission. Its value is removing the
+    redundant, contradictory outer raw-list test. This test exercises the one
+    behavior the diff actually changes: with ``attention_events == []`` and
+    notify on, the digest-build / health-state-write path now runs (the
+    sidecar file appears on disk), ``emit_digest`` is still not called
+    (transitions empty, #669's inner guard), and ``digest["emitted"]`` stays
+    ``False``.
+
+    Drives ``fleet_loop`` with ``run_allocation_pass`` returning a fully
+    converged result with empty notes (so the prologue emits no event) and the
+    per-repo ``OrchestratorApp.loop`` returning empty data (so no per-repo
+    events). The only thing under test is the outer gate.
+    """
+    from dataclasses import replace
+
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    # Fully converged and quiet: nothing moved, no notes -- the prologue
+    # emits no runner_allocation event (started/parked/notes all falsy), so
+    # attention_events stays empty.
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=(),
+    )
+
+    cfg = replace(
+        _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    result = fleet_loop(
+        fleet_dir_override=str(fleet_dir),
+        global_config=cfg,
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # The new path: with attention_events empty and notify on, the digest is
+    # still built -- the health-state sidecar appears on disk. Pre-PR the
+    # outer ``and attention_events`` gate skipped this block entirely, so the
+    # file would not exist. This is the discriminating assertion for the diff.
+    health_state = _fleet_health_state_path(str(fleet_dir))
+    assert health_state.exists(), "digest-build path did not run on empty events"
+
+    # Emission is still gated on the built digest's transitions (#669's
+    # inner guard), so no envelope is written and emitted stays False.
+    mock_emit_digest.assert_not_called()
+    assert result.data["digest"]["emitted"] is False
 
 
 def test_digest_still_surfaces_allocation_failures() -> None:
