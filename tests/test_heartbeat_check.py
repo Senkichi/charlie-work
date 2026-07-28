@@ -644,3 +644,121 @@ def test_check_runners_anomaly_on_windows_with_bad_result(
     hb.check_runners(report)
     assert report.anomaly
     assert "last run result 1" in report.lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Supervisor heartbeat freshness (issue #627)
+# ---------------------------------------------------------------------------
+
+
+def _set_fleet_dir(hb: ModuleType, monkeypatch: Any, tmp_path: Path) -> Path:
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path))
+    return tmp_path
+
+
+def _write_heartbeat(
+    hb: ModuleType,
+    fleet_dir: Path,
+    *,
+    last_beat_at: str,
+    exited_at: str | None = None,
+    pid: int = 12345,
+    full_pass_interval_seconds: int = 300,
+) -> None:
+    payload = {
+        "pid": pid,
+        "started_at": "2026-07-25T17:00:00Z",
+        "last_beat_at": last_beat_at,
+        "pass_number": 5,
+        "full_pass_interval_seconds": full_pass_interval_seconds,
+        "exited_at": exited_at,
+        "exit_code": 0 if exited_at else None,
+    }
+    (fleet_dir / hb.SUPERVISOR_HEARTBEAT_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def test_check_supervisor_heartbeat_anomaly_when_absent(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_fleet_dir(hb, monkeypatch, tmp_path)
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert report.anomaly
+    assert "no supervisor-heartbeat.json found" in report.lines[0]
+
+
+def test_check_supervisor_heartbeat_ok_when_fresh(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    last_beat = (now - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+    _write_heartbeat(hb, fleet_dir, last_beat_at=last_beat, full_pass_interval_seconds=300)
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert not report.anomaly
+    assert "supervisor-heartbeat" in report.lines[0]
+
+
+def test_check_supervisor_heartbeat_anomaly_when_stale_no_exit(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A stale heartbeat with no exited_at means the supervisor was likely killed."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    # 30 minutes old, threshold is 2*300s = 10 minutes.
+    now = datetime.now(timezone.utc)
+    last_beat = (now - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    _write_heartbeat(
+        hb, fleet_dir, last_beat_at=last_beat, exited_at=None, full_pass_interval_seconds=300
+    )
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert report.anomaly
+    assert "likely killed or hung" in report.lines[0]
+
+
+def test_check_supervisor_heartbeat_anomaly_when_stale_with_clean_exit(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A stale heartbeat with exited_at set means the watchdog did not restart it."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    last_beat = (now - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    _write_heartbeat(
+        hb,
+        fleet_dir,
+        last_beat_at=last_beat,
+        exited_at=last_beat,
+        full_pass_interval_seconds=300,
+    )
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert report.anomaly
+    assert "watchdog may be disabled" in report.lines[0]
+
+
+def test_check_supervisor_heartbeat_anomaly_on_corrupt_file(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    (fleet_dir / hb.SUPERVISOR_HEARTBEAT_FILENAME).write_text("{not json", encoding="utf-8")
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert report.anomaly
+    assert "unreadable" in report.lines[0]
+
+
+def test_check_supervisor_heartbeat_threshold_derives_from_full_pass_interval(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A longer full_pass_interval raises the stale threshold."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    # 20 minutes old. With full_pass=600s, threshold = 2*600/60 = 20 min, so OK.
+    last_beat = (now - timedelta(minutes=19)).isoformat().replace("+00:00", "Z")
+    _write_heartbeat(hb, fleet_dir, last_beat_at=last_beat, full_pass_interval_seconds=600)
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert not report.anomaly

@@ -240,6 +240,22 @@ def test_kill_process_tree_own_group_guard_posix() -> None:
     assert killed == []
 
 
+def test_kill_process_tree_self_pid_exempt() -> None:
+    """kill_process_tree never kills the calling process (issue #627).
+
+    The fleet supervisor reaps stalled workers from within its own process
+    image, so a ``kill_process_tree(os.getpid())`` call (e.g. from a
+    recycled-PID or bogus-caller case) would terminate it silently. The
+    PID self-exemption guard returns an empty list without attempting
+    the kill, regardless of platform.
+    """
+    own_pid = os.getpid()
+    killed = kill_process_tree(own_pid)
+    assert killed == []
+    # The calling process is still alive.
+    assert os.getpid() == own_pid
+
+
 def test_kill_process_tree_enumerates_children() -> None:
     """Test that kill_process_tree enumerates and includes child PIDs."""
     # Spawn a real parent process that will spawn a child
