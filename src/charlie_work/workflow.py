@@ -7953,36 +7953,39 @@ class OrchestratorApp:
         # label_error is explicitly set to None so the self-heal loop below
         # can distinguish "edge applied and verified" from "edge never
         # attempted" (absent key, e.g. a pre-#556 escalation).
-        escalated_label_outcomes: list[tuple[int, dict[str, Any] | None]] = []
-        for _pr_num, issue_num in escalated_for_labels:
-            if issue_num is None:
-                continue
-            result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
-            if result.outcome != TransitionOutcome.APPLIED:
-                escalated_label_outcomes.append(
-                    (
-                        int(issue_num),
-                        {
-                            "edge": "escalated",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        },
+        # Gated by dry_run: --dry-run must not perform live GitHub label
+        # mutations or state.json writes (review finding on PR #670).
+        if not self.dry_run:
+            escalated_label_outcomes: list[tuple[int, dict[str, Any] | None]] = []
+            for _pr_num, issue_num in escalated_for_labels:
+                if issue_num is None:
+                    continue
+                result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
+                if result.outcome != TransitionOutcome.APPLIED:
+                    escalated_label_outcomes.append(
+                        (
+                            int(issue_num),
+                            {
+                                "edge": "escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            },
+                        )
                     )
-                )
-            else:
-                escalated_label_outcomes.append((int(issue_num), None))
-        if escalated_label_outcomes:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                for issue_num, label_error in escalated_label_outcomes:
-                    entry = state["issues"].get(str(issue_num), {})
-                    state["issues"][str(issue_num)] = {
-                        **(entry if isinstance(entry, dict) else {}),
-                        "number": issue_num,
-                        "label_error": label_error,
-                    }
-                save_state(self.paths.state_file, state)
+                else:
+                    escalated_label_outcomes.append((int(issue_num), None))
+            if escalated_label_outcomes:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    for issue_num, label_error in escalated_label_outcomes:
+                        entry = state["issues"].get(str(issue_num), {})
+                        state["issues"][str(issue_num)] = {
+                            **(entry if isinstance(entry, dict) else {}),
+                            "number": issue_num,
+                            "label_error": label_error,
+                        }
+                    save_state(self.paths.state_file, state)
 
         # Issue #586: self-heal the escalated label edge for PRs that were
         # already escalated (skipped by the gate above) but whose
@@ -7997,76 +8000,94 @@ class OrchestratorApp:
         # GitHub label fetch. This is the single-point enforcement the issue
         # asks for: state status == "escalated" and the agent:human-needed
         # label cannot stay in disagreement past one dispatch_reviews pass.
-        escalated_repair_outcomes: list[tuple[int, dict[str, Any] | None]] = []
-        import logging
+        # Gated by dry_run: --dry-run must not perform live GitHub label
+        # mutations or state.json writes (review finding on PR #670).
+        if not self.dry_run:
+            escalated_repair_outcomes: list[tuple[int, dict[str, Any] | None]] = []
+            import logging
 
-        for _pr_num, issue_num in escalated_label_repair:
-            if issue_num is None:
-                continue
-            with state_lock(self.paths.state_file):
-                repair_state = load_state(self.paths.state_file)
-                repair_entry = repair_state.get("issues", {}).get(str(issue_num), {})
-            # label_error is None  -> verified OK on a prior pass, skip the
-            #   GitHub fetch entirely (steady-state cost: zero).
-            # label_error is a dict -> prior transition() failed, retry.
-            # label_error key absent -> edge never attempted (pre-#556
-            #   escalation or a call site that doesn't record label_error),
-            #   fetch live labels to decide whether repair is needed.
-            if "label_error" in repair_entry and repair_entry["label_error"] is None:
-                continue
-            # issue_view/transition make GitHub API calls that can raise on
-            # transient errors; a failure to verify one escalated issue must
-            # not abort the entire dispatch_reviews pass. Skip the issue this
-            # pass and retry on the next -- the escalated status is already
-            # durable in state, so no ground truth is lost by deferring.
-            try:
-                issue_view = self.gh.issue_view(int(issue_num))
-                if self.config.labels.human_needed in label_names(issue_view):
-                    escalated_repair_outcomes.append((int(issue_num), None))
+            for pr_num, issue_num in escalated_label_repair:
+                if issue_num is None:
                     continue
-                result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "escalated label repair for issue %s deferred (GitHub "
-                    "fetch failed); will retry next pass",
-                    issue_num,
-                    exc_info=True,
-                )
-                continue
-            if result.outcome == TransitionOutcome.APPLIED:
-                escalated_repair_outcomes.append((int(issue_num), None))
-            else:
-                escalated_repair_outcomes.append(
-                    (
-                        int(issue_num),
-                        {
-                            "edge": "escalated",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        },
+                with state_lock(self.paths.state_file):
+                    repair_state = load_state(self.paths.state_file)
+                    repair_entry = repair_state.get("issues", {}).get(str(issue_num), {})
+                    repair_pr = repair_state.get("prs", {}).get(str(pr_num), {})
+                # Race guard (review finding on PR #670): a concurrent
+                # unescalate() may have freed this issue between the
+                # escalation gate above and this per-item read. Re-check
+                # both the PR's and the issue's current status -- if neither
+                # is still "escalated", the issue is no longer awaiting a
+                # human and re-applying the agent:human-needed label would
+                # silently undo the unescalate (label_error is also cleared
+                # by unescalate, so the absent-key branch below would
+                # otherwise re-escalate without a status check).
+                if (
+                    repair_pr.get("status") != "escalated"
+                    and repair_entry.get("status") != "escalated"
+                ):
+                    continue
+                # label_error is None  -> verified OK on a prior pass, skip the
+                #   GitHub fetch entirely (steady-state cost: zero).
+                # label_error is a dict -> prior transition() failed, retry.
+                # label_error key absent -> edge never attempted (pre-#556
+                #   escalation or a call site that doesn't record label_error),
+                #   fetch live labels to decide whether repair is needed.
+                if "label_error" in repair_entry and repair_entry["label_error"] is None:
+                    continue
+                # issue_view/transition make GitHub API calls that can raise on
+                # transient errors; a failure to verify one escalated issue must
+                # not abort the entire dispatch_reviews pass. Skip the issue this
+                # pass and retry on the next -- the escalated status is already
+                # durable in state, so no ground truth is lost by deferring.
+                try:
+                    issue_view = self.gh.issue_view(int(issue_num))
+                    if self.config.labels.human_needed in label_names(issue_view):
+                        escalated_repair_outcomes.append((int(issue_num), None))
+                        continue
+                    result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "escalated label repair for issue %s deferred (GitHub "
+                        "fetch failed); will retry next pass",
+                        issue_num,
+                        exc_info=True,
                     )
-                )
-        if escalated_repair_outcomes:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                for issue_num, label_error in escalated_repair_outcomes:
-                    entry = state["issues"].get(str(issue_num), {})
-                    state["issues"][str(issue_num)] = {
-                        **(entry if isinstance(entry, dict) else {}),
-                        "number": issue_num,
-                        "label_error": label_error,
-                    }
-                state = append_event(
-                    state,
-                    "escalated_label_repaired",
-                    {
-                        "issue_numbers": [i for i, _ in escalated_repair_outcomes],
-                        "failures": [i for i, e in escalated_repair_outcomes if e is not None],
-                    },
-                    state_path=self.paths.state_file,
-                )
-                save_state(self.paths.state_file, state)
+                    continue
+                if result.outcome == TransitionOutcome.APPLIED:
+                    escalated_repair_outcomes.append((int(issue_num), None))
+                else:
+                    escalated_repair_outcomes.append(
+                        (
+                            int(issue_num),
+                            {
+                                "edge": "escalated",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            },
+                        )
+                    )
+            if escalated_repair_outcomes:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    for issue_num, label_error in escalated_repair_outcomes:
+                        entry = state["issues"].get(str(issue_num), {})
+                        state["issues"][str(issue_num)] = {
+                            **(entry if isinstance(entry, dict) else {}),
+                            "number": issue_num,
+                            "label_error": label_error,
+                        }
+                    state = append_event(
+                        state,
+                        "escalated_label_repaired",
+                        {
+                            "issue_numbers": [i for i, _ in escalated_repair_outcomes],
+                            "failures": [i for i, e in escalated_repair_outcomes if e is not None],
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
 
         # Apply the local and provider-token caps. 0 means unlimited for both.
         max_local = self.config.review_dispatch.max_local_review_processes
