@@ -44,9 +44,7 @@ def contains(base: Path, candidate: Path) -> bool:
     """
     resolved_base = _resolve_defensive(base)
     resolved_candidate = _resolve_defensive(candidate)
-    return resolved_candidate == resolved_base or resolved_candidate.is_relative_to(
-        resolved_base
-    )
+    return resolved_candidate == resolved_base or resolved_candidate.is_relative_to(resolved_base)
 
 
 def require_contained(base: Path, candidate: Path, *, context: str) -> Path:
