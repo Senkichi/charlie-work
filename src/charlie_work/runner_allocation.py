@@ -369,6 +369,15 @@ def plan_allocation(
     changes: list[SlotChange] = []
     target_records: list[RepoTarget] = []
 
+    # The plan's targets sum to at most the budget (pins aside), but the
+    # post-plan running total can exceed it when surplus listeners cannot be
+    # parked. Three causes are possible, and only the ones actually present
+    # belong in the over-budget note — otherwise the operator is told "busy
+    # listeners" when the real cause is a demotion grace period (issue #601).
+    held_by_pin = sum(pinned.values())
+    held_by_hysteresis = 0
+    held_by_busy = 0
+
     for repo in sorted(by_repo):
         target = targets.get(repo, 0)
         running = [i for i in by_repo[repo] if i.running]
@@ -414,6 +423,7 @@ def plan_allocation(
                     f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
                     f"{demand_idle_samples} pass(es) and no repo is waiting"
                 )
+                held_by_hysteresis += surplus
                 continue
 
             reclaimable = sorted(
@@ -434,20 +444,24 @@ def plan_allocation(
                     )
                 )
             if len(reclaimable) < surplus:
+                held_busy = surplus - len(reclaimable)
+                held_by_busy += held_busy
                 notes.append(
-                    f"{repo}: {surplus - len(reclaimable)} surplus slot(s) left running "
+                    f"{repo}: {held_busy} surplus slot(s) left running "
                     f"because they are executing jobs"
                 )
 
-    # The host can sit above its budget for two reasons the allocator refuses
-    # to "fix" by parking: a repo whose demand we cannot read is pinned to its
-    # running count, and a repo whose surplus listeners are executing jobs.
-    # In both cases parking would strand or abort work, so the overage is
-    # reported rather than silently absorbed. The sum of *targets* can equal
-    # the budget while the post-plan running total exceeds it — busy listeners
-    # that cannot be parked keep running on top of the starts the plan issues
-    # (issue #601). Self-corrects on the next pass once demand reads again or
-    # the busy jobs finish.
+    # The host can sit above its budget for three reasons the allocator
+    # refuses to "fix" by parking: a repo whose demand we cannot read is pinned
+    # to its running count, a repo whose surplus listeners are executing jobs,
+    # and a repo whose surplus listeners are still inside the demotion
+    # hysteresis grace period. In each case parking would strand or abort work
+    # (or churn a slot nobody is waiting for), so the overage is reported
+    # rather than silently absorbed. The sum of *targets* can equal the budget
+    # while the post-plan running total exceeds it — listeners that cannot be
+    # parked keep running on top of the starts the plan issues (issue #601).
+    # The note names only the causes actually present, so a grace-period
+    # overage is not mislabeled as busy listeners or unmeasurable repos.
     post_running = sum(running_counts.values())
     for change in changes:
         if change.action is SlotAction.START:
@@ -455,10 +469,18 @@ def plan_allocation(
         else:
             post_running -= 1
     if post_running > budget:
+        causes: list[str] = []
+        if held_by_pin:
+            causes.append(f"{held_by_pin} pinned (unmeasurable)")
+        if held_by_busy:
+            causes.append(f"{held_by_busy} busy")
+        if held_by_hysteresis:
+            causes.append(f"{held_by_hysteresis} in demotion hysteresis")
+        cause_list = "; ".join(causes) if causes else "no single cause tracked"
         notes.append(
-            f"{post_running} slot(s) running above the {budget}-slot budget; "
-            f"busy listeners and/or unmeasurable repos cannot be parked — "
-            f"no slot moves until demand reads again"
+            f"{post_running} slot(s) running above the {budget}-slot budget "
+            f"({cause_list}); self-corrects as pinned repos become measurable, "
+            f"busy jobs finish, or slack streaks mature"
         )
 
     return AllocationPlan(

@@ -28,11 +28,12 @@ from charlie_work.runner_allocation import (
     plan_summary,
     repo_slug_from_github_url,
 )
-from charlie_work.runner_allocation_pass import resolve_inputs
+from charlie_work.runner_allocation_pass import resolve_inputs, run_allocation_pass
 from charlie_work.runner_slots import (
     apply_allocation,
     discover_runner_instances,
     load_idle_streaks,
+    load_tie_break_offset,
     park_runner_slot,
     save_idle_streaks,
 )
@@ -313,6 +314,71 @@ def test_over_budget_from_busy_listeners_is_reported() -> None:
     assert parks == []  # A's surplus listeners are busy — cannot park
     # Post-plan running = 2 (A, busy) + 2 (B, 1 existing + 1 start) = 4 > 3.
     assert any("above the 3-slot budget" in note for note in plan.notes)
+
+
+def test_over_budget_from_demotion_hysteresis_is_attributed_correctly() -> None:
+    """The over-budget note must name the real cause, not always blame busy
+    listeners or unmeasurable repos (issue #601 review finding).
+
+    Reproduced against the allocator: budget 1, one repo holding two idle,
+    non-busy listeners, demand 0, slack streak below demand_idle_samples, and
+    no other repo waiting. Nothing is pinned and nothing is busy — the overage
+    is entirely the demotion-hysteresis grace period holding the surplus slot.
+    The note must say so, and must NOT claim busy listeners or unmeasurable
+    repos.
+    """
+    instances = _instances({CW: [("cw-1", True, False), ("cw-2", True, False)]})
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW)},
+        budget=1,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 0},
+        demand_idle_samples=3,
+    )
+    assert plan.changes == ()  # grace period holds the surplus; no park
+    over = [n for n in plan.notes if "above the 1-slot budget" in n]
+    assert len(over) == 1
+    note = over[0]
+    assert "in demotion hysteresis" in note
+    # The misattribution the review flagged must not survive:
+    assert "busy listeners" not in note
+    assert "unmeasurable" not in note
+
+
+def test_over_budget_note_lists_each_present_cause() -> None:
+    """When multiple holds stack up, the note names all of them.
+
+    Two pinned repos (unmeasurable) plus a busy listener on a third repo push
+    running above budget for two distinct reasons at once.
+    """
+    instances = _instances(
+        {
+            CW: [("cw-1", True, False), ("cw-2", True, False)],
+            JC: [("jc-1", True, False), ("jc-2", True, False)],
+            PUB: [("pub-1", True, True), ("pub-2", True, True)],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {
+            CW: RepoDemand(CW, ok=False, error="403"),
+            JC: RepoDemand(JC, ok=False, error="403"),
+            PUB: RepoDemand(PUB),
+        },
+        budget=4,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={PUB: 99},
+        demand_idle_samples=3,
+    )
+    over = [n for n in plan.notes if "above the 4-slot budget" in n]
+    assert len(over) == 1
+    note = over[0]
+    assert "pinned (unmeasurable)" in note
+    assert "busy" in note
+    assert "in demotion hysteresis" not in note  # PUB's streak is mature, not in grace
 
 
 def test_floor_shortfall_tie_break_rotates_with_offset() -> None:
@@ -1120,3 +1186,94 @@ def test_allocation_stamp_treats_a_naive_timestamp_as_utc(tmp_path: Path) -> Non
     assert stamp is not None
     assert stamp.updated_at is not None
     assert stamp.updated_at.tzinfo is not None
+
+
+# --------------------------------------------------------------------------
+# run_allocation_pass — end-to-end tie_break_offset threading (issue #601)
+# --------------------------------------------------------------------------
+#
+# The unit tests above prove allocate_slots rotates given a hand-supplied
+# offset, and that save/load round-trips the offset. The review finding on
+# PR #678 was that the *wiring* — run_allocation_pass reading the offset,
+# threading it into plan_allocation, and persisting offset+1 — was never
+# exercised end-to-end. This test runs the real pass twice against a fake
+# GitHub and a real managed_root + state file to close that gap.
+
+
+def test_run_allocation_pass_threads_and_persists_tie_break_offset_across_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pass reads tie_break_offset from disk, threads it into the plan, and
+    persists offset+1 so the next pass rotates the floor-shortfall loser.
+
+    Floor-shortfall scenario: A (cap 5, demand 5), B (cap 1, demand 1),
+    C (cap 1, demand 1), budget 2, min_per_repo 1. Only two repos get a floor
+    slot; the third loses a name tie. Pass 1 (offset 0) starves C; pass 2
+    (persisted offset 1) starves B. The rotation is observable in the plan's
+    targets, proving the offset was read, threaded into allocate_slots, and the
+    incremented value written back for the next pass.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir()
+    for i in range(5):
+        _make_runner_dir(managed_root, f"a-{i}", "https://github.com/o/A", f"a-{i}")
+    _make_runner_dir(managed_root, "b-0", "https://github.com/o/B", "b-0")
+    _make_runner_dir(managed_root, "c-0", "https://github.com/o/C", "c-0")
+
+    fleet_dir = tmp_path / "fleet"
+
+    demand_by_repo = {"o/A": 5, "o/B": 1, "o/C": 1}
+
+    def fake_measure(gh: object, repo: str, max_runs_scanned: int) -> RepoDemand:
+        return RepoDemand(repo=repo, queued_jobs=demand_by_repo[repo])
+
+    monkeypatch.setattr("charlie_work.runner_allocation_pass.measure_repo_demand", fake_measure)
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.fetch_busy_runner_names",
+        lambda gh, repo: (set(), None),
+    )
+    # No real actuation: the runner dirs have no listener processes, so
+    # starting/parking them would touch the host. Return no results; the plan
+    # and the state write are what this test inspects.
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.apply_allocation",
+        lambda plan, dry_run=False: [],
+    )
+
+    config = RunnerAllocationConfig(
+        enabled=True,
+        managed_root=str(managed_root),
+        max_running_runners=2,
+        min_running_per_repo=1,
+        demand_idle_samples=3,
+    )
+
+    class _FakeGh:
+        """Stand-in: every gh.run call is intercepted by the monkeypatches above."""
+
+    # Pass 1: no state file -> offset 0 -> B wins the name tie, C starved.
+    r1 = run_allocation_pass(
+        _FakeGh(),  # type: ignore[arg-type]
+        config,
+        fleet_dir_override=str(fleet_dir),
+        source="prologue",
+    )
+    assert r1.ok is True
+    assert r1.plan is not None
+    t1 = {t.repo: t.target for t in r1.plan.targets}
+    assert t1 == {"o/A": 1, "o/B": 1, "o/C": 0}
+    assert load_tie_break_offset(fleet_dir) == 1
+
+    # Pass 2: persisted offset 1 -> C wins the name tie, B starved.
+    r2 = run_allocation_pass(
+        _FakeGh(),  # type: ignore[arg-type]
+        config,
+        fleet_dir_override=str(fleet_dir),
+        source="prologue",
+    )
+    assert r2.ok is True
+    assert r2.plan is not None
+    t2 = {t.repo: t.target for t in r2.plan.targets}
+    assert t2 == {"o/A": 1, "o/B": 0, "o/C": 1}
+    assert load_tie_break_offset(fleet_dir) == 2
