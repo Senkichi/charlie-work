@@ -16,7 +16,8 @@ ISSUE_VALUES = {
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
-    "review_summary": "Fix the typo in the search function.",
+    "dispatch_note": "Fix the typo in the search function.",
+    "required_changes_section": "",
 }
 
 
@@ -207,7 +208,8 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
         "pr_title": "fix: search is broken",
         "pr_url": "https://example.test/pull/456",
         "issue_number": 123,
-        "review_summary": "Fix the typo in the search function.",
+        "dispatch_note": "Fix the typo in the search function.",
+        "required_changes_section": "",
         "branch_name": "agent/issue-123-fix-search",
     }
     # The rework.md template is in the package prompts dir, not repo-local
