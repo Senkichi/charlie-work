@@ -46,6 +46,7 @@ from .runner_slots import (
     load_idle_streaks,
     measure_repo_demand,
     AllocationSource,
+    save_allocation_skip,
     save_idle_streaks,
 )
 
@@ -144,6 +145,7 @@ def run_allocation_pass(
     state_path: Path | None = None,
     dry_run: bool = False,
     source: AllocationSource,
+    full_pass_interval_seconds: int,
 ) -> AllocationPassResult:
     """Rebalance this host's running runner listeners across repos by demand.
 
@@ -161,6 +163,13 @@ def run_allocation_pass(
             the doctor probe can tell an unattended pass from an operator's
             manual ``charlie runners allocate`` — both write the same file, and
             only the former is evidence the daemon is rebalancing (issue #590).
+        full_pass_interval_seconds: The cadence this pass is being driven at
+            (``supervisor.full_pass_interval_seconds`` from the *caller's*
+            resolved config). Persisted with the state file so the doctor probe
+            measures staleness against the interval the daemon actually used
+            rather than re-resolving config through its own load call — a
+            per-repo layer that sets the interval would otherwise make the probe
+            measure against a cadence the daemon is not running at (issue #606).
 
     Returns:
         AllocationPassResult — never raises.
@@ -174,12 +183,31 @@ def run_allocation_pass(
 
     inputs, error = resolve_inputs(allocation, managed_root_fallback)
     if inputs is None:
+        # A misconfigured root leaves no positive evidence the pass ran, so the
+        # doctor probe used to attribute it to "the daemon never reached
+        # allocation" (#590) — a different problem with a different fix. Record
+        # the actual reason instead (issue #606). A dry-run must not write state
+        # (the preview would otherwise bump ``updated_at`` and look like a pass).
+        if not dry_run:
+            save_allocation_skip(
+                fleet_dir(override=fleet_dir_override),
+                source=source,
+                full_pass_interval_seconds=full_pass_interval_seconds,
+                skip_reason=error or "runner_allocation inputs could not be resolved",
+            )
         return AllocationPassResult(ok=False, error=error)
 
     instances, discovery_notes = discover_runner_instances(inputs.managed_root)
     notes = list(inputs.notes) + list(discovery_notes)
 
     if not instances:
+        if not dry_run:
+            save_allocation_skip(
+                fleet_dir(override=fleet_dir_override),
+                source=source,
+                full_pass_interval_seconds=full_pass_interval_seconds,
+                skip_reason=f"no configured runners found under {inputs.managed_root}",
+            )
         return AllocationPassResult(
             ok=True,
             skipped=True,
@@ -222,6 +250,7 @@ def run_allocation_pass(
             state_dir,
             next_idle_streaks(observed, demands, previous_streaks),
             source=source,
+            full_pass_interval_seconds=full_pass_interval_seconds,
         )
 
     if state_path is not None:

@@ -2479,6 +2479,9 @@ def test_allocation_prologue_anchors_on_a_live_repo_and_passes_config_through(
     assert kwargs["fleet_dir_override"] == str(fleet_dir)
     assert kwargs["state_path"] == repo / ".var" / "charlie-work" / "state.json"
     assert kwargs["dry_run"] is True
+    # The driving interval is threaded from the caller's resolved config so the
+    # state file records the cadence the daemon actually used (issue #606).
+    assert kwargs["full_pass_interval_seconds"] == 300
 
     # A note alone is enough to surface an event; a balanced host stays quiet.
     assert [event["type"] for event in events] == ["runner_allocation"]

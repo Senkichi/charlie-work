@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
+from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig, SupervisorConfig
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
@@ -387,6 +387,11 @@ def _run_fleet_allocation_prologue(
         state_path=anchor_state,
         dry_run=dry_run,
         source=UNATTENDED_ALLOCATION_SOURCE,
+        full_pass_interval_seconds=getattr(
+            getattr(global_config, "supervisor", None),
+            "full_pass_interval_seconds",
+            SupervisorConfig().full_pass_interval_seconds,
+        ),
     )
 
     if result.error:

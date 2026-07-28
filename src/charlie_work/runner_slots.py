@@ -329,10 +329,22 @@ class AllocationStamp:
 
     ``source`` is ``None`` for a file written before provenance was recorded,
     which is reported as unknown rather than assumed to be either path.
+
+    ``full_pass_interval_seconds`` is the cadence the pass was actually driven
+    at, recorded by the writer so the doctor probe measures staleness against
+    the interval the daemon used rather than re-resolving config (issue #606).
+    ``None`` for a file written before the interval was recorded.
+
+    ``skip_reason`` is set when the pass ran but declined to act (no runners
+    under ``managed_root``, an unresolvable root, …) so the probe can report
+    the recorded cause instead of guessing that the daemon never reached
+    allocation (issue #606). ``None`` for a pass that acted normally.
     """
 
     updated_at: datetime | None
     source: str | None
+    full_pass_interval_seconds: int | None = None
+    skip_reason: str | None = None
 
 
 def load_allocation_stamp(fleet_dir: Path) -> AllocationStamp | None:
@@ -367,20 +379,36 @@ def load_allocation_stamp(fleet_dir: Path) -> AllocationStamp | None:
         updated_at = updated_at.replace(tzinfo=UTC)
 
     source = raw.get("source")
+    raw_interval = raw.get("full_pass_interval_seconds")
+    full_pass_interval_seconds = (
+        int(raw_interval) if isinstance(raw_interval, int) and raw_interval > 0 else None
+    )
+    raw_skip = raw.get("skip_reason")
+    skip_reason = raw_skip if isinstance(raw_skip, str) and raw_skip else None
     return AllocationStamp(
         updated_at=updated_at,
         source=source if isinstance(source, str) else None,
+        full_pass_interval_seconds=full_pass_interval_seconds,
+        skip_reason=skip_reason,
     )
 
 
-def save_idle_streaks(
-    fleet_dir: Path, streaks: Mapping[str, int], *, source: AllocationSource
+def _write_allocation_state(
+    fleet_dir: Path,
+    repos_payload: Mapping[str, dict[str, int]],
+    *,
+    source: AllocationSource,
+    full_pass_interval_seconds: int,
+    skip_reason: str | None,
 ) -> None:
-    """Persist slack streaks using the project's atomic temp-file + replace.
+    """Atomic write of the allocation state file with full provenance.
 
-    ``source`` is required rather than defaulted: every writer has to say which
-    path it is, because a caller that silently inherited the unattended default
-    would make the state file assert that the daemon ran when it did not.
+    ``source`` and ``full_pass_interval_seconds`` are required rather than
+    defaulted: a writer that silently inherited either default would make the
+    state file assert that the daemon ran (and at a cadence) when it did not,
+    which is exactly the guess-the-probe-was-built-to-eliminate failure. They
+    are injected here, after the payload is built, so a caller cannot forget to
+    thread them and leave the file asserting something nobody declared.
     """
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so "I deployed runner_allocation" would be reported while the file the
@@ -393,11 +421,89 @@ def save_idle_streaks(
         "version": 1,
         "updated_at": datetime.now(UTC).isoformat(),
         "source": source,
-        "repos": {repo: {"idle_streak": streak} for repo, streak in sorted(streaks.items())},
+        "full_pass_interval_seconds": full_pass_interval_seconds,
+        "skip_reason": skip_reason,
+        "repos": dict(repos_payload),
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def save_idle_streaks(
+    fleet_dir: Path,
+    streaks: Mapping[str, int],
+    *,
+    source: AllocationSource,
+    full_pass_interval_seconds: int,
+) -> None:
+    """Persist slack streaks using the project's atomic temp-file + replace.
+
+    ``source`` and ``full_pass_interval_seconds`` are required rather than
+    defaulted: every writer has to say which path it is and which interval it
+    drove at, because a caller that silently inherited either default would
+    make the state file assert that the daemon ran (and at a cadence) when it
+    did not.
+    """
+    _write_allocation_state(
+        fleet_dir,
+        {repo: {"idle_streak": streak} for repo, streak in sorted(streaks.items())},
+        source=source,
+        full_pass_interval_seconds=full_pass_interval_seconds,
+        skip_reason=None,
+    )
+
+
+def _read_prior_repos(fleet_dir: Path) -> dict[str, dict[str, int]]:
+    """Read the ``repos`` map from an existing state file, or ``{}`` if absent.
+
+    A skip does not re-measure demand, so it must not reset the idle-streak
+    history a real pass accumulated — otherwise a transient "no runners found"
+    pass would zero out the demotion hysteresis and the next real pass could
+    park a slot that was only one sample into its cooldown.
+    """
+    path = fleet_dir / ALLOCATION_STATE_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    repos = raw.get("repos") if isinstance(raw, dict) else None
+    if not isinstance(repos, dict):
+        return {}
+    prior: dict[str, dict[str, int]] = {}
+    for repo, entry in repos.items():
+        if isinstance(entry, dict) and isinstance(entry.get("idle_streak"), int):
+            prior[str(repo)] = {"idle_streak": entry["idle_streak"]}
+    return prior
+
+
+def save_allocation_skip(
+    fleet_dir: Path,
+    *,
+    source: AllocationSource,
+    full_pass_interval_seconds: int,
+    skip_reason: str,
+) -> None:
+    """Record that a pass ran but declined to act, without touching ``repos``.
+
+    A skip still bumps ``updated_at`` and records provenance + the reason, so
+    the doctor probe can tell "the daemon reached allocation and found no
+    runners under the configured root" from "the daemon never reached
+    allocation" — both leave a stale file otherwise, and the probe used to
+    attribute every one of them to issue #590 (issue #606).
+
+    The idle-streak map is preserved from the prior file (see
+    ``_read_prior_repos``) so a transient skip does not reset demotion
+    hysteresis. ``source`` and ``full_pass_interval_seconds`` are required for
+    the same reason as in :func:`save_idle_streaks`.
+    """
+    _write_allocation_state(
+        fleet_dir,
+        _read_prior_repos(fleet_dir),
+        source=source,
+        full_pass_interval_seconds=full_pass_interval_seconds,
+        skip_reason=skip_reason,
+    )
 
 
 # --------------------------------------------------------------------------
