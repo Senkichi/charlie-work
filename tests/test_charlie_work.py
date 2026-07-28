@@ -4626,6 +4626,98 @@ def test_dispatch_still_queries_merged_pr_list_when_ready_issues_exist(tmp_path:
     assert fake_gh.merged_pr_list_calls == 1
 
 
+def test_dispatch_defers_when_merged_pr_list_raises_on_direct_fallback(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer — not crash — when merged_pr_list() raises on the
+    _resolve_merged_prs direct-fallback path (#633 review finding).
+
+    This is the COMMON-case path: open ready issues exist but no closed-ready
+    issues this pass, so _finalize_externally_merged_issues skips the
+    merged_pr_list() fetch entirely (returns an outcome with called=False).
+    _resolve_merged_prs then calls merged_pr_list() directly (branch 1), and
+    after #633 that call raises GitHubError on an unusable response instead of
+    silently returning []. Without a handler the error propagates out of
+    dispatch() and crashes the supervised loop daemon on a transient gh
+    failure. dispatch()'s ``except GitHubError`` handler must catch it and
+    return a deferred result so the next pass retries.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
+
+
+def test_dispatch_defers_when_merged_pr_list_raises_on_finalize_reraise(
+    tmp_path: Path,
+) -> None:
+    """dispatch() must defer when _resolve_merged_prs re-raises a finalize error.
+
+    When closed-ready issues exist, _finalize_externally_merged_issues calls
+    merged_pr_list() itself and records a failure in _MergedPRListOutcome
+    (called=True, error=GitHubError). _resolve_merged_prs branch 2 re-raises
+    that stored error. dispatch()'s ``except GitHubError`` handler must catch
+    the re-raise and defer — the same handler that covers the direct fallback
+    (branch 1) — so a transient gh failure during finalization does not crash
+    the supervised loop daemon.
+    """
+
+    class FakeGitHubFailingMergedList(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # A closed ready-labeled issue forces _finalize_externally_merged_issues
+            # to actually call merged_pr_list() (rather than skip with called=False),
+            # so the error is recorded in the outcome. The OPEN ready issue stays
+            # in the queue after finalization strips the closed one, so ``issues``
+            # is non-empty in _dispatch_impl and _resolve_merged_prs branch 2
+            # (``if outcome.error is not None and issues: raise``) fires.
+            self.issues = [
+                {
+                    "number": 200,
+                    "title": "Closed ready issue",
+                    "url": "https://example.test/issues/200",
+                    "body": "Already done",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "CLOSED",
+                },
+                {
+                    "number": 201,
+                    "title": "Open ready issue",
+                    "url": "https://example.test/issues/201",
+                    "body": "Needs work",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "OPEN",
+                },
+            ]
+
+        def merged_pr_list(self):
+            raise github_module.GitHubError("merged_pr_list: unusable response")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubFailingMergedList()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["deferred_reason"] == "github_error"
+    assert "unusable response" in result.data["github_error"]
+
+
 def test_dispatch_only_issues_selects_explicit_subset(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -10081,6 +10173,172 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
 
     assert "alerted_at" not in cleared["reviewer_quota"]
     assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
+    from charlie_work.state import empty_state, set_throttled_until
+
+    state = set_throttled_until(
+        empty_state(),
+        "2026-08-01T00:00:00Z",
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+    )
+
+    assert state["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert state["throttle_reason"] == "quota_exhausted"
+    assert state["throttle_adapter_kind"] == "claude-code"
+
+
+def test_set_throttled_until_defaults_reason_and_adapter_kind_to_none() -> None:
+    from charlie_work.state import empty_state, set_throttled_until
+
+    state = set_throttled_until(empty_state(), "2026-08-01T00:00:00Z")
+
+    assert state["throttle_reason"] is None
+    assert state["throttle_adapter_kind"] is None
+
+
+def test_quota_probe_arm_disarm_and_due_lifecycle() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.state import (
+        arm_quota_probe,
+        disarm_quota_probe,
+        empty_state,
+        is_quota_probe_armed,
+        is_quota_probe_due,
+    )
+
+    state = empty_state()
+    assert is_quota_probe_armed(state) is False
+    assert is_quota_probe_due(state) is False  # unarmed is never "due"
+
+    future = (datetime.now(UTC) + timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+    state = arm_quota_probe(state, future)
+    assert is_quota_probe_armed(state) is True
+    assert is_quota_probe_due(state) is False
+
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    state = arm_quota_probe(state, past)
+    assert is_quota_probe_due(state) is True
+
+    state = disarm_quota_probe(state)
+    assert is_quota_probe_armed(state) is False
+
+
+def test_is_quota_probe_due_treats_malformed_timestamp_as_due() -> None:
+    from charlie_work.state import arm_quota_probe, empty_state, is_quota_probe_due
+
+    state = arm_quota_probe(empty_state(), "not-a-timestamp")
+
+    assert is_quota_probe_due(state) is True
+
+
+def test_any_quota_exhausted_indicator_gate() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.state import (
+        any_quota_exhausted_indicator,
+        empty_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    assert any_quota_exhausted_indicator(empty_state()) is False
+
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    root_throttled = set_throttled_until(empty_state(), future, reason="rate_limited")
+    assert any_quota_exhausted_indicator(root_throttled) is True
+
+    reviewer_throttled = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until=future, probe_after=future
+    )
+    assert any_quota_exhausted_indicator(reviewer_throttled) is True
+
+
+def test_clear_quota_throttles_clears_root_throttle_for_claude_code_or_unset_adapter() -> None:
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    for adapter_kind in (None, "claude-code"):
+        state = set_throttled_until(
+            empty_state(),
+            "2026-08-01T00:00:00Z",
+            reason="rate_limited",
+            adapter_kind=adapter_kind,
+        )
+
+        cleared = clear_quota_throttles(state)
+
+        assert cleared["throttled_until"] is None
+        assert cleared["throttle_reason"] is None
+        assert cleared["throttle_adapter_kind"] is None
+
+
+def test_clear_quota_throttles_preserves_provider_auth_throttle() -> None:
+    """A dead key does not self-heal within minutes -- see
+    claude_code._classify_session_failure; a green probe must not mask it."""
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    state = set_throttled_until(
+        empty_state(),
+        "2026-08-01T00:00:00Z",
+        reason="provider_auth",
+        adapter_kind="claude-code",
+    )
+
+    cleared = clear_quota_throttles(state)
+
+    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert cleared["throttle_reason"] == "provider_auth"
+
+
+def test_clear_quota_throttles_preserves_non_claude_code_adapter_throttle() -> None:
+    """A devin/api-adapter throttle is on a different credential the ambient
+    Claude Code CLI probe provides no evidence about."""
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    for adapter_kind in ("devin", "api"):
+        state = set_throttled_until(
+            empty_state(),
+            "2026-08-01T00:00:00Z",
+            reason="rate_limited",
+            adapter_kind=adapter_kind,
+        )
+
+        cleared = clear_quota_throttles(state)
+
+        assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+        assert cleared["throttle_adapter_kind"] == adapter_kind
+
+
+def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_failures() -> None:
+    from charlie_work.state import (
+        clear_quota_throttles,
+        empty_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    state = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    state = {
+        **state,
+        "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
+    }
+    # Also carry a devin-adapter root throttle, to confirm reviewer_quota
+    # clears independently of what the root-throttle branch decides.
+    state = set_throttled_until(
+        state, "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="devin"
+    )
+
+    cleared = clear_quota_throttles(state)
+
+    assert "throttled_until" not in cleared["reviewer_quota"]
+    assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
+    # The devin adapter's root throttle must still be untouched.
+    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
 
 
 def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(
@@ -22994,6 +23252,340 @@ def test_is_throttled_checks_against_current_time(tmp_path: Path) -> None:
     # Test with malformed timestamp
     state = {"throttled_until": "invalid-timestamp"}
     assert is_throttled(state) is False
+
+
+def _quota_probe_app(
+    tmp_path: Path, *, interval_minutes: int = 15, enabled: bool = True
+) -> OrchestratorApp:
+    from charlie_work.config import QuotaProbeConfig
+
+    config = OrchestratorConfig(
+        quota_probe=QuotaProbeConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+
+def test_maybe_probe_quota_recovery_noop_when_nothing_throttled(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _quota_probe_app(tmp_path)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("run_quota_probe must not be called when nothing is throttled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_disarms_stale_schedule_when_throttle_cleared(
+    tmp_path: Path,
+) -> None:
+    """A cooldown can expire naturally (root throttled_until passes) between
+    passes, before the flat-interval probe schedule fires. The next pass
+    must disarm the now-stale schedule rather than probing needlessly."""
+    from charlie_work.state import arm_quota_probe, save_state
+
+    app = _quota_probe_app(tmp_path)
+    state = load_state(app.paths.state_file)
+    state = arm_quota_probe(state, "2026-08-01T00:00:00Z")
+    save_state(app.paths.state_file, state)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_arms_on_first_pass_without_probing(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("first pass after onset must arm, not probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=15)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_maybe_probe_quota_recovery_waits_until_due(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=10))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("must not probe before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["quota_probe"]["next_probe_at"] == not_due
+
+
+def test_maybe_probe_quota_recovery_green_clears_all_throttles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=future)
+    state = {
+        **state,
+        "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
+    }
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    calls: list[dict] = []
+
+    def _fake_probe(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fake_probe)
+
+    app._maybe_probe_quota_recovery()
+
+    assert len(calls) == 1
+    assert calls[0]["repo_root"] == tmp_path
+    state = load_state(app.paths.state_file)
+    assert state["throttled_until"] is None
+    assert "throttled_until" not in state.get("reviewer_quota", {})
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert any(e["kind"] == "quota_probe_succeeded" for e in state["events"])
+    assert state["reviewer_quota"]["consecutive_probe_failures"] == 0
+
+
+def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_throttle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # Flat interval: rescheduled ~15 minutes out again, not a growing backoff.
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=15)
+    assert abs((parsed - expected).total_seconds()) < 5
+    assert state["throttled_until"] == future
+    assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
+
+
+def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, enabled=False)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("disabled quota_probe must never call run_quota_probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+
+
+def test_maybe_probe_quota_recovery_never_arms_for_provider_auth_throttle(
+    tmp_path: Path,
+) -> None:
+    """A dead key does not self-heal within minutes, and ``clear_quota_throttles``
+    deliberately leaves a provider_auth-reasoned root throttle untouched even
+    on a green probe. The probe must therefore never arm for one in the first
+    place -- arming/probing a throttle that can never be cleared would just
+    burn a Haiku session every ``interval_minutes`` for the whole cooldown
+    window with no possible benefit."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file),
+        future,
+        reason="provider_auth",
+        adapter_kind="claude-code",
+    )
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("provider_auth throttle must never arm the probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert state["throttled_until"] == future
+    assert state["throttle_reason"] == "provider_auth"
+
+
+def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throttle(
+    tmp_path: Path,
+) -> None:
+    """A devin/api-adapter throttle is not cleared by a claude-code ambient
+    probe (different tool/credential entirely -- see
+    ``clear_quota_throttles``), so the probe must never arm for one."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file),
+        future,
+        reason="rate_limited",
+        adapter_kind="devin",
+    )
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(**_kwargs: object) -> bool:
+        raise AssertionError("devin-adapter throttle must never arm the probe")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
+    try:
+        app._maybe_probe_quota_recovery()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("quota_probe", {}).get("next_probe_at") is None
+    assert state["throttled_until"] == future
+    assert state["throttle_adapter_kind"] == "devin"
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:

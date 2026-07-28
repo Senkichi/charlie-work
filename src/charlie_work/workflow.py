@@ -30,6 +30,7 @@ from .claude_code import (
     launch_claude_worker,
     parse_claude_events,
     resolve_review_effort,
+    run_quota_probe,
 )
 from .checks import CheckSummary, summarize_checks
 from .config import (
@@ -103,8 +104,14 @@ from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
+    arm_quota_probe,
+    clear_quota_throttles,
     clear_reviewer_quota,
+    disarm_quota_probe,
     is_claim_stale,
+    is_quota_probe_actionable,
+    is_quota_probe_armed,
+    is_quota_probe_due,
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
@@ -1061,7 +1068,12 @@ def _detect_and_handle_stalled_sessions(
                         update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
                         with state_lock(state_file):
                             state = load_state(state_file)
-                            state = set_throttled_until(state, defer_until)
+                            state = set_throttled_until(
+                                state,
+                                defer_until,
+                                reason="rate_limited",
+                                adapter_kind=w.adapter_kind,
+                            )
                             state = append_event(
                                 state,
                                 "session_rate_limit_deferred",
@@ -1145,7 +1157,12 @@ def _detect_and_handle_stalled_sessions(
                 # relaunching into the same provider rate limit/quota window.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=resolved_failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Log the event
@@ -3924,7 +3941,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # relaunches straight into the same throttled provider.
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             if (
@@ -4144,7 +4166,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # Update state with throttle window
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(state, throttled_until)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
                     save_state(state_file, state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
@@ -5509,6 +5536,38 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(finalized),
                 },
             )
+        except GitHubError as exc:
+            # A GitHubError from _dispatch_impl means a GitHub API call
+            # needed for reliable dispatch failed. The two known sources are
+            # merged_pr_list() (raised on unusable responses — empty stdout,
+            # non-zero exit, unparseable JSON — per #633) and pr_list(); both
+            # are fetched before any issue is claimed or worker launched, so
+            # deferring here cannot leave a partial claim. Earlier
+            # _finalize_externally_merged_issues already recorded its own
+            # merged_pr_list failure in merged_pr_outcome, and
+            # _resolve_merged_prs re-raises that stored error (branch 2) so
+            # this handler covers BOTH the direct-fallback fetch (branch 1,
+            # the common case when there are open ready issues but no
+            # closed-ready issues this pass) and the finalize-errored re-raise
+            # (branch 2). Deferring is the correct response: proceeding with
+            # an empty merged-PR set would re-dispatch issues a merged PR
+            # already covered (the silent-empty path #633 closed), and letting
+            # the error propagate crashes the supervised loop daemon on a
+            # transient gh failure. Any claim written before a later
+            # GitHubError (e.g. issue_view mid-launch) is recovered by the
+            # existing stale-claim sweep on the next pass.
+            return CommandResult(
+                True,
+                f"dispatch deferred: GitHub API error ({exc})",
+                {
+                    "selected_count": 0,
+                    "deferred_reason": "github_error",
+                    "github_error": str(exc),
+                    "merged_prs": merged_prs_for_result,
+                    "merged_pr_closed_issue_numbers": sorted(finalized),
+                    "merged_pr_referenced_issue_numbers": sorted(finalized),
+                },
+            )
         finally:
             if fleet_lock is not None:
                 fleet_lock.release()
@@ -5595,6 +5654,16 @@ class OrchestratorApp:
         def _resolve_merged_prs(
             outcome: _MergedPRListOutcome | None,
         ) -> list[dict[str, Any]]:
+            # Both raising branches (the direct fallback below and the
+            # outcome.error re-raise) propagate GitHubError to dispatch()'s
+            # ``except GitHubError`` handler, which defers the pass. This is
+            # deliberate: proceeding with [] would re-dispatch issues a merged
+            # PR already covered (the silent-empty path #633 closed). The
+            # direct fallback is the COMMON case — it runs whenever there are
+            # open ready issues but no closed-ready issues this pass, because
+            # _finalize_externally_merged_issues skips the merged_pr_list()
+            # fetch entirely when closed_ready is empty (returning an outcome
+            # with called=False).
             if outcome is None or not outcome.called:
                 return self.gh.merged_pr_list() if issues else []
             if outcome.error is not None and issues:
@@ -11389,6 +11458,91 @@ class OrchestratorApp:
             )
             return result
 
+    def _maybe_probe_quota_recovery(self) -> None:
+        """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
+
+        Runs every loop pass but is a near-no-op unless a throttle that a
+        green ambient-CLI probe could actually clear is currently active
+        (``is_quota_probe_actionable``) -- an operator switching to a
+        different subscription account can make a provider's quota recover
+        well before a blanket cooldown (e.g. the 24h
+        ``_DEFAULT_QUOTA_COOLDOWN_HOURS`` window) elapses, and there was
+        previously no way to detect that early. Deliberately a *flat*
+        ``quota_probe.interval_minutes`` schedule (not exponential backoff
+        like ``reviewer_quota.probe_after``): the user asked for a fixed
+        15-minute recheck, not a growing wait.
+
+        The gate is narrower than "any throttle indicator" -- a devin/api
+        adapter throttle or a provider_auth cooldown would survive
+        ``clear_quota_throttles`` untouched even on a green probe (see that
+        function), so arming/probing for one would just burn Haiku sessions
+        every interval for no possible benefit. Because of this, a green
+        probe reaching the success branch below is guaranteed to have
+        something to clear -- no post-hoc check needed there.
+
+        Two-phase lock pattern so the (possibly tens-of-seconds) subprocess
+        call in ``run_quota_probe`` never holds ``state_lock`` and blocks
+        every other state read/writer in the process:
+          1. Under the lock: decide whether to probe at all, and if not,
+             arm/disarm/return without calling out to the CLI.
+          2. Outside the lock: run the actual probe subprocess.
+          3. Under the lock again: re-read state (it may have changed while
+             unlocked) and apply the outcome.
+        """
+        if not self.config.quota_probe.enabled:
+            return
+
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                if is_quota_probe_armed(state):
+                    state = disarm_quota_probe(state)
+                    save_state(state_file, state)
+                return
+            if not is_quota_probe_armed(state):
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                save_state(state_file, state)
+                return
+            if not is_quota_probe_due(state):
+                return
+
+        probe_ok = run_quota_probe(repo_root=self.repo_root, config=self.config)
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_quota_probe_actionable(state):
+                # Cleared or became non-actionable while the probe ran unlocked.
+                state = disarm_quota_probe(state)
+                save_state(state_file, state)
+                return
+            if probe_ok:
+                state = clear_quota_throttles(state)
+                state = disarm_quota_probe(state)
+                state = self._record_event(state, "quota_probe_succeeded", {})
+            else:
+                next_probe_at = (
+                    (
+                        datetime.now(UTC)
+                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
+                    )
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                state = arm_quota_probe(state, next_probe_at)
+                state = self._record_event(state, "quota_probe_failed", {})
+            save_state(state_file, state)
+
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
@@ -11440,6 +11594,10 @@ class OrchestratorApp:
             self.config,
             persist_inconclusive_probe_counter=False,
         )
+
+        # Flat-interval Haiku probe for early quota/rate-limit recovery (see
+        # docstring): only does real work when a throttle indicator is active.
+        self._maybe_probe_quota_recovery()
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
@@ -13164,14 +13322,14 @@ class OrchestratorApp:
                 # first pass cannot bake an empty baseline and permanently
                 # exempt the real history it never saw.
                 #
-                # This covers the raising failures (gh missing, unparseable
-                # JSON, non-zero exit). It does NOT cover gh exiting 0 with
-                # empty stdout, which merged_pr_list() coerces to an empty page
-                # and treats as "no more results" — that would arm an empty
-                # baseline silently. Distinguishing the two belongs in
-                # github.py rather than here and is tracked in #633; recovery
-                # is to delete the baseline key from state.json and let the
-                # next pass re-arm from real data.
+                # This covers every raising failure in merged_pr_list(): gh
+                # missing, unparseable JSON, non-zero exit, AND gh exiting 0
+                # with empty stdout (the silent-empty case #633 closed —
+                # merged_pr_list() now raises GitHubError on a non-list result
+                # instead of coercing None to []). The empty-stdout path no
+                # longer arms an empty baseline silently; it is reported here
+                # as a raising failure and the next pass re-arms from real
+                # data.
                 return []
 
         for pr in merged_prs:

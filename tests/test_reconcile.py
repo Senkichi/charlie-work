@@ -867,6 +867,11 @@ def test_detect_drift_provider_throttle_detected_with_repo_root(tmp_path: Path) 
     assert throttle_drift[0].issue_number == 42
     assert "rate_limited" in throttle_drift[0].detail
     assert "throttled_until" in throttle_drift[0].fix_actions[0]
+    # Regression: reason/adapter_kind must survive on the DriftItem itself
+    # (not just embedded in the detail string) so apply_fixes can thread them
+    # into set_throttled_until -- see test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind.
+    assert throttle_drift[0].throttle_reason == "rate_limited"
+    assert throttle_drift[0].throttle_adapter_kind == "devin"
 
 
 def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
@@ -897,6 +902,38 @@ def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
     assert new_state.get("throttled_until") == throttled_until
     # Original state should be unchanged
     assert state.get("throttled_until") is None
+
+
+def test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind() -> None:
+    """A ``provider_throttle_detected`` drift item's reason/adapter_kind must
+    reach ``set_throttled_until`` -- otherwise ``clear_quota_throttles``
+    treats a devin/provider_auth throttle applied via ``reconcile --fix`` as
+    claude-code-shaped (the field-unset default) and a later green ambient-CLI
+    probe wrongly clears a throttle it never actually tested."""
+    from datetime import UTC, datetime, timedelta
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    throttled_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    drift = [
+        DriftItem(
+            kind="provider_throttle_detected",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died with provider_auth",
+            fix_actions=(f"set throttled_until={throttled_until}",),
+            throttle_reason="provider_auth",
+            throttle_adapter_kind="devin",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state.get("throttled_until") == throttled_until
+    assert new_state.get("throttle_reason") == "provider_auth"
+    assert new_state.get("throttle_adapter_kind") == "devin"
 
 
 def test_detect_drift_without_repo_root_skips_session_check() -> None:
