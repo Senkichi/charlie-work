@@ -9093,34 +9093,51 @@ class OrchestratorApp:
         live_pr = self.gh.pr_view(pr_number) if pr_number is not None else {}
         live_pr_state = str((live_pr or {}).get("state") or "").upper()
 
-        # Issue #214 precedent (reconcile's live_session_issue_numbers
-        # guard): a verifiably live worker session means nothing here is
-        # stuck, it is IN USE -- refuse entirely rather than re-arm around a
-        # running process. Popping issue-side worker_pid/dispatched_at would
-        # blind orphan-worker detection; resetting the PR side would zero
-        # the conflict/no-op attempt counters for a rework cycle still in
-        # flight (defeating the caps) and flip the PR to the passive
-        # reviewing status, inviting a concurrent review() against the
-        # worker's in-progress push. PR "janitor_blocked" + issue
-        # "dispatched" is the NORMAL mid-rework steady state, not a wedge.
-        issue_worker_alive = False
+        # Issue #214 precedent (reconcile's live_session_issue_numbers guard):
+        # a verifiably live worker session means nothing here is stuck, it is
+        # IN USE -- refuse entirely rather than re-arm around a running
+        # process. Popping issue-side worker_pid/dispatched_at would blind
+        # orphan-worker detection; resetting the PR side would zero the
+        # conflict/no-op attempt counters for a rework cycle still in flight
+        # (defeating the caps) and flip the PR to the passive reviewing
+        # status, inviting a concurrent review() against the worker's
+        # in-progress push. PR "janitor_blocked" + issue "dispatched" is the
+        # NORMAL mid-rework steady state, not a wedge.
+        #
+        # Issue #625: "live" is no longer just "is the PID alive?". Both the
+        # sidecar-based and state.json-based checks route through one
+        # predicate (``issue_worker_liveness``) that bounds the state-side
+        # check with the watchdog's stall standard -- an alive-but-silent
+        # session (no real activity for > stall_minutes, or past the
+        # wall-clock deadline with an inconclusive probe) is wedged, not
+        # live, and unescalate may proceed. The refusal carries session age
+        # and last-activity diagnostics so an operator can tell a wedged
+        # worker from a working one.
         if issue_number is not None:
-            from .worker import iter_workers
+            from datetime import UTC
+
+            from .worker import issue_worker_liveness
 
             sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            issue_worker_alive = any(
-                w.issue_number == issue_number and w.is_alive() for w in iter_workers(sessions_dir)
-            ) or _worker_pid_alive(issue_state)
-        if issue_worker_alive:
+            verdict = issue_worker_liveness(
+                issue_number, issue_state, sessions_dir, self.config, datetime.now(UTC)
+            )
+        else:
+            verdict = None
+        if verdict is not None and verdict.live:
             return CommandResult(
                 True,
                 f"issue #{issue_number} has a live worker session; nothing to "
-                f"unescalate (pr={pr_number} left untouched) -- retry after "
-                "the session ends",
+                f"unescalate (pr={pr_number} left untouched) -- {verdict.reason}",
                 {
                     "pr": pr_number,
                     "issue": issue_number,
                     "issue_worker_alive": True,
+                    "issue_worker_last_activity_at": verdict.last_activity_at,
+                    "issue_worker_last_activity_source": verdict.last_activity_source,
+                    "issue_worker_session_started_at": verdict.session_started_at,
+                    "issue_worker_pid": verdict.pid,
+                    "issue_worker_source": verdict.source,
                     "changed": False,
                 },
             )
