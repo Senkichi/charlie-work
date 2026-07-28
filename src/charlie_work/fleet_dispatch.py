@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
-from .fleet_paths import fleet_dir
+from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
@@ -35,7 +36,7 @@ from .runners import (
     scale_down_idle_runners,
     ScaleAction,
 )
-from .state import utc_now
+from .state import state_lock, utc_now
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -885,8 +886,122 @@ def _add_launch_failures(
                 failures.append(event)
 
 
+_FLEET_HEALTH_STATE_FILENAME = "notify_health_state.json"
+
+
+def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
+    """Return the fleet-level notify health baseline sidecar path.
+
+    This sidecar persists the last-known health per (adapter_kind, issue_number)
+    so the fleet digest can emit only on real transitions instead of re-firing
+    every pass with ``previous_health: null`` (issue #554). It lives in the
+    fleet directory alongside ``fleet.json``.
+    """
+    return fleet_dir(override=fleet_dir_override) / _FLEET_HEALTH_STATE_FILENAME
+
+
+def _load_fleet_health_state(path: Path) -> dict[str, str]:
+    """Load the fleet health baseline sidecar.
+
+    Returns an empty dict when the file is missing or unparseable (a corrupt
+    sidecar is non-fatal: the worst case is one extra transition emission on
+    the next pass, which is exactly the degraded mode we are fixing away from).
+    """
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, LookupError, ValueError, OSError):
+        logger.warning("Fleet health state %s unreadable; starting fresh", path)
+        return {}
+    issues = data.get("issues") if isinstance(data, dict) else None
+    if not isinstance(issues, dict):
+        return {}
+    # Coerce values to str; keys are already "adapter_kind:issue_number" strings.
+    return {str(k): str(v) for k, v in issues.items() if isinstance(v, str)}
+
+
+def _save_fleet_health_state(path: Path, issues: dict[str, str]) -> None:
+    """Atomically persist the fleet health baseline sidecar.
+
+    Temp-file + ``replace()`` per the project's atomic-write invariant. Warns
+    on fleet-dir virtualization (issue #624) but never blocks the write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    warn_fleet_dir_virtualization_on_write(path.parent, context="writing notify_health_state.json")
+    payload = {"version": 1, "generated_at": utc_now(), "issues": issues}
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def _filter_fleet_health_transitions(
+    entries: list[AttentionEntry],
+    state_file: Path,
+) -> list[AttentionEntry]:
+    """Stateful filter: keep only entries whose health changed since last pass.
+
+    Reads the fleet health baseline sidecar (``notify_health_state.json``)
+    mapping ``"adapter_kind:issue_number"`` to the last-emitted health. For
+    each entry, only keeps it when the health differs from the persisted
+    baseline, setting ``previous_health`` to that prior value. Updates and
+    atomically persists the new baselines.
+
+    This is the fleet-level analogue of ``workflow._build_attention_digest``'s
+    per-issue transition dedup. Without it, every fleet pass re-emits the same
+    ERROR/STALLED entries with ``previous_health: null`` (issue #554).
+
+    Entries are processed in order so a within-pass health change (e.g.
+    ERROR then OK for the same issue) emits both transitions; the persisted
+    baseline ends at the final health.
+    """
+    emitted: list[AttentionEntry] = []
+    # Ensure the parent directory exists before state_lock tries to create the
+    # sibling .lock file (advisory_file_lock touches it directly).
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(state_file):
+        baselines = _load_fleet_health_state(state_file)
+        for entry in entries:
+            key = f"{entry.adapter_kind}:{entry.issue_number}"
+            last = baselines.get(key)
+            if last == entry.health:
+                continue
+            emitted.append(replace(entry, previous_health=last))
+            baselines[key] = entry.health
+        _save_fleet_health_state(state_file, baselines)
+    return emitted
+
+
+def _emit_fleet_transition(
+    notify_config: Any,
+    entry: AttentionEntry,
+    fleet_dir_override: str | None,
+) -> None:
+    """Emit a single fleet attention entry as a digest, deduped across passes.
+
+    Wraps the stateful ``_filter_fleet_health_transitions`` so a persistent
+    condition (e.g. a recurring self-deploy ERROR) does not re-fire with
+    ``previous_health: null`` every supervisor pass (issue #554). Only emits
+    when the entry represents a real transition vs the persisted baseline.
+    """
+    state_file = _fleet_health_state_path(fleet_dir_override)
+    filtered = _filter_fleet_health_transitions([entry], state_file)
+    if not filtered:
+        return
+    digest = AttentionDigest(
+        generated_at=utc_now(),
+        repo="fleet",
+        transitions=tuple(filtered),
+    )
+    emit_digest(notify_config, digest)
+
+
 def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
+    state_file: Path | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -900,6 +1015,14 @@ def _build_fleet_attention_digest(
     ``issue_number`` is required by ``AttentionEntry``; events that carry no
     issue number (e.g. PR errors) fall back to ``-1`` as a sentinel so they
     still surface in the digest instead of being silently dropped.
+
+    When ``state_file`` is provided, the entries are filtered through
+    ``_filter_fleet_health_transitions`` so only real health transitions
+    (vs the last-persisted baseline) are emitted. Without it every pass
+    re-fires the same entries with ``previous_health: null`` (issue #554).
+    The returned digest always carries the post-filter entries; callers
+    that pass ``state_file`` should still check ``digest.transitions`` for
+    emptiness before emitting.
     """
     entries: list[AttentionEntry] = []
     for event in attention_events:
@@ -1013,6 +1136,9 @@ def _build_fleet_attention_digest(
                     pid=event.get("pid"),
                 )
             )
+
+    if state_file is not None:
+        entries = _filter_fleet_health_transitions(entries, state_file)
 
     return AttentionDigest(
         generated_at=utc_now(),
@@ -1195,11 +1321,15 @@ def fleet_loop(
         "emitted": False,
     }
     if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
-        attention_digest = _build_fleet_attention_digest(attention_events)
-        notify_result = emit_digest(notify_config, attention_digest)
-        digest["emitted"] = notify_result.ok
-        if notify_result.error:
-            digest["notify_error"] = notify_result.error
+        health_state_file = _fleet_health_state_path(fleet_dir_override)
+        attention_digest = _build_fleet_attention_digest(
+            attention_events, state_file=health_state_file
+        )
+        if attention_digest.transitions:
+            notify_result = emit_digest(notify_config, attention_digest)
+            digest["emitted"] = notify_result.ok
+            if notify_result.error:
+                digest["notify_error"] = notify_result.error
 
     ok = all(r.ok for r in per_repo_results.values())
     message = f"fleet pass complete: {len(per_repo_results)} repo(s) processed"
@@ -1455,21 +1585,15 @@ def run_fleet_supervise(
                     and notify_config is not None
                     and getattr(notify_config, "enabled", False)
                 ):
-                    attention_digest = AttentionDigest(
-                        generated_at=utc_now(),
-                        repo="fleet",
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=-1,
-                                adapter_kind="self-deploy",
-                                health="ERROR",
-                                previous_health=None,
-                                last_log_line=deploy.error,
-                                pid=None,
-                            ),
-                        ),
+                    entry = AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=deploy.error,
+                        pid=None,
                     )
-                    emit_digest(notify_config, attention_digest)
+                    _emit_fleet_transition(notify_config, entry, fleet_dir_override)
             elif deploy.previewed:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.synced:
@@ -1478,21 +1602,15 @@ def run_fleet_supervise(
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
                 notify_config = getattr(global_config, "notify", None)
                 if notify_config is not None and getattr(notify_config, "enabled", False):
-                    attention_digest = AttentionDigest(
-                        generated_at=utc_now(),
-                        repo="fleet",
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=-1,
-                                adapter_kind="self-deploy",
-                                health="REPAIRED",
-                                previous_health=None,
-                                last_log_line=deploy.message,
-                                pid=None,
-                            ),
-                        ),
+                    entry = AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="REPAIRED",
+                        previous_health=None,
+                        last_log_line=deploy.message,
+                        pid=None,
                     )
-                    emit_digest(notify_config, attention_digest)
+                    _emit_fleet_transition(notify_config, entry, fleet_dir_override)
 
             # A successful pull that actually moved HEAD updated the files on
             # disk, but this process already imported every charlie_work
