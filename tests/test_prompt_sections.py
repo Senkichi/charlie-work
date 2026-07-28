@@ -16,7 +16,8 @@ ISSUE_VALUES = {
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
-    "review_summary": "Fix the typo in the search function.",
+    "dispatch_note": "Fix the typo in the search function.",
+    "required_changes_section": "",
 }
 
 
