@@ -218,6 +218,27 @@ def test_extract_attention_events_errors() -> None:
     assert events[1]["pr"] == 101
 
 
+def test_extract_attention_events_errors_prefer_issue_number() -> None:
+    """_extract_attention_events surfaces the linked issue number for errors that carry one (issue #502)."""
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [
+                {"pr": 501, "issue": 494, "error": "possible worker self-merge"},
+            ],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo2", result)
+
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["issue_number"] == 494
+    assert events[0]["pr"] == 501
+
+
 def test_extract_attention_events_health_transitions() -> None:
     """_extract_attention_events extracts health transitions."""
     result = CommandResult(

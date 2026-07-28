@@ -527,6 +527,22 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
     return False
 
 
+def _object_exists(repo_root: Path, sha: str) -> bool:
+    """Return True if ``sha`` names an object present in the local object store.
+
+    Callers that ask ancestry questions must gate on this first: ``git
+    merge-base --is-ancestor`` exits non-zero both for "not an ancestor" and
+    for "I have never heard of that object", and conflating the two produces a
+    correct-by-accident decision attached to a false reason string.
+    """
+    result = run_captured(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     """Return True if ``ancestor`` is an ancestor of ``descendant``."""
     result = run_captured(
@@ -2874,6 +2890,74 @@ def _find_linked_pr_number(
     return None
 
 
+def _cleanup_live_writer_reason(issue_state: dict[str, Any], worktree_path: Path) -> str | None:
+    """Return a reason when a merged-PR worktree is demonstrably still in use.
+
+    The merged-PR cleanup lane asks a strictly narrower question than the
+    redispatch lane's ``_probe_recovery_liveness``, and must NOT reuse it.
+
+    By the time this runs, ``clean_worktrees`` has already established three
+    things about the worktree: its PR is confirmed ``MERGED`` by a live
+    ``gh pr view``, its working tree carries no worker-authored changes, and
+    its local HEAD is identical to the merged PR's ``headRefOid``. The tree is
+    therefore byte-identical to what already landed on the base branch — there
+    is no work left to lose. The residual hazard is only ever *deleting a
+    directory out from under a running process*, which is answered by positive
+    evidence of a live process and never by the absence of a record.
+
+    ``_probe_recovery_liveness`` answers a different question (may I reset a
+    branch and relaunch a worker into this workspace?) and is correctly
+    fail-closed on an inconclusive activity probe, because there a reset can
+    destroy uncommitted work (issue #282). Reusing it here produced a
+    permanent skip for every merged worktree:
+
+      * its escape hatch is a deferral counter that only the recovery lane
+        persists to state.json, so ``current_deferred_count`` is always 0 on
+        this path and the ``max_inconclusive_probe_deferrals`` cap is
+        unreachable by construction; and
+      * it probes the Devin CLI's ``sessions.db``, which holds no records at
+        all for claude-code/api workers, so a finished worker with no recorded
+        pid yields ``devin_per_pid_log: no pid`` — the absence of a subject to
+        look up, reported as an errored source and read as "maybe alive".
+
+    Positive liveness signals, in order:
+      1. the recorded worker pid is alive (start-time fingerprint matched);
+      2. a live operator claim marker (liveness comes from
+         ``operator_claimed_at`` in state, not the marker's sentinel pid);
+      3. any writer marker whose pid is alive.
+
+    Read-only by design: unlike ``_check_worktree_writer_marker`` it never
+    deletes a stale marker, so a ``--dry-run`` preview stays write-free.
+    """
+    worker_pid = issue_state.get("worker_pid")
+    process_start_time = issue_state.get("worker_process_start_time")
+    if worker_pid is None:
+        worker_pid = issue_state.get("last_known_worker_pid")
+        process_start_time = issue_state.get("last_known_worker_process_start_time")
+    try:
+        worker_pid = int(worker_pid) if worker_pid is not None else None
+    except (TypeError, ValueError):
+        worker_pid = None
+    if worker_pid is not None and is_pid_alive(worker_pid, process_start_time):
+        return f"recorded worker pid {worker_pid} is alive"
+
+    marker = read_worktree_marker(worktree_path)
+    if marker is None:
+        return None
+    marker_pid = marker.get("pid")
+    session_id = marker.get("session_id")
+    if marker.get("kind") == OPERATOR_MARKER_KIND or (
+        isinstance(session_id, str) and session_id.startswith("operator-")
+    ):
+        # Operator markers carry a sentinel pid; state.json is the authority.
+        if _state.is_operator_claimed(issue_state):
+            return "worktree is operator-claimed"
+        return None
+    if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid, None):
+        return f"live writer marker (pid={marker_pid}, session_id={session_id})"
+    return None
+
+
 @dataclass(frozen=True)
 class WorktreeCleanResult:
     """Result of a ``clean_worktrees`` run.
@@ -2910,11 +2994,22 @@ def clean_worktrees(
          sufficient on its own (state.json reliability history: #285/#309/
          #310), and an unavailable/erroring ``gh`` call fails CLOSED (skip)
          rather than falling back to trusting state.json.
-      2. No live worker (see ``_probe_recovery_liveness``).
-      3. The worktree's working tree is clean (no uncommitted modifications).
-      4. The worktree's local HEAD equals the merged PR's ``headRefOid``.
+      2. The worktree's working tree is clean (no uncommitted modifications).
+      3. The worktree's local HEAD is *contained in* the merged PR's
+         ``headRefOid`` (equal to it, or an ancestor of it).
+      4. No live worker (see ``_cleanup_live_writer_reason``).
 
-    Check 4 is deliberately a standalone comparison rather than a reuse of
+    The order matters and is load-bearing. Checks 2 and 3 together prove the
+    tree is byte-identical to what already landed on the base branch, so
+    nothing can be *lost* by removing it; that is what lets check 4 answer the
+    narrow "is a process using this directory right now?" question with a
+    positive-evidence probe instead of the redispatch lane's fail-closed one.
+    Running liveness first (as this did until the reuse of
+    ``_probe_recovery_liveness`` was removed) skipped every merged worktree
+    forever — see ``_cleanup_live_writer_reason`` for the two independent
+    reasons that probe can never clear on this path.
+
+    Check 3 is deliberately a standalone comparison rather than a reuse of
     ``_worktree_refuse_to_reset_reason``'s remote-branch-ahead check. This
     repo's production ``AutoMergeConfig`` defaults to ``strategy="squash"``
     with ``delete_branch=True``, so after a real merge the remote branch is
@@ -3026,19 +3121,6 @@ def clean_worktrees(
             )
             continue
         try:
-            _probe_recovery_liveness(issue_state, wt_path, config, issue_number)
-        except LiveWorkerRedispatchError as exc:
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": f"live worker detected: {exc.probe_result}",
-                }
-            )
-            continue
-        try:
             dirty_reason = _worktree_dirty_reason(
                 wt_path,
                 config.dispatch.injected_paths,
@@ -3095,16 +3177,75 @@ def clean_worktrees(
             continue
         local_head_sha = head_result.stdout.strip()
         if local_head_sha != merged_head_sha:
+            # Containment, NOT equality. The question this gate exists to ask
+            # is "does the worktree hold commits that did not get merged?",
+            # and an equality test cannot tell the two directions apart:
+            #
+            #   local BEHIND merged  -> everything here is reachable from the
+            #       merged head; nothing to lose. This is the ORDINARY shape,
+            #       because the merge path advances the PR branch after the
+            #       worker's last local commit (Aviator merge-queue rebases,
+            #       merge-train updates, base-into-branch merges). 46 of 47
+            #       mismatching worktrees on this host were this shape and were
+            #       all reported as "stray post-merge commit(s)".
+            #   local AHEAD/DIVERGED -> real unmerged work; refuse.
+            #
+            # This is the same class of error the note above records for
+            # `_worktree_refuse_to_reset_reason`: a check whose shape counts
+            # the expected post-merge topology as danger.
+            #
+            # Known limitation, deliberately left fail-closed: the containment
+            # test needs `merged_head_sha` to still be in the local object
+            # store. For a squash-merged PR whose remote branch was deleted,
+            # nothing references that SHA once the local branch sits behind it,
+            # so a `git gc` can prune it and the object-presence gate below
+            # starts refusing. That is the safe direction (refuse, don't
+            # remove), and it reports its own distinct reason string — if
+            # worktree-clean ever "stops removing things" again, read the
+            # reasons before re-deriving anything.
+            if not _object_exists(repo_root, merged_head_sha):
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": (
+                            f"merged PR head ({merged_head_sha[:8]}) is not present in the "
+                            "local object store; cannot verify the worktree adds nothing "
+                            "beyond it"
+                        ),
+                    }
+                )
+                continue
+            if not _is_ancestor(repo_root, local_head_sha, merged_head_sha):
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": (
+                            f"worktree HEAD ({local_head_sha[:8]}) is not contained in merged "
+                            f"PR head ({merged_head_sha[:8]}); stray post-merge commit(s)"
+                        ),
+                    }
+                )
+                continue
+        # Liveness is checked LAST, and deliberately so: the three gates above
+        # have already proven this tree holds nothing that is not already
+        # merged, which is what reduces the question to "is a process using
+        # this directory right now?" See _cleanup_live_writer_reason for why
+        # the redispatch lane's fail-closed probe is the wrong instrument here.
+        live_reason = _cleanup_live_writer_reason(issue_state, wt_path)
+        if live_reason:
             skipped.append(
                 {
                     "worktree": str(wt_path),
                     "branch": branch,
                     "issue_number": issue_number,
                     "pr_number": pr_number,
-                    "reason": (
-                        f"worktree HEAD ({local_head_sha[:8]}) does not match merged PR head "
-                        f"({merged_head_sha[:8]}); stray post-merge commit(s)"
-                    ),
+                    "reason": f"live worker detected: {live_reason}",
                 }
             )
             continue

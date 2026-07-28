@@ -660,6 +660,7 @@ def _extract_attention_events(
                 "repo_key": repo_key,
                 "type": "error",
                 "pr": error.get("pr"),
+                "issue_number": error.get("issue") or error.get("pr"),
                 "error": error.get("error"),
             }
         )

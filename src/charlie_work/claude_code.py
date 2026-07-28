@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -38,7 +39,7 @@ from .config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
-from .env_sanitize import sanitize_env
+from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
@@ -59,6 +60,8 @@ from .worktree import (
 )
 
 PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
+
+logger = logging.getLogger(__name__)
 
 # Provider throttle signatures — matched against session log tails to classify
 # failure kinds. The defaults are sourced from RuntimeConfig so there is a single
@@ -136,6 +139,8 @@ class ClaudeWorkerRecord:
     session_id: str | None = None  # unique session id for worktree writer marker (issue #400)
     adapter_kind: str = "claude-code"
     provider: str = ""
+    xdist_cap: str | None = None  # resolved PYTEST_XDIST_AUTO_NUM_WORKERS at launch (issue #646)
+    uv_no_sync: str | None = None  # resolved UV_NO_SYNC at launch, or None if no .venv (#646)
 
     def __post_init__(self) -> None:
         """Enforce a canonical ISO-8601 UTC ``started_at`` at construction time."""
@@ -179,6 +184,8 @@ class ClaudeWorkerRecord:
             session_id=payload.get("session_id"),
             adapter_kind=str(payload.get("adapter_kind", "claude-code")),
             provider=str(payload.get("provider", "")),
+            xdist_cap=payload.get("xdist_cap"),
+            uv_no_sync=payload.get("uv_no_sync"),
         )
 
 
@@ -1131,11 +1138,21 @@ def launch_claude_worker(
     # the shared host (see docs/RUNBOOK.md "Local host saturation ceiling
     # (claude-code adapter)"). `env` is a validated mapping (see config.py).
     # Sanitize the base environment to prevent VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT
-    # leaks from the orchestrator, then merge user-provided overrides on top.
+    # leaks from the orchestrator and to isolate GitHub CLI credentials
+    # (GH_TOKEN/GITHUB_TOKEN dropped, GH_CONFIG_DIR forced to a worktree-local
+    # empty directory) so workers do not inherit the orchestrator's admin token
+    # or stored gh auth state (issue #502). To give workers a scoped GitHub
+    # token, set claude_code.worker_env={"GH_TOKEN": "<scoped-PAT>"}.
+    sanitized_env = sanitize_env(worktree.path)
     worker_env = {
-        **sanitize_env(worktree.path),
+        **sanitized_env,
         **{str(k): str(v) for k, v in (env or {}).items()},
     }
+    # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
+    # purely for the launch-time diagnostic log below (does not affect
+    # worker_env itself, which already carries the real values).
+    xdist_cap, xdist_cap_source = resolve_pytest_cap(sanitized_env, env)
+    uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, env)
 
     try:
         # If tee_stream_json is enabled, we need to tee stdout to both log and events file
@@ -1257,6 +1274,24 @@ def launch_claude_worker(
         # Best-effort marker write must not derail a successful launch.
         pass
 
+    # Issue #646: launch-time INFO log so a reader can answer "how many
+    # suites were running at <time>, from which worktrees, at what cap"
+    # without process forensics. Paired with the exit-side census log in
+    # workflow.py (_log_worker_census) — join on session_id/pid/worktree.
+    logger.info(
+        "worker launch: adapter=claude-code issue=%s worktree=%s pid=%s session_id=%s "
+        "xdist_cap=%s(%s) uv_no_sync=%s(%s) at=%s",
+        issue_number,
+        worktree.path,
+        process.pid,
+        session_id,
+        xdist_cap,
+        xdist_cap_source,
+        uv_no_sync,
+        uv_no_sync_source,
+        datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    )
+
     record = ClaudeWorkerRecord(
         issue_number=issue_number,
         branch=branch,
@@ -1276,6 +1311,8 @@ def launch_claude_worker(
         session_id=session_id,
         adapter_kind=adapter_kind,
         provider=provider,
+        xdist_cap=xdist_cap,
+        uv_no_sync=uv_no_sync,
     )
     return _write_record(sessions_dir, record)
 
@@ -1428,6 +1465,7 @@ def update_worker_record_with_failure_classification(
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
+    session_completed: bool = False,
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1446,6 +1484,24 @@ def update_worker_record_with_failure_classification(
     classified as such even when the caller only knows "this looked stalled"
     — otherwise ``throttled_until`` never gets set and dispatch keeps
     relaunching workers into the same limit.
+
+    ``session_completed`` (issue #656): when the caller has already confirmed
+    via worktree inspection that this session produced complete, committable
+    work, log-tail classification is skipped entirely and ``fallback_kind`` is
+    used directly. A session that finished real work cannot also have been
+    killed by a provider quota/rate-limit/auth failure — that's ground truth,
+    not a heuristic — so there is no need to search its log tail at all.
+    Without this, the marker search treats the worker's own final-turn
+    completion summary (ordinary Claude Code CLI behavior — nearly every
+    session ends with a natural-language write-up) as fair game, and generic
+    markers like "usage limit" / "rate limit" false-positive on legitimate
+    prose about this codebase's own rate-limit/quota domain. Observed live
+    2026-07-27: a rework session for issue #651 (the bug about this exact
+    false-positive class in the *reviewer* path, fixed by #652) quoted its own
+    fix's marker examples in its completion summary and was reclassified
+    quota_exhausted, setting a fleet-wide 24h dispatch throttle despite having
+    finished cleanly — the same failure mode #652 fixed for reviewers, just in
+    the sibling worker-classification path #652 didn't touch.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
@@ -1478,7 +1534,7 @@ def update_worker_record_with_failure_classification(
 
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path")
+    log_path_str = payload.get("log_path") if not session_completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers

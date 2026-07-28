@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
+from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
 from .state import StateLockBusy, load_state_locked, utc_now
@@ -1112,11 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args([arg for arg in raw_argv if arg != "--json"])
     args.json_output = json_output or args.json_output
 
-    logging.basicConfig(
-        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    configure_logging(verbose=getattr(args, "verbose", False))
     try:
         if args.command == "doctor":
             result = run_doctor_command(args)

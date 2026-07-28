@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
 from charlie_work.config import (
@@ -190,12 +191,7 @@ def test_launch_claude_worker_process_receives_prompt_via_stdin(
 
     # Wait for the fake claude subprocess (very fast: reads stdin, writes, exits).
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
-    assert marker_path.read_text(encoding="utf-8") == "prompt payload for stdin"
+    read_worker_marker(marker_path, expected="prompt payload for stdin")
 
 
 def test_launch_claude_worker_injects_worker_env(
@@ -239,13 +235,8 @@ def test_launch_claude_worker_injects_worker_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
     # Injected var present AND orchestrator env inherited (merge, not replace).
-    assert probe_path.read_text(encoding="utf-8") == "2|inherited-value"
+    read_worker_marker(probe_path, expected="2|inherited-value")
 
 
 def test_launch_claude_worker_worker_env_overrides_sanitize_env(
@@ -298,13 +289,119 @@ def test_launch_claude_worker_worker_env_overrides_sanitize_env(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
     # worker_env VIRTUAL_ENV override wins over sanitize_env's stripping
-    assert probe_path.read_text(encoding="utf-8") == "/custom/override/venv"
+    read_worker_marker(probe_path, expected="/custom/override/venv")
+
+
+def test_launch_claude_worker_records_default_xdist_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #646: with no ambient/config cap, the sidecar records the safe default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+
+    record = launch_claude_worker(
+        141,
+        "agent/issue-141-default-cap",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert record.ok
+    assert record.xdist_cap == "2"
+    assert record.uv_no_sync is None  # no .venv in this fake worktree
+
+    payload = json.loads((sessions_dir / "issue-141.claude.json").read_text(encoding="utf-8"))
+    assert payload["xdist_cap"] == "2"
+    assert payload["uv_no_sync"] is None
+
+
+def test_launch_claude_worker_worker_env_pytest_cap_override_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #646: an explicit worker_env cap must win over the ambient env and default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "6")
+
+    record = launch_claude_worker(
+        142,
+        "agent/issue-142-cap-override",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "UV_NO_SYNC": "0"},
+    )
+
+    assert record.ok
+    assert record.xdist_cap == "1"
+    assert record.uv_no_sync == "0"
+
+
+def test_log_worker_census_emits_alive_worker_with_cap(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #646: the per-pass census must actually surface a real alive worker.
+
+    Regression guard against a census that only ever exercises the empty-
+    sessions-dir path (n_alive=0): writes a real sidecar for a genuinely
+    live process (matching pid + process_start_time, like production
+    sidecars) and asserts the emitted INFO line names its worktree, pid,
+    and resolved xdist_cap -- proving `cap` is populated end-to-end rather
+    than silently `None`.
+    """
+    from charlie_work.claude_code import _get_process_start_time
+    from charlie_work.workflow import _log_worker_census
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        start_time = _get_process_start_time(process.pid)
+        assert start_time is not None
+
+        record = ClaudeWorkerRecord(
+            issue_number=646,
+            branch="agent/issue-646-census",
+            worktree_path=str(tmp_path / "worktrees" / "issue-646-census"),
+            prompt_path="p.md",
+            command=("x",),
+            pid=process.pid,
+            started_at="2026-01-01T00:00:00Z",
+            log_path="log.txt",
+            process_start_time=start_time,
+            xdist_cap="2",
+        )
+        (sessions_dir / "issue-646.claude.json").write_text(
+            json.dumps(record.to_dict()), encoding="utf-8"
+        )
+
+        with caplog.at_level("INFO", logger="charlie_work.workflow"):
+            _log_worker_census(sessions_dir)
+
+        [census_record] = [r for r in caplog.records if "worker census" in r.message]
+        assert "n_alive=1" in census_record.message
+        assert f"pid={process.pid}" in census_record.message
+        assert "worktree=" in census_record.message and "issue-646-census" in census_record.message
+        assert "cap=2" in census_record.message
+    finally:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
@@ -344,12 +441,7 @@ def test_launch_claude_worker_prompt_path_placeholder_skips_stdin(
 
     worktree_path = Path(record.worktree_path)
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
-    assert marker_path.read_text(encoding="utf-8") == "prompt payload for argv"
+    read_worker_marker(marker_path, expected="prompt payload for argv")
 
 
 def test_launch_claude_worker_missing_binary_returns_error_record(
@@ -1162,6 +1254,59 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
     expected = now + timedelta(minutes=5, seconds=90)
     assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_update_worker_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Reproduces the live incident: a worker's completion summary quoted the
+    throttle-marker text ("usage limit") while describing an unrelated fix,
+    and log-tail classification stomped the caller's ``fallback_kind`` with
+    ``quota_exhausted`` despite the worktree proving the work completed.
+    ``session_completed=True`` must skip log-tail classification entirely.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["claude", "-p"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Completion summary prose that happens to quote a throttle marker while
+    # describing an unrelated fix -- not an actual provider death message.
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n"
+        "- `ruff check` + `ruff format`: clean\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
 
 
 def _make_worker_sidecar(sessions_dir: Path, issue_number: int, log_path: Path) -> Path:
@@ -2024,9 +2169,7 @@ def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
+    read_worker_marker(probe_path)
 
 
 def test_launch_sanitizes_with_worktree_venv(
@@ -2082,15 +2225,10 @@ def test_launch_sanitizes_with_worktree_venv(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent
-    assert received == f"{str(worktree_venv)}|<unset>", (
-        f"VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected=f"{str(worktree_venv)}|<unset>",
+        reason="VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent",
     )
 
 
@@ -2140,15 +2278,10 @@ def test_launch_preserves_worker_env_override(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # User-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped
-    assert received == "/custom/.venv|<unset>|custom-value", (
-        f"User VIRTUAL_ENV override must win, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="/custom/.venv|<unset>|custom-value",
+        reason="user-provided VIRTUAL_ENV must win, UV_PROJECT_ENVIRONMENT must be dropped",
     )
 
 
@@ -2210,15 +2343,13 @@ def test_launch_override_precedence_with_worktree_venv(
 
     assert record.ok
     probe_path = Path(record.worktree_path) / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # User-provided VIRTUAL_ENV must win over worktree .venv (merge order: sanitizer first, then user overrides)
-    assert received == "/custom/.venv|<unset>|custom-value", (
-        f"User VIRTUAL_ENV override must win over worktree .venv, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="/custom/.venv|<unset>|custom-value",
+        reason=(
+            "user-provided VIRTUAL_ENV must win over worktree .venv "
+            "(merge order: sanitizer first, then user overrides)"
+        ),
     )
 
 
@@ -2275,15 +2406,10 @@ def test_launch_sanitizes_environment_with_prompt_path(
 
     worktree_path = Path(record.worktree_path)
     probe_path = worktree_path / "env-received.txt"
-    deadline = time.time() + 10
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    received = probe_path.read_text(encoding="utf-8")
-    # VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped (no worktree .venv)
-    assert received == "<unset>|<unset>", (
-        f"VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped, got: {received}"
+    read_worker_marker(
+        probe_path,
+        expected="<unset>|<unset>",
+        reason="VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be dropped (no worktree .venv)",
     )
 
 
@@ -2554,13 +2680,9 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     assert record.ok
     worktree_path = Path(record.worktree_path)
 
-    # Wait for the worker to complete
+    # Wait for the worker to complete (content, not just the path appearing).
     marker_path = worktree_path / "worker-ran.txt"
-    deadline = time.time() + 10
-    while not marker_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert marker_path.exists()
+    read_worker_marker(marker_path)
 
     # Give the tee thread a moment to finish writing
     time.sleep(0.2)

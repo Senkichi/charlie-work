@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _worker_marker_wait import read_worker_marker
 
 from charlie_work import devin_shell
 from charlie_work.config import DevinConfig, OrchestratorConfig, RuntimeConfig
@@ -302,6 +303,66 @@ def test_launch_devin_session_worker_env_overrides_sanitize_env(
     log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
     # worker_env VIRTUAL_ENV override wins over sanitize_env's stripping
     assert log_text == "/custom/override/venv"
+
+
+def test_launch_devin_session_records_default_xdist_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: with no ambient/config cap, the sidecar records the safe default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("UV_NO_SYNC", raising=False)
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        141,
+        "agent/issue-141-default-cap",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "2"
+    assert record.uv_no_sync is None  # no .venv in this fake worktree
+
+    payload = json.loads((sessions_dir / "issue-141.json").read_text(encoding="utf-8"))
+    assert payload["xdist_cap"] == "2"
+    assert payload["uv_no_sync"] is None
+
+
+def test_launch_devin_session_worker_env_pytest_cap_override_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #646: an explicit worker_env cap must win over the ambient env and default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("do the thing", encoding="utf-8")
+    _install_fake_create_worktree(monkeypatch, tmp_path, with_venv=True)
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "6")
+
+    exit_script = _write_fake_devin(tmp_path, "import sys\nsys.exit(0)\n")
+    record = launch_devin_session(
+        142,
+        "agent/issue-142-cap-override",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(exit_script)),
+        worker_env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "UV_NO_SYNC": "0"},
+    )
+
+    assert record.error is None
+    assert record.xdist_cap == "1"
+    assert record.uv_no_sync == "0"
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1308,121 @@ def test_sanitize_env_preserves_other_env_vars(
     assert "VIRTUAL_ENV" not in env, "VIRTUAL_ENV must be dropped"
 
 
+def test_sanitize_env_drops_github_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sanitize_env must drop GH_TOKEN and GITHUB_TOKEN so workers do not inherit the orchestrator's admin token (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("GH_TOKEN", "admin-orchestrator-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "admin-orchestrator-token")
+
+    env = sanitize_env(worktree_path)
+
+    assert "GH_TOKEN" not in env, "GH_TOKEN must be dropped"
+    assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must be dropped"
+
+
+def test_sanitize_env_drops_enterprise_github_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sanitize_env must drop GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN so a worker cannot fall back on a GHES credential to merge (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "ghes-admin-token")
+    monkeypatch.setenv("GITHUB_ENTERPRISE_TOKEN", "ghes-admin-token")
+
+    env = sanitize_env(worktree_path)
+
+    assert "GH_ENTERPRISE_TOKEN" not in env, "GH_ENTERPRISE_TOKEN must be dropped"
+    assert "GITHUB_ENTERPRISE_TOKEN" not in env, "GITHUB_ENTERPRISE_TOKEN must be dropped"
+
+
+def test_sanitize_env_isolates_gh_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sanitize_env must point GH_CONFIG_DIR at a worktree-local empty directory so gh cannot use the orchestrator's stored credentials (issue #502)."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    # Simulate the orchestrator having a live gh login.
+    orchestrator_config_dir = tmp_path / "orchestrator-gh-config"
+    orchestrator_config_dir.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(orchestrator_config_dir))
+
+    env = sanitize_env(worktree_path)
+
+    expected_gh_config_dir = worktree_path / ".var" / "gh-config"
+    assert env.get("GH_CONFIG_DIR") == str(expected_gh_config_dir), (
+        f"GH_CONFIG_DIR must be isolated to the worktree, got {env.get('GH_CONFIG_DIR')!r}"
+    )
+    assert expected_gh_config_dir.is_dir(), "isolated gh config directory must be created"
+    # The orchestrator's stored credential directory must not leak.
+    assert env.get("GH_CONFIG_DIR") != str(orchestrator_config_dir)
+
+
+def test_sanitize_env_leaves_no_channel_for_orchestrator_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credential isolation must not be a no-op: no orchestrator credential
+    material may reach the worker through ANY environment channel (issue #502).
+
+    The sibling tests above enumerate the four token variable names and the
+    config-dir override. That is a checklist, and a checklist cannot show the
+    control has teeth — a fifth channel, or a token smuggled in an unrelated
+    variable, passes every one of them. This test asserts the invariant
+    instead: given an orchestrator whose ``gh`` credential store is genuinely
+    populated, the secret string must appear in no value of the sanitized
+    environment, and the directory ``gh`` is pointed at must contain no
+    ``hosts.yml`` for it to read. Those are the two mechanisms by which ``gh``
+    resolves an identity, so together they are what makes ``gh pr merge``
+    impossible for a worker rather than merely inconvenient.
+
+    Deliberately hermetic: it does not shell out to ``gh``. A live
+    ``gh auth status`` probe would depend on the runner having ``gh`` installed
+    and on CI not injecting its own ``GH_TOKEN`` — it would pass here and be
+    meaningless or flaky there.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    secret = "ghp_orchestrator_admin_secret_do_not_leak"
+
+    # A real, populated gh credential store for the orchestrator.
+    orchestrator_config_dir = tmp_path / "orchestrator-gh-config"
+    orchestrator_config_dir.mkdir()
+    (orchestrator_config_dir / "hosts.yml").write_text(
+        f"github.com:\n    oauth_token: {secret}\n    user: orchestrator\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GH_CONFIG_DIR", str(orchestrator_config_dir))
+    monkeypatch.setenv("GH_TOKEN", secret)
+    monkeypatch.setenv("GITHUB_TOKEN", secret)
+    monkeypatch.setenv("GH_ENTERPRISE_TOKEN", secret)
+    monkeypatch.setenv("GITHUB_ENTERPRISE_TOKEN", secret)
+
+    env = sanitize_env(worktree_path)
+
+    # Channel 1: environment. The secret must survive in no value, whatever
+    # the variable happens to be called.
+    leaked = sorted(name for name, value in env.items() if secret in str(value))
+    assert leaked == [], f"orchestrator credential leaked via env var(s): {leaked}"
+
+    # Channel 2: gh's stored-credential file. The worker's config dir must
+    # exist (so gh does not fall back to the platform default) and must hold
+    # no hosts.yml for gh to authenticate from.
+    worker_config_dir = Path(env["GH_CONFIG_DIR"])
+    assert worker_config_dir.is_dir()
+    assert not (worker_config_dir / "hosts.yml").exists(), (
+        "worker gh config dir must not contain a credential store"
+    )
+    assert list(worker_config_dir.iterdir()) == [], (
+        f"worker gh config dir must be empty, found {list(worker_config_dir.iterdir())}"
+    )
+    # And it must not simply be the orchestrator's directory under a new name.
+    assert worker_config_dir.resolve() != orchestrator_config_dir.resolve()
+
+
 def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """launch_devin_session must sanitize the environment before spawning the worker."""
     repo_root = tmp_path / "repo"
@@ -1290,6 +1466,64 @@ def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert log_text == "UNSET", (
         f"Worker inherited VIRTUAL_ENV={log_text!r}, expected UNSET (sanitized)"
+    )
+
+
+def test_launch_passes_operator_scoped_gh_token_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator-supplied scoped GH_TOKEN must reach the worker (issue #502).
+
+    Stripping the orchestrator's token is only half the contract. The documented
+    escape hatch is ``devin.worker_env``/``claude_code.worker_env``, which is
+    merged AFTER sanitize_env precisely so a scoped PAT wins. If that merge order
+    ever inverted, sanitization would silently eat the operator's token and every
+    worker would lose ``gh`` entirely — an availability failure that the
+    token-stripping tests above would still report as a pass. This asserts the
+    happy path end to end: the spawned process really does see the scoped value.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    env_script = tmp_path / "echo_gh_token.py"
+    env_script.write_text(
+        "import os, sys\n"
+        "sys.stdout.write(os.environ.get('GH_TOKEN', 'UNSET') + '\\n')\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # The orchestrator's own admin token is present and must NOT be what wins.
+    monkeypatch.setenv("GH_TOKEN", "admin-orchestrator-token")
+
+    record = launch_devin_session(
+        56,
+        "agent/issue-56-test",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+        worker_env={"GH_TOKEN": "scoped-worker-pat"},
+    )
+
+    assert record.error is None
+    assert record.pid is not None
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text = Path(record.log_path).read_text(encoding="utf-8")
+        if log_text.strip():
+            break
+        time.sleep(0.05)
+    log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
+
+    assert log_text == "scoped-worker-pat", (
+        f"worker_env GH_TOKEN must survive sanitization, worker saw {log_text!r}"
     )
 
 
@@ -1590,6 +1824,52 @@ def test_update_session_record_with_failure_classification_includes_resume_margi
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
     expected = now + timedelta(minutes=5, seconds=90)
     assert abs((parsed - expected).total_seconds()) < 1
+
+
+def test_update_session_record_with_failure_classification_session_completed_skips_log_tail(
+    tmp_path: Path,
+) -> None:
+    """Issue #656: a completed session's own prose must not be reclassified quota_exhausted.
+
+    Sibling of the claude_code.py regression test -- same fix, devin adapter.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "branch": "agent/issue-42",
+                "worktree_path": "/tmp/wt/issue-42",
+                "prompt_path": "p.md",
+                "command": ["devin", "--print"],
+                "pid": 1234,
+                "started_at": "2026-01-01T00:00:00Z",
+                "log_path": str(sessions_dir / "issue-42.log"),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        '## Summary\n\nFixed generic substrings ("rate limit", "usage limit") that '
+        "legitimately appear in this codebase's rate-limit/quota domain commentary.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_session_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="unpublished_work", session_completed=True
+    )
+
+    assert failure_kind == "unpublished_work"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "unpublished_work"
 
 
 def test_update_session_record_skips_already_classified(tmp_path: Path) -> None:
@@ -2182,14 +2462,9 @@ def test_launch_devin_session_injects_worker_env(
     assert record.error is None
     assert record.pid is not None
 
-    # Wait for the subprocess to complete
-    deadline = time.time() + 10
+    # Wait for the subprocess to finish WRITING, not merely to create the file.
     probe_path = Path(record.worktree_path) / "env-probe.txt"
-    while not probe_path.exists() and time.time() < deadline:
-        time.sleep(0.05)
-
-    assert probe_path.exists()
-    assert probe_path.read_text(encoding="utf-8") == "test-value"
+    read_worker_marker(probe_path, expected="test-value")
 
 
 def test_launch_devin_session_passes_materialize_dirs_to_create_worktree(

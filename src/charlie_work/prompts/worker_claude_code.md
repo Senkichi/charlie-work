@@ -23,6 +23,8 @@ $issue_body
 
 $section_scope_contract
 
+$section_no_merge_contract
+
 $section_api_shape_validation
 
 $section_parallel_investigation
