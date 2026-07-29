@@ -5462,3 +5462,60 @@ def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
     assert not result.data["orphans"]["failed"]
     assert any(e["type"] == "worktree_list_failed" for e in result.data["attention_events"])
     assert result.ok is False
+
+
+# --- issue #659: git argv validation (defense-in-depth) -----------------------
+
+
+def test_create_worktree_rejects_flag_like_branch(tmp_path: Path) -> None:
+    """A flag-like branch name must raise before reaching any git argv."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree branch"):
+        create_worktree(repo_root, "--exec=foo", base_ref="HEAD")
+
+
+def test_create_worktree_rejects_rev_syntax_branch(tmp_path: Path) -> None:
+    """A branch name with rev-syntax metacharacters must raise."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree branch"):
+        create_worktree(repo_root, "foo~bar", base_ref="HEAD")
+
+
+def test_create_worktree_rejects_flag_like_base_ref(tmp_path: Path) -> None:
+    """A flag-like base_ref must raise before reaching any git argv."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree base_ref"):
+        create_worktree(repo_root, "agent/issue-1-fix", base_ref="--upload-pack=evil")
+
+
+def test_create_worktree_accepts_empty_base_ref(tmp_path: Path) -> None:
+    """Empty base_ref (auto-resolve sentinel) must pass validation."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    info = create_worktree(repo_root, "agent/issue-659-valid", base_ref="")
+    assert info.path.exists()
+
+
+def test_create_review_checkout_rejects_flag_like_head_sha(tmp_path: Path) -> None:
+    """A flag-like head_sha must raise before reaching ``git fetch``/``worktree add``."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_review_checkout head_sha"):
+        create_review_checkout(repo_root, 1, "--exec=foo", reviews_dir=tmp_path / "reviews")
+
+
+def test_create_review_checkout_rejects_non_hex_head_sha(tmp_path: Path) -> None:
+    """A non-hex head_sha must raise (format check, not just flags)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_review_checkout head_sha"):
+        create_review_checkout(repo_root, 1, "not-a-sha!", reviews_dir=tmp_path / "reviews")

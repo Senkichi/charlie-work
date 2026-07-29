@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
 from charlie_work.github import linked_issue_number
+from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import (
     hidden_console_kwargs,
     no_console_window_kwargs,
@@ -591,6 +592,9 @@ def _check_no_op_rework(
             # Enrich with unpushed-commit count if worktree exists
             head_ref = pr.get("headRefName")
             if head_ref:
+                head_ref = require_valid_ref_name(
+                    head_ref, context="_check_no_op_rework head_ref (patch-id)"
+                )
                 unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
                 if unpushed_info:
                     failure_msg += f"; {unpushed_info}"
@@ -611,10 +615,20 @@ def _check_no_op_rework(
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:
         return False
+    # Validate before it reaches any git argv: reviewed_head_sha comes from
+    # persisted state.json, which can diverge or be hand-edited over a long
+    # lifetime (issue #659). The ^ prefix in the rev-list arg currently
+    # prevents flag parsing, but this guard keeps that true after refactors.
+    reviewed_head_sha = require_valid_sha(
+        reviewed_head_sha, context="_check_no_op_rework reviewed_head_sha"
+    )
 
     current_head_sha = pr.get("headRefOid")
     if not current_head_sha:
         return False
+    current_head_sha = require_valid_sha(
+        current_head_sha, context="_check_no_op_rework current_head_sha"
+    )
 
     # If heads match exactly, it's a no-op rework
     if current_head_sha == reviewed_head_sha:
@@ -626,6 +640,9 @@ def _check_no_op_rework(
         # Enrich with unpushed-commit count if worktree exists
         head_ref = pr.get("headRefName")
         if head_ref:
+            head_ref = require_valid_ref_name(
+                head_ref, context="_check_no_op_rework head_ref (sha-match)"
+            )
             unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
             if unpushed_info:
                 failure_msg += f"; {unpushed_info}"
@@ -645,6 +662,16 @@ def _check_no_op_rework(
         # Can't check merge-only case without ref name; fall back to SHA equality check
         # (which already passed above, so no failure here)
         return False
+    # Validate ref names before they reach git argv (issue #659): head_ref is
+    # passed as a plain positional to ``git fetch origin``, so a flag-like
+    # value would be parsed as an option without this guard.
+    head_ref = require_valid_ref_name(
+        head_ref, context="_check_no_op_rework head_ref (merge-only)"
+    )
+    if base_ref:
+        base_ref = require_valid_ref_name(
+            base_ref, context="_check_no_op_rework base_ref (merge-only)"
+        )
 
     try:
         # Fetch both the PR head ref and base ref from origin

@@ -2724,3 +2724,87 @@ index 0000000..1234567
 
     assert verdict.ok is True
     assert any("test_pass_stub" in w for w in verdict.warnings)
+
+
+# --- issue #659: git argv validation (defense-in-depth) -----------------------
+#
+# These tests verify that _check_no_op_rework rejects flag-like or malformed
+# SHA/ref values *before* they reach any subprocess argv, rather than relying
+# on git's own ref/SHA naming rules or the incidental ``^`` prefix protection.
+
+
+def test_no_op_rework_rejects_flag_like_reviewed_head_sha() -> None:
+    """A flag-like reviewed_head_sha from persisted state.json must raise."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "--exec=foo",
+    }
+
+    with pytest.raises(ValueError, match="reviewed_head_sha"):
+        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+
+def test_no_op_rework_rejects_non_hex_reviewed_head_sha() -> None:
+    """A non-hex reviewed_head_sha must raise (format check, not just flags)."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "not-a-sha!",
+    }
+
+    with pytest.raises(ValueError, match="reviewed_head_sha"):
+        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+
+def test_no_op_rework_rejects_flag_like_current_head_sha() -> None:
+    """A flag-like headRefOid (fresh API) must raise before reaching argv."""
+    pr = _green_pr(headRefOid="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    with pytest.raises(ValueError, match="current_head_sha"):
+        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+
+def test_no_op_rework_rejects_flag_like_head_ref() -> None:
+    """A flag-like headRefName must raise before reaching ``git fetch origin``."""
+    pr = _green_pr(headRefOid="def456", headRefName="--exec=foo")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    with pytest.raises(ValueError, match="head_ref"):
+        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+
+def test_no_op_rework_rejects_flag_like_base_ref() -> None:
+    """A flag-like baseRefName must raise before reaching ``git fetch origin``."""
+    pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="--exec=bar")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    with pytest.raises(ValueError, match="base_ref"):
+        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+
+def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
+    """Valid SHA and ref-name values pass validation and reach the normal path."""
+    pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="main")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    # Heads differ and no real git repo at cwd — the merge-only check will
+    # fail gracefully (subprocess error → warning), but validation must pass.
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    # No ValueError raised — that's the assertion. The verdict itself may be
+    # ok or not depending on other gates, but the validation boundary held.
+    assert isinstance(verdict, JanitorVerdict)
