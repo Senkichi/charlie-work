@@ -12935,10 +12935,10 @@ def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path
         )
 
 
-def test_find_repo_root_explicit_respects_show_toplevel(tmp_path: Path) -> None:
-    """An explicit --repo is the operator's deliberate choice: find_repo_root
-    honors --show-toplevel for that path rather than re-resolving the shared
-    root, so pointing --repo at the main checkout still returns the main root."""
+def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path) -> None:
+    """An explicit --repo pointing at the main checkout returns the main root.
+    The shared-root resolution returns None in the main worktree (where
+    --git-dir == --git-common-dir), so --show-toplevel is used and is correct."""
     from charlie_work.paths import find_repo_root
 
     repo_root = tmp_path / "repo"
@@ -12947,10 +12947,99 @@ def test_find_repo_root_explicit_respects_show_toplevel(tmp_path: Path) -> None:
     assert resolved == repo_root.resolve()
 
 
+def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Path) -> None:
+    """Issue #648 review: an explicit --repo pointing at a linked worktree must
+    also resolve to the shared main root, not the linked worktree's own
+    toplevel.  The orchestrator's state is shared — there is no per-worktree
+    state directory — so --repo <linked-worktree> would silently target a
+    phantom state dir without this."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    branch = "agent/issue-648-explicit"
+    linked_wt = tmp_path / "wt-explicit"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(linked_wt, explicit=True)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648 review: find_repo_root from a *subdirectory* of a linked
+    worktree must still resolve to the shared main root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    linked_wt = tmp_path / "wt-subdir"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "agent/issue-648-subdir", str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subdir = linked_wt / "src" / "deep"
+    subdir.mkdir(parents=True)
+    try:
+        resolved = find_repo_root(subdir)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_separate_git_dir_main_worktree(tmp_path: Path) -> None:
+    """Issue #648 review MAJOR 1: a --separate-git-dir repo's main worktree
+    must resolve to the *working tree* root (where the code lives), not the
+    external git dir's container.  The shared-root resolution detects the main
+    worktree (--git-dir == --git-common-dir) and returns None, so
+    --show-toplevel is used and returns the working tree root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    external_git = tmp_path / "external" / ".git"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    external_git.parent.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", f"--separate-git-dir={external_git}", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+    # The external dir's parent must NOT be returned as the repo root.
+    resolved = find_repo_root(repo_root)
+    assert resolved == repo_root.resolve()
+    assert resolved != external_git.parent.resolve()
+
+
 def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -> None:
-    """Issue #648: a state dir that exists but has no state.json is a phantom
-    signal — runtime_paths must warn (non-blocking) so the operator notices
-    instead of seeing a silent 'all clear'."""
+    """Issue #648: a state dir that exists with sibling artifacts but no
+    state.json is a phantom signal — runtime_paths must warn (non-blocking)
+    so the operator notices instead of seeing a silent 'all clear'."""
     from charlie_work.paths import runtime_paths
 
     state_dir = tmp_path / ".var" / "charlie-work"
@@ -12962,7 +13051,45 @@ def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -
     with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
         runtime_paths(tmp_path, ".var/charlie-work")
 
-    assert any("phantom" in record.message for record in caplog.records)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(state_dir.resolve()) in warnings[0].message
+    assert "state.json" in warnings[0].message
+
+
+def test_runtime_paths_silent_without_sibling_artifacts(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648 review MINOR: a state dir that exists but has no state.json
+    AND no sibling artifacts (events.db, state.json.lock) must NOT warn — it
+    could be a pre-existing directory used for an unrelated purpose, not a
+    phantom left by a misresolved invocation."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # No sibling artifacts — just an empty dir.
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_no_warn_for_absolute_unrelated_state_dir(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """Issue #648 review MINOR: an absolute state_dir pointing at a
+    pre-existing directory without sibling artifacts must not trigger the
+    phantom warning."""
+    from charlie_work.paths import runtime_paths
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "some-file.txt").write_text("data", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, str(unrelated))
+
+    assert not caplog.records
 
 
 def test_runtime_paths_silent_when_state_dir_absent(tmp_path: Path, caplog: Any) -> None:
