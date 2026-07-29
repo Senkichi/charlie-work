@@ -516,6 +516,28 @@ def test_plan_defers_demotion_while_nobody_is_waiting() -> None:
 
 
 def test_plan_demotes_once_the_slack_streak_matures() -> None:
+    """A mature streak still parks when the budget is already fully used."""
+    instances = _instances({CW: [("cw-1", True, False), ("cw-2", True, False)]})
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW)},
+        budget=2,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
+    parks = [c for c in plan.changes if c.action is SlotAction.PARK]
+    assert [c.runner_name for c in parks] == ["cw-2"]
+
+
+def test_plan_holds_mature_slack_when_budget_undersubscribed() -> None:
+    """Mature streaks must not park idle slots when the budget has spare room.
+
+    Reproduced from issue #628: a host with budget to spare should not bounce
+    the same listeners through park/restore cycles, because the restore latency
+    costs real CI time while the parked slots were not displacing any work.
+    """
     instances = _instances({CW: [("cw-1", True, False), ("cw-2", True, False)]})
     plan = plan_allocation(
         instances,
@@ -526,8 +548,82 @@ def test_plan_demotes_once_the_slack_streak_matures() -> None:
         idle_streaks={CW: 3},
         demand_idle_samples=3,
     )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    assert any(
+        "budget undersubscribed" in note and "no repo is waiting" in note for note in plan.notes
+    )
+
+
+def test_plan_does_not_displace_idle_slots_when_pending_starts_fit() -> None:
+    """A repo that can start its own runners using spare budget should not force
+    an idle repo to park first. Issue #628: the budget-undersubscribed guard
+    must not turn into a hard floor when another repo is merely ramping up.
+    """
+    instances = _instances(
+        {
+            CW: [
+                ("cw-1", True, False),
+                ("cw-2", True, False),
+                ("cw-3", True, False),
+                ("cw-4", True, False),
+            ],
+            JC: [
+                ("jc-1", True, False),
+                ("jc-2", False, False),
+                ("jc-3", False, False),
+                ("jc-4", False, False),
+            ],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW), JC: RepoDemand(JC, queued_jobs=4)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    starts = [c for c in plan.changes if c.action is SlotAction.START]
+    assert [c.runner_name for c in starts] == ["jc-2", "jc-3", "jc-4"]
+    assert not any("above the" in note and "budget" in note for note in plan.notes)
+    assert any("budget undersubscribed" in note for note in plan.notes)
+
+
+def test_plan_demotes_when_pending_starts_would_exceed_budget() -> None:
+    """If pending starts do not fit in the spare budget, the surplus must still
+    be reclaimed so the host stays within its configured ceiling."""
+    instances = _instances(
+        {
+            CW: [
+                ("cw-1", True, False),
+                ("cw-2", True, False),
+                ("cw-3", True, False),
+                ("cw-4", True, False),
+                ("cw-5", True, False),
+            ],
+            JC: [
+                ("jc-1", True, False),
+                ("jc-2", False, False),
+                ("jc-3", False, False),
+                ("jc-4", False, False),
+            ],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW), JC: RepoDemand(JC, queued_jobs=4)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
     parks = [c for c in plan.changes if c.action is SlotAction.PARK]
-    assert [c.runner_name for c in parks] == ["cw-2"]
+    assert [c.runner_name for c in parks] == ["cw-5", "cw-4", "cw-3", "cw-2"]
+    starts = [c for c in plan.changes if c.action is SlotAction.START]
+    assert [c.runner_name for c in starts] == ["jc-2", "jc-3", "jc-4"]
 
 
 def test_plan_reclaims_immediately_when_another_repo_is_waiting() -> None:

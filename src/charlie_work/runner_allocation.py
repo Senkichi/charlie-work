@@ -311,6 +311,11 @@ def plan_allocation(
     actively queuing would defeat the point; waiting before parking a slot
     nobody wants avoids pointless churn.
 
+    A mature slack streak is also left in place when the host's budget is
+    undersubscribed and all pending starts still fit within it, because
+    parking a slot only to restart it a few passes later wastes CI latency
+    for host resources that are not the binding constraint (issue #628).
+
     Slots executing jobs are never selected for parking, so a plan can be
     smaller than the target arithmetic implies; that gap is reported in notes.
     """
@@ -366,6 +371,15 @@ def plan_allocation(
         targets.get(repo, 0) < min(demand_values[repo], capacities[repo]) for repo in by_repo
     )
 
+    total_running = sum(running_counts.values())
+    pending_starts = sum(max(0, targets.get(repo, 0) - running_counts[repo]) for repo in by_repo)
+    post_without_parks = total_running + pending_starts
+    # A purely-idle surplus should not be parked while the budget is
+    # undersubscribed (current running plus all planned starts still fit),
+    # because parking then only saves host resources while a restore costs
+    # real CI latency. See issue #628.
+    budget_undersubscribed = total_running < budget and post_without_parks <= budget
+
     changes: list[SlotChange] = []
     target_records: list[RepoTarget] = []
 
@@ -418,12 +432,19 @@ def plan_allocation(
         if target < len(running):
             surplus = len(running) - target
             streak = idle_streaks.get(repo, 0)
-            if not contended and streak < demand_idle_samples:
-                notes.append(
-                    f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
-                    f"{demand_idle_samples} pass(es) and no repo is waiting"
-                )
-                held_by_hysteresis += surplus
+            if not contended and (streak < demand_idle_samples or budget_undersubscribed):
+                if streak < demand_idle_samples:
+                    notes.append(
+                        f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
+                        f"{demand_idle_samples} pass(es) and no repo is waiting"
+                    )
+                    held_by_hysteresis += surplus
+                else:
+                    notes.append(
+                        f"{repo}: holding {surplus} surplus slot(s) — "
+                        f"budget undersubscribed ({total_running}/{budget} running) "
+                        f"and no repo is waiting"
+                    )
                 continue
 
             reclaimable = sorted(
