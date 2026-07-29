@@ -12625,6 +12625,114 @@ def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> Non
         raise AssertionError("expected RepoNotFoundError")
 
 
+def _init_git_repo(repo_root: Path) -> None:
+    """Create a real non-bare git repo with one commit on ``main``."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648: with no --repo, find_repo_root() invoked from inside a
+    linked git worktree must resolve the *shared* (main) worktree root, not
+    the worktree's own toplevel — otherwise runtime state silently targets a
+    phantom, never-populated ``.var/charlie-work/`` directory."""
+    from charlie_work.paths import find_repo_root, runtime_paths
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    # Seed a real state dir under the main root so we can distinguish it.
+    main_state_dir = repo_root / ".var" / "charlie-work"
+    main_state_dir.mkdir(parents=True)
+    (main_state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    branch = "agent/issue-648-linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(tmp_path / "wt"), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(tmp_path / "wt")
+        # Must resolve to the main worktree root, not the linked worktree.
+        assert resolved == repo_root.resolve()
+        paths = runtime_paths(resolved, ".var/charlie-work")
+        assert paths.state_file.exists()
+        assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(tmp_path / "wt")],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_explicit_respects_show_toplevel(tmp_path: Path) -> None:
+    """An explicit --repo is the operator's deliberate choice: find_repo_root
+    honors --show-toplevel for that path rather than re-resolving the shared
+    root, so pointing --repo at the main checkout still returns the main root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    resolved = find_repo_root(repo_root, explicit=True)
+    assert resolved == repo_root.resolve()
+
+
+def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648: a state dir that exists but has no state.json is a phantom
+    signal — runtime_paths must warn (non-blocking) so the operator notices
+    instead of seeing a silent 'all clear'."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # Mimic the stray artifacts described in the issue.
+    (state_dir / "events.db").write_bytes(b"")
+    (state_dir / "state.json.lock").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert any("phantom" in record.message for record in caplog.records)
+
+
+def test_runtime_paths_silent_when_state_dir_absent(tmp_path: Path, caplog: Any) -> None:
+    """A genuine first run has not created the state dir yet at runtime_paths
+    call time — no phantom warning must fire."""
+    from charlie_work.paths import runtime_paths
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any) -> None:
+    """A populated state dir is the normal steady state — no warning."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
 
 
