@@ -23066,18 +23066,18 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # First request_changes (count = 1, head = "sha-1")
-    fake_gh.pr_head_shas[456] = "sha-1"
+    # First request_changes (count = 1)
+    fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
     app.record_review(456, "request_changes", summary="fix A")
 
-    # Second request_changes (count = 2, head = "sha-2")
-    fake_gh.pr_head_shas[456] = "sha-2"
+    # Second request_changes (count = 2)
+    fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
     app.record_review(456, "request_changes", summary="fix B")
 
-    # Third request_changes (escalated, head = "sha-3")
-    fake_gh.pr_head_shas[456] = "sha-3"
+    # Third request_changes (escalated)
+    fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
     app.record_review(456, "request_changes", summary="fix C")
 
@@ -23091,7 +23091,7 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     fake_gh.labels_removed.clear()
 
     # Simulate a worker pushing after escalation: new head and new diff
-    fake_gh.pr_head_shas[456] = "sha-new"
+    fake_gh.pr_head_shas[456] = "4444444444444444444444444444444444444444"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change new"
 
     result = app.review(456)
@@ -23126,18 +23126,18 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     # Cross-repo PRs never resolve to a linked issue for lifecycle purposes.
     fake_gh.prs[0]["isCrossRepository"] = True
 
-    # First request_changes (count = 1, head = "sha-1")
-    fake_gh.pr_head_shas[456] = "sha-1"
+    # First request_changes (count = 1)
+    fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
     app.record_review(456, "request_changes", summary="fix A")
 
-    # Second request_changes (count = 2, head = "sha-2")
-    fake_gh.pr_head_shas[456] = "sha-2"
+    # Second request_changes (count = 2)
+    fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
     app.record_review(456, "request_changes", summary="fix B")
 
-    # Third request_changes (escalated, head = "sha-3")
-    fake_gh.pr_head_shas[456] = "sha-3"
+    # Third request_changes (escalated)
+    fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
     result = app.record_review(456, "request_changes", summary="fix C")
     assert result.data["escalated"] is True
@@ -23155,7 +23155,7 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     fake_gh.labels_removed.clear()
 
     # Simulate a later loop/review pass with a new head and new diff.
-    fake_gh.pr_head_shas[456] = "sha-new"
+    fake_gh.pr_head_shas[456] = "4444444444444444444444444444444444444444"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+new change"
     review_result = app.review(456)
 
@@ -26746,19 +26746,19 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     monkeypatch.setattr(app, "record_review", _fake_record_review)
 
     # First review: hard-fail records request_changes
-    app.gh.pr_head_shas[456] = "sha-abc123"
+    app.gh.pr_head_shas[456] = "abc123abcdefabcdefabcdefabcdefabcdefabcd"
     result1 = app.review(456)
     assert check_calls["n"] == 1
     assert result1.ok is True
 
-    # Simulate state after first review: decision=request_changes, reviewed_head_sha=sha-abc123,
+    # Simulate state after first review: decision=request_changes,
     # and the rework_requested issue status the real record_review sets (the janitor gate's
     # pending-rework guard reads it).
     state = load_state(app.paths.state_file)
     if "456" not in state["prs"]:
         state["prs"]["456"] = {}
     state["prs"]["456"]["decision"] = "request_changes"
-    state["prs"]["456"]["reviewed_head_sha"] = "sha-abc123"
+    state["prs"]["456"]["reviewed_head_sha"] = "abc123abcdefabcdefabcdefabcdefabcdefabcd"
     state["issues"]["123"] = {
         **state["issues"].get("123", {}),
         "number": 123,
