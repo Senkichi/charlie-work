@@ -1595,6 +1595,12 @@ def _probe_recovery_liveness(
         # a worker whose probe is permanently broken is not stuck forever
         # (issue #426).
         errored_sources = [source for source in probe.sources if source.error is not None]
+        # Bind ``all_permanent`` once before the first ``errored_sources`` branch
+        # so the second guarded read below is provably bound to Pyright (issue
+        # #640). The default is never observed in a decision: both reads of
+        # ``all_permanent`` are guarded by ``if errored_sources:``, and a
+        # truthy ``errored_sources`` always rebinds it here first.
+        all_permanent = False
         if errored_sources:
             all_permanent = all(
                 _is_permanent_no_match_error(source.error) for source in errored_sources

@@ -30,7 +30,7 @@ import json
 from pathlib import Path
 
 from charlie_work import cli
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.labels import TransitionOutcome, transition
 from charlie_work.paths import runtime_paths
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
@@ -45,7 +45,18 @@ def _events(state, kind: str) -> list[dict]:
 
 
 def _app(tmp_path: Path) -> OrchestratorApp:
-    config = OrchestratorConfig()
+    # Isolate post_mortem.db_path from the real Devin sessions.db. The default
+    # (db_path="") resolves to %APPDATA%\devin\cli\sessions.db at read time;
+    # on a self-hosted CI runner that file exists with real session data, so
+    # issue_worker_liveness's real-activity probe could surface a stale
+    # timestamp for the test PID and flip the verdict from inconclusive-defer
+    # (live=True, refuse) to conclusive-stale (live=False, proceed) -- dropping
+    # the ``issue_worker_alive`` key the refusal branch sets. Pointing at a
+    # nonexistent path under tmp_path makes every probe source error out
+    # (inconclusive), which is the condition both #625 tests depend on.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     return OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -309,6 +320,83 @@ def test_unescalate_refuses_entirely_when_worker_session_alive(tmp_path: Path) -
     conflict/no-op attempt caps for a rework cycle still in flight and flip
     the PR to the passive reviewing status, inviting a concurrent review()
     against the worker's in-progress push.
+
+    Issue #625: "live" now means PID-alive AND not stalled. This test process
+    is the live worker; with no real activity sources for the test PID the
+    probe is inconclusive, so a FRESH dispatched_at (within the wall-clock
+    deadline) keeps the verdict deferred to live=True (refuse). The
+    wedged-but-alive case is covered by
+    ``test_unescalate_proceeds_when_worker_alive_but_wedged`` below.
+    """
+    import os
+    from datetime import UTC, datetime
+
+    app = _app(tmp_path)
+    fresh_dispatched_at = datetime.now(UTC).isoformat()
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": ["merge conflict"],
+            "conflict_rework_attempts": 1,
+            "conflict_rework_attempts_last_head": "sha-mid-cycle",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            # This test process itself is the "live worker": is_pid_alive
+            # passes for a real live pid when no start time is recorded.
+            "worker_pid": os.getpid(),
+            # Fresh timestamp: the inconclusive-activity probe defers to
+            # live=True only while the session is within the wall-clock
+            # deadline, so the refusal branch is exercised here.
+            "dispatched_at": fresh_dispatched_at,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(456, None, dry_run=False)
+
+    assert result.ok is True
+    assert result.data["issue_worker_alive"] is True
+    assert result.data["changed"] is False
+    # Issue #625 direction 4: the refusal must be diagnosable.
+    assert result.data["issue_worker_source"] == "state"
+    assert result.data["issue_worker_pid"] == os.getpid()
+    assert result.data["issue_worker_session_started_at"] is not None
+    assert "inconclusive" in result.message
+    assert app.gh.labels_added == []
+    assert app.gh.labels_removed == []
+
+    state = load_state(app.paths.state_file)
+    issue = state["issues"]["123"]
+    assert issue["status"] == "dispatched"
+    assert issue["worker_pid"] == os.getpid()
+    assert issue["dispatched_at"] == fresh_dispatched_at
+    # PR side untouched too: mid-epoch attempt caps and janitor caches must
+    # survive, or the anti-infinite-loop bound resets around a live worker.
+    pr = state["prs"]["456"]
+    assert pr["status"] == "janitor_blocked"
+    assert pr["conflict_rework_attempts"] == 1
+    assert pr["conflict_rework_attempts_last_head"] == "sha-mid-cycle"
+    assert pr["janitor_failures"] == ["merge conflict"]
+
+
+def test_unescalate_proceeds_when_worker_alive_but_wedged(tmp_path: Path) -> None:
+    """Issue #625 regression: a worker process that finishes its work but
+    never exits held its slot forever and blocked ``charlie unescalate``
+    indefinitely, because the state-side check asked only "is the PID alive?"
+    with no staleness bound. The session's sidecar had been reaped, so the
+    watchdog (which knows how to time it out) never saw it; only the
+    timeout-less state-side check remained.
+
+    Now both checks route through ``issue_worker_liveness``: an alive PID
+    whose session is past the wall-clock deadline with no fresh activity is
+    wedged, not live, so unescalate proceeds and re-arms the record. This
+    test uses the test process as the alive PID with a stale dispatched_at
+    and no sidecar, mirroring the observed job-cannon #1268/#1392 wedge.
     """
     import os
 
@@ -327,33 +415,29 @@ def test_unescalate_refuses_entirely_when_worker_session_alive(tmp_path: Path) -
         state["issues"]["123"] = {
             "number": 123,
             "status": "dispatched",
-            # This test process itself is the "live worker": is_pid_alive
-            # passes for a real live pid when no start time is recorded.
+            # The test process is alive, but the session is days old -- past
+            # the wall-clock deadline and with no activity source for the
+            # test PID, the probe is inconclusive and the wall-clock backstop
+            # classifies it as wedged.
             "worker_pid": os.getpid(),
-            "dispatched_at": "2026-07-24T00:00:00+00:00",
+            "dispatched_at": "2026-07-23T19:44:05+00:00",
         }
         save_state(app.paths.state_file, state)
 
     result = app.unescalate(456, None, dry_run=False)
 
     assert result.ok is True
-    assert result.data["issue_worker_alive"] is True
-    assert result.data["changed"] is False
-    assert app.gh.labels_added == []
-    assert app.gh.labels_removed == []
-
+    # The wedged worker no longer blocks unescalate: the record is re-armed.
+    assert result.data["changed"] is True
+    assert result.data.get("issue_worker_alive") is not True
     state = load_state(app.paths.state_file)
-    issue = state["issues"]["123"]
-    assert issue["status"] == "dispatched"
-    assert issue["worker_pid"] == os.getpid()
-    assert issue["dispatched_at"] == "2026-07-24T00:00:00+00:00"
-    # PR side untouched too: mid-epoch attempt caps and janitor caches must
-    # survive, or the anti-infinite-loop bound resets around a live worker.
     pr = state["prs"]["456"]
-    assert pr["status"] == "janitor_blocked"
-    assert pr["conflict_rework_attempts"] == 1
-    assert pr["conflict_rework_attempts_last_head"] == "sha-mid-cycle"
-    assert pr["janitor_failures"] == ["merge conflict"]
+    assert pr["status"] == PASSIVE_OPEN_STATUS
+    issue = state["issues"]["123"]
+    assert issue["status"] == PASSIVE_OPEN_STATUS
+    # The wedged worker_pid / dispatched_at are cleared on re-arm.
+    assert "worker_pid" not in issue
+    assert "dispatched_at" not in issue
 
 
 def test_unescalate_concurrent_writer_fields_survive_the_write(tmp_path: Path) -> None:

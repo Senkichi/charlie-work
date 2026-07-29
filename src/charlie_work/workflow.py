@@ -130,7 +130,7 @@ from .state import (
     without_review_dispatch_claim,
 )
 from .instrumentation import correlation_context, log_event, record_loop_pass
-from .throttle_signatures import match_throttle_tail
+from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
@@ -2063,8 +2063,12 @@ def _remove_review_checkout_with_warning(
 
 
 def _set_reviewer_quota_exhausted_with_backoff(
-    state: dict[str, Any], config: OrchestratorConfig, now_dt: datetime
-) -> dict[str, Any]:
+    state: dict[str, Any],
+    config: OrchestratorConfig,
+    now_dt: datetime,
+    *,
+    reset_at: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Record a quota-exhaustion episode with exponential probe backoff.
 
     Every consecutive throttle hit without an intervening successful probe
@@ -2080,6 +2084,25 @@ def _set_reviewer_quota_exhausted_with_backoff(
     ``consecutive_probe_failures`` lives inside the existing ``reviewer_quota``
     dict rather than as a new state.py-owned field/helper, matching this
     fix's file scope.
+
+    Issue #612: when the provider's session-limit notice names a specific
+    reset time (``reset_at``, the parsed "resets H:MMam/pm (zone)" clock
+    time), ``throttled_until`` is that reset plus the configured
+    ``throttle_resume_margin_s`` instead of ``now + quota_reset_hours``.
+    The provider's own stated reset is a far better backoff target than a
+    fixed guess: it avoids both re-spending into a still-closed window
+    (fixed window shorter than the real reset) and stalling far longer than
+    necessary (fixed window longer than the real reset). The resume margin
+    is added because provider reset estimates are floors, not guarantees
+    (issue #499). When ``reset_at`` is None (no clock-time notice parsed,
+    or the named zone was unavailable), the fixed ``quota_reset_hours``
+    window is used as before.
+
+    Returns ``(new_state, quota_record)`` where ``quota_record`` is the
+    written ``reviewer_quota`` dict, so callers can emit a
+    ``review_quota_exhausted`` event carrying ``throttled_until``,
+    ``probe_after``, ``reset_at`` (ISO or None), and
+    ``consecutive_probe_failures`` without re-reading state.
     """
     rd = config.review_dispatch
     quota = state.get("reviewer_quota") or {}
@@ -2087,12 +2110,13 @@ def _set_reviewer_quota_exhausted_with_backoff(
     interval_minutes = rd.quota_probe_interval_minutes * (2 ** (consecutive_failures - 1))
     if rd.quota_probe_max_interval_minutes > 0:
         interval_minutes = min(interval_minutes, rd.quota_probe_max_interval_minutes)
-    throttled_until = (
-        (now_dt + timedelta(hours=rd.quota_reset_hours))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    if reset_at is not None:
+        # Back off until the provider's own stated reset, plus the resume
+        # margin (provider resets are floors, not guarantees — issue #499).
+        throttled_dt = reset_at + timedelta(seconds=config.runtime.throttle_resume_margin_s)
+    else:
+        throttled_dt = now_dt + timedelta(hours=rd.quota_reset_hours)
+    throttled_until = throttled_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     probe_after = (
         (now_dt + timedelta(minutes=interval_minutes))
         .replace(microsecond=0)
@@ -2102,13 +2126,17 @@ def _set_reviewer_quota_exhausted_with_backoff(
     state = set_reviewer_quota_exhausted(
         state, throttled_until=throttled_until, probe_after=probe_after
     )
-    return {
-        **state,
-        "reviewer_quota": {
-            **state["reviewer_quota"],
-            "consecutive_probe_failures": consecutive_failures,
-        },
+    quota_record = {
+        **state["reviewer_quota"],
+        "consecutive_probe_failures": consecutive_failures,
+        "reset_at": (
+            reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if reset_at is not None
+            else None
+        ),
     }
+    state = {**state, "reviewer_quota": quota_record}
+    return state, quota_record
 
 
 def _detect_and_handle_stalled_reviews(
@@ -2201,6 +2229,7 @@ def _detect_and_handle_stalled_reviews(
         # the launch-time path uses (job-cannon PRs #1342/#1343/#1344/#1346,
         # 2026-07-21: 20+ hours of hot redispatch into a session-limit wall).
         throttled = False
+        reset_at: datetime | None = None
         try:
             log_text = Path(w.log_path).read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -2208,12 +2237,46 @@ def _detect_and_handle_stalled_reviews(
         if log_text:
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
             throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
+            # Issue #612: the session-limit notice names a specific reset
+            # clock time in an IANA zone (e.g. "resets 1:20am
+            # (America/Los_Angeles)"). Parse it once per dead session so the
+            # fleet-wide backoff targets the provider's own stated reset
+            # instead of a fixed quota_reset_hours guess. Only parsed on the
+            # session that triggers the backoff (the first throttled one);
+            # subsequent throttled sessions in the same wave reuse the
+            # already-applied backoff, matching the one-increment-per-wave
+            # guard below.
+            if throttled and not throttle_backoff_applied:
+                reset_at = parse_reset_clock_time(tail, datetime.now(UTC))
 
         if throttled:
             if not throttle_backoff_applied:
                 now_dt = datetime.now(UTC)
-                state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+                state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
+                    state, config, now_dt, reset_at=reset_at
+                )
                 throttle_backoff_applied = True
+                # Distinct, queryable event for a quota-dead reviewer session
+                # (issue #612): carries the parsed reset time (or None when
+                # the notice carried no clock-time form / the zone was
+                # unavailable) so the condition is diagnosable as a quota
+                # exhaustion rather than collapsing into a generic
+                # "no verdict" / "provider_throttled" stall. Emitted once per
+                # sweep alongside the single backoff increment.
+                state = append_event(
+                    state,
+                    "review_quota_exhausted",
+                    {
+                        "throttled_until": quota_record.get("throttled_until"),
+                        "probe_after": quota_record.get("probe_after"),
+                        "reset_at": quota_record.get("reset_at"),
+                        "consecutive_probe_failures": quota_record.get(
+                            "consecutive_probe_failures"
+                        ),
+                        "source": "stalled_review_sweep",
+                    },
+                    state_path=state_file,
+                )
             throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
             # A session that exhausted its full turn budget did real
             # PR-specific work -- its death is a PR-level outcome (the
@@ -7404,6 +7467,7 @@ class OrchestratorApp:
                                 decision,
                                 live_head_sha,
                                 old_head=reviewed_head_sha,
+                                issue_number=issue_number,
                                 tier=check.tier or "patch-id",
                                 new_patch_id=check.live_patch_id,
                                 new_signature=check.live_signature,
@@ -8183,6 +8247,10 @@ class OrchestratorApp:
         launched: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         quota_hit = False
+        # Captured at the moment a launch-time quota hit is detected so the
+        # provider's named reset time (issue #612) can be parsed from it
+        # after the loop and used for the fleet-wide backoff target.
+        quota_hit_error: str | None = None
         for candidate in selected:
             pr_number = candidate["pr"]
             issue_number = candidate["issue"]
@@ -8282,6 +8350,7 @@ class OrchestratorApp:
                         )[0]
                     ):
                         quota_hit = True
+                        quota_hit_error = record.error
                         break
                     failed.append({"pr": pr_number, "error": error_text})
                 else:
@@ -8356,7 +8425,33 @@ class OrchestratorApp:
 
             if quota_hit:
                 now_dt = datetime.now(UTC)
-                state = _set_reviewer_quota_exhausted_with_backoff(state, self.config, now_dt)
+                # Issue #612: parse the provider's named reset clock time
+                # from the launch error (e.g. "resets 1:20am
+                # (America/Los_Angeles)") so the backoff targets the stated
+                # reset instead of a fixed quota_reset_hours guess.
+                reset_at = (
+                    parse_reset_clock_time(quota_hit_error, now_dt) if quota_hit_error else None
+                )
+                state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
+                    state, self.config, now_dt, reset_at=reset_at
+                )
+                # Distinct, queryable event for a launch-time quota hit
+                # (issue #612): mirrors the stalled-sweep event so a quota
+                # exhaustion is diagnosable from either detection path.
+                state = append_event(
+                    state,
+                    "review_quota_exhausted",
+                    {
+                        "throttled_until": quota_record.get("throttled_until"),
+                        "probe_after": quota_record.get("probe_after"),
+                        "reset_at": quota_record.get("reset_at"),
+                        "consecutive_probe_failures": quota_record.get(
+                            "consecutive_probe_failures"
+                        ),
+                        "source": "launch_quota_hit",
+                    },
+                    state_path=self.paths.state_file,
+                )
 
             state = append_event(
                 state,
@@ -9093,34 +9188,51 @@ class OrchestratorApp:
         live_pr = self.gh.pr_view(pr_number) if pr_number is not None else {}
         live_pr_state = str((live_pr or {}).get("state") or "").upper()
 
-        # Issue #214 precedent (reconcile's live_session_issue_numbers
-        # guard): a verifiably live worker session means nothing here is
-        # stuck, it is IN USE -- refuse entirely rather than re-arm around a
-        # running process. Popping issue-side worker_pid/dispatched_at would
-        # blind orphan-worker detection; resetting the PR side would zero
-        # the conflict/no-op attempt counters for a rework cycle still in
-        # flight (defeating the caps) and flip the PR to the passive
-        # reviewing status, inviting a concurrent review() against the
-        # worker's in-progress push. PR "janitor_blocked" + issue
-        # "dispatched" is the NORMAL mid-rework steady state, not a wedge.
-        issue_worker_alive = False
+        # Issue #214 precedent (reconcile's live_session_issue_numbers guard):
+        # a verifiably live worker session means nothing here is stuck, it is
+        # IN USE -- refuse entirely rather than re-arm around a running
+        # process. Popping issue-side worker_pid/dispatched_at would blind
+        # orphan-worker detection; resetting the PR side would zero the
+        # conflict/no-op attempt counters for a rework cycle still in flight
+        # (defeating the caps) and flip the PR to the passive reviewing
+        # status, inviting a concurrent review() against the worker's
+        # in-progress push. PR "janitor_blocked" + issue "dispatched" is the
+        # NORMAL mid-rework steady state, not a wedge.
+        #
+        # Issue #625: "live" is no longer just "is the PID alive?". Both the
+        # sidecar-based and state.json-based checks route through one
+        # predicate (``issue_worker_liveness``) that bounds the state-side
+        # check with the watchdog's stall standard -- an alive-but-silent
+        # session (no real activity for > stall_minutes, or past the
+        # wall-clock deadline with an inconclusive probe) is wedged, not
+        # live, and unescalate may proceed. The refusal carries session age
+        # and last-activity diagnostics so an operator can tell a wedged
+        # worker from a working one.
         if issue_number is not None:
-            from .worker import iter_workers
+            from datetime import UTC
+
+            from .worker import issue_worker_liveness
 
             sessions_dir = self._resolve(self.config.devin.sessions_dir)
-            issue_worker_alive = any(
-                w.issue_number == issue_number and w.is_alive() for w in iter_workers(sessions_dir)
-            ) or _worker_pid_alive(issue_state)
-        if issue_worker_alive:
+            verdict = issue_worker_liveness(
+                issue_number, issue_state, sessions_dir, self.config, datetime.now(UTC)
+            )
+        else:
+            verdict = None
+        if verdict is not None and verdict.live:
             return CommandResult(
                 True,
                 f"issue #{issue_number} has a live worker session; nothing to "
-                f"unescalate (pr={pr_number} left untouched) -- retry after "
-                "the session ends",
+                f"unescalate (pr={pr_number} left untouched) -- {verdict.reason}",
                 {
                     "pr": pr_number,
                     "issue": issue_number,
                     "issue_worker_alive": True,
+                    "issue_worker_last_activity_at": verdict.last_activity_at,
+                    "issue_worker_last_activity_source": verdict.last_activity_source,
+                    "issue_worker_session_started_at": verdict.session_started_at,
+                    "issue_worker_pid": verdict.pid,
+                    "issue_worker_source": verdict.source,
                     "changed": False,
                 },
             )
@@ -9339,6 +9451,7 @@ class OrchestratorApp:
                         decision,
                         live_head_sha,
                         old_head=old_reviewed_head_sha,
+                        issue_number=issue_number,
                         tier=check.tier or "patch-id",
                         new_patch_id=check.live_patch_id,
                         new_signature=check.live_signature,
@@ -9363,28 +9476,10 @@ class OrchestratorApp:
                             "consecutive_failed_merge_attempts": 0,
                             "consecutive_stale_base_deferrals": 0,
                         }
-                        # Tier 1 keeps its original event kind/payload shape
-                        # (issue #375/#412); tier 2 (issue #414) gets its own
-                        # distinct kind so the two mechanisms stay separately
-                        # auditable in the events log.
-                        event_kind = (
-                            "verdict_carried_forward_clean_rebase"
-                            if check.tier == "patch-id"
-                            else "verdict_carried_forward_line_content"
-                        )
-                        state = self._record_event(
-                            state,
-                            event_kind,
-                            {
-                                "pr_number": pr_number,
-                                "issue_number": issue_number,
-                                "old_reviewed_head_sha": old_reviewed_head_sha,
-                                "new_head_sha": live_head_sha,
-                                "patch_id": check.live_patch_id,
-                                "carry_forward_tier": check.tier,
-                                "carried_forward_from": decision.get("carried_forward_from", []),
-                            },
-                        )
+                        # The carry-forward event itself is recorded inside
+                        # _update_approval_head (issue #638) so every call
+                        # site is instrumented uniformly; do NOT re-record
+                        # here or the transition is double-counted.
                         save_state(self.paths.state_file, state)
                     carried_forward = True
             if head_moved and not carried_forward:
@@ -9556,7 +9651,11 @@ class OrchestratorApp:
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
                             self._update_approval_head(
-                                pr_number, decision, new_head, old_head=live_head_sha
+                                pr_number,
+                                decision,
+                                new_head,
+                                old_head=live_head_sha,
+                                issue_number=issue_number,
                             )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
@@ -10569,7 +10668,17 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(pr_number, decision, new_head, old_head=old_head)
+            self._update_approval_head(
+                pr_number,
+                decision,
+                new_head,
+                old_head=old_head,
+                issue_number=linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=self.config.dispatch.branch_prefix,
+                ),
+            )
             return [
                 {
                     "pr_number": pr_number,
@@ -11493,6 +11602,7 @@ class OrchestratorApp:
         new_head: str,
         old_head: str | None = None,
         *,
+        issue_number: int | None = None,
         tier: str = "verified-sync",
         new_patch_id: str | None = None,
         new_signature: DiffContentSignature | None = None,
@@ -11517,6 +11627,18 @@ class OrchestratorApp:
         pointlessly defeat that head's own future tier-1 fast path: patch-id
         is unstable across every main advance, not just the one just
         carried past.
+
+        A carry-forward event is recorded here, inside the locked section
+        that already persists the transition, so every call site is
+        instrumented by construction — a new caller cannot forget it
+        (issue #638). The event kind is tier-dependent so the three
+        mechanisms (``verdict_carried_forward_clean_rebase`` for patch-id,
+        ``verdict_carried_forward_line_content`` for line-content, and
+        ``verdict_carried_forward_verified_sync`` for the structurally-
+        verified sync that never compared patch-ids) stay separately
+        auditable in the events log. Callers that previously recorded the
+        event themselves must NOT do so anymore, or the transition would be
+        double-counted.
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         updated_decision = dict(decision)
@@ -11533,6 +11655,13 @@ class OrchestratorApp:
             carried_forward.append(old_head)
         updated_decision["carried_forward_from"] = carried_forward
         self._write_json(decision_path, updated_decision)
+
+        if tier == "patch-id":
+            event_kind = "verdict_carried_forward_clean_rebase"
+        elif tier == "line-content":
+            event_kind = "verdict_carried_forward_line_content"
+        else:
+            event_kind = "verdict_carried_forward_verified_sync"
 
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -11551,6 +11680,19 @@ class OrchestratorApp:
                 "carry_forward_tier": tier,
                 "carried_forward_from": carried_forward,
             }
+            state = self._record_event(
+                state,
+                event_kind,
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "old_reviewed_head_sha": old_head,
+                    "new_head_sha": new_head,
+                    "patch_id": new_patch_id,
+                    "carry_forward_tier": tier,
+                    "carried_forward_from": carried_forward,
+                },
+            )
             save_state(self.paths.state_file, state)
 
     def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
