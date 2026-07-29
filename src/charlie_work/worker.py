@@ -33,6 +33,7 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
+from .process_utils import is_pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -1098,6 +1099,262 @@ def update_worker_log_stat(
         _write_json_atomic(sidecar_path, payload)
 
 
+@dataclass(frozen=True)
+class IssueWorkerLiveness:
+    """Verdict on whether an issue's worker session is genuinely live.
+
+    Unifies the sidecar-based and state.json-based liveness authorities so they
+    cannot drift apart (issue #625). A worker whose PID is alive but whose
+    session has shown no real activity for longer than the watchdog stall
+    window is reported as wedged (``live=False``), not live -- regardless of
+    whether it was surfaced by a sidecar or by state.json's ``worker_pid``.
+    This is the same standard the watchdog applies via Signal 3
+    (``classify_worker_health``); before this predicate existed, the state-side
+    check asked only "is the PID alive?" with no staleness bound, so a worker
+    that finished its work but never exited held its slot forever and blocked
+    ``charlie unescalate`` indefinitely.
+
+    The diagnostic fields (``last_activity_at``, ``last_activity_source``,
+    ``session_started_at``, ``pid``, ``source``) let callers decline with a
+    diagnosable message instead of a bare "has a live worker session".
+    """
+
+    live: bool
+    reason: str
+    last_activity_at: str | None
+    last_activity_source: str | None
+    session_started_at: str | None
+    pid: int | None
+    source: str  # "sidecar" | "state" | "none"
+
+
+def _state_session_start_dt(issue_state: dict[str, Any]) -> datetime | None:
+    """Resolve the wall-clock start time of a state-recorded worker session.
+
+    Prefers ``worker_process_start_time`` (epoch seconds, the process identity
+    fingerprint) and falls back to ``dispatched_at`` (ISO 8601). Returns None
+    when neither is present or parseable.
+    """
+    start = issue_state.get("worker_process_start_time")
+    if start is not None:
+        try:
+            return datetime.fromtimestamp(float(start), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            pass
+    dispatched_at = issue_state.get("dispatched_at")
+    if dispatched_at:
+        parsed = _parse_started_at(str(dispatched_at))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def issue_worker_liveness(
+    issue_number: int,
+    issue_state: dict[str, Any],
+    sessions_dir: Path,
+    config: OrchestratorConfig,
+    now: datetime,
+) -> IssueWorkerLiveness:
+    """Single authority for "is this issue's worker genuinely live?"
+
+    Routes both the sidecar-based check (``iter_workers`` + ``is_alive``) and
+    the state.json-based check (``worker_pid`` + ``is_pid_alive``) through one
+    predicate so the criteria cannot drift apart (issue #625, direction 1).
+    A PID that is alive is necessary but no longer sufficient: the session
+    must also show real activity within the watchdog stall window
+    (``watchdog.stall_minutes``), the same standard ``classify_worker_health``
+    applies via Signal 3. An alive-but-silent session is reported as wedged
+    (``live=False``), which is the minimum viable fix for the alive-but-finished
+    wedge that blocked ``charlie unescalate`` forever (issue #625, direction 2).
+
+    When the state-side probe is inconclusive (every activity source errored
+    or produced no timestamp -- e.g. the per-PID Devin log was reaped alongside
+    the sidecar), the wall-clock deadline (``watchdog.wall_clock_minutes``,
+    Signal 4) bounds the session instead. Within that window the verdict
+    defers to ``live=True`` so a young session that simply has not landed in
+    sessions.db yet is not reaped; past it, the session is wedged.
+
+    Args:
+        issue_number: Issue to inspect.
+        issue_state: The issue's ``state["issues"][n]`` entry (may be empty).
+        sessions_dir: Directory containing worker sidecar files.
+        config: Orchestrator config (watchdog thresholds, post_mortem db path).
+        now: Current datetime for staleness/age calculations.
+
+    Returns:
+        An ``IssueWorkerLiveness`` verdict; ``live`` is the decision and the
+        remaining fields make a refusal diagnosable (issue #625, direction 4).
+    """
+    stall_minutes = config.watchdog.stall_minutes
+    wall_clock_minutes = config.watchdog.wall_clock_minutes
+
+    # --- Source 1: sidecar workers -------------------------------------------
+    for w in iter_workers(sessions_dir):
+        if w.issue_number != issue_number or not w.is_alive():
+            continue
+        probe = real_activity_probe_for(w, config, now)
+        health = classify_worker_health(w, config, now, probe)
+        last_activity = probe.latest_timestamp
+        last_activity_iso = last_activity.isoformat() if last_activity else None
+        if health is WorkerHealth.STALLED:
+            return IssueWorkerLiveness(
+                live=False,
+                reason=(
+                    f"sidecar worker pid={w.pid} alive but stalled: no real "
+                    f"activity for >{stall_minutes}m (last activity: "
+                    f"{last_activity_iso or 'unknown'} via "
+                    f"{probe.latest_source or 'no source'})"
+                ),
+                last_activity_at=last_activity_iso,
+                last_activity_source=probe.latest_source,
+                session_started_at=w.started_at,
+                pid=w.pid,
+                source="sidecar",
+            )
+        if health is WorkerHealth.DEAD:
+            return IssueWorkerLiveness(
+                live=False,
+                reason=(
+                    f"sidecar worker pid={w.pid} classified dead (terminal marker or recycled PID)"
+                ),
+                last_activity_at=last_activity_iso,
+                last_activity_source=probe.latest_source,
+                session_started_at=w.started_at,
+                pid=w.pid,
+                source="sidecar",
+            )
+        # HEALTHY / SLOW / RUNAWAY: still working -> genuinely live.
+        return IssueWorkerLiveness(
+            live=True,
+            reason=(
+                f"sidecar worker pid={w.pid} live and working "
+                f"(health={health.value}; last activity: "
+                f"{last_activity_iso or 'unknown'} via "
+                f"{probe.latest_source or 'no source'})"
+            ),
+            last_activity_at=last_activity_iso,
+            last_activity_source=probe.latest_source,
+            session_started_at=w.started_at,
+            pid=w.pid,
+            source="sidecar",
+        )
+
+    # --- Source 2: state.json worker_pid -------------------------------------
+    worker_pid = issue_state.get("worker_pid")
+    if worker_pid is None:
+        return IssueWorkerLiveness(
+            live=False,
+            reason="no sidecar worker and no worker_pid in state",
+            last_activity_at=None,
+            last_activity_source=None,
+            session_started_at=None,
+            pid=None,
+            source="none",
+        )
+
+    started_at_dt = _state_session_start_dt(issue_state)
+    started_at_iso = started_at_dt.isoformat() if started_at_dt is not None else None
+
+    if not is_pid_alive(worker_pid, issue_state.get("worker_process_start_time")):
+        return IssueWorkerLiveness(
+            live=False,
+            reason=f"state worker_pid={worker_pid} is not alive",
+            last_activity_at=None,
+            last_activity_source=None,
+            session_started_at=started_at_iso,
+            pid=worker_pid,
+            source="state",
+        )
+
+    # PID alive: bound it with the same staleness standard the watchdog applies
+    # (Signal 3). Build a real-activity probe from the state-side data we have
+    # (pid + dispatched_at). worktree_path/log_path are absent so sessions.db
+    # and events.jsonl sources will not match, but the per-PID Devin log source
+    # is keyed on pid alone and is the signal that surfaces a wedged-but-alive
+    # session even when the sidecar has been reaped (the exact #625 scenario).
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        worktree_path="",
+        started_at=started_at_iso or "",
+        pid=worker_pid,
+        now=now,
+        log_path=None,
+        watchdog_config=config.watchdog,
+    )
+    last_activity = probe.latest_timestamp
+    last_activity_iso = last_activity.isoformat() if last_activity else None
+
+    if probe.is_fresh(stall_minutes):
+        return IssueWorkerLiveness(
+            live=True,
+            reason=(
+                f"state worker_pid={worker_pid} alive and active within "
+                f"{stall_minutes}m (last activity: {last_activity_iso} via "
+                f"{probe.latest_source or 'no source'})"
+            ),
+            last_activity_at=last_activity_iso,
+            last_activity_source=probe.latest_source,
+            session_started_at=started_at_iso,
+            pid=worker_pid,
+            source="state",
+        )
+
+    # Probe not fresh. Distinguish conclusive-stale (we have a timestamp, it
+    # is just old) from inconclusive (every source errored / no match).
+    if last_activity is not None:
+        return IssueWorkerLiveness(
+            live=False,
+            reason=(
+                f"state worker_pid={worker_pid} alive but wedged: no real "
+                f"activity for >{stall_minutes}m (last activity: "
+                f"{last_activity_iso} via {probe.latest_source or 'no source'})"
+            ),
+            last_activity_at=last_activity_iso,
+            last_activity_source=probe.latest_source,
+            session_started_at=started_at_iso,
+            pid=worker_pid,
+            source="state",
+        )
+
+    # Inconclusive probe: no activity source produced a timestamp. Fall back
+    # to the wall-clock deadline (the watchdog's Signal 4) so a wedged worker
+    # whose per-PID log was reaped is still bounded. Within the wall-clock
+    # window we defer (live=True) -- a young session that simply has not
+    # landed in sessions.db yet must not be reaped, mirroring the watchdog's
+    # own inconclusive-probe deferral.
+    session_start = started_at_dt
+    if session_start is not None and (now - session_start) > timedelta(minutes=wall_clock_minutes):
+        age = now - session_start
+        return IssueWorkerLiveness(
+            live=False,
+            reason=(
+                f"state worker_pid={worker_pid} alive but wedged: session age "
+                f"{age} exceeds wall-clock deadline {wall_clock_minutes}m and "
+                f"no activity source produced a timestamp (probe inconclusive)"
+            ),
+            last_activity_at=None,
+            last_activity_source=None,
+            session_started_at=started_at_iso,
+            pid=worker_pid,
+            source="state",
+        )
+
+    return IssueWorkerLiveness(
+        live=True,
+        reason=(
+            f"state worker_pid={worker_pid} alive; activity probe inconclusive "
+            f"and session within wall-clock deadline {wall_clock_minutes}m -- "
+            f"deferring (retry after the session ends or ages past the deadline)"
+        ),
+        last_activity_at=None,
+        last_activity_source=None,
+        session_started_at=started_at_iso,
+        pid=worker_pid,
+        source="state",
+    )
+
+
 def real_activity_probe_for(
     view: WorkerView, config: OrchestratorConfig, now: datetime
 ) -> RealActivityProbe:
@@ -1123,7 +1380,9 @@ __all__ = [
     "WorkerHealth",
     "UsageSnapshot",
     "WorkerView",
+    "IssueWorkerLiveness",
     "classify_worker_health",
+    "issue_worker_liveness",
     "iter_workers",
     "parse_cumulative_usage",
     "real_activity_probe_for",
