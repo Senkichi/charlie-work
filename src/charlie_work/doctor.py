@@ -468,16 +468,32 @@ def _check_runner_allocation(
     # the "never reached it" shape #590 describes. A *stale* skip is both: the
     # daemon last found <reason> and has not been back, so the #590 reading joins
     # the recorded reason rather than replacing it.
+    #
+    # A skip written by a non-unattended source (a manual `charlie runners
+    # allocate`, or a file predating provenance) still cannot confirm the daemon
+    # is rebalancing — the writer overwrites the same host-wide file, so its
+    # skip reason is not evidence the daemon reached allocation. That clause
+    # joins the recorded reason the same way staleness does, so a fresh manual
+    # skip names *why* it declined *and* flags that it cannot speak for the
+    # daemon (issue #590). When both apply (a stale manual skip) the clauses are
+    # joined so #590 is cited once rather than duplicated.
     if stamp.skip_reason is not None:
         detail = (
             f"enabled (budget {budget}) but the last pass ({writer}) {age}s ago "
             f"declined to act: {stamp.skip_reason}"
         )
-        if age > stale_after:
-            detail += (
-                f" — over the {stale_after}s staleness bound, so allocation is "
-                f"not running unattended (issue #590)"
+        clauses: list[str] = []
+        if stamp.source != UNATTENDED_ALLOCATION_SOURCE:
+            clauses.append(
+                "this overwrites the same file the unattended pass uses, "
+                "so it cannot confirm the daemon is rebalancing"
             )
+        if age > stale_after:
+            clauses.append(
+                f"over the {stale_after}s staleness bound, allocation is not running unattended"
+            )
+        if clauses:
+            detail += " — " + "; ".join(clauses) + " (issue #590)"
         add("runner allocation", False, detail, severity="warning")
         return
 

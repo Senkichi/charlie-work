@@ -1488,7 +1488,14 @@ def test_allocation_probe_joins_skip_reason_and_staleness_when_stale(
 def test_allocation_probe_reports_a_manual_skip_with_the_recorded_reason(
     tmp_path: Path,
 ) -> None:
-    """A CLI skip names the reason; the writer is still flagged as non-daemon."""
+    """A CLI skip names the reason; the writer is still flagged as non-daemon.
+
+    A fresh manual skip records *why* it declined (issue #606) but, like a
+    fresh manual non-skip, cannot confirm the daemon is rebalancing — the
+    writer overwrites the same host-wide file, so its skip reason is not
+    evidence the unattended pass reached allocation (issue #590). Both
+    signals must appear together.
+    """
     _write_allocation_stamp(
         tmp_path,
         age_seconds=5,
@@ -1500,7 +1507,68 @@ def test_allocation_probe_reports_a_manual_skip_with_the_recorded_reason(
     _, ok, detail = checks[0]
     assert ok is False
     assert "declined to act" in detail
+    assert "no configured runners found under /actions-runners" in detail
     assert "manual" in detail
+    # The writer is non-unattended, so the #590 "cannot confirm" framing must
+    # join the recorded reason — exactly the distinction this probe preserves.
+    assert "cannot confirm" in detail
+    assert "#590" in detail
+
+
+def test_allocation_probe_cannot_confirm_clause_for_a_fresh_manual_skip(
+    tmp_path: Path,
+) -> None:
+    """Regression: a fresh manual (CLI) skip surfaces the #590 clause.
+
+    The skip_reason branch returns before the source-mismatch check, so the
+    'cannot confirm the daemon is rebalancing (issue #590)' framing must be
+    appended within that branch when the writer is not unattended — otherwise
+    an operator's manual run reads as a named daemon skip and blinds the probe
+    for three intervals during the very window #590 is being diagnosed.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=5,
+        source="cli",
+        full_pass_interval_seconds=300,
+        skip_reason="no configured runners found under /actions-runners",
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    # The #590 clause is the authoritative signal that a manual write cannot
+    # stand in for daemon health.
+    assert "cannot confirm the daemon is rebalancing" in detail
+    assert "issue #590" in detail
+    # Fresh (5s < 900s bound): staleness must NOT also be cited — only the
+    # source-mismatch clause applies, so "not running unattended" is absent.
+    assert "not running unattended" not in detail
+
+
+def test_allocation_probe_joins_source_and_staleness_for_a_stale_manual_skip(
+    tmp_path: Path,
+) -> None:
+    """A stale manual skip cites both clauses, with #590 named once.
+
+    Both the source mismatch (manual write cannot confirm the daemon) and
+    staleness (daemon has not been back) apply; the clauses join so #590 is
+    cited once rather than duplicated.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=2000,
+        source="cli",
+        full_pass_interval_seconds=300,
+        skip_reason="no configured runners found under /actions-runners",
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "declined to act" in detail
+    assert "cannot confirm the daemon is rebalancing" in detail
+    assert "not running unattended" in detail
+    # #590 cited exactly once, not duplicated.
+    assert detail.count("#590") == 1
 
 
 def test_run_doctor_wires_the_allocation_probe(tmp_path: Path) -> None:
