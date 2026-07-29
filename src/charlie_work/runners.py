@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RunnerScalingConfig
-from .github import GitHub
+from .github import GitHubLike
 from .subprocess_runner import (
     RunResult,
     hidden_console_kwargs,
@@ -455,7 +455,7 @@ def is_runner_launched(runner_dir: Path) -> bool:
     return get_runner_launcher_process(runner_dir) is not None
 
 
-def mint_remove_token(gh: GitHub) -> tuple[bool, str]:
+def mint_remove_token(gh: GitHubLike) -> tuple[bool, str]:
     """Mint a remove token for deregistering a runner.
 
     Args:
@@ -596,7 +596,7 @@ def delete_runner_dir(runner_dir: Path, *, dry_run: bool = False) -> tuple[bool,
 
 def gracefully_remove_runner(
     runner_dir: RunnerDir,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     dry_run: bool = False,
 ) -> tuple[bool, str]:
@@ -842,7 +842,7 @@ def is_in_cooldown(state_dir: Path, cooldown_minutes: int) -> bool:
 def scale_down_idle_runners(
     managed_root: Path,
     runner_dir_prefix: str,
-    gh: GitHub,
+    gh: GitHubLike,
     config: RunnerScalingConfig,
     state_dir: Path,
     *,
@@ -1071,7 +1071,7 @@ class ProvisioningResult:
 
 
 def observe_runner_pool(
-    gh: GitHub,
+    gh: GitHubLike,
     config: RunnerScalingConfig,
     *,
     workflow_filename: str | None = None,
@@ -1246,7 +1246,7 @@ def _classify_pressure(
     return PoolPressure.BALANCED
 
 
-def _mint_registration_token(gh: GitHub) -> dict[str, Any] | None:
+def _mint_registration_token(gh: GitHubLike) -> dict[str, Any] | None:
     """Mint a GitHub Actions runner registration token.
 
     The token is returned in the JSON response and must never be logged or persisted.
@@ -1451,7 +1451,7 @@ def _launch_runner(runner_dir: Path) -> RunResult:
 
 
 def _verify_runner_online(
-    gh: GitHub,
+    gh: GitHubLike,
     runner_name: str,
     max_retries: int = 30,
     retry_interval_seconds: int = 5,
@@ -1512,7 +1512,7 @@ def _cleanup_runner_dir(runner_dir: Path) -> None:
 
 
 def provision_runner(
-    gh: GitHub,
+    gh: GitHubLike,
     config: RunnerScalingConfig,
     busy_jobs: int,
     *,

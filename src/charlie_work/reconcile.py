@@ -29,8 +29,8 @@ from typing import Any
 
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
-    GitHub,
     GitHubError,
+    GitHubLike,
     GraphQLBudgetError,
     _LIST_LIMIT,
     RECONCILE_ISSUE_FIELDS,
@@ -122,7 +122,7 @@ def _issue_state(issue: dict[str, Any] | None) -> str:
     return str(issue.get("state") or "OPEN").upper()
 
 
-def _fetch_snapshot(gh: GitHub, args: list[str], *, what: str) -> list[dict[str, Any]]:
+def _fetch_snapshot(gh: GitHubLike, args: list[str], *, what: str) -> list[dict[str, Any]]:
     """Run a ``gh ... list --json`` query, refusing to degrade a failed read to ``[]``.
 
     ``GitHub.run`` does not raise on every failure mode. On the *success* path
@@ -159,7 +159,7 @@ def _fetch_snapshot(gh: GitHub, args: list[str], *, what: str) -> list[dict[str,
     return result
 
 
-def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
+def _fetch_prs(gh: GitHubLike) -> list[dict[str, Any]]:
     return _fetch_snapshot(
         gh,
         [
@@ -176,7 +176,7 @@ def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
     )
 
 
-def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
+def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
     return _fetch_snapshot(
         gh,
         [
@@ -235,7 +235,7 @@ def _pr_review_approved_at_head(
 
 
 def detect_aviator_stale_blocked(
-    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHubLike, config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
     """Detect PRs stuck behind a stale Aviator ``blocked`` label.
 
@@ -349,7 +349,7 @@ def detect_aviator_stale_blocked(
 
 
 def detect_drift(
-    gh: GitHub,
+    gh: GitHubLike,
     state: dict[str, Any],
     config: OrchestratorConfig,
     *,
@@ -1314,7 +1314,7 @@ def detect_drift(
 
 
 def apply_fixes(
-    gh: GitHub,
+    gh: GitHubLike,
     state: dict[str, Any],
     drift: list[DriftItem],
     config: OrchestratorConfig,

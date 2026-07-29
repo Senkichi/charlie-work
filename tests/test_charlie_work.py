@@ -2942,8 +2942,9 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
 
 
 class FakeGitHub:
-    def __init__(self, repo_root: Any = None) -> None:
+    def __init__(self, repo_root: Any = None, dry_run: bool = False) -> None:
         self.repo_root = repo_root
+        self.dry_run = dry_run
         self.issues = [
             {
                 "number": 123,
@@ -3368,6 +3369,21 @@ class FakeGitHub:
         return [{"name": name} for name, _color, _desc in self.labels_created]
 
     def pr_comment(self, number: int, body_file: Path) -> None:
+        pass
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        return True
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        return None
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        return []
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def validate_field_lists(self) -> None:
         pass
 
 

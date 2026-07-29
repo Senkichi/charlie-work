@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Literal, Mapping
 
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
-from .github import GitHub, GitHubError
+from .github import GitHubError, GitHubLike
 from .safe_path import contains
 from .runner_allocation import (
     AllocationPlan,
@@ -211,7 +211,7 @@ def has_active_job(runner_path: Path) -> bool:
 # --------------------------------------------------------------------------
 
 
-def fetch_busy_runner_names(gh: GitHub, repo: str) -> tuple[set[str], str | None]:
+def fetch_busy_runner_names(gh: GitHubLike, repo: str) -> tuple[set[str], str | None]:
     """Names of runners GitHub currently reports as busy for ``repo``.
 
     The repo is addressed by explicit slug rather than gh's ``{owner}/{repo}``
@@ -226,7 +226,7 @@ def fetch_busy_runner_names(gh: GitHub, repo: str) -> tuple[set[str], str | None
     return {str(r.get("name")) for r in runners if r.get("busy") is True}, None
 
 
-def measure_repo_demand(gh: GitHub, repo: str, max_runs_scanned: int) -> RepoDemand:
+def measure_repo_demand(gh: GitHubLike, repo: str, max_runs_scanned: int) -> RepoDemand:
     """Count self-hosted Actions jobs that want or hold a slot in ``repo``.
 
     Demand is measured in *jobs*, not runs: one workflow run can hold several
