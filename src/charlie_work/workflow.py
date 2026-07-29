@@ -9412,6 +9412,7 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         merge_conflict_routed = False
+        check_failure_routed = False
         cross_pr_revert_detected = False
         cross_pr_revert_routed = False
         cross_pr_revert_reason: str | None = None
@@ -9989,6 +9990,49 @@ class OrchestratorApp:
                     rework_label_error = self._request_merge_conflict_rework(
                         pr, issue_number, decision
                     )
+        # Check-failure rework dispatch (issue #674): an approved PR whose
+        # required checks have genuinely failed (a completed FAILURE
+        # conclusion, not merely pending/missing/infra_failed/unavailable)
+        # never re-enters review()'s janitor gate once approved -- the
+        # already_approved fast path in loop() routes straight to
+        # merge_ready as long as the head hasn't moved, so nothing else in
+        # the orchestrator ever pushes it back to rework. Debounced to the
+        # same failed-attempt-alarm threshold as merge-conflict rework
+        # (above) so a transient failure or the mergequeue's own
+        # speculative-merge retry gets a chance to self-heal first.
+        # Deliberately scoped to `summary.failed` only: `missing`/
+        # `infra_failed`/`unavailable` checks are not something a code push
+        # can reliably fix and are left to the existing warning-only alarm.
+        if (
+            not merge_conflict
+            and not cross_pr_revert_detected
+            and not mergequeue_handoff_failed
+            and approved
+            and not can_merge
+            and bool(summary.failed)
+            and issue_number is not None
+        ):
+            state = load_state_locked(self.paths.state_file)
+            issue_state = state["issues"].get(str(issue_number), {})
+            issue_status = issue_state.get("status")
+            existing_for_route = state["prs"].get(str(pr_number), {})
+            if issue_status not in (
+                "dispatched",
+                "dispatch_pending",
+                "manifest_written",
+                "escalated",
+                "blocked",
+                "rework_requested",
+            ):
+                new_attempts_for_route = (
+                    int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
+                )
+                threshold = self.config.auto_merge.failed_attempt_alarm
+                if threshold > 0 and new_attempts_for_route >= threshold:
+                    check_failure_routed = True
+                    rework_label_error = self._request_check_failure_rework(
+                        pr, issue_number, decision, summary
+                    )
         if rework_label_error is not None:
             label_error = rework_label_error
         with state_lock(self.paths.state_file):
@@ -10052,6 +10096,27 @@ class OrchestratorApp:
                             f"label {self.config.auto_merge.mergequeue_label!r} failed to "
                             f"apply for {new_attempts} {pass_str} — never handed off to "
                             "Aviator"
+                        )
+                    elif bool(summary.failed):
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        if issue_number is None:
+                            check_detail = "no linked issue, cannot route to rework"
+                        elif check_failure_routed:
+                            if rework_label_error:
+                                outcome = rework_label_error.get("outcome", rework_label_error)
+                                check_detail = (
+                                    f"rework dispatch attempted (label update failed: {outcome})"
+                                )
+                            else:
+                                check_detail = "rework dispatched"
+                        elif issue_status == "rework_requested":
+                            check_detail = "rework already requested"
+                        else:
+                            check_detail = "rework not routed"
+                        failed_str = ", ".join(summary.failed)
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            f"required check(s) failed ({failed_str}) — {check_detail}"
                         )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
@@ -10978,6 +11043,51 @@ class OrchestratorApp:
             summary,
             "merge_conflict_rework_requested",
             extra_payload={"conflict_rework_requested_at": requested_at},
+            extra_state=merged_extra_state,
+        )
+
+    def _request_check_failure_rework(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+        summary: CheckSummary,
+        *,
+        extra_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Route an approved PR whose required checks have genuinely failed to rework.
+
+        Called only from merge_ready's approved+alarm-threshold path (issue
+        #674), mirroring ``_request_merge_conflict_rework``. Once a PR is
+        approved and its head stops moving, loop()'s already_approved fast
+        path never calls review() again -- it goes straight to merge_ready --
+        so a required check that starts genuinely failing after approval
+        (not merely pending/missing/infra_failed/unavailable) previously had
+        no path back to rework at all. Debounced to the same
+        failed-attempt-alarm threshold as merge-conflict rework so a
+        transient failure or the mergequeue's own speculative-merge retry
+        gets a chance to self-heal first.
+        """
+        failed_str = ", ".join(summary.failed)
+        text = (
+            f"CI failed on required check(s) after approval: {failed_str}. The code "
+            "changes are already approved; do not re-litigate the review -- push a fix "
+            "for the failing check(s)."
+        )
+        requested_at = utc_now()
+        merged_extra_state = {"check_failure_rework_requested_at": requested_at}
+        if extra_state:
+            merged_extra_state.update(extra_state)
+        return self._route_to_rework(
+            pr,
+            issue_number,
+            decision,
+            text,
+            "check_failure_rework_requested",
+            extra_payload={
+                "check_failure_rework_requested_at": requested_at,
+                "failed_checks": list(summary.failed),
+            },
             extra_state=merged_extra_state,
         )
 
