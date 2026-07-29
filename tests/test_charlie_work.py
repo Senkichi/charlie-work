@@ -19457,6 +19457,104 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "dispatched"
 
 
+def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #674: an approved PR whose required checks genuinely fail is routed to rework.
+
+    Once approved, loop()'s already_approved fast path never calls review()
+    again, so review()'s pre-approval janitor-gate check-failure handling
+    never re-fires for this PR. A completed FAILURE conclusion on a required
+    check (not merely pending/missing/infra_failed/unavailable) must still
+    reach rework via merge_ready's own alarm-threshold dispatch. The approved
+    verdict and its patch-id must survive so carry-forward can re-approve the
+    rework push.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "state": "SUCCESS"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BLOCKED",
+            "mergeable": "MERGEABLE",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    original_decision = json.loads(decision_path.read_text())
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is False
+    assert result.data["checks"]["failed"] == ("Tests passed",)
+    assert result.data["merge_attempt_alarm"] is True
+    assert result.data["merge_attempt_warning"] is not None
+    assert "Tests passed" in result.data["merge_attempt_warning"]
+    # The sync step is bypassed: the PR head should not be advanced.
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123"
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["events"][-1]["kind"] == "merge_ready"
+    check_failure_events = [
+        e for e in state["events"] if e["kind"] == "check_failure_rework_requested"
+    ]
+    assert len(check_failure_events) == 1
+    assert check_failure_events[0]["payload"]["pr_number"] == 456
+    assert check_failure_events[0]["payload"]["issue_number"] == 123
+    assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
+
+    # The approved verdict must not be clobbered by the rework request.
+    current_decision = json.loads(decision_path.read_text())
+    assert current_decision["decision"] == "approved"
+    assert current_decision["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert current_decision["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert state["prs"]["456"]["decision"] == "approved"
+    assert state["prs"]["456"]["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert state["prs"]["456"]["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert "check_failure_rework_requested_at" in state["prs"]["456"]
+
+    # The rework prompt was written and the issue was labeled for rework.
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert "Tests passed" in prompt_path.read_text(encoding="utf-8")
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    # dispatch_rework can pick the issue up and launch a worker.
+    dispatch = app.dispatch_rework()
+    assert dispatch.data["selected_count"] == 1
+    assert dispatch.data["sessions"][0]["issue_number"] == 123
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+
 def _init_cross_pr_revert_repo(repo_root: Path) -> tuple[str, str, str]:
     """Set up a git repo where main has C and an agent branch merges C then reverts C.
 
