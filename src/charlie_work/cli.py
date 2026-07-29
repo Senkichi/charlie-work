@@ -291,6 +291,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("worktree-clean")
 
+    tripwire = subparsers.add_parser(
+        "tripwire",
+        help="Manage the #502 post-merge unauthorized-merge tripwire",
+    )
+    tripwire_sub = tripwire.add_subparsers(dest="tripwire_command", required=True)
+    tripwire_ack = tripwire_sub.add_parser(
+        "ack",
+        help=(
+            "Acknowledge a post-arming unauthorized-merge finding so it stops "
+            "pinning ok=False on every pass (issue #673). Requires an explicit "
+            "--reason; the tripwire never auto-acknowledges."
+        ),
+    )
+    tripwire_ack.add_argument("pr", type=int, help="PR number to acknowledge")
+    tripwire_ack.add_argument(
+        "--reason",
+        default=None,
+        help=(
+            "Why this finding is triaged (e.g. 'root cause fixed in #N', "
+            "'confirmed benign per #634 audit'). Mandatory — a tripwire that "
+            "can be silenced silently is no control. Validated by the handler "
+            "so a missing reason exits 1 (a command failure) rather than 2 "
+            "(an argparse usage error), matching every other command."
+        ),
+    )
+    tripwire_ack.add_argument(
+        "--by",
+        default=None,
+        help="Operator who acknowledged the finding (recorded for audit).",
+    )
+
     return parser
 
 
@@ -1098,6 +1129,10 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
+    if args.command == "tripwire":
+        if args.tripwire_command == "ack":
+            return app.ack_unauthorized_merge(args.pr, args.reason or "", by=args.by)
+        return CommandResult(False, f"unknown tripwire command: {args.tripwire_command}", {})
     if args.command == "bash-rats":
         from .supervise import run_supervised, try_acquire_supervisor_lock
 

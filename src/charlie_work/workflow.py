@@ -1791,6 +1791,16 @@ def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
 # the tests that pre-arm it cannot drift apart on a string literal.
 UNAUTHORIZED_MERGE_BASELINE_KEY = "unauthorized_merge_baseline"
 
+# state.json key holding the ongoing acknowledgment set for post-arming
+# unauthorized-merge findings (issue #673). The baseline (#510) suppresses
+# *pre-arming* history once; this set suppresses *post-arming* findings that a
+# human or automated remediation has explicitly triaged, so a confirmed,
+# already-actioned finding stops pinning ok=False on every subsequent pass.
+# Like the baseline it is an explicit set of PR numbers (never a high-water
+# mark) and is only ever populated by an explicit `charlie tripwire ack` action
+# — the tripwire never auto-acknowledges, or it would defeat itself.
+UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
+
 
 @dataclass(frozen=True)
 class ReviewSessionOutcome:
@@ -13836,6 +13846,21 @@ class OrchestratorApp:
         auditable, and reports nothing. Every later pass reports only merges
         absent from that baseline.
 
+        A second, ongoing dedupe layer handles *post-arming* findings (issue
+        #673). The baseline suppresses history once; it cannot suppress a
+        genuine bypass that lands after arming, and without an ack mechanism
+        such a finding is re-appended to ``errors`` on every single pass for as
+        long as it stays inside ``merged_pr_list()``'s 500-PR window — pinning
+        ``ok=False`` forever and drowning any new signal in constant noise. That
+        is the same "a control that can never go quiet is not a control" failure
+        the baseline exists to prevent, arriving from the other direction. So a
+        finding that has been explicitly acknowledged via
+        ``ack_unauthorized_merge`` (state key ``unauthorized_merge_acknowledged``,
+        a ``{pr_number: {acknowledged_at, reason, by}}`` map) is filtered out of
+        the reported candidates the same way the baseline filters pre-arming
+        history. Acknowledgment is never automatic — it requires an explicit
+        ``charlie tripwire ack`` action — or the tripwire would defeat itself.
+
         Why an explicit set of PR numbers and not a high-water PR number: a
         number watermark also exempts any PR that was already open when the
         control armed but merges afterwards. That is not hypothetical here — at
@@ -13861,10 +13886,29 @@ class OrchestratorApp:
             raw = baseline.get("pre_existing_prs") or []
             return {int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)}
 
+        def _acked(ack_map: Any) -> set[int]:
+            # The ack set is a JSON object keyed by string PR numbers (JSON keys
+            # are always strings). Parse them back to int so the membership test
+            # against the int ``c["pr"]`` candidates works.
+            if not isinstance(ack_map, dict):
+                return set()
+            out: set[int] = set()
+            for n in ack_map:
+                try:
+                    out.add(int(n))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
         state = load_state_locked(self.paths.state_file)
         if isinstance(state.get(key), dict):
             pre_existing = _suppressed(state.get(key))
-            return [c for c in candidates if c["pr"] not in pre_existing]
+            acknowledged = _acked(state.get(UNAUTHORIZED_MERGE_ACK_KEY))
+            return [
+                c
+                for c in candidates
+                if c["pr"] not in pre_existing and c["pr"] not in acknowledged
+            ]
 
         # ---- arming pass ----
         pre_existing_now = sorted({int(c["pr"]) for c in candidates})
@@ -13886,7 +13930,12 @@ class OrchestratorApp:
                 # Another pass armed between the read above and this lock. Its
                 # baseline wins, so arming is idempotent and never re-widens.
                 pre_existing = _suppressed(locked.get(key))
-                return [c for c in candidates if c["pr"] not in pre_existing]
+                acknowledged = _acked(locked.get(UNAUTHORIZED_MERGE_ACK_KEY))
+                return [
+                    c
+                    for c in candidates
+                    if c["pr"] not in pre_existing and c["pr"] not in acknowledged
+                ]
             locked[key] = {
                 "armed_at": utc_now(),
                 "pre_existing_prs": pre_existing_now,
@@ -13908,6 +13957,65 @@ class OrchestratorApp:
             ", ".join(f"#{n}" for n in pre_existing_now) or "none",
         )
         return []
+
+    def ack_unauthorized_merge(
+        self, pr_number: int, reason: str, *, by: str | None = None
+    ) -> CommandResult:
+        """Acknowledge a post-arming unauthorized-merge finding so it stops pinning ok=False.
+
+        The #502 tripwire's pre-arming baseline (``_apply_unauthorized_merge_baseline``)
+        suppresses history once. It has no equivalent for *post-arming* findings, so a
+        single confirmed, already-actioned bypass is re-detected and re-appended to
+        ``loop()``'s ``errors`` bucket on every pass for as long as the merged PR stays
+        inside ``merged_pr_list()``'s 500-PR REST window — pinning ``ok=False`` forever
+        and drowning any new signal (issue #673).
+
+        This records an explicit acknowledgment in ``state.json`` under
+        ``unauthorized_merge_acknowledged`` (a ``{pr_number: {acknowledged_at, reason,
+        by}}`` map). The tripwire filters acknowledged PRs out of its reported
+        candidates the same way it filters pre-arming history, so the finding keeps its
+        bite until acked and then goes quiet, freeing ``ok=False`` / ``errors`` to mean
+        "there is something new to look at" again.
+
+        Acknowledgment is never automatic — that would defeat the tripwire. It requires
+        this explicit action (exposed as ``charlie tripwire ack``), mirroring how
+        ``agent:human-needed`` requires explicit human action to clear. A non-empty
+        ``reason`` is mandatory: a tripwire that can be silenced silently is no control.
+        Re-acking the same PR updates the record (new reason/by/timestamp) rather than
+        duplicating or refusing, so a finding's triage state can be corrected.
+        """
+        if not reason.strip():
+            return CommandResult(
+                False,
+                "a non-empty --reason is required to acknowledge an unauthorized-merge "
+                "finding (a tripwire that can be silenced silently is no control)",
+                {"pr": pr_number},
+            )
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+            if not isinstance(acks, dict):
+                acks = {}
+            acks[str(pr_number)] = {
+                "acknowledged_at": utc_now(),
+                "reason": reason,
+                "by": by,
+            }
+            state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+            state = self._record_event(
+                state,
+                "unauthorized_merge_acknowledged",
+                {"pr": pr_number, "reason": reason, "by": by},
+            )
+            save_state(self.paths.state_file, state)
+
+        return CommandResult(
+            True,
+            f"acknowledged unauthorized-merge finding for PR #{pr_number}; "
+            "it will no longer pin ok=False",
+            {"pr": pr_number, "reason": reason, "by": by},
+        )
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
