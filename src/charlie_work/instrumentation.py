@@ -147,6 +147,11 @@ _WARNING_KINDS = frozenset(
         "dispatch_merged_pr_mention_flagged",
         "review_dispatch_lifecycle_reaped",
         "session_rate_limit_deferred",
+        # Issue #612: a quota-dead reviewer session is a handled backoff
+        # (the fleet defers and probes), not a crash — warning, like the
+        # analogous session_rate_limit_deferred. Distinct from the per-PR
+        # review_dispatch_stalled (error) that fires alongside it.
+        "review_quota_exhausted",
     }
 )
 

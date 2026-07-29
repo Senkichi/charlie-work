@@ -6953,6 +6953,263 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
     assert "carry_forward_tier" not in decision
 
 
+def test_update_approval_head_records_event_for_every_tier(tmp_path: Path) -> None:
+    """Issue #638: ``_update_approval_head`` must record a carry-forward event
+    itself, so a new call site cannot forget it. The event kind is
+    tier-dependent so the three mechanisms (patch-id, line-content,
+    verified-sync) stay separately auditable, and exactly one event is
+    emitted per call."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_number = 456
+    issue_number = 123
+    decision_dir = paths.prs / f"pr-{pr_number}"
+    decision_dir.mkdir(parents=True)
+
+    def _run(tier: str, old_head: str, new_head: str) -> dict[str, Any]:
+        decision = {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": "pid-xyz",
+        }
+        (decision_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+        app._update_approval_head(
+            pr_number,
+            decision,
+            new_head,
+            old_head=old_head,
+            issue_number=issue_number,
+            tier=tier,
+        )
+        return load_state(paths.state_file)
+
+    expected_kind = {
+        "patch-id": "verdict_carried_forward_clean_rebase",
+        "line-content": "verdict_carried_forward_line_content",
+        "verified-sync": "verdict_carried_forward_verified_sync",
+    }
+
+    for tier, kind in expected_kind.items():
+        state = _run(tier, f"old-{tier}", f"new-{tier}")
+        carry_events = [e for e in state["events"] if e["kind"] == kind]
+        assert len(carry_events) == 1, f"tier {tier}: expected 1 {kind} event"
+        payload = carry_events[0]["payload"]
+        assert payload["pr_number"] == pr_number
+        assert payload["issue_number"] == issue_number
+        assert payload["old_reviewed_head_sha"] == f"old-{tier}"
+        assert payload["new_head_sha"] == f"new-{tier}"
+        assert payload["carry_forward_tier"] == tier
+        assert payload["carried_forward_from"] == [f"old-{tier}"]
+
+
+def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
+    """Issue #638: the ``review_queue()`` carry-forward path (one of the three
+    previously-silent call sites) must record a carry-forward event, not just
+    mutate ``review-decision.json`` and ``state.json``."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+    assert result.ok is True
+
+    state = load_state(app.paths.state_file)
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_clean_rebase"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["carry_forward_tier"] == "patch-id"
+
+
+def test_merge_ready_post_update_branch_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the post-``pr_update_branch`` + ``_verify_synced_head``
+    carry-forward inside ``merge_ready`` (a previously-silent
+    ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="broadcast",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    pr_number = 456
+    issue_number = 123
+    old_head = "sha-abc123"
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "MERGEABLE",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Advance the base tip so the PR is stale and triggers pr_update_branch.
+    post_merge_base = "main-merged-sha"
+    fake_gh.base_head_sha = post_merge_base
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": old_head}]}
+
+    result = app.merge_ready(pr_number, merge=False)
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
+def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the front-of-train ``_update_open_agent_prs`` carry-forward
+    (a previously-silent ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == 789
+    assert payload["issue_number"] == 124
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
 def _dispatch_reviews_app(
     tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
 ) -> OrchestratorApp:
