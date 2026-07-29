@@ -244,11 +244,16 @@ def test_kill_process_tree_enumerates_children() -> None:
     """Test that kill_process_tree enumerates and includes child PIDs."""
     # Spawn a real parent process that will spawn a child
     # On POSIX, use start_new_session=True to avoid sharing pytest's process group
+    # The parent imports ``sys`` before referencing ``sys.executable``; without it
+    # the parent crashes with NameError before spawning the child, and the test
+    # silently no-ops via the empty-children skip path (a false positive).
     parent_proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import subprocess; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); import time; time.sleep(10)",
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+            "time.sleep(10)",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -256,21 +261,32 @@ def test_kill_process_tree_enumerates_children() -> None:
     )
 
     try:
-        # Give the parent time to spawn the child
         import time
 
-        time.sleep(0.5)
-
-        # Get the actual child PID(s)
         from charlie_work.process_utils import _enumerate_child_pids
 
-        child_pids = _enumerate_child_pids(parent_proc.pid)
+        # Poll for the child to appear instead of sampling once. Under full-suite
+        # CPU contention the child may not be visible to a single CIM/proc
+        # snapshot immediately, and on Windows the enumeration itself may
+        # transiently time out and return ``[]`` (swallowed by design). A bounded
+        # retry distinguishes "child not yet visible" (keep waiting) from "no
+        # child was spawned / enumeration failed" (skip), avoiding a spurious
+        # assertion failure on unrelated PRs. See issue #608.
+        deadline = time.monotonic() + 10.0
+        child_pids: list[int] = []
+        while time.monotonic() < deadline:
+            if parent_proc.poll() is not None:
+                pytest.skip(f"parent process {parent_proc.pid} exited before spawning a child")
+            child_pids = _enumerate_child_pids(parent_proc.pid)
+            if child_pids:
+                break
+            time.sleep(0.25)
 
         if not child_pids:
-            # If no children were spawned, skip this test
-            parent_proc.terminate()
-            parent_proc.wait()
-            return
+            pytest.skip(
+                f"no child of parent {parent_proc.pid} became visible within "
+                f"the deadline; enumeration may have failed under load"
+            )
 
         # Kill the parent process tree
         killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
