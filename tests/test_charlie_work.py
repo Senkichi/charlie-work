@@ -9756,7 +9756,7 @@ def test_run_cross_family_sanitizes_environment(
 def test_run_cross_family_sanitizes_environment_with_repo_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When repo has .venv, VIRTUAL_ENV must be set to that path."""
+    """When repo has .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be pinned to it."""
     from charlie_work.env_sanitize import sanitize_env
 
     repo_root = tmp_path / "repo"
@@ -9771,8 +9771,8 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
     env = sanitize_env(repo_root)
 
     assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
-    assert "UV_PROJECT_ENVIRONMENT" not in env, (
-        "UV_PROJECT_ENVIRONMENT must be dropped when repo has .venv"
+    assert env.get("UV_PROJECT_ENVIRONMENT") == str(repo_venv), (
+        "UV_PROJECT_ENVIRONMENT must be pinned to repo .venv (issue #649)"
     )
 
 

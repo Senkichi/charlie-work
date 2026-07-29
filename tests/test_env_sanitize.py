@@ -245,3 +245,97 @@ def test_resolve_uv_no_sync_config_can_force_it_without_a_venv(
     value, source = resolve_uv_no_sync(worktree_path, sanitized, {UV_NO_SYNC_VAR: "1"})
 
     assert (value, source) == ("1", "config")
+
+
+# ---------------------------------------------------------------------------
+# Issue #649: UV_PROJECT_ENVIRONMENT pin confines uv to the worktree's own venv
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_pins_uv_project_environment_when_venv_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree with its own .venv must get UV_PROJECT_ENVIRONMENT pinned to it.
+
+    UV_NO_SYNC only gates `uv run`'s implicit sync — an explicit `uv sync` still
+    resolves and rewrites the project environment. VIRTUAL_ENV alone does not
+    bind uv (uv ignores it during project operations by default). Pinning
+    UV_PROJECT_ENVIRONMENT to the worktree's own .venv confines an explicit
+    `uv sync` to THIS venv by construction, so a junctioned shared venv cannot
+    be rewritten out from under sibling workers.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+
+    env = sanitize_env(worktree_path)
+
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(worktree_venv)
+
+
+def test_sanitize_env_omits_uv_project_environment_when_no_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree without its own .venv must NOT get UV_PROJECT_ENVIRONMENT set.
+
+    With no target venv there is nothing to pin, and any ambient value was the
+    orchestrator's leak (popped unconditionally on entry). The key must be
+    absent so uv is free to manage its own venv.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+
+    env = sanitize_env(worktree_path)
+
+    assert "UV_PROJECT_ENVIRONMENT" not in env
+
+
+def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchanged_with_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The orchestrator's ambient UV_PROJECT_ENVIRONMENT must never reach the
+    worker unchanged — pins issue #117's leak guarantee, which this change must
+    not erode.
+
+    When the worktree has a .venv, the orchestrator's value is popped and then
+    re-set to the worktree's own venv, so the leaked value is replaced rather
+    than passed through. When it has no .venv, the value is simply absent.
+    """
+    orchestrator_venv = "/orchestrator/.venv"
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", orchestrator_venv)
+
+    # With a worktree .venv: the orchestrator's value is replaced by the pin.
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    worktree_venv = worktree_path / ".venv"
+    worktree_venv.mkdir()
+
+    env = sanitize_env(worktree_path)
+
+    assert env.get("UV_PROJECT_ENVIRONMENT") == str(worktree_venv), (
+        "UV_PROJECT_ENVIRONMENT must be pinned to the worktree venv, not the "
+        "orchestrator's leaked value"
+    )
+    assert env["UV_PROJECT_ENVIRONMENT"] != orchestrator_venv, (
+        "the orchestrator's ambient UV_PROJECT_ENVIRONMENT must not survive "
+        "into the returned env unchanged"
+    )
+
+
+def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchanged_without_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The orchestrator's ambient UV_PROJECT_ENVIRONMENT must be dropped when
+    the worktree has no .venv (issue #117 leak guard, undisturbed by #649).
+    """
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    env = sanitize_env(worktree_path)
+
+    assert "UV_PROJECT_ENVIRONMENT" not in env

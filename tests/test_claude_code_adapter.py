@@ -2193,7 +2193,7 @@ def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
 def test_sanitize_env_sets_worktree_venv_when_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When worktree has .venv, VIRTUAL_ENV must be set to that path."""
+    """When worktree has .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be pinned to it."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
     worktree_venv = worktree_path / ".venv"
@@ -2208,8 +2208,8 @@ def test_sanitize_env_sets_worktree_venv_when_present(
     assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
         "VIRTUAL_ENV must be set to worktree .venv"
     )
-    assert "UV_PROJECT_ENVIRONMENT" not in env, (
-        "UV_PROJECT_ENVIRONMENT must be dropped when worktree has .venv"
+    assert env.get("UV_PROJECT_ENVIRONMENT") == str(worktree_venv), (
+        "UV_PROJECT_ENVIRONMENT must be pinned to worktree .venv (issue #649)"
     )
 
 
@@ -2330,8 +2330,11 @@ def test_launch_sanitizes_with_worktree_venv(
     probe_path = Path(record.worktree_path) / "env-received.txt"
     read_worker_marker(
         probe_path,
-        expected=f"{str(worktree_venv)}|<unset>",
-        reason="VIRTUAL_ENV must be worktree .venv, UV_PROJECT_ENVIRONMENT must be absent",
+        expected=f"{str(worktree_venv)}|{str(worktree_venv)}",
+        reason=(
+            "VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must both be pinned to the "
+            "worktree .venv (issue #649)"
+        ),
     )
 
 
@@ -2448,10 +2451,12 @@ def test_launch_override_precedence_with_worktree_venv(
     probe_path = Path(record.worktree_path) / "env-received.txt"
     read_worker_marker(
         probe_path,
-        expected="/custom/.venv|<unset>|custom-value",
+        expected=f"/custom/.venv|{str(worktree_venv)}|custom-value",
         reason=(
             "user-provided VIRTUAL_ENV must win over worktree .venv "
-            "(merge order: sanitizer first, then user overrides)"
+            "(merge order: sanitizer first, then user overrides); "
+            "UV_PROJECT_ENVIRONMENT stays pinned to the worktree .venv since "
+            "the override did not touch it (issue #649)"
         ),
     )
 

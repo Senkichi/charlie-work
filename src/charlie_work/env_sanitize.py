@@ -25,6 +25,17 @@ value already present in the orchestrator's own environment, or an operator
 override supplied via ``worker_env``, always wins over the default. See
 ``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
 by callers that need to log which layer supplied the final value.
+
+Shared-venv confinement (issue #649): when the target worktree has a
+``.venv``, ``sanitize_env`` also pins ``UV_PROJECT_ENVIRONMENT`` to it. uv
+ignores ``VIRTUAL_ENV`` during project operations by default, and
+``UV_NO_SYNC`` only gates ``uv run``'s implicit sync — neither stops an
+explicit ``uv sync`` from rewriting a junctioned shared venv out from under
+sibling workers. Pinning ``UV_PROJECT_ENVIRONMENT`` confines uv to THIS
+worktree's venv by construction. The ambient orchestrator value is always
+popped first (issue #117 leak guard), then re-set to the worktree venv, so
+the orchestrator's value never survives unchanged; a config-level
+``worker_env`` override still wins via the post-sanitize merge.
 """
 
 from __future__ import annotations
@@ -47,15 +58,19 @@ from pathlib import Path
 PYTEST_XDIST_AUTO_NUM_WORKERS_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 
-# Issue #646: pairs with the cap above. Worktrees in this fleet commonly share
-# a junctioned/copied .venv (see create_worktree's venv_source handling) —
-# when one worker's `uv run`/`uv sync` is left free to resolve/reinstall that
-# shared venv while sibling workers are concurrently running out of it, the
-# reinstall can wipe site-packages out from under them mid-run (2 prior
-# incidents referenced from job-cannon's own CLAUDE.md; the risk here is
-# analogous whenever venv_source is configured). UV_NO_SYNC must only ever be
-# set alongside a confirmed .venv — never unconditionally, since a worktree
-# legitimately without one still wants uv to manage its own.
+# Issue #646 / #649: pairs with the cap above. UV_NO_SYNC gates only `uv run`'s
+# *implicit* sync (the `--no-sync` flag, per uv docs) — it does NOT gate an
+# explicit `uv sync`, which still resolves and rewrites the project environment.
+# So UV_NO_SYNC alone cannot protect a shared/junctioned .venv from a worker's
+# explicit `uv sync` rewriting it out from under sibling workers. That
+# protection comes from pinning UV_PROJECT_ENVIRONMENT to the worktree's own
+# .venv in sanitize_env (issue #649), which confines uv to THIS worktree's venv
+# by construction. UV_NO_SYNC is still worth keeping alongside a confirmed
+# .venv: it prevents `uv run`'s implicit sync from pruning extras a worker
+# needs, but it is a convenience guard, not the shared-venv safety boundary.
+# UV_NO_SYNC must only ever be set alongside a confirmed .venv — never
+# unconditionally, since a worktree legitimately without one still wants uv to
+# manage its own.
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
 _UV_NO_SYNC_DEFAULT = "1"
 
@@ -66,7 +81,13 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
     to prevent the orchestrator's venv from leaking into worker sessions. If the
     target path contains a .venv directory, VIRTUAL_ENV is set to that path
-    instead of being dropped.
+    instead of being dropped, and UV_PROJECT_ENVIRONMENT is pinned to it so an
+    explicit ``uv sync`` inside the worker cannot resolve/rewrite a
+    shared/junctioned venv out from under sibling workers (issue #649).
+    VIRTUAL_ENV alone does not bind uv (uv ignores it during project operations
+    by default), and UV_NO_SYNC only gates ``uv run``'s implicit sync — neither
+    protects a junctioned shared venv from an explicit ``uv sync``. Pinning
+    UV_PROJECT_ENVIRONMENT makes the shared venv unreachable by construction.
 
     This is a defense-in-depth measure: workers should resolve their own
     environment via uv run --active or similar, not inherit the orchestrator's.
@@ -80,12 +101,24 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     target_venv = target_path / ".venv"
 
-    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
+    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks (issue #117):
+    # any ambient value at this point is by definition the orchestrator's.
     env.pop("UV_PROJECT_ENVIRONMENT", None)
 
     if target_venv.is_dir():
         # Target has its own venv — use it
         env["VIRTUAL_ENV"] = str(target_venv)
+        # Confine uv to THIS worktree's venv (issue #649). Plain assignment
+        # rather than setdefault: the unconditional pop above guarantees the
+        # key is absent here, so setdefault would be a no-op vs assignment, and
+        # assignment makes the pin intent explicit. A config-level worker_env
+        # override merged AFTER sanitize_env (the established launcher pattern,
+        # see claude_code.py/devin_shell.py) still wins via dict-spread, so an
+        # operator who deliberately wants a different UV_PROJECT_ENVIRONMENT
+        # can override it. VIRTUAL_ENV alone does not bind uv, and UV_NO_SYNC
+        # only gates `uv run`'s implicit sync — neither stops an explicit
+        # `uv sync` from rewriting a junctioned shared venv. This pin does.
+        env["UV_PROJECT_ENVIRONMENT"] = str(target_venv)
     else:
         # No target venv — drop VIRTUAL_ENV to prevent leaks
         env.pop("VIRTUAL_ENV", None)
