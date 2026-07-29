@@ -260,6 +260,19 @@ def build_parser() -> argparse.ArgumentParser:
     runners_sub.add_parser("status")
     ensure_started_parser = runners_sub.add_parser("ensure-started")
     _add_dry_run(ensure_started_parser)
+    ensure_started_parser.add_argument(
+        "--force",
+        action="store_true",
+        dest="force",
+        help=(
+            "Bypass the runner_allocation single-controller guard. By default "
+            "ensure-started refuses to run when runner_allocation.enabled is true, "
+            "because relaunching every not-running listener silently undoes slot "
+            "parking and burns a full demand_idle_samples hysteresis window "
+            "reconverging. Use this only for a deliberate manual recovery that "
+            "runners allocate cannot do; otherwise prefer `charlie runners allocate`."
+        ),
+    )
     scale_down_parser = runners_sub.add_parser("scale-down")
     _add_dry_run(scale_down_parser)
     autoscale_parser = runners_sub.add_parser("autoscale")
@@ -648,6 +661,16 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     - Returns the number of runners started and status messages
 
     Returns an error if the runner_scaling feature is not enabled.
+
+    Single-controller guard: when ``runner_allocation.enabled`` is true, this
+    command refuses unless ``--force`` is passed. ``ensure_runner_running``
+    relaunches any runner where ``not is_runner_launched(...)`` -- exactly the
+    state a deliberately parked slot is in -- so running it while allocation
+    is enabled restarts every parked listener and silently undoes
+    ``runners allocate``'s parking, burning a full ``demand_idle_samples``
+    hysteresis window reconverging (CLAUDE.md: "``charlie runners allocate``
+    is the only thing allowed to decide which listeners run"). The guard
+    enforces that invariant at one boundary rather than documenting it.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
@@ -657,6 +680,26 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
             ok=False,
             message="runner_scaling feature is not enabled in config",
             data={},
+        )
+
+    # Single-controller guard (issue #598): when runner_allocation is enabled,
+    # `runners allocate` owns the set of running listeners. ensure-started would
+    # relaunch every parked slot (a parked slot is exactly a configured-but-
+    # not-running listener), silently undoing allocation and burning a full
+    # demand_idle_samples hysteresis window reconverging. Refuse and point at
+    # the single controller; --force is the explicit escape hatch for a
+    # deliberate manual recovery that allocate cannot do.
+    force = getattr(args, "force", False)
+    if config.runner_allocation.enabled and not force:
+        return CommandResult(
+            ok=False,
+            message=(
+                "runner_allocation is enabled: `charlie runners allocate` owns "
+                "which listeners run. ensure-started would relaunch every parked "
+                "slot and silently undo allocation. Re-run with --force only for "
+                "a deliberate manual recovery that allocate cannot do."
+            ),
+            data={"runner_allocation_enabled": True},
         )
 
     if not config.runner_scaling.managed_root:

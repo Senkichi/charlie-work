@@ -35,6 +35,7 @@ from charlie_work.runners import (
     ensure_runners_started,
     format_runner_pool_state,
     get_last_scale_event_time,
+    get_runner_launcher_process,
     get_runner_listener_process,
     gracefully_remove_runner,
     is_in_cooldown,
@@ -835,6 +836,80 @@ def test_get_runner_listener_process_windows_match(tmp_path: Path) -> None:
 
     # The function should return None when no matching process exists
     process = get_runner_listener_process(runner_dir)
+    assert process is None
+
+
+def _fake_proc(pid: int, name: str, cmdline: list[str] | None) -> MagicMock:
+    """Build a fake psutil.Process with the .info dict process_iter populates."""
+    proc = MagicMock()
+    proc.info = {"pid": pid, "name": name, "cmdline": cmdline}
+    return proc
+
+
+def test_get_runner_launcher_process_no_script(tmp_path: Path) -> None:
+    """get_runner_launcher_process returns None when the launch script is absent."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    process = get_runner_launcher_process(runner_dir)
+    assert process is None
+
+
+def test_get_runner_launcher_process_no_match(tmp_path: Path) -> None:
+    """get_runner_launcher_process returns None when no plausible wrapper runs."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    (runner_dir / ("run.cmd" if sys.platform == "win32" else "run.sh")).touch()
+
+    procs = [_fake_proc(1, "explorer.exe", ["C:\\Windows\\explorer.exe"])]
+
+    with patch("psutil.process_iter", return_value=procs):
+        process = get_runner_launcher_process(runner_dir)
+    assert process is None
+
+
+def test_get_runner_launcher_process_matches_wrapper(tmp_path: Path) -> None:
+    """A plausible wrapper process whose cmdline references the script is matched."""
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    script = runner_dir / ("run.cmd" if sys.platform == "win32" else "run.sh")
+    script.touch()
+
+    wrapper_name = "cmd.exe" if sys.platform == "win32" else "bash"
+    wrapper_cmd = (
+        ["C:\\Windows\\System32\\cmd.exe", "/c", str(script)]
+        if sys.platform == "win32"
+        else ["/bin/bash", str(script)]
+    )
+    wrapper = _fake_proc(100, wrapper_name, wrapper_cmd)
+    # An unrelated process whose argv merely contains the script path must not
+    # be returned even if it appears first in the iteration.
+    bystander = _fake_proc(101, "Code.exe", ["code", str(script)])
+
+    with patch("psutil.process_iter", return_value=[bystander, wrapper]):
+        process = get_runner_launcher_process(runner_dir)
+    assert process is not None
+    assert process.info["pid"] == 100
+
+
+def test_get_runner_launcher_process_rejects_unrelated_substring(
+    tmp_path: Path,
+) -> None:
+    """An unrelated process whose cmdline contains the script path is not matched.
+
+    Regression for issue #599: previously any process whose argv happened to
+    contain the absolute run.cmd/run.sh path (an editor, grep, a diff tool)
+    was mistaken for the launch wrapper, silently starving the slot.
+    """
+    runner_dir = tmp_path / "jc-1"
+    runner_dir.mkdir()
+    script = runner_dir / ("run.cmd" if sys.platform == "win32" else "run.sh")
+    script.touch()
+
+    bystander_name = "Code.exe" if sys.platform == "win32" else "rg"
+    bystander = _fake_proc(200, bystander_name, [bystander_name, str(script)])
+
+    with patch("psutil.process_iter", return_value=[bystander]):
+        process = get_runner_launcher_process(runner_dir)
     assert process is None
 
 
