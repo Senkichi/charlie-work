@@ -702,6 +702,9 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     quota.pop("throttled_until", None)
     quota.pop("probe_after", None)
     quota.pop("alerted_at", None)
+    # Issue #612: the parsed provider reset time is per-episode; clear it so
+    # a stale value does not linger after the quota window is proven open.
+    quota.pop("reset_at", None)
     return {**data, "reviewer_quota": quota}
 
 
