@@ -1076,9 +1076,16 @@ def _fake_process_iter(monkeypatch: pytest.MonkeyPatch, procs: list[_FakeProc]) 
 
 
 def _launcher_proc(runner_dir: Path, pid: int = 100) -> _FakeProc:
-    """A process whose cmdline names this runner's launch script."""
+    """A process whose cmdline names this runner's launch script.
+
+    The launcher matcher restricts its scan to plausible wrapper image names
+    (``cmd.exe``/``conhost.exe`` on Windows, POSIX shells on Unix) before the
+    cmdline substring test, so the fake must carry a name in that allow-list
+    or it is skipped before the cmdline is ever inspected.
+    """
     script = runner_dir / _platform_launch_script()
-    return _FakeProc(pid, _FakeInfo({"pid": pid, "cmdline": [str(script)]}))
+    name = "cmd.exe" if sys.platform == "win32" else "bash"
+    return _FakeProc(pid, _FakeInfo({"pid": pid, "name": name, "cmdline": [str(script)]}))
 
 
 def _listener_proc(runner_dir: Path, pid: int = 200) -> _FakeProc:
@@ -1127,7 +1134,13 @@ def test_get_runner_launcher_process_returns_none_when_no_cmdline_matches(
         "cw-1",
         script=_platform_launch_script(),
     )
-    other = _FakeProc(300, _FakeInfo({"pid": 300, "cmdline": ["cmd", "/c", "unrelated.cmd"]}))
+    # A plausible wrapper image (so it clears the name filter) but an
+    # unrelated cmdline — the matcher must reject it on the substring test,
+    # not vacuously skip it on the name filter.
+    other_name = "cmd.exe" if sys.platform == "win32" else "bash"
+    other = _FakeProc(
+        300, _FakeInfo({"pid": 300, "name": other_name, "cmdline": ["cmd", "/c", "unrelated.cmd"]})
+    )
     _fake_process_iter(monkeypatch, [other])
 
     assert get_runner_launcher_process(runner_dir) is None
