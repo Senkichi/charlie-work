@@ -8279,6 +8279,185 @@ def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log
     )
 
 
+def test_detect_and_handle_stalled_reviews_suppresses_backoff_after_probe_recovery(
+    tmp_path: Path,
+) -> None:
+    """Issue #662: a dead reviewer whose log shows a throttle signature must
+    NOT re-poison reviewer_quota when a green flat-interval probe already
+    cleared the throttle AFTER the reviewer died. The throttle signature in a
+    dead session's log tail is frozen at death time; re-applying backoff from
+    it would anchor throttled_until/probe_after to "now" rather than the
+    original death time, delaying the next dispatch by up to one probe cycle
+    even though the quota window is open. The claim is still rolled back and
+    the sidecar reaped -- the reviewer is dead regardless, and with the quota
+    recovered the PR should be immediately re-dispatchable.
+    """
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    # Pin the log mtime to 10 minutes ago -- the reviewer died then, and a
+    # green probe cleared the quota 1 minute ago (after death).
+    death_dt = datetime.now(UTC) - timedelta(minutes=10)
+    cleared_dt = datetime.now(UTC) - timedelta(minutes=1)
+    os.utime(log_path, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    cleared_iso = cleared_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        # Simulate a green probe that cleared the quota after the reviewer died.
+        state["reviewer_quota"] = {
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": cleared_iso,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
+    )
+
+    state = _load_state(state_file)
+    pr_state = state["prs"]["100"]
+    # Rolled back, not failed -- immediately re-dispatchable (quota is open).
+    assert pr_state.get("review_dispatch_status") is None
+    assert pr_state.get("reviewer_pid") is None
+
+    quota = state.get("reviewer_quota", {})
+    # Backoff was suppressed: no throttled_until / probe_after re-poisoning.
+    assert not quota.get("throttled_until")
+    assert not quota.get("probe_after")
+    # The recovery marker must survive the sweep unchanged.
+    assert quota.get("last_probe_cleared_at") == cleared_iso
+
+    # The event must record the suppression for observability.
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is True
+        for event in state.get("events", [])
+    )
+    # The sidecar was reaped (one-shot, no re-entry next sweep).
+    assert not (reviews_dir / "issue-100.claude.json").exists()
+
+
+def test_detect_and_handle_stalled_reviews_applies_backoff_when_probe_predates_death(
+    tmp_path: Path,
+) -> None:
+    """Issue #662 control: when the green probe cleared BEFORE the reviewer
+    died, the throttle signature is fresh evidence the quota closed again and
+    backoff must still be applied. Only a probe recovery that post-dates the
+    death suppresses backoff.
+    """
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    # The reviewer died 1 minute ago; the probe cleared 10 minutes ago (before
+    # death) -- the throttle signature is fresh, backoff must engage.
+    death_dt = datetime.now(UTC) - timedelta(minutes=1)
+    cleared_dt = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    cleared_iso = cleared_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        state["reviewer_quota"] = {
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": cleared_iso,
+        }
+        save_state(state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = _load_state(state_file)
+    quota = state.get("reviewer_quota", {})
+    # Backoff applied: throttled_until / probe_after are set.
+    assert quota.get("throttled_until")
+    assert quota.get("probe_after")
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is False
+        for event in state.get("events", [])
+    )
+
+
 def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -10596,6 +10775,48 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
     assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
     # The devin adapter's root throttle must still be untouched.
     assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+
+
+def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
+    """Issue #662: ``clear_quota_throttles`` stamps ``last_probe_cleared_at``
+    on reviewer_quota so the dead-reviewer reap sweep can tell a recovery
+    happened. It is recorded even when reviewer_quota was never exhausted
+    (a green probe clearing a root-only throttle still proves the provider
+    recovered), and survives ``clear_reviewer_quota`` across episodes.
+    """
+    from charlie_work.state import (
+        clear_quota_throttles,
+        clear_reviewer_quota,
+        empty_state,
+        reviewer_quota_last_probe_cleared_at,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    # Reviewer-quota exhaustion present: marker recorded after clear.
+    state = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    cleared = clear_quota_throttles(state)
+    assert reviewer_quota_last_probe_cleared_at(cleared) is not None
+    assert "throttled_until" not in cleared["reviewer_quota"]
+
+    # Root-only throttle (reviewer_quota never set): marker still recorded.
+    root_only = set_throttled_until(
+        empty_state(), "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="claude-code"
+    )
+    cleared_root = clear_quota_throttles(root_only)
+    assert reviewer_quota_last_probe_cleared_at(cleared_root) is not None
+    assert "throttled_until" not in cleared_root["reviewer_quota"]
+
+    # The marker survives a subsequent clear_reviewer_quota (new episode).
+    re_exhausted = set_reviewer_quota_exhausted(
+        cleared_root, throttled_until="2026-09-01T00:00:00Z", probe_after="2026-09-01T00:00:00Z"
+    )
+    re_cleared = clear_reviewer_quota(re_exhausted)
+    assert reviewer_quota_last_probe_cleared_at(
+        re_cleared
+    ) == reviewer_quota_last_probe_cleared_at(cleared_root)
 
 
 def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(

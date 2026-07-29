@@ -120,6 +120,7 @@ from .state import (
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     release_operator_claimed,
+    reviewer_quota_last_probe_cleared_at,
     save_state,
     set_operator_claimed,
     set_reviewer_quota_exhausted,
@@ -2201,8 +2202,14 @@ def _detect_and_handle_stalled_reviews(
         # the launch-time path uses (job-cannon PRs #1342/#1343/#1344/#1346,
         # 2026-07-21: 20+ hours of hot redispatch into a session-limit wall).
         throttled = False
+        log_mtime_dt: datetime | None = None
         try:
-            log_text = Path(w.log_path).read_text(encoding="utf-8", errors="replace")
+            log_file = Path(w.log_path)
+            log_text = log_file.read_text(encoding="utf-8", errors="replace")
+            try:
+                log_mtime_dt = datetime.fromtimestamp(log_file.stat().st_mtime, tz=UTC)
+            except OSError:
+                log_mtime_dt = None
         except OSError:
             log_text = ""
         if log_text:
@@ -2210,11 +2217,38 @@ def _detect_and_handle_stalled_reviews(
             throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
 
         if throttled:
-            if not throttle_backoff_applied:
-                now_dt = datetime.now(UTC)
-                state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
-                throttle_backoff_applied = True
-            throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+            # A green flat-interval probe may have already cleared
+            # reviewer_quota AFTER this reviewer died (issue #662): the
+            # throttle signature in a dead session's log tail is frozen at
+            # death time and does not reflect a recovery that happened
+            # since. Re-applying backoff here would re-poison
+            # reviewer_quota.throttled_until/probe_after anchored to "now"
+            # rather than the original death time, delaying the next
+            # dispatch by up to one probe cycle even though the quota
+            # window is open. Suppress the backoff (but still roll back
+            # the claim and reap the sidecar -- the reviewer is dead
+            # regardless, and with the quota recovered the PR should be
+            # immediately re-dispatchable) when a probe cleared after the
+            # reviewer's last log write, which is the closest available
+            # proxy for when the session died.
+            probe_cleared_at = reviewer_quota_last_probe_cleared_at(state)
+            backoff_suppressed = False
+            if probe_cleared_at and log_mtime_dt is not None:
+                try:
+                    cleared_dt = datetime.fromisoformat(probe_cleared_at.replace("Z", "+00:00"))
+                    if cleared_dt.tzinfo is None:
+                        cleared_dt = cleared_dt.replace(tzinfo=UTC)
+                    backoff_suppressed = cleared_dt > log_mtime_dt
+                except (ValueError, TypeError):
+                    backoff_suppressed = False
+            if backoff_suppressed:
+                throttled_until = None
+            else:
+                if not throttle_backoff_applied:
+                    now_dt = datetime.now(UTC)
+                    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now_dt)
+                    throttle_backoff_applied = True
+                throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
             # A session that exhausted its full turn budget did real
             # PR-specific work -- its death is a PR-level outcome (the
             # review didn't fit the budget) regardless of what killed the
@@ -2252,6 +2286,7 @@ def _detect_and_handle_stalled_reviews(
                         "started_at": w.started_at,
                         "reason": "provider_throttled_turn_limit_counted",
                         "throttled_until": throttled_until,
+                        "backoff_suppressed": backoff_suppressed,
                     },
                     state_path=state_file,
                 )
@@ -2288,6 +2323,7 @@ def _detect_and_handle_stalled_reviews(
                     "started_at": w.started_at,
                     "reason": "provider_throttled",
                     "throttled_until": throttled_until,
+                    "backoff_suppressed": backoff_suppressed,
                 },
                 state_path=state_file,
             )

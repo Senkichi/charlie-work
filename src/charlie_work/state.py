@@ -694,7 +694,11 @@ def mark_reviewer_quota_alerted(data: dict[str, Any]) -> dict[str, Any]:
 def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     """Clear reviewer quota exhaustion state.
 
-    Returns a new state dict; does not mutate ``data``.
+    Returns a new state dict; does not mutate ``data``. The
+    ``last_probe_cleared_at`` recovery marker (written by
+    ``clear_quota_throttles``) is deliberately preserved across clears so the
+    dead-reviewer reap sweep can compare it against a dead session's death
+    time across exhaustion episodes (issue #662).
     """
     quota = _reviewer_quota(data)
     if not quota:
@@ -703,6 +707,20 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     quota.pop("probe_after", None)
     quota.pop("alerted_at", None)
     return {**data, "reviewer_quota": quota}
+
+
+def reviewer_quota_last_probe_cleared_at(data: dict[str, Any]) -> str | None:
+    """Return the timestamp of the last green probe that cleared a throttle.
+
+    Written by ``clear_quota_throttles`` whenever a green ambient-CLI probe
+    clears a claude-code-shaped throttle. Consumed by the dead-reviewer reap
+    sweep (``_detect_and_handle_stalled_reviews``) to suppress re-poisoning
+    ``reviewer_quota`` from a throttle signature frozen in a dead session's
+    log tail when a recovery has already happened after that session died
+    (issue #662). None when no green probe has cleared since the last
+    exhaustion episode (or ever).
+    """
+    return _reviewer_quota(data).get("last_probe_cleared_at")
 
 
 def _quota_probe(data: dict[str, Any]) -> dict[str, Any]:
@@ -843,10 +861,20 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
             "throttle_adapter_kind": None,
         }
     cleared = clear_reviewer_quota(cleared)
-    reviewer_quota = cleared.get("reviewer_quota")
-    if reviewer_quota:
-        cleared = {
-            **cleared,
-            "reviewer_quota": {**reviewer_quota, "consecutive_probe_failures": 0},
-        }
+    reviewer_quota = cleared.get("reviewer_quota") or {}
+    # Stamp the recovery time so the dead-reviewer reap sweep can suppress
+    # backoff for sessions whose throttle signature predates this recovery
+    # (issue #662): a dead reviewer's log tail is frozen at death time and
+    # does not reflect a quota window that has since reopened, so re-applying
+    # backoff from it would re-poison reviewer_quota anchored to "now" rather
+    # than the original death time. Always populate reviewer_quota (even when
+    # it was absent) so the marker survives regardless of which throttle was
+    # active -- the exhaustion checks treat a missing throttled_until/probe_after
+    # as "not exhausted", so an ever-present recovery marker is benign.
+    reviewer_quota = {
+        **reviewer_quota,
+        "consecutive_probe_failures": 0,
+        "last_probe_cleared_at": utc_now(),
+    }
+    cleared = {**cleared, "reviewer_quota": reviewer_quota}
     return cleared
