@@ -1369,7 +1369,19 @@ def fleet_loop(
         "orphan_sweep_calls": orphan_sweep_calls,
         "emitted": False,
     }
-    if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
+    # Build the digest whenever notify is on, then gate the *emission* on the
+    # built digest's transitions (the inner ``if attention_digest.transitions``
+    # added by #669). The previous outer ``and attention_events`` test was
+    # redundant with that inner gate and tested a different, rawer signal — a
+    # converged pass (every event routed to an explicit ``continue``, e.g. a
+    # healthy ``runner_allocation``) has a non-empty ``attention_events`` list
+    # but an empty ``transitions`` tuple, so the two tests disagreed on whether
+    # to enter this block. #669's inner gate already prevented the
+    # ``emit_digest(transitions=())`` empty-envelope call for that case; this
+    # drop removes the contradictory outer condition rather than fixing a
+    # currently-reproducing emission (issue #610). The ``notify_config`` check
+    # stays outermost so no digest is built when notify is off.
+    if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
         attention_digest = _build_fleet_attention_digest(
             attention_events, state_file=health_state_file
