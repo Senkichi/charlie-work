@@ -7404,6 +7404,7 @@ class OrchestratorApp:
                                 decision,
                                 live_head_sha,
                                 old_head=reviewed_head_sha,
+                                issue_number=issue_number,
                                 tier=check.tier or "patch-id",
                                 new_patch_id=check.live_patch_id,
                                 new_signature=check.live_signature,
@@ -9339,6 +9340,7 @@ class OrchestratorApp:
                         decision,
                         live_head_sha,
                         old_head=old_reviewed_head_sha,
+                        issue_number=issue_number,
                         tier=check.tier or "patch-id",
                         new_patch_id=check.live_patch_id,
                         new_signature=check.live_signature,
@@ -9363,28 +9365,10 @@ class OrchestratorApp:
                             "consecutive_failed_merge_attempts": 0,
                             "consecutive_stale_base_deferrals": 0,
                         }
-                        # Tier 1 keeps its original event kind/payload shape
-                        # (issue #375/#412); tier 2 (issue #414) gets its own
-                        # distinct kind so the two mechanisms stay separately
-                        # auditable in the events log.
-                        event_kind = (
-                            "verdict_carried_forward_clean_rebase"
-                            if check.tier == "patch-id"
-                            else "verdict_carried_forward_line_content"
-                        )
-                        state = self._record_event(
-                            state,
-                            event_kind,
-                            {
-                                "pr_number": pr_number,
-                                "issue_number": issue_number,
-                                "old_reviewed_head_sha": old_reviewed_head_sha,
-                                "new_head_sha": live_head_sha,
-                                "patch_id": check.live_patch_id,
-                                "carry_forward_tier": check.tier,
-                                "carried_forward_from": decision.get("carried_forward_from", []),
-                            },
-                        )
+                        # The carry-forward event itself is recorded inside
+                        # _update_approval_head (issue #638) so every call
+                        # site is instrumented uniformly; do NOT re-record
+                        # here or the transition is double-counted.
                         save_state(self.paths.state_file, state)
                     carried_forward = True
             if head_moved and not carried_forward:
@@ -9556,7 +9540,11 @@ class OrchestratorApp:
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
                         if new_head and new_head != live_head_sha:
                             self._update_approval_head(
-                                pr_number, decision, new_head, old_head=live_head_sha
+                                pr_number,
+                                decision,
+                                new_head,
+                                old_head=live_head_sha,
+                                issue_number=issue_number,
                             )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
@@ -10569,7 +10557,17 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(pr_number, decision, new_head, old_head=old_head)
+            self._update_approval_head(
+                pr_number,
+                decision,
+                new_head,
+                old_head=old_head,
+                issue_number=linked_issue_number(
+                    pr,
+                    is_cross_repository=pr.get("isCrossRepository"),
+                    branch_prefix=self.config.dispatch.branch_prefix,
+                ),
+            )
             return [
                 {
                     "pr_number": pr_number,
@@ -11493,6 +11491,7 @@ class OrchestratorApp:
         new_head: str,
         old_head: str | None = None,
         *,
+        issue_number: int | None = None,
         tier: str = "verified-sync",
         new_patch_id: str | None = None,
         new_signature: DiffContentSignature | None = None,
@@ -11517,6 +11516,18 @@ class OrchestratorApp:
         pointlessly defeat that head's own future tier-1 fast path: patch-id
         is unstable across every main advance, not just the one just
         carried past.
+
+        A carry-forward event is recorded here, inside the locked section
+        that already persists the transition, so every call site is
+        instrumented by construction — a new caller cannot forget it
+        (issue #638). The event kind is tier-dependent so the three
+        mechanisms (``verdict_carried_forward_clean_rebase`` for patch-id,
+        ``verdict_carried_forward_line_content`` for line-content, and
+        ``verdict_carried_forward_verified_sync`` for the structurally-
+        verified sync that never compared patch-ids) stay separately
+        auditable in the events log. Callers that previously recorded the
+        event themselves must NOT do so anymore, or the transition would be
+        double-counted.
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
         updated_decision = dict(decision)
@@ -11533,6 +11544,13 @@ class OrchestratorApp:
             carried_forward.append(old_head)
         updated_decision["carried_forward_from"] = carried_forward
         self._write_json(decision_path, updated_decision)
+
+        if tier == "patch-id":
+            event_kind = "verdict_carried_forward_clean_rebase"
+        elif tier == "line-content":
+            event_kind = "verdict_carried_forward_line_content"
+        else:
+            event_kind = "verdict_carried_forward_verified_sync"
 
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -11551,6 +11569,19 @@ class OrchestratorApp:
                 "carry_forward_tier": tier,
                 "carried_forward_from": carried_forward,
             }
+            state = self._record_event(
+                state,
+                event_kind,
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "old_reviewed_head_sha": old_head,
+                    "new_head_sha": new_head,
+                    "patch_id": new_patch_id,
+                    "carry_forward_tier": tier,
+                    "carried_forward_from": carried_forward,
+                },
+            )
             save_state(self.paths.state_file, state)
 
     def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
