@@ -68,10 +68,12 @@ re-check, or an ``OSError`` raised by the underlying move, both come back as
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 
+from . import safe_path
 from .worktree import _list_worktrees_porcelain
 
 #: SQLite WAL-mode side-file suffixes. A child ending in one of these is part
@@ -367,6 +369,17 @@ def plan_state_dir_migration(
         reasons: list[str] = []
         remediation: list[str] = []
 
+        if not _is_lexically_contained(src_root, child):
+            reasons.append(
+                f"source {child} is not inside the source root {src_root} -- refusing to "
+                "move a path from outside the tree being migrated"
+            )
+        if not _is_lexically_contained(dst_root, dst_path):
+            reasons.append(
+                f"destination {dst_path} escapes the destination root {dst_root} "
+                f"(child name {name!r})"
+            )
+
         nested = sorted(
             (reg for reg in registered_worktrees if _is_equal_or_nested(reg, child)),
             key=str,
@@ -479,6 +492,25 @@ def gather_migration_inputs(*, repo_root: Path, src_root: Path, dst_root: Path) 
         dst_names=dst_names,
         registered_worktrees=registered_worktrees,
     )
+
+
+def _is_lexically_contained(root: Path, candidate: Path) -> bool:
+    """Exact-prefix containment decided *lexically*, without touching the filesystem.
+
+    The planner is pure, so it cannot use :func:`charlie_work.safe_path.contains`
+    (which resolves both sides on disk). The two checks are not redundant: this one
+    catches a name whose *shape* escapes -- ``..`` (note ``Path("..").name`` is
+    ``".."``, so ``dst_root / name`` genuinely climbs out) or a caller-supplied
+    absolute path outside the tree -- while the actuator's on-disk check catches an
+    escape that exists only after resolution, i.e. through a junction or symlink.
+    Neither subsumes the other, and only the lexical one can run in a pure function.
+
+    Exact-prefix, not a bare ``startswith``: the latter would treat a sibling
+    ``<root>-old`` as contained, the hazard CLAUDE.md documents for ``$WT_ROOT``.
+    """
+    root_key = os.path.normcase(os.path.normpath(str(root)))
+    candidate_key = os.path.normcase(os.path.normpath(str(candidate)))
+    return candidate_key == root_key or candidate_key.startswith(root_key.rstrip("\\/") + os.sep)
 
 
 def _default_mover(src: Path, dst: Path) -> None:
@@ -607,6 +639,24 @@ def apply_state_dir_migration(
 
     for child in movable:
         try:
+            # On-disk containment, re-checked here and not only in the planner: a
+            # junction or symlink can make a lexically-contained path resolve outside
+            # the tree, and only a resolving check sees that. The rehearsal trees carry
+            # .venv junctions, and CLAUDE.md's managed_root invariant is exactly this
+            # hazard. Aborts the whole run like any other divergence.
+            if not safe_path.contains(plan.src_root, child.src_path) or not safe_path.contains(
+                plan.dst_root, child.dst_path
+            ):
+                return MigrationOutcome(
+                    ok=False,
+                    moved=tuple(moved),
+                    aborted_at=child.name,
+                    error=(
+                        f"aborting migration: {child.name} resolves outside the migration "
+                        f"roots on disk ({child.src_path} -> {child.dst_path}); a junction "
+                        "or symlink escapes the tree"
+                    ),
+                )
             if not child.src_path.exists():
                 return MigrationOutcome(
                     ok=False,

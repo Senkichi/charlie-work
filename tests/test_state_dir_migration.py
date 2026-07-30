@@ -30,6 +30,7 @@ history):
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -935,3 +936,87 @@ def test_apply_oserror_from_mover_returns_ok_false_not_raised(tmp_path: Path) ->
     # The fake mover raised before performing any real move.
     assert (src_root / "issues").exists()
     assert (src_root / "prs").exists()
+
+
+def test_plan_blocks_child_whose_source_is_outside_src_root(tmp_path: Path) -> None:
+    """A caller-supplied path from outside the tree is blocked, not moved.
+
+    ``plan_state_dir_migration`` is public and takes ``src_children`` verbatim, and
+    ``MigrationChild.src_path`` is that path unchanged. Without this rule the actuator
+    would happily relocate any path handed to it.
+    """
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    src_root.mkdir()
+    outsider = tmp_path / "elsewhere" / "secrets"
+    outsider.parent.mkdir()
+    outsider.mkdir()
+
+    plan = plan_state_dir_migration(
+        repo_root=tmp_path,
+        src_root=src_root,
+        dst_root=dst_root,
+        src_children=[outsider],
+        dst_names=[],
+        registered_worktrees=[],
+    )
+
+    assert [child.name for child in plan.blocked] == ["secrets"]
+    assert any("not inside the source root" in reason for reason in plan.blocked[0].reasons)
+
+
+def test_plan_blocks_dotdot_child_that_climbs_out_of_dst_root(tmp_path: Path) -> None:
+    """``Path("..").name`` is ``".."``, so ``dst_root / name`` escapes the destination."""
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    src_root.mkdir()
+
+    plan = plan_state_dir_migration(
+        repo_root=tmp_path,
+        src_root=src_root,
+        dst_root=dst_root,
+        src_children=[src_root / ".."],
+        dst_names=[],
+        registered_worktrees=[],
+    )
+
+    assert len(plan.blocked) == 1
+    assert any("escapes the destination root" in r for r in plan.blocked[0].reasons)
+
+
+def test_apply_refuses_when_a_child_escapes_the_roots_on_disk(tmp_path: Path) -> None:
+    """A lexically-clean plan is still refused when the child resolves outside on disk.
+
+    The planner is pure and can only judge shape; a symlink/junction escape exists
+    only after resolution. Built by constructing the plan from real in-tree children
+    and then pointing one child's ``src_path`` at an outside directory, which is what
+    a resolved junction amounts to.
+    """
+    src_root = tmp_path / "src"
+    dst_root = tmp_path / "dst"
+    src_root.mkdir()
+    (src_root / "issues").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    plan = plan_state_dir_migration(
+        repo_root=tmp_path,
+        src_root=src_root,
+        dst_root=dst_root,
+        src_children=[src_root / "issues"],
+        dst_names=[],
+        registered_worktrees=[],
+    )
+    assert plan.blocked == ()
+
+    escaped = dataclasses.replace(plan.children[0], src_path=outside)
+    escaped_plan = dataclasses.replace(plan, children=(escaped,))
+
+    moves: list[tuple[Path, Path]] = []
+    outcome = apply_state_dir_migration(escaped_plan, mover=lambda s, d: moves.append((s, d)))
+
+    assert outcome.ok is False
+    assert outcome.aborted_at == "issues"
+    assert outcome.error is not None
+    assert "outside the migration roots" in outcome.error
+    assert moves == []
