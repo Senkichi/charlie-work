@@ -713,6 +713,12 @@ def test_fleet_loop_config_load_error_isolated(
     pins isolation at that exact point. D-4 requires the per-repo ``except``
     to keep catching this; this test would fail loudly (as a fleet-wide
     exception) if a future change narrowed or removed it.
+
+    G-AC6: the injected failure happens inside ``load_layered_config``,
+    strictly before ``paths = runtime_paths(...)`` executes in the same try
+    block, so ``paths`` is genuinely unbound in repo1's except handler (not
+    merely untested) -- see the ``mock_runtime_paths.call_count`` assertion
+    below.
     """
     registry = {
         "repos": {
@@ -785,6 +791,18 @@ def test_fleet_loop_config_load_error_isolated(
     assert result.data["repos"]["owner/repo2"]["ok"] is True
     assert mock_app_class.call_count == 1
     assert mock_app2.loop.call_count == 1
+
+    # G-AC6: repo1's ConfigError is raised inside load_layered_config,
+    # strictly before `paths = runtime_paths(...)` is reached in that same
+    # try block. runtime_paths is therefore called exactly once (for repo2
+    # only) -- proving `paths` is genuinely unbound in repo1's except
+    # handler, not just untested. The handler itself never references
+    # `paths` (it uses `repo_root`/`entry`, both bound before the try); if a
+    # future change added a `paths.state_file` reference there, this would
+    # raise UnboundLocalError *inside* the except block, which escapes the
+    # per-repo isolation boundary entirely (D-4) instead of being caught by
+    # it -- this assertion is what pins that it never happens.
+    assert mock_runtime_paths.call_count == 1
 
     message = result.data["repos"]["owner/repo1"]["message"]
     assert "fleet pass error" in message
@@ -1034,6 +1052,13 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
     assert result.data["repos"]["owner/repo2"]["ok"] is True
     assert mock_app_class.call_count == 1
     assert mock_app2.loop.call_count == 1
+
+    # G-AC6: same pre-`paths`-binding failure point as
+    # test_fleet_loop_config_load_error_isolated, this time via the real,
+    # unmocked load_layered_config raising the real ConfigError rather than
+    # a mock side_effect. runtime_paths is called exactly once (repo2 only).
+    assert mock_runtime_paths.call_count == 1
+
     message = result.data["repos"]["owner/repo1"]["message"]
     assert "ConfigError" in message
     assert "cross_family" in message
