@@ -66,6 +66,8 @@ WORKTREES_DIRNAME = "worktrees"
 CROSS_FAMILY_DIRNAME = "cross-family"
 NOTIFY_DIRNAME = "notify"
 NOTIFY_DIGEST_FILENAME = "digest.jsonl"
+SESSION_MANIFEST_FILENAME = "session-manifest.json"
+SESSION_RESULTS_FILENAME = "session-results.json"
 
 #: Worktree-local ``gh`` configuration directory name components.
 #:
@@ -175,6 +177,24 @@ def reviews_dir_default(state_root: Path) -> Path:
     return dispatches_dir(state_root) / REVIEWS_DIRNAME
 
 
+def session_manifest_default(state_root: Path) -> Path:
+    """Return the default session-manifest path under ``state_root``.
+
+    ``_default`` marks this as the value used when ``devin.session_manifest``
+    is not explicitly configured.
+    """
+    return dispatches_dir(state_root) / SESSION_MANIFEST_FILENAME
+
+
+def session_results_default(state_root: Path) -> Path:
+    """Return the default session-results path under ``state_root``.
+
+    ``_default`` marks this as the value used when ``devin.session_results``
+    is not explicitly configured.
+    """
+    return dispatches_dir(state_root) / SESSION_RESULTS_FILENAME
+
+
 def notify_digest_default(state_root: Path) -> Path:
     """Return the default notification digest path under ``state_root``.
 
@@ -182,6 +202,31 @@ def notify_digest_default(state_root: Path) -> Path:
     explicitly configured.
     """
     return state_root / NOTIFY_DIRNAME / NOTIFY_DIGEST_FILENAME
+
+
+def resolve_state_child(value: str, *, repo_root: Path, default: Path) -> Path:
+    """Resolve a sentinel-style state-child config value.
+
+    Several config fields (``devin.sessions_dir``, ``devin.session_manifest``,
+    ``devin.session_results``, ``review_dispatch.reviews_dir``,
+    ``notify.file_path``) use an empty string to mean "derive this from
+    ``runtime.state_dir``" rather than re-spelling the historical default in
+    every config dataclass. An empty *value* therefore returns *default*
+    (already an absolute path under the repo's resolved state root, e.g.
+    :func:`sessions_dir_default`). A non-empty *value* is an explicit override,
+    resolved against *repo_root* the same way config paths always have been
+    (an absolute override is returned as-is; a relative one is joined to
+    *repo_root*).
+
+    This is the single place that understands the sentinel convention — see
+    :func:`charlie_work.paths.resolved_layout`, which calls this once per
+    sentinel field instead of re-implementing the "empty means derive" check
+    at each of the dozen or so call sites across the package.
+    """
+    if not value:
+        return default
+    candidate = Path(value)
+    return candidate if candidate.is_absolute() else repo_root / candidate
 
 
 def gh_config_dir(target_path: Path) -> Path:

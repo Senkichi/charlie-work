@@ -38,7 +38,7 @@ from .github import (
     linked_issue_number,
 )
 from .labels import TransitionOutcome, transition
-from .paths import runtime_paths
+from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .state import (
     PASSIVE_OPEN_STATUS,
@@ -553,7 +553,7 @@ def detect_drift(
             update_worker_log_stat,
         )
 
-        sessions_dir = repo_root / config.devin.sessions_dir
+        sessions_dir = resolved_layout(config, repo_root).sessions_dir
         # state_dir root (sibling of state.json) for api-budget ledger settlement
         # on reap (issue #480). Resolved through runtime_paths so an absolute
         # state_dir config is honored identically to state.json itself.
@@ -1235,7 +1235,7 @@ def apply_fixes(
 
     alive_pr_numbers: set[int] = set()
     if repo_root is not None:
-        reviews_dir = repo_root / config.review_dispatch.reviews_dir
+        reviews_dir = resolved_layout(config, repo_root).reviews_dir
         from .worker import _alive_review_worker_issue_numbers
 
         alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
@@ -1259,7 +1259,7 @@ def apply_fixes(
 
                 checkout_removed = False
                 if repo_root is not None:
-                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )
@@ -1317,7 +1317,7 @@ def apply_fixes(
                 if pr_key in new_prs:
                     new_prs[pr_key] = without_review_dispatch_claim(new_prs[pr_key])
                 if repo_root is not None:
-                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )

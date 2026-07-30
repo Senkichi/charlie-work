@@ -34,7 +34,7 @@ from .github import (
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
 )
-from .paths import RuntimePaths
+from .paths import RuntimePaths, resolved_layout
 from .prompts import resolve_template
 from .runner_slots import (
     ALLOCATION_STATE_FILENAME,
@@ -273,7 +273,7 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     from .claude_code import read_worker_records
     from .devin_shell import is_session_alive, read_session_records
 
-    sessions_dir = repo_root / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, repo_root).sessions_dir
     if not sessions_dir.is_dir():
         add("launched sessions", True, "no sessions directory yet", severity="warning")
         return
@@ -782,35 +782,34 @@ def _check_state_dir_split_brain(add: Any, repo_root: Path, paths: RuntimePaths)
 def _check_worktrees_root_agreement(
     add: Any, repo_root: Path, paths: RuntimePaths, config: OrchestratorConfig
 ) -> None:
-    """Report the effective worktrees root(s) for dispatch vs. ``worktree-clean``.
+    """Report the effective worktrees root that dispatch and ``worktree-clean``
+    both use.
 
-    ``charlie worktree-clean`` always sweeps ``layout.worktrees_dir(paths.root)``
-    — the configured ``state_dir``. Dispatch uses that same root only when
-    ``claude_code.worktrees_dir`` is set; otherwise it falls back to
-    ``layout.worktrees_dir(layout.default_state_root(repo_root))``, which
-    ignores any ``state_dir`` override. Printed unconditionally (not just when
-    they disagree) so the effective root is always visible, and so this line
-    is the place that documents the two sides agree once A2 unifies them.
+    Before A2, this was a real pass/fail comparison: dispatch fell back to
+    ``layout.worktrees_dir(layout.default_state_root(repo_root))`` (ignoring
+    ``runtime.state_dir``) while ``worktree-clean`` swept
+    ``layout.worktrees_dir(paths.root)`` (honouring it) — the #712 divergence.
+    A2 fixed the root cause by routing both call sites
+    (``OrchestratorApp._layout.worktrees`` and
+    ``run_worktree_clean_command``'s call into ``clean_worktrees``) through
+    the identical ``paths.resolved_layout(config, repo_root).worktrees``. With
+    one function computing both sides, there is no second, independently
+    derived value left to compare — reintroducing a comparison here would
+    necessarily be ``x == x`` (an ``ok=False`` branch that can never fire) and
+    would only ever measure whether *this check* also calls the same
+    function, not whether dispatch and clean agree. So this is now an
+    unconditional report line rather than a pass/fail check; the real
+    regression gate for #712 / the ``claude_code.worktrees_dir`` axis lives in
+    ``tests/test_paths.py``, exercised against the two actual production call
+    sites (``OrchestratorApp._adapter_settings()`` and
+    ``run_worktree_clean_command``'s ``clean_worktrees`` call).
     """
-    clean_root = layout.worktrees_dir(paths.root)
-    if config.claude_code.worktrees_dir:
-        dispatch_root = repo_root / config.claude_code.worktrees_dir
-    else:
-        dispatch_root = layout.worktrees_dir(layout.default_state_root(repo_root))
-
-    if dispatch_root == clean_root:
-        add("worktrees root", True, f"{clean_root} (dispatch and `worktree-clean` agree)")
-    else:
-        add(
-            "worktrees root",
-            False,
-            f"dispatch creates worktrees under {dispatch_root} but "
-            f"`worktree-clean` sweeps {clean_root} — they disagree because "
-            f"runtime.state_dir is overridden and claude_code.worktrees_dir "
-            f"is not set (issue #712); worktrees created by dispatch will "
-            f"never be found by cleanup",
-            severity="warning",
-        )
+    effective_root = resolved_layout(config, repo_root).worktrees
+    add(
+        "worktrees root",
+        True,
+        f"{effective_root} (dispatch and `worktree-clean` both resolve here)",
+    )
 
 
 def run_doctor(

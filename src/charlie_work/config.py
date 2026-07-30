@@ -279,8 +279,10 @@ class ReviewDispatchConfig:
     enabled: bool = False
     # Per-PR review sidecar + log directory. MUST be distinct from
     # devin.sessions_dir so worker concurrency accounting is not poisoned by
-    # reviewer processes.
-    reviews_dir: str = ".var/charlie-work/dispatches/reviews"
+    # reviewer processes. Empty string means "derive from runtime.state_dir"
+    # (layout.reviews_dir_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    reviews_dir: str = ""
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
     # Default is 2 so a host that enables review_dispatch without overriding
@@ -563,12 +565,18 @@ class DevinConfig:
     # "claude-code" launches Claude Code workers in isolated git worktrees
     # (claude_code.py, configured under the claude_code section).
     adapter: str = "manual"
-    session_manifest: str = ".var/charlie-work/dispatches/session-manifest.json"
-    session_results: str = ".var/charlie-work/dispatches/session-results.json"
+    # Empty string means "derive from runtime.state_dir" (layout.py's
+    # session_manifest_default/session_results_default) rather than a fixed
+    # literal -- see paths.resolved_layout, the single place that resolves
+    # this sentinel.
+    session_manifest: str = ""
+    session_results: str = ""
     dispatch_command: str | tuple[str, ...] = ""
     command_timeout_seconds: int = 300
-    # devin-shell adapter: sidecar JSON + per-session logs live here.
-    sessions_dir: str = ".var/charlie-work/dispatches/sessions"
+    # devin-shell adapter: sidecar JSON + per-session logs live here. Empty
+    # string means "derive from runtime.state_dir" (layout.sessions_dir_default)
+    # -- see paths.resolved_layout.
+    sessions_dir: str = ""
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
     shell_command: tuple[str, ...] = ()
@@ -964,7 +972,10 @@ class NotifyConfig:
     sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
     webhook_url: str = ""
     shell_command: tuple[str, ...] = ()
-    file_path: str = ".var/charlie-work/notify/digest.jsonl"
+    # Empty string means "derive from runtime.state_dir"
+    # (layout.notify_digest_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    file_path: str = ""
 
 
 @dataclass(frozen=True)
