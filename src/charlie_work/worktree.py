@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
-from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
@@ -2981,12 +2981,29 @@ class WorktreeCleanResult:
     data: dict[str, Any]
 
 
+@runtime_checkable
+class WorktreeCleanGH(Protocol):
+    """Slice of :class:`GitHub` that ``clean_worktrees`` depends on.
+
+    The cleanup lane only reads PR merge state via a single ``gh pr view``
+    call, so it needs just ``run`` -- the rest of ``GitHub`` (list caches,
+    mutating ops, retry config) is irrelevant here. Narrowing the parameter
+    type to this protocol lets test doubles satisfy the contract structurally
+    without subclassing the frozen ``GitHub`` dataclass, and documents exactly
+    which GitHub surface the cleanup lane relies on (issue #641).
+    """
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any: ...
+
+
 def clean_worktrees(
     repo_root: Path,
     worktrees_dir: Path,
     state: dict[str, Any],
     config: OrchestratorConfig,
-    gh: GitHub,
+    gh: WorktreeCleanGH,
     *,
     dry_run: bool = False,
 ) -> WorktreeCleanResult:
