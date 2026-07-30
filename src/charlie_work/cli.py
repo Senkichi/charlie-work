@@ -11,7 +11,7 @@ import yaml
 
 from . import CLI_NAME
 from .config import ConfigError, find_config_path
-from .doctor import run_doctor
+from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
@@ -352,7 +352,26 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config_path = find_config_path(repo_root, args.config)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    # #6-G: doctor exists to diagnose a broken repo, so it must not itself
+    # crash on the exact condition it is meant to diagnose (e.g. the
+    # unknown-config-key ConfigError that silently killed the cw fleet lane
+    # three times on 2026-07-29). Render the parse failure as a structured
+    # finding instead of letting it propagate to main()'s generic
+    # `except (ConfigError, ValueError)` handler, which prints to stderr and
+    # exits 2 with no machine-readable finding at all.
+    try:
+        config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    except ConfigError as exc:
+        check = DoctorCheck(
+            name="config file",
+            ok=False,
+            detail=f"{config_path or 'orchestrator.config.yaml'}: {exc}",
+        )
+        return CommandResult(
+            False,
+            "doctor: 1 finding(s), at least one blocking",
+            {"checks": [check.to_dict()]},
+        )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
