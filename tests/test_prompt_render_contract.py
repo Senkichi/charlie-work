@@ -29,7 +29,8 @@ import json
 import string
 from pathlib import Path
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work import layout
+from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import TEMPLATE_DIR, render_prompt
@@ -269,6 +270,71 @@ def test_pinned_templates_actually_render_against_real_caller_keys() -> None:
             f"{template_name} rendered with an unresolved $placeholder despite strict "
             f"mode -- investigate before trusting this contract test"
         )
+
+
+def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
+    tmp_path: Path,
+) -> None:
+    """review.md's real caller (workflow.py:7202-7219, ``OrchestratorApp.review()``)
+    is already subset- and render-tested above against *synthetic*
+    ``f"<{key}>"`` values. This test additionally builds production-shaped
+    values -- real ``Path`` objects for ``pr_json_path``/``diff_path``,
+    mirroring workflow.py:7132's ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
+    -- under a non-default ``runtime.state_dir`` override, then asserts the
+    rendered prompt contains neither an unresolved placeholder nor the
+    default state-dir literal.
+
+    This closes the half of the plan's 13a-8 requirement ("rendered output
+    contains no ``.var/charlie-work`` literal") that no test in this file
+    checked for *any* of the four required templates -- not something
+    specific to review.md; see this change's report for the other three.
+
+    A non-default state_dir is deliberate: rendering under the DEFAULT
+    state_dir would legitimately embed ``layout.DEFAULT_STATE_DIR`` in
+    ``pr_json_path``/``diff_path`` as a *correct* resolved path, making a
+    "literal absent" assertion pass vacuously regardless of whether the
+    template itself hardcodes anything. Overriding state_dir means every
+    path threaded through the template now points elsewhere, so the
+    assertion is actually exercising the template's own prose.
+    """
+    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / "pr-42"
+
+    values = {
+        "pr_number": 42,
+        "pr_title": "Fake PR title",
+        "pr_url": "https://example.test/pull/42",
+        "issue_number": 7,
+        "issue_title": "Fake issue title",
+        "issue_url": "https://example.test/issues/7",
+        "pr_json_path": pr_dir / "pr.json",
+        "diff_path": pr_dir / "diff.patch",
+        "cross_family_section": "",
+        "janitor_section": "",
+        "test_adequacy_section": "",
+        "diff_size_section": "",
+        "ci_status_section": "",
+        "prior_review_section": "",
+    }
+    assert set(values) == REVIEW_MD_SUPPLIED_KEYS
+
+    rendered = render_prompt("review.md", values)
+
+    assert not _unresolved_placeholders_in_output(rendered), (
+        "review.md rendered with an unresolved $placeholder against production-shaped values"
+    )
+    # Normalize separators before the literal check: str(Path) on Windows
+    # yields backslashes, so a rendered path reads ".var\charlie-work", and
+    # checking only the forward-slash spelling of DEFAULT_STATE_DIR would
+    # pass vacuously on this host regardless of what the template contains.
+    normalized = rendered.replace("\\", "/")
+    assert layout.DEFAULT_STATE_DIR not in normalized, (
+        f"review.md rendered output contains the default state-dir literal "
+        f"{layout.DEFAULT_STATE_DIR!r} despite runtime.state_dir being "
+        f"overridden to 'custom-state' -- the template must derive every "
+        f"path from supplied values, never hardcode the default"
+    )
 
 
 # ---------------------------------------------------------------------------

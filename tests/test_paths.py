@@ -10,6 +10,12 @@ means derive from runtime.state_dir" check.
 Covers the plan's three required gates:
   (i)   default config derives the same paths as the pre-A2 hardcoded literals
   (ii)  overriding runtime.state_dir moves every child together
+  (ii-b) an explicit child override still wins over the state_dir-derived
+        default -- the other half of (ii)'s assertion, per the plan's
+        13a-6 gap: (ii) only proved "no override -> children follow
+        state_dir"; it never proved an explicit override survives a
+        simultaneous state_dir override instead of being silently
+        re-derived under it.
   (iii) dispatch and worktree-clean resolve to the identical worktrees root,
         exercised against the two real production call sites (not two calls
         to resolved_layout(), which would only prove the function is
@@ -27,7 +33,10 @@ import pytest
 from charlie_work import cli
 from charlie_work.config import (
     ClaudeCodeConfig,
+    DevinConfig,
+    NotifyConfig,
     OrchestratorConfig,
+    ReviewDispatchConfig,
     RuntimeConfig,
 )
 from charlie_work.paths import resolved_layout, runtime_paths
@@ -91,6 +100,48 @@ def test_resolved_layout_overridden_state_dir_moves_every_child(tmp_path: Path) 
     assert layout_view.worktrees == new_root / "worktrees"
     assert layout_view.cross_family == new_root / "cross-family"
     assert layout_view.notify.file_path == str(new_root / "notify" / "digest.jsonl")
+
+
+def test_resolved_layout_explicit_child_override_wins_over_state_dir(tmp_path: Path) -> None:
+    """(ii-b) An explicit per-field override must still win when runtime.state_dir
+    is *also* overridden -- the other half of (ii)'s claim. (ii) only proves
+    "no override -> children follow state_dir"; it never proves an explicit
+    override survives rather than being silently re-derived under the new
+    state_dir root. Per the plan's 13a-6 gap, this half had no named test.
+
+    Every sentinel-style state-child field is set explicitly here, alongside
+    an overridden state_dir, and each must resolve to its own explicit value
+    -- NOT nested under the overridden state_dir. ``cross_family`` has no
+    override sentinel of its own (config.py has no ``cross_family_dir``
+    field), so it is asserted as a contrast: it must still derive from the
+    overridden state_dir root, proving the state_dir override itself did
+    take effect and the other fields' independence from it is not an
+    artifact of a no-op override.
+    """
+    config = OrchestratorConfig(
+        runtime=RuntimeConfig(state_dir="custom-state"),
+        devin=DevinConfig(
+            sessions_dir="explicit-sessions",
+            session_manifest="explicit-manifest.json",
+            session_results="explicit-results.json",
+        ),
+        review_dispatch=ReviewDispatchConfig(reviews_dir="explicit-reviews"),
+        claude_code=ClaudeCodeConfig(worktrees_dir="explicit-worktrees"),
+        notify=NotifyConfig(file_path="explicit-notify/digest.jsonl"),
+    )
+
+    layout_view = resolved_layout(config, tmp_path)
+
+    assert layout_view.sessions_dir == tmp_path / "explicit-sessions"
+    assert layout_view.session_manifest == tmp_path / "explicit-manifest.json"
+    assert layout_view.session_results == tmp_path / "explicit-results.json"
+    assert layout_view.reviews_dir == tmp_path / "explicit-reviews"
+    assert layout_view.worktrees == tmp_path / "explicit-worktrees"
+    assert layout_view.notify.file_path == str(tmp_path / "explicit-notify" / "digest.jsonl")
+    # Contrast: no override sentinel exists for cross_family, so it must still
+    # derive from the overridden state_dir root -- proving the state_dir
+    # override is live, not that everything above happened to no-op.
+    assert layout_view.cross_family == tmp_path / "custom-state" / "cross-family"
 
 
 def _dispatch_worktrees_root(repo: Path, config: OrchestratorConfig) -> Path:
