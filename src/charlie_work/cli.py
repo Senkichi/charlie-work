@@ -20,6 +20,7 @@ from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
 from .state import StateLockBusy, load_state_locked, utc_now
+from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from .runner_allocation import plan_summary
 from .runner_allocation_pass import run_allocation_pass
@@ -292,6 +293,29 @@ def build_parser() -> argparse.ArgumentParser:
     worktree_clean_parser = subparsers.add_parser("worktree-clean")
     _add_dry_run(worktree_clean_parser)
 
+    migrate_parser = subparsers.add_parser(
+        "migrate-state-dir",
+        help="Plan (and optionally apply) a move of a legacy state dir to its new root",
+    )
+    # --src and --dst are both REQUIRED, deliberately: neither is derived from
+    # config.runtime.state_dir. During the migration window that key still names the
+    # *source* (it is retired in a later step), so deriving the destination from it
+    # would silently invert the two -- and the inversion's failure mode is moving a
+    # live state tree onto itself. An explicit pair has no dependency on which
+    # config edits have landed yet.
+    migrate_parser.add_argument(
+        "--src", required=True, help="Legacy state dir to move from (abs, or relative to repo)"
+    )
+    migrate_parser.add_argument(
+        "--dst", required=True, help="New state dir to move into (abs, or relative to repo)"
+    )
+    migrate_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually move. Without this the command only plans and prints.",
+    )
+    _add_dry_run(migrate_parser)
+
     return parser
 
 
@@ -349,6 +373,81 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
         dry_run=args.dry_run,
     )
     return CommandResult(result.ok, result.message, result.data)
+
+
+def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
+    """Resolve a ``--src``/``--dst`` argument against *repo_root* when relative."""
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return candidate
+
+
+def _render_migration_plan(plan) -> str:
+    """Human-readable rendering of a plan: counts, then every blocked child.
+
+    Blocked children are printed with their reasons *and* remediation, because the
+    operator's next action is always "clear the blockers, re-plan" -- a bare count
+    would send them back to the filesystem to work out why.
+    """
+    lines = [
+        f"src: {plan.src_root}",
+        f"dst: {plan.dst_root}",
+        f"children: {len(plan.children)}  movable: {len(plan.movable)}  "
+        f"blocked: {len(plan.blocked)}",
+    ]
+    for child in plan.blocked:
+        lines.append(f"  BLOCKED {child.name}")
+        for reason in child.reasons:
+            lines.append(f"      reason: {reason}")
+        for step in child.remediation:
+            lines.append(f"      remediate: {step}")
+    return "\n".join(lines)
+
+
+def run_migrate_state_dir_command(args: argparse.Namespace) -> CommandResult:
+    """Plan, and with ``--apply``, actuate a legacy state-dir move.
+
+    Plan-only is the default; ``--apply`` is the explicit opt-in. A global or
+    subcommand ``--dry-run`` *overrides* ``--apply`` rather than the other way
+    round, so the two flags together can only ever be safe: the failure mode of
+    the opposite precedence is an operator who wrote ``--dry-run`` watching a
+    real migration run.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    src_root = _resolve_migration_root(args.src, repo_root)
+    dst_root = _resolve_migration_root(args.dst, repo_root)
+
+    plan = gather_migration_inputs(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
+    rendered = _render_migration_plan(plan)
+    data = {
+        "src_root": str(plan.src_root),
+        "dst_root": str(plan.dst_root),
+        "children": len(plan.children),
+        "movable": len(plan.movable),
+        "blocked": [child.name for child in plan.blocked],
+        "applied": False,
+    }
+
+    if not plan.ok:
+        return CommandResult(False, f"{rendered}\nplan failed: {plan.error}", data)
+
+    if not args.apply:
+        return CommandResult(True, f"{rendered}\n(plan only; pass --apply to move)", data)
+
+    if args.dry_run:
+        return CommandResult(True, f"{rendered}\n(dry-run: --apply ignored, nothing moved)", data)
+
+    outcome = apply_state_dir_migration(plan)
+    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    if not outcome.ok:
+        data = {**data, "aborted_at": outcome.aborted_at}
+        return CommandResult(
+            False,
+            f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
+            data,
+        )
+    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -1190,6 +1289,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
+        elif args.command == "migrate-state-dir":
+            result = run_migrate_state_dir_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
