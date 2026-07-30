@@ -40,7 +40,11 @@ $section_caller_sweep
 
 $section_no_merge_contract
 
+$section_process_lifetime
+
 $section_mutation_check
+
+$section_test_hygiene
 
 $section_pr_body_honesty
 
