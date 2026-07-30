@@ -137,6 +137,12 @@ _ERROR_KINDS = frozenset(
         "merge_failed",
         "spec_review_failed",
         "operator_claim_failed",
+        # #6-G: a per-repo fleet-pass iteration failed before (or during)
+        # config load / app.loop() — see fleet_dispatch.py's per-repo
+        # except Exception boundary. Classified as an error so it is
+        # reachable through query_events(level="error") without any new
+        # query infrastructure.
+        "fleet_pass_config_error",
     }
 )
 _WARNING_KINDS = frozenset(

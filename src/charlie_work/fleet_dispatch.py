@@ -14,6 +14,7 @@ from .fleet_registry import _load_registry, count_fleet_runners
 from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
+from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
@@ -1195,6 +1196,59 @@ def _build_fleet_attention_digest(
     )
 
 
+def _lane_failure_state_path(repo_root: Path, entry: dict[str, Any]) -> Path:
+    """Resolve the per-repo ``state.json`` path for a lane that failed to start.
+
+    A lane failure (e.g. ``load_layered_config`` raising ``ConfigError``) can
+    happen before ``runtime_paths()`` is reachable, so this cannot use the
+    configured ``runtime.state_dir`` the way a healthy pass does. Instead it
+    mirrors ``_take_fleet_snapshot``'s precedent: prefer the fleet registry's
+    recorded ``state_dir`` (written by a prior successful ``touch_repo()``),
+    falling back to the conventional default for a repo that has never
+    registered successfully.
+
+    Note this can diverge from ``runtime_paths(...).state_file`` for a repo
+    whose config overrides ``runtime.state_dir`` to a non-default path *and*
+    has no registry ``state_dir`` recorded yet (e.g. its very first pass) —
+    the event would be recorded at the default location, and a doctor check
+    reading the configured path would not find it until the repo registers
+    successfully once. This is the same divergence class layout.py's
+    docstrings warn about; it is not fully closable here since the whole
+    point of this helper is to work when config load has failed.
+    """
+    state_dir_str = entry.get("state_dir")
+    state_root = Path(state_dir_str) if state_dir_str else layout.default_state_root(repo_root)
+    return layout.state_file_path(state_root)
+
+
+def _record_lane_failure_event(
+    repo_root: Path,
+    repo_key: str,
+    entry: dict[str, Any],
+    error_message: str,
+) -> None:
+    """Durably record a lane-startup failure to the repo's own events.db (#6-G).
+
+    This is best-effort and must never escape: ``log_event`` already guards
+    its own sqlite calls, but the directory-creation call it makes before
+    that guard is not caught by that guard's exception type, so this wraps
+    the whole call in its own try/except. A failure to *record* a lane
+    failure must never itself break the per-repo isolation boundary this is
+    called from (D-4) — the caller has already logged the real error via
+    ``logger.exception`` regardless of what happens here.
+    """
+    try:
+        state_path = _lane_failure_state_path(repo_root, entry)
+        log_event(
+            state_path,
+            "fleet_pass_config_error",
+            {"repo_key": repo_key, "error": error_message},
+            repo=repo_key,
+        )
+    except Exception:
+        logger.exception("Failed to record lane failure event for repo %s", repo_key)
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1354,10 +1408,27 @@ def fleet_loop(
             # pass alive instead of crashing on one unclassified exception.
             # The exception type is part of the message and the full traceback
             # goes to the log — an unclassified failure must stay diagnosable.
+            error_message = f"{type(exc).__name__}: {exc}"
             per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {type(exc).__name__}: {exc}", {}
+                False, f"fleet pass error: {error_message}", {}
             )
             logger.exception("Error processing repo %s", repo_key)
+            # #6-G: the two lines above are an in-process dict and a line in a
+            # dated flat-text log — neither reaches events.db, state.json, or
+            # the fleet digest, since _extract_attention_events() above only
+            # runs after a successful app.loop(). A repo whose lane fails on
+            # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
+            # was previously invisible to everything except that log line.
+            # Reuse the existing "error" AttentionEntry branch (health=ERROR,
+            # already desktop-toast-eligible via _DESKTOP_SEVERITIES) so this
+            # works on exactly the path where app.loop() never ran, and
+            # durably record it so `charlie doctor` and
+            # query_events(level="error") can see it even after the digest's
+            # cross-pass dedup stops re-emitting the same standing failure.
+            attention_events.append(
+                {"repo_key": repo_key, "type": "error", "error": error_message}
+            )
+            _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
