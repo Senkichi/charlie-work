@@ -4529,6 +4529,90 @@ def test_dispatch_merged_pr_mention_flag_is_one_shot(tmp_path: Path) -> None:
     assert len(flagged_events_3) == 1  # still only the single pass-1 event
 
 
+def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
+    tmp_path: Path,
+) -> None:
+    """A PARTIAL_FAILURE label transition for merged_pr_mention_flagged must
+    NOT stamp merged_pr_mention_flagged_at. Before the fix, the dedup marker
+    was written unconditionally regardless of transition()'s outcome, so a
+    failed agent:human-needed label add still left the timestamp in state --
+    and the one-shot guard exercised by
+    test_dispatch_merged_pr_mention_flag_is_one_shot keys off exactly that
+    timestamp's presence, so the issue would never be retried even though
+    its label never actually changed.
+
+    Pass 2 then clears the injected failure and re-dispatches, proving the
+    withheld marker actually causes a retry -- not just that it is absent.
+    """
+    config = OrchestratorConfig()
+    human_needed = config.labels.human_needed
+
+    class LabelFailMentionGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_add = True
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            if label == human_needed and self.fail_add:
+                # Simulate a failed add (error-as-value) -> PARTIAL_FAILURE.
+                return False
+            return super().add_issue_label(number, label)
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailMentionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Same mention-only setup as test_dispatch_merged_pr_mention_flag_is_one_shot:
+    # merged PR #456 only *mentions* issue #123 in free text -- no branch-prefix
+    # binding, no closing keyword -- so only the loose mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # --- Pass 1: label add fails -> marker withheld, no event ---------------
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+
+    # The add was attempted (proves the transition actually ran) but failed.
+    assert (123, human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"].get("123", {})
+    # The dedup marker must be ABSENT: a retry must occur on the next pass
+    # instead of being permanently suppressed by a marker stamped despite
+    # the label write having failed.
+    assert issue_entry.get("merged_pr_mention_flagged_at") is None
+
+    # The one-shot event is gated on the same success condition as the
+    # marker, so it must not have fired either.
+    flagged_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert flagged_events == []
+
+    # --- Pass 2: label add now succeeds -> the withheld marker must let the
+    # mention scan retry, not permanently suppress the issue. This is the
+    # behavior the marker's absence exists to enable -- proving it, not just
+    # the marker's absence, is what distinguishes "will retry" from "silently
+    # dropped."
+    fake_gh.fail_add = False
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, human_needed) in fake_gh.labels_added
+
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    flagged_events_2 = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_2) == 1
+    assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
