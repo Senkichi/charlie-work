@@ -11,6 +11,8 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
+from . import layout
+
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 # Root-relative path the Claude Code adapter writes to in each worktree.
@@ -482,7 +484,7 @@ class AutoMergeConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    state_dir: str = ".var/charlie-work"
+    state_dir: str = layout.DEFAULT_STATE_DIR
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None

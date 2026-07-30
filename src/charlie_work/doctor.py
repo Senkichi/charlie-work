@@ -20,6 +20,8 @@ import yaml
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
+from . import layout
+from .instrumentation import _db_path
 from .github import (
     GitHub,
     GitHubError,
@@ -516,7 +518,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     repo's per-repo supervisor lock is checked individually. A single supervised
     repo no longer hides an unsupervised one.
     """
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     if not fleet_json_path.exists():
         return
     registry = _load_registry(fleet_json_path)
@@ -524,7 +526,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     if not repos:
         return
 
-    fleet_lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    fleet_lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     if fleet_lock_path.exists():
         fleet_lock = try_acquire_supervisor_lock(fleet_lock_path)
         if fleet_lock is None:
@@ -544,7 +546,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
         if not state_dir.exists():
             unreachable_repo_keys.append(repo_key)
             continue
-        repo_lock_path = state_dir / "supervisor.lock"
+        repo_lock_path = layout.supervisor_lock_path(state_dir)
         if repo_lock_path.exists():
             repo_lock = try_acquire_supervisor_lock(repo_lock_path)
             if repo_lock is None:
@@ -721,6 +723,94 @@ def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
                     False,
                     f"probe failed (not a field error): {error_msg}",
                 )
+
+
+def _check_state_dir_split_brain(add: Any, repo_root: Path, paths: RuntimePaths) -> None:
+    """Warn when the default state tree still holds residue after a
+    ``runtime.state_dir`` override (issue #712).
+
+    Dispatch creates worktrees under ``layout.default_state_root(repo_root)``
+    regardless of ``runtime.state_dir`` (until A2 lands), while
+    ``charlie worktree-clean`` and every other subsystem use the *configured*
+    ``paths.root`` (see ``layout.py``'s module docstring). When a repo
+    overrides ``state_dir``, those are two different directories: cleanup
+    enumerates an empty tree while dispatch keeps writing to the default one,
+    and nothing ever looks at the default tree again. That is exactly how
+    job-cannon accumulated 74 uncollected worktrees under a 0-byte
+    ``events.db`` — a state nobody noticed because nothing diagnosed it.
+
+    This check does not fix the divergence (that is A2's job) — it turns the
+    silent residue into a named, warned-about condition. Silent when
+    ``state_dir`` is not overridden: the two trees are the same tree, so there
+    is nothing to diagnose.
+    """
+    default_root = layout.default_state_root(repo_root)
+    if paths.root == default_root:
+        return
+
+    residue: list[str] = []
+
+    default_state_file = layout.state_file_path(default_root)
+    if default_state_file.exists():
+        residue.append(layout.STATE_FILENAME)
+
+    default_worktrees = layout.worktrees_dir(default_root)
+    if default_worktrees.is_dir():
+        worktree_count = sum(1 for _ in default_worktrees.iterdir())
+        if worktree_count:
+            residue.append(f"{layout.WORKTREES_DIRNAME}/ ({worktree_count} entries)")
+
+    default_events_db = _db_path(default_state_file)
+    if default_events_db.exists() and default_events_db.stat().st_size > 0:
+        residue.append("events.db")
+
+    if not residue:
+        return
+
+    add(
+        "state dir split-brain",
+        False,
+        f"configured state_dir is {paths.root}, but the default tree "
+        f"{default_root} still contains {', '.join(residue)} — some subsystem "
+        f"is writing there while the rest of the orchestrator uses the "
+        f"configured tree (issue #712); nothing currently cleans up "
+        f"{default_root}, so this residue only grows",
+        severity="warning",
+    )
+
+
+def _check_worktrees_root_agreement(
+    add: Any, repo_root: Path, paths: RuntimePaths, config: OrchestratorConfig
+) -> None:
+    """Report the effective worktrees root(s) for dispatch vs. ``worktree-clean``.
+
+    ``charlie worktree-clean`` always sweeps ``layout.worktrees_dir(paths.root)``
+    — the configured ``state_dir``. Dispatch uses that same root only when
+    ``claude_code.worktrees_dir`` is set; otherwise it falls back to
+    ``layout.worktrees_dir(layout.default_state_root(repo_root))``, which
+    ignores any ``state_dir`` override. Printed unconditionally (not just when
+    they disagree) so the effective root is always visible, and so this line
+    is the place that documents the two sides agree once A2 unifies them.
+    """
+    clean_root = layout.worktrees_dir(paths.root)
+    if config.claude_code.worktrees_dir:
+        dispatch_root = repo_root / config.claude_code.worktrees_dir
+    else:
+        dispatch_root = layout.worktrees_dir(layout.default_state_root(repo_root))
+
+    if dispatch_root == clean_root:
+        add("worktrees root", True, f"{clean_root} (dispatch and `worktree-clean` agree)")
+    else:
+        add(
+            "worktrees root",
+            False,
+            f"dispatch creates worktrees under {dispatch_root} but "
+            f"`worktree-clean` sweeps {clean_root} — they disagree because "
+            f"runtime.state_dir is overridden and claude_code.worktrees_dir "
+            f"is not set (issue #712); worktrees created by dispatch will "
+            f"never be found by cleanup",
+            severity="warning",
+        )
 
 
 def run_doctor(
@@ -925,6 +1015,11 @@ def run_doctor(
         template_path.is_file(),
         str(template_path) if template_path.is_file() else f"not found: {template_path}",
     )
+
+    # -- state-dir split-brain (issue #712) ----------------------------------
+    # Read-only: only stats/lists the default tree, never touches it.
+    _check_state_dir_split_brain(add, repo_root, paths)
+    _check_worktrees_root_agreement(add, repo_root, paths, config)
 
     # -- fleet supervisor ----------------------------------------------------
     _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)

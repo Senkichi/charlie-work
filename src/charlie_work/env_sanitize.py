@@ -32,6 +32,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import layout
+
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
 # pyproject.toml commonly ships `addopts = "... -n auto --dist loadscope"`
 # (e.g. job-cannon), so a bare `pytest` invoked inside a worker claims every
@@ -107,7 +109,7 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     # worktree-local empty directory is created on demand. If an operator later
     # merges a scoped ``GH_TOKEN`` via ``worker_env``, it takes precedence over
     # any (empty) stored credential.
-    gh_config_dir = target_path / ".var" / "gh-config"
+    gh_config_dir = layout.gh_config_dir(target_path)
     gh_config_dir.mkdir(parents=True, exist_ok=True)
     env["GH_CONFIG_DIR"] = str(gh_config_dir)
 

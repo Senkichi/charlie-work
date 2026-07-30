@@ -22515,11 +22515,12 @@ def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypa
     }
     fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
 
-    # Mock fleet_dir to point to our test fleet dir
-    def mock_fleet_dir(override=None):
-        return fleet_dir
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", mock_fleet_dir)
+    # Redirect fleet_dir resolution to our test fleet dir via the env var
+    # fleet_paths.fleet_dir() itself supports (checked before the platform
+    # default). Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its
+    # own reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
 
     # Count fleet live sessions
     live_count, skipped_repos = count_fleet_live_sessions(None)
@@ -27023,11 +27024,11 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
 
-    # Mock fleet_dir to use tmp_path
-    def fake_fleet_dir(*, override: str | None = None) -> Path:
-        return tmp_path / "fleet"
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", fake_fleet_dir)
+    # Redirect fleet_dir resolution to tmp_path via the env var fleet_paths.fleet_dir()
+    # itself supports. Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its own
+    # reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
 
     # Build args
     import argparse
