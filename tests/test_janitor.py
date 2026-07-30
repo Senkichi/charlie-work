@@ -16,6 +16,7 @@ from charlie_work.github import PR_VIEW_FIELDS
 from charlie_work.janitor import (
     _calculate_patch_id,
     CONVENTIONAL_COMMIT_TYPES,
+    detect_cross_pr_revert,
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
@@ -2728,69 +2729,84 @@ index 0000000..1234567
 
 # --- issue #659: git argv validation (defense-in-depth) -----------------------
 #
-# These tests verify that _check_no_op_rework rejects flag-like or malformed
-# SHA/ref values *before* they reach any subprocess argv, rather than relying
-# on git's own ref/SHA naming rules or the incidental ``^`` prefix protection.
+# These tests verify that _check_no_op_rework and detect_cross_pr_revert
+# reject flag-like or malformed SHA/ref values *before* they reach any
+# subprocess argv, and that run_janitor never raises in the process.
 
 
-def test_no_op_rework_rejects_flag_like_reviewed_head_sha() -> None:
-    """A flag-like reviewed_head_sha from persisted state.json must raise."""
+def test_no_op_rework_warns_on_flag_like_reviewed_head_sha() -> None:
+    """A flag-like reviewed_head_sha is caught as a warning, not a crash."""
     pr = _green_pr(headRefOid="abc123")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": "--exec=foo",
     }
 
-    with pytest.raises(ValueError, match="reviewed_head_sha"):
-        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework reviewed_head_sha" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_rejects_non_hex_reviewed_head_sha() -> None:
-    """A non-hex reviewed_head_sha must raise (format check, not just flags)."""
+def test_no_op_rework_warns_on_non_hex_reviewed_head_sha() -> None:
+    """A non-hex reviewed_head_sha is caught as a warning, not a crash."""
     pr = _green_pr(headRefOid="abc123")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": "not-a-sha!",
     }
 
-    with pytest.raises(ValueError, match="reviewed_head_sha"):
-        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework reviewed_head_sha" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_rejects_flag_like_current_head_sha() -> None:
-    """A flag-like headRefOid (fresh API) must raise before reaching argv."""
+def test_no_op_rework_warns_on_flag_like_current_head_sha() -> None:
+    """A flag-like headRefOid is caught as a warning before reaching argv."""
     pr = _green_pr(headRefOid="--upload-pack=evil")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": "abc123",
     }
 
-    with pytest.raises(ValueError, match="current_head_sha"):
-        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework current_head_sha" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_rejects_flag_like_head_ref() -> None:
-    """A flag-like headRefName must raise before reaching ``git fetch origin``."""
+def test_no_op_rework_warns_on_flag_like_head_ref() -> None:
+    """A flag-like headRefName is caught as a warning before ``git fetch origin``."""
     pr = _green_pr(headRefOid="def456", headRefName="--exec=foo")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": "abc123",
     }
 
-    with pytest.raises(ValueError, match="head_ref"):
-        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework head_ref (merge-only)" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_rejects_flag_like_base_ref() -> None:
-    """A flag-like baseRefName must raise before reaching ``git fetch origin``."""
+def test_no_op_rework_warns_on_flag_like_base_ref() -> None:
+    """A flag-like baseRefName is caught as a warning before ``git fetch origin``."""
     pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="--exec=bar")
     pr_state = {
         "decision": "request_changes",
         "reviewed_head_sha": "abc123",
     }
 
-    with pytest.raises(ValueError, match="base_ref"):
-        run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework base_ref (merge-only)" in w for w in verdict.warnings)
 
 
 def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
@@ -2805,6 +2821,48 @@ def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
     # fail gracefully (subprocess error → warning), but validation must pass.
     verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
 
-    # No ValueError raised — that's the assertion. The verdict itself may be
-    # ok or not depending on other gates, but the validation boundary held.
     assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("git fetch/rev-list failed" in w for w in verdict.warnings)
+
+
+def test_detect_cross_pr_revert_skips_invalid_head_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag-like headRefName must not reach ``git fetch origin <head> <base>``."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="--upload-pack=evil")
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subprocess.run should not be called with invalid refs")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result is None
+
+
+def test_detect_cross_pr_revert_skips_invalid_base_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag-like baseRefName must not reach ``git fetch origin <head> <base>``."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subprocess.run should not be called with invalid refs")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result is None

@@ -592,13 +592,19 @@ def _check_no_op_rework(
             # Enrich with unpushed-commit count if worktree exists
             head_ref = pr.get("headRefName")
             if head_ref:
-                head_ref = require_valid_ref_name(
-                    head_ref, context="_check_no_op_rework head_ref (patch-id)"
-                )
-                unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
-                if unpushed_info:
-                    failure_msg += f"; {unpushed_info}"
-                else:
+                try:
+                    validated_head_ref = require_valid_ref_name(
+                        head_ref, context="_check_no_op_rework head_ref (patch-id)"
+                    )
+                    unpushed_info = _get_unpushed_commit_info(validated_head_ref, repo_root)
+                    if unpushed_info:
+                        failure_msg += f"; {unpushed_info}"
+                    else:
+                        failure_msg += (
+                            "; check the branch worktree for unpushed work before re-reviewing"
+                        )
+                except ValueError as exc:
+                    warnings.append(str(exc))
                     failure_msg += (
                         "; check the branch worktree for unpushed work before re-reviewing"
                     )
@@ -615,20 +621,25 @@ def _check_no_op_rework(
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:
         return False
-    # Validate before it reaches any git argv: reviewed_head_sha comes from
-    # persisted state.json, which can diverge or be hand-edited over a long
-    # lifetime (issue #659). The ^ prefix in the rev-list arg currently
-    # prevents flag parsing, but this guard keeps that true after refactors.
-    reviewed_head_sha = require_valid_sha(
-        reviewed_head_sha, context="_check_no_op_rework reviewed_head_sha"
-    )
 
     current_head_sha = pr.get("headRefOid")
     if not current_head_sha:
         return False
-    current_head_sha = require_valid_sha(
-        current_head_sha, context="_check_no_op_rework current_head_sha"
-    )
+
+    try:
+        # Validate before the values reach any git argv: reviewed_head_sha comes
+        # from persisted state.json, which can diverge or be hand-edited over a
+        # long lifetime (issue #659). The ^ prefix in the rev-list arg currently
+        # prevents flag parsing, but this guard keeps that true after refactors.
+        reviewed_head_sha = require_valid_sha(
+            reviewed_head_sha, context="_check_no_op_rework reviewed_head_sha"
+        )
+        current_head_sha = require_valid_sha(
+            current_head_sha, context="_check_no_op_rework current_head_sha"
+        )
+    except ValueError as exc:
+        warnings.append(str(exc))
+        return False
 
     # If heads match exactly, it's a no-op rework
     if current_head_sha == reviewed_head_sha:
@@ -640,13 +651,19 @@ def _check_no_op_rework(
         # Enrich with unpushed-commit count if worktree exists
         head_ref = pr.get("headRefName")
         if head_ref:
-            head_ref = require_valid_ref_name(
-                head_ref, context="_check_no_op_rework head_ref (sha-match)"
-            )
-            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
-            if unpushed_info:
-                failure_msg += f"; {unpushed_info}"
-            else:
+            try:
+                validated_head_ref = require_valid_ref_name(
+                    head_ref, context="_check_no_op_rework head_ref (sha-match)"
+                )
+                unpushed_info = _get_unpushed_commit_info(validated_head_ref, repo_root)
+                if unpushed_info:
+                    failure_msg += f"; {unpushed_info}"
+                else:
+                    failure_msg += (
+                        "; check the branch worktree for unpushed work before re-reviewing"
+                    )
+            except ValueError as exc:
+                warnings.append(str(exc))
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
         else:
             failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
@@ -662,18 +679,19 @@ def _check_no_op_rework(
         # Can't check merge-only case without ref name; fall back to SHA equality check
         # (which already passed above, so no failure here)
         return False
-    # Validate ref names before they reach git argv (issue #659): head_ref is
-    # passed as a plain positional to ``git fetch origin``, so a flag-like
-    # value would be parsed as an option without this guard.
-    head_ref = require_valid_ref_name(
-        head_ref, context="_check_no_op_rework head_ref (merge-only)"
-    )
-    if base_ref:
-        base_ref = require_valid_ref_name(
-            base_ref, context="_check_no_op_rework base_ref (merge-only)"
-        )
 
     try:
+        # Validate ref names before they reach git argv (issue #659): head_ref is
+        # passed as a plain positional to ``git fetch origin``, so a flag-like
+        # value would be parsed as an option without this guard.
+        head_ref = require_valid_ref_name(
+            head_ref, context="_check_no_op_rework head_ref (merge-only)"
+        )
+        if base_ref:
+            base_ref = require_valid_ref_name(
+                base_ref, context="_check_no_op_rework base_ref (merge-only)"
+            )
+
         # Fetch both the PR head ref and base ref from origin
         # We need the base ref to exclude base-reachable commits from the count
         fetch_refs = [head_ref]
@@ -724,9 +742,13 @@ def _check_no_op_rework(
 
             failures.append(failure_msg)
             return True
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        # Git failed (no network, unknown ref, shallow history, or parse error)
-        # Fall back to SHA equality result and append a warning
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
+        # Git failed (no network, unknown ref, shallow history, parse error) or
+        # a ref/SHA value failed format validation. Fall back to the SHA equality
+        # result and append a warning; include the validation message if that is
+        # what failed so callers can tell the difference.
+        if isinstance(exc, ValueError):
+            warnings.append(str(exc))
         warnings.append(
             f"Could not verify whether PR head advance ({reviewed_head_sha} → {current_head_sha}) "
             f"included non-merge commits; git fetch/rev-list failed. "
@@ -835,6 +857,12 @@ def detect_cross_pr_revert(
         return None
 
     try:
+        # Validate ref names before they reach git argv (issue #659). Both
+        # values are passed as plain positionals to ``git fetch origin``, so a
+        # flag-like value would be parsed as an option without this guard.
+        head_ref = require_valid_ref_name(head_ref, context="detect_cross_pr_revert head_ref")
+        base_ref = require_valid_ref_name(base_ref, context="detect_cross_pr_revert base_ref")
+
         fetch = subprocess.run(
             ["git", "fetch", "origin", str(head_ref), str(base_ref)],
             cwd=repo_root_path,
