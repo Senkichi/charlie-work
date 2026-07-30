@@ -258,6 +258,16 @@ def _slugify(value: str, *, max_length: int = 80) -> str:
 
 
 def _default_worktrees_dir(repo_root: Path) -> Path:
+    """Return the package-default worktrees root, ignoring any config override.
+
+    Equals the historical (pre-layout-module) path only when ``state_dir`` is
+    left at its default AND ``claude_code.worktrees_dir`` is unset. This is
+    the final fallback for direct library callers with no config in hand
+    (e.g. some unit tests); the production paths -- dispatch and ``charlie
+    worktree-clean`` -- always resolve through
+    ``paths.resolved_layout(config, repo_root).worktrees`` instead, which
+    honours both overrides.
+    """
     return layout.worktrees_dir(layout.default_state_root(repo_root))
 
 
@@ -2404,17 +2414,6 @@ def remove_worktree(
     return worktree_removed and branch_deleted
 
 
-def _default_reviews_dir(repo_root: Path) -> Path:
-    # layout.reviews_dir_default() is the dedicated helper for exactly this
-    # value -- its docstring: "the value used when review_dispatch.reviews_dir
-    # is not explicitly configured" -- which is this function's own purpose.
-    # Unlike issues/prs/dispatches/logs (which have an existing RuntimePaths
-    # member to reuse instead), "reviews" has no such member, so the helper
-    # function itself is the single source of truth here, not a bypassable
-    # constant substitution.
-    return layout.reviews_dir_default(layout.default_state_root(repo_root))
-
-
 def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
     """True if ``sha`` resolves to a commit object already present locally."""
     result = run_captured(
@@ -2430,7 +2429,7 @@ def create_review_checkout(
     pr_number: int,
     head_sha: str,
     *,
-    reviews_dir: Path | None = None,
+    reviews_dir: Path,
 ) -> WorktreeInfo:
     """Create an isolated, detached-HEAD checkout of a PR's head SHA for a
     reviewer session.
@@ -2463,7 +2462,7 @@ def create_review_checkout(
             f"create_review_checkout requires a non-empty head_sha for PR #{pr_number}"
         )
 
-    target_dir = reviews_dir or _default_reviews_dir(repo_root)
+    target_dir = reviews_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     checkout_path = target_dir / f"pr-{pr_number}"
 
@@ -2511,9 +2510,7 @@ def create_review_checkout(
     return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
 
 
-def remove_review_checkout(
-    repo_root: Path, pr_number: int, *, reviews_dir: Path | None = None
-) -> bool:
+def remove_review_checkout(repo_root: Path, pr_number: int, *, reviews_dir: Path) -> bool:
     """Idempotent teardown of a PR's isolated review checkout.
 
     Returns True if the checkout was removed or was already absent; never
@@ -2521,8 +2518,7 @@ def remove_review_checkout(
     or during a stale-claim/completed-verdict sweep that isn't sure whether a
     checkout exists for a given PR).
     """
-    target_dir = reviews_dir or _default_reviews_dir(repo_root)
-    checkout_path = target_dir / f"pr-{pr_number}"
+    checkout_path = reviews_dir / f"pr-{pr_number}"
 
     existing_worktrees = list_worktrees(repo_root)
     is_registered = any(Path(wt["worktree"]) == checkout_path for wt in existing_worktrees)

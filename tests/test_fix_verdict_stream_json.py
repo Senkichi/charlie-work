@@ -361,7 +361,7 @@ def test_reap_records_verdict_from_stream_json_log(monkeypatch, tmp_path: Path) 
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     log_text = _stream_json_log(
         json.dumps({"type": "system", "subtype": "init"}),
@@ -401,7 +401,7 @@ def test_reap_records_verdict_via_file_fallback(monkeypatch, tmp_path: Path) -> 
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     md = tmp_path / "plans" / "adversarial-review-notes.md"
     md.parent.mkdir(parents=True)

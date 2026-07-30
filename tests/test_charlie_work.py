@@ -55,7 +55,7 @@ from charlie_work.cross_family import (
     run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
-from charlie_work.paths import runtime_paths
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
     append_event,
@@ -4829,7 +4829,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -5318,7 +5318,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -7651,7 +7651,7 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     _write_review_packet(tmp_path, 100, "sha-100")
 
     # Seed a stale reviewer sidecar + state claim.
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     old_dispatched = old_started
@@ -7789,7 +7789,7 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
         save_state(app.paths.state_file, state)
 
     # Write a sidecar + log with a verdict so _reap_review_verdicts finds it.
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text(
@@ -7871,7 +7871,7 @@ def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a log with NO verdict block (simulates turn-limit exhaustion).
@@ -7993,7 +7993,7 @@ def test_dispatch_reviews_turn_limit_summary_not_posted_twice(monkeypatch, tmp_p
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text("Some analysis without a verdict.\n", encoding="utf-8")
@@ -27883,7 +27883,7 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID and stale log
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -27962,7 +27962,7 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-343.json"
     log_file = sessions_dir / "issue-343.log"
@@ -28056,7 +28056,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-356.json"
     log_file = sessions_dir / "issue-356.log"
@@ -30362,7 +30362,7 @@ def test_detect_drift_api_dead_session_provider_auth(
     gh.prs = []
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 4805, provider="example", pid=99996)
 
@@ -31804,7 +31804,7 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31858,7 +31858,7 @@ def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Pat
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31931,7 +31931,7 @@ def test_reap_review_verdicts_folds_review_effort_arm_into_session_metrics(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31992,7 +31992,7 @@ def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metric
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -32112,7 +32112,7 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
@@ -32751,7 +32751,7 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(

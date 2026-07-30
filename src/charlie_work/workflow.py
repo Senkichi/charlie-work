@@ -80,7 +80,7 @@ from .janitor import (
     TestAdequacyVerdict,
 )
 from .labels import TransitionOutcome, transition
-from .paths import RuntimePaths
+from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import render_prompt
 from .reconcile import (
     DriftItem,
@@ -4696,6 +4696,12 @@ class OrchestratorApp:
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
+        # Single resolved view of every sentinel-style state-child config
+        # value (devin.sessions_dir/session_manifest/session_results,
+        # review_dispatch.reviews_dir, notify.file_path, claude_code.worktrees_dir)
+        # -- see paths.resolved_layout. Safe to cache once: self.config is
+        # assigned only here, never reassigned on a live instance.
+        self._layout = resolved_layout(config, repo_root)
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
@@ -4715,6 +4721,17 @@ class OrchestratorApp:
         # installed CLI. Fail fast before any dispatch/review/merge work.
         if isinstance(self.gh, GitHub):
             self.gh.validate_field_lists()
+
+    @property
+    def layout(self) -> ResolvedLayout:
+        """Public, read-only view of the resolved state-child layout.
+
+        This is the contract module-level helpers (e.g. ``supervise.run_supervised``)
+        that take an ``app`` argument should use, mirroring the existing public
+        ``paths`` attribute -- callers outside this class should never reach into
+        the private ``self._layout`` cache directly.
+        """
+        return self._layout
 
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
@@ -4771,10 +4788,10 @@ class OrchestratorApp:
             adapter=resolved_adapter,
             dispatch_command=devin.dispatch_command,
             command_timeout_seconds=devin.command_timeout_seconds,
-            sessions_dir=self._resolve(devin.sessions_dir),
+            sessions_dir=self._layout.sessions_dir,
             shell_command=devin.shell_command,
             claude_command=claude.command,
-            worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
+            worktrees_dir=self._layout.worktrees,
             venv_source=venv_source,
             worker_env=worker_env,
             worker_model=devin.worker_model,
@@ -4828,7 +4845,7 @@ class OrchestratorApp:
         # Live api sessions counted via iter_workers filtered to adapter_kind == "api".
         # Wrapped in a mutable list so _select_adapter_for_issue can increment it
         # as issues are routed to api within the same pass (concurrency cap fix).
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         live_api_sessions = sum(
             1 for w in iter_workers(sessions_dir) if w.adapter_kind == "api" and w.is_alive()
         )
@@ -4891,8 +4908,8 @@ class OrchestratorApp:
         artifacts reflect every session in the pass (per-group calls each
         overwrite these files; the combined write at the end is authoritative).
         """
-        manifest_path = self.repo_root / self.config.devin.session_manifest
-        results_path = self.repo_root / self.config.devin.session_results
+        manifest_path = self._layout.session_manifest
+        results_path = self._layout.session_results
 
         if not adapter_choices:
             # No routing (api disabled) — single group, today's behavior.
@@ -4949,9 +4966,9 @@ class OrchestratorApp:
         )
         return AdapterSettings(
             adapter="claude-code",
-            sessions_dir=self._resolve(self.config.devin.sessions_dir),
+            sessions_dir=self._layout.sessions_dir,
             claude_command=claude.command,
-            worktrees_dir=self._resolve(claude.worktrees_dir) if claude.worktrees_dir else None,
+            worktrees_dir=self._layout.worktrees,
             venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
             worker_env=claude.worker_env,
             materialize_dirs=self.config.dispatch.materialize_dirs,
@@ -4985,7 +5002,7 @@ class OrchestratorApp:
 
         if max_concurrent > 0:
             if live_count is None:
-                sessions_dir = self._resolve(self.config.devin.sessions_dir)
+                sessions_dir = self._layout.sessions_dir
                 live_count = _count_live_sessions(sessions_dir, self.paths.state_file)
             available_slots = max(0, max_concurrent - live_count)
             if available_slots < dispatch_limit:
@@ -5029,7 +5046,7 @@ class OrchestratorApp:
         )
 
         # Check for stalled sessions (read-only for status/roll-call)
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
 
         # Build workers list with health classification
@@ -5116,12 +5133,9 @@ class OrchestratorApp:
             )
 
         branch_name = self._branch_name(issue)
-        worktrees_dir = (
-            self._resolve(self.config.claude_code.worktrees_dir)
-            if self.config.claude_code.worktrees_dir
-            else None
+        worktree_path = worktree_path_for_branch(
+            self.repo_root, branch_name, self._layout.worktrees
         )
-        worktree_path = worktree_path_for_branch(self.repo_root, branch_name, worktrees_dir)
 
         marker_written = False
         if not release and worktree_path.is_dir():
@@ -5531,7 +5545,7 @@ class OrchestratorApp:
         # less, during the exact high-concurrency moment this census exists to
         # diagnose.
         try:
-            _log_worker_census(self._resolve(self.config.devin.sessions_dir))
+            _log_worker_census(self._layout.sessions_dir)
         except Exception:
             import logging
 
@@ -5672,7 +5686,7 @@ class OrchestratorApp:
         operator_claimed_ready: list[int] = []
 
         # Gather sessions_dir for stall detection and live worker counting
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
 
         # Detect and handle stalled sessions before applying concurrency governor.
         # This must run exactly once per pass, not twice (was duplicated in the
@@ -6343,8 +6357,8 @@ class OrchestratorApp:
                 )
             )
         dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
-        manifest_path = self.repo_root / self.config.devin.session_manifest
-        results_path = self.repo_root / self.config.devin.session_results
+        manifest_path = self._layout.session_manifest
+        results_path = self._layout.session_results
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
@@ -6742,7 +6756,7 @@ class OrchestratorApp:
                 repo=self.repo_root.name,
             )
             if digest:
-                emit_digest(self.config.notify, digest)
+                emit_digest(self._layout.notify, digest)
 
         # Emit dispatch-alert digest for live-worker redispatch averted outcomes.
         # This surfaces the silent-stall class of dispatch failures in the same
@@ -6755,7 +6769,7 @@ class OrchestratorApp:
                 state_field="dispatch_alert",
             )
             if dispatch_digest:
-                emit_digest(self.config.notify, dispatch_digest)
+                emit_digest(self._layout.notify, dispatch_digest)
 
         return CommandResult(
             not failed_issue_numbers,
@@ -7788,7 +7802,7 @@ class OrchestratorApp:
                 },
             )
 
-        reviews_dir = self._resolve(self.config.review_dispatch.reviews_dir)
+        reviews_dir = self._layout.reviews_dir
 
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
         # gate so dead reviewers are reaped and stale claims are freed even
@@ -7861,7 +7875,7 @@ class OrchestratorApp:
         if deferred:
             if quota_alert is not None:
                 emit_digest(
-                    self.config.notify,
+                    self._layout.notify,
                     AttentionDigest(
                         generated_at=utc_now(),
                         repo=self.repo_root.name,
@@ -9273,7 +9287,7 @@ class OrchestratorApp:
 
             from .worker import issue_worker_liveness
 
-            sessions_dir = self._resolve(self.config.devin.sessions_dir)
+            sessions_dir = self._layout.sessions_dir
             verdict = issue_worker_liveness(
                 issue_number, issue_state, sessions_dir, self.config, datetime.now(UTC)
             )
@@ -10307,7 +10321,7 @@ class OrchestratorApp:
         path = Path(artifact_path)
         artifact_text = path.read_text(encoding="utf-8")
         cfg = self.config.cross_family
-        reviews_dir = layout.cross_family_dir(self.paths.root)
+        reviews_dir = self.paths.cross_family
         reviews_dir.mkdir(parents=True, exist_ok=True)
         slug = slugify(path.stem)
         prompt_text = self._render(
@@ -12056,7 +12070,7 @@ class OrchestratorApp:
         # restarts (observed live: intake frozen at a stale issue set for the
         # daemon's entire lifetime).
         self.gh.invalidate_list_cache()
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         # Issue #646: the worker census now logs from inside dispatch() itself
         # (the one chokepoint every dispatch path funnels through, including
         # standalone `work`/`fleet work` which never reach this method) --
@@ -12086,7 +12100,7 @@ class OrchestratorApp:
         # Classify dead sessions and update throttle state (production loop path)
         # This detects provider throttling from worker deaths and sets cooldown
         # Also reconciles labels for dead sessions with no open PR (issue #118)
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         # Issue #343 Finding 2: the stall lane at the top of this method
         # (line ~4100) already ran this pass and is the sole writer of the
         # inconclusive-probe deferral counter for a not-alive worker -- tell
@@ -12140,7 +12154,7 @@ class OrchestratorApp:
                 repo=self.repo_root.name,
             )
             if digest:
-                emit_digest(self.config.notify, digest)
+                emit_digest(self._layout.notify, digest)
 
         dispatch_rework = self.dispatch_rework(
             effective_limit, stalled_entries=loop_stalled_entries
@@ -12381,7 +12395,7 @@ class OrchestratorApp:
                 state_field="merge_alert",
             )
             if digest:
-                emit_digest(self.config.notify, digest)
+                emit_digest(self._layout.notify, digest)
 
         # One-shot alert for newly parked foreign PRs. Dedupe comes from the
         # durable state marker (_mark_foreign_issue_ref returns True exactly
@@ -12389,7 +12403,7 @@ class OrchestratorApp:
         # than through the per-issue health-baseline machinery.
         if foreign_transitions and self.config.notify.enabled:
             emit_digest(
-                self.config.notify,
+                self._layout.notify,
                 AttentionDigest(
                     generated_at=utc_now(),
                     repo=self.repo_root.name,
@@ -12524,7 +12538,7 @@ class OrchestratorApp:
                 {"adapter": "manual", "selected_count": 0},
             )
 
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         # Unconditional stall reaper call, matching dispatch()'s — previously this
         # only ran when max_concurrent_sessions > 0 via the governor. Skipped
         # only when the caller (loop()) already ran the sweep this pass and
@@ -13024,8 +13038,8 @@ class OrchestratorApp:
                 data,
             )
 
-        manifest_path = self.repo_root / self.config.devin.session_manifest
-        results_path = self.repo_root / self.config.devin.session_results
+        manifest_path = self._layout.session_manifest
+        results_path = self._layout.session_results
         # Rescue tier (issue #555) + per-issue routing (issue #482): split
         # the batch so rescue-marked issues launch via the claude-code adapter
         # pinned to rescue.worker_model (see _rescue_adapter_settings),
@@ -13293,7 +13307,7 @@ class OrchestratorApp:
 
         # Emit notification digest if there are health transitions (stalled sessions)
         # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
-        sessions_dir = self._resolve(self.config.devin.sessions_dir)
+        sessions_dir = self._layout.sessions_dir
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
         if stalled_entries and self.config.notify.enabled:
             health_transitions: dict[int, dict[str, Any]] = {}
@@ -13312,7 +13326,7 @@ class OrchestratorApp:
                 repo=self.repo_root.name,
             )
             if digest:
-                emit_digest(self.config.notify, digest)
+                emit_digest(self._layout.notify, digest)
 
         return CommandResult(
             not failed_issue_numbers,

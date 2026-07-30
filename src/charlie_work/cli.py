@@ -18,7 +18,7 @@ from .github import GitHub, GitHubError
 from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .paths import RepoNotFoundError, find_repo_root, runtime_paths
+from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
 from .state import StateLockBusy, load_state_locked, utc_now
 from .supervise import orchestrator_root, self_deploy
 from .runner_allocation import plan_summary
@@ -289,7 +289,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run(allocate_parser)
 
-    subparsers.add_parser("worktree-clean")
+    worktree_clean_parser = subparsers.add_parser("worktree-clean")
+    _add_dry_run(worktree_clean_parser)
 
     return parser
 
@@ -341,7 +342,7 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     state = load_state_locked(paths.state_file)
     result = clean_worktrees(
         repo_root,
-        layout.worktrees_dir(paths.root),
+        resolved_layout(config, repo_root).worktrees,
         state,
         config,
         gh,

@@ -1696,8 +1696,9 @@ def test_doctor_state_dir_split_brain_ignores_zero_byte_events_db(tmp_path: Path
 
 
 def test_doctor_worktrees_root_agrees_by_default(tmp_path: Path) -> None:
-    """No override -> dispatch and ``worktree-clean`` already resolve to the
-    same root; the line reports agreement, not silence."""
+    """No override -> the reported root is the plain default; ``ok`` is
+    unconditionally True (see the ``_check_worktrees_root_agreement``
+    docstring for why a pass/fail comparison is no longer meaningful post-A2)."""
     config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -1708,14 +1709,20 @@ def test_doctor_worktrees_root_agrees_by_default(tmp_path: Path) -> None:
     check = by_name["worktrees root"]
     assert check.ok is True
     assert check.severity == "error"  # default severity; ok=True never blocks
+    assert str(paths.root / "worktrees") in check.detail
 
 
-def test_doctor_worktrees_root_disagrees_when_state_dir_overridden(tmp_path: Path) -> None:
-    """Empirical proof of the #712 create/clean divergence: with
-    ``runtime.state_dir`` overridden and no explicit
-    ``claude_code.worktrees_dir``, dispatch's fallback (the unconditional
-    default tree) and ``worktree-clean``'s sweep (the configured tree) resolve
-    to two different directories.
+def test_doctor_worktrees_root_no_longer_diverges_when_state_dir_overridden(
+    tmp_path: Path,
+) -> None:
+    """Regression proof for #712: before A2, an overridden ``runtime.state_dir``
+    with no explicit ``claude_code.worktrees_dir`` made dispatch's fallback
+    (the unconditional default tree) and ``worktree-clean``'s sweep (the
+    configured tree) resolve to two different directories, and this check
+    reported ``ok=False``. A2 unified both call sites behind
+    ``resolved_layout(config, repo_root).worktrees``, so the same config now
+    reports a single root (the configured tree) and ``ok=True`` -- the stale
+    default-tree path must no longer appear anywhere in the detail.
     """
     config = _config(
         runtime=RuntimeConfig(state_dir="custom-state"),
@@ -1728,18 +1735,19 @@ def test_doctor_worktrees_root_disagrees_when_state_dir_overridden(tmp_path: Pat
 
     by_name = {c.name: c for c in checks}
     check = by_name["worktrees root"]
-    assert check.ok is False
-    assert check.severity == "warning"
+    assert check.ok is True
+    assert check.severity == "error"  # default severity; ok=True never blocks
     assert str(paths.root / "worktrees") in check.detail
-    assert str(tmp_path / ".var" / "charlie-work" / "worktrees") in check.detail
+    stale_default_worktrees = tmp_path / ".var" / "charlie-work" / "worktrees"
+    assert str(stale_default_worktrees) not in check.detail
 
 
 def test_doctor_worktrees_root_agrees_when_explicit_worktrees_dir_matches_state_dir(
     tmp_path: Path,
 ) -> None:
-    """An explicit ``claude_code.worktrees_dir`` pointed at the configured
-    state dir is the escape hatch available today, pre-A2: it makes the two
-    sides agree even though the default-tree fallback would not."""
+    """An explicit ``claude_code.worktrees_dir`` (axis 2) still reports a
+    single agreeing root -- unaffected by which of the two override axes is
+    in play, since both resolve through the same ``resolved_layout`` call."""
     config = _config(
         runtime=RuntimeConfig(state_dir="custom-state"),
         claude_code=ClaudeCodeConfig(worktrees_dir="custom-state/worktrees"),

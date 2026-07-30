@@ -16,7 +16,7 @@ from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
 from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
 from charlie_work.instrumentation import read_event_log
-from charlie_work.paths import runtime_paths
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import (
     AVIATOR_BLOCKED_MESSAGE,
     AVIATOR_CHECK_NAME,
@@ -2065,8 +2065,9 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     gh = FakeGitHub(prs=[], issues=[_issue(55, [config.labels.in_progress])])
     state = empty_state()
 
-    # detect_drift looks in repo_root / config.devin.sessions_dir
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    # detect_drift resolves the sessions dir through paths.resolved_layout
+    # (config.devin.sessions_dir is a "" sentinel resolved against runtime.state_dir).
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a small log with only the shim marker — frozen well past grace period
@@ -2608,7 +2609,7 @@ def test_apply_fixes_merged_pr_reaps_review_checkout_and_clears_dispatch_state(
     repo_root, pr_number, reviews_dir = removed_calls[0]
     assert repo_root == tmp_path
     assert pr_number == 1
-    assert reviews_dir == tmp_path / config.review_dispatch.reviews_dir
+    assert reviews_dir == tmp_path / ".var" / "charlie-work" / "dispatches" / "reviews"
 
     assert new_state["prs"]["1"]["status"] == "merged"
     assert new_state["prs"]["1"]["review_dispatch_status"] is None
@@ -2643,7 +2644,7 @@ def test_apply_fixes_merged_pr_defers_reap_while_reviewer_alive(
         "reviewer_process_start_time": 1.0,
     }
 
-    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     sidecar = {
         "issue_number": 1,
@@ -2723,7 +2724,7 @@ def test_apply_fixes_closed_unmerged_pr_defers_reap_while_reviewer_alive(
         "reviewer_process_start_time": 1.0,
     }
 
-    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     sidecar = {
         "issue_number": 2,
@@ -2819,7 +2820,7 @@ def test_detect_drift_dead_api_session_settles_budget_ledger(tmp_path: Path) -> 
     )
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 42, provider="example")
     write_api_events(sessions_dir, 42)
@@ -2871,7 +2872,7 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
     )
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 55, provider="example")
     write_api_events(sessions_dir, 55)
