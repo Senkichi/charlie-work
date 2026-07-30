@@ -24370,6 +24370,329 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     assert state["throttle_adapter_kind"] == "devin"
 
 
+def _reclamation_app(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    interval_minutes: int = 60,
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    config = OrchestratorConfig(
+        worktree_reclamation=WorktreeReclamationConfig(
+            enabled=enabled, interval_minutes=interval_minutes
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=dry_run)
+
+
+def test_worktree_reclamation_config_defaults() -> None:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    wr = WorktreeReclamationConfig()
+    assert wr.enabled is True
+    assert wr.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_absent_block_defaults_enabled(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_parses(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "worktree_reclamation:\n  enabled: true\n  interval_minutes: 30\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 30
+
+
+def test_worktree_reclamation_config_rejects_non_int_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: soon\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_worktree_reclamation_config_rejects_zero_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_is_worktree_reclamation_due_when_no_schedule() -> None:
+    from charlie_work.state import is_worktree_reclamation_due
+
+    # An absent schedule means "never run yet" -> due, so the first fleet pass
+    # after startup clears the existing backlog (issue #636).
+    assert is_worktree_reclamation_due({}) is True
+    assert is_worktree_reclamation_due({"worktree_reclamation": {}}) is True
+
+
+def test_is_worktree_reclamation_due_false_for_future_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, future)
+
+    assert is_worktree_reclamation_due(state) is False
+
+
+def test_is_worktree_reclamation_due_true_for_past_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    past = (
+        (datetime.now(UTC) - timedelta(minutes=5))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, past)
+
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_is_worktree_reclamation_due_treats_malformed_as_due() -> None:
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    state = schedule_worktree_reclamation({}, "not-a-timestamp")
+
+    # A corrupt value must not wedge reclamation off forever.
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_maybe_reclaim_worktrees_disabled_returns_none(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _reclamation_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("disabled reclamation must never call clean_worktrees")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("worktree_reclamation", {}).get("next_run_at") is None
+
+
+def test_maybe_reclaim_worktrees_not_due_does_not_sweep(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, schedule_worktree_reclamation
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    save_state(app.paths.state_file, schedule_worktree_reclamation({}, future))
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("must not sweep before the scheduled interval elapses")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    # Schedule is untouched when not due.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] == future
+
+
+def test_maybe_reclaim_worktrees_dry_run_threads_and_removes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A --dry-run fleet pass must run the sweep in preview mode, which removes
+    nothing (the preview-vs-act class tracked in #614-#619). ``dry_run`` is
+    threaded from the app into ``clean_worktrees``."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, dry_run=True)
+
+    calls: list[dict] = []
+
+    def _fake_clean(*args: object, **kwargs: object) -> WorktreeCleanResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean (dry-run): 2 eligible, 0 skipped, 0 orphan(s)",
+            data={
+                "planned": [{"worktree": "a"}, {"worktree": "b"}],
+                "removed": [],
+                "skipped": [],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert len(calls) == 1
+    # dry_run is threaded honestly into the sweep.
+    assert calls[0]["kwargs"]["dry_run"] is True
+    # The canonical resolved worktrees root is passed -- not a manual
+    # re-derivation -- so this call site can never diverge from dispatch's
+    # and `charlie worktree-clean`'s (the create/sweep split documented in
+    # layout.py's module docstring, "74-uncollected-worktrees").
+    assert calls[0]["args"][1] == app.layout.worktrees
+    # A preview removes nothing.
+    assert summary["removed"] == 0
+    assert summary["planned"] == 2
+    assert summary["dry_run"] is True
+    # The schedule is advanced even in dry-run: clean_worktrees makes its
+    # live `gh pr view` fan-out unconditionally (dry_run only gates the final
+    # `git worktree remove`), so the cadence gate's cost is identical in both
+    # modes and must be rate-limited in both.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    # An event was emitted so the preview is observable.
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["dry_run"] is True
+    assert events[0]["payload"]["planned"] == 2
+    assert events[0]["payload"]["removed"] == 0
+
+
+def test_maybe_reclaim_worktrees_runs_and_emits_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live (non-dry-run) pass runs the sweep, records a
+    ``worktrees_reclaimed`` event with the counts, and advances the cadence
+    schedule (issue #636: a maintenance action that leaves no trace is
+    indistinguishable from one that never ran -- lesson from #595/#621)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean: 3 removed, 1 skipped, 0 failed, 0 orphan(s)",
+            data={
+                "planned": [],
+                "removed": [{"issue_number": 1}, {"issue_number": 2}, {"issue_number": 3}],
+                "skipped": [{"issue_number": 4}],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["dry_run"] is False
+    assert summary["removed"] == 3
+    assert summary["skipped"] == 1
+    state = load_state(app.paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["removed"] == 3
+    # The schedule was advanced ~interval_minutes into the future, so the very
+    # next pass does not re-fire the per-candidate gh fan-out.
+    next_run_at = state["worktree_reclamation"]["next_run_at"]
+    parsed = datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=60)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The schedule is advanced BEFORE the sweep runs, so a sweep that errors
+    or takes longer than one poll interval cannot double-fire on the next
+    pass."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _exploding_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        # Simulate a sweep that fails: the schedule must already have been
+        # advanced before this point.
+        state = load_state(app.paths.state_file)
+        assert state["worktree_reclamation"]["next_run_at"] is not None
+        return WorktreeCleanResult(
+            ok=False,
+            message="worktree-clean: 0 removed, 0 skipped, 1 failed",
+            data={
+                "planned": [],
+                "removed": [],
+                "skipped": [],
+                "failed": [{"worktree": "a"}],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _exploding_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["ok"] is False
+    assert summary["failed"] == 1
+    # A failed sweep still records an event (observability) and keeps the
+    # advanced schedule (no immediate retry storm).
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["failed"] == 1
+
+
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.workflow import _count_live_sessions
