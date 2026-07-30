@@ -1444,7 +1444,7 @@ def test_supervisor_lifecycle_records_started_and_clean_exit(
     tmp_path: Path,
     _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
 ) -> None:
-    """A clean run emits supervisor_started once and supervisor_exited with exit_code=0."""
+    """A run stopped by max_passes emits supervisor_started once and supervisor_exited with exit_code=0."""
     mocks = _patch_self_deploy_for_fleet_tests
     mock_load_config.return_value = OrchestratorConfig(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
@@ -1456,10 +1456,12 @@ def test_supervisor_lifecycle_records_started_and_clean_exit(
 
     assert result.ok is True
     mocks["record_supervisor_started"].assert_called_once()
+    start_kwargs = mocks["record_supervisor_started"].call_args.kwargs
+    assert start_kwargs["max_pass_runtime_seconds"] == 1800
     mocks["record_supervisor_exit"].assert_called_once()
     exit_kwargs = mocks["record_supervisor_exit"].call_args.kwargs
     assert exit_kwargs["exit_code"] == 0
-    assert exit_kwargs["reason"] == "completed"
+    assert exit_kwargs["reason"] == "max_passes"
     # Heartbeat refreshed once per loop iteration.
     assert mocks["update_supervisor_heartbeat"].call_count >= 2
 

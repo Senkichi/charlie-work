@@ -664,6 +664,7 @@ def _write_heartbeat(
     exited_at: str | None = None,
     pid: int = 12345,
     full_pass_interval_seconds: int = 300,
+    max_pass_runtime_seconds: int = 0,
 ) -> None:
     payload = {
         "pid": pid,
@@ -671,6 +672,7 @@ def _write_heartbeat(
         "last_beat_at": last_beat_at,
         "pass_number": 5,
         "full_pass_interval_seconds": full_pass_interval_seconds,
+        "max_pass_runtime_seconds": max_pass_runtime_seconds,
         "exited_at": exited_at,
         "exit_code": 0 if exited_at else None,
     }
@@ -750,15 +752,47 @@ def test_check_supervisor_heartbeat_anomaly_on_corrupt_file(
     assert "unreadable" in report.lines[0]
 
 
-def test_check_supervisor_heartbeat_threshold_derives_from_full_pass_interval(
+def test_check_supervisor_heartbeat_threshold_derives_from_max_pass_runtime(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
 ) -> None:
-    """A longer full_pass_interval raises the stale threshold."""
+    """A longer max_pass_runtime_seconds raises the stale threshold."""
     fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
     now = datetime.now(timezone.utc)
-    # 20 minutes old. With full_pass=600s, threshold = 2*600/60 = 20 min, so OK.
+    # 20 minutes old. With max_pass_runtime=600s, threshold = 2*600/60 = 20 min, so OK.
     last_beat = (now - timedelta(minutes=19)).isoformat().replace("+00:00", "Z")
-    _write_heartbeat(hb, fleet_dir, last_beat_at=last_beat, full_pass_interval_seconds=600)
+    _write_heartbeat(
+        hb,
+        fleet_dir,
+        last_beat_at=last_beat,
+        full_pass_interval_seconds=300,
+        max_pass_runtime_seconds=600,
+    )
+    report = hb.Report()
+    hb.check_supervisor_heartbeat(report)
+    assert not report.anomaly
+
+
+def test_check_supervisor_heartbeat_uses_max_pass_runtime_not_full_pass_interval(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The stale threshold is keyed on max_pass_runtime_seconds, not full_pass_interval_seconds.
+
+    This is the M1 fix: a short full_pass_interval_seconds (the fallback pass
+    cadence) does not bound a pass's wall-clock runtime, so a long-running but
+    live supervisor must not be flagged as killed.
+    """
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    # 15 minutes old. full_pass=300s would give a 10-minute threshold and flag
+    # this as stale, but max_pass_runtime=1800s gives a 60-minute threshold.
+    last_beat = (now - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+    _write_heartbeat(
+        hb,
+        fleet_dir,
+        last_beat_at=last_beat,
+        full_pass_interval_seconds=300,
+        max_pass_runtime_seconds=1800,
+    )
     report = hb.Report()
     hb.check_supervisor_heartbeat(report)
     assert not report.anomaly

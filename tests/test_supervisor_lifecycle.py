@@ -51,6 +51,7 @@ def test_record_supervisor_started_writes_heartbeat_and_event(tmp_path: Path) ->
         pid=12345,
         started_at="2026-07-25T17:55:22Z",
         full_pass_interval_seconds=300,
+        max_pass_runtime_seconds=300,
     )
 
     hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
@@ -59,6 +60,7 @@ def test_record_supervisor_started_writes_heartbeat_and_event(tmp_path: Path) ->
     assert hb["last_beat_at"] == "2026-07-25T17:55:22Z"
     assert hb["pass_number"] == 0
     assert hb["full_pass_interval_seconds"] == 300
+    assert hb["max_pass_runtime_seconds"] == 300
     assert hb["exited_at"] is None
     assert hb["exit_code"] is None
 
@@ -66,6 +68,7 @@ def test_record_supervisor_started_writes_heartbeat_and_event(tmp_path: Path) ->
     assert len(events) == 1
     assert events[0]["payload"]["pid"] == 12345
     assert events[0]["payload"]["full_pass_interval_seconds"] == 300
+    assert events[0]["payload"]["max_pass_runtime_seconds"] == 300
     assert events[0]["repo"] == "fleet"
 
 

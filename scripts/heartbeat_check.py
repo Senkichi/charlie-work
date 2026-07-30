@@ -47,17 +47,20 @@ MIN_BEAT_INTERVAL_MINUTES = 10
 CHARLIE_STATUS_TIMEOUT_SECONDS = 60
 
 # Supervisor heartbeat freshness (issue #627). The supervisor writes
-# supervisor-heartbeat.json every loop iteration, so on a live supervisor
-# ``last_beat_at`` is at most one ``poll_interval_seconds`` old. A stale
+# supervisor-heartbeat.json at the top of every loop iteration. On a live
+# supervisor ``last_beat_at`` is at most one ``max_pass_runtime_seconds``
+# (plus the post-pass sleep) old; a stale
 # heartbeat means the supervisor is down — killed (no ``exited_at``) or
 # cleanly stopped but not restarted by the watchdog (``exited_at`` set).
-# The stale threshold is a multiplier on ``full_pass_interval_seconds``
-# recorded in the heartbeat itself, so it derives from config rather than
-# a hardcoded constant. The multiplier covers a full pass duration plus
-# the cooldown sleep with margin.
+# The stale threshold is a multiplier on ``max_pass_runtime_seconds``
+# recorded in the heartbeat itself, so it derives from the config knob that
+# actually bounds a single pass's wall-clock runtime. The multiplier covers
+# a full pass duration plus the post-pass cooldown/poll sleep with margin.
+# Older heartbeats that lack ``max_pass_runtime_seconds`` fall back to
+# ``full_pass_interval_seconds`` (the pre-fix behavior) for transition safety.
 SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
-SUPERVISOR_HEARTBEAT_DEFAULT_FULL_PASS_SECONDS = 300
+SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 
 DELTA_SKIP_SUFFIX = " (delta skipped: last beat <10m ago)"
 
@@ -887,8 +890,9 @@ def check_supervisor_heartbeat(report: Report) -> None:
     supervisor leaves the heartbeat stale with no ``exited_at``, and a
     supervisor whose launcher was also killed leaves no marker at all — the
     heartbeat file's age is the only remaining signal. The stale threshold
-    derives from ``full_pass_interval_seconds`` recorded in the heartbeat
-    itself (so it follows config), defaulting to 300 s when absent.
+    derives from ``max_pass_runtime_seconds`` recorded in the heartbeat
+    itself (the config knob that bounds a single pass's wall-clock runtime),
+    falling back to ``full_pass_interval_seconds`` for older heartbeats.
     """
     check = "supervisor-heartbeat"
     path = fleet_dir() / SUPERVISOR_HEARTBEAT_FILENAME
@@ -917,18 +921,27 @@ def check_supervisor_heartbeat(report: Report) -> None:
     age_min = (now - last_beat).total_seconds() / 60.0
     exited_at = data.get("exited_at")
     try:
-        raw_interval = data.get("full_pass_interval_seconds")
-        full_pass = (
-            int(raw_interval)
-            if raw_interval is not None
-            else SUPERVISOR_HEARTBEAT_DEFAULT_FULL_PASS_SECONDS
-        )
+        raw_timeout = data.get("max_pass_runtime_seconds")
+        pass_timeout = int(raw_timeout) if raw_timeout is not None else None
     except (TypeError, ValueError):
-        full_pass = SUPERVISOR_HEARTBEAT_DEFAULT_FULL_PASS_SECONDS
-    stale_threshold_min = (SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER * full_pass) / 60.0
+        pass_timeout = None
+    if pass_timeout is None or pass_timeout <= 0:
+        try:
+            raw_interval = data.get("full_pass_interval_seconds")
+            pass_timeout = (
+                int(raw_interval)
+                if raw_interval is not None
+                else SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
+            )
+        except (TypeError, ValueError):
+            pass_timeout = SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
+    stale_threshold_min = (SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER * pass_timeout) / 60.0
 
     pid = data.get("pid")
-    facts = f"last_beat={round(age_min)}m ago pid={pid} exited_at={exited_at}"
+    facts = (
+        f"last_beat={round(age_min)}m ago pid={pid} exited_at={exited_at} "
+        f"pass_timeout={pass_timeout}s"
+    )
 
     if age_min <= stale_threshold_min:
         report.ok(check, facts)

@@ -1661,6 +1661,7 @@ def run_fleet_supervise(
         pid=os.getpid(),
         started_at=started_at_iso,
         full_pass_interval_seconds=full_pass_interval,
+        max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
     )
 
     # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
@@ -1685,9 +1686,10 @@ def run_fleet_supervise(
         while True:
             now = clock()
             # Refresh the heartbeat at the top of every iteration so the
-            # freshness signal stays at most one poll_interval old on a live
-            # supervisor (issue #627). A killed supervisor stops updating it,
-            # which is exactly the gap the heartbeat check detects.
+            # freshness signal stays at most one ``max_pass_runtime_seconds``
+            # (plus the post-pass sleep) old on a live supervisor (issue #627).
+            # A killed supervisor stops updating it, which is exactly the gap
+            # the heartbeat check detects.
             update_supervisor_heartbeat(
                 fleet_dir_override,
                 pass_number=pass_number,
@@ -1696,8 +1698,10 @@ def run_fleet_supervise(
             if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
                 if elapsed_minutes >= cfg.max_runtime_minutes:
+                    _exit_reason = "max_runtime"
                     break
             if max_passes is not None and pass_number >= max_passes:
+                _exit_reason = "max_passes"
                 break
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)

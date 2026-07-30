@@ -1090,12 +1090,17 @@ class SupervisorConfig:
     ``active_cooldown_seconds``: sleep after a pass that dispatched or merged
     something (default 30 s — stagger starts, respect rate limits).
     ``max_runtime_minutes``: hard wall-clock cap; 0 = unlimited (default).
+    ``max_pass_runtime_seconds``: upper bound on a single pass's wall-clock
+    duration. The supervisor heartbeat freshness check uses this bound so a
+    long-running pass is not mistaken for a dead supervisor (default 1800 s /
+    30 min).
     """
 
     poll_interval_seconds: int = 20
     full_pass_interval_seconds: int = 300
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
+    max_pass_runtime_seconds: int = 1800
 
 
 @dataclass(frozen=True)
@@ -2156,6 +2161,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         "full_pass_interval_seconds",
         "active_cooldown_seconds",
         "max_runtime_minutes",
+        "max_pass_runtime_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):

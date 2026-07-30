@@ -29312,6 +29312,7 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.full_pass_interval_seconds == 300
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
+    assert config.supervisor.max_pass_runtime_seconds == 1800
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -29324,6 +29325,7 @@ supervisor:
   full_pass_interval_seconds: 120
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
+  max_pass_runtime_seconds: 900
 """
     )
     config = load_config(config_file)
@@ -29331,6 +29333,7 @@ supervisor:
     assert config.supervisor.full_pass_interval_seconds == 120
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
+    assert config.supervisor.max_pass_runtime_seconds == 900
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:

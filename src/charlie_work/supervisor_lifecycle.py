@@ -129,6 +129,7 @@ def record_supervisor_started(
     pid: int,
     started_at: str,
     full_pass_interval_seconds: int,
+    max_pass_runtime_seconds: int | None = None,
 ) -> None:
     """Emit ``supervisor_started`` and write a fresh heartbeat.
 
@@ -138,6 +139,8 @@ def record_supervisor_started(
     ``exited_at`` here means the prior supervisor was killed, not that
     it is still running.
     """
+    if max_pass_runtime_seconds is None:
+        max_pass_runtime_seconds = full_pass_interval_seconds
     path = supervisor_heartbeat_path(fleet_dir_override)
     heartbeat = {
         "pid": pid,
@@ -145,6 +148,7 @@ def record_supervisor_started(
         "last_beat_at": started_at,
         "pass_number": 0,
         "full_pass_interval_seconds": full_pass_interval_seconds,
+        "max_pass_runtime_seconds": max_pass_runtime_seconds,
         "exited_at": None,
         "exit_code": None,
     }
@@ -156,6 +160,7 @@ def record_supervisor_started(
             "pid": pid,
             "started_at": started_at,
             "full_pass_interval_seconds": full_pass_interval_seconds,
+            "max_pass_runtime_seconds": max_pass_runtime_seconds,
         },
         repo=_FLEET_REPO,
     )
