@@ -1,0 +1,84 @@
+# charlie-work config — GLM 5.2 promo profile.
+#
+# Temporary profile for Devin's free GLM 5.2 promotional access period
+# (2026-07-22). Workers run glm-5.2 (the free promo model); cross-family
+# reviewers run swe-1-7 to preserve the different-model review dynamic.
+#
+# Derived from examples/orchestrator.config.devin.yaml. When the promo ends,
+# revert to the standard devin profile (workers: swe-1-7, reviewers: codex or
+# your usual cross-family model). Copy to your repo root as
+# `orchestrator.config.yaml` and adjust.
+
+labels:
+  ready: automated-ready
+
+dispatch:
+  default_limit: 3
+  finalize_limit: 25
+  branch_prefix: agent/issue
+  worker_model_tier: capable
+  worker_template: worker.md
+  # order: oldest
+
+review:
+  max_rework_cycles: 2
+  require_tests_or_rationale: true
+  require_issue_link: true
+
+review_dispatch:
+  enabled: false
+  reviews_dir: .var/charlie-work/dispatches/reviews
+  max_local_review_processes: 0
+
+auto_merge:
+  enabled: true
+  strategy: squash
+  delete_branch: true
+  require_approved_review: true
+  # update_branch_strategy: front_of_train
+  required_checks:
+    - Tests passed
+    - Lint & Format
+    - Pre-commit
+  # merge_flags: ["--admin"]
+
+runtime:
+  state_dir: .var/charlie-work
+  # prompts_dir: orchestrator-prompts
+  # gh_max_retries: 3
+  # gh_retry_base_seconds: 1.0
+  # graphql_rate_limit_threshold: 1500
+
+devin:
+  adapter: devin-shell
+  session_manifest: .var/charlie-work/dispatches/session-manifest.json
+  session_results: .var/charlie-work/dispatches/session-results.json
+  sessions_dir: .var/charlie-work/dispatches/sessions
+  # PROMO: workers run glm-5.2 during Devin's free-access promotional period.
+  # Default effort is fine (GLM 5.2 defaults to max reasoning). Revert to
+  # swe-1-7 (or your usual subsidized model) when the promo ends.
+  worker_model: glm-5.2
+  venv_source: null
+  # shell_command: [devin, --prompt-file, "{prompt_path}", --print, --permission-mode, dangerous]
+
+cross_family:
+  # PROMO: reviewers run swe-1-7 (Devin's subsidized proprietary model) while
+  # workers run glm-5.2, preserving the cross-family (different-model) review
+  # dynamic. Revert to codex (or your usual cross-family model) when the promo
+  # ends.
+  enabled: true
+  model: swe-1-7
+  command:
+    - devin
+    - --model
+    - "{model}"
+    - -p
+    - --prompt-file
+    - "{prompt_path}"
+  timeout_seconds: 300
+
+supervisor:
+  poll_interval_seconds: 20
+  full_pass_interval_seconds: 300
+  active_cooldown_seconds: 30
+  max_runtime_minutes: 0
