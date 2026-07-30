@@ -6058,8 +6058,32 @@ class OrchestratorApp:
         newly_flagged_mention_issues = [
             n for n in finalizable_mention_issue_numbers if n not in already_flagged_mention_issues
         ]
-        for issue_number in newly_flagged_mention_issues:
-            transition(self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged")
+        # Capture the transition outcome per issue so the dedup marker below
+        # is only stamped for issues whose label edge actually took effect.
+        # Stamping unconditionally (the pre-fix behavior) meant a
+        # PARTIAL_FAILURE label write still recorded
+        # merged_pr_mention_flagged_at, permanently suppressing retry (the
+        # one-shot guard above keys off the timestamp's presence) with no
+        # diagnostic beyond transition()'s own log line. NOTHING_CHANGED is
+        # treated the same as APPLIED: per labels.py's _edges(),
+        # "merged_pr_mention_flagged" always has a non-empty add tuple, so
+        # NOTHING_CHANGED is unreachable for this event today, but it is
+        # handled here defensively since a retry would recompute the exact
+        # same static edge and produce the same NOTHING_CHANGED outcome again.
+        mention_flag_outcomes: list[tuple[int, TransitionOutcome]] = [
+            (
+                issue_number,
+                transition(
+                    self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged"
+                ).outcome,
+            )
+            for issue_number in newly_flagged_mention_issues
+        ]
+        stamped_mention_issues = [
+            issue_number
+            for issue_number, outcome in mention_flag_outcomes
+            if outcome != TransitionOutcome.PARTIAL_FAILURE
+        ]
 
         # Issue #429/#433: closed-unmerged stripping is handled by
         # _finalize_externally_merged_issues, which already performs the
@@ -6107,7 +6131,11 @@ class OrchestratorApp:
             # (newly_flagged_mention_issues); already-flagged issues are
             # skipped so the event fires once and the operator's label
             # removal is not overridden on the next pass.
-            for issue_number in newly_flagged_mention_issues:
+            # Only issues whose transition() outcome was not PARTIAL_FAILURE
+            # (stamped_mention_issues, computed above) get the dedup marker —
+            # a failed label write must leave it unset so the next pass
+            # retries instead of silently leaving the wrong labels forever.
+            for issue_number in stamped_mention_issues:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {
@@ -6115,11 +6143,11 @@ class OrchestratorApp:
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
                 }
-            if newly_flagged_mention_issues:
+            if stamped_mention_issues:
                 state = append_event(
                     state,
                     "dispatch_merged_pr_mention_flagged",
-                    {"issue_numbers": newly_flagged_mention_issues},
+                    {"issue_numbers": stamped_mention_issues},
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
