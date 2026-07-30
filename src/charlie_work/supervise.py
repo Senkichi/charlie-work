@@ -788,7 +788,7 @@ def run_supervised(
     full_pass_interval = cfg.full_pass_interval_seconds
     active_cooldown = cfg.active_cooldown_seconds
 
-    sessions_dir = app._layout.sessions_dir
+    sessions_dir = app.layout.sessions_dir
     prs_dir = app.paths.prs
 
     pass_number = 0

@@ -80,7 +80,7 @@ from .janitor import (
     TestAdequacyVerdict,
 )
 from .labels import TransitionOutcome, transition
-from .paths import RuntimePaths, resolved_layout
+from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import render_prompt
 from .reconcile import (
     DriftItem,
@@ -4721,6 +4721,17 @@ class OrchestratorApp:
         # installed CLI. Fail fast before any dispatch/review/merge work.
         if isinstance(self.gh, GitHub):
             self.gh.validate_field_lists()
+
+    @property
+    def layout(self) -> ResolvedLayout:
+        """Public, read-only view of the resolved state-child layout.
+
+        This is the contract module-level helpers (e.g. ``supervise.run_supervised``)
+        that take an ``app`` argument should use, mirroring the existing public
+        ``paths`` attribute -- callers outside this class should never reach into
+        the private ``self._layout`` cache directly.
+        """
+        return self._layout
 
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
