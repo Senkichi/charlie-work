@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
+from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
@@ -297,22 +299,39 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate-state-dir",
         help="Plan (and optionally apply) a move of a legacy state dir to its new root",
     )
-    # --src and --dst are both REQUIRED, deliberately: neither is derived from
-    # config.runtime.state_dir. During the migration window that key still names the
-    # *source* (it is retired in a later step), so deriving the destination from it
-    # would silently invert the two -- and the inversion's failure mode is moving a
-    # live state tree onto itself. An explicit pair has no dependency on which
-    # config edits have landed yet.
+    # --src/--dst are optional overrides. Their defaults are derived, never a
+    # repeated literal: src is wherever this repo's config currently points
+    # runtime.state_dir at (the "legacy" location for the duration of the
+    # migration window), dst is the package-wide default state root from
+    # layout.py. Overrides exist so an operator can rehearse against a copied
+    # tree instead of the live one.
     migrate_parser.add_argument(
-        "--src", required=True, help="Legacy state dir to move from (abs, or relative to repo)"
+        "--src",
+        default=None,
+        help="Legacy state dir to move from (default: this repo's configured runtime.state_dir)",
     )
     migrate_parser.add_argument(
-        "--dst", required=True, help="New state dir to move into (abs, or relative to repo)"
+        "--dst",
+        default=None,
+        help="New state dir to move into (default: the package's default state root)",
     )
     migrate_parser.add_argument(
         "--apply",
         action="store_true",
         help="Actually move. Without this the command only plans and prints.",
+    )
+    migrate_parser.add_argument(
+        "--quiesce-pattern",
+        action="append",
+        dest="quiesce_patterns",
+        default=None,
+        metavar="REGEX",
+        help=(
+            "Regex matched against live process command lines to prove the fleet is "
+            "stopped before --apply acts; repeatable. With --apply and no pattern given, "
+            "quiescence cannot be established and the move is refused. Without --apply, "
+            "patterns (if given) are only reported informationally."
+        ),
     )
     _add_dry_run(migrate_parser)
 
@@ -383,6 +402,17 @@ def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
     return candidate
 
 
+def _migration_path_key(path: Path) -> str:
+    """Fold case/separator so a resolved src/dst pair compares equal correctly.
+
+    Mirrors the normalization discipline ``state_migration._normalize_path_key``
+    applies for the same hazard (git-porcelain forward slashes vs. disk
+    backslashes, drive-letter case) without importing a private name across
+    that module's boundary.
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
 def _render_migration_plan(plan) -> str:
     """Human-readable rendering of a plan: counts, then every blocked child.
 
@@ -405,7 +435,13 @@ def _render_migration_plan(plan) -> str:
     return "\n".join(lines)
 
 
-def run_migrate_state_dir_command(args: argparse.Namespace) -> CommandResult:
+def run_migrate_state_dir_command(
+    args: argparse.Namespace,
+    *,
+    planner=gather_migration_inputs,
+    actuator=apply_state_dir_migration,
+    quiescence_checker=check_quiescence,
+) -> CommandResult:
     """Plan, and with ``--apply``, actuate a legacy state-dir move.
 
     Plan-only is the default; ``--apply`` is the explicit opt-in. A global or
@@ -413,12 +449,57 @@ def run_migrate_state_dir_command(args: argparse.Namespace) -> CommandResult:
     round, so the two flags together can only ever be safe: the failure mode of
     the opposite precedence is an operator who wrote ``--dry-run`` watching a
     real migration run.
+
+    ``--src``/``--dst`` default to the repo's *currently configured*
+    ``runtime.state_dir`` and the package's default state root respectively --
+    never a literal re-spelled here -- so the common case needs no flags at
+    all. If they resolve to the same place there is nothing to migrate.
+
+    Quiescence (proof the fleet is stopped) gates ``--apply`` only. A dry run
+    must keep working against a live fleet -- that is how an operator inspects
+    a plan before committing -- so it only *reports* quiesce status. Patterns
+    are supplied by the caller via ``--quiesce-pattern`` (repeatable); there is
+    no built-in default list (CLAUDE.md rule 9: no embedded manual lists), so
+    ``--apply`` with none given is refused rather than silently skipping the
+    check.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    src_root = _resolve_migration_root(args.src, repo_root)
-    dst_root = _resolve_migration_root(args.dst, repo_root)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
 
-    plan = gather_migration_inputs(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
+    src_root = (
+        _resolve_migration_root(args.src, repo_root)
+        if args.src is not None
+        else runtime_paths(repo_root, config.runtime.state_dir).root
+    )
+    dst_root = (
+        _resolve_migration_root(args.dst, repo_root)
+        if args.dst is not None
+        # ``.resolve()`` here (not just in ``layout.default_state_root``) matters:
+        # ``runtime_paths`` above resolves symlinks/junctions in the *whole* src
+        # path, not just ``repo_root``. Without a matching resolve on this side,
+        # a repo whose ``.var`` is itself a symlink/junction would make the two
+        # roots compare unequal even when they name the same on-disk location,
+        # producing a same-place migration plan instead of the intended
+        # already-migrated short-circuit. Safe on a not-yet-created dst: Path
+        # .resolve() does not require the path to exist.
+        else layout.default_state_root(repo_root).resolve()
+    )
+
+    if _migration_path_key(src_root) == _migration_path_key(dst_root):
+        return CommandResult(
+            True,
+            f"already migrated: src and dst both resolve to {dst_root}",
+            {
+                "src_root": str(src_root),
+                "dst_root": str(dst_root),
+                "already_migrated": True,
+                "applied": False,
+            },
+        )
+
+    patterns = tuple(args.quiesce_patterns) if args.quiesce_patterns else ()
+
+    plan = planner(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
     rendered = _render_migration_plan(plan)
     data = {
         "src_root": str(plan.src_root),
@@ -432,13 +513,37 @@ def run_migrate_state_dir_command(args: argparse.Namespace) -> CommandResult:
     if not plan.ok:
         return CommandResult(False, f"{rendered}\nplan failed: {plan.error}", data)
 
-    if not args.apply:
-        return CommandResult(True, f"{rendered}\n(plan only; pass --apply to move)", data)
+    acting = args.apply and not args.dry_run
 
-    if args.dry_run:
-        return CommandResult(True, f"{rendered}\n(dry-run: --apply ignored, nothing moved)", data)
+    if not acting:
+        if args.apply and args.dry_run:
+            note = "(dry-run: --apply ignored, nothing moved)"
+        else:
+            note = "(plan only; pass --apply to move)"
+        if patterns:
+            report = quiescence_checker(patterns=patterns)
+            note = f"{note}\nquiesce (informational, not enforced for a dry run): {report.summary}"
+        else:
+            note = f"{note}\nquiesce: not checked (no --quiesce-pattern given)"
+        return CommandResult(True, f"{rendered}\n{note}", data)
 
-    outcome = apply_state_dir_migration(plan)
+    if not patterns:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: no --quiesce-pattern given, "
+            "quiescence cannot be established",
+            data,
+        )
+
+    report = quiescence_checker(patterns=patterns)
+    if not report.ok:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: fleet is not quiescent\n{report.summary}",
+            data,
+        )
+
+    outcome = actuator(plan)
     data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
     if not outcome.ok:
         data = {**data, "aborted_at": outcome.aborted_at}

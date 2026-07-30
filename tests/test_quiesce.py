@@ -10,6 +10,7 @@ patterns, and malformed regexes.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -391,3 +392,43 @@ def test_check_quiescence_delegates_to_assert_quiescent_on_success() -> None:
 
     assert report.ok is False
     assert report.matched == (reviewer,)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")
+def test_list_processes_actually_runs_against_this_host() -> None:
+    """Execute the real PowerShell snapshot -- no injected lister.
+
+    Every other test in this file substitutes a fake ``lister``, which is why a
+    PowerShell incompatibility survived a fully green suite: ``ConvertTo-Json
+    -AsArray`` is PowerShell 6+, so on Windows PowerShell 5.1 the command failed
+    with a ParameterBindingException and ``check_quiescence`` fail-closed on
+    *every* invocation. A gate that can only ever answer "not quiescent" is
+    indistinguishable from a working gate right up until you need it to say yes.
+
+    This asserts the level the fake-lister tests structurally cannot: that the
+    real command runs on the real interpreter and returns parseable data. The
+    running interpreter must appear in its own snapshot, which also pins the
+    ProcessId/CommandLine field names the parser depends on.
+    """
+    processes, error = list_processes()
+
+    assert error is None, f"real process listing failed: {error}"
+    assert processes, "process listing returned no processes"
+
+    own = [p for p in processes if p.pid == os.getpid()]
+    assert own, "the running interpreter did not appear in its own process snapshot"
+    assert own[0].command_line, "own process reported an empty command line"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")
+def test_check_quiescence_can_report_quiescent_against_the_real_lister() -> None:
+    """A pattern matching nothing must yield ok=True through the real lister.
+
+    The complement of the test above. Together they pin both answers: the
+    -AsArray bug made ok=True unreachable, so a test asserting only the
+    not-quiescent path would have passed against the broken implementation.
+    """
+    report = check_quiescence(patterns=[r"pattern-that-matches-no-command-line-\d{9}"])
+
+    assert report.ok is True, f"expected quiescent, got: {report.summary}"
+    assert report.matched == ()

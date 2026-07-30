@@ -253,9 +253,15 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
                 "powershell",
                 "-NoProfile",
                 "-Command",
+                # No `-AsArray`: that switch is PowerShell 6+. Windows PowerShell
+                # 5.1 -- the edition this host and the self-hosted runners ship --
+                # fails the whole command with a ParameterBindingException, which
+                # made every quiescence check on 5.1 fail closed and report
+                # "not quiescent" regardless of what was actually running. The
+                # single-result normalization below is what makes dropping it safe.
                 "Get-CimInstance Win32_Process | "
                 "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
-                "ConvertTo-Json -AsArray",
+                "ConvertTo-Json",
             ],
             capture_output=True,
             text=True,
@@ -274,10 +280,9 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
     except json.JSONDecodeError as exc:
         return (), f"could not parse powershell output as JSON: {exc}"
 
-    # `ConvertTo-Json -AsArray` normally guarantees a JSON array, but a
-    # single-result edge case has been observed collapsing to a bare object
-    # on some PowerShell builds; normalize defensively rather than dropping
-    # the one process.
+    # Required, not defensive: without `-AsArray` (see above), `ConvertTo-Json`
+    # emits a bare object whenever the pipeline yields exactly one result, and a
+    # JSON array otherwise. Both shapes are normal input here.
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):
