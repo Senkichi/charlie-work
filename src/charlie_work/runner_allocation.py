@@ -432,7 +432,13 @@ def plan_allocation(
         if target < len(running):
             surplus = len(running) - target
             streak = idle_streaks.get(repo, 0)
-            if not contended and (streak < demand_idle_samples or budget_undersubscribed):
+            # Hold the surplus when either the streak is still inside the
+            # demotion grace period and no other repo is contended, or the
+            # budget is undersubscribed.  The budget guard does not need a
+            # ``not contended`` clause: a contended allocation has already
+            # spent the entire budget, so any surplus would push
+            # post_without_parks above it.
+            if budget_undersubscribed or (not contended and streak < demand_idle_samples):
                 if streak < demand_idle_samples:
                     notes.append(
                         f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
@@ -440,11 +446,18 @@ def plan_allocation(
                     )
                     held_by_hysteresis += surplus
                 else:
-                    notes.append(
+                    busy = sum(1 for i in running if i.busy)
+                    busy_surplus = max(0, busy - target)
+                    if busy_surplus:
+                        held_by_busy += busy_surplus
+                    note = (
                         f"{repo}: holding {surplus} surplus slot(s) — "
-                        f"budget undersubscribed ({total_running}/{budget} running) "
+                        f"budget undersubscribed ({post_without_parks}/{budget} running) "
                         f"and no repo is waiting"
                     )
+                    if busy_surplus:
+                        note += f"; {busy_surplus} executing jobs"
+                    notes.append(note)
                 continue
 
             reclaimable = sorted(
