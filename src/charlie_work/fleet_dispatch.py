@@ -1018,16 +1018,25 @@ def _emit_fleet_transition(
     notify_config: Any,
     entry: AttentionEntry,
     fleet_dir_override: str | None,
+    *,
+    persistent: bool = True,
 ) -> None:
-    """Emit a single fleet attention entry as a digest, deduped across passes.
+    """Emit a single fleet attention entry as a digest.
 
-    Wraps the stateful ``_filter_fleet_health_transitions`` so a persistent
-    condition (e.g. a recurring self-deploy ERROR) does not re-fire with
-    ``previous_health: null`` every supervisor pass (issue #554). Only emits
-    when the entry represents a real transition vs the persisted baseline.
+    By default this wraps ``_filter_fleet_health_transitions`` so a
+    persistent condition (e.g. a recurring self-deploy ERROR) does not
+    re-fire with ``previous_health: null`` every supervisor pass (issue #554).
+    Only emits when the entry represents a real transition vs the persisted
+    baseline.
+
+    Set ``persistent=False`` for occurrence-style events (e.g. supervisor
+    lifecycle kills) that must alert every time instead of being deduped.
     """
     state_file = _fleet_health_state_path(fleet_dir_override)
-    filtered = _filter_fleet_health_transitions([entry], state_file)
+    persistent_mask = [persistent] if persistent is not None else None
+    filtered = _filter_fleet_health_transitions(
+        [entry], state_file, persistent_mask=persistent_mask
+    )
     if not filtered:
         return
     digest = AttentionDigest(
@@ -1653,6 +1662,7 @@ def run_fleet_supervise(
                     pid=prior.get("prior_pid"),
                 ),
                 fleet_dir_override,
+                persistent=False,
             )
 
     started_at_iso = utc_now()
@@ -1911,6 +1921,7 @@ def run_fleet_supervise(
                         pid=os.getpid(),
                     ),
                     fleet_dir_override,
+                    persistent=False,
                 )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("supervisor exit instrumentation failed: %s", exc)

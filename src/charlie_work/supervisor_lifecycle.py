@@ -152,18 +152,24 @@ def record_supervisor_started(
         "exited_at": None,
         "exit_code": None,
     }
-    _write_heartbeat(path, heartbeat)
-    log_event(
-        path,
-        SUPERVISOR_STARTED,
-        {
-            "pid": pid,
-            "started_at": started_at,
-            "full_pass_interval_seconds": full_pass_interval_seconds,
-            "max_pass_runtime_seconds": max_pass_runtime_seconds,
-        },
-        repo=_FLEET_REPO,
-    )
+    try:
+        _write_heartbeat(path, heartbeat)
+    except OSError as exc:
+        logger.warning("Failed to write supervisor heartbeat at %s: %s", path, exc)
+    try:
+        log_event(
+            path,
+            SUPERVISOR_STARTED,
+            {
+                "pid": pid,
+                "started_at": started_at,
+                "full_pass_interval_seconds": full_pass_interval_seconds,
+                "max_pass_runtime_seconds": max_pass_runtime_seconds,
+            },
+            repo=_FLEET_REPO,
+        )
+    except OSError as exc:
+        logger.warning("Failed to log supervisor_started event for %s: %s", path, exc)
 
 
 def update_supervisor_heartbeat(

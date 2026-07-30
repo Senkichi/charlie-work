@@ -18,6 +18,7 @@ from charlie_work.config import (
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
     _build_fleet_attention_digest,
+    _emit_fleet_transition,
     _extract_attention_events,
     _is_fleet_pass_active,
     _run_fleet_allocation_prologue,
@@ -26,6 +27,7 @@ from charlie_work.fleet_dispatch import (
     fleet_loop,
     run_fleet_supervise,
 )
+from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.runner_allocation import (
     AllocationPlan,
@@ -1579,6 +1581,7 @@ def test_supervisor_lifecycle_abnormal_exit_alerts_when_notify_enabled(
     entry = mock_emit.call_args.args[1]
     assert entry.adapter_kind == "fleet-supervisor"
     assert entry.health == "ERROR"
+    assert mock_emit.call_args.kwargs.get("persistent") is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -1728,6 +1731,49 @@ def test_supervisor_lifecycle_prior_exit_alerts_when_notify_enabled(
     ]
     assert prior_emit, "prior abnormal exit did not reach the attention digest"
     assert prior_emit[0].args[1].health == "ERROR"
+    assert prior_emit[0].kwargs.get("persistent") is False
+
+
+def test_supervisor_lifecycle_repeated_errors_are_not_deduped(tmp_path: Path) -> None:
+    """Supervisor-kill alerts are occurrence-style: repeated kills must all fire."""
+    notify_config = MagicMock()
+    notify_config.enabled = True
+    entry = AttentionEntry(
+        issue_number=-1,
+        adapter_kind="fleet-supervisor",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="prior supervisor terminated without an exit event",
+        pid=4242,
+    )
+
+    fleet_dir = str(tmp_path / "fleet")
+    with patch("charlie_work.fleet_dispatch.emit_digest") as mock_emit:
+        _emit_fleet_transition(notify_config, entry, fleet_dir, persistent=False)
+        _emit_fleet_transition(notify_config, entry, fleet_dir, persistent=False)
+
+    assert mock_emit.call_count == 2
+
+
+def test_supervisor_lifecycle_persistent_errors_are_deduped(tmp_path: Path) -> None:
+    """Persistent health transitions still dedup by default."""
+    notify_config = MagicMock()
+    notify_config.enabled = True
+    entry = AttentionEntry(
+        issue_number=-1,
+        adapter_kind="self-deploy",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="self-deploy failed",
+        pid=None,
+    )
+
+    fleet_dir = str(tmp_path / "fleet-persist")
+    with patch("charlie_work.fleet_dispatch.emit_digest") as mock_emit:
+        _emit_fleet_transition(notify_config, entry, fleet_dir)
+        _emit_fleet_transition(notify_config, entry, fleet_dir)
+
+    assert mock_emit.call_count == 1
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")

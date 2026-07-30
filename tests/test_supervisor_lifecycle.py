@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -235,3 +236,63 @@ def test_full_lifecycle_killed_then_new_start_detects_gap(tmp_path: Path) -> Non
     assert len(exited) == 1
     assert exited[0]["payload"]["exit_code"] is None
     assert exited[0]["payload"]["reason"] == "prior_supervisor_terminated_without_exit_event"
+
+
+def test_record_supervisor_started_swallows_heartbeat_write_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    """A disk error writing the heartbeat must not crash the supervisor start path."""
+    fleet_dir = str(tmp_path / "fleet")
+
+    def failing_write(_path: Path, _payload: dict[str, Any]) -> None:
+        raise OSError("heartbeat disk full")
+
+    monkeypatch.setattr(
+        "charlie_work.supervisor_lifecycle._write_heartbeat",
+        failing_write,
+    )
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        record_supervisor_started(
+            fleet_dir,
+            pid=12345,
+            started_at="2026-07-25T17:55:22Z",
+            full_pass_interval_seconds=300,
+        )
+
+    assert "heartbeat disk full" in caplog.text
+    events = query_events(supervisor_heartbeat_path(fleet_dir), kind=SUPERVISOR_STARTED)
+    assert len(events) == 1
+    assert events[0]["payload"]["pid"] == 12345
+
+
+def test_record_supervisor_started_swallows_event_log_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    """A disk error logging the started event must not crash the supervisor start path."""
+    fleet_dir = str(tmp_path / "fleet")
+
+    def failing_log(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("event db full")
+
+    monkeypatch.setattr(
+        "charlie_work.supervisor_lifecycle.log_event",
+        failing_log,
+    )
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        record_supervisor_started(
+            fleet_dir,
+            pid=12345,
+            started_at="2026-07-25T17:55:22Z",
+            full_pass_interval_seconds=300,
+        )
+
+    assert "event db full" in caplog.text
+    # The heartbeat sidecar is still written even though the event log failed.
+    hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
+    assert hb["pid"] == 12345
