@@ -108,6 +108,7 @@ from .state import (
     arm_quota_probe,
     clear_quota_throttles,
     clear_reviewer_quota,
+    defer_reviewer_probe_after,
     disarm_quota_probe,
     is_claim_stale,
     is_quota_probe_actionable,
@@ -12033,6 +12034,13 @@ class OrchestratorApp:
                     .replace("+00:00", "Z")
                 )
                 state = arm_quota_probe(state, next_probe_at)
+                # Share the failure with dispatch_reviews's probe_mode gate:
+                # a red flat probe confirmed the window is still closed, so
+                # also bump reviewer_quota.probe_after (when the reviewer
+                # quota is exhausted) to stop dispatch_reviews from
+                # independently launching a real reviewer session into the
+                # same window on this or a nearby pass (issue #663).
+                state = defer_reviewer_probe_after(state, next_probe_at)
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 

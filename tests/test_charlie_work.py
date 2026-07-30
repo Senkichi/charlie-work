@@ -10510,6 +10510,68 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
     assert "throttled_until" not in cleared["reviewer_quota"]
 
 
+def test_defer_reviewer_probe_after_bumps_past_probe_after() -> None:
+    """A red flat probe must bump reviewer_quota.probe_after forward so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    # Quota exhausted, probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2020-01-01T00:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
+    # throttled_until is untouched.
+    assert result["reviewer_quota"]["throttled_until"] == "2099-01-01T00:00:00Z"
+
+
+def test_defer_reviewer_probe_after_noop_when_quota_not_exhausted() -> None:
+    """Must not write probe_after on a non-exhausted quota -- that would
+    leave stale state for no reason (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert "probe_after" not in result.get("reviewer_quota", {})
+
+
+def test_defer_reviewer_probe_after_never_moves_earlier() -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, the bump must
+    not shorten it -- that would make dispatch_reviews probe more often,
+    not less (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2026-08-01T04:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T04:00:00Z"
+
+
+def test_defer_reviewer_probe_after_overwrites_malformed_current() -> None:
+    """A malformed current probe_after must not wedge the bump -- overwrite
+    with the well-formed new value (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="not-a-timestamp",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
+
+
 def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
     from charlie_work.state import empty_state, set_throttled_until
 
@@ -23963,6 +24025,147 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
     assert abs((parsed - expected).total_seconds()) < 5
     assert state["throttled_until"] == future
     assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
+
+
+def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must also bump reviewer_quota.probe_after so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        is_reviewer_probe_ready,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    # Reviewer quota exhausted with probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    # probe_after must now be bumped to the flat probe's next attempt, so
+    # dispatch_reviews's is_reviewer_probe_ready returns False.
+    assert state["reviewer_quota"]["probe_after"] == next_probe_at
+    assert is_reviewer_probe_ready(state) is False
+    # consecutive_probe_failures is not touched by the flat probe.
+    assert state["reviewer_quota"].get("consecutive_probe_failures", 0) == 0
+
+
+def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, a red flat
+    probe must not shorten it (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    far_future = (
+        (datetime.now(UTC) + timedelta(hours=4))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # probe_after stays at the existing (further-out) backoff target.
+    assert state["reviewer_quota"]["probe_after"] == far_future
+
+
+def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_throttled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must not write reviewer_quota.probe_after when the
+    reviewer quota is not exhausted -- only the root throttle is active
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # No reviewer_quota.probe_after written -- reviewer quota was not exhausted.
+    assert "probe_after" not in state.get("reviewer_quota", {})
 
 
 def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
