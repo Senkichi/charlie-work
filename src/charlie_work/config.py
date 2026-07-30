@@ -786,6 +786,7 @@ class CrossFamilyConfig:
         "{prompt_path}",
     )
     timeout_seconds: int = 300
+    auto_verdict: bool = False
 
 
 @dataclass(frozen=True)

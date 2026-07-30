@@ -53,9 +53,21 @@ _BLOCKED_RE = re.compile(
     re.IGNORECASE,
 )
 
-_VERDICT_RE = re.compile(r"^\s*verdict\s*:", re.IGNORECASE | re.MULTILINE)
+# ``Verdict:`` line OR a ``## Verdict`` heading — cross-family models
+# (e.g. kimi-k3) emit the verdict as a markdown heading without a colon.
+_VERDICT_RE = re.compile(
+    r"^\s*verdict\s*:|^#+\s*verdict\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
-_SEVERITY_RE = re.compile(r"\*\*(BLOCKER|MAJOR|MINOR|NIT)\*\*")
+# ``**SEVERITY**`` bold marker OR a ``### SEVERITY`` heading — cross-family
+# models (e.g. kimi-k3) emit findings as ``### NIT — file:line`` headings
+# instead of ``**NIT**`` bold inline markers.
+_SEVERITY_RE = re.compile(
+    r"\*\*(?:BLOCKER|MAJOR|MINOR|NIT)\*\*"
+    r"|^#+\s*(?:BLOCKER|MAJOR|MINOR|NIT)\b",
+    re.MULTILINE,
+)
 
 
 def _looks_transient(*texts: str) -> bool:
@@ -295,6 +307,55 @@ def _fail(
     )
 
 
+_BLOCKER_OR_MAJOR_RE = re.compile(
+    r"\*\*(?:BLOCKER|MAJOR)\*\*|^#+\s*(?:BLOCKER|MAJOR)\b",
+    re.MULTILINE,
+)
+
+
+def parse_cross_family_verdict(report_text: str) -> tuple[str, str] | None:
+    """Parse a cross-family report into a ``(decision, summary)`` tuple.
+
+    Returns ``("approved", summary)`` when the report body contains no
+    BLOCKER or MAJOR severity markers, ``("request_changes", summary)``
+    when it does, or ``None`` when the report is absent, UNAVAILABLE, or
+    semantically invalid (so the caller skips the PR rather than recording
+    a wrong verdict).
+
+    The summary is the verdict section text (the line(s) after the
+    ``Verdict:`` marker or ``## Verdict`` heading), truncated to a
+    reasonable length for a PR comment / state event payload.
+    """
+    if not report_text or not report_text.strip():
+        return None
+    first_line = report_text.strip().splitlines()[0]
+    if "(UNAVAILABLE)" in first_line:
+        return None
+    body = extract_report_body(report_text)
+    if not report_body_is_valid(body):
+        return None
+    # Extract the verdict section as the summary.
+    summary = ""
+    verdict_match = _VERDICT_RE.search(body)
+    if verdict_match:
+        # Take the text after the verdict marker up to the next blank line
+        # or end of body.
+        after = body[verdict_match.end() :].strip()
+        # Strip leading markdown punctuation like "**" or "---"
+        after = after.lstrip("*-# \n")
+        # Take up to ~500 chars of the first paragraph.
+        lines: list[str] = []
+        for line in after.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped == "---":
+                break
+            lines.append(stripped)
+        summary = " ".join(lines)[:500]
+    if _BLOCKER_OR_MAJOR_RE.search(body):
+        return "request_changes", summary or "Cross-family review found BLOCKER/MAJOR findings"
+    return "approved", summary or "Cross-family review found no BLOCKER or MAJOR findings"
+
+
 __all__ = [
     "CrossFamilyResult",
     "render_command",
@@ -302,4 +363,5 @@ __all__ = [
     "extract_report_body",
     "extract_head_ref_oid",
     "report_body_is_valid",
+    "parse_cross_family_verdict",
 ]

@@ -49,6 +49,7 @@ from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
     extract_report_body,
+    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
@@ -10133,11 +10134,88 @@ def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None
     assert report_body_is_valid(blocked_with_bold) is False
 
 
+def test_report_body_is_valid_accepts_heading_style_markers() -> None:
+    """Cross-family models (e.g. kimi-k3) emit findings as ``### NIT —`` headings
+    and a ``## Verdict`` heading instead of ``**NIT**`` bold / ``Verdict:`` line.
+    These are real reviews and must not be falsely rejected as UNAVAILABLE.
+    """
+    heading_severity = (
+        "### NIT — worktree.py:2977 (new): dead weight\n\n"
+        "## Verdict\n\n**Approve** — claims verified."
+    )
+    assert report_body_is_valid(heading_severity) is True
+    # Heading verdict alone (no severity heading) is also valid.
+    assert report_body_is_valid("## Verdict\n\nApprove") is True
+    # Heading severity alone (no verdict heading) is also valid.
+    assert report_body_is_valid("### MAJOR — bug.py:10: off-by-one\n\nfix it") is True
+
+
 def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
     body = "**MAJOR**\nissue\n\nVerdict: safe"
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
+
+
+def test_parse_cross_family_verdict_approved_no_blockers() -> None:
+    """A report with only MINOR/NIT findings parses to approved."""
+    body = "**MINOR**\nsmall issue\n\nVerdict: No BLOCKERs or MAJORs — fix is correct"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "approved"
+    assert "No BLOCKERs" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
+    """A report with a BLOCKER finding parses to request_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "request_changes"
+    assert "BLOCKER" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_major() -> None:
+    """A report with a MAJOR finding parses to request_changes."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_heading_style_major() -> None:
+    """Heading-style ``### MAJOR`` markers are detected as request_changes."""
+    body = "### MAJOR — bug.py:10: off-by-one\n\nfix it\n\n## Verdict\n\nMAJOR should be fixed"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
+    """An UNAVAILABLE stub report returns None (skip, don't record a wrong verdict)."""
+    stub = "# Cross-family adversarial review — `glm-5.2` (UNAVAILABLE)\n\n> timed out\n"
+    assert parse_cross_family_verdict(stub) is None
+
+
+def test_parse_cross_family_verdict_empty_returns_none() -> None:
+    """Empty/blank report text returns None."""
+    assert parse_cross_family_verdict("") is None
+    assert parse_cross_family_verdict("   ") is None
+
+
+def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
+    """A report body that fails report_body_is_valid returns None."""
+    body = "some random text with no severity or verdict"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert parse_cross_family_verdict(wrapped) is None
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
