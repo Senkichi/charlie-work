@@ -311,7 +311,12 @@ def detect_aviator_stale_blocked(
 
 
 def detect_drift(
-    gh: GitHub, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHub,
+    state: dict[str, Any],
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+    skip_dead_session_sweep: bool = False,
 ) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
@@ -321,6 +326,29 @@ def detect_drift(
 
     If ``repo_root`` is provided, also checks for dead sessions and classifies
     their failures to update the provider throttle state.
+
+    ``skip_dead_session_sweep`` (merge-lane-recovery §6-B): when True, the
+    confirmed-dead-session classify+reap block below is skipped entirely,
+    while live-session tracking and launch-stalled detection (both gated on
+    the same ``repo_root is not None`` check, immediately above it) still
+    run. This lane predates issue #343 and never adopted its single
+    enforcement point (``classify_worker_health`` + the
+    ``max_inconclusive_probe_deferrals`` grace cap) — it goes straight from
+    "pid not alive" to classify-and-reap on the very first sighting. That
+    was safe as long as this function was reachable only from manual
+    ``mop-up --fix``, run by an operator who has already independently
+    satisfied themselves the session is really gone. It stops being safe once
+    ``detect_drift`` runs automatically inside the main loop
+    (``_maybe_reconcile_drift``): the loop's own stall/dead lanes
+    (``_detect_and_handle_stalled_sessions`` /
+    ``_classify_dead_sessions_and_update_throttle_state``) already ran this
+    exact same pass, immediately before reconcile, and may have deliberately
+    *deferred* a not-yet-confirmed-dead session to preserve its grace budget.
+    Re-scanning the same ``sessions_dir`` a few calls later with no memory of
+    that decision reaps the sidecar out from under the grace period,
+    silently halving it every 30 minutes. The periodic in-loop caller passes
+    True for this reason; ``mop-up --fix`` (and every existing caller/test)
+    defaults to False and keeps today's full behavior.
     """
     threshold = config.runtime.graphql_rate_limit_threshold
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold)
@@ -337,6 +365,23 @@ def detect_drift(
     # issues that ARE in the snapshot.
     issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
     state_prs: dict[str, Any] = state.get("prs", {})
+    # PR-side counterpart of issue_snapshot_truncated, guarding
+    # state_pr_missing_on_github below. Two distinct signals both mean "this
+    # gh.run() response cannot be trusted to represent every PR the
+    # orchestrator is tracking":
+    #   - truncated-from-above: `--limit _LIST_LIMIT` returned exactly that
+    #     many, so real GitHub has strictly more PRs than fit in this
+    #     snapshot.
+    #   - suspiciously-empty: the fetch returned zero PRs while state.json is
+    #     actively tracking PRs. GitHub never deletes closed/merged PRs, so a
+    #     repo with tracked PR history can never legitimately report zero PRs
+    #     via `--state all`. `_fetch_prs` has no exception handling around
+    #     `gh.run(json_output=True)`, so a transient CLI/API failure that
+    #     degrades to an empty result is indistinguishable, at this layer,
+    #     from "GitHub really has none" -- without this guard it reads as
+    #     "every tracked PR was deleted" and state_pr_missing_on_github drops
+    #     every single one in that pass.
+    pr_snapshot_incomplete = len(prs) >= _LIST_LIMIT or (not prs and bool(state_prs))
 
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
@@ -523,21 +568,22 @@ def detect_drift(
                 )
 
     pr_numbers_on_github = {int(pr["number"]) for pr in prs if pr.get("number") is not None}
-    for pr_number_str in state_prs:
-        try:
-            pr_number = int(pr_number_str)
-        except ValueError:
-            continue
-        if pr_number not in pr_numbers_on_github:
-            drift.append(
-                DriftItem(
-                    kind="state_pr_missing_on_github",
-                    issue_number=state_prs[pr_number_str].get("issue_number"),
-                    pr_number=pr_number,
-                    detail=f"state has prs[{pr_number}] but gh reports no such PR",
-                    fix_actions=(f"drop prs[{pr_number}] from state",),
+    if not pr_snapshot_incomplete:
+        for pr_number_str in state_prs:
+            try:
+                pr_number = int(pr_number_str)
+            except ValueError:
+                continue
+            if pr_number not in pr_numbers_on_github:
+                drift.append(
+                    DriftItem(
+                        kind="state_pr_missing_on_github",
+                        issue_number=state_prs[pr_number_str].get("issue_number"),
+                        pr_number=pr_number,
+                        detail=f"state has prs[{pr_number}] but gh reports no such PR",
+                        fix_actions=(f"drop prs[{pr_number}] from state",),
+                    )
                 )
-            )
 
     # Detect dead sessions and classify failures for provider throttle state
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
@@ -653,7 +699,7 @@ def detect_drift(
                                     # Mark this issue as handled to avoid double-emission
                                     issues_handled_by_session_relabel.add(w.issue_number)
 
-                if w.error is None and not w.is_alive():
+                if not skip_dead_session_sweep and w.error is None and not w.is_alive():
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)
 
@@ -1195,6 +1241,33 @@ def detect_drift(
                 ),
                 fix_actions=(
                     "skip completeness-dependent sweeps for this pass",
+                    "full pagination is tracked in issue #45",
+                ),
+            )
+        )
+
+    # PR-side counterpart: see pr_snapshot_incomplete's definition above for
+    # the two conditions this covers (truncated-from-above, or suspiciously
+    # empty relative to what state.json tracks).
+    if pr_snapshot_incomplete:
+        logger.warning(
+            "PR snapshot is incomplete (%d returned, %d tracked in state); "
+            "skipping state_pr_missing_on_github sweep for this pass",
+            len(prs),
+            len(state_prs),
+        )
+        drift.append(
+            DriftItem(
+                kind="snapshot_truncated",
+                issue_number=None,
+                pr_number=None,
+                detail=(
+                    f"PR snapshot returned {len(prs)} PR(s) while state tracks "
+                    f"{len(state_prs)}; snapshot may be incomplete or the fetch may "
+                    "have failed"
+                ),
+                fix_actions=(
+                    "skip state_pr_missing_on_github sweep for this pass",
                     "full pagination is tracked in issue #45",
                 ),
             )

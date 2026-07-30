@@ -10530,7 +10530,9 @@ class OrchestratorApp:
         lines.append("")
         return "\n".join(lines)
 
-    def reconcile(self, *, fix: bool = False) -> CommandResult:
+    def reconcile(
+        self, *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the
         orchestrator's labels/state — e.g. a PR merged by hand outside
         merge-ready leaving `agent:in-progress` stale forever. Read-only unless
@@ -10541,6 +10543,14 @@ class OrchestratorApp:
         same ``supervisor.lock`` used by fleet/supervise. If either the
         supervisor lock or the state lock is held, the call returns a skipped
         value result rather than blocking or writing unlocked.
+
+        ``skip_dead_session_sweep`` is passed straight through to
+        ``detect_drift`` (see its docstring for the full rationale): the
+        periodic in-loop caller (``_maybe_reconcile_drift``) sets this True
+        because the loop's own stall/dead lanes already swept sessions this
+        exact pass with grace-period semantics reconcile.py's sweep lacks.
+        ``mop-up --fix`` and every other caller default to False, preserving
+        today's full manual-reconcile behavior.
         """
         supervisor_lock = None
         if fix:
@@ -10583,7 +10593,11 @@ class OrchestratorApp:
                         },
                     )
                 drift = detect_drift(
-                    self.gh, state, self.config, repo_root=self.repo_root
+                    self.gh,
+                    state,
+                    self.config,
+                    repo_root=self.repo_root,
+                    skip_dead_session_sweep=skip_dead_session_sweep,
                 ) + detect_aviator_stale_blocked(self.gh, self.config, repo_root=self.repo_root)
                 fixed = False
                 post_fix_drift: list[DriftItem] = []
@@ -10602,7 +10616,11 @@ class OrchestratorApp:
                     # reconcile event. Re-detect against the new state to verify the repairs
                     # actually landed before reporting success.
                     post_fix_drift = detect_drift(
-                        self.gh, new_state, self.config, repo_root=self.repo_root
+                        self.gh,
+                        new_state,
+                        self.config,
+                        repo_root=self.repo_root,
+                        skip_dead_session_sweep=skip_dead_session_sweep,
                     ) + detect_aviator_stale_blocked(
                         self.gh, self.config, repo_root=self.repo_root
                     )
@@ -12086,6 +12104,20 @@ class OrchestratorApp:
         *from* state, never the reverse -- an escalated issue's ``status``
         is never rewritten (D-2). This method does not touch ``status``.
 
+        Calls with ``skip_dead_session_sweep=True``: this pass already ran
+        the loop's own stall/dead lanes (``_detect_and_handle_stalled_sessions``
+        / ``_classify_dead_sessions_and_update_throttle_state``) earlier in
+        ``_loop_body``, with grace-period semantics
+        (``max_inconclusive_probe_deferrals``) that reconcile.py's own
+        dead-session sweep predates and does not implement. Without this,
+        reconcile would re-scan the same sessions a few calls later and
+        unconditionally reap any not-alive one, silently defeating that
+        grace period every time this pass runs. See ``detect_drift``'s
+        docstring in ``reconcile.py`` for the full rationale. Launch-stalled
+        detection and live-session tracking (the other two things gated on
+        ``repo_root`` in ``detect_drift``) are unaffected -- they have no
+        counterpart in the loop's own lanes and keep running.
+
         Two-phase lock pattern, mirroring ``_maybe_probe_quota_recovery``:
         ``self.reconcile(fix=True)`` acquires ``state_lock`` itself
         internally to run drift detection/repair, and ``state_lock`` wraps a
@@ -12114,7 +12146,7 @@ class OrchestratorApp:
             if not is_reconcile_due(state):
                 return
 
-        result = self.reconcile(fix=True)
+        result = self.reconcile(fix=True, skip_dead_session_sweep=True)
 
         next_reconcile_at = (
             (datetime.now(UTC) + timedelta(minutes=self.config.reconcile_pass.interval_minutes))

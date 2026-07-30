@@ -24332,11 +24332,13 @@ def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -
 
     app = _reconcile_pass_app(tmp_path, interval_minutes=30)
     original_reconcile = app.reconcile
-    calls: list[bool] = []
+    calls: list[tuple[bool, bool]] = []
 
-    def _counting_reconcile(*, fix: bool = False) -> CommandResult:
-        calls.append(fix)
-        return original_reconcile(fix=fix)
+    def _counting_reconcile(
+        *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
+        calls.append((fix, skip_dead_session_sweep))
+        return original_reconcile(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(app, "reconcile", _counting_reconcile)
@@ -24345,7 +24347,14 @@ def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -
     finally:
         monkeypatch.undo()
 
-    assert calls == [True]
+    # merge-lane-recovery §6-B follow-up: the in-loop caller must skip
+    # reconcile's own dead-session sweep -- the loop's stall/dead lanes
+    # (_detect_and_handle_stalled_sessions /
+    # _classify_dead_sessions_and_update_throttle_state) already ran this
+    # exact pass, immediately before this call, with grace-period semantics
+    # (max_inconclusive_probe_deferrals) that reconcile.py's sweep does not
+    # implement.
+    assert calls == [(True, True)]
 
     state = load_state(app.paths.state_file)
     next_at = state["reconcile_pass"]["next_reconcile_at"]
