@@ -42,10 +42,12 @@ from . import layout
 # sessions can spawn dozens of xdist workers on an 8-core box (measured
 # incident 2026-07-26: 5 stacked local suites, ~36 xdist workers on 8 physical
 # cores, CI runtime 6.4min -> ~145min). This mirrors the manual operator
-# recipe already used by .var/devin-orchestrator/launch_devin_worker.sh line
-# 49 (comment on line 13: "3 concurrent tracks x 2 xdist workers ~= 8
+# recipe already used by job-cannon's scripts/orchestrator/launch_devin_worker.sh,
+# which exports this same variable ("3 concurrent tracks x 2 xdist workers ~= 8
 # physical cores") — this constant is that same value, applied automatically
-# instead of requiring every dispatch path to remember to set it.
+# instead of requiring every dispatch path to remember to set it. Cited by
+# path + variable name rather than line number: the previous form pointed at
+# .var/devin-orchestrator/…:49, and both the directory and the line moved.
 PYTEST_XDIST_AUTO_NUM_WORKERS_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 
