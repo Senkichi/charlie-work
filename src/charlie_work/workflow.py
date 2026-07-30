@@ -107,6 +107,7 @@ from .state import (
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
     arm_quota_probe,
+    arm_reconcile_pass,
     clear_quota_throttles,
     clear_reviewer_quota,
     defer_reviewer_probe_after,
@@ -115,6 +116,7 @@ from .state import (
     is_quota_probe_actionable,
     is_quota_probe_armed,
     is_quota_probe_due,
+    is_reconcile_due,
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
@@ -12061,6 +12063,102 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
+    def _maybe_reconcile_drift(self) -> None:
+        """Periodic in-loop repair of GitHub label / state.json divergence.
+
+        merge-lane-recovery plan §6-B / D-8. ``OrchestratorApp.reconcile()``
+        (``detect_drift`` + ``apply_fixes``) was previously reachable only
+        via the operator-invoked ``charlie mop-up --fix`` CLI command
+        (``cli.py``'s ``mop-up`` handler) -- the fleet has never run its own
+        repair. This wires it into the loop on a fixed cadence so a
+        divergence like a failed escalation label write (the PRIMARY defect:
+        ``status`` flips to ``escalated`` but the paired ``human_needed``
+        label transition silently fails, leaving a stale ``needs-rework``
+        label on a dead issue forever) is corrected automatically instead of
+        only when an operator remembers to intervene.
+
+        This method is wiring only -- it does not reimplement drift
+        detection or repair. ``self.reconcile(fix=True)`` owns that (and
+        already threads ``state_path`` so ``apply_fixes`` emits one
+        ``"reconcile"`` event per repaired drift item for free -- see
+        ``reconcile.py``). It also owns the safety invariant this
+        workstream exists to preserve: reconcile only ever converges labels
+        *from* state, never the reverse -- an escalated issue's ``status``
+        is never rewritten (D-2). This method does not touch ``status``.
+
+        Two-phase lock pattern, mirroring ``_maybe_probe_quota_recovery``:
+        ``self.reconcile(fix=True)`` acquires ``state_lock`` itself
+        internally to run drift detection/repair, and ``state_lock`` wraps a
+        non-reentrant advisory file lock (a plain per-path
+        ``threading.Lock``, not an ``RLock``) -- calling it while this
+        method already held the same lock would deadlock. So:
+          1. Under our own (short) lock: decide whether reconcile is due at
+             all. If not, return without calling out.
+          2. Outside any lock held by this method: call
+             ``self.reconcile(fix=True)``. This may itself defer (the
+             existing GraphQL rate-limit check) or skip (supervisor lock
+             held by a concurrent manual ``mop-up --fix``) rather than
+             running -- both are preserved, not bypassed.
+          3. Under our own (short) lock again: persist the next-due
+             timestamp and emit exactly one summary event for this pass,
+             shaped by the outcome (completed / deferred / skipped) so a
+             deferred or skipped pass is distinguishable from a silent
+             no-op rather than failing silently (D-8, B-AC3).
+        """
+        if not self.config.reconcile_pass.enabled:
+            return
+
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_reconcile_due(state):
+                return
+
+        result = self.reconcile(fix=True)
+
+        next_reconcile_at = (
+            (datetime.now(UTC) + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = arm_reconcile_pass(state, next_reconcile_at)
+            data = result.data
+            if data.get("skipped"):
+                state = self._record_event(
+                    state,
+                    "reconcile_pass_skipped",
+                    {"reason": data.get("reason")},
+                )
+            elif data.get("deferred"):
+                state = self._record_event(
+                    state,
+                    "reconcile_pass_deferred",
+                    {
+                        "deferred_reason": data.get("deferred_reason"),
+                        "graphql_remaining": data.get("graphql_remaining"),
+                        "graphql_reset": data.get("graphql_reset"),
+                        "graphql_threshold": data.get("graphql_threshold"),
+                    },
+                )
+            else:
+                drift_before = data.get("drift_before", 0)
+                drift_after = data.get("drift_after", 0)
+                state = self._record_event(
+                    state,
+                    "reconcile_pass_completed",
+                    {
+                        "ok": result.ok,
+                        "drift_detected": drift_before,
+                        "drift_fixed": drift_before - drift_after,
+                        "drift_remaining": drift_after,
+                    },
+                )
+            save_state(state_file, state)
+
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
@@ -12116,6 +12214,14 @@ class OrchestratorApp:
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see
         # docstring): only does real work when a throttle indicator is active.
         self._maybe_probe_quota_recovery()
+
+        # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
+        # GitHub label / state.json divergence on a fixed cadence instead of
+        # only when an operator runs `charlie mop-up --fix`. Placed before
+        # the dispatch calls below so labels it repairs (e.g. a stale
+        # `needs-rework` on an issue state already marked `escalated`) are
+        # visible to this same pass's dispatch decisions, not just the next.
+        self._maybe_reconcile_drift()
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills

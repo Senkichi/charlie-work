@@ -24286,6 +24286,229 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     assert state["throttle_adapter_kind"] == "devin"
 
 
+def _reconcile_pass_app(
+    tmp_path: Path,
+    *,
+    interval_minutes: int = 30,
+    enabled: bool = True,
+    gh: Any = None,
+) -> OrchestratorApp:
+    from charlie_work.config import ReconcilePassConfig
+
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+
+
+def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: reconcile_pass.enabled=False must skip reconcile entirely --
+    no call to reconcile(), no schedule armed, no summary event."""
+    app = _reconcile_pass_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("reconcile() must not be called when reconcile_pass is disabled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("reconcile_pass", {}).get("next_reconcile_at") is None
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: enabled + due calls reconcile(fix=True) exactly once, arms
+    the next-due schedule ~interval_minutes out, and records a single
+    reconcile_pass_completed summary event carrying drift counts."""
+    from datetime import UTC, datetime
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    original_reconcile = app.reconcile
+    calls: list[bool] = []
+
+    def _counting_reconcile(*, fix: bool = False) -> CommandResult:
+        calls.append(fix)
+        return original_reconcile(fix=fix)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _counting_reconcile)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    assert calls == [True]
+
+    state = load_state(app.paths.state_file)
+    next_at = state["reconcile_pass"]["next_reconcile_at"]
+    parsed = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=30)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+    events = state.get("events", [])
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["drift_detected"] == 0
+    assert completed[0]["payload"]["drift_fixed"] == 0
+    assert completed[0]["payload"]["drift_remaining"] == 0
+
+
+def test_maybe_reconcile_drift_waits_until_due(tmp_path: Path) -> None:
+    """The periodic cadence must not re-run reconcile before the armed
+    next_reconcile_at timestamp."""
+    from datetime import UTC, datetime
+
+    from charlie_work.state import arm_reconcile_pass
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=25))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_reconcile_pass(load_state(app.paths.state_file), not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("must not reconcile before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] == not_due
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_defers_on_graphql_rate_limit(tmp_path: Path) -> None:
+    """B-AC3: reconcile()'s existing GraphQL rate-limit deferral must be
+    preserved, not bypassed -- surfaced as a distinguishable
+    reconcile_pass_deferred event rather than a silent no-op."""
+
+    class LowBudgetGitHub(FakeGitHub):
+        def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+            return (False, 50, 1234567890)
+
+    app = _reconcile_pass_app(tmp_path, gh=LowBudgetGitHub())
+
+    app._maybe_reconcile_drift()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] is not None
+    events = state.get("events", [])
+    deferred = [e for e in events if e.get("kind") == "reconcile_pass_deferred"]
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["deferred_reason"] == "graphql_rate_limit"
+    assert deferred[0]["payload"]["graphql_remaining"] == 50
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert completed == []
+
+
+def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: Path) -> None:
+    """B-AC5 (critical wiring test): a state/label divergence of the
+    escalated_labels_converged shape -- state says status "escalated", GitHub
+    still carries the stale needs-rework label -- must be corrected by a
+    single app.loop() pass. This proves _maybe_reconcile_drift is actually
+    wired into _loop_body's production call path, not merely present and
+    independently callable. Must FAIL if the wiring call site is removed;
+    see the removal verification recorded in the PR description."""
+    from charlie_work.config import ReconcilePassConfig
+
+    class EscalatedDivergenceGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 40,
+                    "title": "issue 40",
+                    "url": "https://example.test/issues/40",
+                    "body": "",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+
+        def run(
+            self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        ) -> Any:
+            if args[:2] == ["issue", "list"]:
+                return self.issues
+            if args[:2] == ["pr", "list"]:
+                return self.prs
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+        def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]:
+            return self.issues
+
+        def pr_list(self) -> list[dict[str, Any]]:
+            return self.prs
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {
+                issue["number"]
+                for issue in self.issues
+                if issue["number"] in issue_numbers and issue.get("state") == "OPEN"
+            }
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    names = {entry.get("name") for entry in issue["labels"]}
+                    if label not in names:
+                        issue["labels"].append({"name": label})
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        entry for entry in issue["labels"] if entry.get("name") != label
+                    ]
+            return True
+
+    gh = EscalatedDivergenceGitHub()
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    state = load_state(app.paths.state_file)
+    state = {
+        **state,
+        "issues": {**state.get("issues", {}), "40": {"number": 40, "status": "escalated"}},
+    }
+    save_state(app.paths.state_file, state)
+
+    app.loop(limit=1)
+
+    assert (40, "agent:human-needed") in gh.labels_added
+    assert (40, "agent:needs-rework") in gh.labels_removed
+
+    # B-AC7 (critical safety invariant): reconcile must never rewrite status
+    # to match labels -- only `charlie unescalate` re-enters the machine.
+    final_state = load_state(app.paths.state_file)
+    assert final_state["issues"]["40"]["status"] == "escalated"
+
+
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.workflow import _count_live_sessions
