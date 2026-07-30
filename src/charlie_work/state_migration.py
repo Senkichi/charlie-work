@@ -8,12 +8,12 @@ see ``layout.py``), and a legacy override pointing somewhere else (job-cannon's
 ``.var/devin-orchestrator``). Merging the legacy tree into the canonical one
 was originally written as imperative PowerShell prose in a plan doc, and that
 prose accumulated roughly a dozen defects because shell prose has no
-verifier. This module replaces the *decision* half of that migration --
-"which children may be moved, and which cannot" -- with tested, pure Python,
-following the plan/actuate split already established by
-:mod:`charlie_work.runner_allocation`: a pure function turns a snapshot into
-an immutable plan; a separate actuator (out of scope here -- this module is
-planning only) applies it.
+verifier. This module replaces both the *decision* half of that migration --
+"which children may be moved, and which cannot" -- and the *actuation* half
+that applies the decision, following the plan/actuate split already
+established by :mod:`charlie_work.runner_allocation`:
+:func:`plan_state_dir_migration` turns a snapshot into an immutable plan;
+:func:`apply_state_dir_migration` applies it.
 
 Two defects this module exists specifically to prevent
 --------------------------------------------------------
@@ -54,12 +54,15 @@ whole group is blocked.
 Errors as values
 ----------------
 Per CLAUDE.md ("errors from external processes come back as values, never
-raised"), nothing in this module raises for an ordinary planning outcome.
+raised"), nothing in this module raises for an ordinary outcome.
 :func:`plan_state_dir_migration` is pure and cannot fail (no I/O, so no
 external error can occur); its ``MigrationPlan.ok`` is always ``True``.
 :func:`gather_migration_inputs` is where a real failure can happen (the git
 worktree listing can fail), and it surfaces that as ``ok=False`` with a
-message on ``.error`` -- never an exception.
+message on ``.error`` -- never an exception. :func:`apply_state_dir_migration`
+is the third impure function here: a stale plan caught by its TOCTOU
+re-check, or an ``OSError`` raised by the underlying move, both come back as
+``MigrationOutcome(ok=False, error=...)`` -- never an exception either.
 """
 
 from __future__ import annotations
@@ -67,7 +70,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 from .worktree import _list_worktrees_porcelain
 
@@ -181,10 +184,12 @@ def _is_equal_or_nested(inner: Path, outer: Path) -> bool:
     :func:`_normalize_path_key` -- deliberately NOT ``safe_path.contains``,
     which resolves symlinks/junctions on both sides via ``Path.resolve()``
     and is therefore impure. This function must stay filesystem-free so
-    :func:`plan_state_dir_migration` remains a pure function; a future
-    actuator applying this plan should use ``safe_path.contains`` (or
-    ``require_contained``) for its own on-disk safety check before actually
-    moving anything.
+    :func:`plan_state_dir_migration` remains a pure function.
+    :func:`apply_state_dir_migration` deliberately does not add its own
+    ``safe_path.contains`` on-disk containment check before moving a child --
+    its TOCTOU existence re-check (src still present, dst still absent) is
+    judged sufficient for now; a stronger on-disk containment guard remains a
+    possible future hardening, not implemented here.
     """
     inner_key = _normalize_path_key(inner)
     outer_key = _normalize_path_key(outer)
@@ -418,8 +423,8 @@ def gather_migration_inputs(*, repo_root: Path, src_root: Path, dst_root: Path) 
       nothing to migrate, which is a normal steady state (e.g. re-running the
       plan after a previous migration already completed), not a failure.
     * *dst_root* does not exist yet -> treated as having no existing entries,
-      so nothing can collide by name. Creating it is the actuator's job (out
-      of scope for this planning-only module).
+      so nothing can collide by name. Creating it is
+      :func:`apply_state_dir_migration`'s job, not this function's.
 
     A git-worktree-listing failure IS an error (``ok=False``, children empty,
     ``.error`` set to a message naming the failure): the entire point of
@@ -474,3 +479,162 @@ def gather_migration_inputs(*, repo_root: Path, src_root: Path, dst_root: Path) 
         dst_names=dst_names,
         registered_worktrees=registered_worktrees,
     )
+
+
+def _default_mover(src: Path, dst: Path) -> None:
+    """Move *src* to *dst* via ``Path.rename`` -- the default ``mover``.
+
+    A same-volume atomic rename (a repo's two state-dir roots are always
+    ``.var/...`` paths under the same checkout, never across a volume
+    boundary). :func:`apply_state_dir_migration` accepts an injected ``mover``
+    instead of calling this directly so it is unit-testable against a
+    recording fake with zero real filesystem writes, mirroring the
+    ``ProcessLister`` seam in ``quiesce.py``.
+    """
+    src.rename(dst)
+
+
+@dataclass(frozen=True)
+class MigrationOutcome:
+    """Result of :func:`apply_state_dir_migration` -- what actually moved.
+
+    ``moved`` lists child names in the order they were moved -- exactly
+    ``plan.movable``'s names on full success, a strict prefix of them on an
+    aborted run. ``aborted_at`` names the child whose pre-move re-check or
+    move itself failed; it is ``None`` both on full success and on a
+    pre-flight refusal (refusal happens before any child is touched, so
+    there is no child to name). ``error`` is set on every ``ok=False``
+    outcome and is the only field distinguishing *why* -- pre-flight
+    refusal, a stale plan caught by the TOCTOU re-check, or an ``OSError``
+    from ``mover`` -- since ``aborted_at`` alone cannot tell those apart.
+    """
+
+    ok: bool
+    moved: tuple[str, ...] = ()
+    error: str | None = None
+    aborted_at: str | None = None
+
+
+def apply_state_dir_migration(
+    plan: MigrationPlan,
+    *,
+    mover: Callable[[Path, Path], None] | None = None,
+) -> MigrationOutcome:
+    """Actuate *plan*: move every movable child from ``src_root`` to ``dst_root``.
+
+    The actuator half of the plan/actuate split described in the module
+    docstring. All-or-nothing by construction, for the same reason
+    :func:`plan_state_dir_migration` forces a whole atomic sibling group to
+    share one disposition: a partial migration is the dangerous state, not
+    merely an incomplete one -- it leaves the source directory non-empty, no
+    compat junction pointing anywhere, and both trees simultaneously "live"
+    with no single answer for where a given child currently is.
+
+    Pre-flight (refuses before touching anything)
+    ----------------------------------------------
+    * ``plan.ok is False`` -- refuse. The plan itself could not be produced
+      (see :func:`gather_migration_inputs`), so there is nothing safe to act
+      on.
+    * ``plan.blocked`` non-empty -- refuse, naming every blocked child in
+      ``.error``. Moving only ``plan.movable`` and silently leaving the
+      blocked children behind is exactly the partial-migration hazard this
+      function exists to prevent.
+
+    TOCTOU re-check (immediately before each move)
+    -------------------------------------------------
+    *plan* is a snapshot taken at some time T; this function may run at
+    T+n. Immediately before moving each child, this re-verifies that
+    ``child.src_path`` still exists and ``child.dst_path`` still does not --
+    mirroring ``runner_slots.park_runner_slot``'s re-check for a live
+    ``Runner.Worker`` immediately before stopping a listener, because a plan
+    is a snapshot and the world can change between planning and actuation.
+    On divergence the whole run aborts (``ok=False``, ``aborted_at`` set,
+    ``moved`` holding exactly what succeeded before this child) rather than
+    skipping the one stale child and continuing -- skipping would produce
+    the same forbidden partial state as ignoring ``plan.blocked`` above.
+
+    Movement and failure handling
+    ------------------------------
+    Each move goes through *mover* (default :func:`_default_mover`, a
+    same-volume ``Path.rename``); injecting it is what makes this function
+    testable without touching a real filesystem tree. Per CLAUDE.md ("errors
+    from external processes come back as values, never raised"), an
+    ``OSError`` from either the pre-move existence re-checks or *mover*
+    itself is caught and returned as ``ok=False`` with ``aborted_at`` naming
+    the offending child -- never propagated to the caller.
+
+    ``plan.dst_root`` is created (``mkdir(parents=True, exist_ok=True)``) the
+    first time there is at least one child to move -- :func:`gather_migration_inputs`
+    documents that creating it is this function's job, since a planning-only
+    module cannot touch the filesystem. Nothing is created when
+    ``plan.movable`` is empty, so a no-op run has no filesystem side effects.
+
+    Deliberately NOT done here: creating the compat junction (``mklink /J``)
+    that makes the legacy location keep resolving after the move. Data
+    movement and "make it look finished" must stay separately observable
+    outcomes.
+    """
+    if not plan.ok:
+        return MigrationOutcome(
+            ok=False,
+            error=f"refusing to apply migration: plan itself is not ok: {plan.error}",
+        )
+
+    blocked = plan.blocked
+    if blocked:
+        blocked_names = ", ".join(child.name for child in blocked)
+        noun = "child" if len(blocked) == 1 else "children"
+        return MigrationOutcome(
+            ok=False,
+            error=(
+                f"refusing to apply migration: {len(blocked)} blocked {noun} "
+                f"present (all-or-nothing): {blocked_names}"
+            ),
+        )
+
+    move = mover if mover is not None else _default_mover
+    movable = plan.movable
+    moved: list[str] = []
+
+    if movable:
+        try:
+            plan.dst_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return MigrationOutcome(
+                ok=False,
+                error=f"could not create destination root {plan.dst_root}: {exc}",
+            )
+
+    for child in movable:
+        try:
+            if not child.src_path.exists():
+                return MigrationOutcome(
+                    ok=False,
+                    moved=tuple(moved),
+                    aborted_at=child.name,
+                    error=(
+                        f"aborting migration: {child.name}'s source {child.src_path} no "
+                        "longer exists -- plan is stale; nothing after it was moved"
+                    ),
+                )
+            if child.dst_path.exists():
+                return MigrationOutcome(
+                    ok=False,
+                    moved=tuple(moved),
+                    aborted_at=child.name,
+                    error=(
+                        f"aborting migration: {child.name}'s destination {child.dst_path} "
+                        "now exists -- plan is stale; nothing after it was moved"
+                    ),
+                )
+            move(child.src_path, child.dst_path)
+        except OSError as exc:
+            return MigrationOutcome(
+                ok=False,
+                moved=tuple(moved),
+                aborted_at=child.name,
+                error=f"failed to move {child.name}: {exc}",
+            )
+        moved.append(child.name)
+
+    return MigrationOutcome(ok=True, moved=tuple(moved))
