@@ -7857,11 +7857,19 @@ class OrchestratorApp:
                     # review through -- reset the probe backoff so the next
                     # outage starts from the configured base interval again
                     # instead of carrying forward an exponentially-grown one.
+                    # Stamp the same recovery marker a green flat probe would,
+                    # so a later dead-reviewer reap sweep can suppress backoff
+                    # from a throttle signature that predates this recovery
+                    # (issue #662). Use microsecond precision for sub-second
+                    # comparisons against a dead session's log mtime.
                     state = {
                         **state,
                         "reviewer_quota": {
                             **(state.get("reviewer_quota") or {}),
                             "consecutive_probe_failures": 0,
+                            "last_probe_cleared_at": datetime.now(UTC)
+                            .isoformat()
+                            .replace("+00:00", "Z"),
                         },
                     }
                     save_state(self.paths.state_file, state)

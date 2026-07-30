@@ -7832,6 +7832,160 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
     # completed, so the queue is empty and dispatch returns early — but the
     # quota clearing happens before the queue check (fix 1.1).
     assert state.get("reviewer_quota", {}).get("throttled_until") is None
+    # The verdict-reap recovery path must stamp the same recovery marker a
+    # green flat probe would, so later dead-reviewer sweeps can suppress
+    # backoff from throttle signatures that predate the recovery (issue #662).
+    assert state.get("reviewer_quota", {}).get("last_probe_cleared_at") is not None
+
+
+def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #662: a recorded verdict from a dead reviewer clears reviewer_quota
+    and stamps ``last_probe_cleared_at``. A later stale throttled reviewer that
+    died before that marker must not re-poison ``reviewer_quota``.
+    """
+    from charlie_work.state import is_reviewer_quota_exhausted
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    future_throttle = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    past_probe = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {
+            "throttled_until": future_throttle,
+            "probe_after": past_probe,
+        }
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
+        save_state(app.paths.state_file, state)
+
+    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        'Review complete.\n```json\n{"decision": "approved", "summary": "LGTM"}\n```',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+    assert not is_reviewer_quota_exhausted(state)
+    marker = state["reviewer_quota"]["last_probe_cleared_at"]
+    assert marker
+
+    # Now create a second stale throttled reviewer (PR 200) whose death
+    # predates the marker. The reap sweep should suppress backoff.
+    marker_dt = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+    death_dt = marker_dt - timedelta(seconds=1)
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+
+    log_path_200 = reviews_dir / "issue-200-review.claude.log"
+    log_path_200.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path_200, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    (reviews_dir / "issue-200.claude.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 200,
+                "branch": "agent/issue-20-fix",
+                "worktree_path": str(tmp_path / "wt200"),
+                "prompt_path": str(tmp_path / "prompt200"),
+                "command": ["claude", "-p"],
+                "pid": 999999999,
+                "started_at": old_started,
+                "log_path": str(log_path_200),
+                "error": None,
+                "process_start_time": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["200"] = {
+            "number": 200,
+            "issue_number": 20,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, app.paths.state_file, app.config, repo_root)
+
+    state = load_state(app.paths.state_file)
+    assert not is_reviewer_quota_exhausted(state)
+    assert state["prs"]["200"].get("review_dispatch_status") is None
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("pr_number") == 200
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is True
+        for event in state.get("events", [])
+    )
 
 
 def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path: Path) -> None:
