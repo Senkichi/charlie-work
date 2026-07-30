@@ -49,6 +49,7 @@ from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
     extract_report_body,
+    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
@@ -6953,6 +6954,263 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
     assert "carry_forward_tier" not in decision
 
 
+def test_update_approval_head_records_event_for_every_tier(tmp_path: Path) -> None:
+    """Issue #638: ``_update_approval_head`` must record a carry-forward event
+    itself, so a new call site cannot forget it. The event kind is
+    tier-dependent so the three mechanisms (patch-id, line-content,
+    verified-sync) stay separately auditable, and exactly one event is
+    emitted per call."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_number = 456
+    issue_number = 123
+    decision_dir = paths.prs / f"pr-{pr_number}"
+    decision_dir.mkdir(parents=True)
+
+    def _run(tier: str, old_head: str, new_head: str) -> dict[str, Any]:
+        decision = {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": "pid-xyz",
+        }
+        (decision_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+        app._update_approval_head(
+            pr_number,
+            decision,
+            new_head,
+            old_head=old_head,
+            issue_number=issue_number,
+            tier=tier,
+        )
+        return load_state(paths.state_file)
+
+    expected_kind = {
+        "patch-id": "verdict_carried_forward_clean_rebase",
+        "line-content": "verdict_carried_forward_line_content",
+        "verified-sync": "verdict_carried_forward_verified_sync",
+    }
+
+    for tier, kind in expected_kind.items():
+        state = _run(tier, f"old-{tier}", f"new-{tier}")
+        carry_events = [e for e in state["events"] if e["kind"] == kind]
+        assert len(carry_events) == 1, f"tier {tier}: expected 1 {kind} event"
+        payload = carry_events[0]["payload"]
+        assert payload["pr_number"] == pr_number
+        assert payload["issue_number"] == issue_number
+        assert payload["old_reviewed_head_sha"] == f"old-{tier}"
+        assert payload["new_head_sha"] == f"new-{tier}"
+        assert payload["carry_forward_tier"] == tier
+        assert payload["carried_forward_from"] == [f"old-{tier}"]
+
+
+def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
+    """Issue #638: the ``review_queue()`` carry-forward path (one of the three
+    previously-silent call sites) must record a carry-forward event, not just
+    mutate ``review-decision.json`` and ``state.json``."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+    assert result.ok is True
+
+    state = load_state(app.paths.state_file)
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_clean_rebase"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["carry_forward_tier"] == "patch-id"
+
+
+def test_merge_ready_post_update_branch_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the post-``pr_update_branch`` + ``_verify_synced_head``
+    carry-forward inside ``merge_ready`` (a previously-silent
+    ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="broadcast",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    pr_number = 456
+    issue_number = 123
+    old_head = "sha-abc123"
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "MERGEABLE",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Advance the base tip so the PR is stale and triggers pr_update_branch.
+    post_merge_base = "main-merged-sha"
+    fake_gh.base_head_sha = post_merge_base
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": old_head}]}
+
+    result = app.merge_ready(pr_number, merge=False)
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
+def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the front-of-train ``_update_open_agent_prs`` carry-forward
+    (a previously-silent ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == 789
+    assert payload["issue_number"] == 124
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
 def _dispatch_reviews_app(
     tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
 ) -> OrchestratorApp:
@@ -9876,11 +10134,88 @@ def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None
     assert report_body_is_valid(blocked_with_bold) is False
 
 
+def test_report_body_is_valid_accepts_heading_style_markers() -> None:
+    """Cross-family models (e.g. kimi-k3) emit findings as ``### NIT —`` headings
+    and a ``## Verdict`` heading instead of ``**NIT**`` bold / ``Verdict:`` line.
+    These are real reviews and must not be falsely rejected as UNAVAILABLE.
+    """
+    heading_severity = (
+        "### NIT — worktree.py:2977 (new): dead weight\n\n"
+        "## Verdict\n\n**Approve** — claims verified."
+    )
+    assert report_body_is_valid(heading_severity) is True
+    # Heading verdict alone (no severity heading) is also valid.
+    assert report_body_is_valid("## Verdict\n\nApprove") is True
+    # Heading severity alone (no verdict heading) is also valid.
+    assert report_body_is_valid("### MAJOR — bug.py:10: off-by-one\n\nfix it") is True
+
+
 def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
     body = "**MAJOR**\nissue\n\nVerdict: safe"
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
+
+
+def test_parse_cross_family_verdict_approved_no_blockers() -> None:
+    """A report with only MINOR/NIT findings parses to approved."""
+    body = "**MINOR**\nsmall issue\n\nVerdict: No BLOCKERs or MAJORs — fix is correct"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "approved"
+    assert "No BLOCKERs" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
+    """A report with a BLOCKER finding parses to request_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "request_changes"
+    assert "BLOCKER" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_major() -> None:
+    """A report with a MAJOR finding parses to request_changes."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_heading_style_major() -> None:
+    """Heading-style ``### MAJOR`` markers are detected as request_changes."""
+    body = "### MAJOR — bug.py:10: off-by-one\n\nfix it\n\n## Verdict\n\nMAJOR should be fixed"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
+    """An UNAVAILABLE stub report returns None (skip, don't record a wrong verdict)."""
+    stub = "# Cross-family adversarial review — `glm-5.2` (UNAVAILABLE)\n\n> timed out\n"
+    assert parse_cross_family_verdict(stub) is None
+
+
+def test_parse_cross_family_verdict_empty_returns_none() -> None:
+    """Empty/blank report text returns None."""
+    assert parse_cross_family_verdict("") is None
+    assert parse_cross_family_verdict("   ") is None
+
+
+def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
+    """A report body that fails report_body_is_valid returns None."""
+    body = "some random text with no severity or verdict"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert parse_cross_family_verdict(wrapped) is None
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
@@ -10173,6 +10508,68 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
 
     assert "alerted_at" not in cleared["reviewer_quota"]
     assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_defer_reviewer_probe_after_bumps_past_probe_after() -> None:
+    """A red flat probe must bump reviewer_quota.probe_after forward so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    # Quota exhausted, probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2020-01-01T00:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
+    # throttled_until is untouched.
+    assert result["reviewer_quota"]["throttled_until"] == "2099-01-01T00:00:00Z"
+
+
+def test_defer_reviewer_probe_after_noop_when_quota_not_exhausted() -> None:
+    """Must not write probe_after on a non-exhausted quota -- that would
+    leave stale state for no reason (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert "probe_after" not in result.get("reviewer_quota", {})
+
+
+def test_defer_reviewer_probe_after_never_moves_earlier() -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, the bump must
+    not shorten it -- that would make dispatch_reviews probe more often,
+    not less (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2026-08-01T04:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T04:00:00Z"
+
+
+def test_defer_reviewer_probe_after_overwrites_malformed_current() -> None:
+    """A malformed current probe_after must not wedge the bump -- overwrite
+    with the well-formed new value (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="not-a-timestamp",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
 
 
 def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
@@ -19457,6 +19854,104 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "dispatched"
 
 
+def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #674: an approved PR whose required checks genuinely fail is routed to rework.
+
+    Once approved, loop()'s already_approved fast path never calls review()
+    again, so review()'s pre-approval janitor-gate check-failure handling
+    never re-fires for this PR. A completed FAILURE conclusion on a required
+    check (not merely pending/missing/infra_failed/unavailable) must still
+    reach rework via merge_ready's own alarm-threshold dispatch. The approved
+    verdict and its patch-id must survive so carry-forward can re-approve the
+    rework push.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "state": "SUCCESS"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BLOCKED",
+            "mergeable": "MERGEABLE",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    original_decision = json.loads(decision_path.read_text())
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is False
+    assert result.data["checks"]["failed"] == ("Tests passed",)
+    assert result.data["merge_attempt_alarm"] is True
+    assert result.data["merge_attempt_warning"] is not None
+    assert "Tests passed" in result.data["merge_attempt_warning"]
+    # The sync step is bypassed: the PR head should not be advanced.
+    assert fake_gh.prs[0]["headRefOid"] == "sha-abc123"
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["events"][-1]["kind"] == "merge_ready"
+    check_failure_events = [
+        e for e in state["events"] if e["kind"] == "check_failure_rework_requested"
+    ]
+    assert len(check_failure_events) == 1
+    assert check_failure_events[0]["payload"]["pr_number"] == 456
+    assert check_failure_events[0]["payload"]["issue_number"] == 123
+    assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
+
+    # The approved verdict must not be clobbered by the rework request.
+    current_decision = json.loads(decision_path.read_text())
+    assert current_decision["decision"] == "approved"
+    assert current_decision["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert current_decision["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert state["prs"]["456"]["decision"] == "approved"
+    assert state["prs"]["456"]["reviewed_head_sha"] == original_decision["reviewed_head_sha"]
+    assert state["prs"]["456"]["reviewed_patch_id"] == original_decision["reviewed_patch_id"]
+    assert "check_failure_rework_requested_at" in state["prs"]["456"]
+
+    # The rework prompt was written and the issue was labeled for rework.
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert "Tests passed" in prompt_path.read_text(encoding="utf-8")
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    # dispatch_rework can pick the issue up and launch a worker.
+    dispatch = app.dispatch_rework()
+    assert dispatch.data["selected_count"] == 1
+    assert dispatch.data["sessions"][0]["issue_number"] == 123
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+
 def _init_cross_pr_revert_repo(repo_root: Path) -> tuple[str, str, str]:
     """Set up a git repo where main has C and an agent branch merges C then reverts C.
 
@@ -23530,6 +24025,147 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
     assert abs((parsed - expected).total_seconds()) < 5
     assert state["throttled_until"] == future
     assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
+
+
+def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must also bump reviewer_quota.probe_after so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        is_reviewer_probe_ready,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    # Reviewer quota exhausted with probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    # probe_after must now be bumped to the flat probe's next attempt, so
+    # dispatch_reviews's is_reviewer_probe_ready returns False.
+    assert state["reviewer_quota"]["probe_after"] == next_probe_at
+    assert is_reviewer_probe_ready(state) is False
+    # consecutive_probe_failures is not touched by the flat probe.
+    assert state["reviewer_quota"].get("consecutive_probe_failures", 0) == 0
+
+
+def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, a red flat
+    probe must not shorten it (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    far_future = (
+        (datetime.now(UTC) + timedelta(hours=4))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # probe_after stays at the existing (further-out) backoff target.
+    assert state["reviewer_quota"]["probe_after"] == far_future
+
+
+def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_throttled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must not write reviewer_quota.probe_after when the
+    reviewer quota is not exhausted -- only the root throttle is active
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # No reviewer_quota.probe_after written -- reviewer quota was not exhausted.
+    assert "probe_after" not in state.get("reviewer_quota", {})
 
 
 def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:

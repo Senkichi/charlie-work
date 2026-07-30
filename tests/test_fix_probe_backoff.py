@@ -41,19 +41,19 @@ def test_probe_backoff_doubles_each_consecutive_failure() -> None:
     now = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
     state: dict[str, Any] = {}
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 1
     assert _probe_after(state) - now == timedelta(minutes=15)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 2
     assert _probe_after(state) - now == timedelta(minutes=30)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 3
     assert _probe_after(state) - now == timedelta(minutes=60)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 4
     assert _probe_after(state) - now == timedelta(minutes=120)
 
@@ -70,7 +70,7 @@ def test_probe_backoff_caps_at_configured_max_interval() -> None:
 
     # 15 -> 30 -> 60 (capped to 40) -> 120 (capped to 40)
     for _ in range(4):
-        state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+        state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert _probe_after(state) - now == timedelta(minutes=40)
 
 
@@ -85,7 +85,7 @@ def test_probe_backoff_uncapped_when_max_interval_is_zero() -> None:
     state: dict[str, Any] = {}
 
     for _ in range(5):
-        state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+        state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     # 15 * 2^4 = 240, uncapped (0 disables the cap per the config docstring).
     assert _probe_after(state) - now == timedelta(minutes=240)
 

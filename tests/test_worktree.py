@@ -20,6 +20,7 @@ from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
     WorktreeCleanResult,
+    WorktreeCleanGH,
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeState,
@@ -4077,6 +4078,80 @@ def test_recovery_aborts_on_transient_probe_error_despite_dead_pid(
     assert branch_name not in _git(repo_root, "branch", "--list").stdout
 
 
+def test_recovery_proceeds_when_no_source_errored_and_pid_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #640: when no probe source errors, ``all_permanent`` keeps its
+    pre-bound default and is never read in a decision — the second
+    ``if errored_sources:`` block is skipped entirely. A confirmed-dead PID
+    with a fully successful (but stale) probe must let recovery proceed
+    without raising and without any ``UnboundLocalError`` on ``all_permanent``.
+
+    This is the no-errored-source counterpart to the errored-source tests
+    above; it guards the binding fix that makes ``all_permanent`` provably
+    bound to Pyright.
+    """
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch_name = "agent/issue-1-no-source-errored-dead-pid"
+    worktree_path = _default_worktrees_dir(repo_root) / _slugify(branch_name)
+
+    # A probe where every source returned successfully (no error) but with only
+    # stale timestamps — liveness is genuinely inconclusive, yet no source
+    # errored, so neither ``if errored_sources:`` branch runs.
+    stale = datetime.now(UTC) - timedelta(hours=2)
+    probe = RealActivityProbe(
+        sources=(
+            ActivitySource(
+                name="sessions.db",
+                timestamp=stale,
+                staleness_seconds=7200.0,
+                error=None,
+            ),
+            ActivitySource(
+                name="devin_per_pid_log",
+                timestamp=stale,
+                staleness_seconds=7200.0,
+                error=None,
+            ),
+        )
+    )
+
+    monkeypatch.setattr(worktree_module, "real_activity_for_worker", lambda *a, **k: probe)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "unused.db")),
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
+    )
+
+    recovery_record = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+
+    result = create_worktree(
+        repo_root,
+        branch_name,
+        base_ref="HEAD",
+        recovery=recovery_record,
+        config=config,
+    )
+
+    # Recovery proceeds: the dead PID and stale-but-error-free probe do not
+    # abort redispatch.
+    assert isinstance(result, WorktreeInfo)
+    assert worktree_path.exists()
+    assert branch_name in _git(repo_root, "branch", "--list").stdout
+
+
 def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:
     return {
         "issues": {str(issue_number): {"number": issue_number}},
@@ -4092,8 +4167,12 @@ def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") ->
     }
 
 
-class _FakeGH:
+class _FakeGH(WorktreeCleanGH):
     """Fake ``GitHub`` for ``clean_worktrees`` tests.
+
+    Implements the ``WorktreeCleanGH`` protocol (the slice of ``GitHub`` the
+    cleanup lane depends on) so it is statically assignable to
+    ``clean_worktrees(..., gh=...)`` without ``cast`` (issue #641).
 
     ``available=False`` simulates ``gh`` itself failing/being unreachable
     (``GitHubRunResult(ok=False, ...)``), distinct from ``gh`` succeeding but
