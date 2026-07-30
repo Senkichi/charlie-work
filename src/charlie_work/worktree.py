@@ -27,6 +27,7 @@ from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
+from . import layout
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
@@ -257,7 +258,7 @@ def _slugify(value: str, *, max_length: int = 80) -> str:
 
 
 def _default_worktrees_dir(repo_root: Path) -> Path:
-    return repo_root / ".var" / "charlie-work" / "worktrees"
+    return layout.worktrees_dir(layout.default_state_root(repo_root))
 
 
 def worktree_path_for_branch(
@@ -2404,7 +2405,14 @@ def remove_worktree(
 
 
 def _default_reviews_dir(repo_root: Path) -> Path:
-    return repo_root / ".var" / "charlie-work" / "dispatches" / "reviews"
+    # layout.reviews_dir_default() is the dedicated helper for exactly this
+    # value -- its docstring: "the value used when review_dispatch.reviews_dir
+    # is not explicitly configured" -- which is this function's own purpose.
+    # Unlike issues/prs/dispatches/logs (which have an existing RuntimePaths
+    # member to reuse instead), "reviews" has no such member, so the helper
+    # function itself is the single source of truth here, not a bypassable
+    # constant substitution.
+    return layout.reviews_dir_default(layout.default_state_root(repo_root))
 
 
 def _commit_exists_locally(repo_root: Path, sha: str) -> bool:

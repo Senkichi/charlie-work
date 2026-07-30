@@ -12,10 +12,10 @@ from . import CLI_NAME
 from .config import ConfigError, find_config_path
 from .doctor import run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
-from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
+from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, runtime_paths
@@ -341,7 +341,7 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     state = load_state_locked(paths.state_file)
     result = clean_worktrees(
         repo_root,
-        paths.root / "worktrees",
+        layout.worktrees_dir(paths.root),
         state,
         config,
         gh,
@@ -531,7 +531,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     Note: This command does not include per-worker health fields yet. That will be added
     in a follow-up issue (#167) once the worker health abstraction lands.
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -576,7 +576,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
     - Isolates per-repo errors (missing/broken repos) without aborting aggregation
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -1105,7 +1105,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             # Single-pass mode: check the supervisor lock first to avoid double-
             # dispatching through the governor read→launch window when a supervised
             # loop is already running.
-            lock_path = app.paths.root / "supervisor.lock"
+            lock_path = layout.supervisor_lock_path(app.paths.root)
             lock = try_acquire_supervisor_lock(lock_path)
             if lock is None:
                 return CommandResult(

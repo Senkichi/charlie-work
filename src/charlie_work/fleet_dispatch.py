@@ -11,6 +11,7 @@ from typing import Any, Callable
 from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
+from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -166,7 +167,7 @@ def compute_api_worker_fleet_report(
     from .api_budget import budget_status, ledger_path, load_ledger
     from .worker import iter_workers
 
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
     if not repos:
@@ -230,7 +231,7 @@ def compute_api_worker_fleet_report(
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
-        sessions_dir = Path(state_dir_str) / "dispatches" / "sessions"
+        sessions_dir = layout.sessions_dir_default(Path(state_dir_str))
         if not sessions_dir.is_dir():
             continue
         try:
@@ -359,7 +360,7 @@ def _run_fleet_allocation_prologue(
     # Any existing repo root works as the gh working directory: the allocation
     # pass addresses every repo by explicit owner/name slug, so the cwd's git
     # identity is irrelevant. Only auth and a valid directory are needed.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     anchor_root: Path | None = None
     anchor_state: Path | None = None
@@ -368,7 +369,7 @@ def _run_fleet_allocation_prologue(
         if candidate.is_dir():
             anchor_root = candidate
             state_dir = entry.get("state_dir")
-            anchor_state = Path(state_dir) / "state.json" if state_dir else None
+            anchor_state = layout.state_file_path(Path(state_dir)) if state_dir else None
             break
 
     if anchor_root is None:
@@ -480,7 +481,7 @@ def _run_fleet_autoscale_prologue(
     # Pick a representative repo with runner_scaling enabled. Its runtime config
     # is used for the fleet-wide runner count (all repos share the same retry
     # knobs) and for the subsequent autoscale observation/actions.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos_map = registry.get("repos", {})
 
@@ -886,8 +887,6 @@ def _add_launch_failures(
                 failures.append(event)
 
 
-_FLEET_HEALTH_STATE_FILENAME = "notify_health_state.json"
-
 # Event types whose AttentionEntry represents a persistent health state of an
 # issue/worker (STALLED/ERROR/REPAIRED-style). Only these are subject to
 # cross-pass transition dedup: a persistent ERROR must not re-fire with
@@ -908,7 +907,7 @@ def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
     every pass with ``previous_health: null`` (issue #554). It lives in the
     fleet directory alongside ``fleet.json``.
     """
-    return fleet_dir(override=fleet_dir_override) / _FLEET_HEALTH_STATE_FILENAME
+    return layout.notify_health_state_path(override=fleet_dir_override)
 
 
 def _load_fleet_health_state(path: Path) -> dict[str, str]:
@@ -1227,7 +1226,7 @@ def fleet_loop(
         A CommandResult with per-repo results and the consolidated digest.
     """
     # Load fleet registry with state_lock guard
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
 
     # Select repos in the appropriate order
@@ -1291,7 +1290,7 @@ def fleet_loop(
             # Non-blocking supervisor lock: fleet passes must be mutually exclusive
             # with a supervised bash-rats loop on the same repo to avoid double-
             # dispatching through the governor's read-then-launch window.
-            lock = try_acquire_supervisor_lock(paths.root / "supervisor.lock")
+            lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(paths.root))
             if lock is None:
                 per_repo_results[repo_key] = CommandResult(
                     True,
@@ -1474,7 +1473,7 @@ class FleetLocalSnapshot:
 
 def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
     """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
-    sessions_dir = state_dir / "dispatches" / "sessions"
+    sessions_dir = layout.sessions_dir_default(state_dir)
     prs_dir = state_dir / "prs"
     return sessions_dir, prs_dir
 
@@ -1484,7 +1483,7 @@ def _take_fleet_snapshot(
     fleet_dir_override: str | None = None,
 ) -> FleetLocalSnapshot:
     """Capture a cheap, network-free snapshot across all registered fleet repos."""
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
 
@@ -1579,7 +1578,7 @@ def run_fleet_supervise(
     # False, and all of them take load_layered_config's silent-{} branch. A bare
     # exists=False here would reproduce the exact ambiguity this line exists to
     # remove. See describe_config_file for which errors are and are not hidden.
-    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_config_path = layout.global_config_path(override=fleet_dir_override)
     logger.info(
         "Fleet supervisor global config: path=%s %s",
         global_config_path,
@@ -1593,7 +1592,7 @@ def run_fleet_supervise(
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
 
-    lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
     if lock is None:
         return CommandResult(

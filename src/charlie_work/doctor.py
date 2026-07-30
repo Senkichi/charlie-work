@@ -20,6 +20,7 @@ import yaml
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
+from . import layout
 from .github import (
     GitHub,
     GitHubError,
@@ -516,7 +517,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     repo's per-repo supervisor lock is checked individually. A single supervised
     repo no longer hides an unsupervised one.
     """
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     if not fleet_json_path.exists():
         return
     registry = _load_registry(fleet_json_path)
@@ -524,7 +525,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     if not repos:
         return
 
-    fleet_lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    fleet_lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     if fleet_lock_path.exists():
         fleet_lock = try_acquire_supervisor_lock(fleet_lock_path)
         if fleet_lock is None:
@@ -544,7 +545,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
         if not state_dir.exists():
             unreachable_repo_keys.append(repo_key)
             continue
-        repo_lock_path = state_dir / "supervisor.lock"
+        repo_lock_path = layout.supervisor_lock_path(state_dir)
         if repo_lock_path.exists():
             repo_lock = try_acquire_supervisor_lock(repo_lock_path)
             if repo_lock is None:

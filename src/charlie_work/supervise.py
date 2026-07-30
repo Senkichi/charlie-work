@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from . import fleet_registry, worktree
+from . import fleet_registry, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .safe_path import contains
 from .subprocess_runner import RunResult, run_captured
@@ -212,8 +212,13 @@ def read_head_sha(
 
 
 def _pending_sync_marker_path(repo_root: Path) -> Path:
-    """Return the path to the pending-sync marker for this orchestrator tree."""
-    return repo_root / ".var" / "charlie-work" / "pending-sync.json"
+    """Return the path to the pending-sync marker for this orchestrator tree.
+
+    NOTE: deliberately uses the *default* state root, ignoring a configured
+    ``runtime.state_dir`` override, preserving today's behavior. Deriving this
+    from the configured state dir instead is a deferred behavioral fix.
+    """
+    return layout.pending_sync_path(layout.default_state_root(repo_root))
 
 
 def _write_marker(path: Path, from_sha: str, to_sha: str) -> None:
@@ -759,7 +764,7 @@ def run_supervised(
     from .workflow import CommandResult
 
     # Single-instance guard
-    lock_path = app.paths.root / "supervisor.lock"
+    lock_path = layout.supervisor_lock_path(app.paths.root)
     lock = try_acquire_supervisor_lock(lock_path)
     if lock is None:
         return CommandResult(

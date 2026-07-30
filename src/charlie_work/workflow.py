@@ -41,6 +41,7 @@ from .config import (
 )
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
+from . import layout
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
@@ -10306,7 +10307,7 @@ class OrchestratorApp:
         path = Path(artifact_path)
         artifact_text = path.read_text(encoding="utf-8")
         cfg = self.config.cross_family
-        reviews_dir = self.paths.root / "cross-family"
+        reviews_dir = layout.cross_family_dir(self.paths.root)
         reviews_dir.mkdir(parents=True, exist_ok=True)
         slug = slugify(path.stem)
         prompt_text = self._render(
@@ -10527,7 +10528,9 @@ class OrchestratorApp:
         """
         supervisor_lock = None
         if fix:
-            supervisor_lock = try_acquire_byte_range_lock(self.paths.root / "supervisor.lock")
+            supervisor_lock = try_acquire_byte_range_lock(
+                layout.supervisor_lock_path(self.paths.root)
+            )
             if supervisor_lock is None:
                 return CommandResult(
                     True,

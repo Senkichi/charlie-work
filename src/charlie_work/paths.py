@@ -4,6 +4,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import layout
 from .subprocess_runner import hidden_console_kwargs
 
 
@@ -65,9 +66,9 @@ def runtime_paths(repo_root: Path, state_dir: str) -> RuntimePaths:
     root = root.resolve()
     return RuntimePaths(
         root=root,
-        issues=root / "issues",
-        prs=root / "prs",
-        dispatches=root / "dispatches",
-        logs=root / "logs",
-        state_file=root / "state.json",
+        issues=root / layout.ISSUES_DIRNAME,
+        prs=root / layout.PRS_DIRNAME,
+        dispatches=root / layout.DISPATCHES_DIRNAME,
+        logs=root / layout.LOGS_DIRNAME,
+        state_file=layout.state_file_path(root),
     )
