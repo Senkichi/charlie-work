@@ -444,12 +444,11 @@ def plan_allocation(
                         f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
                         f"{demand_idle_samples} pass(es) and no repo is waiting"
                     )
-                    held_by_hysteresis += surplus
+                    if not budget_undersubscribed:
+                        held_by_hysteresis += surplus
                 else:
                     busy = sum(1 for i in running if i.busy)
                     busy_surplus = max(0, busy - target)
-                    if busy_surplus:
-                        held_by_busy += busy_surplus
                     note = (
                         f"{repo}: holding {surplus} surplus slot(s) — "
                         f"budget undersubscribed ({post_without_parks}/{budget} running) "
