@@ -48,6 +48,7 @@ from .cross_family import (
     CrossFamilyResult,
     extract_head_ref_oid,
     extract_report_body,
+    parse_cross_family_verdict,
     report_body_is_valid,
     run_cross_family_review,
 )
@@ -107,6 +108,7 @@ from .state import (
     arm_quota_probe,
     clear_quota_throttles,
     clear_reviewer_quota,
+    defer_reviewer_probe_after,
     disarm_quota_probe,
     is_claim_stale,
     is_quota_probe_actionable,
@@ -7697,6 +7699,63 @@ class OrchestratorApp:
 
         return {"recorded": recorded, "missed": missed}
 
+    def _record_cross_family_verdicts(self) -> list[dict[str, Any]]:
+        """Parse cross-family reports and record verdicts for pending PRs.
+
+        When ``cross_family.auto_verdict`` is enabled and
+        ``review_dispatch`` is disabled (the cross-family pass is the sole
+        automated review), this scans the review queue for PRs whose
+        ``review-decision.json`` is still ``pending`` but whose
+        ``cross-family-review.md`` report is valid and non-stale. It
+        parses the report into an approved/request_changes verdict and
+        records it via ``record_review()``, unblocking the merge lane.
+
+        Returns a list of per-PR result dicts for logging/diagnostics.
+        """
+        if not self.config.cross_family.auto_verdict:
+            return []
+        results: list[dict[str, Any]] = []
+        queue_result = self.review_queue()
+        candidates = queue_result.data.get("queue", [])
+        for candidate in candidates:
+            pr_number = candidate["pr"]
+            decision = candidate.get("decision")
+            if decision != "pending":
+                continue
+            pr_dir = self.paths.prs / f"pr-{pr_number}"
+            report_path = pr_dir / "cross-family-review.md"
+            if not report_path.exists():
+                continue
+            try:
+                report_text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # Skip stale reports: the head SHA in the report must match the
+            # packet head SHA so we don't record a verdict for an old diff.
+            report_head = extract_head_ref_oid(report_text)
+            packet_head = candidate.get("packet_head_sha")
+            if report_head is not None and packet_head is not None and report_head != packet_head:
+                continue
+            parsed = parse_cross_family_verdict(report_text)
+            if parsed is None:
+                continue
+            verdict_decision, summary = parsed
+            record_result = self.record_review(
+                pr_number,
+                verdict_decision,
+                summary=summary,
+                reviewed_head=packet_head,
+            )
+            results.append(
+                {
+                    "pr_number": pr_number,
+                    "decision": verdict_decision,
+                    "ok": record_result.ok,
+                    "message": record_result.message,
+                }
+            )
+        return results
+
     @_guard_state_lock
     def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
         """Launch Claude Code reviewer sessions concurrently for queued PRs.
@@ -11975,6 +12034,13 @@ class OrchestratorApp:
                     .replace("+00:00", "Z")
                 )
                 state = arm_quota_probe(state, next_probe_at)
+                # Share the failure with dispatch_reviews's probe_mode gate:
+                # a red flat probe confirmed the window is still closed, so
+                # also bump reviewer_quota.probe_after (when the reviewer
+                # quota is exhausted) to stop dispatch_reviews from
+                # independently launching a real reviewer session into the
+                # same window on this or a nearby pass (issue #663).
+                state = defer_reviewer_probe_after(state, next_probe_at)
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
@@ -12085,6 +12151,13 @@ class OrchestratorApp:
         # same loop pass only if the reviewer finishes immediately (tests); in
         # production the per-PR merge lane below fires on the next poll.
         dispatch_reviews = self.dispatch_reviews()
+
+        # Auto-record cross-family verdicts for pending PRs when the
+        # cross-family pass is the sole automated review (review_dispatch
+        # disabled). Without this, PRs with valid cross-family reports but
+        # no recorded verdict pile up in "reviewing" status forever.
+        if not self.dry_run:
+            self._record_cross_family_verdicts()
 
         reviews: list[dict[str, Any]] = []
         merges: list[dict[str, Any]] = []
