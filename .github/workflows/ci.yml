@@ -48,7 +48,44 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
-        run: uv run pytest -q --tb=short
+        # -n 2 (pytest-xdist, fixed count -- deliberately not "auto"): matches
+        # the box-wide xdist cap already established in
+        # src/charlie_work/env_sanitize.py (PYTEST_XDIST_AUTO_NUM_WORKERS
+        # default "2", issue 646) after a 2026-07-26 incident where ~36
+        # uncapped xdist workers stacked on this box's 8 physical cores took
+        # a 6.4min suite to ~145min. This box runs 2 self-hosted runners (so
+        # 2 Tests jobs can execute concurrently) and charlie-work's own
+        # worker-dispatch tree can add more pytest sessions on the same
+        # shared box independent of CI, each already capped at 2 workers by
+        # that same constant -- matching it here keeps this job consistent
+        # with the rest of the system's box-sharing discipline instead of
+        # being the one uncapped outlier. --dist=load (pytest-xdist's
+        # default, spelled out for clarity) rather than loadfile:
+        # tests/test_worktree.py alone is ~150 of ~3100 tests and the
+        # heaviest file by wall time (real git.exe subprocesses), so pinning
+        # it to a single worker would floor the achievable speedup.
+        #
+        # Measured full-suite, full local run, ambient box load 35-70%
+        # (2026-07-31, this box, all runs identical pass/skip count --
+        # 3092 passed, 2 skipped):
+        #   serial:    1593.55s (26:33)
+        #   -n 2:       458.86s ( 7:38)  3.47x
+        #   -n 4:       457.45s ( 7:37)  3.48x  (measured for comparison,
+        #                                        not used -- ties -n 2)
+        #   -n 6:       369.76s ( 6:10)  4.31x  (measured for comparison,
+        #                                        not used -- exceeds the
+        #                                        established box-wide cap)
+        # -n 2 ties -n 4 head-to-head, indicating this suite is
+        # subprocess/IO-bound past 2 workers on this box rather than
+        # CPU-bound, so there is no measured speed cost to picking the safe,
+        # convention-matching worker count.
+        # -q dropped here (pyproject.toml addopts already sets it): stacking
+        # an explicit -q on top of addopts' -q silently drops pytest's final
+        # "N passed" summary line -- verified locally, exit code is
+        # unaffected either way but CI logs become unreadable for a human
+        # skimming a pass without failures. Pre-existing on this line before
+        # this change; fixed in the same edit rather than left in place.
+        run: uv run pytest --tb=short -n 2 --dist=load
 
   Lint:
     name: Lint
