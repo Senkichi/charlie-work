@@ -10785,8 +10785,29 @@ class OrchestratorApp:
             # compare API once and use it for both the pre-merge sync decision
             # and the merge-base gate. mergeStateStatus can lag and report CLEAN
             # while the branch is actually stale, so it is no longer authoritative.
+            #
+            # Whether base freshness is required AT ALL is itself derived from
+            # GitHub branch protection (issue #812), not trusted from the
+            # `require_current_base` config constant: a repo whose protection sets
+            # `strict: false` does not require branches to be current with main, so
+            # both the pr_update_branch write below and the deferral gate are
+            # skipped entirely. See _is_base_freshness_required for the
+            # fail-closed contract on read failure. `update_branch_strategy ==
+            # "off"` additionally forces this off regardless of what protection
+            # says: with no sync mechanism at all, requiring currency would be an
+            # inescapable deadlock -- the same hazard __post_init__ already blocks
+            # for the config-only case (require_current_base=True + strategy=off).
             base_current: bool | None = None
-            if not sync_failed and update_branch_strategy in {"front_of_train", "broadcast"}:
+            base_freshness_required = False
+            if not sync_failed and update_branch_strategy != "off":
+                base_freshness_required = self._is_base_freshness_required(
+                    pr.get("baseRefName") or self.config.runners.default_branch
+                )
+            if (
+                not sync_failed
+                and base_freshness_required
+                and update_branch_strategy in {"front_of_train", "broadcast"}
+            ):
                 base_current = self._is_base_current(pr)
                 # Aviator MergeQueue handoff (task #10): once this PR has
                 # already been parked in Aviator's queue (state status
@@ -10796,9 +10817,9 @@ class OrchestratorApp:
                 # writer on the same ref — this repo's live config is
                 # broadcast, so every poll would otherwise attempt it. The
                 # base-freshness *read* above still runs (it only feeds the
-                # require_current_base gate below); only the write is
-                # skipped. See the merge-train exclusion in
-                # _merge_train_candidates for the sibling half of this fix.
+                # deferral gate below); only the write is skipped. See the
+                # merge-train exclusion in _merge_train_candidates for the
+                # sibling half of this fix.
                 already_in_mergequeue = existing_pr_state.get("status") == "mergequeue"
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
@@ -10821,8 +10842,9 @@ class OrchestratorApp:
                     else:
                         sync_failed = True
             # merge-base freshness gate: mergeStateStatus can lag, so verify
-            # ancestry with the GitHub compare API before merging.
-            if not sync_failed and self.config.auto_merge.require_current_base:
+            # ancestry with the GitHub compare API before merging. Skipped
+            # entirely when base freshness is not required (issue #812).
+            if not sync_failed and base_freshness_required:
                 if base_current is None and update_branch_strategy not in {
                     "front_of_train",
                     "broadcast",
@@ -12051,6 +12073,25 @@ class OrchestratorApp:
                         }
                     )
                     continue
+
+            # Whether base freshness is required at all is derived from GitHub
+            # branch protection, cached per orchestrator pass (issue #812) --
+            # see _is_base_freshness_required for the fail-closed contract.
+            # When not required, skip the compare-API read and the
+            # pr_update_branch write entirely: this is the update_open_prs
+            # half of the churn issue #812 eliminates (merge_ready's own sync
+            # block is the other half).
+            base_ref = pr.get("baseRefName") or self.config.runners.default_branch
+            if not self._is_base_freshness_required(base_ref):
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "base_freshness_not_required",
+                    }
+                )
+                continue
 
             # Use the same compare-derived base-current signal as the front-of-train
             # path and merge_ready so broadcast mode also skips up-to-date PRs and
@@ -13390,6 +13431,53 @@ class OrchestratorApp:
         if not base_sha or not merge_base_sha:
             return None
         return bool(base_sha == merge_base_sha)
+
+    def _is_base_freshness_required(self, base_ref: str) -> bool:
+        """Return whether base currency is actually required for ``base_ref``.
+
+        Derives base-freshness policy from GitHub branch protection
+        (``required_status_checks.strict``) instead of trusting the
+        hardcoded ``auto_merge.require_current_base`` config constant
+        (issue #812). A repo whose protection sets ``strict: false`` does
+        not require branches to be current with their base before merging,
+        so forcing ``pr_update_branch`` on every open PR and deferring
+        merges on staleness is pure CI-capacity waste with zero
+        mergeability benefit.
+
+        The read is cached per orchestrator pass by
+        ``GitHub.branch_protection`` (cleared each pass by
+        ``_loop_body``'s ``invalidate_list_cache()`` call), so PRs sharing a
+        base ref within one pass cost exactly one API call in total.
+
+        FAILS CLOSED: this is the single most important safety property of
+        the derivation. If the protection read raises, returns an error
+        value (``None``), 404s, is rate-limited, or
+        ``required_status_checks.strict`` is absent or not a bool for any
+        reason, this falls back to ``auto_merge.require_current_base``
+        (default ``True``) rather than treating the failure as "no
+        freshness required". An API hiccup must never silently disable base
+        checking.
+        """
+        try:
+            protection = self.gh.branch_protection(base_ref)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "branch_protection(%s) raised; failing closed to "
+                "auto_merge.require_current_base=%s",
+                base_ref,
+                self.config.auto_merge.require_current_base,
+                exc_info=True,
+            )
+            return self.config.auto_merge.require_current_base
+        if isinstance(protection, dict):
+            required_status_checks = protection.get("required_status_checks")
+            if isinstance(required_status_checks, dict):
+                strict = required_status_checks.get("strict")
+                if isinstance(strict, bool):
+                    return strict
+        return self.config.auto_merge.require_current_base
 
     def _record_review_or_error(
         self,

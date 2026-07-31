@@ -3042,6 +3042,13 @@ class FakeGitHub:
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
         self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
+        # Per-base branch protection overrides for testing issue #812's
+        # freshness-policy derivation. Default (no override) is None, matching
+        # the real GitHub.branch_protection()'s fail-closed return on any read
+        # failure -- so every pre-existing test keeps exercising the
+        # require_current_base fallback unchanged unless it opts in.
+        self.branch_protection_overrides: dict[str, dict[str, Any] | None] = {}
+        self.branch_protection_calls: list[str] = []
         self._record_pr_heads(self.prs)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -3413,6 +3420,10 @@ class FakeGitHub:
         if override != "_unset":
             return override
         return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
+
+    def branch_protection(self, base: str) -> dict[str, Any] | None:
+        self.branch_protection_calls.append(base)
+        return self.branch_protection_overrides.get(base)
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -17733,6 +17744,70 @@ def test_github_dry_run_allows_readonly_command(monkeypatch, tmp_path: Path) -> 
     assert len(calls) == 1  # read-only command still executes under dry-run
 
 
+def test_branch_protection_caches_per_pass(monkeypatch, tmp_path: Path) -> None:
+    """Issue #812: branch_protection() must cost exactly one `gh api` call per
+    base ref per orchestrator pass, not one per PR -- N callers sharing a base
+    (e.g. N open PRs against main in one merge_ready/broadcast-sweep pass) must
+    collapse to a single underlying read. The cache lives in GitHub._list_cache
+    (the same dict pr_list/issue_list already use) and is cleared only by
+    invalidate_list_cache(), which the orchestrator calls once per pass.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        payload = json.dumps({"required_status_checks": {"strict": True}})
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    # Simulate N=5 PRs against the same base within one pass: 5 calls to the
+    # method, but the underlying `gh api` subprocess must run exactly once.
+    results = [gh.branch_protection("main") for _ in range(5)]
+    assert all(r == {"required_status_checks": {"strict": True}} for r in results)
+    assert len(calls) == 1
+    # Pin the actual endpoint (and the {owner}/{repo} placeholder escaping),
+    # not just "something got cached" -- a wrong URL would still pass a
+    # call-count-only assertion.
+    assert calls[0] == ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"]
+
+    # A different base ref is a distinct cache key, so it costs a fresh read.
+    gh.branch_protection("develop")
+    assert len(calls) == 2
+    gh.branch_protection("develop")
+    assert len(calls) == 2  # still cached
+
+    # invalidate_list_cache() (called once at the top of every orchestrator
+    # pass) must force a fresh read on the next call -- the cache is valid
+    # only within a single pass, never leaking across passes.
+    gh.invalidate_list_cache()
+    gh.branch_protection("main")
+    assert len(calls) == 3
+
+
+def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -> None:
+    """A failed read (404/rate-limited) must also be cached as None for the
+    rest of the pass -- otherwise every PR sharing a broken base ref retries
+    the same doomed `gh api` call once each, turning one outage into N.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args, returncode=1, stdout="", stderr="HTTP 404: Not Found"
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    assert gh.branch_protection("main") is None
+    assert gh.branch_protection("main") is None
+    assert gh.branch_protection("main") is None
+    assert len(calls) == 1
+
+
 def test_is_mutating_classifies_readonly_and_mutating() -> None:
     from charlie_work.github import _is_mutating
 
@@ -22071,6 +22146,309 @@ def test_merge_ready_require_current_base_false_allows_stale_base(tmp_path: Path
 
     state = json.loads(paths.state_file.read_text())
     assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
+
+
+def _stale_base_prs() -> list[dict[str, Any]]:
+    """Two-PR fixture used by the issue #812 protection-derivation tests: PR
+    456 merges first (advancing the fake base tip), then PR 789's merge-base
+    is still the old tip, making it organically stale for the second call.
+    """
+    return [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+
+def test_merge_ready_protection_strict_true_defers_even_when_config_disables_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #812: base freshness is DERIVED from branch protection, not merely
+    defaulted from config. Prove the direction that matters most for adoption --
+    protection strict:true still enforces the gate even though the operator has
+    explicitly set require_current_base=False in config. If this regressed to
+    "config wins", a repo relying on protection-derived enforcement while having
+    require_current_base=False would silently stop deferring stale merges.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+            require_current_base=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": True}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["can_merge"] is False
+    assert result_789.data["merged"] is False
+    assert result_789.data.get("stale_base") is True
+    assert fake_gh.merged == [(456, "squash")]
+    assert "main" in fake_gh.branch_protection_calls
+
+    state = json.loads(paths.state_file.read_text())
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
+    assert len(stale_events) == 1
+    assert stale_events[0]["payload"]["pr_number"] == 789
+
+
+def test_merge_ready_protection_strict_false_allows_stale_base_without_update_call(
+    tmp_path: Path,
+) -> None:
+    """Issue #812: protection strict:false disables the gate even though
+    require_current_base defaults to True in config -- the config constant is
+    a fallback for unreadable protection, not the authority. Also pins that the
+    pr_update_branch write is skipped entirely (the CI-churn half of the fix),
+    not merely that the deferral gate is skipped.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+        )
+    )
+    assert config.auto_merge.require_current_base is True  # sanity: default unchanged
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["can_merge"] is True
+    assert result_789.data["merged"] is True
+    assert result_789.data.get("stale_base") is not True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+    # The write half of the churn (pr_update_branch) never fires when
+    # freshness isn't required -- not just the deferral-gate read half.
+    assert fake_gh.pr_update_branch_calls == []
+
+    state = json.loads(paths.state_file.read_text())
+    assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
+
+
+def test_is_base_freshness_required_fails_closed_when_protection_raises(tmp_path: Path) -> None:
+    """Fail-closed shape 1/3: the protection read raising an exception must not
+    propagate as an unhandled error, and must not be treated as "no freshness
+    required" -- it falls back to the require_current_base config value.
+    """
+
+    class ExplodingProtectionGitHub(FakeGitHub):
+        def branch_protection(self, base: str) -> dict[str, Any] | None:
+            raise RuntimeError("simulated network failure")
+
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ExplodingProtectionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is True
+
+
+def test_is_base_freshness_required_fails_closed_when_protection_read_errors(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed shape 2/3: an error-value read (404 / rate-limited / gh
+    unavailable) surfaces as branch_protection() returning None -- the fake's
+    default for a base with no configured override, mirroring the real
+    GitHub.branch_protection()'s contract. This must fall back to
+    require_current_base, not be treated as "no freshness required".
+    """
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # no override for "main" -> branch_protection("main") is None
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is True
+
+
+def test_is_base_freshness_required_fails_closed_on_malformed_protection_payload(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed shape 3/3: the protection payload is readable (200 OK) but
+    `required_status_checks.strict` is absent or the wrong type -- e.g. a repo
+    with protection configured for something other than status checks, or a
+    GitHub API response shape this code doesn't anticipate. Every malformed
+    shape must fall back to require_current_base, never silently disable the
+    gate.
+    """
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    malformed_payloads: list[dict[str, Any]] = [
+        {},  # no required_status_checks key at all
+        {"required_status_checks": {}},  # present but no "strict" key
+        {"required_status_checks": {"strict": "yes"}},  # wrong type (str, not bool)
+        {"required_status_checks": None},  # wrong type (None, not dict)
+        {"enforce_admins": {"enabled": True}},  # unrelated protection field only
+    ]
+    for payload in malformed_payloads:
+        fake_gh = FakeGitHub()
+        fake_gh.branch_protection_overrides["main"] = payload
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        assert app._is_base_freshness_required("main") is True, f"payload={payload!r}"
+
+
+def test_is_base_freshness_required_bidirectional_config_fallback(tmp_path: Path) -> None:
+    """The fallback target on failure is require_current_base itself (per issue
+    #812's non-goal: preserve it as the fallback), not a hardcoded True -- an
+    operator who has explicitly opted out via config keeps that behavior when
+    protection can't be read, matching pre-#812 semantics exactly.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(require_current_base=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # unreadable protection (no override -> None)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is False
+
+
+def test_update_open_agent_prs_broadcast_skips_when_protection_strict_false(
+    tmp_path: Path,
+) -> None:
+    """Issue #812, second half: the broadcast sweep's pr_update_branch write was
+    previously ungated by require_current_base entirely (only merge_ready's own
+    deferral gate checked it). Prove the new gate now skips the compare-API
+    read and the update-branch write together when protection says freshness
+    isn't required, recording a distinct skipped_reason for telemetry.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+    fake_gh.prs = [
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-new456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    decision_dir = paths.prs / "pr-789"
+    decision_dir.mkdir(parents=True, exist_ok=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-def456"}, indent=2),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "base_freshness_not_required"
+    assert fake_gh.pr_update_branch_calls == []
+
+
+def test_merge_ready_strategy_off_skips_freshness_check_despite_protection_strict_true(
+    tmp_path: Path,
+) -> None:
+    """Regression pin for a deadlock this fix could otherwise introduce:
+    update_branch_strategy="off" means there is no sync mechanism at all, so
+    requiring base currency would be an inescapable deferral loop -- the same
+    hazard AutoMergeConfig.__post_init__ already blocks for the config-only
+    case (require_current_base=True + strategy=off). Since base_freshness_required
+    can now become True purely from protection (independent of config), the
+    strategy=="off" guard in merge_ready must short-circuit it before the
+    protection read is ever consulted.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",
+            require_current_base=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    # If the "off" guard were missing, this would force freshness_required=True
+    # for both PRs and PR 789 would be deferred below.
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": True}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["merged"] is True
+    assert result_789.data.get("stale_base") is not True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+    # strategy=="off" short-circuits before the protection read ever happens.
+    assert fake_gh.branch_protection_calls == []
 
 
 def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:

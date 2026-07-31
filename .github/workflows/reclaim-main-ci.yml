@@ -1,0 +1,112 @@
+name: Reclaim superseded main CI runs
+
+# Closes the gap left by ci.yml's concurrency block (#801/#809): that block
+# deliberately exempts push-to-main runs from cancel-in-progress, because an
+# in-progress main run is a per-commit historical/deployment record, not a
+# superseded draft, and killing it would leave a gap in that history.
+#
+# The exemption is unconditional, though, so a main run that is only QUEUED
+# (waiting for one of this repo's 2 registered self-hosted runners -- #799,
+# a hard registration-bound ceiling) or PENDING (waiting for its own
+# concurrency group, which GitHub only auto-replaces for a run superseded by
+# a *second* still-pending run, never once it reaches "queued") is never
+# reclaimed by ci.yml on its own. It sits there competing with real PR
+# checks for the only two runners the repo has, testing a commit that is no
+# longer main's tip. See #810 for the live evidence (two main runs both
+# `queued` simultaneously, up to ~31 minutes of 2-runner capacity spent on a
+# superseded commit) and the full option analysis.
+#
+# This workflow is a separate file, with its own trigger and its own
+# concurrency group, specifically so it is never itself blocked by ci.yml's
+# concurrency state -- a reaper embedded as a step inside Tests/Lint (or
+# gated by ci.yml's own concurrency block) would be queued behind the very
+# stale run it exists to cancel. It only cancels runs that have NOT started
+# (queued/pending/etc.) and explicitly skips the current push's own commit,
+# so ci.yml's actual invariant -- an in-progress main run always keeps
+# running, and the tip of main is always eventually certified -- is
+# unchanged. This is additive only; ci.yml is not modified.
+#
+# Runs on self-hosted, matching ci.yml: hosted-runner minutes are suspended
+# for this repo as of 2026-07 (see ci.yml's own comment) and there is no
+# hosted fallback available today. That means this job waits in the same
+# queue as everything else and is not instant -- but that only bounds how
+# quickly a superseded run gets reclaimed, not whether it eventually is, and
+# the job itself is a few seconds of github-script with no checkout/install,
+# so it clears quickly once scheduled.
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: reclaim-superseded-main-ci
+  cancel-in-progress: true
+
+jobs:
+  reclaim:
+    name: Cancel superseded queued/pending main CI runs
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel non-started CI runs for superseded main commits
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Defensively broad: GitHub's REST `status` field for a
+            // not-yet-started run has been observed as "queued" live in
+            // this repo; "pending"/"requested"/"waiting" are included
+            // because the exact value for every not-started state isn't
+            // documented as a single guaranteed string, and including one
+            // that never occurs is harmless -- listWorkflowRuns simply
+            // returns nothing in that status. Never include "in_progress"
+            // or "completed" here: that is the exemption #810 preserves.
+            const cancelable = new Set(['queued', 'pending', 'requested', 'waiting']);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              branch: 'main',
+              event: 'push',
+              per_page: 30,
+            });
+
+            for (const run of data.workflow_runs) {
+              // Never touch the run for the commit that triggered this
+              // reaper -- that is the current tip of main, and it must
+              // always be the one left to run to completion.
+              if (run.head_sha === context.sha) {
+                continue;
+              }
+              if (!cancelable.has(run.status)) {
+                continue;
+              }
+
+              // Re-fetch immediately before cancelling: the run may have
+              // moved from queued/pending to in_progress (or completed)
+              // between the list call above and now. Cancelling based on
+              // stale status could kill a run that has since started,
+              // which is exactly what must never happen to a main run.
+              const fresh = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              if (!cancelable.has(fresh.data.status)) {
+                core.info(`Skipping run ${run.id} (sha ${run.head_sha}): now ${fresh.data.status}`);
+                continue;
+              }
+
+              core.info(`Cancelling superseded ${fresh.data.status} main CI run ${run.id} (sha ${run.head_sha}, created ${run.created_at})`);
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id,
+                });
+              } catch (err) {
+                core.warning(`Failed to cancel run ${run.id}: ${err.message}`);
+              }
+            }
